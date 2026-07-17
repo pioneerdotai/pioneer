@@ -17,7 +17,7 @@ use crate::{
     gateway::DesktopGatewayWsCommandSenderExt,
 };
 use gpui::{prelude::*, *};
-use gpui_component::{button::*, theme::ActiveTheme, *};
+use gpui_component::{theme::ActiveTheme, *};
 use pioneer_client::{
     composer::{
         state_machine::ComposerDomainAction,
@@ -37,7 +37,6 @@ const DESKTOP_VOICE_STATUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DesktopVoiceEntryAvailability {
     Hidden,
-    Disabled,
     Ready,
 }
 
@@ -594,20 +593,6 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    pub(super) fn render_desktop_voice_disabled_button(
-        &self,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
-        Button::new("desktop-voice-disabled-button")
-            .small()
-            .ghost()
-            .rounded_full()
-            .icon(PioneerIconName::Microphone)
-            .disabled(true)
-            .tooltip(desktop_voice_status_message(self.desktop_voice_status))
-            .into_any_element()
-    }
-
     pub(super) fn render_desktop_voice_hold_prompt(&self, _: &mut Context<Self>) -> AnyElement {
         div()
             .id("desktop-voice-hold-prompt")
@@ -644,21 +629,6 @@ impl PioneerDesktop {
     }
 }
 
-fn desktop_voice_status_message(status: VoiceStatus) -> String {
-    match status {
-        VoiceStatus::Ready => String::new(),
-        VoiceStatus::ModelDownloading => t!("chat.composer.voice.model_downloading").to_string(),
-        VoiceStatus::ModelLoading => t!("chat.composer.voice.model_loading").to_string(),
-        VoiceStatus::Busy | VoiceStatus::Recording | VoiceStatus::Transcribing => {
-            t!("chat.composer.voice.busy").to_string()
-        }
-        VoiceStatus::Disabled | VoiceStatus::Unavailable => {
-            t!("chat.composer.voice.unavailable").to_string()
-        }
-        VoiceStatus::Error => t!("chat.composer.voice.failed_open_settings").to_string(),
-    }
-}
-
 fn desktop_voice_entry_availability_for_context(
     context: DesktopVoiceEntryContext,
     voice_input_enabled: bool,
@@ -677,7 +647,7 @@ fn desktop_voice_entry_availability_for_context(
         | VoiceStatus::Recording
         | VoiceStatus::Transcribing
         | VoiceStatus::Unavailable
-        | VoiceStatus::Error => DesktopVoiceEntryAvailability::Disabled,
+        | VoiceStatus::Error => DesktopVoiceEntryAvailability::Hidden,
     }
 }
 
@@ -797,7 +767,7 @@ mod tests {
                 true,
                 VoiceStatus::Disabled,
             ),
-            DesktopVoiceEntryAvailability::Disabled
+            DesktopVoiceEntryAvailability::Hidden
         );
         assert_eq!(
             desktop_voice_entry_availability_for_context(READY_CONTEXT, true, VoiceStatus::Ready,),
@@ -814,16 +784,9 @@ mod tests {
         ] {
             assert_eq!(
                 desktop_voice_entry_availability_for_context(READY_CONTEXT, true, status),
-                DesktopVoiceEntryAvailability::Disabled
+                DesktopVoiceEntryAvailability::Hidden
             );
         }
-    }
-
-    #[::core::prelude::v1::test]
-    fn composer_voice_failed_affordance_points_to_settings_without_raw_error() {
-        let message = desktop_voice_status_message(VoiceStatus::Error);
-        assert!(message.contains("Settings > General > Voice Input"));
-        assert!(!message.contains("desktop_voice_status_error"));
     }
 
     #[::core::prelude::v1::test]

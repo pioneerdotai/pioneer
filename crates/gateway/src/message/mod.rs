@@ -342,6 +342,8 @@ pub struct MessageProcessor {
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
     thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
+    thread_episodic_workspace_refill_supervisor:
+        Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor>,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
@@ -632,6 +634,8 @@ impl MessageProcessor {
         let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
             && thread_episodic_runtime_config.indexing_enabled;
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
 
         Self {
             thread_manager,
@@ -641,6 +645,7 @@ impl MessageProcessor {
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,
+            thread_episodic_workspace_refill_supervisor,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
@@ -837,6 +842,12 @@ impl MessageProcessor {
         self.thread_episodic_vector_refill_status_tx.clone()
     }
 
+    pub(crate) fn thread_episodic_workspace_refill_supervisor(
+        &self,
+    ) -> Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor> {
+        self.thread_episodic_workspace_refill_supervisor.clone()
+    }
+
     pub fn start_thread_episodic_vector_refill_status_notifications(self: &Arc<Self>) {
         let mut status_rx = self.thread_episodic_vector_refill_status_tx.subscribe();
         let processor = Arc::downgrade(self);
@@ -861,6 +872,9 @@ impl MessageProcessor {
                 let notification = GatewayThreadEpisodicVectorRefillStatusChangedNotification {
                     workspace_id: workspace_id.clone(),
                     status: event.status,
+                    local_model_status: event.local_model_status,
+                    downloaded_bytes: event.downloaded_bytes,
+                    total_bytes: event.total_bytes,
                 };
                 processor
                     .send_notification_to_workspace_connections(
@@ -2295,6 +2309,8 @@ impl MessageProcessor {
             ),
         );
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
         Self {
             thread_manager,
             agent_manager,
@@ -2303,6 +2319,7 @@ impl MessageProcessor {
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,
+            thread_episodic_workspace_refill_supervisor,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,

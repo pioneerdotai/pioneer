@@ -2935,8 +2935,31 @@ impl MessageProcessor {
         }
 
         let previous_general_settings = settings.effective_general_settings(&config.gateway);
+        let previous_workspace_vector_search = workspace_id.as_deref().map(|workspace_id| {
+            settings
+                .effective_thread_episodic_settings_for_workspace(
+                    &config.gateway.thread_episodic,
+                    Some(workspace_id),
+                )
+                .vector_search
+        });
         let changes =
             settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
+        let disabled_local_embedding_model = previous_workspace_vector_search
+            .as_ref()
+            .zip(workspace_id.as_deref())
+            .and_then(|(previous, workspace_id)| {
+                let current = settings
+                    .effective_thread_episodic_settings_for_workspace(
+                        &config.gateway.thread_episodic,
+                        Some(workspace_id),
+                    )
+                    .vector_search;
+                crate::thread_episodic_embedding::local_embedding_model_disabled_by_transition(
+                    previous, &current,
+                )
+                .map(|model| (workspace_id.to_owned(), model))
+            });
         if changes.remote_access.changed {
             if let Some(key) = changes.remote_access.key.as_deref() {
                 self.gateway_secrets.put_remote_access_secret(
@@ -2990,6 +3013,12 @@ impl MessageProcessor {
                 let applied = supervisor
                     .apply_desired(desired, changes.voice_input.retry_install)
                     .context("failed to apply Voice Input settings")?;
+                if applied.cleanup_disabled_models {
+                    supervisor
+                        .cleanup_disabled_models()
+                        .await
+                        .context("failed to remove disabled Voice Input model installations")?;
+                }
                 if let Some(reconcile) = applied.reconcile {
                     let worker = supervisor.clone();
                     tokio::spawn(async move {
@@ -3029,6 +3058,28 @@ impl MessageProcessor {
             self.apply_thread_episodic_workspace_vector_search_configs(
                 workspace_vector_search_configs.clone(),
             );
+            if let Some((disabled_workspace_id, model)) = disabled_local_embedding_model.as_ref() {
+                self.thread_episodic_workspace_refill_supervisor
+                    .cancel_and_wait(disabled_workspace_id.as_str())
+                    .await;
+                let model_still_in_use =
+                    crate::thread_episodic_embedding::configs_use_enabled_local_embedding_model(
+                        std::iter::once(&thread_episodic_settings.vector_search)
+                            .chain(workspace_vector_search_configs.values()),
+                        model.as_str(),
+                    );
+                if !model_still_in_use {
+                    crate::thread_episodic_embedding::remove_local_embedding_model_install(
+                        self.artifact_runtime_home.as_path(),
+                        model.as_str(),
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| {
+                        format!("failed to remove disabled local embedding model `{model}`")
+                    })?;
+                }
+            }
             let vector_refill_startable =
                 crate::settings::thread_episodic_vector_refill_is_startable(
                     &snapshot.thread_episodic.vector_search,
@@ -3057,7 +3108,9 @@ impl MessageProcessor {
                         self.provider_registry.clone(),
                         self.artifact_runtime_home.clone(),
                         Some(self.thread_episodic_vector_refill_status_sender()),
-                    );
+                        self.thread_episodic_workspace_refill_supervisor.clone(),
+                    )
+                    .await;
                     vector_refill_started = true;
                 } else {
                     crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
@@ -3068,6 +3121,7 @@ impl MessageProcessor {
                         self.provider_registry.clone(),
                         self.artifact_runtime_home.clone(),
                         Some(self.thread_episodic_vector_refill_status_sender()),
+                        self.thread_episodic_workspace_refill_supervisor.clone(),
                     );
                     vector_refill_started = true;
                 }

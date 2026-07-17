@@ -162,7 +162,7 @@ impl PioneerDesktop {
             ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
                 notification,
             ) => {
-                self.apply_thread_episodic_vector_refill_status_changed(notification.status, cx);
+                self.apply_thread_episodic_vector_refill_status_changed(notification, cx);
             }
             ClientRuntimeNotification::GatewayVoiceInputStatusChanged(notification) => {
                 self.apply_voice_input_status_changed(notification.settings, cx);
@@ -191,14 +191,21 @@ impl PioneerDesktop {
 
     fn apply_thread_episodic_vector_refill_status_changed(
         &mut self,
-        status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus,
+        notification: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
         cx: &mut Context<Self>,
     ) {
         let Some(settings) = self.gateway.settings.as_mut() else {
             return;
         };
-        settings.thread_episodic.vector_search.refill_status = status;
+        let should_refresh = apply_vector_refill_notification(
+            &mut settings.thread_episodic.vector_search,
+            &notification,
+        );
         cx.notify();
+
+        if should_refresh {
+            self.refresh_gateway_settings(cx);
+        }
     }
 
     fn apply_voice_input_status_changed(
@@ -504,6 +511,45 @@ impl PioneerDesktop {
     }
 }
 
+fn apply_vector_refill_notification(
+    vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+    notification: &pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+) -> bool {
+    vector_search.refill_status = notification.status;
+    if let Some(local_model_status) = notification.local_model_status {
+        vector_search.local_model_status = local_model_status;
+        if local_model_status
+            == pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        {
+            vector_search.downloaded_bytes = notification.downloaded_bytes;
+            vector_search.total_bytes = notification.total_bytes;
+        } else {
+            vector_search.downloaded_bytes = None;
+            vector_search.total_bytes = None;
+        }
+    } else if notification.status
+        == pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        && vector_search.provider
+            == Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local)
+        && vector_search.local_model_status
+            != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+    {
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
+    }
+
+    let terminal = matches!(
+        notification.status,
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
+            | pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed
+    );
+    if terminal {
+        vector_search.downloaded_bytes = None;
+        vector_search.total_bytes = None;
+    }
+    terminal
+}
+
 fn desktop_voice_no_speech_message(error: Option<&VoiceError>) -> String {
     let Some(details) = error.and_then(|error| desktop_voice_error_details(error.message.as_str()))
     else {
@@ -532,4 +578,120 @@ fn desktop_voice_transcription_failed_message(error: Option<&VoiceError>) -> Str
 fn desktop_voice_error_details(message: &str) -> Option<String> {
     let (_, details) = message.split_once("reason=")?;
     Some(format!("reason={details}"))
+}
+
+#[cfg(test)]
+mod vector_refill_tests {
+    use super::*;
+    use pioneer_protocol::{
+        GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
+        GatewayThreadEpisodicVectorRefillStatus,
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+        GatewayThreadEpisodicVectorSearchSettings,
+    };
+
+    fn notification(
+        status: GatewayThreadEpisodicVectorRefillStatus,
+        local_model_status: Option<GatewayThreadEpisodicVectorLocalModelStatus>,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) -> GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+            workspace_id: "workspace-a".to_owned(),
+            status,
+            local_model_status,
+            downloaded_bytes,
+            total_bytes,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn vector_refill_progress_reducer_covers_download_and_terminal_states() {
+        let mut settings = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            model: Some("bge-small-en-v1.5".to_owned()),
+            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+
+        let terminal = apply_vector_refill_notification(
+            &mut settings,
+            &notification(
+                GatewayThreadEpisodicVectorRefillStatus::Running,
+                Some(GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+                Some(16 * 1024 * 1024),
+                Some(64 * 1024 * 1024),
+            ),
+        );
+        assert!(!terminal);
+        assert_eq!(
+            settings.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        );
+        assert_eq!(settings.downloaded_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(settings.total_bytes, Some(64 * 1024 * 1024));
+
+        let terminal = apply_vector_refill_notification(
+            &mut settings,
+            &notification(
+                GatewayThreadEpisodicVectorRefillStatus::Running,
+                Some(GatewayThreadEpisodicVectorLocalModelStatus::Installed),
+                None,
+                None,
+            ),
+        );
+        assert!(!terminal);
+        assert_eq!(
+            settings.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::Installed
+        );
+        assert_eq!(settings.downloaded_bytes, None);
+        assert_eq!(settings.total_bytes, None);
+
+        settings.downloaded_bytes = Some(64 * 1024 * 1024);
+        settings.total_bytes = Some(64 * 1024 * 1024);
+        let terminal = apply_vector_refill_notification(
+            &mut settings,
+            &notification(
+                GatewayThreadEpisodicVectorRefillStatus::Failed,
+                Some(GatewayThreadEpisodicVectorLocalModelStatus::Failed),
+                None,
+                None,
+            ),
+        );
+        assert!(terminal);
+        assert_eq!(
+            settings.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::Failed
+        );
+        assert_eq!(settings.downloaded_bytes, None);
+        assert_eq!(settings.total_bytes, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn vector_refill_progress_reducer_accepts_legacy_running_notification() {
+        let mut settings = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+
+        let terminal = apply_vector_refill_notification(
+            &mut settings,
+            &notification(
+                GatewayThreadEpisodicVectorRefillStatus::Running,
+                None,
+                None,
+                None,
+            ),
+        );
+
+        assert!(!terminal);
+        assert_eq!(
+            settings.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        );
+    }
 }

@@ -252,6 +252,10 @@ pub struct GatewayThreadEpisodicVectorSearchSettings {
     pub refill_status: GatewayThreadEpisodicVectorRefillStatus,
     #[serde(default)]
     pub local_model_status: GatewayThreadEpisodicVectorLocalModelStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
 }
 
 impl Default for GatewayThreadEpisodicVectorSearchSettings {
@@ -267,6 +271,8 @@ impl Default for GatewayThreadEpisodicVectorSearchSettings {
             provider_key: GatewayThreadEpisodicVectorProviderKeyStatus::default(),
             refill_status: GatewayThreadEpisodicVectorRefillStatus::Disabled,
             local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+            downloaded_bytes: None,
+            total_bytes: None,
         }
     }
 }
@@ -319,6 +325,12 @@ impl Default for GatewayThreadEpisodicVectorRefillStatus {
 pub struct GatewayThreadEpisodicVectorRefillStatusChangedNotification {
     pub workspace_id: String,
     pub status: GatewayThreadEpisodicVectorRefillStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model_status: Option<GatewayThreadEpisodicVectorLocalModelStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -673,6 +685,7 @@ mod tests {
         GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
         GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
         GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification,
         GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
         GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
         GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
@@ -865,6 +878,8 @@ mod tests {
                 },
                 refill_status: GatewayThreadEpisodicVectorRefillStatus::Complete,
                 local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+                downloaded_bytes: None,
+                total_bytes: None,
             };
 
             let serialized =
@@ -900,6 +915,8 @@ mod tests {
                     },
                     refill_status: GatewayThreadEpisodicVectorRefillStatus::Complete,
                     local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+                    downloaded_bytes: None,
+                    total_bytes: None,
                 },
                 ..GatewayThreadEpisodicSettings::default()
             },
@@ -932,16 +949,42 @@ mod tests {
                 present: false,
             },
             refill_status: GatewayThreadEpisodicVectorRefillStatus::Required,
-            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
+            downloaded_bytes: Some(32 * 1024 * 1024),
+            total_bytes: Some(64 * 1024 * 1024),
         };
 
         let serialized = serde_json::to_string(&settings).expect("local vector settings serialize");
         assert!(serialized.contains("\"provider\":\"local\""));
+        assert!(serialized.contains("\"downloaded_bytes\":33554432"));
+        assert!(serialized.contains("\"total_bytes\":67108864"));
         assert!(!serialized.contains("api_key"));
 
         let roundtrip: GatewayThreadEpisodicVectorSearchSettings =
             serde_json::from_str(serialized.as_str()).expect("local vector settings deserialize");
         assert_eq!(roundtrip, settings);
+    }
+
+    #[test]
+    fn vector_refill_progress_notification_is_backward_compatible() {
+        let legacy: GatewayThreadEpisodicVectorRefillStatusChangedNotification =
+            serde_json::from_str(r#"{"workspace_id":"workspace-a","status":"running"}"#)
+                .expect("legacy refill notification should deserialize");
+        assert_eq!(legacy.local_model_status, None);
+        assert_eq!(legacy.downloaded_bytes, None);
+        assert_eq!(legacy.total_bytes, None);
+
+        let progress = GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+            workspace_id: "workspace-a".to_owned(),
+            status: GatewayThreadEpisodicVectorRefillStatus::Running,
+            local_model_status: Some(GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            downloaded_bytes: Some(16 * 1024 * 1024),
+            total_bytes: Some(64 * 1024 * 1024),
+        };
+        let serialized = serde_json::to_string(&progress).expect("progress should serialize");
+        let roundtrip: GatewayThreadEpisodicVectorRefillStatusChangedNotification =
+            serde_json::from_str(serialized.as_str()).expect("progress should deserialize");
+        assert_eq!(roundtrip, progress);
     }
 
     #[test]

@@ -430,6 +430,88 @@ pub(crate) fn remove_non_selected_voice_model_installs(
     Ok(report)
 }
 
+pub(crate) fn remove_all_voice_model_installs(
+    config: &AppConfig,
+    runtime_home: &Path,
+    protected_model_id: &RwLock<Option<String>>,
+) -> Result<VoiceModelCleanupReport> {
+    let mut report = VoiceModelCleanupReport::default();
+    let mut failures = Vec::new();
+
+    for entry in voice_model_catalog() {
+        let layout = voice_model_install_layout(&entry, config, runtime_home)?;
+        validate_install_layout_paths(&layout)?;
+        validate_layout_matches_entry(&entry, &layout)?;
+        validate_catalog_cleanup_target(&layout)?;
+        let protected_model_id = protected_model_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if protected_model_id.as_deref() == Some(entry.id) {
+            continue;
+        }
+        if let Err(error) = remove_voice_model_artifacts(&entry, &layout, &mut report) {
+            failures.push(format!("{}: {error:#}", entry.id));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(report)
+    } else {
+        bail!(
+            "failed to remove one or more disabled Voice Input model installations: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn remove_voice_model_artifacts(
+    entry: &VoiceModelCatalogEntry,
+    layout: &VoiceModelInstallLayout,
+    report: &mut VoiceModelCleanupReport,
+) -> Result<()> {
+    let mut failures = Vec::new();
+
+    match fs::symlink_metadata(layout.install_dir.as_path()) {
+        Ok(_) => match remove_path_if_exists(layout.install_dir.as_path()) {
+            Ok(()) => report.removed_install_dirs.push(layout.install_dir.clone()),
+            Err(error) => failures.push(format!(
+                "failed to remove voice model install {}: {error:#}",
+                layout.install_dir.display()
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!(
+            "failed to inspect voice model install {}: {error}",
+            layout.install_dir.display()
+        )),
+    }
+
+    for (path, label) in [
+        (&layout.archive_path, "downloaded archive"),
+        (&layout.partial_archive_path, "partial archive"),
+    ] {
+        if let Err(error) = remove_path_if_exists(path.as_path()) {
+            failures.push(format!(
+                "failed to remove voice model {label} {}: {error:#}",
+                path.display()
+            ));
+        }
+    }
+
+    if let Err(error) = remove_owned_staging_if_exists(entry, layout) {
+        failures.push(format!(
+            "failed to remove voice model staging directory {}: {error:#}",
+            layout.staging_dir.display()
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
 fn validate_catalog_cleanup_target(layout: &VoiceModelInstallLayout) -> Result<()> {
     if layout.install_dir == layout.models_root
         || layout.install_dir.parent() != Some(layout.models_root.as_path())
@@ -1476,6 +1558,81 @@ mod tests {
             report.removed_install_dirs,
             vec![superseded_layout.install_dir]
         );
+    }
+
+    #[test]
+    fn voice_model_disabled_cleanup_removes_known_installs_and_transient_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = AppConfig::load().expect("config");
+        let first = voice_model_catalog_entry("small").expect("small catalog entry");
+        let second = voice_model_catalog_entry("medium").expect("medium catalog entry");
+        let first_layout =
+            voice_model_install_layout(&first, &config, temp.path()).expect("first layout");
+        let second_layout =
+            voice_model_install_layout(&second, &config, temp.path()).expect("second layout");
+
+        for (entry, layout) in [(&first, &first_layout), (&second, &second_layout)] {
+            fs::create_dir_all(layout.install_dir.as_path()).expect("known model install");
+            fs::create_dir_all(layout.downloads_dir.as_path()).expect("downloads dir");
+            fs::write(layout.archive_path.as_path(), b"archive").expect("archive");
+            fs::write(layout.partial_archive_path.as_path(), b"partial").expect("partial");
+            fs::create_dir_all(layout.staging_dir.as_path()).expect("owned staging");
+            let marker = VoiceModelStagingMarker {
+                id: entry.id.to_owned(),
+                sha256: entry.sha256.to_owned(),
+            };
+            fs::write(
+                layout
+                    .staging_dir
+                    .join(VoiceModelStagingGuard::OWNERSHIP_MARKER_FILE),
+                serde_json::to_vec(&marker).expect("serialize staging marker"),
+            )
+            .expect("staging marker");
+        }
+        let unknown = first_layout.models_root.join("custom-user-model");
+        fs::create_dir_all(unknown.as_path()).expect("unknown model dir");
+
+        let report = remove_all_voice_model_installs(&config, temp.path(), &RwLock::new(None))
+            .expect("disabled cleanup");
+
+        for layout in [&first_layout, &second_layout] {
+            assert!(!layout.install_dir.exists());
+            assert!(!layout.archive_path.exists());
+            assert!(!layout.partial_archive_path.exists());
+            assert!(!layout.staging_dir.exists());
+            assert!(report.removed_install_dirs.contains(&layout.install_dir));
+        }
+        assert!(unknown.exists());
+    }
+
+    #[test]
+    fn voice_model_disabled_cleanup_preserves_a_concurrently_reenabled_model() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = AppConfig::load().expect("config");
+        let protected = voice_model_catalog_entry("small").expect("protected catalog entry");
+        let stale = voice_model_catalog_entry("medium").expect("stale catalog entry");
+        let protected_layout =
+            voice_model_install_layout(&protected, &config, temp.path()).expect("protected layout");
+        let stale_layout =
+            voice_model_install_layout(&stale, &config, temp.path()).expect("stale layout");
+        for layout in [&protected_layout, &stale_layout] {
+            fs::create_dir_all(layout.install_dir.as_path()).expect("known model install");
+            fs::create_dir_all(layout.downloads_dir.as_path()).expect("downloads dir");
+            fs::write(layout.archive_path.as_path(), b"archive").expect("archive");
+        }
+
+        let report = remove_all_voice_model_installs(
+            &config,
+            temp.path(),
+            &RwLock::new(Some(protected.id.to_owned())),
+        )
+        .expect("disabled cleanup with re-enabled model");
+
+        assert!(protected_layout.install_dir.exists());
+        assert!(protected_layout.archive_path.exists());
+        assert!(!stale_layout.install_dir.exists());
+        assert!(!stale_layout.archive_path.exists());
+        assert_eq!(report.removed_install_dirs, vec![stale_layout.install_dir]);
     }
 
     #[test]

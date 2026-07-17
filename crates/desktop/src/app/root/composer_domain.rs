@@ -1,7 +1,7 @@
 use super::*;
 use pioneer_client::composer::state_machine::{
-    reduce_composer_domain_state, ComposerDomainAction, ComposerDomainState,
-    ComposerDomainTransition,
+    ComposerDomainAction, ComposerDomainState, ComposerDomainTransition,
+    reduce_composer_domain_state,
 };
 
 impl PioneerDesktop {

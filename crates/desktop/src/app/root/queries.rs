@@ -3,7 +3,7 @@ use pioneer_client::agents_doc::scope as agents_doc_scope;
 #[cfg(test)]
 use pioneer_client::composer::capabilities::composer_capability_target_for_provider as shared_composer_capability_target_for_provider;
 use pioneer_client::composer::capabilities::{
-    plan_composer_submission, ComposerCapabilityTarget, ComposerSubmissionPlan,
+    ComposerCapabilityTarget, ComposerSubmissionPlan, plan_composer_submission,
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;

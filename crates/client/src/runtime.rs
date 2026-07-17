@@ -1131,7 +1131,12 @@ mod tests {
         let notification = GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
             GatewayThreadEpisodicVectorRefillStatusChangedNotification {
                 workspace_id: "workspace_a".to_owned(),
-                status: GatewayThreadEpisodicVectorRefillStatus::Complete,
+                status: GatewayThreadEpisodicVectorRefillStatus::Running,
+                local_model_status: Some(
+                    pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
+                ),
+                downloaded_bytes: Some(1024),
+                total_bytes: Some(4096),
             },
         );
 
@@ -1152,8 +1157,10 @@ mod tests {
         assert_eq!(notification.workspace_id, "workspace_a");
         assert_eq!(
             notification.status,
-            GatewayThreadEpisodicVectorRefillStatus::Complete
+            GatewayThreadEpisodicVectorRefillStatus::Running
         );
+        assert_eq!(notification.downloaded_bytes, Some(1024));
+        assert_eq!(notification.total_bytes, Some(4096));
 
         let ignored = reduce_gateway_notification(
             GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(notification),

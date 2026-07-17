@@ -707,6 +707,7 @@ impl PioneerDesktop {
         let progress =
             (settings.runtime.phase == GatewayVoiceInputRuntimePhase::Downloading).then(|| {
                 Self::render_voice_input_download_progress(
+                    "settings-voice-input-download-progress",
                     settings.runtime.downloaded_bytes,
                     settings.runtime.total_bytes,
                     cx,
@@ -753,6 +754,7 @@ impl PioneerDesktop {
     }
 
     fn render_voice_input_download_progress(
+        progress_id: &'static str,
         downloaded_bytes: Option<u64>,
         total_bytes: Option<u64>,
         _cx: &mut Context<Self>,
@@ -765,7 +767,7 @@ impl PioneerDesktop {
             .mb_0p5()
             .items_center()
             .child(
-                ProgressCircle::new("settings-voice-input-download-progress")
+                ProgressCircle::new(progress_id)
                     .value(progress_percent)
                     .size_4(),
             )
@@ -1110,6 +1112,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (selected_provider, selected_model) = Self::vector_search_model_selection(&settings);
+        let has_saved_model = selected_provider.is_some() && selected_model.is_some();
 
         v_flex()
             .w_full()
@@ -1147,12 +1150,16 @@ impl PioneerDesktop {
                                 move |enabled, window, cx| {
                                     let _ = desktop_entity.update(cx, |view, cx| {
                                         if *enabled {
-                                            view.open_vector_search_model_selector(
-                                                selected_provider.clone(),
-                                                selected_model.clone(),
-                                                window,
-                                                cx,
-                                            );
+                                            if has_saved_model {
+                                                view.apply_vector_search_enabled(true, cx);
+                                            } else {
+                                                view.open_vector_search_model_selector(
+                                                    selected_provider.clone(),
+                                                    selected_model.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         } else {
                                             view.apply_vector_search_enabled(false, cx);
                                         }
@@ -1183,17 +1190,28 @@ impl PioneerDesktop {
         settings: &GatewayThreadEpisodicVectorSearchSettings,
         desktop_entity: Entity<Self>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let (selected_provider, selected_model) = Self::vector_search_model_selection(settings);
         let selection_label = match (&selected_provider, &selected_model) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
             _ => t!("settings.memory.vector_search.embedding_model_not_selected").to_string(),
         };
+        let progress = (settings.local_model_status
+            == GatewayThreadEpisodicVectorLocalModelStatus::Downloading)
+            .then(|| {
+                Self::render_voice_input_download_progress(
+                    "settings-vector-search-download-progress",
+                    settings.downloaded_bytes,
+                    settings.total_bytes,
+                    cx,
+                )
+            });
 
         v_flex()
             .w_full()
             .pb_4()
+            .gap_3()
             .child(
                 h_flex()
                     .w_full()
@@ -1233,6 +1251,7 @@ impl PioneerDesktop {
                         ),
                     ),
             )
+            .when_some(progress, |this, progress| this.child(progress))
             .into_any_element()
     }
 
@@ -1251,7 +1270,11 @@ impl PioneerDesktop {
                 .clone()
                 .or_else(|| settings.local_model.clone()),
             _ => provider.as_ref().and(settings.model.as_ref()).cloned(),
-        };
+        }
+        .and_then(|model| {
+            let model = model.trim();
+            (!model.is_empty()).then(|| model.to_owned())
+        });
         (provider, model)
     }
 
@@ -1789,6 +1812,7 @@ mod tests {
     use super::{GatewayVoiceInputRuntimePhase, PioneerDesktop};
     use pioneer_protocol::{
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings, GatewayRemoteAccessState,
+        GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorSearchSettings,
     };
 
     fn production_view_source() -> &'static str {
@@ -2036,6 +2060,8 @@ mod tests {
             .next()
             .expect("vector search renderer body exists");
         assert!(vector_search_view.contains("if *enabled"));
+        assert!(vector_search_view.contains("if has_saved_model"));
+        assert!(vector_search_view.contains("apply_vector_search_enabled(true"));
         assert!(vector_search_view.contains("open_vector_search_model_selector"));
         assert!(vector_search_view.contains("apply_vector_search_enabled(false"));
         assert!(!vector_search_view.contains("apply_vector_search_enabled(*enabled"));
@@ -2052,12 +2078,70 @@ mod tests {
         assert!(vector_model_view.contains("settings-vector-search-change-model"));
         assert!(vector_model_view.contains("settings.memory.vector_search.change_model"));
         assert!(vector_model_view.contains("open_vector_search_model_selector"));
+        assert!(
+            vector_model_view.contains("GatewayThreadEpisodicVectorLocalModelStatus::Downloading")
+        );
+        assert!(vector_model_view.contains("settings-vector-search-download-progress"));
+        assert!(vector_model_view.contains("settings.downloaded_bytes"));
+        assert!(vector_model_view.contains("settings.total_bytes"));
+        assert!(vector_model_view.contains("render_voice_input_download_progress"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
         assert!(!memory_view.contains("render_preflight_model_setting"));
         assert!(!memory_view.contains("settings.general.preflight_model"));
         assert!(!memory_view.contains("settings.memory.active_recall_model"));
         assert!(!memory_view.contains("settings-memory-active-recall-model"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn vector_search_saved_model_selection_is_reused_on_enable() {
+        let local = GatewayThreadEpisodicVectorSearchSettings {
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+        assert_eq!(
+            PioneerDesktop::vector_search_model_selection(&local),
+            (
+                Some("local".to_owned()),
+                Some("bge-small-en-v1.5".to_owned())
+            )
+        );
+
+        let remote = GatewayThreadEpisodicVectorSearchSettings {
+            provider: Some(GatewayThreadEpisodicVectorProvider::OpenAi),
+            model: Some("  text-embedding-3-small  ".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+        assert_eq!(
+            PioneerDesktop::vector_search_model_selection(&remote),
+            (
+                Some("openai".to_owned()),
+                Some("text-embedding-3-small".to_owned())
+            )
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn vector_search_missing_or_empty_model_still_requires_selection() {
+        let missing_provider = GatewayThreadEpisodicVectorSearchSettings {
+            model: Some("text-embedding-3-small".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+        assert_eq!(
+            PioneerDesktop::vector_search_model_selection(&missing_provider),
+            (None, None)
+        );
+
+        let empty_model = GatewayThreadEpisodicVectorSearchSettings {
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            model: Some("   ".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+        assert_eq!(
+            PioneerDesktop::vector_search_model_selection(&empty_model),
+            (Some("local".to_owned()), None)
+        );
     }
 
     #[::core::prelude::v1::test]

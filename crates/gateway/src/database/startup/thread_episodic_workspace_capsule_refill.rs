@@ -34,6 +34,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub(crate) const THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY: &str =
@@ -52,6 +53,10 @@ const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
     pub(crate) workspace_id: String,
     pub(crate) status: GatewayThreadEpisodicVectorRefillStatus,
+    pub(crate) local_model_status:
+        Option<pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus>,
+    pub(crate) downloaded_bytes: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
 }
 
 pub(crate) type ThreadEpisodicWorkspaceCapsuleRefillStatusSender =
@@ -271,6 +276,7 @@ pub(super) async fn run(
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    refill_supervisor: Arc<super::ThreadEpisodicWorkspaceRefillSupervisor>,
 ) {
     let workspace_ids = match crud_store.list_thread_episodic_refill_workspace_ids().await {
         Ok(workspace_ids) => workspace_ids,
@@ -283,6 +289,11 @@ pub(super) async fn run(
         }
     };
     for workspace_id in workspace_ids {
+        let Some(refill_lease) = refill_supervisor.begin_startup(workspace_id.as_str()).await
+        else {
+            continue;
+        };
+        let cancellation = refill_lease.cancellation();
         let workspace_vector_search_config = effective_workspace_vector_search_config(
             &vector_search_config,
             &workspace_vector_search_configs,
@@ -298,8 +309,10 @@ pub(super) async fn run(
             provider_registry.clone(),
             runtime_home.clone(),
             refill_status_sender.clone(),
+            cancellation,
         )
         .await;
+        drop(refill_lease);
     }
 }
 
@@ -313,21 +326,86 @@ pub(super) async fn run_workspace(
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    cancellation: CancellationToken,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if workspace_vector_search_config.enabled
         && !workspace_vector_search_config.has_selected_embedding_model()
     {
         return;
     }
 
-    if !ensure_local_embedding_model_ready_for_workspace_refill(
+    let local_model_status = local_embedding_model_status_for_refill(
         runtime_home.as_path(),
-        workspace_id.as_str(),
         &workspace_vector_search_config,
-    )
-    .await
-    {
+    );
+    let download_progress_observer = local_model_status
+        .filter(|status| {
+            *status != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+        })
+        .map(|_| {
+            let progress_sender = refill_status_sender.clone();
+            let progress_workspace_id = workspace_id.clone();
+            Arc::new(
+                move |progress: crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgress| {
+                    notify_local_model_download_progress(
+                        progress_sender.as_ref(),
+                        progress_workspace_id.as_str(),
+                        progress,
+                    );
+                },
+            ) as crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgressObserver
+        });
+    if download_progress_observer.is_some() {
+        notify_local_model_download_progress(
+            refill_status_sender.as_ref(),
+            workspace_id.as_str(),
+            crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgress {
+                downloaded_bytes: 0,
+                total_bytes: None,
+            },
+        );
+    }
+
+    let local_model_ready = tokio::select! {
+        _ = cancellation.cancelled() => return,
+        ready = ensure_local_embedding_model_ready_for_workspace_refill(
+            runtime_home.as_path(),
+            workspace_id.as_str(),
+            &workspace_vector_search_config,
+            download_progress_observer,
+        ) => ready,
+    };
+    if !local_model_ready {
+        if local_embedding_model_status_for_refill(
+            runtime_home.as_path(),
+            &workspace_vector_search_config,
+        ) == Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Failed)
+        {
+            notify_local_model_status(
+                refill_status_sender.as_ref(),
+                workspace_id.as_str(),
+                GatewayThreadEpisodicVectorRefillStatus::Failed,
+                pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Failed,
+            );
+        }
         return;
+    }
+    if local_model_status.is_some_and(|status| {
+        status != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+    }) && local_embedding_model_status_for_refill(
+        runtime_home.as_path(),
+        &workspace_vector_search_config,
+    ) == Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed)
+    {
+        notify_local_model_status(
+            refill_status_sender.as_ref(),
+            workspace_id.as_str(),
+            GatewayThreadEpisodicVectorRefillStatus::Running,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed,
+        );
     }
 
     let projection_target =
@@ -345,16 +423,18 @@ pub(super) async fn run_workspace(
         resolver.apply_workspace_configs(workspace_vector_search_configs);
         resolver as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>
     });
-    match refill_once_with_projection_resolver(
-        crud_store,
-        thread_episodic_storage_root.as_path(),
-        workspace_id.as_str(),
-        projection_target,
-        embedding_provider_resolver,
-        refill_status_sender.as_ref(),
-    )
-    .await
-    {
+    let refill = tokio::select! {
+        _ = cancellation.cancelled() => return,
+        refill = refill_once_with_projection_resolver(
+            crud_store,
+            thread_episodic_storage_root.as_path(),
+            workspace_id.as_str(),
+            projection_target,
+            embedding_provider_resolver,
+            refill_status_sender.as_ref(),
+        ) => refill,
+    };
+    match refill {
         Ok(summary) if summary.skipped && summary.lock_contended => {
             info!(
                 "thread episodic workspace capsule refill skipped because another process holds the refill lock"
@@ -406,10 +486,14 @@ async fn ensure_local_embedding_model_ready_for_workspace_refill(
     runtime_home: &Path,
     workspace_id: &str,
     config: &GatewayThreadEpisodicVectorSearchConfig,
+    progress_observer: Option<
+        crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgressObserver,
+    >,
 ) -> bool {
     match crate::thread_episodic_embedding::ensure_local_embedding_model_downloaded_if_needed(
         runtime_home,
         config,
+        progress_observer,
     )
     .await
     {
@@ -468,6 +552,25 @@ fn selected_local_embedding_model(
         .or(config.local_model.as_deref())
         .map(str::trim)
         .filter(|model| !model.is_empty())
+}
+
+fn local_embedding_model_status_for_refill(
+    runtime_home: &Path,
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> Option<pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus> {
+    if !config.enabled || config.provider != Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+    {
+        return None;
+    }
+
+    selected_local_embedding_model(config).map(|model| {
+        crate::thread_episodic_embedding::local_embedding_model_status(
+            runtime_home,
+            true,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local),
+            model,
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -1672,6 +1775,46 @@ fn notify_refill_status(
     let _ = sender.send(ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
         workspace_id: workspace_id.to_owned(),
         status,
+        local_model_status: None,
+        downloaded_bytes: None,
+        total_bytes: None,
+    });
+}
+
+fn notify_local_model_download_progress(
+    sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    workspace_id: &str,
+    progress: crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgress,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let _ = sender.send(ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
+        workspace_id: workspace_id.to_owned(),
+        status: GatewayThreadEpisodicVectorRefillStatus::Running,
+        local_model_status: Some(
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
+        ),
+        downloaded_bytes: Some(progress.downloaded_bytes),
+        total_bytes: progress.total_bytes,
+    });
+}
+
+fn notify_local_model_status(
+    sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    workspace_id: &str,
+    status: GatewayThreadEpisodicVectorRefillStatus,
+    local_model_status: pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let _ = sender.send(ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
+        workspace_id: workspace_id.to_owned(),
+        status,
+        local_model_status: Some(local_model_status),
+        downloaded_bytes: None,
+        total_bytes: None,
     });
 }
 
@@ -1701,6 +1844,46 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn local_model_progress_events_carry_bytes_and_terminal_status_clears_them() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+
+        notify_local_model_download_progress(
+            Some(&sender),
+            "workspace-a",
+            crate::thread_episodic_embedding::LocalEmbeddingModelDownloadProgress {
+                downloaded_bytes: 16 * 1024 * 1024,
+                total_bytes: Some(64 * 1024 * 1024),
+            },
+        );
+        let progress = receiver.try_recv().expect("progress event");
+        assert_eq!(progress.workspace_id, "workspace-a");
+        assert_eq!(
+            progress.status,
+            GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(
+            progress.local_model_status,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading)
+        );
+        assert_eq!(progress.downloaded_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(progress.total_bytes, Some(64 * 1024 * 1024));
+
+        notify_local_model_status(
+            Some(&sender),
+            "workspace-a",
+            GatewayThreadEpisodicVectorRefillStatus::Running,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed,
+        );
+        let installed = receiver.try_recv().expect("installed event");
+        assert_eq!(
+            installed.local_model_status,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed)
+        );
+        assert_eq!(installed.downloaded_bytes, None);
+        assert_eq!(installed.total_bytes, None);
+    }
 
     struct StaticThreadEpisodicEmbeddingProvider {
         provider_id: &'static str,

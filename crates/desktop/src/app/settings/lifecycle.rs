@@ -1,8 +1,8 @@
 use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
-        MemoryModelSetting, MemorySettingToggle, VoiceInputEnableAction,
-        SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
+        MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID,
+        SETTINGS_CONTENT_MEMORY_NODE_ID, VoiceInputEnableAction,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
@@ -891,7 +891,9 @@ mod tests {
 
         assert!(thread_episodic_fn.contains("thread_episodic_enabled_update_plan"));
         assert!(thread_episodic_fn.contains("self.apply_gateway_settings_update"));
-        assert!(!thread_episodic_fn.contains("settings_memory::gateway_settings_update_for_memory"));
+        assert!(
+            !thread_episodic_fn.contains("settings_memory::gateway_settings_update_for_memory")
+        );
         assert!(!thread_episodic_fn.contains("desktop-settings.toml"));
     }
 
@@ -928,7 +930,9 @@ mod tests {
         assert!(embedding_model_fn.contains("vector_search.enabled = true"));
         assert!(embedding_model_fn.contains("self.apply_vector_search_settings"));
         assert!(!embedding_model_fn.contains("provider_set_api_key"));
-        assert!(!embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory"));
+        assert!(
+            !embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory")
+        );
     }
 
     #[::core::prelude::v1::test]

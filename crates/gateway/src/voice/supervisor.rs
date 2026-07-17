@@ -7,7 +7,7 @@ use super::model_install::{
     VoiceModelInstallControl, VoiceModelInstallPhase, VoiceModelInstallProgress,
     VoiceModelInstallReport, ensure_voice_model_installed_with_control,
     force_fresh_voice_model_install, is_voice_model_installed_and_verified,
-    remove_non_selected_voice_model_installs,
+    remove_all_voice_model_installs, remove_non_selected_voice_model_installs,
 };
 use super::runtime::LoadedVoiceEngine;
 use super::transcription::{PreparedSpeechBuffer, VoiceSpeechTranscriber, VoiceTranscriptionError};
@@ -22,6 +22,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -76,6 +77,11 @@ pub(crate) trait VoiceModelInstaller: Send + Sync {
         &self,
         selected_model_id: &str,
         cancellation: &CancellationToken,
+        protected_model_id: &RwLock<Option<String>>,
+    ) -> Result<VoiceModelCleanupReport>;
+
+    fn cleanup_disabled(
+        &self,
         protected_model_id: &RwLock<Option<String>>,
     ) -> Result<VoiceModelCleanupReport>;
 
@@ -140,6 +146,17 @@ impl VoiceModelInstaller for FilesystemVoiceModelInstaller {
         )
     }
 
+    fn cleanup_disabled(
+        &self,
+        protected_model_id: &RwLock<Option<String>>,
+    ) -> Result<VoiceModelCleanupReport> {
+        remove_all_voice_model_installs(
+            &self.config,
+            self.runtime_home.as_path(),
+            protected_model_id,
+        )
+    }
+
     async fn install(
         &self,
         entry: VoiceModelCatalogEntry,
@@ -194,6 +211,7 @@ pub(crate) struct VoiceInputSupervisor {
     pub(crate) engine_loader: Arc<dyn VoiceEngineLoader>,
     settings_tx: watch::Sender<GatewayVoiceInputSettings>,
     cleanup_protected_model_id: Arc<RwLock<Option<String>>>,
+    model_operation: AsyncMutex<()>,
 }
 
 struct VoiceInputSupervisorInner {
@@ -237,6 +255,7 @@ pub(crate) struct VoiceDesiredApplyResult {
     pub(crate) generation: u64,
     #[cfg(test)]
     pub(crate) changed: bool,
+    pub(crate) cleanup_disabled_models: bool,
     pub(crate) reconcile: Option<VoiceReconcileContext>,
 }
 
@@ -257,6 +276,7 @@ impl VoiceInputSupervisor {
             engine_loader,
             settings_tx,
             cleanup_protected_model_id: Arc::new(RwLock::new(None)),
+            model_operation: AsyncMutex::new(()),
         }
     }
 
@@ -326,6 +346,7 @@ impl VoiceInputSupervisor {
                 generation: inner.state.generation,
                 #[cfg(test)]
                 changed: false,
+                cleanup_disabled_models: false,
                 reconcile: None,
             });
         }
@@ -333,6 +354,7 @@ impl VoiceInputSupervisor {
             return Err(VoiceSupervisorTransitionError::GenerationExhausted);
         }
 
+        let cleanup_disabled_models = inner.state.desired.enabled && !desired.enabled;
         if let Some(previous) = inner.current_reconcile.take() {
             previous.cancellation.cancel();
         }
@@ -357,8 +379,22 @@ impl VoiceInputSupervisor {
             generation,
             #[cfg(test)]
             changed: true,
+            cleanup_disabled_models,
             reconcile,
         })
+    }
+
+    pub(crate) async fn cleanup_disabled_models(&self) -> Result<VoiceModelCleanupReport> {
+        let _model_operation = self.model_operation.lock().await;
+        if self.settings_snapshot().enabled {
+            return Ok(VoiceModelCleanupReport::default());
+        }
+
+        let installer = self.installer.clone();
+        let protected_model_id = self.cleanup_protected_model_id.clone();
+        tokio::task::spawn_blocking(move || installer.cleanup_disabled(protected_model_id.as_ref()))
+            .await
+            .context("disabled Voice Input model cleanup task failed")?
     }
 
     pub(crate) fn mark_downloading(
@@ -473,6 +509,10 @@ impl VoiceInputSupervisor {
     }
 
     pub(crate) async fn reconcile(self: &Arc<Self>, context: VoiceReconcileContext) {
+        if context.is_cancelled() {
+            return;
+        }
+        let _model_operation = self.model_operation.lock().await;
         if context.is_cancelled() {
             return;
         }
@@ -936,6 +976,14 @@ mod tests {
             panic!("pure state tests must not clean installations")
         }
 
+        fn cleanup_disabled(
+            &self,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("pure state tests must not clean disabled installations")
+        }
+
         async fn install(
             &self,
             _entry: VoiceModelCatalogEntry,
@@ -996,6 +1044,13 @@ mod tests {
             &self,
             _selected_model_id: &str,
             _cancellation: &CancellationToken,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            Ok(VoiceModelCleanupReport::default())
+        }
+
+        fn cleanup_disabled(
+            &self,
             _protected_model_id: &RwLock<Option<String>>,
         ) -> Result<VoiceModelCleanupReport> {
             Ok(VoiceModelCleanupReport::default())
@@ -1063,6 +1118,53 @@ mod tests {
         cleanup_saw_cancellation: Arc<AtomicBool>,
     }
 
+    struct DisabledCleanupTrackingInstaller {
+        cleanup_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl VoiceModelInstaller for DisabledCleanupTrackingInstaller {
+        fn verified_install_layout(
+            &self,
+            _entry: &VoiceModelCatalogEntry,
+        ) -> Result<Option<VoiceModelInstallLayout>> {
+            panic!("disabled cleanup fixture must not inspect installations")
+        }
+
+        fn cleanup_non_selected(
+            &self,
+            _selected_model_id: &str,
+            _cancellation: &CancellationToken,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            panic!("disabled cleanup fixture must not run replacement cleanup")
+        }
+
+        fn cleanup_disabled(
+            &self,
+            protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            assert_eq!(
+                protected_model_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_deref(),
+                None
+            );
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VoiceModelCleanupReport::default())
+        }
+
+        async fn install(
+            &self,
+            _entry: VoiceModelCatalogEntry,
+            _force_fresh: bool,
+            _control: VoiceModelInstallControl,
+        ) -> Result<VoiceModelInstallReport> {
+            panic!("disabled cleanup fixture must not install a model")
+        }
+    }
+
     #[async_trait]
     impl VoiceModelInstaller for CleanupTrackingInstaller {
         fn verified_install_layout(
@@ -1080,6 +1182,13 @@ mod tests {
         ) -> Result<VoiceModelCleanupReport> {
             assert!(!cancellation.is_cancelled());
             self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VoiceModelCleanupReport::default())
+        }
+
+        fn cleanup_disabled(
+            &self,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
             Ok(VoiceModelCleanupReport::default())
         }
 
@@ -1126,6 +1235,13 @@ mod tests {
             Ok(VoiceModelCleanupReport::default())
         }
 
+        fn cleanup_disabled(
+            &self,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            Ok(VoiceModelCleanupReport::default())
+        }
+
         async fn install(
             &self,
             _entry: VoiceModelCatalogEntry,
@@ -1150,6 +1266,13 @@ mod tests {
             &self,
             _selected_model_id: &str,
             _cancellation: &CancellationToken,
+            _protected_model_id: &RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            Ok(VoiceModelCleanupReport::default())
+        }
+
+        fn cleanup_disabled(
+            &self,
             _protected_model_id: &RwLock<Option<String>>,
         ) -> Result<VoiceModelCleanupReport> {
             Ok(VoiceModelCleanupReport::default())
@@ -1571,6 +1694,107 @@ mod tests {
                 .expect("late failure is ignored")
         );
         assert_phase(&supervisor, GatewayVoiceInputRuntimePhase::Disabled, None);
+    }
+
+    #[tokio::test]
+    async fn voice_supervisor_disable_unloads_runtime_cleans_disk_and_preserves_selection() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let supervisor = VoiceInputSupervisor::new(
+            Arc::new(DisabledCleanupTrackingInstaller {
+                cleanup_calls: cleanup_calls.clone(),
+            }),
+            Arc::new(NoIoEngineLoader {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let selected = selected("small");
+        let context = supervisor
+            .apply_desired(selected.clone(), false)
+            .expect("select model")
+            .reconcile
+            .expect("reconcile context");
+        supervisor
+            .mark_loading(context.generation())
+            .expect("mark loading");
+        supervisor
+            .mark_ready(
+                context.generation(),
+                identity("small"),
+                LoadedVoiceEngine::test_stub(),
+            )
+            .expect("mark ready");
+        assert!(supervisor.has_loaded_engine());
+
+        let disabled_desired = VoiceInputDesiredState {
+            enabled: false,
+            ..selected
+        };
+        let disabled = supervisor
+            .apply_desired(disabled_desired.clone(), false)
+            .expect("disable voice input");
+
+        assert!(disabled.cleanup_disabled_models);
+        assert!(disabled.reconcile.is_none());
+        assert!(context.is_cancelled());
+        assert!(!supervisor.has_loaded_engine());
+        assert_eq!(supervisor.desired(), disabled_desired);
+        assert_eq!(
+            supervisor.settings_snapshot().model.as_deref(),
+            Some("small")
+        );
+        assert_eq!(
+            supervisor.runtime_snapshot().phase,
+            GatewayVoiceInputRuntimePhase::Disabled
+        );
+
+        supervisor
+            .cleanup_disabled_models()
+            .await
+            .expect("clean disabled model installs");
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+        let repeated = supervisor
+            .apply_desired(disabled_desired, false)
+            .expect("repeat disabled settings");
+        assert!(!repeated.changed);
+        assert!(!repeated.cleanup_disabled_models);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_supervisor_stale_disable_cleanup_does_not_delete_a_reenabled_model() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let supervisor = VoiceInputSupervisor::new(
+            Arc::new(DisabledCleanupTrackingInstaller {
+                cleanup_calls: cleanup_calls.clone(),
+            }),
+            Arc::new(NoIoEngineLoader {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let selected = selected("small");
+        supervisor
+            .apply_desired(selected.clone(), false)
+            .expect("select model");
+        let disabled = supervisor
+            .apply_desired(
+                VoiceInputDesiredState {
+                    enabled: false,
+                    ..selected.clone()
+                },
+                false,
+            )
+            .expect("disable voice input");
+        assert!(disabled.cleanup_disabled_models);
+        supervisor
+            .apply_desired(selected, false)
+            .expect("re-enable before cleanup");
+
+        supervisor
+            .cleanup_disabled_models()
+            .await
+            .expect("stale cleanup is skipped");
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

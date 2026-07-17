@@ -1086,6 +1086,8 @@ fn vector_search_config_to_protocol(
         } else {
             pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected
         },
+        downloaded_bytes: None,
+        total_bytes: None,
     };
     apply_thread_episodic_vector_search_status(&mut settings);
     settings
@@ -1237,6 +1239,15 @@ pub fn mark_thread_episodic_vector_refill_running_if_ready(
 
     vector_search.refill_status =
         pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running;
+    if vector_search.provider == Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local)
+        && vector_search.local_model_status
+            != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+    {
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
+        vector_search.downloaded_bytes.get_or_insert(0);
+        vector_search.total_bytes = None;
+    }
 }
 
 pub fn thread_episodic_vector_refill_is_startable(
@@ -1270,11 +1281,6 @@ pub fn thread_episodic_vector_refill_is_startable(
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .is_none()
-            {
-                return false;
-            }
-            if vector_search.local_model_status
-                != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
             {
                 return false;
             }
@@ -3043,8 +3049,31 @@ use_search_instructions = true
         super::mark_thread_episodic_vector_refill_running_if_ready(&mut local_missing);
         assert_eq!(
             local_missing.refill_status,
-            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
         );
+        assert_eq!(
+            local_missing.local_model_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        );
+        assert_eq!(local_missing.downloaded_bytes, Some(0));
+        assert_eq!(local_missing.total_bytes, None);
+
+        let mut local_failed = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            local_model_status:
+                pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Failed,
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..local_missing
+        };
+        super::mark_thread_episodic_vector_refill_running_if_ready(&mut local_failed);
+        assert_eq!(
+            local_failed.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(
+            local_failed.local_model_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        );
+        assert_eq!(local_failed.downloaded_bytes, Some(0));
     }
 
     #[test]

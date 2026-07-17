@@ -12,7 +12,7 @@ use crate::{
         editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         skills::details::table::SkillDiagnosticsTableDelegate,
-        thread::{view::timeline::TimelineRenderModel, ThreadCoordinator},
+        thread::{ThreadCoordinator, view::timeline::TimelineRenderModel},
     },
     audio::{
         capture::{
@@ -26,7 +26,7 @@ use crate::{
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    input::InputState, table::TableState, tree::TreeState, VirtualListScrollHandle,
+    VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
 };
 use gpui_terminal::TerminalView;
 pub(super) use pioneer_client::{
@@ -68,7 +68,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

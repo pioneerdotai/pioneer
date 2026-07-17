@@ -5,9 +5,9 @@ use pioneer_protocol::{
     GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
     GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
-    GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorProvider,
-    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
-    GatewayThreadEpisodicVectorSearchSettingsUpdate,
+    GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
+    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorRefillStatus,
+    GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -281,8 +281,18 @@ pub fn thread_episodic_vector_search_update_plan(
         || previous.embedding_normalized != vector_search.embedding_normalized;
     if !vector_search.enabled {
         vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Disabled;
+        vector_search.downloaded_bytes = None;
+        vector_search.total_bytes = None;
     } else if projection_changed {
         vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Required;
+        let starts_local_download =
+            vector_search.provider == Some(GatewayThreadEpisodicVectorProvider::Local);
+        if starts_local_download {
+            vector_search.local_model_status =
+                GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
+        }
+        vector_search.downloaded_bytes = starts_local_download.then_some(0);
+        vector_search.total_bytes = None;
     } else {
         vector_search.refill_status = previous.refill_status;
     }
@@ -670,6 +680,34 @@ mod tests {
         assert!(!update_json.contains("embedding_dimension"));
         assert!(!update_json.contains("embeddingDimension"));
         assert!(update_json.contains("openrouter"));
+    }
+
+    #[test]
+    fn vector_search_update_plan_starts_local_download_progress() {
+        let current = snapshot(true);
+        let next = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            model: Some("bge-small-en-v1.5".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+
+        let plan = thread_episodic_vector_search_update_plan(Some(&current), next)
+            .expect("local vector search update plan");
+        let vector_search = &plan.snapshot.thread_episodic.vector_search;
+
+        assert!(vector_search.enabled);
+        assert_eq!(
+            vector_search.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        );
+        assert_eq!(vector_search.downloaded_bytes, Some(0));
+        assert_eq!(vector_search.total_bytes, None);
+        assert_eq!(
+            vector_search.refill_status,
+            GatewayThreadEpisodicVectorRefillStatus::Required
+        );
     }
 
     #[test]

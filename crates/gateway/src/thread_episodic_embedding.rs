@@ -16,25 +16,86 @@ use pioneer_provider::{
     EmbeddingRequest, Provider,
     providers::{LocalEmbeddingModelInfo, local_embedding_model_info},
 };
-use reqwest::blocking::Client as BlockingClient;
+use reqwest::blocking::{Client as BlockingClient, Response as BlockingResponse};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const OPENAI_PROVIDER_ID: &str = "openai";
 const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 const LOCAL_PROVIDER_ID: &str = "local";
 const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["models", "embedding", "text"];
 const LOCAL_EMBEDDING_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
+const LOCAL_EMBEDDING_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const LOCAL_EMBEDDING_MODEL_REMOVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const LOCAL_EMBEDDING_MODEL_REMOVE_MAX_ATTEMPTS: usize = 50;
 const THREAD_EPISODIC_PERSONAL_ASSISTANT_QUERY_INSTRUCTION: &str = concat!(
     "Given the user's current message in an ongoing personal assistant conversation, ",
     "retrieve relevant prior conversation passages, user preferences, remembered facts, ",
     "decisions, plans, commitments, and context that would help the assistant respond ",
     "accurately and consistently."
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalEmbeddingModelDownloadProgress {
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) total_bytes: Option<u64>,
+}
+
+pub(crate) type LocalEmbeddingModelDownloadProgressObserver =
+    Arc<dyn Fn(LocalEmbeddingModelDownloadProgress) + Send + Sync>;
+
+static LOCAL_EMBEDDING_DOWNLOADS: OnceLock<
+    Mutex<HashMap<PathBuf, ActiveLocalEmbeddingModelDownload>>,
+> = OnceLock::new();
+static NEXT_LOCAL_EMBEDDING_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct ActiveLocalEmbeddingModelDownload {
+    id: u64,
+    cancellation: CancellationToken,
+    completed: watch::Receiver<bool>,
+}
+
+struct LocalEmbeddingModelDownloadLease {
+    id: u64,
+    model_path: PathBuf,
+    cancellation: CancellationToken,
+    completed: Option<watch::Sender<bool>>,
+}
+
+impl LocalEmbeddingModelDownloadLease {
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for LocalEmbeddingModelDownloadLease {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(true);
+        }
+        let Some(downloads) = LOCAL_EMBEDDING_DOWNLOADS.get() else {
+            return;
+        };
+        let Ok(mut downloads) = downloads.lock() else {
+            return;
+        };
+        if downloads
+            .get(self.model_path.as_path())
+            .is_some_and(|active| active.id == self.id)
+        {
+            downloads.remove(self.model_path.as_path());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenAiEmbeddingModelInfo {
@@ -147,6 +208,8 @@ pub(crate) struct LocalEmbeddingModelFiles {
     pub models_dir: PathBuf,
     pub model_path: PathBuf,
     pub tokenizer_path: PathBuf,
+    pub model_partial_path: PathBuf,
+    pub tokenizer_partial_path: PathBuf,
     pub download_marker_path: PathBuf,
     pub failure_marker_path: PathBuf,
 }
@@ -160,6 +223,8 @@ pub(crate) fn local_embedding_model_files(
     Some(LocalEmbeddingModelFiles {
         model_path: models_dir.join(format!("{}.onnx", info.id)),
         tokenizer_path: models_dir.join(format!("{}_tokenizer.json", info.id)),
+        model_partial_path: models_dir.join(format!("{}.onnx.partial", info.id)),
+        tokenizer_partial_path: models_dir.join(format!("{}_tokenizer.json.partial", info.id)),
         download_marker_path: models_dir.join(format!("{}.download", info.id)),
         failure_marker_path: models_dir.join(format!("{}.failed", info.id)),
         models_dir,
@@ -201,14 +266,19 @@ pub(crate) fn spawn_local_embedding_model_download_if_needed(
     runtime_home: &Path,
     config: &GatewayThreadEpisodicVectorSearchConfig,
 ) -> std::result::Result<bool, String> {
-    let Some((files, info)) = prepare_local_embedding_model_download(runtime_home, config)? else {
+    let Some((files, info, download_lease)) =
+        prepare_local_embedding_model_download(runtime_home, config)?
+    else {
         return Ok(false);
     };
 
-    let files_for_task = files.clone();
+    let files_for_task = files;
     tokio::task::spawn_blocking(move || {
-        let result = download_local_embedding_model_files(&files_for_task, info);
+        let cancellation = download_lease.cancellation();
+        let result =
+            download_local_embedding_model_files(&files_for_task, info, None, &cancellation);
         let _ = complete_local_embedding_model_download(&files_for_task, result);
+        drop(download_lease);
     });
 
     Ok(true)
@@ -217,26 +287,43 @@ pub(crate) fn spawn_local_embedding_model_download_if_needed(
 pub(crate) async fn ensure_local_embedding_model_downloaded_if_needed(
     runtime_home: &Path,
     config: &GatewayThreadEpisodicVectorSearchConfig,
+    progress_observer: Option<LocalEmbeddingModelDownloadProgressObserver>,
 ) -> std::result::Result<bool, String> {
-    let Some((files, info)) = prepare_local_embedding_model_download(runtime_home, config)? else {
+    let Some((files, info, download_lease)) =
+        prepare_local_embedding_model_download(runtime_home, config)?
+    else {
         return Ok(false);
     };
 
-    let files_for_task = files.clone();
     let result = tokio::task::spawn_blocking(move || {
-        download_local_embedding_model_files(&files_for_task, info)
+        let cancellation = download_lease.cancellation();
+        let result = download_local_embedding_model_files(
+            &files,
+            info,
+            progress_observer.as_ref(),
+            &cancellation,
+        );
+        let result = complete_local_embedding_model_download(&files, result);
+        drop(download_lease);
+        result
     })
     .await
     .map_err(|error| format!("local embedding model download task failed: {error}"))?;
-    complete_local_embedding_model_download(&files, result)?;
+    result?;
     Ok(true)
 }
 
 fn prepare_local_embedding_model_download(
     runtime_home: &Path,
     config: &GatewayThreadEpisodicVectorSearchConfig,
-) -> std::result::Result<Option<(LocalEmbeddingModelFiles, &'static LocalEmbeddingModelInfo)>, String>
-{
+) -> std::result::Result<
+    Option<(
+        LocalEmbeddingModelFiles,
+        &'static LocalEmbeddingModelInfo,
+        LocalEmbeddingModelDownloadLease,
+    )>,
+    String,
+> {
     if !config.enabled || config.provider != Some(GatewayThreadEpisodicVectorProviderConfig::Local)
     {
         return Ok(None);
@@ -279,15 +366,26 @@ fn prepare_local_embedding_model_download(
             ));
         }
     };
-    marker.write_all(info.id.as_bytes()).map_err(|error| {
-        format!("failed to write local embedding model download marker: {error}")
-    })?;
+    if let Err(error) = marker.write_all(info.id.as_bytes()) {
+        drop(marker);
+        let _ = std::fs::remove_file(files.download_marker_path.as_path());
+        return Err(format!(
+            "failed to write local embedding model download marker: {error}"
+        ));
+    }
     drop(marker);
 
-    Ok(Some((files, info)))
+    let download_lease = match register_local_embedding_model_download(&files) {
+        Ok(download_lease) => download_lease,
+        Err(error) => {
+            let _ = std::fs::remove_file(files.download_marker_path.as_path());
+            return Err(error);
+        }
+    };
+    Ok(Some((files, info, download_lease)))
 }
 
-fn selected_local_embedding_model(
+pub(crate) fn selected_local_embedding_model(
     config: &GatewayThreadEpisodicVectorSearchConfig,
 ) -> Option<&str> {
     config
@@ -298,11 +396,188 @@ fn selected_local_embedding_model(
         .filter(|model| !model.is_empty())
 }
 
+pub(crate) fn config_uses_enabled_local_embedding_model(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+    model: &str,
+) -> bool {
+    config.enabled
+        && config.provider == Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+        && selected_local_embedding_model(config) == Some(model)
+}
+
+pub(crate) fn configs_use_enabled_local_embedding_model<'a>(
+    configs: impl IntoIterator<Item = &'a GatewayThreadEpisodicVectorSearchConfig>,
+    model: &str,
+) -> bool {
+    configs
+        .into_iter()
+        .any(|config| config_uses_enabled_local_embedding_model(config, model))
+}
+
+pub(crate) fn local_embedding_model_disabled_by_transition(
+    previous: &GatewayThreadEpisodicVectorSearchConfig,
+    current: &GatewayThreadEpisodicVectorSearchConfig,
+) -> Option<String> {
+    if !previous.enabled
+        || current.enabled
+        || previous.provider != Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+    {
+        return None;
+    }
+    selected_local_embedding_model(previous)
+        .filter(|model| local_embedding_model_info(model).is_some())
+        .map(ToOwned::to_owned)
+}
+
+fn local_embedding_downloads() -> &'static Mutex<HashMap<PathBuf, ActiveLocalEmbeddingModelDownload>>
+{
+    LOCAL_EMBEDDING_DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_local_embedding_model_download(
+    files: &LocalEmbeddingModelFiles,
+) -> std::result::Result<LocalEmbeddingModelDownloadLease, String> {
+    let id = NEXT_LOCAL_EMBEDDING_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
+    let cancellation = CancellationToken::new();
+    let (completed_tx, completed_rx) = watch::channel(false);
+    let mut downloads = local_embedding_downloads()
+        .lock()
+        .map_err(|_| "local embedding download registry lock is poisoned".to_owned())?;
+    if downloads
+        .get(files.model_path.as_path())
+        .is_some_and(|active| !*active.completed.borrow())
+    {
+        return Err(format!(
+            "local embedding model download is already active for {}",
+            files.model_path.display()
+        ));
+    }
+    downloads.insert(
+        files.model_path.clone(),
+        ActiveLocalEmbeddingModelDownload {
+            id,
+            cancellation: cancellation.clone(),
+            completed: completed_rx,
+        },
+    );
+    Ok(LocalEmbeddingModelDownloadLease {
+        id,
+        model_path: files.model_path.clone(),
+        cancellation,
+        completed: Some(completed_tx),
+    })
+}
+
+async fn cancel_active_local_embedding_model_download(
+    files: &LocalEmbeddingModelFiles,
+) -> std::result::Result<(), String> {
+    let active = local_embedding_downloads()
+        .lock()
+        .map_err(|_| "local embedding download registry lock is poisoned".to_owned())?
+        .get(files.model_path.as_path())
+        .cloned();
+    let Some(mut active) = active else {
+        return Ok(());
+    };
+
+    active.cancellation.cancel();
+    while !*active.completed.borrow() {
+        if active.completed.changed().await.is_err() {
+            break;
+        }
+    }
+    let mut downloads = local_embedding_downloads()
+        .lock()
+        .map_err(|_| "local embedding download registry lock is poisoned".to_owned())?;
+    if downloads
+        .get(files.model_path.as_path())
+        .is_some_and(|current| current.id == active.id)
+    {
+        downloads.remove(files.model_path.as_path());
+    }
+    Ok(())
+}
+
+pub(crate) async fn remove_local_embedding_model_install(
+    runtime_home: &Path,
+    model: &str,
+) -> std::result::Result<(), String> {
+    let files = local_embedding_model_files(runtime_home, model)
+        .ok_or_else(|| format!("unknown local embedding model `{model}`"))?;
+    cancel_active_local_embedding_model_download(&files).await?;
+
+    tokio::task::spawn_blocking(move || remove_local_embedding_model_files_with_retry(&files))
+        .await
+        .map_err(|error| format!("local embedding model cleanup task failed: {error}"))?
+}
+
+fn remove_local_embedding_model_files_with_retry(
+    files: &LocalEmbeddingModelFiles,
+) -> std::result::Result<(), String> {
+    for attempt in 1..=LOCAL_EMBEDDING_MODEL_REMOVE_MAX_ATTEMPTS {
+        match remove_local_embedding_model_files(files) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < LOCAL_EMBEDDING_MODEL_REMOVE_MAX_ATTEMPTS => {
+                std::thread::sleep(LOCAL_EMBEDDING_MODEL_REMOVE_RETRY_INTERVAL);
+                tracing::debug!(
+                    attempt,
+                    model_path = %files.model_path.display(),
+                    error = %error,
+                    "retrying local embedding model cleanup"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn remove_local_embedding_model_files(
+    files: &LocalEmbeddingModelFiles,
+) -> std::result::Result<(), String> {
+    for path in [
+        files.model_path.as_path(),
+        files.tokenizer_path.as_path(),
+        files.model_partial_path.as_path(),
+        files.tokenizer_partial_path.as_path(),
+        files.download_marker_path.as_path(),
+        files.failure_marker_path.as_path(),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove local embedding model file {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    match std::fs::remove_dir(files.models_dir.as_path()) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to remove empty local embedding model directory {}: {error}",
+                files.models_dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn complete_local_embedding_model_download(
     files: &LocalEmbeddingModelFiles,
     result: std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
     let _ = std::fs::remove_file(files.download_marker_path.as_path());
+    let _ = std::fs::remove_file(files.model_partial_path.as_path());
+    let _ = std::fs::remove_file(files.tokenizer_partial_path.as_path());
     match result {
         Ok(()) => {
             let _ = std::fs::remove_file(files.failure_marker_path.as_path());
@@ -320,7 +595,10 @@ fn complete_local_embedding_model_download(
 fn download_local_embedding_model_files(
     files: &LocalEmbeddingModelFiles,
     info: &LocalEmbeddingModelInfo,
+    progress_observer: Option<&LocalEmbeddingModelDownloadProgressObserver>,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<(), String> {
+    ensure_local_embedding_download_not_cancelled(cancellation)?;
     std::fs::create_dir_all(files.models_dir.as_path()).map_err(|error| {
         format!(
             "failed to create local embedding model directory {}: {error}",
@@ -336,53 +614,91 @@ fn download_local_embedding_model_files(
             format!("failed to initialize local embedding download client: {error}")
         })?;
 
-    download_local_embedding_model_file(
-        &client,
-        info.model_url,
+    let model_response = open_local_embedding_model_response(&client, info.model_url)?;
+    ensure_local_embedding_download_not_cancelled(cancellation)?;
+    let tokenizer_response = open_local_embedding_model_response(&client, info.tokenizer_url)?;
+    ensure_local_embedding_download_not_cancelled(cancellation)?;
+    let total_bytes = model_response
+        .content_length()
+        .zip(tokenizer_response.content_length())
+        .and_then(|(model_bytes, tokenizer_bytes)| model_bytes.checked_add(tokenizer_bytes));
+    report_local_embedding_download_progress(progress_observer, 0, total_bytes);
+
+    let downloaded_bytes = download_local_embedding_model_file(
+        model_response,
         files.model_path.as_path(),
-        files
-            .models_dir
-            .join(format!("{}.onnx.partial", info.id))
-            .as_path(),
-    )
-    .and_then(|()| {
-        download_local_embedding_model_file(
-            &client,
-            info.tokenizer_url,
-            files.tokenizer_path.as_path(),
-            files
-                .models_dir
-                .join(format!("{}_tokenizer.json.partial", info.id))
-                .as_path(),
-        )
-    })
+        files.model_partial_path.as_path(),
+        0,
+        total_bytes,
+        progress_observer,
+        cancellation,
+    )?;
+    let downloaded_bytes = download_local_embedding_model_file(
+        tokenizer_response,
+        files.tokenizer_path.as_path(),
+        files.tokenizer_partial_path.as_path(),
+        downloaded_bytes,
+        total_bytes,
+        progress_observer,
+        cancellation,
+    )?;
+    if total_bytes != Some(downloaded_bytes) {
+        report_local_embedding_download_progress(
+            progress_observer,
+            downloaded_bytes,
+            Some(downloaded_bytes),
+        );
+    }
+    Ok(())
 }
 
-fn download_local_embedding_model_file(
+fn open_local_embedding_model_response(
     client: &BlockingClient,
     url: &str,
-    destination_path: &Path,
-    partial_path: &Path,
-) -> std::result::Result<(), String> {
-    let _ = std::fs::remove_file(partial_path);
-    let mut response = client
+) -> std::result::Result<BlockingResponse, String> {
+    client
         .get(url)
         .send()
         .map_err(|error| format!("failed to download {url}: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("failed to download {url}: {error}"))?;
+        .map_err(|error| format!("failed to download {url}: {error}"))
+}
+
+fn download_local_embedding_model_file(
+    mut response: BlockingResponse,
+    destination_path: &Path,
+    partial_path: &Path,
+    downloaded_before: u64,
+    total_bytes: Option<u64>,
+    progress_observer: Option<&LocalEmbeddingModelDownloadProgressObserver>,
+    cancellation: &CancellationToken,
+) -> std::result::Result<u64, String> {
+    ensure_local_embedding_download_not_cancelled(cancellation)?;
+    let _ = std::fs::remove_file(partial_path);
+    let expected_file_bytes = response.content_length();
     let mut partial_file = File::create(partial_path).map_err(|error| {
         format!(
             "failed to create local embedding model partial file {}: {error}",
             partial_path.display()
         )
     })?;
-    std::io::copy(&mut response, &mut partial_file).map_err(|error| {
-        format!(
-            "failed to write local embedding model partial file {}: {error}",
-            partial_path.display()
-        )
-    })?;
+    let file_downloaded_bytes = copy_local_embedding_model_response(
+        &mut response,
+        &mut partial_file,
+        destination_path,
+        partial_path,
+        downloaded_before,
+        total_bytes,
+        progress_observer,
+        cancellation,
+    )?;
+    ensure_local_embedding_download_not_cancelled(cancellation)?;
+    if expected_file_bytes.is_some_and(|expected| expected != file_downloaded_bytes) {
+        return Err(format!(
+            "local embedding model download for {} did not match declared Content-Length",
+            destination_path.display()
+        ));
+    }
     partial_file.sync_all().map_err(|error| {
         format!(
             "failed to sync local embedding model partial file {}: {error}",
@@ -395,7 +711,82 @@ fn download_local_embedding_model_file(
             "failed to install local embedding model file {}: {error}",
             destination_path.display()
         )
-    })
+    })?;
+    let downloaded_bytes = downloaded_before
+        .checked_add(file_downloaded_bytes)
+        .ok_or_else(|| "local embedding model byte count overflow".to_owned())?;
+    report_local_embedding_download_progress(progress_observer, downloaded_bytes, total_bytes);
+    Ok(downloaded_bytes)
+}
+
+fn copy_local_embedding_model_response(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    destination_path: &Path,
+    partial_path: &Path,
+    downloaded_before: u64,
+    total_bytes: Option<u64>,
+    progress_observer: Option<&LocalEmbeddingModelDownloadProgressObserver>,
+    cancellation: &CancellationToken,
+) -> std::result::Result<u64, String> {
+    let mut file_downloaded_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut last_progress_at = Instant::now();
+    loop {
+        ensure_local_embedding_download_not_cancelled(cancellation)?;
+        let read = source.read(&mut buffer).map_err(|error| {
+            format!(
+                "failed to read local embedding model response for {}: {error}",
+                destination_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read]).map_err(|error| {
+            format!(
+                "failed to write local embedding model partial file {}: {error}",
+                partial_path.display()
+            )
+        })?;
+        file_downloaded_bytes = file_downloaded_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| "local embedding model byte count overflow".to_owned())?;
+        let downloaded_bytes = downloaded_before
+            .checked_add(file_downloaded_bytes)
+            .ok_or_else(|| "local embedding model byte count overflow".to_owned())?;
+        if last_progress_at.elapsed() >= LOCAL_EMBEDDING_DOWNLOAD_PROGRESS_INTERVAL {
+            report_local_embedding_download_progress(
+                progress_observer,
+                downloaded_bytes,
+                total_bytes,
+            );
+            last_progress_at = Instant::now();
+        }
+    }
+    Ok(file_downloaded_bytes)
+}
+
+fn ensure_local_embedding_download_not_cancelled(
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), String> {
+    if cancellation.is_cancelled() {
+        return Err("local embedding model download cancelled".to_owned());
+    }
+    Ok(())
+}
+
+fn report_local_embedding_download_progress(
+    progress_observer: Option<&LocalEmbeddingModelDownloadProgressObserver>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) {
+    if let Some(progress_observer) = progress_observer {
+        progress_observer(LocalEmbeddingModelDownloadProgress {
+            downloaded_bytes,
+            total_bytes,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,6 +1094,12 @@ impl LocalEmbeddingProvider {
             tokenizer_path: self
                 .models_dir
                 .join(format!("{}_tokenizer.json", self.model_info.id)),
+            model_partial_path: self
+                .models_dir
+                .join(format!("{}.onnx.partial", self.model_info.id)),
+            tokenizer_partial_path: self
+                .models_dir
+                .join(format!("{}_tokenizer.json.partial", self.model_info.id)),
             download_marker_path: self
                 .models_dir
                 .join(format!("{}.download", self.model_info.id)),
@@ -1110,6 +1507,7 @@ impl RemoteEmbeddingProvider {
 mod tests {
     use super::*;
     use memvid_core::types::ask::VecEmbedder;
+    use std::io::Cursor;
     use std::sync::Mutex;
 
     struct FakeRemoteProvider {
@@ -1466,6 +1864,196 @@ mod tests {
         assert_eq!(
             files.tokenizer_path,
             files.models_dir.join("bge-small-en-v1.5_tokenizer.json")
+        );
+    }
+
+    #[test]
+    fn local_embedding_model_cleanup_transition_requires_enabled_local_to_disabled() {
+        let enabled_local = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::Local),
+            model: Some("bge-small-en-v1.5".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchConfig::default()
+        };
+        let disabled_local = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            ..enabled_local.clone()
+        };
+        assert_eq!(
+            local_embedding_model_disabled_by_transition(&enabled_local, &disabled_local),
+            Some("bge-small-en-v1.5".to_owned())
+        );
+        assert_eq!(
+            local_embedding_model_disabled_by_transition(&disabled_local, &disabled_local),
+            None
+        );
+
+        let enabled_remote = GatewayThreadEpisodicVectorSearchConfig {
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            ..enabled_local.clone()
+        };
+        let disabled_remote = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            ..enabled_remote.clone()
+        };
+        assert_eq!(
+            local_embedding_model_disabled_by_transition(&enabled_remote, &disabled_remote),
+            None
+        );
+
+        let enabled_unknown_local = GatewayThreadEpisodicVectorSearchConfig {
+            model: Some("unknown-local-model".to_owned()),
+            local_model: Some("unknown-local-model".to_owned()),
+            ..enabled_local
+        };
+        let disabled_unknown_local = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            ..enabled_unknown_local.clone()
+        };
+        assert_eq!(
+            local_embedding_model_disabled_by_transition(
+                &enabled_unknown_local,
+                &disabled_unknown_local
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn enabled_local_model_reference_scan_protects_shared_install() {
+        let enabled_local = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::Local),
+            model: Some("bge-small-en-v1.5".to_owned()),
+            ..GatewayThreadEpisodicVectorSearchConfig::default()
+        };
+        let disabled_local = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            ..enabled_local.clone()
+        };
+        let other_local = GatewayThreadEpisodicVectorSearchConfig {
+            model: Some("bge-base-en-v1.5".to_owned()),
+            ..enabled_local.clone()
+        };
+
+        assert!(configs_use_enabled_local_embedding_model(
+            [&disabled_local, &enabled_local],
+            "bge-small-en-v1.5"
+        ));
+        assert!(!configs_use_enabled_local_embedding_model(
+            [&disabled_local, &other_local],
+            "bge-small-en-v1.5"
+        ));
+    }
+
+    #[tokio::test]
+    async fn removing_local_embedding_install_cancels_download_and_removes_all_artifacts() {
+        let runtime_home = tempfile::tempdir().expect("runtime home");
+        let files = local_embedding_model_files(runtime_home.path(), "bge-small-en-v1.5")
+            .expect("model files");
+        std::fs::create_dir_all(files.models_dir.as_path()).expect("create model directory");
+        for path in [
+            files.model_path.as_path(),
+            files.tokenizer_path.as_path(),
+            files.model_partial_path.as_path(),
+            files.tokenizer_partial_path.as_path(),
+            files.download_marker_path.as_path(),
+            files.failure_marker_path.as_path(),
+        ] {
+            std::fs::write(path, b"artifact").expect("write model artifact");
+        }
+
+        let download_lease =
+            register_local_embedding_model_download(&files).expect("register download");
+        let cancellation = download_lease.cancellation();
+        let download_task = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            drop(download_lease);
+        });
+
+        remove_local_embedding_model_install(runtime_home.path(), "bge-small-en-v1.5")
+            .await
+            .expect("remove local model install");
+        download_task.await.expect("download task");
+
+        for path in [
+            files.model_path.as_path(),
+            files.tokenizer_path.as_path(),
+            files.model_partial_path.as_path(),
+            files.tokenizer_partial_path.as_path(),
+            files.download_marker_path.as_path(),
+            files.failure_marker_path.as_path(),
+        ] {
+            assert!(!path.exists(), "{} should be removed", path.display());
+        }
+    }
+
+    #[test]
+    fn local_embedding_download_stream_counts_written_bytes() {
+        let source_bytes = vec![7_u8; 96 * 1024 + 17];
+        let mut source = Cursor::new(source_bytes.clone());
+        let mut destination = Vec::new();
+
+        let downloaded = copy_local_embedding_model_response(
+            &mut source,
+            &mut destination,
+            Path::new("model.onnx"),
+            Path::new("model.onnx.partial"),
+            32,
+            Some(source_bytes.len() as u64 + 32),
+            None,
+            &CancellationToken::new(),
+        )
+        .expect("download stream should copy");
+
+        assert_eq!(downloaded, source_bytes.len() as u64);
+        assert_eq!(destination, source_bytes);
+    }
+
+    #[test]
+    fn local_embedding_download_stream_stops_before_writing_when_cancelled() {
+        let mut source = Cursor::new(vec![7_u8; 1024]);
+        let mut destination = Vec::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = copy_local_embedding_model_response(
+            &mut source,
+            &mut destination,
+            Path::new("model.onnx"),
+            Path::new("model.onnx.partial"),
+            0,
+            Some(1024),
+            None,
+            &cancellation,
+        )
+        .expect_err("cancelled download should stop");
+
+        assert!(error.contains("cancelled"));
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn local_embedding_download_progress_observer_receives_aggregate_bytes() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_callback = observed.clone();
+        let observer: LocalEmbeddingModelDownloadProgressObserver = Arc::new(move |progress| {
+            observed_for_callback
+                .lock()
+                .expect("progress lock")
+                .push(progress);
+        });
+
+        report_local_embedding_download_progress(Some(&observer), 24, Some(96));
+
+        assert_eq!(
+            observed.lock().expect("progress lock").as_slice(),
+            &[LocalEmbeddingModelDownloadProgress {
+                downloaded_bytes: 24,
+                total_bytes: Some(96),
+            }]
         );
     }
 

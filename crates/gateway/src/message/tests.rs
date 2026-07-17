@@ -6271,6 +6271,13 @@ impl crate::voice::supervisor::VoiceModelInstaller for TestGatewayVoiceInstaller
         anyhow::bail!("ready test supervisor must not clean model files")
     }
 
+    fn cleanup_disabled(
+        &self,
+        _protected_model_id: &std::sync::RwLock<Option<String>>,
+    ) -> anyhow::Result<crate::voice::model_install::VoiceModelCleanupReport> {
+        Ok(crate::voice::model_install::VoiceModelCleanupReport::default())
+    }
+
     async fn install(
         &self,
         _entry: crate::voice::model_catalog::VoiceModelCatalogEntry,
@@ -7196,6 +7203,145 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         serde_json::from_value(response.result).expect("settings update response");
     assert!(payload.settings.voice_input.enabled);
     assert_eq!(payload.settings.voice_input.model.as_deref(), Some("small"));
+
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
+    let runtime_home = unique_temp_dir("voice_settings_disable_cleanup");
+    std::fs::create_dir_all(&runtime_home).expect("runtime home");
+    let config = pioneer_config::AppConfig::load().expect("app config");
+    let entry =
+        crate::voice::model_catalog::voice_model_catalog_entry("small").expect("small voice model");
+    let layout = crate::voice::model_catalog::voice_model_install_layout(
+        &entry,
+        &config,
+        runtime_home.as_path(),
+    )
+    .expect("voice model layout");
+    std::fs::create_dir_all(layout.install_dir.as_path()).expect("installed model");
+    std::fs::create_dir_all(layout.downloads_dir.as_path()).expect("downloads dir");
+    std::fs::write(layout.archive_path.as_path(), b"archive").expect("model archive");
+    std::fs::write(layout.partial_archive_path.as_path(), b"partial")
+        .expect("partial model archive");
+    let unknown_model_dir = layout.models_root.join("custom-user-model");
+    std::fs::create_dir_all(unknown_model_dir.as_path()).expect("unknown model dir");
+
+    let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        config.gateway.settings_file_name.as_str(),
+    )
+    .expect("initial settings");
+    settings
+        .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                model: Some(Some(entry.id.to_owned())),
+                retry_install: false,
+            }),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        })
+        .expect("enable persisted Voice Input");
+    crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
+        .expect("save enabled Voice Input");
+
+    let supervisor = Arc::new(crate::voice::supervisor::VoiceInputSupervisor::new(
+        Arc::new(
+            crate::voice::supervisor::FilesystemVoiceModelInstaller::new(
+                config.clone(),
+                runtime_home.clone(),
+            ),
+        ),
+        Arc::new(TestGatewayVoiceEngineLoader),
+    ));
+    let applied = supervisor
+        .apply_desired(
+            crate::voice::supervisor::VoiceInputDesiredState {
+                enabled: true,
+                provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+                model: Some(entry.id.to_owned()),
+            },
+            false,
+        )
+        .expect("apply enabled Voice Input");
+    supervisor
+        .mark_loading(applied.generation)
+        .expect("mark voice model loading");
+    supervisor
+        .mark_ready(
+            applied.generation,
+            crate::voice::supervisor::VoiceModelIdentity {
+                provider: pioneer_protocol::GatewayVoiceInputProvider::Local,
+                model: entry.id.to_owned(),
+            },
+            crate::voice::runtime::LoadedVoiceEngine::test_stub(),
+        )
+        .expect("mark voice model ready");
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id))
+        .await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_voice_input_supervisor(supervisor);
+
+    let request_id = generate_test_request_id("voice_settings", "disable_cleanup");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "voice_input": { "enabled": false }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let payload: pioneer_protocol::GatewaySettingsUpdateResponse =
+        serde_json::from_value(response.result).expect("settings update response");
+
+    assert!(!payload.settings.voice_input.enabled);
+    assert_eq!(
+        payload.settings.voice_input.model.as_deref(),
+        Some(entry.id)
+    );
+    assert!(!layout.install_dir.exists());
+    assert!(!layout.archive_path.exists());
+    assert!(!layout.partial_archive_path.exists());
+    assert!(unknown_model_dir.exists());
+    let persisted = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        config.gateway.settings_file_name.as_str(),
+    )
+    .expect("persisted disabled settings")
+    .snapshot(&config.gateway);
+    assert!(!persisted.voice_input.enabled);
+    assert_eq!(persisted.voice_input.model.as_deref(), Some(entry.id));
 
     let _ = std::fs::remove_dir_all(runtime_home);
 }

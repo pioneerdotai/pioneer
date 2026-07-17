@@ -560,6 +560,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         provider_registry.clone(),
         runtime_home.clone(),
         Some(message_processor.thread_episodic_vector_refill_status_sender()),
+        message_processor.thread_episodic_workspace_refill_supervisor(),
     );
     database::maintenance::spawn(message_processor.crud_store.clone());
 
@@ -1038,6 +1039,13 @@ mod tests {
             _protected_model_id: &std::sync::RwLock<Option<String>>,
         ) -> Result<VoiceModelCleanupReport> {
             bail!("startup probe must not clean model installs")
+        }
+
+        fn cleanup_disabled(
+            &self,
+            _protected_model_id: &std::sync::RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            bail!("startup probe must not clean disabled model installs")
         }
 
         async fn install(

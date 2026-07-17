@@ -22,7 +22,6 @@ enum DesktopComposerPrimaryAction {
     Send,
     Stop,
     VoiceReady,
-    VoiceDisabled,
 }
 
 fn resolve_desktop_composer_primary_action(
@@ -39,7 +38,6 @@ fn resolve_desktop_composer_primary_action(
 
     match voice_entry_availability {
         DesktopVoiceEntryAvailability::Hidden => DesktopComposerPrimaryAction::Send,
-        DesktopVoiceEntryAvailability::Disabled => DesktopComposerPrimaryAction::VoiceDisabled,
         DesktopVoiceEntryAvailability::Ready => DesktopComposerPrimaryAction::VoiceReady,
     }
 }
@@ -261,9 +259,6 @@ impl PioneerDesktop {
                                         .child(match composer_primary_action {
                                             DesktopComposerPrimaryAction::VoiceReady => {
                                                 self.render_desktop_voice_idle_button(cx)
-                                            }
-                                            DesktopComposerPrimaryAction::VoiceDisabled => {
-                                                self.render_desktop_voice_disabled_button(cx)
                                             }
                                             DesktopComposerPrimaryAction::Send
                                             | DesktopComposerPrimaryAction::Stop => {
@@ -654,9 +649,8 @@ enum ComposerChipRow {
 mod tests {
     use super::*;
 
-    const VOICE_AVAILABILITIES: [DesktopVoiceEntryAvailability; 3] = [
+    const VOICE_AVAILABILITIES: [DesktopVoiceEntryAvailability; 2] = [
         DesktopVoiceEntryAvailability::Hidden,
-        DesktopVoiceEntryAvailability::Disabled,
         DesktopVoiceEntryAvailability::Ready,
     ];
 
@@ -684,14 +678,6 @@ mod tests {
                 DesktopVoiceEntryAvailability::Hidden,
             ),
             DesktopComposerPrimaryAction::Send
-        );
-        assert_eq!(
-            resolve_desktop_composer_primary_action(
-                false,
-                false,
-                DesktopVoiceEntryAvailability::Disabled,
-            ),
-            DesktopComposerPrimaryAction::VoiceDisabled
         );
         assert_eq!(
             resolve_desktop_composer_primary_action(
