@@ -8,7 +8,9 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::composer::permissions as composer_permissions;
+use pioneer_client::composer::{
+    permissions as composer_permissions, state_machine::ComposerDomainAction,
+};
 use pioneer_protocol::TurnPermissionMode;
 
 impl PioneerDesktop {
@@ -104,10 +106,12 @@ impl PioneerDesktop {
                             })
                             .on_click(move |_, window, cx| {
                                 let _ = desktop_entity.update(cx, |view, cx| {
-                                    if composer_permissions::set_composer_permission_mode(
-                                        &mut view.composer_permission_mode,
-                                        mode,
-                                    ) {
+                                    if view
+                                        .reduce_composer_domain(
+                                            ComposerDomainAction::SetPermissionMode { mode },
+                                        )
+                                        .changed
+                                    {
                                         cx.notify();
                                     }
                                 });

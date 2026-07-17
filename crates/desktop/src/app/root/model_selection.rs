@@ -1,6 +1,8 @@
 use super::*;
-use pioneer_client::composer::model_selection::{
-    ComposerModelSelection, ComposerModelSelectionState,
+use pioneer_client::composer::{
+    capabilities::composer_capability_target_for_provider,
+    model_selection::{ComposerModelSelection, has_complete_composer_model_selection},
+    state_machine::ComposerDomainAction,
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::providers::presentation::{
@@ -15,42 +17,72 @@ impl PioneerDesktop {
         provider: Option<String>,
         model: Option<String>,
     ) {
-        let mut state = self.composer_model_selection_state();
-        state.set_from_user(provider, model);
-        self.apply_composer_model_selection_state(state);
+        let capability_target = composer_capability_target_for_provider(
+            provider.as_deref(),
+            self.providers.cli_runtimes(),
+        );
+        self.reduce_composer_domain(ComposerDomainAction::SetModelSelectionFromUser {
+            provider,
+            model,
+            capability_target: Some(capability_target),
+        });
+        if self.composer_selected_provider_is_cli_runtime() {
+            self.composer_upload_in_progress = false;
+        }
     }
 
     pub(in crate::app) fn sync_composer_model_selection_for_active_thread(&mut self) {
         let selection = self.resolve_composer_model_selection();
-        let mut state = self.composer_model_selection_state();
-        state.sync_resolved_selection(selection);
-        self.apply_composer_model_selection_state(state);
+        let capability_target = composer_capability_target_for_provider(
+            selection
+                .as_ref()
+                .map(|selection| selection.provider.as_str()),
+            self.providers.cli_runtimes(),
+        );
+        self.reduce_composer_domain(ComposerDomainAction::SyncResolvedModelSelection {
+            selection,
+            capability_target: Some(capability_target),
+        });
     }
 
     pub(in crate::app) fn reset_composer_model_selection_for_active_thread(&mut self) {
         let selection = self.resolve_composer_model_selection();
-        let mut state = self.composer_model_selection_state();
-        state.reset_to_resolved_selection(selection);
-        self.apply_composer_model_selection_state(state);
-        self.clear_composer_reasoning_effort();
+        let capability_target = composer_capability_target_for_provider(
+            selection
+                .as_ref()
+                .map(|selection| selection.provider.as_str()),
+            self.providers.cli_runtimes(),
+        );
+        self.reduce_composer_domain(ComposerDomainAction::ResetModelSelection {
+            selection,
+            capability_target: Some(capability_target),
+        });
     }
 
     pub(in crate::app) fn has_complete_composer_model_selection(&self) -> bool {
-        self.composer_model_selection_state()
-            .has_complete_selection()
+        has_complete_composer_model_selection(
+            self.composer_selected_provider.as_deref(),
+            self.composer_selected_model.as_deref(),
+        )
     }
 
     pub(in crate::app) fn set_composer_reasoning_effort_from_user(
         &mut self,
         effort: Option<String>,
     ) {
-        let mut state = self.composer_model_selection_state();
-        state.set_reasoning_effort_from_user(effort);
-        self.apply_composer_model_selection_state(state);
+        self.reduce_composer_domain(ComposerDomainAction::SetReasoningEffortFromUser { effort });
     }
 
-    pub(in crate::app) fn clear_composer_reasoning_effort(&mut self) {
-        self.composer_selected_reasoning_effort = None;
+    pub(in crate::app) fn refresh_composer_capability_target_for_selected_provider(&mut self) {
+        let provider = self.composer_selected_provider.clone();
+        let target = composer_capability_target_for_provider(
+            provider.as_deref(),
+            self.providers.cli_runtimes(),
+        );
+        self.reduce_composer_domain(ComposerDomainAction::SyncCapabilityTarget {
+            provider,
+            target,
+        });
     }
 
     pub(in crate::app) fn composer_model_display_state(
@@ -97,42 +129,6 @@ impl PioneerDesktop {
 
         self.current_active_thread_id()
             .is_some_and(|thread_id| self.is_thread_timeline_loading(thread_id))
-    }
-
-    fn composer_model_selection_state(&self) -> ComposerModelSelectionState {
-        ComposerModelSelectionState::new_with_reasoning_effort(
-            self.composer_selected_provider.clone(),
-            self.composer_selected_model.clone(),
-            self.composer_selected_reasoning_effort.clone(),
-            self.composer_model_selection_manually_selected,
-        )
-    }
-
-    fn apply_composer_model_selection_state(&mut self, state: ComposerModelSelectionState) {
-        let (provider, model, reasoning_effort, manually_selected) =
-            state.into_parts_with_reasoning_effort();
-        self.composer_selected_provider = provider;
-        self.composer_selected_model = model;
-        self.composer_selected_reasoning_effort = reasoning_effort;
-        self.composer_model_selection_manually_selected = manually_selected;
-        self.reconcile_composer_capabilities_with_selected_provider();
-        if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_upload_in_progress = false;
-        }
-    }
-
-    pub(in crate::app) fn reconcile_composer_capabilities_with_selected_provider(&mut self) {
-        let filtered = self.effective_composer_capabilities();
-        let removed = filtered.len() != self.composer_capabilities.len();
-        self.composer_capabilities = filtered;
-        if let Some(thread_id) = self.active_thread_id.as_ref() {
-            self.thread_draft_capabilities
-                .insert(thread_id.clone(), self.composer_capabilities.clone());
-        }
-        if removed {
-            self.composer_upload_error =
-                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
-        }
     }
 
     fn composer_model_display_key(&self) -> Option<ProviderModelDisplayKey> {

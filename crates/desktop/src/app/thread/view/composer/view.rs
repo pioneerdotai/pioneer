@@ -2,6 +2,7 @@ use crate::{
     app::root::{
         ComposerAttachmentUploadState, ComposerCapability, ComposerCapabilityKind, PioneerDesktop,
     },
+    app::thread::view::composer::voice::DesktopVoiceEntryAvailability,
     assets::PioneerIconName,
 };
 use gpui::{prelude::*, *};
@@ -61,9 +62,13 @@ impl PioneerDesktop {
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
         let desktop_voice_send_processing = self.desktop_voice_send_processing();
-        let show_desktop_voice_entry =
-            !has_in_flight_turn && self.can_show_desktop_voice_entry(composer_text.as_str());
-        let show_desktop_voice_button = desktop_voice_hold_ui_active || show_desktop_voice_entry;
+        let voice_entry_availability = if has_in_flight_turn {
+            DesktopVoiceEntryAvailability::Hidden
+        } else {
+            self.desktop_voice_entry_availability(composer_text.as_str())
+        };
+        let show_desktop_voice_button = desktop_voice_hold_ui_active
+            || voice_entry_availability != DesktopVoiceEntryAvailability::Hidden;
         let composer_action_loading = self.composer_upload_in_progress
             || (has_in_flight_turn && is_cancelling)
             || desktop_voice_send_processing;
@@ -220,33 +225,40 @@ impl PioneerDesktop {
                                                     )),
                                             )
                                         })
-                                        .child(if show_desktop_voice_button {
-                                            self.render_desktop_voice_idle_button(cx)
-                                        } else {
-                                            Button::new(composer_action_id)
-                                                .primary()
-                                                .rounded_full()
-                                                .disabled(composer_action_disabled)
-                                                .loading(composer_action_loading)
-                                                .when(has_in_flight_turn, |this| {
-                                                    this.icon(PioneerIconName::Square)
-                                                })
-                                                .when(!has_in_flight_turn, |this| {
-                                                    this.icon(IconName::ArrowUp)
-                                                })
-                                                .on_click(cx.listener(
-                                                    move |view, _, window, cx| {
-                                                        if has_in_flight_turn {
-                                                            view.stop_active_turn(window, cx);
-                                                        } else {
-                                                            view.submit_composer_message(
-                                                                window, cx,
-                                                            );
-                                                        }
-                                                    },
-                                                ))
-                                                .into_any_element()
-                                        }),
+                                        .child(
+                                            if desktop_voice_hold_ui_active
+                                                || voice_entry_availability
+                                                    == DesktopVoiceEntryAvailability::Ready
+                                            {
+                                                self.render_desktop_voice_idle_button(cx)
+                                            } else if show_desktop_voice_button {
+                                                self.render_desktop_voice_disabled_button(cx)
+                                            } else {
+                                                Button::new(composer_action_id)
+                                                    .primary()
+                                                    .rounded_full()
+                                                    .disabled(composer_action_disabled)
+                                                    .loading(composer_action_loading)
+                                                    .when(has_in_flight_turn, |this| {
+                                                        this.icon(PioneerIconName::Square)
+                                                    })
+                                                    .when(!has_in_flight_turn, |this| {
+                                                        this.icon(IconName::ArrowUp)
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |view, _, window, cx| {
+                                                            if has_in_flight_turn {
+                                                                view.stop_active_turn(window, cx);
+                                                            } else {
+                                                                view.submit_composer_message(
+                                                                    window, cx,
+                                                                );
+                                                            }
+                                                        },
+                                                    ))
+                                                    .into_any_element()
+                                            },
+                                        ),
                                 ),
                         ),
                 ),

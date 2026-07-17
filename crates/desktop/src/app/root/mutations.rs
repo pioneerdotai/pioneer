@@ -1,6 +1,10 @@
 use super::*;
 use crate::state;
-use pioneer_client::composer::draft as composer_draft;
+use pioneer_client::composer::draft::{
+    ComposerDomainDraft, ComposerDraftLifecycleAction, normalize_composer_draft_text,
+    reduce_composer_draft_lifecycle,
+};
+use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::state::reducers as client_state_reducers;
 use pioneer_client::threads::{
     resume as thread_resume, session as thread_session, start as thread_start, tree as thread_tree,
@@ -114,32 +118,37 @@ impl PioneerDesktop {
             return;
         };
 
-        let value =
-            composer_draft::normalize_composer_draft_text(&self.composer_state.read(cx).value());
-        let attachments = self.composer_attachments.clone();
-        let capabilities = self.effective_composer_capabilities();
-        let permission_mode = self.composer_permission_mode;
-        composer_draft::remember_thread_composer_draft(
-            thread_id.as_str(),
-            value,
-            attachments,
-            capabilities,
-            permission_mode,
-            &mut self.thread_drafts,
-            &mut self.thread_draft_attachments,
-            &mut self.thread_draft_capabilities,
-            &mut self.thread_draft_permission_modes,
+        let draft = ComposerDomainDraft {
+            text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
+            domain: self.composer_domain_state(),
+        };
+        let transition = reduce_composer_draft_lifecycle(
+            &self.composer_draft_lifecycle,
+            ComposerDraftLifecycleAction::RememberThread { thread_id, draft },
         );
+        self.composer_draft_lifecycle = transition.state;
     }
 
     pub(in crate::app) fn clear_thread_draft(&mut self, thread_id: &str) {
-        composer_draft::clear_thread_composer_draft(
-            thread_id,
-            &mut self.thread_drafts,
-            &mut self.thread_draft_attachments,
-            &mut self.thread_draft_capabilities,
-            &mut self.thread_draft_permission_modes,
+        let transition = reduce_composer_draft_lifecycle(
+            &self.composer_draft_lifecycle,
+            ComposerDraftLifecycleAction::ClearThread {
+                thread_id: thread_id.to_owned(),
+            },
         );
+        self.composer_draft_lifecycle = transition.state;
+    }
+
+    fn apply_composer_domain_draft(
+        &mut self,
+        draft: ComposerDomainDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ComposerDomainDraft { text, domain } = draft;
+        self.composer_state
+            .update(cx, move |state, cx| state.set_value(text, window, cx));
+        self.reduce_composer_domain(ComposerDomainAction::Reset { defaults: domain });
     }
 
     pub(in crate::app) fn restore_thread_draft(
@@ -148,20 +157,23 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let draft = composer_draft::restore_thread_composer_draft(
-            thread_id,
-            &self.thread_drafts,
-            &self.thread_draft_attachments,
-            &self.thread_draft_capabilities,
-            &self.thread_draft_permission_modes,
+        let fallback = ComposerDomainDraft {
+            text: String::new(),
+            domain: self.composer_domain_state(),
+        };
+        let transition = reduce_composer_draft_lifecycle(
+            &self.composer_draft_lifecycle,
+            ComposerDraftLifecycleAction::SwitchThread {
+                current_thread_id: None,
+                current_draft: None,
+                target_thread_id: thread_id.to_owned(),
+                fallback,
+            },
         );
-        self.composer_state.update(cx, move |state, cx| {
-            state.set_value(draft.text.clone(), window, cx)
-        });
-        self.composer_permission_mode = draft.permission_mode;
-        self.composer_attachments = draft.attachments;
-        self.composer_capabilities = draft.capabilities;
-        self.reconcile_composer_capabilities_with_selected_provider();
+        self.composer_draft_lifecycle = transition.state;
+        if let Some(draft) = transition.restored_draft {
+            self.apply_composer_domain_draft(draft, window, cx);
+        }
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(
@@ -170,24 +182,42 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.remember_active_thread_draft(cx);
+        let current_thread_id = self.active_thread_id.clone();
+        let current_draft = current_thread_id.as_ref().map(|_| ComposerDomainDraft {
+            text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
+            domain: self.composer_domain_state(),
+        });
         self.set_active_thread_id(Some(thread_id.clone()));
-        self.restore_thread_draft(thread_id.as_str(), window, cx);
+        let fallback = ComposerDomainDraft {
+            text: String::new(),
+            domain: self.composer_domain_state(),
+        };
+        let transition = reduce_composer_draft_lifecycle(
+            &self.composer_draft_lifecycle,
+            ComposerDraftLifecycleAction::SwitchThread {
+                current_thread_id,
+                current_draft,
+                target_thread_id: thread_id,
+                fallback,
+            },
+        );
+        self.composer_draft_lifecycle = transition.state;
+        if let Some(draft) = transition.restored_draft {
+            self.apply_composer_domain_draft(draft, window, cx);
+        }
     }
 
     pub(in crate::app) fn clear_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_state
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.composer_attachments.clear();
-        self.composer_capabilities.clear();
+        self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
         self.composer_upload_in_progress = false;
         self.composer_upload_error = None;
     }
 
     pub(in crate::app) fn clear_composer_payload_for_thread(&mut self, thread_id: &str) {
         if self.active_thread_id.as_deref() == Some(thread_id) {
-            self.composer_attachments.clear();
-            self.composer_capabilities.clear();
+            self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
             self.composer_upload_in_progress = false;
             self.composer_upload_error = None;
         }
@@ -295,12 +325,9 @@ impl PioneerDesktop {
             thread_id,
             &mut self.draft_thread_id,
             &mut self.thread_coordinators,
-            &mut self.thread_drafts,
-            &mut self.thread_draft_attachments,
-            &mut self.thread_draft_capabilities,
-            &mut self.thread_draft_permission_modes,
             &mut self.thread_placements,
         );
+        self.clear_thread_draft(thread_id);
         if pioneer_client::timeline::semantic::remove_thread_semantic_timeline(
             &mut self.semantic_timelines,
             thread_id,
@@ -324,28 +351,36 @@ impl PioneerDesktop {
         client_state_reducers::clear_thread_client_state(
             &mut self.draft_thread_id,
             &mut self.thread_coordinators,
-            &mut self.thread_drafts,
-            &mut self.thread_draft_attachments,
-            &mut self.thread_draft_capabilities,
-            &mut self.thread_draft_permission_modes,
-            &mut self.composer_attachments,
-            &mut self.composer_capabilities,
-            &mut self.composer_permission_mode,
-            &mut self.composer_upload_in_progress,
-            &mut self.composer_upload_error,
-            &mut self.composer_selected_provider,
-            &mut self.composer_selected_model,
-            &mut self.composer_model_selection_manually_selected,
             &mut self.thread_folders,
             &mut self.thread_placements,
             &mut self.thread_agents_doc_summaries,
             &mut self.thread_folder_expanded,
             &mut self.thread_tree_selected_node_id,
         );
+        self.composer_draft_lifecycle = reduce_composer_draft_lifecycle(
+            &self.composer_draft_lifecycle,
+            ComposerDraftLifecycleAction::ClearAll,
+        )
+        .state;
         self.semantic_timelines = Default::default();
         self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
         self.semantic_timeline_in_flight.clear();
-        self.clear_composer_reasoning_effort();
+        let mut composer_defaults = self.composer_domain_state();
+        composer_defaults.attachments.clear();
+        composer_defaults.capabilities.clear();
+        composer_defaults.selected_provider = None;
+        composer_defaults.capability_target =
+            pioneer_client::composer::capabilities::ComposerCapabilityTarget::native();
+        composer_defaults.selected_model = None;
+        composer_defaults.selected_reasoning_effort = None;
+        composer_defaults.selected_permission_mode =
+            pioneer_client::composer::permissions::default_composer_permission_mode();
+        composer_defaults.model_manually_selected = false;
+        self.reduce_composer_domain(ComposerDomainAction::Reset {
+            defaults: composer_defaults,
+        });
+        self.composer_upload_in_progress = false;
+        self.composer_upload_error = None;
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
         self.pending_requests = Default::default();

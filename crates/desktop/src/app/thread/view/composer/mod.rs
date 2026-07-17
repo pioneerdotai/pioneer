@@ -15,7 +15,6 @@ impl PioneerDesktop {
     pub(in crate::app::thread) fn desktop_microphone_error_message(&self) -> Option<String> {
         self.desktop_voice_error_message()
             .map(str::to_owned)
-            .or_else(|| self.desktop_voice_status_error_message())
             .or_else(|| self.desktop_microphone_gate.composer_error_message())
     }
 

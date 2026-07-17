@@ -164,6 +164,9 @@ impl PioneerDesktop {
             ) => {
                 self.apply_thread_episodic_vector_refill_status_changed(notification.status, cx);
             }
+            ClientRuntimeNotification::GatewayVoiceInputStatusChanged(notification) => {
+                self.apply_voice_input_status_changed(notification.settings, cx);
+            }
             ClientRuntimeNotification::WorkspaceChanged {
                 notification,
                 preference,
@@ -195,6 +198,26 @@ impl PioneerDesktop {
             return;
         };
         settings.thread_episodic.vector_search.refill_status = status;
+        cx.notify();
+    }
+
+    fn apply_voice_input_status_changed(
+        &mut self,
+        settings: pioneer_protocol::GatewayVoiceInputSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.desktop_voice_status = settings.runtime.phase.coarse_voice_status();
+        self.desktop_voice_status_error =
+            settings.runtime.error.as_ref().map(|error| error.clone());
+        self.desktop_voice_status_poll_generation =
+            self.desktop_voice_status_poll_generation.saturating_add(1);
+        let Some(current) = self.gateway.settings.as_mut() else {
+            self.refresh_gateway_settings(cx);
+            cx.notify();
+            return;
+        };
+        current.voice_input = settings;
+        self.gateway.settings_error = None;
         cx.notify();
     }
 

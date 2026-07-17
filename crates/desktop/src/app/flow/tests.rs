@@ -2,7 +2,9 @@ use super::{
     build_remote_candidate_ws_connect_spec, build_ws_connect_spec,
     default_user_command_bin_dir_label, warning_notification_messages,
 };
-use crate::app::root::composer_capability_target_for_provider;
+use crate::app::root::{
+    composer_capability_target_for_provider, composer_submission_plan_for_provider,
+};
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
 use pioneer_client::composer::capabilities::{
     COMPOSER_CAPABILITY_MATRIX, ComposerCapability, ComposerCapabilityKind,
@@ -195,6 +197,52 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
         composer_capability_target_for_provider(Some("openai"), &[]),
         ComposerCapabilityTarget::native()
     );
+}
+
+#[test]
+fn desktop_submission_preserves_explicit_mcp_when_presentation_catalog_is_stale() {
+    let capabilities = vec![
+        ComposerCapability {
+            id: "server".to_owned(),
+            label: "App Store Connect".to_owned(),
+            kind: ComposerCapabilityKind::McpServer {
+                name: "appstoreconnect".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        },
+        ComposerCapability {
+            id: "system".to_owned(),
+            label: "Memory".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                slug: "memory".to_owned(),
+                source_kind: "system".to_owned(),
+            },
+        },
+    ];
+
+    assert_eq!(
+        composer_capability_target_for_provider(Some("cli_runtime:codex"), &[]),
+        ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli())
+    );
+    let text = composer_submission_plan_for_provider(
+        Some("cli_runtime:codex"),
+        "inspect releases",
+        false,
+        capabilities.as_slice(),
+    );
+    let voice = composer_submission_plan_for_provider(
+        Some("cli_runtime:codex"),
+        "",
+        true,
+        capabilities.as_slice(),
+    );
+
+    assert_eq!(text.capabilities, voice.capabilities);
+    assert_eq!(text.removed, voice.removed);
+    assert_eq!(text.capabilities.len(), 1);
+    assert_eq!(text.capabilities[0].id, "server");
+    assert!(text.has_composer_payload);
+    assert!(voice.has_composer_payload);
 }
 
 #[test]

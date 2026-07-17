@@ -2,7 +2,7 @@ use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
         MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID,
-        SETTINGS_CONTENT_MEMORY_NODE_ID,
+        SETTINGS_CONTENT_MEMORY_NODE_ID, VoiceInputEnableAction,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
@@ -12,10 +12,19 @@ use gpui_component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
-use pioneer_client::settings::{gateway as gateway_settings, memory as settings_memory};
+use pioneer_client::{
+    providers::list as provider_list,
+    settings::{
+        gateway as gateway_settings, memory as settings_memory, voice as voice_input_settings,
+    },
+};
 use pioneer_protocol::{
     GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorSearchSettings,
+};
+#[cfg(test)]
+use pioneer_protocol::{
+    GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -44,6 +53,9 @@ impl PioneerDesktop {
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
         self.refresh_gateway_settings(cx);
+        if content_view == SettingsContentView::General {
+            self.refresh_voice_input_models(cx);
+        }
     }
 
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
@@ -130,6 +142,70 @@ impl PioneerDesktop {
         self.remote_access_settings_expanded = !self.remote_access_settings_expanded;
     }
 
+    pub(super) fn toggle_voice_input_settings_expanded(&mut self) {
+        self.voice_input_settings_expanded = !self.voice_input_settings_expanded;
+    }
+
+    pub(super) fn refresh_voice_input_models(&mut self, cx: &mut Context<Self>) {
+        if self.voice_input_models_loading || !self.voice_input_models.is_empty() {
+            return;
+        }
+        let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
+            self.gateway.ws_connection_id,
+            self.gateway.connection_epoch,
+        ) else {
+            return;
+        };
+        let connection_id = scope.connection_id;
+        let connection_epoch = scope.connection_epoch;
+        let workspace_id = self.model_selector_workspace_id();
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        self.voice_input_models_loading = true;
+        self.voice_input_models_error = None;
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.provider_list_transcription_models(
+                            provider_list::provider_list_transcription_models_params(
+                                workspace_id,
+                                "local",
+                            ),
+                        )
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !gateway_settings::settings_action_matches_connection(
+                        connection_id,
+                        connection_epoch,
+                        view.gateway.ws_connection_id,
+                        view.gateway.connection_epoch,
+                    ) {
+                        return;
+                    }
+                    view.voice_input_models_loading = false;
+                    match result {
+                        Ok(mut response) => {
+                            provider_list::order_transcription_selector_models(
+                                response.models.as_mut_slice(),
+                            );
+                            view.voice_input_models = response.models;
+                            view.voice_input_models_error = None;
+                        }
+                        Err(error) => {
+                            view.voice_input_models_error = Some(format!("{error:#}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn apply_remote_access_setting(
         &mut self,
         enabled: bool,
@@ -170,6 +246,90 @@ impl PioneerDesktop {
         };
         vector_search.enabled = enabled;
         self.apply_vector_search_settings(vector_search, cx);
+    }
+
+    pub(super) fn apply_voice_input_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> VoiceInputEnableAction {
+        let Some(current) = self
+            .gateway
+            .settings
+            .as_ref()
+            .map(|settings| settings.voice_input.clone())
+        else {
+            self.refresh_gateway_settings(cx);
+            return VoiceInputEnableAction::Noop;
+        };
+
+        let plan = if enabled {
+            voice_input_settings::voice_input_enable_plan(&current)
+        } else {
+            voice_input_settings::voice_input_disable_plan(&current)
+        };
+        match plan {
+            voice_input_settings::VoiceInputSettingsPlan::Update { update } => {
+                if self.apply_gateway_voice_settings_update(update, cx) {
+                    VoiceInputEnableAction::Sent
+                } else {
+                    VoiceInputEnableAction::Noop
+                }
+            }
+            voice_input_settings::VoiceInputSettingsPlan::NeedsSelection => {
+                VoiceInputEnableAction::NeedsSelection
+            }
+            voice_input_settings::VoiceInputSettingsPlan::Noop
+            | voice_input_settings::VoiceInputSettingsPlan::Rejected { .. } => {
+                VoiceInputEnableAction::Noop
+            }
+        }
+    }
+
+    pub(super) fn apply_voice_input_model_selection(
+        &mut self,
+        selection: crate::components::model_selector::ModelSelectorSelection,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(current) = self
+            .gateway
+            .settings
+            .as_ref()
+            .map(|settings| &settings.voice_input)
+        else {
+            self.refresh_gateway_settings(cx);
+            return false;
+        };
+        let voice_input_settings::VoiceInputSettingsPlan::Update { update } =
+            voice_input_settings::voice_input_model_selection_plan(
+                current,
+                selection.provider.as_deref(),
+                selection.model,
+            )
+        else {
+            return false;
+        };
+
+        self.apply_gateway_voice_settings_update(update, cx)
+    }
+
+    pub(super) fn retry_voice_input_install(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(current) = self
+            .gateway
+            .settings
+            .as_ref()
+            .map(|settings| &settings.voice_input)
+        else {
+            self.refresh_gateway_settings(cx);
+            return false;
+        };
+        let voice_input_settings::VoiceInputSettingsPlan::Update { update } =
+            voice_input_settings::voice_input_retry_plan(current)
+        else {
+            return false;
+        };
+
+        self.apply_gateway_voice_settings_update(update, cx)
     }
 
     pub(super) fn apply_vector_search_use_search_instructions(
@@ -384,6 +544,67 @@ impl PioneerDesktop {
         );
     }
 
+    fn apply_gateway_voice_settings_update(
+        &mut self,
+        update: GatewaySettingsUpdate,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
+            self.gateway.ws_connection_id,
+            self.gateway.connection_epoch,
+        ) else {
+            warn!("cannot update Voice Input settings without an active gateway connection");
+            return false;
+        };
+        let connection_id = scope.connection_id;
+        let connection_epoch = scope.connection_epoch;
+        self.voice_input_action_error = None;
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.gateway_settings_update(update) })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !gateway_settings::settings_action_matches_connection(
+                        connection_id,
+                        connection_epoch,
+                        view.gateway.ws_connection_id,
+                        view.gateway.connection_epoch,
+                    ) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            gateway_settings::apply_gateway_settings_update_response(
+                                &mut view.gateway.settings,
+                                &mut view.voice_input_action_error,
+                                response,
+                            );
+                        }
+                        Err(error) => {
+                            gateway_settings::apply_gateway_settings_update_error(
+                                &mut view.voice_input_action_error,
+                                format!("{error:#}"),
+                            );
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "failed to update Voice Input settings"
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        true
+    }
+
     pub(in crate::app) fn apply_gateway_settings_update(
         &mut self,
         snapshot: pioneer_protocol::GatewaySettingsSnapshot,
@@ -530,14 +751,162 @@ impl PioneerDesktop {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     fn production_lifecycle_source() -> &'static str {
         include_str!("lifecycle.rs")
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production source segment exists")
     }
 
-    #[test]
+    fn voice_settings(
+        enabled: bool,
+        provider: Option<GatewayVoiceInputProvider>,
+        model: Option<&str>,
+        phase: GatewayVoiceInputRuntimePhase,
+    ) -> GatewayVoiceInputSettings {
+        GatewayVoiceInputSettings {
+            enabled,
+            provider,
+            model: model.map(str::to_owned),
+            runtime: pioneer_protocol::GatewayVoiceInputRuntimeSnapshot {
+                phase,
+                ..pioneer_protocol::GatewayVoiceInputRuntimeSnapshot::default()
+            },
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_lifecycle_enable_selection_disable_and_retry_updates_are_exact() {
+        let unselected = voice_settings(false, None, None, GatewayVoiceInputRuntimePhase::Disabled);
+        assert!(matches!(
+            voice_input_settings::voice_input_enable_plan(&unselected),
+            voice_input_settings::VoiceInputSettingsPlan::NeedsSelection
+        ));
+
+        let voice_input_settings::VoiceInputSettingsPlan::Update { update: selection } =
+            voice_input_settings::voice_input_model_selection_plan(
+                &unselected,
+                Some("local"),
+                Some(" parakeet-tdt-0.6b-v3 ".to_owned()),
+            )
+        else {
+            panic!("valid local selection must produce an update")
+        };
+        let selection = selection.voice_input.expect("voice selection update");
+        assert_eq!(selection.enabled, Some(true));
+        assert_eq!(
+            selection.provider,
+            Some(Some(GatewayVoiceInputProvider::Local))
+        );
+        assert_eq!(
+            selection.model.as_ref().and_then(|model| model.as_deref()),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+        assert!(!selection.retry_install);
+
+        let selected = voice_settings(
+            true,
+            Some(GatewayVoiceInputProvider::Local),
+            Some("parakeet-tdt-0.6b-v3"),
+            GatewayVoiceInputRuntimePhase::Ready,
+        );
+        let voice_input_settings::VoiceInputSettingsPlan::Update { update: disable } =
+            voice_input_settings::voice_input_disable_plan(&selected)
+        else {
+            panic!("disable must send an update");
+        };
+        let disable = disable.voice_input.expect("voice disable update");
+        assert_eq!(disable.enabled, Some(false));
+        assert_eq!(disable.provider, None);
+        assert_eq!(disable.model, None);
+        assert!(!disable.retry_install);
+
+        let failed = voice_settings(
+            true,
+            Some(GatewayVoiceInputProvider::Local),
+            Some("parakeet-tdt-0.6b-v3"),
+            GatewayVoiceInputRuntimePhase::Failed,
+        );
+        let voice_input_settings::VoiceInputSettingsPlan::Update { update: retry } =
+            voice_input_settings::voice_input_retry_plan(&failed)
+        else {
+            panic!("failed selected model may retry")
+        };
+        let retry = retry.voice_input.expect("voice retry update");
+        assert_eq!(retry.enabled, None);
+        assert_eq!(retry.provider, None);
+        assert_eq!(retry.model, None);
+        assert!(retry.retry_install);
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_lifecycle_cancel_and_noop_paths_send_nothing() {
+        let selected = voice_settings(
+            true,
+            Some(GatewayVoiceInputProvider::Local),
+            Some("small"),
+            GatewayVoiceInputRuntimePhase::Ready,
+        );
+        assert!(matches!(
+            voice_input_settings::voice_input_enable_plan(&selected),
+            voice_input_settings::VoiceInputSettingsPlan::Noop
+        ));
+        assert!(matches!(
+            voice_input_settings::voice_input_model_selection_plan(
+                &selected,
+                None,
+                Some("medium".to_owned())
+            ),
+            voice_input_settings::VoiceInputSettingsPlan::Rejected { .. }
+        ));
+        assert!(matches!(
+            voice_input_settings::voice_input_model_selection_plan(&selected, Some("local"), None),
+            voice_input_settings::VoiceInputSettingsPlan::Rejected { .. }
+        ));
+        assert!(matches!(
+            voice_input_settings::voice_input_model_selection_plan(
+                &selected,
+                Some("local"),
+                Some("small".to_owned())
+            ),
+            voice_input_settings::VoiceInputSettingsPlan::Noop
+        ));
+        assert!(matches!(
+            voice_input_settings::voice_input_retry_plan(&selected),
+            voice_input_settings::VoiceInputSettingsPlan::Rejected { .. }
+        ));
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_lifecycle_uses_shared_client_plans() {
+        let source = production_lifecycle_source();
+        assert!(source.contains("voice_input_settings::voice_input_enable_plan"));
+        assert!(source.contains("voice_input_settings::voice_input_disable_plan"));
+        assert!(source.contains("voice_input_settings::voice_input_model_selection_plan"));
+        assert!(source.contains("voice_input_settings::voice_input_retry_plan"));
+        assert!(!source.contains("fn plan_voice_input_"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_lifecycle_rejection_keeps_authoritative_snapshot() {
+        let source = production_lifecycle_source();
+        let voice_update_fn = source
+            .split("fn apply_gateway_voice_settings_update")
+            .nth(1)
+            .expect("authoritative Voice Input update function exists")
+            .split("pub(in crate::app) fn apply_gateway_settings_update")
+            .next()
+            .expect("Voice Input update function body exists");
+
+        assert!(voice_update_fn.contains("gateway_settings_update(update)"));
+        assert!(voice_update_fn.contains("apply_gateway_settings_update_response"));
+        assert!(voice_update_fn.contains("apply_gateway_settings_update_error"));
+        assert!(!voice_update_fn.contains("apply_optimistic_gateway_settings_update"));
+    }
+
+    #[::core::prelude::v1::test]
     fn settings_preflight_model_update_writes_general_settings_only() {
         let source = production_lifecycle_source();
         let preflight_fn = source
@@ -553,7 +922,7 @@ mod tests {
         assert!(!preflight_fn.contains("settings_memory::gateway_settings_update_for_memory"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_memory_model_update_keeps_only_proactive_write_model_owned_by_memory() {
         let source = production_lifecycle_source();
         let memory_model_fn = source
@@ -570,7 +939,7 @@ mod tests {
         assert!(!memory_model_fn.contains("ActiveRecall"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_thread_episodic_update_writes_thread_episodic_settings_only() {
         let source = production_lifecycle_source();
         let thread_episodic_fn = source
@@ -589,7 +958,7 @@ mod tests {
         assert!(!thread_episodic_fn.contains("desktop-settings.toml"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_vector_search_update_writes_thread_episodic_settings_only() {
         let source = production_lifecycle_source();
         let vector_fn = source
@@ -607,7 +976,7 @@ mod tests {
         assert!(!vector_fn.contains("remote_access"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_vector_search_embedding_model_selection_writes_thread_episodic_settings_only() {
         let source = production_lifecycle_source();
         let embedding_model_fn = source
@@ -626,7 +995,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_vector_search_instruction_toggle_writes_thread_episodic_settings_only() {
         let source = production_lifecycle_source();
         let instruction_fn = source

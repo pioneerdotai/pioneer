@@ -6,7 +6,7 @@ use pioneer_client::cli_runtime::approvals::{
     PendingRequestsReduction, plan_pending_request_response,
 };
 use pioneer_client::composer::attachments as composer_attachments;
-use pioneer_client::composer::capabilities as composer_capabilities;
+use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::composer::turn_prepare::{
     self as composer_turn_prepare, PrepareComposerTurnRequest,
 };
@@ -209,10 +209,10 @@ impl PioneerDesktop {
         if self.desktop_voice_context_locked() {
             return;
         }
-        if composer_attachments::remove_composer_attachment_at(
-            &mut self.composer_attachments,
-            index,
-        ) {
+        if self
+            .reduce_composer_domain(ComposerDomainAction::RemoveAttachmentAt { index })
+            .changed
+        {
             self.composer_upload_error = None;
         }
     }
@@ -221,10 +221,7 @@ impl PioneerDesktop {
         if self.desktop_voice_context_locked() {
             return;
         }
-        composer_capabilities::remove_composer_capability_at(
-            &mut self.composer_capabilities,
-            index,
-        );
+        self.reduce_composer_domain(ComposerDomainAction::RemoveCapabilityAt { index });
     }
 
     pub(super) fn add_composer_capabilities(
@@ -235,17 +232,7 @@ impl PioneerDesktop {
             return;
         }
         for capability in capabilities {
-            composer_capabilities::add_composer_capability(
-                &mut self.composer_capabilities,
-                capability,
-            );
-        }
-        let filtered = self.effective_composer_capabilities();
-        let removed = filtered.len() != self.composer_capabilities.len();
-        self.composer_capabilities = filtered;
-        if removed {
-            self.composer_upload_error =
-                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
+            self.reduce_composer_domain(ComposerDomainAction::AddCapability { capability });
         }
     }
 
@@ -287,15 +274,15 @@ impl PioneerDesktop {
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let composer_attachments = self.composer_attachments.clone();
-        let composer_capabilities = self.effective_composer_capabilities();
-        self.composer_capabilities = composer_capabilities.clone();
-        if !composer_turn_prepare::composer_has_sendable_content(
-            composer_text.as_str(),
-            !composer_attachments.is_empty(),
-            !composer_capabilities.is_empty(),
-        ) {
+        let submission =
+            self.composer_submission_plan(composer_text.as_str(), !composer_attachments.is_empty());
+        if !submission.has_composer_payload {
             return;
         }
+        let composer_capabilities = submission.capabilities;
+        self.reduce_composer_domain(ComposerDomainAction::SetCapabilities {
+            capabilities: composer_capabilities.clone(),
+        });
         let turn_start_ids = turn_start::plan_turn_start_ids();
         let turn_id = turn_start_ids.turn_id;
         let pending_request_id = turn_start_ids.pending_request_id;
@@ -313,9 +300,7 @@ impl PioneerDesktop {
 
         self.composer_upload_in_progress = true;
         self.composer_upload_error = None;
-        composer_turn_prepare::mark_pending_composer_attachments_uploading(
-            &mut self.composer_attachments,
-        );
+        self.reduce_composer_domain(ComposerDomainAction::MarkAttachmentsUploading);
         cx.notify();
 
         cx.spawn_in(
@@ -356,9 +341,12 @@ impl PioneerDesktop {
                                     reduction.composer_upload_in_progress;
                                 view.composer_upload_error =
                                     Some(reduction.composer_upload_error.clone());
-                                composer_turn_prepare::mark_uploading_composer_attachments_failed(
-                                    &mut view.composer_attachments,
-                                    reduction.mark_uploading_attachments_failed_error.as_str(),
+                                view.reduce_composer_domain(
+                                    ComposerDomainAction::MarkAttachmentsFailed {
+                                        error: reduction
+                                            .mark_uploading_attachments_failed_error
+                                            .clone(),
+                                    },
                                 );
                                 cx.notify();
                                 return;
@@ -388,9 +376,10 @@ impl PioneerDesktop {
                         if reduction.clear_composer_upload_error {
                             view.composer_upload_error = None;
                         }
-                        composer_turn_prepare::apply_uploaded_composer_attachment_artifacts(
-                            &mut view.composer_attachments,
-                            reduction.uploaded_attachment_artifacts,
+                        view.reduce_composer_domain(
+                            ComposerDomainAction::ApplyUploadedAttachments {
+                                artifacts: reduction.uploaded_attachment_artifacts,
+                            },
                         );
                         if reduction.clear_composer {
                             view.clear_composer(window, cx);
@@ -577,10 +566,10 @@ impl PioneerDesktop {
         if self.desktop_voice_context_locked() {
             return;
         }
-        composer_attachments::append_composer_attachment_paths(
-            &mut self.composer_attachments,
-            paths,
-        );
+        let mut attachments = self.composer_attachments.clone();
+        if composer_attachments::append_composer_attachment_paths(&mut attachments, paths) {
+            self.reduce_composer_domain(ComposerDomainAction::SetAttachments { attachments });
+        }
     }
 
     pub(in crate::app) fn attach_artifact_to_composer(
@@ -591,10 +580,10 @@ impl PioneerDesktop {
         if self.desktop_voice_context_locked() {
             return;
         }
-        if composer_attachments::add_composer_attachment_from_artifact(
-            &mut self.composer_attachments,
-            artifact,
-        ) {
+        if self
+            .reduce_composer_domain(ComposerDomainAction::AddArtifactAttachment { artifact })
+            .changed
+        {
             self.composer_upload_error = None;
             cx.notify();
         }

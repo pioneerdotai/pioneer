@@ -162,7 +162,7 @@ impl PioneerDesktop {
                                 response,
                                 provider_now_unix_ms(),
                             );
-                            view.reconcile_composer_capabilities_with_selected_provider();
+                            view.refresh_composer_capability_target_for_selected_provider();
                         }
                         Err(error) => {
                             view.providers.apply_cli_runtime_refresh_failed(
@@ -235,7 +235,7 @@ impl PioneerDesktop {
                                 response,
                                 provider_now_unix_ms(),
                             );
-                            view.reconcile_composer_capabilities_with_selected_provider();
+                            view.refresh_composer_capability_target_for_selected_provider();
                         }
                         Err(error) => {
                             view.providers.apply_cli_runtime_refresh_failed(

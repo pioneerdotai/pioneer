@@ -1,3 +1,4 @@
+mod composer_domain;
 mod desktop_update;
 mod model_selection;
 mod mutations;
@@ -36,9 +37,12 @@ pub(super) use pioneer_client::{
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
     cli_runtime::approvals::{PendingRequest, PendingRequestState},
-    composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
+    composer::capabilities::{
+        ComposerCapability, ComposerCapabilityKind, ComposerCapabilityTarget,
+    },
     composer::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},
+        draft::ComposerDraftLifecycleState,
         turn_prepare::PrepareVoiceComposerSnapshotRequest,
     },
     gateway::runtime::GatewaySetupAction,
@@ -53,11 +57,13 @@ pub(super) use pioneer_client::{
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
-    ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
+    ProviderModelInfo, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
+    ThreadFolder, ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
 #[cfg(test)]
-pub(crate) use queries::composer_capability_target_for_provider;
+pub(crate) use queries::{
+    composer_capability_target_for_provider, composer_submission_plan_for_provider,
+};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -288,6 +294,11 @@ pub struct PioneerDesktop {
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,
     pub(super) settings_content_view: SettingsContentView,
+    pub(super) voice_input_settings_expanded: bool,
+    pub(super) voice_input_models: Vec<ProviderModelInfo>,
+    pub(super) voice_input_models_loading: bool,
+    pub(super) voice_input_models_error: Option<String>,
+    pub(super) voice_input_action_error: Option<String>,
     pub(super) remote_access_settings_expanded: bool,
     pub(super) remote_access_key_input_revision: u64,
     pub(super) remote_access_status_poll_generation: u64,
@@ -311,7 +322,9 @@ pub struct PioneerDesktop {
     pub(super) composer_upload_in_progress: bool,
     pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
+    pub(super) composer_mode_manually_selected: bool,
     pub(super) composer_selected_provider: Option<String>,
+    pub(super) composer_capability_target: ComposerCapabilityTarget,
     pub(super) composer_selected_model: Option<String>,
     pub(super) composer_selected_reasoning_effort: Option<String>,
     pub(super) composer_permission_mode: TurnPermissionMode,
@@ -358,10 +371,7 @@ pub struct PioneerDesktop {
     pub(super) skills_list_scroll_handle: VirtualListScrollHandle,
     pub(super) skills_details_expanded_sections: HashSet<String>,
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
-    pub(super) thread_drafts: HashMap<String, String>,
-    pub(super) thread_draft_attachments: HashMap<String, Vec<ComposerAttachment>>,
-    pub(super) thread_draft_capabilities: HashMap<String, Vec<ComposerCapability>>,
-    pub(super) thread_draft_permission_modes: HashMap<String, TurnPermissionMode>,
+    pub(super) composer_draft_lifecycle: ComposerDraftLifecycleState,
     pub(super) thread_start: ThreadStartCoordinator,
     pub(super) thread_start_requested: bool,
     pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,

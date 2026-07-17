@@ -1,7 +1,7 @@
 use crate::{
     app::{
         root::{PioneerDesktop, SettingsContentView},
-        settings::{MemoryModelSetting, MemorySettingToggle},
+        settings::{MemoryModelSetting, MemorySettingToggle, VoiceInputEnableAction},
     },
     assets::PioneerIconName,
     components::{
@@ -26,10 +26,19 @@ use pioneer_protocol::{
     GatewayMemoryModelSelection, GatewayMemorySettings, GatewayRemoteAccessSettings,
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
     GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
+    ProviderModelInfo,
 };
 use std::rc::Rc;
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
+const VOICE_INPUT_PROGRESS_WIDTH_PX: f32 = 240.0;
+
+#[derive(Clone, Debug, PartialEq)]
+struct VoiceInputDownloadPresentation {
+    label: String,
+    fraction: Option<f32>,
+}
 
 struct RemoteAccessSettingsInputState {
     key: Entity<InputState>,
@@ -98,6 +107,18 @@ impl PioneerDesktop {
                 .child(Self::render_preflight_model_setting(
                     settings.general.preflight_model.clone(),
                     desktop_entity.clone(),
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_voice_input_setting(
+                    settings.voice_input.clone(),
+                    self.voice_input_settings_expanded,
+                    self.voice_input_models.as_slice(),
+                    self.voice_input_models_loading,
+                    self.voice_input_models_error.clone(),
+                    self.voice_input_action_error.clone(),
+                    desktop_entity.clone(),
+                    window,
                     cx,
                 ))
                 .child(Self::render_settings_divider(cx))
@@ -597,6 +618,478 @@ impl PioneerDesktop {
                     }),
             )
             .into_any_element()
+    }
+
+    fn render_voice_input_setting(
+        settings: GatewayVoiceInputSettings,
+        expanded: bool,
+        models: &[ProviderModelInfo],
+        models_loading: bool,
+        models_error: Option<String>,
+        action_error: Option<String>,
+        desktop_entity: Entity<Self>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_provider = (settings.provider == Some(GatewayVoiceInputProvider::Local))
+            .then(|| "local".to_owned());
+        let selected_model = settings.model.clone();
+        let expanded_content = expanded.then(|| {
+            Self::render_voice_input_expanded(
+                &settings,
+                models,
+                models_loading,
+                models_error,
+                action_error,
+                selected_provider.clone(),
+                selected_model.clone(),
+                desktop_entity.clone(),
+                cx,
+            )
+        });
+        let label = t!("settings.voice_input.label").to_string();
+        let description = t!("settings.voice_input.description").to_string();
+        let expand_tooltip = if expanded {
+            t!("settings.voice_input.collapse").to_string()
+        } else {
+            t!("settings.voice_input.expand").to_string()
+        };
+        let expand_icon = if expanded {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        };
+
+        v_flex()
+            .w_full()
+            .gap_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .py_3()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(div().text_sm().font_semibold().child(label))
+                            .child(div().text_xs().opacity(0.6).child(description)),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("settings-voice-input-expand")
+                                    .small()
+                                    .ghost()
+                                    .icon(expand_icon)
+                                    .tooltip(expand_tooltip)
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        move |_, _, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.toggle_voice_input_settings_expanded();
+                                                view.refresh_voice_input_models(cx);
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Switch::new("settings-voice-input-enabled")
+                                    .checked(settings.enabled)
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        let selected_provider = selected_provider.clone();
+                                        let selected_model = selected_model.clone();
+                                        move |enabled, window, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                let action =
+                                                    view.apply_voice_input_enabled(*enabled, cx);
+                                                if action == VoiceInputEnableAction::NeedsSelection
+                                                {
+                                                    view.open_voice_input_model_selector(
+                                                        selected_provider.clone(),
+                                                        selected_model.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .when_some(expanded_content, |this, content| this.child(content))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_voice_input_expanded(
+        settings: &GatewayVoiceInputSettings,
+        models: &[ProviderModelInfo],
+        models_loading: bool,
+        models_error: Option<String>,
+        action_error: Option<String>,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let model_summary =
+            Self::render_voice_input_model_summary(settings, models, models_loading, cx);
+        let status_badge = Self::render_vector_status_badge(
+            Self::voice_input_runtime_phase_label(settings.runtime.phase),
+            Self::voice_input_runtime_phase_color(settings.runtime.phase, cx),
+        );
+        let progress =
+            (settings.runtime.phase == GatewayVoiceInputRuntimePhase::Downloading).then(|| {
+                Self::render_voice_input_download_progress(
+                    settings.runtime.downloaded_bytes,
+                    settings.runtime.total_bytes,
+                    cx,
+                )
+            });
+        let actions = Self::render_voice_input_actions(
+            settings.runtime.phase == GatewayVoiceInputRuntimePhase::Failed,
+            selected_provider,
+            selected_model,
+            desktop_entity,
+        );
+
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .px_0()
+            .py_3()
+            .gap_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .justify_between()
+                    .items_start()
+                    .child(model_summary)
+                    .child(status_badge),
+            )
+            .when_some(progress, |this, progress| this.child(progress))
+            .when_some(models_error, |this, error| {
+                this.child(Self::render_voice_input_error(error, cx))
+            })
+            .when_some(settings.runtime.error.clone(), |this, error| {
+                this.child(Self::render_voice_input_error(error, cx))
+            })
+            .when_some(action_error, |this, error| {
+                this.child(Self::render_voice_input_error(error, cx))
+            })
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn render_voice_input_model_summary(
+        settings: &GatewayVoiceInputSettings,
+        models: &[ProviderModelInfo],
+        models_loading: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_info = settings
+            .model
+            .as_deref()
+            .and_then(|selected| models.iter().find(|model| model.id == selected));
+        let label = selected_info
+            .map(pioneer_client::providers::presentation::model_selector_model_display_name)
+            .unwrap_or_else(|| {
+                if settings.model.is_none() {
+                    t!("settings.voice_input.no_model_selected").to_string()
+                } else if models_loading {
+                    t!("settings.voice_input.loading_model_details").to_string()
+                } else {
+                    t!("settings.voice_input.model_details_unavailable").to_string()
+                }
+            });
+        let presentation = selected_info.and_then(
+            pioneer_client::providers::presentation::transcription_model_selector_presentation,
+        );
+        let family = selected_info
+            .and_then(|model| model.family.as_deref())
+            .map(Self::voice_input_metadata_label)
+            .or_else(|| presentation.as_ref().map(|model| model.engine.clone()));
+        let family_label = family
+            .map(|family| t!("settings.voice_input.engine_family", family = family).to_string());
+
+        v_flex()
+            .min_w_0()
+            .flex_1()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .when_some(family_label, |this, family| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(family),
+                )
+            })
+            .when_some(presentation, |this, model| {
+                this.child(Self::render_voice_input_metadata(model, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_voice_input_metadata(
+        model: pioneer_client::providers::presentation::TranscriptionModelSelectorPresentation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(model.download_size),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(model.language_summary),
+            )
+            .when(model.recommended, |this| {
+                this.child(Self::render_vector_status_badge(
+                    t!("settings.voice_input.recommended").to_string(),
+                    cx.theme().success,
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn render_voice_input_download_progress(
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let progress = Self::voice_input_download_presentation(downloaded_bytes, total_bytes);
+        let fill = progress.fraction.map(|fraction| {
+            div()
+                .h(px(4.0))
+                .w(px(VOICE_INPUT_PROGRESS_WIDTH_PX * fraction))
+                .rounded_full()
+                .bg(cx.theme().accent)
+        });
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(progress.label),
+            )
+            .child(
+                div()
+                    .w(px(VOICE_INPUT_PROGRESS_WIDTH_PX))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(cx.theme().border)
+                    .when_some(fill, |this, fill| this.child(fill)),
+            )
+            .into_any_element()
+    }
+
+    fn render_voice_input_error(error: String, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .text_xs()
+            .text_color(cx.theme().danger)
+            .child(error)
+            .into_any_element()
+    }
+
+    fn render_voice_input_actions(
+        retry_available: bool,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        desktop_entity: Entity<Self>,
+    ) -> AnyElement {
+        let change_model = small_outline_button("settings-voice-input-change-model")
+            .label(t!("settings.voice_input.change_model").to_string())
+            .tooltip(t!("settings.voice_input.change_model_tooltip").to_string())
+            .on_click({
+                let desktop_entity = desktop_entity.clone();
+                move |_, window, cx| {
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.open_voice_input_model_selector(
+                            selected_provider.clone(),
+                            selected_model.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            });
+        let retry = retry_available.then(|| {
+            small_outline_button("settings-voice-input-retry")
+                .label(t!("settings.voice_input.retry").to_string())
+                .tooltip(t!("settings.voice_input.retry_tooltip").to_string())
+                .on_click(move |_, _, cx| {
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.retry_voice_input_install(cx);
+                        cx.notify();
+                    });
+                })
+        });
+
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .child(change_model)
+            .when_some(retry, |this, retry| this.child(retry))
+            .into_any_element()
+    }
+
+    fn voice_input_runtime_phase_label(phase: GatewayVoiceInputRuntimePhase) -> String {
+        match phase {
+            GatewayVoiceInputRuntimePhase::Disabled => {
+                t!("settings.voice_input.status_disabled")
+            }
+            GatewayVoiceInputRuntimePhase::ModelNotSelected => {
+                t!("settings.voice_input.status_model_not_selected")
+            }
+            GatewayVoiceInputRuntimePhase::Missing => t!("settings.voice_input.status_missing"),
+            GatewayVoiceInputRuntimePhase::Downloading => {
+                t!("settings.voice_input.status_downloading")
+            }
+            GatewayVoiceInputRuntimePhase::Installing => {
+                t!("settings.voice_input.status_installing")
+            }
+            GatewayVoiceInputRuntimePhase::Loading => t!("settings.voice_input.status_loading"),
+            GatewayVoiceInputRuntimePhase::Ready => t!("settings.voice_input.status_ready"),
+            GatewayVoiceInputRuntimePhase::Failed => t!("settings.voice_input.status_failed"),
+        }
+        .to_string()
+    }
+
+    fn voice_input_runtime_phase_color(
+        phase: GatewayVoiceInputRuntimePhase,
+        cx: &mut Context<Self>,
+    ) -> Hsla {
+        match phase {
+            GatewayVoiceInputRuntimePhase::Disabled
+            | GatewayVoiceInputRuntimePhase::ModelNotSelected
+            | GatewayVoiceInputRuntimePhase::Missing => cx.theme().muted_foreground,
+            GatewayVoiceInputRuntimePhase::Downloading
+            | GatewayVoiceInputRuntimePhase::Installing
+            | GatewayVoiceInputRuntimePhase::Loading => cx.theme().warning,
+            GatewayVoiceInputRuntimePhase::Ready => cx.theme().success,
+            GatewayVoiceInputRuntimePhase::Failed => cx.theme().danger,
+        }
+    }
+
+    fn voice_input_download_presentation(
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) -> VoiceInputDownloadPresentation {
+        let downloaded_bytes = downloaded_bytes.unwrap_or(0);
+        match total_bytes.filter(|total| *total > 0) {
+            Some(total_bytes) => {
+                let fraction = (downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0);
+                VoiceInputDownloadPresentation {
+                    label: t!(
+                        "settings.voice_input.progress_known",
+                        percent = (fraction * 100.0).round() as u64,
+                        downloaded = Self::format_voice_input_bytes(downloaded_bytes),
+                        total = Self::format_voice_input_bytes(total_bytes)
+                    )
+                    .to_string(),
+                    fraction: Some(fraction as f32),
+                }
+            }
+            None => VoiceInputDownloadPresentation {
+                label: if downloaded_bytes == 0 {
+                    t!("settings.voice_input.progress_unknown").to_string()
+                } else {
+                    t!(
+                        "settings.voice_input.progress_unknown_downloaded",
+                        downloaded = Self::format_voice_input_bytes(downloaded_bytes)
+                    )
+                    .to_string()
+                },
+                fraction: None,
+            },
+        }
+    }
+
+    fn format_voice_input_bytes(bytes: u64) -> String {
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = KIB * 1024.0;
+        const GIB: f64 = MIB * 1024.0;
+        let bytes = bytes as f64;
+        if bytes >= GIB {
+            format!("{:.1} GB", bytes / GIB)
+        } else if bytes >= MIB {
+            format!("{:.1} MB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.1} KB", bytes / KIB)
+        } else {
+            format!("{} B", bytes as u64)
+        }
+    }
+
+    fn voice_input_metadata_label(value: &str) -> String {
+        value
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut characters = part.chars();
+                let Some(first) = characters.next() else {
+                    return String::new();
+                };
+                format!("{}{}", first.to_uppercase(), characters.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn open_voice_input_model_selector(
+        &mut self,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = self.model_selector_workspace_id();
+        self.open_model_selector_dialog(
+            ModelSelectorDialogOptions {
+                title: t!("settings.voice_input.select_dialog_title").to_string(),
+                selected_provider,
+                selected_model,
+                selected_reasoning_effort: None,
+                mode: ProviderModelSelectorMode::Transcription,
+                workspace_id,
+                ws_sender: self.gateway.ws_command_sender.clone(),
+                on_save: Rc::new(
+                    move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
+                        view.apply_voice_input_model_selection(selection, cx)
+                    },
+                ),
+            },
+            window,
+            cx,
+        );
     }
 
     fn render_remote_access_setting(
@@ -1433,6 +1926,7 @@ impl PioneerDesktop {
 
 #[cfg(test)]
 mod tests {
+    use super::{GatewayVoiceInputRuntimePhase, PioneerDesktop};
     use pioneer_protocol::{
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings, GatewayRemoteAccessState,
     };
@@ -1444,7 +1938,7 @@ mod tests {
             .expect("production source segment exists")
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn remote_access_status_label_follows_switch_state() {
         rust_i18n::set_locale("en");
 
@@ -1470,7 +1964,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn remote_access_status_label_localizes_validation_failures() {
         rust_i18n::set_locale("en");
 
@@ -1510,7 +2004,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_general_view_owns_preflight_model_selector() {
         let source = production_view_source();
         let general_view = source
@@ -1545,7 +2039,107 @@ mod tests {
         assert!(!source.contains("save_remote_access_server_inline"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
+    fn voice_settings_enable_flow_is_gateway_authoritative_and_selector_first() {
+        let source = production_view_source();
+        let general_view = source
+            .split("fn render_settings_general")
+            .nth(1)
+            .expect("general renderer exists")
+            .split("fn render_settings_memory")
+            .next()
+            .expect("general renderer body exists");
+        assert!(general_view.contains("render_voice_input_setting"));
+
+        let voice_view = source
+            .split("fn render_voice_input_setting")
+            .nth(1)
+            .expect("Voice Input renderer exists")
+            .split("fn open_voice_input_model_selector")
+            .next()
+            .expect("Voice Input renderer body exists");
+        assert!(voice_view.contains(".checked(settings.enabled)"));
+        assert!(voice_view.contains("apply_voice_input_enabled"));
+        assert!(voice_view.contains("VoiceInputEnableAction::NeedsSelection"));
+        assert!(voice_view.contains("open_voice_input_model_selector"));
+        assert!(!voice_view.contains("settings.voice_input.enabled ="));
+
+        let selector = source
+            .split("fn open_voice_input_model_selector")
+            .nth(1)
+            .expect("Voice Input selector exists")
+            .split("fn render_remote_access_setting")
+            .next()
+            .expect("Voice Input selector body exists");
+        assert!(selector.contains("ProviderModelSelectorMode::Transcription"));
+        assert!(selector.contains("apply_voice_input_model_selection"));
+        assert!(!selector.contains("apply_voice_input_enabled"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_runtime_states_have_deterministic_labels_and_progress() {
+        let phases = [
+            (GatewayVoiceInputRuntimePhase::Disabled, "Disabled"),
+            (
+                GatewayVoiceInputRuntimePhase::ModelNotSelected,
+                "Model not selected",
+            ),
+            (GatewayVoiceInputRuntimePhase::Missing, "Missing"),
+            (GatewayVoiceInputRuntimePhase::Downloading, "Downloading"),
+            (GatewayVoiceInputRuntimePhase::Installing, "Installing"),
+            (GatewayVoiceInputRuntimePhase::Loading, "Loading"),
+            (GatewayVoiceInputRuntimePhase::Ready, "Ready"),
+            (GatewayVoiceInputRuntimePhase::Failed, "Failed"),
+        ];
+        for (phase, expected) in phases {
+            assert_eq!(
+                PioneerDesktop::voice_input_runtime_phase_label(phase),
+                expected
+            );
+        }
+
+        let known = PioneerDesktop::voice_input_download_presentation(
+            Some(50 * 1024 * 1024),
+            Some(100 * 1024 * 1024),
+        );
+        assert_eq!(known.label, "50% - 50.0 MB / 100.0 MB");
+        assert_eq!(known.fraction, Some(0.5));
+
+        let clamped = PioneerDesktop::voice_input_download_presentation(Some(120), Some(100));
+        assert_eq!(clamped.fraction, Some(1.0));
+        assert!(clamped.label.starts_with("100%"));
+
+        let unknown = PioneerDesktop::voice_input_download_presentation(Some(2048), None);
+        assert_eq!(unknown.label, "2.0 KB downloaded - size unknown");
+        assert_eq!(unknown.fraction, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_retry_change_controls_follow_authoritative_runtime() {
+        let source = production_view_source();
+        let voice_view = source
+            .split("fn render_voice_input_setting")
+            .nth(1)
+            .expect("Voice Input renderer exists")
+            .split("fn voice_input_runtime_phase_label")
+            .next()
+            .expect("Voice Input renderer body exists");
+
+        assert!(
+            voice_view.contains("settings.runtime.phase == GatewayVoiceInputRuntimePhase::Failed")
+        );
+        assert!(voice_view.contains("settings-voice-input-retry"));
+        assert!(voice_view.contains("retry_voice_input_install"));
+        assert!(voice_view.contains("settings-voice-input-change-model"));
+        assert!(voice_view.contains("open_voice_input_model_selector"));
+        assert!(voice_view.contains("settings.runtime.downloaded_bytes"));
+        assert!(voice_view.contains("settings.runtime.total_bytes"));
+        assert!(!voice_view.contains("remove_file"));
+        assert!(!voice_view.contains("remove_dir"));
+        assert!(!voice_view.contains("auto_retry"));
+    }
+
+    #[::core::prelude::v1::test]
     fn settings_memory_view_keeps_memory_toggles_without_legacy_planner_model_selector() {
         let source = production_view_source();
         let memory_view = source
@@ -1587,7 +2181,7 @@ mod tests {
         assert!(!memory_view.contains("settings-memory-active-recall-model"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn settings_locale_keys_cover_preflight_and_memory_model_rows() {
         let en = include_str!("../../../locales/en.toml");
         let ru = include_str!("../../../locales/ru.toml");
@@ -1615,5 +2209,89 @@ mod tests {
             }
             assert!(!source.contains("[settings.memory.active_recall_model]"));
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn settings_voice_input_locales_have_complete_key_parity() {
+        let locales = [
+            ("de", include_str!("../../../locales/de.toml")),
+            ("en", include_str!("../../../locales/en.toml")),
+            ("es", include_str!("../../../locales/es.toml")),
+            ("fr", include_str!("../../../locales/fr.toml")),
+            ("hi", include_str!("../../../locales/hi.toml")),
+            ("jp", include_str!("../../../locales/jp.toml")),
+            ("ru", include_str!("../../../locales/ru.toml")),
+            ("zh", include_str!("../../../locales/zh.toml")),
+        ];
+        let required_keys = [
+            "label",
+            "description",
+            "expand",
+            "collapse",
+            "no_model_selected",
+            "loading_model_details",
+            "model_details_unavailable",
+            "engine_family",
+            "recommended",
+            "change_model",
+            "change_model_tooltip",
+            "retry",
+            "retry_tooltip",
+            "select_dialog_title",
+            "status_disabled",
+            "status_model_not_selected",
+            "status_missing",
+            "status_downloading",
+            "status_installing",
+            "status_loading",
+            "status_ready",
+            "status_failed",
+            "progress_known",
+            "progress_unknown",
+            "progress_unknown_downloaded",
+        ];
+
+        for (locale, source) in locales {
+            let section = source
+                .split("[settings.voice_input]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{locale} is missing settings.voice_input"))
+                .split("\n[")
+                .next()
+                .expect("Voice Input locale section is bounded");
+            for key in required_keys {
+                assert!(
+                    section
+                        .lines()
+                        .any(|line| line.starts_with(&format!("{key} ="))),
+                    "{locale} is missing settings.voice_input.{key}"
+                );
+            }
+            assert!(
+                source.contains("failed_open_settings ="),
+                "{locale} is missing chat.composer.voice.failed_open_settings"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_compact_metadata_and_controls_are_accessible() {
+        let source = production_view_source();
+        let voice_view = source
+            .split("fn render_voice_input_setting")
+            .nth(1)
+            .expect("Voice Input renderer exists")
+            .split("fn voice_input_runtime_phase_label")
+            .next()
+            .expect("Voice Input renderer body exists");
+        assert!(voice_view.contains(".min_w_0()"));
+        assert!(voice_view.contains(".overflow_hidden()"));
+        assert!(voice_view.contains(".text_ellipsis()"));
+        assert!(voice_view.contains(".flex_wrap()"));
+        assert!(voice_view.contains("VOICE_INPUT_PROGRESS_WIDTH_PX"));
+        assert!(voice_view.contains("settings.voice_input.expand"));
+        assert!(voice_view.contains("settings.voice_input.collapse"));
+        assert!(voice_view.contains("settings.voice_input.change_model_tooltip"));
+        assert!(voice_view.contains("settings.voice_input.retry_tooltip"));
     }
 }

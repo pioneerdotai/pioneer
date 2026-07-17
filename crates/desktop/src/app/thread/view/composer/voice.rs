@@ -17,9 +17,12 @@ use crate::{
     gateway::DesktopGatewayWsCommandSenderExt,
 };
 use gpui::{prelude::*, *};
-use gpui_component::{theme::ActiveTheme, *};
+use gpui_component::{button::*, theme::ActiveTheme, *};
 use pioneer_client::{
-    composer::turn_prepare::{self, PrepareVoiceComposerSnapshotRequest},
+    composer::{
+        state_machine::ComposerDomainAction,
+        turn_prepare::{self, PrepareVoiceComposerSnapshotRequest},
+    },
     providers::list as provider_list,
     turns::start as turn_start,
     voice::{VoiceFinalizeUiAction, reduce_voice_session_finalize_response},
@@ -30,6 +33,13 @@ use tracing::warn;
 
 const DESKTOP_VOICE_HOLD_RADIUS: Pixels = px(16.);
 const DESKTOP_VOICE_STATUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DesktopVoiceEntryAvailability {
+    Hidden,
+    Disabled,
+    Ready,
+}
 
 impl PioneerDesktop {
     pub(in crate::app) fn desktop_voice_hold_ui_active(&self) -> bool {
@@ -58,26 +68,6 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn desktop_voice_error_message(&self) -> Option<&str> {
         self.desktop_voice_composer.error_message()
-    }
-
-    pub(in crate::app) fn desktop_voice_status_error_message(&self) -> Option<String> {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            return None;
-        }
-        if matches!(self.desktop_voice_status, VoiceStatus::Ready) {
-            return None;
-        }
-
-        self.desktop_voice_status_error
-            .as_deref()
-            .map(|error| {
-                t!(
-                    "chat.composer.voice.status_error_with_details",
-                    error = error
-                )
-                .to_string()
-            })
-            .or_else(|| Some(desktop_voice_status_message(self.desktop_voice_status)))
     }
 
     pub(in crate::app) fn refresh_desktop_voice_status(&mut self, cx: &mut Context<Self>) {
@@ -163,18 +153,25 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn can_show_desktop_voice_entry(&self, composer_text: &str) -> bool {
-        composer_text.trim().is_empty()
+    pub(super) fn desktop_voice_entry_availability(
+        &self,
+        composer_text: &str,
+    ) -> DesktopVoiceEntryAvailability {
+        let context_available = composer_text.trim().is_empty()
             && !self.desktop_voice_composer.is_active()
             && self.gateway.connection_state == GatewayConnectionState::Connected
-            && matches!(self.desktop_voice_status, VoiceStatus::Ready)
             && self.active_task_thread_navigation().is_none()
             && self.current_active_thread_id().is_some()
             && self.has_complete_composer_model_selection()
             && self
                 .active_thread_conversation()
                 .is_some_and(|conversation| conversation.can_submit_message())
-            && !self.composer_upload_in_progress
+            && !self.composer_upload_in_progress;
+        if !context_available {
+            return DesktopVoiceEntryAvailability::Hidden;
+        }
+
+        desktop_voice_entry_availability_for_status(self.desktop_voice_status)
     }
 
     pub(super) fn start_desktop_voice_hold(
@@ -183,7 +180,9 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.desktop_voice_composer.is_active() {
+        if self.desktop_voice_composer.is_active()
+            || self.desktop_voice_status != VoiceStatus::Ready
+        {
             return;
         }
 
@@ -394,7 +393,7 @@ impl PioneerDesktop {
         let upload_sender = self.gateway.ws_command_sender.clone();
         self.composer_upload_in_progress = true;
         self.composer_upload_error = None;
-        turn_prepare::mark_pending_composer_attachments_uploading(&mut self.composer_attachments);
+        self.reduce_composer_domain(ComposerDomainAction::MarkAttachmentsUploading);
         cx.notify();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -412,9 +411,10 @@ impl PioneerDesktop {
                         let _ = this.update(&mut cx, move |view, cx| {
                             view.composer_upload_in_progress = false;
                             view.composer_upload_error = None;
-                            turn_prepare::apply_uploaded_composer_attachment_artifacts(
-                                &mut view.composer_attachments,
-                                uploaded_artifacts,
+                            view.reduce_composer_domain(
+                                ComposerDomainAction::ApplyUploadedAttachments {
+                                    artifacts: uploaded_artifacts,
+                                },
                             );
                             cx.notify();
                         });
@@ -430,9 +430,12 @@ impl PioneerDesktop {
                                 reduction.composer_upload_in_progress;
                             view.composer_upload_error =
                                 Some(reduction.composer_upload_error.clone());
-                            turn_prepare::mark_uploading_composer_attachments_failed(
-                                &mut view.composer_attachments,
-                                reduction.mark_uploading_attachments_failed_error.as_str(),
+                            view.reduce_composer_domain(
+                                ComposerDomainAction::MarkAttachmentsFailed {
+                                    error: reduction
+                                        .mark_uploading_attachments_failed_error
+                                        .clone(),
+                                },
                             );
                             if matches!(
                                 view.desktop_voice_composer,
@@ -557,6 +560,20 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    pub(super) fn render_desktop_voice_disabled_button(
+        &self,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        Button::new("desktop-voice-disabled-button")
+            .small()
+            .ghost()
+            .rounded_full()
+            .icon(PioneerIconName::Microphone)
+            .disabled(true)
+            .tooltip(desktop_voice_status_message(self.desktop_voice_status))
+            .into_any_element()
+    }
+
     pub(super) fn render_desktop_voice_hold_prompt(&self, _: &mut Context<Self>) -> AnyElement {
         div()
             .id("desktop-voice-hold-prompt")
@@ -601,8 +618,26 @@ fn desktop_voice_status_message(status: VoiceStatus) -> String {
         VoiceStatus::Busy | VoiceStatus::Recording | VoiceStatus::Transcribing => {
             t!("chat.composer.voice.busy").to_string()
         }
-        VoiceStatus::Unavailable => t!("chat.composer.voice.unavailable").to_string(),
-        VoiceStatus::Error => t!("chat.composer.voice.failed").to_string(),
+        VoiceStatus::Disabled | VoiceStatus::Unavailable => {
+            t!("chat.composer.voice.unavailable").to_string()
+        }
+        VoiceStatus::Error => t!("chat.composer.voice.failed_open_settings").to_string(),
+    }
+}
+
+fn desktop_voice_entry_availability_for_status(
+    status: VoiceStatus,
+) -> DesktopVoiceEntryAvailability {
+    match status {
+        VoiceStatus::Disabled => DesktopVoiceEntryAvailability::Hidden,
+        VoiceStatus::Ready => DesktopVoiceEntryAvailability::Ready,
+        VoiceStatus::ModelDownloading
+        | VoiceStatus::ModelLoading
+        | VoiceStatus::Busy
+        | VoiceStatus::Recording
+        | VoiceStatus::Transcribing
+        | VoiceStatus::Unavailable
+        | VoiceStatus::Error => DesktopVoiceEntryAvailability::Disabled,
     }
 }
 
@@ -612,5 +647,77 @@ fn desktop_voice_error_state_from_capture_error(
     DesktopVoiceComposerState::Error {
         kind: error.kind,
         message: error.composer_message().to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_readiness_matches_gateway_status_matrix() {
+        assert_eq!(
+            desktop_voice_entry_availability_for_status(VoiceStatus::Disabled),
+            DesktopVoiceEntryAvailability::Hidden
+        );
+        assert_eq!(
+            desktop_voice_entry_availability_for_status(VoiceStatus::Ready),
+            DesktopVoiceEntryAvailability::Ready
+        );
+        for status in [
+            VoiceStatus::ModelDownloading,
+            VoiceStatus::ModelLoading,
+            VoiceStatus::Busy,
+            VoiceStatus::Recording,
+            VoiceStatus::Transcribing,
+            VoiceStatus::Unavailable,
+            VoiceStatus::Error,
+        ] {
+            assert_eq!(
+                desktop_voice_entry_availability_for_status(status),
+                DesktopVoiceEntryAvailability::Disabled
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_failed_affordance_points_to_settings_without_raw_error() {
+        let message = desktop_voice_status_message(VoiceStatus::Error);
+        assert!(message.contains("Settings > General > Voice Input"));
+        assert!(!message.contains("desktop_voice_status_error"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_ready_path_keeps_capture_and_session_transport_unchanged() {
+        let source = include_str!("voice.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source exists");
+        let start = source
+            .split("pub(super) fn start_desktop_voice_hold")
+            .nth(1)
+            .expect("voice start function exists")
+            .split("pub(super) fn update_desktop_voice_hold_pointer")
+            .next()
+            .expect("voice start function body exists");
+        assert!(start.contains("self.desktop_voice_status != VoiceStatus::Ready"));
+        assert!(start.contains("DesktopVoiceCaptureFlow::new"));
+        assert!(start.contains("flow.start("));
+        assert!(start.contains("VoiceSessionStartContext"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_status_event_converges_without_restart_or_stale_poll_override() {
+        let source = include_str!("../../../flow/ws_events_notifications.rs");
+        let handler = source
+            .split("fn apply_voice_input_status_changed")
+            .nth(1)
+            .expect("Voice Input status handler exists")
+            .split("fn apply_thread_started_reduction")
+            .next()
+            .expect("Voice Input status handler body exists");
+        assert!(handler.contains("settings.runtime.phase.coarse_voice_status()"));
+        assert!(handler.contains("desktop_voice_status_poll_generation.saturating_add(1)"));
+        assert!(handler.contains("current.voice_input = settings"));
     }
 }

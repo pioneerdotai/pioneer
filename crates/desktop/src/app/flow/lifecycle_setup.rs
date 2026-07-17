@@ -36,6 +36,7 @@ impl PioneerDesktop {
         self.providers.clear_for_gateway_switch();
         self.gateway.settings_loading = plan.gateway_settings_loading;
         self.gateway.settings_error = plan.gateway_settings_error;
+        self.voice_input_action_error = None;
         plan.effects
     }
 

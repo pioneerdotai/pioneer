@@ -76,6 +76,21 @@ struct CachedModelRowLayout {
     height_px: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiProviderModelListKind {
+    Chat,
+    Embeddings,
+    Transcription,
+}
+
+fn api_provider_model_list_kind(mode: ProviderModelSelectorMode) -> ApiProviderModelListKind {
+    match mode {
+        ProviderModelSelectorMode::Chat => ApiProviderModelListKind::Chat,
+        ProviderModelSelectorMode::Embeddings => ApiProviderModelListKind::Embeddings,
+        ProviderModelSelectorMode::Transcription => ApiProviderModelListKind::Transcription,
+    }
+}
+
 #[derive(IntoElement)]
 struct SelectorPopoverTrigger {
     id: ElementId,
@@ -340,18 +355,29 @@ impl PioneerDesktop {
                                         response,
                                     )
                                 })
-                        } else if mode == ProviderModelSelectorMode::Embeddings {
-                            ws_sender.provider_list_embedding_models(
-                                provider_list::provider_list_embedding_models_params(
-                                    workspace_id,
-                                    provider_name,
-                                ),
-                            )
                         } else {
-                            ws_sender.provider_list_models(provider_list::provider_list_models_params(
-                                workspace_id,
-                                provider_name,
-                            ))
+                            match api_provider_model_list_kind(mode) {
+                                ApiProviderModelListKind::Chat => ws_sender.provider_list_models(
+                                    provider_list::provider_list_models_params(
+                                        workspace_id,
+                                        provider_name,
+                                    ),
+                                ),
+                                ApiProviderModelListKind::Embeddings => ws_sender
+                                    .provider_list_embedding_models(
+                                        provider_list::provider_list_embedding_models_params(
+                                            workspace_id,
+                                            provider_name,
+                                        ),
+                                    ),
+                                ApiProviderModelListKind::Transcription => ws_sender
+                                    .provider_list_transcription_models(
+                                        provider_list::provider_list_transcription_models_params(
+                                            workspace_id,
+                                            provider_name,
+                                        ),
+                                    ),
+                            }
                         }
                     })
                     .await;
@@ -507,6 +533,9 @@ impl PioneerDesktop {
     fn reasoning_effort_rows(
         state: &ModelSelectorDialogState,
     ) -> Vec<provider_presentation::ReasoningEffortRow> {
+        if state.mode == ProviderModelSelectorMode::Transcription {
+            return Vec::new();
+        }
         let selector = state.selector.borrow();
         let Some(selected_model) = selector.selected_model() else {
             return Vec::new();
@@ -1187,6 +1216,12 @@ impl PioneerDesktop {
         model.id.hash(&mut hasher);
         model.name.hash(&mut hasher);
         model.description.hash(&mut hasher);
+        if let Some(metadata) = model.transcription.as_ref() {
+            metadata.engine.hash(&mut hasher);
+            metadata.download_size_mb.hash(&mut hasher);
+            metadata.supported_languages.hash(&mut hasher);
+            metadata.recommended.hash(&mut hasher);
+        }
         row_width.as_f32().to_bits().hash(&mut hasher);
         hasher.finish()
     }
@@ -1205,6 +1240,9 @@ impl PioneerDesktop {
         let model_id = model.id.clone();
         let display_name = provider_presentation::model_selector_model_display_name(model);
         let secondary_text = provider_presentation::model_selector_model_secondary_text(model);
+        let transcription = (state.mode == ProviderModelSelectorMode::Transcription)
+            .then(|| provider_presentation::transcription_model_selector_presentation(model))
+            .flatten();
         let is_active = state.selector.borrow().selected_model() == Some(model_id.as_str());
         let id: SharedString = format!("model-vl-{ix}").into();
 
@@ -1241,7 +1279,39 @@ impl PioneerDesktop {
                 v_flex()
                     .w_full()
                     .min_w_0()
-                    .child(div().text_sm().whitespace_normal().child(display_name))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .whitespace_normal()
+                                    .child(display_name),
+                            )
+                            .when(
+                                transcription
+                                    .as_ref()
+                                    .is_some_and(|details| details.recommended),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .px_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(foreground.opacity(0.5))
+                                            .text_size(px(10.))
+                                            .font_medium()
+                                            .child(
+                                                t!("settings.voice_input.recommended").to_string(),
+                                            ),
+                                    )
+                                },
+                            ),
+                    )
                     .when_some(secondary_text, |d, secondary_text| {
                         d.child(
                             div()
@@ -1250,6 +1320,19 @@ impl PioneerDesktop {
                                 .line_height(relative(1.3))
                                 .opacity(0.6)
                                 .child(secondary_text),
+                        )
+                    })
+                    .when_some(transcription, |d, details| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .line_height(relative(1.3))
+                                .opacity(0.75)
+                                .child(format!(
+                                    "{} | {} | {}",
+                                    details.engine, details.download_size, details.language_summary
+                                )),
                         )
                     }),
             )
@@ -1265,4 +1348,36 @@ fn render_selector_filter_form(search: &Entity<InputState>) -> AnyElement {
                 .child(Input::new(search).appearance(false).px_2().min_w_0()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn model_selector_transcription_uses_dedicated_transport_kind() {
+        assert_eq!(
+            api_provider_model_list_kind(ProviderModelSelectorMode::Transcription),
+            ApiProviderModelListKind::Transcription
+        );
+        assert_eq!(
+            api_provider_model_list_kind(ProviderModelSelectorMode::Chat),
+            ApiProviderModelListKind::Chat
+        );
+        assert_eq!(
+            api_provider_model_list_kind(ProviderModelSelectorMode::Embeddings),
+            ApiProviderModelListKind::Embeddings
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_selector_transcription_recommended_badge_is_localized() {
+        let source = include_str!("model_selector.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source exists");
+
+        assert!(source.contains("settings.voice_input.recommended"));
+        assert!(!source.contains(".child(\"Recommended\")"));
+    }
 }

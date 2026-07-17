@@ -48,6 +48,7 @@ impl PioneerDesktop {
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
             self.desktop_voice_status_error = None;
+            self.voice_input_action_error = None;
         }
 
         if let Some(cx) = cx.as_deref_mut() {

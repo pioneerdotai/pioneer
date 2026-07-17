@@ -1,22 +1,33 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
+#[cfg(test)]
+use pioneer_client::composer::capabilities::composer_capability_target_for_provider as shared_composer_capability_target_for_provider;
 use pioneer_client::composer::capabilities::{
-    ComposerCapabilityTarget,
-    composer_capability_target_for_provider as shared_composer_capability_target_for_provider,
-    filter_composer_capabilities_for_target,
+    ComposerCapabilityTarget, ComposerSubmissionPlan, plan_composer_submission,
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
 use pioneer_client::threads::tree as thread_tree;
 use pioneer_client::workspaces::selectors as workspace_selectors;
+#[cfg(test)]
 use pioneer_protocol::RuntimeSummary;
 
+#[cfg(test)]
 pub(crate) fn composer_capability_target_for_provider(
     provider: Option<&str>,
     runtimes: &[RuntimeSummary],
 ) -> ComposerCapabilityTarget {
     shared_composer_capability_target_for_provider(provider, runtimes)
+}
+
+pub(crate) fn composer_submission_plan_for_provider(
+    provider: Option<&str>,
+    text: &str,
+    has_attachments: bool,
+    capabilities: &[ComposerCapability],
+) -> ComposerSubmissionPlan {
+    plan_composer_submission(provider, text, has_attachments, capabilities)
 }
 
 impl PioneerDesktop {
@@ -130,16 +141,23 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn composer_capability_target(&self) -> ComposerCapabilityTarget {
-        composer_capability_target_for_provider(
-            self.composer_selected_provider.as_deref(),
-            self.providers.cli_runtimes(),
-        )
+        self.composer_capability_target
     }
 
     pub(in crate::app) fn effective_composer_capabilities(&self) -> Vec<ComposerCapability> {
-        filter_composer_capabilities_for_target(
+        self.composer_submission_plan("", false).capabilities
+    }
+
+    pub(in crate::app) fn composer_submission_plan(
+        &self,
+        text: &str,
+        has_attachments: bool,
+    ) -> ComposerSubmissionPlan {
+        composer_submission_plan_for_provider(
+            self.composer_selected_provider.as_deref(),
+            text,
+            has_attachments,
             self.composer_capabilities.as_slice(),
-            self.composer_capability_target(),
         )
     }
 

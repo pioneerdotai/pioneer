@@ -8,7 +8,9 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::composer::model_selection as composer_model_selection;
+use pioneer_client::composer::{
+    model_selection as composer_model_selection, state_machine::ComposerDomainAction,
+};
 use pioneer_protocol::ThreadMode;
 
 impl PioneerDesktop {
@@ -94,10 +96,12 @@ impl PioneerDesktop {
                         })
                         .on_click(move |_, window, cx| {
                             let _ = desktop_entity.update(cx, |view, cx| {
-                                if composer_model_selection::set_composer_turn_mode(
-                                    &mut view.composer_turn_mode,
-                                    mode,
-                                ) {
+                                if view
+                                    .reduce_composer_domain(ComposerDomainAction::SetModeFromUser {
+                                        mode,
+                                    })
+                                    .changed
+                                {
                                     cx.notify();
                                 }
                             });
