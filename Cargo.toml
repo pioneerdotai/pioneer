@@ -133,7 +133,7 @@ names = { version = "0.14", default-features = false }
 pretty_assertions = "1"
 keepawake = "0.6"
 cpal = "0.18"
-transcribe-rs = { version = "0.3.11", features = ["onnx"] }
+transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
 memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.2", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
