@@ -42,7 +42,6 @@ pub(super) enum DesktopVoiceEntryAvailability {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DesktopVoiceEntryContext {
-    composer_payload_empty: bool,
     voice_composer_idle: bool,
     gateway_connected: bool,
     task_thread_unlocked: bool,
@@ -54,8 +53,7 @@ struct DesktopVoiceEntryContext {
 
 impl DesktopVoiceEntryContext {
     fn allows_voice(self) -> bool {
-        self.composer_payload_empty
-            && self.voice_composer_idle
+        self.voice_composer_idle
             && self.gateway_connected
             && self.task_thread_unlocked
             && self.active_thread
@@ -177,10 +175,7 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn desktop_voice_entry_availability(
-        &self,
-        composer_payload_empty: bool,
-    ) -> DesktopVoiceEntryAvailability {
+    pub(super) fn desktop_voice_entry_availability(&self) -> DesktopVoiceEntryAvailability {
         let voice_input_enabled = effective_voice_input_enabled(
             self.pending_voice_input_enabled,
             self.gateway
@@ -190,7 +185,6 @@ impl PioneerDesktop {
         );
         desktop_voice_entry_availability_for_context(
             DesktopVoiceEntryContext {
-                composer_payload_empty,
                 voice_composer_idle: !self.desktop_voice_composer.is_active(),
                 gateway_connected: self.gateway.connection_state
                     == GatewayConnectionState::Connected,
@@ -669,7 +663,6 @@ mod tests {
     use super::*;
 
     const READY_CONTEXT: DesktopVoiceEntryContext = DesktopVoiceEntryContext {
-        composer_payload_empty: true,
         voice_composer_idle: true,
         gateway_connected: true,
         task_thread_unlocked: true,
@@ -700,10 +693,6 @@ mod tests {
     #[::core::prelude::v1::test]
     fn composer_voice_is_hidden_for_every_blocked_context() {
         let blocked_contexts = [
-            DesktopVoiceEntryContext {
-                composer_payload_empty: false,
-                ..READY_CONTEXT
-            },
             DesktopVoiceEntryContext {
                 voice_composer_idle: false,
                 ..READY_CONTEXT

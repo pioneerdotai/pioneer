@@ -24,21 +24,53 @@ enum DesktopComposerPrimaryAction {
     VoiceReady,
 }
 
-fn resolve_desktop_composer_primary_action(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopComposerPrimaryActionState {
+    action: DesktopComposerPrimaryAction,
+    disabled: bool,
+    loading: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DesktopComposerPrimaryActionInput {
     voice_hold_ui_active: bool,
     has_in_flight_turn: bool,
+    composer_text_empty: bool,
     voice_entry_availability: DesktopVoiceEntryAvailability,
-) -> DesktopComposerPrimaryAction {
-    if voice_hold_ui_active {
-        return DesktopComposerPrimaryAction::VoiceReady;
-    }
-    if has_in_flight_turn {
-        return DesktopComposerPrimaryAction::Stop;
-    }
+    can_send: bool,
+    can_stop: bool,
+    is_cancelling: bool,
+    upload_in_progress: bool,
+    voice_send_processing: bool,
+}
 
-    match voice_entry_availability {
-        DesktopVoiceEntryAvailability::Hidden => DesktopComposerPrimaryAction::Send,
-        DesktopVoiceEntryAvailability::Ready => DesktopComposerPrimaryAction::VoiceReady,
+fn resolve_desktop_composer_primary_action(
+    input: DesktopComposerPrimaryActionInput,
+) -> DesktopComposerPrimaryActionState {
+    let action = if input.voice_hold_ui_active {
+        DesktopComposerPrimaryAction::VoiceReady
+    } else if input.has_in_flight_turn {
+        DesktopComposerPrimaryAction::Stop
+    } else if input.composer_text_empty
+        && input.voice_entry_availability == DesktopVoiceEntryAvailability::Ready
+    {
+        DesktopComposerPrimaryAction::VoiceReady
+    } else {
+        DesktopComposerPrimaryAction::Send
+    };
+    let disabled = match action {
+        DesktopComposerPrimaryAction::VoiceReady => false,
+        DesktopComposerPrimaryAction::Stop => !input.can_stop,
+        DesktopComposerPrimaryAction::Send => !input.voice_send_processing && !input.can_send,
+    };
+    let loading = input.upload_in_progress
+        || (input.has_in_flight_turn && input.is_cancelling)
+        || input.voice_send_processing;
+
+    DesktopComposerPrimaryActionState {
+        action,
+        disabled,
+        loading,
     }
 }
 
@@ -87,35 +119,32 @@ impl PioneerDesktop {
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
         let desktop_voice_send_processing = self.desktop_voice_send_processing();
-        let composer_payload_empty =
-            composer_text.is_empty() && attachments.is_empty() && capabilities.is_empty();
         let voice_entry_availability = if has_in_flight_turn {
             DesktopVoiceEntryAvailability::Hidden
         } else {
-            self.desktop_voice_entry_availability(composer_payload_empty)
+            self.desktop_voice_entry_availability()
         };
-        let composer_primary_action = resolve_desktop_composer_primary_action(
-            desktop_voice_hold_ui_active,
-            has_in_flight_turn,
-            voice_entry_availability,
-        );
-        let composer_action_loading = self.composer_upload_in_progress
-            || (has_in_flight_turn && is_cancelling)
-            || desktop_voice_send_processing;
+        let composer_primary_action =
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                voice_hold_ui_active: desktop_voice_hold_ui_active,
+                has_in_flight_turn,
+                composer_text_empty: composer_text.is_empty(),
+                voice_entry_availability,
+                can_send,
+                can_stop,
+                is_cancelling,
+                upload_in_progress: self.composer_upload_in_progress,
+                voice_send_processing: desktop_voice_send_processing,
+            });
+        let composer_action_loading = composer_primary_action.loading;
+        let composer_action_disabled = composer_primary_action.disabled;
+        let composer_primary_action = composer_primary_action.action;
 
         let composer_action_is_stop = composer_primary_action == DesktopComposerPrimaryAction::Stop;
         let composer_action_id = if composer_action_is_stop {
             "stop-turn"
         } else {
             "send-message"
-        };
-
-        let composer_action_disabled = if desktop_voice_send_processing {
-            false
-        } else if composer_action_is_stop {
-            !can_stop
-        } else {
-            !can_send
         };
 
         h_flex()
@@ -638,6 +667,18 @@ enum ComposerChipRow {
 mod tests {
     use super::*;
 
+    const READY_INPUT: DesktopComposerPrimaryActionInput = DesktopComposerPrimaryActionInput {
+        voice_hold_ui_active: false,
+        has_in_flight_turn: false,
+        composer_text_empty: true,
+        voice_entry_availability: DesktopVoiceEntryAvailability::Ready,
+        can_send: false,
+        can_stop: true,
+        is_cancelling: false,
+        upload_in_progress: false,
+        voice_send_processing: false,
+    };
+
     const VOICE_AVAILABILITIES: [DesktopVoiceEntryAvailability; 2] = [
         DesktopVoiceEntryAvailability::Hidden,
         DesktopVoiceEntryAvailability::Ready,
@@ -647,34 +688,124 @@ mod tests {
     fn desktop_composer_primary_action_priority_matrix_is_complete() {
         for availability in VOICE_AVAILABILITIES {
             assert_eq!(
-                resolve_desktop_composer_primary_action(true, false, availability),
-                DesktopComposerPrimaryAction::VoiceReady
+                resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                    voice_hold_ui_active: true,
+                    voice_entry_availability: availability,
+                    ..READY_INPUT
+                })
+                .action,
+                DesktopComposerPrimaryAction::VoiceReady,
             );
             assert_eq!(
-                resolve_desktop_composer_primary_action(true, true, availability),
-                DesktopComposerPrimaryAction::VoiceReady
+                resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                    voice_hold_ui_active: true,
+                    has_in_flight_turn: true,
+                    voice_entry_availability: availability,
+                    ..READY_INPUT
+                })
+                .action,
+                DesktopComposerPrimaryAction::VoiceReady,
             );
             assert_eq!(
-                resolve_desktop_composer_primary_action(false, true, availability),
-                DesktopComposerPrimaryAction::Stop
+                resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                    has_in_flight_turn: true,
+                    voice_entry_availability: availability,
+                    ..READY_INPUT
+                })
+                .action,
+                DesktopComposerPrimaryAction::Stop,
             );
         }
+    }
 
+    #[::core::prelude::v1::test]
+    fn desktop_composer_empty_text_keeps_microphone_with_frozen_non_text_payload() {
+        // can_send=true with empty text represents selected attachments or capabilities.
         assert_eq!(
-            resolve_desktop_composer_primary_action(
-                false,
-                false,
-                DesktopVoiceEntryAvailability::Hidden,
-            ),
-            DesktopComposerPrimaryAction::Send
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                can_send: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::VoiceReady,
+                disabled: false,
+                loading: false,
+            },
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_composer_typed_text_uses_enabled_send() {
+        assert_eq!(
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                composer_text_empty: false,
+                can_send: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Send,
+                disabled: false,
+                loading: false,
+            },
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_composer_voice_fallback_uses_normal_send_availability() {
+        for (can_send, disabled) in [(false, true), (true, false)] {
+            assert_eq!(
+                resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                    voice_entry_availability: DesktopVoiceEntryAvailability::Hidden,
+                    can_send,
+                    ..READY_INPUT
+                }),
+                DesktopComposerPrimaryActionState {
+                    action: DesktopComposerPrimaryAction::Send,
+                    disabled,
+                    loading: false,
+                },
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_composer_stop_and_processing_states_keep_their_existing_behavior() {
+        assert_eq!(
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                has_in_flight_turn: true,
+                can_stop: false,
+                is_cancelling: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Stop,
+                disabled: true,
+                loading: true,
+            },
         );
         assert_eq!(
-            resolve_desktop_composer_primary_action(
-                false,
-                false,
-                DesktopVoiceEntryAvailability::Ready,
-            ),
-            DesktopComposerPrimaryAction::VoiceReady
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                voice_entry_availability: DesktopVoiceEntryAvailability::Hidden,
+                voice_send_processing: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Send,
+                disabled: false,
+                loading: true,
+            },
+        );
+        assert_eq!(
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                voice_entry_availability: DesktopVoiceEntryAvailability::Hidden,
+                upload_in_progress: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Send,
+                disabled: true,
+                loading: true,
+            },
         );
     }
 }
