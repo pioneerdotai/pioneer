@@ -2341,7 +2341,7 @@ impl MessageProcessor {
             reason: error_message.clone(),
             base_backoff_secs: 2,
             max_attempts: 3,
-            max_wall_clock_secs: 180,
+            max_wall_clock_secs: crate::resilience::TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
             no_progress_limit: 3,
             metadata: pioneer_protocol::ToolMetadata::from_json(serde_json::json!({
                 "thread_id": thread_id,

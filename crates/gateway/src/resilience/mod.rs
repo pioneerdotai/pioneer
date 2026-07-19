@@ -4,7 +4,7 @@ mod timeout;
 pub use recovery::{
     CliRuntimeRecoveryAttemptRequest, ProviderFailureCandidate, RecoveryCoordinator,
     RecoveryCoordinatorEvent, RecoveryPolicyRegistry, RecoveryTerminalOutcome,
-    RuntimeFailureCandidate,
+    RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
 };
 pub use timeout::{
     TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS, TimeoutPolicyRegistry,

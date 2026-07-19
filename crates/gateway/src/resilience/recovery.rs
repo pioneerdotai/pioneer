@@ -28,6 +28,8 @@ const RECOVERY_JOB_CLAIM_LEASE_SECS: u64 = 45;
 const ACTIVE_RECOVERY_RECHECK_SECS: i64 = 2;
 const RECOVERY_ATTEMPT_ID_LEN: usize = 21;
 const STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT: u32 = 2;
+pub const TURN_RECOVERY_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
+const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 3 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryPolicy {
@@ -192,7 +194,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 3,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 180,
+                max_wall_clock_secs: TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
                 no_progress_limit: 3,
             },
         );
@@ -202,7 +204,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 4,
                 base_backoff_secs: 3,
-                max_wall_clock_secs: 300,
+                max_wall_clock_secs: TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
                 no_progress_limit: 4,
             },
         );
@@ -212,7 +214,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 3,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 180,
+                max_wall_clock_secs: TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
                 no_progress_limit: 3,
             },
         );
@@ -1524,17 +1526,31 @@ impl RecoveryCoordinator {
                 continue;
             };
             let wall_clock_elapsed = now_unix.saturating_sub(job.scheduled_at_unix);
-            if wall_clock_elapsed <= max_wall_clock_secs {
-                continue;
-            }
-
             let active_elapsed = job
                 .active_attempt_started_at_unix
                 .map(|started_at| now_unix.saturating_sub(started_at))
                 .unwrap_or_else(|| now_unix.saturating_sub(job.updated_at_unix));
-            let message = Some(format!(
-                "active recovery attempt exceeded wall-clock budget after {wall_clock_elapsed}s (active for {active_elapsed}s)"
-            ));
+            let attempt_wall_clock_secs = i64::try_from(
+                policy
+                    .max_wall_clock_secs
+                    .min(RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS),
+            )
+            .unwrap_or(i64::MAX);
+            let job_budget_exceeded = wall_clock_elapsed > max_wall_clock_secs;
+            let attempt_budget_exceeded = active_elapsed > attempt_wall_clock_secs;
+            if !job_budget_exceeded && !attempt_budget_exceeded {
+                continue;
+            }
+
+            let message = Some(if job_budget_exceeded {
+                format!(
+                    "recovery job exceeded {max_wall_clock_secs}s wall-clock budget after {wall_clock_elapsed}s (active attempt ran for {active_elapsed}s)"
+                )
+            } else {
+                format!(
+                    "recovery attempt exceeded {attempt_wall_clock_secs}s wall-clock budget after {active_elapsed}s"
+                )
+            });
 
             if let Some(active_attempt_id) = job.active_attempt_id.clone() {
                 events.extend(
@@ -2881,6 +2897,7 @@ mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
         RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RuntimeFailureCandidate,
+        TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -2934,6 +2951,24 @@ mod tests {
         let policy = registry.policy_for_item_type(TurnItemType::CommandExecution);
 
         assert_eq!(policy.max_wall_clock_secs, 900);
+    }
+
+    #[test]
+    fn recoverable_provider_failures_use_fifteen_minute_job_budget() {
+        let registry = RecoveryPolicyRegistry::default();
+
+        for class in [
+            ProviderFailureClass::NetworkTransient,
+            ProviderFailureClass::RateLimit,
+            ProviderFailureClass::Provider5xx,
+        ] {
+            assert_eq!(
+                registry
+                    .policy_for_provider_failure(class)
+                    .max_wall_clock_secs,
+                TURN_RECOVERY_MAX_WALL_CLOCK_SECS
+            );
+        }
     }
 
     fn test_tool_loop_config() -> ToolLoopConfig {
@@ -4984,7 +5019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_recovery_watchdog_exhausts_stale_attempt_after_wall_clock_budget() {
+    async fn active_recovery_watchdog_retries_stale_attempt_before_job_budget_expires() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_active_recovery_watchdog";
         let job = coordinator
@@ -5003,21 +5038,21 @@ mod tests {
         let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
 
         let events = coordinator
-            .run_ready_jobs(1_700_000_181, 64)
+            .run_ready_jobs(1_700_000_182, 64)
             .await
-            .expect("active watchdog should expire stale recovery");
+            .expect("active watchdog should expire the stale attempt");
 
         assert!(matches!(
             events.as_slice(),
-            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
-                if outcome.job_id == job.id && outcome.status == RecoveryJobStatus::Exhausted
+            [RecoveryCoordinatorEvent::RetryScheduled { job_id, attempt_number: 2, .. }]
+                if job_id == &job.id
         ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Exhausted);
+        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 1);
         assert!(reloaded.active_attempt_id.is_none());
 
@@ -5034,6 +5069,45 @@ mod tests {
             .await
             .expect("late stale provider failure should not error");
         assert!(late_events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_recovery_watchdog_exhausts_job_after_total_wall_clock_budget() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let turn_id = "turn_active_recovery_total_budget";
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "reasoning_1".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("initial provider failure should enqueue")
+            .into_job();
+        let _active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_901, 64)
+            .await
+            .expect("active watchdog should expire the recovery job");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+                if outcome.job_id == job.id && outcome.status == RecoveryJobStatus::Exhausted
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.status, RecoveryJobStatus::Exhausted);
+        assert_eq!(reloaded.run_count, 1);
+        assert!(reloaded.active_attempt_id.is_none());
     }
 
     #[tokio::test]
@@ -5077,9 +5151,9 @@ mod tests {
             .expect("duplicate pending job should enqueue for regression setup");
 
         let events = coordinator
-            .run_ready_jobs(1_700_000_181, 64)
+            .run_ready_jobs(1_700_000_901, 64)
             .await
-            .expect("active watchdog should expire stale recovery");
+            .expect("active watchdog should expire the recovery job");
 
         assert!(matches!(
             events.as_slice(),
