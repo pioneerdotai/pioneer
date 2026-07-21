@@ -1768,6 +1768,22 @@ impl MessageProcessor {
                 return;
             }
             let native_thread_id = native_thread.binding.native_thread_id;
+            if matches!(runtime_kind, CLIAgentRuntimeKind::Codex)
+                && let Err(error) = cli_session
+                    .reset_native_thread_goal(native_thread_id.as_str())
+                    .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to reset Codex Goal before turn start: {error:#}"),
+                )
+                .await;
+                send_turn_start_failure!(format!(
+                    "failed to reset Codex Goal before turn start: {error:#}"
+                ));
+                return;
+            }
             let native_turn_start_params =
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
                     native_thread_id: native_thread_id.clone(),
@@ -2072,6 +2088,13 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if turn_binding.runtime_kind == "codex" {
+            self.bind_buffered_codex_root_execution_segments(
+                &session_instance,
+                native_thread_id.as_str(),
+            )
+            .await;
+        }
         self.flush_cli_runtime_events_for_native_turn(
             &session_instance,
             native_thread_id.as_str(),
@@ -2368,6 +2391,12 @@ impl MessageProcessor {
                 binding.native_thread_id
             );
         }
+        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+            cli_session
+                .reset_native_thread_goal(binding.native_thread_id.as_str())
+                .await
+                .context("failed to reset Codex Goal before recovery")?;
+        }
 
         let prepared_at = chrono::Utc::now().fixed_offset();
         let (prepared_binding, attempt) = self
@@ -2466,6 +2495,13 @@ impl MessageProcessor {
             )
             .await;
             return Err(error);
+        }
+        if prepared_binding.runtime_kind == "codex" {
+            self.bind_buffered_codex_root_execution_segments(
+                session_handle.instance(),
+                prepared_binding.native_thread_id.as_str(),
+            )
+            .await;
         }
         self.flush_cli_runtime_events_for_native_turn(
             session_handle.instance(),

@@ -112,6 +112,8 @@ pub(crate) fn project_cli_runtime_event(
         RuntimeEvent::ThreadStateChanged(thread) => project_thread_state_changed(context, thread),
         RuntimeEvent::Raw(raw) => project_raw_event(context, raw),
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadGoalUpdated(_)
+        | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::TurnStarted(_)
         | RuntimeEvent::RequestOpened(_)
         | RuntimeEvent::RequestResolved(_)
@@ -1313,6 +1315,8 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed",
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed",
+        RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated",
+        RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared",
         RuntimeEvent::TurnStarted(_) => "turn_started",
         RuntimeEvent::TurnCompleted(_) => "turn_completed",
         RuntimeEvent::TurnFailed(_) => "turn_failed",

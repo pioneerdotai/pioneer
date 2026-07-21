@@ -1466,11 +1466,36 @@ impl MessageProcessor {
             let key = item.key.clone();
             let active_binding = match self
                 .crud_store
-                .get_cli_runtime_turn_binding(key.turn_id.as_str())
+                .resolve_cli_runtime_native_turn_owner(
+                    key.runtime_id.as_str(),
+                    item.native_turn_id(),
+                )
                 .await
             {
-                Ok(Some(binding)) => item.matches_active_turn_binding(&binding),
-                Ok(None) => false,
+                Ok(Some(owner)) => item.matches_active_native_turn_owner(&owner),
+                Ok(None) => match self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(key.turn_id.as_str())
+                    .await
+                {
+                    Ok(Some(binding)) => item.matches_active_turn_binding(&binding),
+                    Ok(None) => false,
+                    Err(error) => {
+                        warn!(
+                            workspace_id = key.workspace_id.as_str(),
+                            runtime_id = key.runtime_id.as_str(),
+                            thread_id = key.thread_id.as_str(),
+                            turn_id = key.turn_id.as_str(),
+                            item_id = key.item_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to validate legacy CLI runtime command heartbeat binding"
+                        );
+                        self.cli_runtime_command_heartbeats
+                            .mark_attempt_failed(&key, now_unix)
+                            .await;
+                        continue;
+                    }
+                },
                 Err(error) => {
                     warn!(
                         workspace_id = key.workspace_id.as_str(),

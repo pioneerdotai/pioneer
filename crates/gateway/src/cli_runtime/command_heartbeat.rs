@@ -3,7 +3,7 @@ use crate::cli_runtime::turn_binding::{
     CLI_RUNTIME_TURN_STATUS_RUNNING, CLI_RUNTIME_TURN_STATUS_STARTING,
 };
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
-use pioneer_crud::CliRuntimeTurnBindingRecord;
+use pioneer_crud::{CliRuntimeNativeTurnOwner, CliRuntimeTurnBindingRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -38,7 +38,8 @@ impl CliRuntimeCommandHeartbeatDueItem {
         &self,
         binding: &CliRuntimeTurnBindingRecord,
     ) -> bool {
-        binding.workspace_id == self.key.workspace_id
+        binding.turn_id == self.key.turn_id
+            && binding.workspace_id == self.key.workspace_id
             && binding.runtime_id == self.key.runtime_id
             && binding.thread_id == self.key.thread_id
             && self
@@ -50,6 +51,34 @@ impl CliRuntimeCommandHeartbeatDueItem {
                 binding.status.as_str(),
                 CLI_RUNTIME_TURN_STATUS_STARTING | CLI_RUNTIME_TURN_STATUS_RUNNING
             )
+    }
+
+    pub(crate) fn matches_active_native_turn_owner(
+        &self,
+        owner: &CliRuntimeNativeTurnOwner,
+    ) -> bool {
+        let binding = &owner.binding;
+        binding.turn_id == self.key.turn_id
+            && owner.attempt.turn_id == self.key.turn_id
+            && binding.workspace_id == self.key.workspace_id
+            && binding.runtime_id == self.key.runtime_id
+            && binding.thread_id == self.key.thread_id
+            && self
+                .native_thread_id
+                .as_deref()
+                .is_none_or(|native_thread_id| binding.native_thread_id == native_thread_id)
+            && owner.attempt.status.is_active()
+            && owner.segment.as_ref().is_none_or(|segment| {
+                segment.status == pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+            })
+            && matches!(
+                binding.status.as_str(),
+                CLI_RUNTIME_TURN_STATUS_STARTING | CLI_RUNTIME_TURN_STATUS_RUNNING
+            )
+    }
+
+    pub(crate) fn native_turn_id(&self) -> &str {
+        self.native_turn_id.as_str()
     }
 }
 
@@ -268,6 +297,9 @@ mod tests {
             runtime_kind: "codex".to_owned(),
             native_thread_id: "native-thread".to_owned(),
             native_turn_id: Some("native-turn".to_owned()),
+            native_goal_status: None,
+            native_goal_turn_id: None,
+            native_goal_observed_at: None,
             request_id: None,
             status: status.to_owned(),
             model: None,

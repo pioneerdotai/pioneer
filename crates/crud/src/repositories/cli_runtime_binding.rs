@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use pioneer_entity::{
     cli_runtime_native_event, cli_runtime_pending_request, thread_cli_runtime_binding,
-    turn_cli_runtime_attempt, turn_cli_runtime_binding,
+    turn_cli_runtime_attempt, turn_cli_runtime_binding, turn_cli_runtime_execution_segment,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
@@ -164,6 +164,9 @@ pub struct CliRuntimeTurnBindingRecord {
     pub approval_policy: Option<String>,
     pub input_mapping_json: String,
     pub mcp: Option<CliRuntimeTurnMcpMetadata>,
+    pub native_goal_status: Option<String>,
+    pub native_goal_turn_id: Option<String>,
+    pub native_goal_observed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -271,6 +274,82 @@ pub struct NewCliRuntimeTurnAttempt {
     pub status: CliRuntimeTurnAttemptStatus,
     pub failure_reason: Option<String>,
     pub started_at: Option<DateTimeWithTimeZone>,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRuntimeExecutionSegmentStatus {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl CliRuntimeExecutionSegmentStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(anyhow!(
+                "unknown CLI runtime execution segment status `{other}`"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeExecutionSegmentRecord {
+    pub id: String,
+    pub attempt_id: String,
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub runtime_id: String,
+    pub native_thread_id: String,
+    pub native_turn_id: String,
+    pub status: CliRuntimeExecutionSegmentStatus,
+    pub failure_reason: Option<String>,
+    pub started_at: DateTimeWithTimeZone,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeNativeTurnOwner {
+    pub binding: CliRuntimeTurnBindingRecord,
+    pub attempt: CliRuntimeTurnAttemptRecord,
+    pub segment: Option<CliRuntimeExecutionSegmentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCliRuntimeExecutionSegment {
+    pub id: String,
+    pub attempt_id: String,
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub runtime_id: String,
+    pub native_thread_id: String,
+    pub native_turn_id: String,
+    pub status: CliRuntimeExecutionSegmentStatus,
+    pub failure_reason: Option<String>,
+    pub started_at: DateTimeWithTimeZone,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -802,6 +881,58 @@ pub async fn set_turn_mcp_metadata<C: ConnectionTrait>(
     turn_binding_record_from_model(model)
 }
 
+pub async fn set_turn_native_goal_state<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    status: Option<String>,
+    native_goal_turn_id: Option<String>,
+    observed_at: DateTimeWithTimeZone,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    if status
+        .as_deref()
+        .is_some_and(|status| status.trim().is_empty())
+    {
+        return Err(anyhow!("CLI runtime native Goal status cannot be empty"));
+    }
+    let model = turn_cli_runtime_binding::Entity::find_by_id(turn_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn binding for native Goal update")?
+        .context("CLI runtime turn binding is missing for native Goal update")?;
+    let mut active: turn_cli_runtime_binding::ActiveModel = model.into();
+    active.native_goal_status = Set(status);
+    active.native_goal_turn_id = Set(native_goal_turn_id);
+    active.native_goal_observed_at = Set(Some(observed_at));
+    active.updated_at = Set(observed_at);
+    let model = active
+        .update(db)
+        .await
+        .context("failed to update CLI runtime native Goal state")?;
+    turn_binding_record_from_model(model)
+}
+
+pub async fn clear_turn_native_goal_state<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    let model = turn_cli_runtime_binding::Entity::find_by_id(turn_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn binding for native Goal reset")?
+        .context("CLI runtime turn binding is missing for native Goal reset")?;
+    let mut active: turn_cli_runtime_binding::ActiveModel = model.into();
+    active.native_goal_status = Set(None);
+    active.native_goal_turn_id = Set(None);
+    active.native_goal_observed_at = Set(None);
+    active.updated_at = Set(updated_at);
+    let model = active
+        .update(db)
+        .await
+        .context("failed to reset CLI runtime native Goal state")?;
+    turn_binding_record_from_model(model)
+}
+
 pub async fn find_turn_binding_by_request<C: ConnectionTrait>(
     db: &C,
     request_id: &str,
@@ -1005,7 +1136,7 @@ pub async fn mark_turn_attempt_terminal<C: ConnectionTrait>(
         )
         .col_expr(
             turn_cli_runtime_attempt::Column::FailureReason,
-            sea_orm::sea_query::Expr::value(failure_reason),
+            sea_orm::sea_query::Expr::value(failure_reason.clone()),
         )
         .col_expr(
             turn_cli_runtime_attempt::Column::CompletedAt,
@@ -1023,6 +1154,43 @@ pub async fn mark_turn_attempt_terminal<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to mark CLI runtime turn attempt terminal")?;
+    if result.rows_affected == 1 {
+        let segment_status = match status {
+            CliRuntimeTurnAttemptStatus::Completed => CliRuntimeExecutionSegmentStatus::Completed,
+            CliRuntimeTurnAttemptStatus::Failed => CliRuntimeExecutionSegmentStatus::Failed,
+            CliRuntimeTurnAttemptStatus::Interrupted => {
+                CliRuntimeExecutionSegmentStatus::Interrupted
+            }
+            CliRuntimeTurnAttemptStatus::Starting | CliRuntimeTurnAttemptStatus::Running => {
+                unreachable!("active attempt status was rejected above")
+            }
+        };
+        turn_cli_runtime_execution_segment::Entity::update_many()
+            .col_expr(
+                turn_cli_runtime_execution_segment::Column::Status,
+                sea_orm::sea_query::Expr::value(segment_status.as_str()),
+            )
+            .col_expr(
+                turn_cli_runtime_execution_segment::Column::FailureReason,
+                sea_orm::sea_query::Expr::value(failure_reason),
+            )
+            .col_expr(
+                turn_cli_runtime_execution_segment::Column::CompletedAt,
+                sea_orm::sea_query::Expr::value(Some(completed_at)),
+            )
+            .col_expr(
+                turn_cli_runtime_execution_segment::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(completed_at),
+            )
+            .filter(turn_cli_runtime_execution_segment::Column::AttemptId.eq(id.to_owned()))
+            .filter(
+                turn_cli_runtime_execution_segment::Column::Status
+                    .eq(CliRuntimeExecutionSegmentStatus::Running.as_str()),
+            )
+            .exec(db)
+            .await
+            .context("failed to terminalize active CLI runtime execution segments")?;
+    }
     Ok(result.rows_affected == 1)
 }
 
@@ -1049,6 +1217,164 @@ pub async fn mark_turn_attempt_recovery_confirmed<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to mark CLI runtime recovery confirmed")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn create_execution_segment<C: ConnectionTrait>(
+    db: &C,
+    segment: NewCliRuntimeExecutionSegment,
+) -> Result<CliRuntimeExecutionSegmentRecord> {
+    validate_new_execution_segment(&segment)?;
+    let id = segment.id.clone();
+    turn_cli_runtime_execution_segment::Entity::insert(active_execution_segment_from_new(segment))
+        .exec(db)
+        .await
+        .context("failed to insert CLI runtime execution segment")?;
+    find_execution_segment(db, id.as_str())
+        .await?
+        .context("inserted CLI runtime execution segment is missing")
+}
+
+pub async fn find_execution_segment<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+    turn_cli_runtime_execution_segment::Entity::find_by_id(id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime execution segment")?
+        .map(execution_segment_record_from_model)
+        .transpose()
+}
+
+pub async fn find_execution_segment_by_native_turn<C: ConnectionTrait>(
+    db: &C,
+    runtime_id: &str,
+    native_turn_id: &str,
+) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+    turn_cli_runtime_execution_segment::Entity::find()
+        .filter(turn_cli_runtime_execution_segment::Column::RuntimeId.eq(runtime_id.to_owned()))
+        .filter(
+            turn_cli_runtime_execution_segment::Column::NativeTurnId.eq(native_turn_id.to_owned()),
+        )
+        .one(db)
+        .await
+        .context("failed to query CLI runtime execution segment by native turn")?
+        .map(execution_segment_record_from_model)
+        .transpose()
+}
+
+pub async fn latest_execution_segment_for_attempt<C: ConnectionTrait>(
+    db: &C,
+    attempt_id: &str,
+) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+    turn_cli_runtime_execution_segment::Entity::find()
+        .filter(turn_cli_runtime_execution_segment::Column::AttemptId.eq(attempt_id.to_owned()))
+        .order_by_desc(turn_cli_runtime_execution_segment::Column::SegmentIndex)
+        .one(db)
+        .await
+        .context("failed to query latest CLI runtime execution segment")?
+        .map(execution_segment_record_from_model)
+        .transpose()
+}
+
+pub async fn latest_running_execution_segment_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+    turn_cli_runtime_execution_segment::Entity::find()
+        .filter(turn_cli_runtime_execution_segment::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(
+            turn_cli_runtime_execution_segment::Column::Status
+                .eq(CliRuntimeExecutionSegmentStatus::Running.as_str()),
+        )
+        .order_by_desc(turn_cli_runtime_execution_segment::Column::SegmentIndex)
+        .one(db)
+        .await
+        .context("failed to query running CLI runtime execution segment")?
+        .map(execution_segment_record_from_model)
+        .transpose()
+}
+
+pub async fn resolve_native_turn_owner<C: ConnectionTrait>(
+    db: &C,
+    runtime_id: &str,
+    native_turn_id: &str,
+) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+    let (attempt, segment) = if let Some(segment) =
+        find_execution_segment_by_native_turn(db, runtime_id, native_turn_id).await?
+    {
+        let attempt = find_turn_attempt(db, segment.attempt_id.as_str())
+            .await?
+            .context("CLI runtime execution segment owning attempt is missing")?;
+        (attempt, Some(segment))
+    } else if let Some(attempt) =
+        find_turn_attempt_by_native_turn(db, runtime_id, native_turn_id).await?
+    {
+        (attempt, None)
+    } else {
+        return Ok(None);
+    };
+    let binding = find_turn_binding(db, attempt.turn_id.as_str())
+        .await?
+        .context("CLI runtime native turn binding is missing")?;
+    if binding.runtime_id != runtime_id
+        || binding.turn_id != attempt.turn_id
+        || binding.native_thread_id != attempt.native_thread_id
+        || segment.as_ref().is_some_and(|segment| {
+            segment.turn_id != attempt.turn_id
+                || segment.attempt_id != attempt.id
+                || segment.runtime_id != runtime_id
+                || segment.native_thread_id != attempt.native_thread_id
+        })
+    {
+        return Err(anyhow!("CLI runtime native turn owner is inconsistent"));
+    }
+    Ok(Some(CliRuntimeNativeTurnOwner {
+        binding,
+        attempt,
+        segment,
+    }))
+}
+
+pub async fn mark_execution_segment_terminal<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    status: CliRuntimeExecutionSegmentStatus,
+    failure_reason: Option<String>,
+    completed_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    if !status.is_terminal() {
+        return Err(anyhow!(
+            "CLI runtime terminal execution segment status cannot be `{}`",
+            status.as_str()
+        ));
+    }
+    let result = turn_cli_runtime_execution_segment::Entity::update_many()
+        .col_expr(
+            turn_cli_runtime_execution_segment::Column::Status,
+            sea_orm::sea_query::Expr::value(status.as_str()),
+        )
+        .col_expr(
+            turn_cli_runtime_execution_segment::Column::FailureReason,
+            sea_orm::sea_query::Expr::value(failure_reason),
+        )
+        .col_expr(
+            turn_cli_runtime_execution_segment::Column::CompletedAt,
+            sea_orm::sea_query::Expr::value(Some(completed_at)),
+        )
+        .col_expr(
+            turn_cli_runtime_execution_segment::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(completed_at),
+        )
+        .filter(turn_cli_runtime_execution_segment::Column::Id.eq(id.to_owned()))
+        .filter(
+            turn_cli_runtime_execution_segment::Column::Status
+                .eq(CliRuntimeExecutionSegmentStatus::Running.as_str()),
+        )
+        .exec(db)
+        .await
+        .context("failed to mark CLI runtime execution segment terminal")?;
     Ok(result.rows_affected == 1)
 }
 
@@ -1381,6 +1707,26 @@ fn active_turn_attempt_from_new(
     }
 }
 
+fn active_execution_segment_from_new(
+    segment: NewCliRuntimeExecutionSegment,
+) -> turn_cli_runtime_execution_segment::ActiveModel {
+    turn_cli_runtime_execution_segment::ActiveModel {
+        id: Set(segment.id),
+        attempt_id: Set(segment.attempt_id),
+        turn_id: Set(segment.turn_id),
+        segment_index: Set(i64::from(segment.segment_index)),
+        runtime_id: Set(segment.runtime_id),
+        native_thread_id: Set(segment.native_thread_id),
+        native_turn_id: Set(segment.native_turn_id),
+        status: Set(segment.status.as_str().to_owned()),
+        failure_reason: Set(segment.failure_reason),
+        started_at: Set(segment.started_at),
+        completed_at: Set(segment.completed_at),
+        created_at: Set(segment.created_at),
+        updated_at: Set(segment.updated_at),
+    }
+}
+
 fn validate_new_turn_attempt(attempt: &NewCliRuntimeTurnAttempt) -> Result<()> {
     if attempt.attempt_index == 0 {
         return Err(anyhow!("CLI runtime turn attempt index must be positive"));
@@ -1405,6 +1751,37 @@ fn validate_new_turn_attempt(attempt: &NewCliRuntimeTurnAttempt) -> Result<()> {
     if attempt.status == CliRuntimeTurnAttemptStatus::Starting && attempt.native_turn_id.is_some() {
         return Err(anyhow!(
             "starting CLI runtime turn attempt cannot have a native turn id"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_execution_segment(segment: &NewCliRuntimeExecutionSegment) -> Result<()> {
+    for (label, value) in [
+        ("id", segment.id.as_str()),
+        ("attempt_id", segment.attempt_id.as_str()),
+        ("turn_id", segment.turn_id.as_str()),
+        ("runtime_id", segment.runtime_id.as_str()),
+        ("native_thread_id", segment.native_thread_id.as_str()),
+        ("native_turn_id", segment.native_turn_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow!(
+                "CLI runtime execution segment `{label}` cannot be empty"
+            ));
+        }
+    }
+    if segment.segment_index == 0 {
+        return Err(anyhow!(
+            "CLI runtime execution segment index must be positive"
+        ));
+    }
+    if segment.status != CliRuntimeExecutionSegmentStatus::Running
+        || segment.completed_at.is_some()
+        || segment.failure_reason.is_some()
+    {
+        return Err(anyhow!(
+            "new CLI runtime execution segment must be running and non-terminal"
         ));
     }
     Ok(())
@@ -1539,6 +1916,9 @@ fn turn_binding_record_from_model(
         approval_policy: model.approval_policy,
         input_mapping_json: model.input_mapping_json,
         mcp,
+        native_goal_status: model.native_goal_status,
+        native_goal_turn_id: model.native_goal_turn_id,
+        native_goal_observed_at: model.native_goal_observed_at,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
@@ -1565,6 +1945,27 @@ fn turn_attempt_record_from_model(
             .transpose()
             .context("CLI runtime execution window index is outside u32")?,
         status: CliRuntimeTurnAttemptStatus::from_db(model.status.as_str())?,
+        failure_reason: model.failure_reason,
+        started_at: model.started_at,
+        completed_at: model.completed_at,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+    })
+}
+
+fn execution_segment_record_from_model(
+    model: turn_cli_runtime_execution_segment::Model,
+) -> Result<CliRuntimeExecutionSegmentRecord> {
+    Ok(CliRuntimeExecutionSegmentRecord {
+        id: model.id,
+        attempt_id: model.attempt_id,
+        turn_id: model.turn_id,
+        segment_index: u32::try_from(model.segment_index)
+            .context("CLI runtime execution segment index is outside u32 range")?,
+        runtime_id: model.runtime_id,
+        native_thread_id: model.native_thread_id,
+        native_turn_id: model.native_turn_id,
+        status: CliRuntimeExecutionSegmentStatus::from_db(model.status.as_str())?,
         failure_reason: model.failure_reason,
         started_at: model.started_at,
         completed_at: model.completed_at,

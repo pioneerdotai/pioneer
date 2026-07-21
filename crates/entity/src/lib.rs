@@ -64,6 +64,7 @@ pub mod thread_timeline_projection_meta;
 pub mod turn;
 pub mod turn_cli_runtime_attempt;
 pub mod turn_cli_runtime_binding;
+pub mod turn_cli_runtime_execution_segment;
 pub mod turn_cli_runtime_instruction;
 pub mod turn_event;
 pub mod turn_event_projection_state;

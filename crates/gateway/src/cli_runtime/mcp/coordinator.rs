@@ -404,7 +404,7 @@ impl CliMcpCoordinator {
         let native_turn_id = normalize_identity(native_turn_id.into())?;
         let mut state = self.state.lock().await;
         state.grants.validate_bound(bound, now_unix_ms())?;
-        let (projection_generation, process_instance) = {
+        let (projection_generation, process_instance, effective_native_turn_id) = {
             let turn = state
                 .active_turns
                 .get(&bound.grant_id())
@@ -413,7 +413,18 @@ impl CliMcpCoordinator {
             if turn.state != CliMcpActiveTurnState::Preparing {
                 return Err(CliMcpCoordinatorError::InvalidTransition);
             }
-            (turn.projection_generation, turn.process_instance.clone())
+            if turn
+                .native_thread_id
+                .as_deref()
+                .is_some_and(|staged| staged != native_thread_id)
+            {
+                return Err(CliMcpCoordinatorError::InvalidTransition);
+            }
+            (
+                turn.projection_generation,
+                turn.process_instance.clone(),
+                turn.native_turn_id.clone().unwrap_or(native_turn_id),
+            )
         };
         let projection = state
             .projections
@@ -431,7 +442,7 @@ impl CliMcpCoordinator {
             .get_mut(&bound.grant_id())
             .ok_or(CliMcpCoordinatorError::MissingTurn)?;
         turn.native_thread_id = Some(native_thread_id);
-        turn.native_turn_id = Some(native_turn_id);
+        turn.native_turn_id = Some(effective_native_turn_id);
         turn.state = CliMcpActiveTurnState::Active;
         Ok(())
     }
@@ -475,6 +486,46 @@ impl CliMcpCoordinator {
                 .ok_or(CliMcpCoordinatorError::CallsNotActive)?,
             cancellation: turn.cancellation.clone(),
         })
+    }
+
+    pub(crate) async fn retarget_turn(
+        &self,
+        bound: &CliMcpBoundGrant,
+        activation_generation: CliMcpActivationGeneration,
+        native_thread_id: impl Into<String>,
+        native_turn_id: impl Into<String>,
+    ) -> Result<(), CliMcpCoordinatorError> {
+        let native_thread_id = normalize_identity(native_thread_id.into())?;
+        let native_turn_id = normalize_identity(native_turn_id.into())?;
+        let mut state = self.state.lock().await;
+        state.grants.validate_bound(bound, now_unix_ms())?;
+        let turn = state
+            .active_turns
+            .get_mut(&bound.grant_id())
+            .ok_or(CliMcpCoordinatorError::MissingTurn)?;
+        validate_turn_binding(turn, bound, activation_generation)?;
+        match turn.state {
+            CliMcpActiveTurnState::Preparing => {
+                if turn
+                    .native_thread_id
+                    .as_deref()
+                    .is_some_and(|staged| staged != native_thread_id)
+                {
+                    return Err(CliMcpCoordinatorError::InvalidTransition);
+                }
+                turn.native_thread_id = Some(native_thread_id);
+                turn.native_turn_id = Some(native_turn_id);
+            }
+            CliMcpActiveTurnState::Active
+                if turn.native_thread_id.as_deref() == Some(native_thread_id.as_str()) =>
+            {
+                turn.native_turn_id = Some(native_turn_id);
+            }
+            CliMcpActiveTurnState::Active | CliMcpActiveTurnState::Terminal => {
+                return Err(CliMcpCoordinatorError::InvalidTransition);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn terminal_turn(
@@ -757,6 +808,21 @@ mod tests {
             .mark_projection_ready(&bound, projection.generation, &fingerprint)
             .await
             .expect("ready");
+        coordinator
+            .retarget_turn(
+                &bound,
+                turn.activation_generation,
+                "native-thread",
+                "native-turn-staged",
+            )
+            .await
+            .expect("root segment may arrive while MCP activation is still preparing");
+        assert_eq!(
+            coordinator
+                .authorize_call(&bound, turn.activation_generation)
+                .await,
+            Err(CliMcpCoordinatorError::CallsNotActive)
+        );
 
         let (first, second) = tokio::join!(
             coordinator.activate_turn(
@@ -778,7 +844,34 @@ mod tests {
             .await
             .expect("active call");
         assert_eq!(authorization.turn_id, "turn-1");
-        assert_eq!(authorization.native_turn_id, "native-turn");
+        assert_eq!(authorization.native_turn_id, "native-turn-staged");
+
+        coordinator
+            .retarget_turn(
+                &bound,
+                turn.activation_generation,
+                "native-thread",
+                "native-turn-2",
+            )
+            .await
+            .expect("active turn should retarget to the next root segment");
+        let authorization = coordinator
+            .authorize_call(&bound, turn.activation_generation)
+            .await
+            .expect("retargeted call should remain active");
+        assert_eq!(authorization.native_thread_id, "native-thread");
+        assert_eq!(authorization.native_turn_id, "native-turn-2");
+        assert_eq!(
+            coordinator
+                .retarget_turn(
+                    &bound,
+                    turn.activation_generation,
+                    "subagent-thread",
+                    "subagent-turn",
+                )
+                .await,
+            Err(CliMcpCoordinatorError::InvalidTransition)
+        );
 
         coordinator
             .terminal_turn(&bound, turn.activation_generation)

@@ -43,6 +43,10 @@ pub struct Model {
     pub mcp_isolation_contract_fingerprint: Option<String>,
     pub mcp_session_generation: Option<i64>,
     pub mcp_projection_activation_generation: Option<i64>,
+    pub native_goal_status: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_goal_turn_id: Option<String>,
+    pub native_goal_observed_at: Option<DateTimeWithTimeZone>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

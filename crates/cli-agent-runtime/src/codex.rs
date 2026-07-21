@@ -390,6 +390,12 @@ pub enum CodexJsonlRpcClientError {
     },
 }
 
+impl CodexJsonlRpcClientError {
+    pub const fn is_method_not_found(&self) -> bool {
+        matches!(self, Self::Native(error) if error.code == -32601)
+    }
+}
+
 impl fmt::Display for CodexJsonlRpcClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -685,6 +691,53 @@ impl CodexAppServerClient {
             .request_value("turn/start", Some(params), timeout)
             .await?;
         decode_codex_turn_start_response("turn/start", native_thread_id.as_str(), result)
+    }
+
+    pub async fn thread_goal_get(
+        &self,
+        thread_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<CodexThreadGoalSnapshot>, CodexJsonlRpcClientError> {
+        let result = match self
+            .rpc
+            .request_value(
+                "thread/goal/get",
+                Some(json!({ "threadId": thread_id })),
+                timeout,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.is_method_not_found() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        decode_codex_thread_goal_get_response(thread_id, result)
+    }
+
+    pub async fn thread_goal_clear(
+        &self,
+        thread_id: &str,
+        timeout: Duration,
+    ) -> Result<bool, CodexJsonlRpcClientError> {
+        let result = match self
+            .rpc
+            .request_value(
+                "thread/goal/clear",
+                Some(json!({ "threadId": thread_id })),
+                timeout,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.is_method_not_found() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_value::<CodexThreadGoalClearResponse>(result)
+            .map(|response| response.cleared)
+            .map_err(|error| CodexJsonlRpcClientError::Decode {
+                method: "thread/goal/clear".to_owned(),
+                message: error.to_string(),
+            })
     }
 
     pub async fn thread_name_set(
@@ -3204,6 +3257,23 @@ pub struct CodexTurnStartSnapshot {
     pub raw: JsonValue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexThreadGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexThreadGoalSnapshot {
+    pub native_thread_id: String,
+    pub status: CodexThreadGoalStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexThreadNameSetParams {
@@ -3526,6 +3596,25 @@ struct CodexTurnStartTurnResponse {
     id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadGoalGetResponse {
+    #[serde(default)]
+    goal: Option<CodexThreadGoalResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadGoalResponse {
+    thread_id: String,
+    status: CodexThreadGoalStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct CodexThreadGoalClearResponse {
+    cleared: bool,
+}
+
 fn decode_codex_thread_open_response(
     method: &str,
     raw: JsonValue,
@@ -3591,6 +3680,33 @@ fn decode_codex_turn_start_response(
         native_turn_id,
         raw,
     })
+}
+
+fn decode_codex_thread_goal_get_response(
+    requested_thread_id: &str,
+    raw: JsonValue,
+) -> Result<Option<CodexThreadGoalSnapshot>, CodexJsonlRpcClientError> {
+    let response: CodexThreadGoalGetResponse =
+        serde_json::from_value(raw).map_err(|error| CodexJsonlRpcClientError::Decode {
+            method: "thread/goal/get".to_owned(),
+            message: error.to_string(),
+        })?;
+    let Some(goal) = response.goal else {
+        return Ok(None);
+    };
+    if goal.thread_id != requested_thread_id {
+        return Err(CodexJsonlRpcClientError::Decode {
+            method: "thread/goal/get".to_owned(),
+            message: format!(
+                "Codex thread goal belongs to `{}`, expected `{requested_thread_id}`",
+                goal.thread_id
+            ),
+        });
+    }
+    Ok(Some(CodexThreadGoalSnapshot {
+        native_thread_id: goal.thread_id,
+        status: goal.status,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -6746,6 +6862,98 @@ while read line; do :; done
             .expect("turn start should succeed");
         assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
         assert_eq!(snapshot.native_turn_id, "codex-turn-started");
+    }
+
+    #[tokio::test]
+    async fn codex_thread_goal_get_and_clear_use_typed_contract() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let get = tokio::spawn(async move {
+            client
+                .thread_goal_get("codex-thread-existing", Duration::from_secs(2))
+                .await
+        });
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("thread/goal/get"));
+        assert_eq!(
+            request["params"],
+            json!({"threadId": "codex-thread-existing"})
+        );
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({
+                "goal": {
+                    "threadId": "codex-thread-existing",
+                    "status": "usageLimited",
+                    "objective": "Finish",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "timeUsedSeconds": 3,
+                    "tokensUsed": 4
+                }
+            }),
+        )
+        .await;
+        let goal = get
+            .await
+            .expect("Goal get task should join")
+            .expect("Goal get should succeed")
+            .expect("Goal should be present");
+        assert_eq!(goal.native_thread_id, "codex-thread-existing");
+        assert_eq!(goal.status, CodexThreadGoalStatus::UsageLimited);
+
+        let client = fake.client.clone();
+        let clear = tokio::spawn(async move {
+            client
+                .thread_goal_clear("codex-thread-existing", Duration::from_secs(2))
+                .await
+        });
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("thread/goal/clear"));
+        fake.write_result_response(request["id"].clone(), json!({"cleared": true}))
+            .await;
+        assert!(
+            clear
+                .await
+                .expect("Goal clear task should join")
+                .expect("Goal clear should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_thread_goal_methods_are_backward_compatible() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let get = tokio::spawn(async move {
+            client
+                .thread_goal_get("legacy-thread", Duration::from_secs(2))
+                .await
+        });
+        let request = fake.read_message().await;
+        fake.write_error_response(request["id"].clone(), -32601, "method not found")
+            .await;
+        assert_eq!(
+            get.await
+                .expect("legacy Goal get task should join")
+                .expect("method-not-found should be a supported fallback"),
+            None
+        );
+
+        let client = fake.client.clone();
+        let clear = tokio::spawn(async move {
+            client
+                .thread_goal_clear("legacy-thread", Duration::from_secs(2))
+                .await
+        });
+        let request = fake.read_message().await;
+        fake.write_error_response(request["id"].clone(), -32601, "method not found")
+            .await;
+        assert!(
+            !clear
+                .await
+                .expect("legacy Goal clear task should join")
+                .expect("method-not-found should be a supported fallback")
+        );
     }
 
     #[tokio::test]

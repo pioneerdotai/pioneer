@@ -329,16 +329,17 @@ pub use crate::repositories::artifact::{
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
 pub use crate::repositories::cli_runtime_binding::{
-    CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord,
+    CliRuntimeExecutionSegmentRecord, CliRuntimeExecutionSegmentStatus,
+    CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord, CliRuntimeNativeTurnOwner,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
     CliRuntimePendingRequestStatus, CliRuntimeProviderSessionBinding,
     CliRuntimeProviderSessionLifecycle, CliRuntimeThreadBindingRecord, CliRuntimeThreadMcpMetadata,
     CliRuntimeTurnAttemptRecord, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
-    CliRuntimeTurnBindingRecord, CliRuntimeTurnMcpMetadata, NewCliRuntimeNativeEvent,
-    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-    PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
-    PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
-    deserialize_cli_runtime_json, serialize_cli_runtime_json,
+    CliRuntimeTurnBindingRecord, CliRuntimeTurnMcpMetadata, NewCliRuntimeExecutionSegment,
+    NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+    NewCliRuntimeTurnBinding, PrepareClaudeProviderSessionBinding,
+    PreparedClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
+    ResolveCliRuntimePendingRequest, deserialize_cli_runtime_json, serialize_cli_runtime_json,
 };
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
@@ -1130,6 +1131,27 @@ impl CrudStore {
         .await
     }
 
+    pub async fn set_cli_runtime_turn_native_goal_state(
+        &self,
+        turn_id: &str,
+        status: Option<String>,
+        native_goal_turn_id: Option<String>,
+        observed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<CliRuntimeTurnBindingRecord> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::set_turn_native_goal_state(
+                &self.connection,
+                turn_id.as_str(),
+                status.clone(),
+                native_goal_turn_id.clone(),
+                observed_at,
+            )
+            .await
+        })
+        .await
+    }
+
     /// Atomically binds the runtime turn metadata and the same activation
     /// generation to every tool in the already-frozen MCP projection.
     pub async fn bind_cli_runtime_turn_mcp_activation(
@@ -1259,6 +1281,225 @@ impl CrudStore {
         cli_runtime_binding::latest_turn_attempt(&self.connection, turn_id).await
     }
 
+    pub async fn get_cli_runtime_execution_segment_by_native_turn(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+        cli_runtime_binding::find_execution_segment_by_native_turn(
+            &self.connection,
+            runtime_id,
+            native_turn_id,
+        )
+        .await
+    }
+
+    pub async fn resolve_cli_runtime_native_turn_owner(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+        cli_runtime_binding::resolve_native_turn_owner(&self.connection, runtime_id, native_turn_id)
+            .await
+    }
+
+    pub async fn latest_cli_runtime_execution_segment_for_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+        cli_runtime_binding::latest_execution_segment_for_attempt(&self.connection, attempt_id)
+            .await
+    }
+
+    pub async fn latest_running_cli_runtime_execution_segment_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeExecutionSegmentRecord>> {
+        cli_runtime_binding::latest_running_execution_segment_for_turn(&self.connection, turn_id)
+            .await
+    }
+
+    pub async fn register_cli_runtime_execution_segment(
+        &self,
+        turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        started_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<(
+        CliRuntimeTurnBindingRecord,
+        CliRuntimeTurnAttemptRecord,
+        CliRuntimeExecutionSegmentRecord,
+    )> {
+        let turn_id = turn_id.to_owned();
+        let native_thread_id = native_thread_id.to_owned();
+        let native_turn_id = native_turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime execution segment transaction")?;
+            let binding = cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str())
+                .await?
+                .context("CLI runtime turn binding is missing for execution segment")?;
+            if binding.status != "running" || binding.native_thread_id != native_thread_id {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn binding cannot accept this execution segment");
+            }
+            let attempt = cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str())
+                .await?
+                .context("CLI runtime turn has no attempt for execution segment")?;
+            if !attempt.status.is_active()
+                || attempt.runtime_id != binding.runtime_id
+                || attempt.native_thread_id != native_thread_id
+            {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime execution segment has no active owning attempt");
+            }
+
+            if let Some(existing) = cli_runtime_binding::find_execution_segment_by_native_turn(
+                &transaction,
+                binding.runtime_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await?
+            {
+                if existing.attempt_id != attempt.id
+                    || existing.turn_id != binding.turn_id
+                    || existing.native_thread_id != native_thread_id
+                {
+                    transaction.rollback().await.ok();
+                    bail!("native CLI runtime execution segment already has a different owner");
+                }
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit idempotent execution segment transaction")?;
+                return Ok((binding, attempt, existing));
+            }
+
+            let segment_index = match cli_runtime_binding::latest_execution_segment_for_attempt(
+                &transaction,
+                attempt.id.as_str(),
+            )
+            .await?
+            {
+                Some(previous) => {
+                    if previous.status == CliRuntimeExecutionSegmentStatus::Running {
+                        transaction.rollback().await.ok();
+                        bail!(
+                            "CLI runtime attempt already has active execution segment `{}`",
+                            previous.native_turn_id
+                        );
+                    }
+                    previous
+                        .segment_index
+                        .checked_add(1)
+                        .context("CLI runtime execution segment index overflow")?
+                }
+                None => 1,
+            };
+            let segment = cli_runtime_binding::create_execution_segment(
+                &transaction,
+                NewCliRuntimeExecutionSegment {
+                    id: pioneer_protocol::generate_id(DB_ID_LEN),
+                    attempt_id: attempt.id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    segment_index,
+                    runtime_id: binding.runtime_id.clone(),
+                    native_thread_id: native_thread_id.clone(),
+                    native_turn_id: native_turn_id.clone(),
+                    status: CliRuntimeExecutionSegmentStatus::Running,
+                    failure_reason: None,
+                    started_at,
+                    completed_at: None,
+                    created_at: started_at,
+                    updated_at: started_at,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime execution segment transaction")?;
+            Ok((binding, attempt, segment))
+        })
+        .await
+    }
+
+    pub async fn terminalize_cli_runtime_execution_segment(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+        status: CliRuntimeExecutionSegmentStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<
+        Option<(
+            CliRuntimeTurnBindingRecord,
+            CliRuntimeTurnAttemptRecord,
+            CliRuntimeExecutionSegmentRecord,
+        )>,
+    > {
+        let runtime_id = runtime_id.to_owned();
+        let native_turn_id = native_turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction =
+                self.connection.begin().await.context(
+                    "failed to begin CLI runtime execution segment terminal transaction",
+                )?;
+            let Some(segment) = cli_runtime_binding::find_execution_segment_by_native_turn(
+                &transaction,
+                runtime_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await?
+            else {
+                transaction.rollback().await.ok();
+                return Ok(None);
+            };
+            let binding =
+                cli_runtime_binding::find_turn_binding(&transaction, segment.turn_id.as_str())
+                    .await?
+                    .context("execution segment turn binding is missing")?;
+            let attempt =
+                cli_runtime_binding::find_turn_attempt(&transaction, segment.attempt_id.as_str())
+                    .await?
+                    .context("execution segment owning attempt is missing")?;
+            if attempt.id != segment.attempt_id || !attempt.status.is_active() {
+                transaction.rollback().await.ok();
+                bail!("execution segment does not belong to the active CLI runtime attempt");
+            }
+            if segment.status == CliRuntimeExecutionSegmentStatus::Running {
+                if !cli_runtime_binding::mark_execution_segment_terminal(
+                    &transaction,
+                    segment.id.as_str(),
+                    status,
+                    failure_reason.clone(),
+                    completed_at,
+                )
+                .await?
+                {
+                    transaction.rollback().await.ok();
+                    bail!("CLI runtime execution segment changed during terminalization");
+                }
+            } else if segment.status != status {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime execution segment received conflicting terminal states");
+            }
+            let stored =
+                cli_runtime_binding::find_execution_segment(&transaction, segment.id.as_str())
+                    .await?
+                    .context("terminalized CLI runtime execution segment is missing")?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit execution segment terminal transaction")?;
+            Ok(Some((binding, attempt, stored)))
+        })
+        .await
+    }
+
     pub async fn mark_cli_runtime_turn_attempt_terminal(
         &self,
         id: &str,
@@ -1267,14 +1508,24 @@ impl CrudStore {
         completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<bool> {
         self.run_serialized_write(|| async {
-            cli_runtime_binding::mark_turn_attempt_terminal(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime attempt terminal transaction")?;
+            let changed = cli_runtime_binding::mark_turn_attempt_terminal(
+                &transaction,
                 id,
                 status,
                 failure_reason.clone(),
                 completed_at,
             )
-            .await
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime attempt terminal transaction")?;
+            Ok(changed)
         })
         .await
     }
@@ -1567,6 +1818,12 @@ impl CrudStore {
                     created_at: binding.created_at,
                     updated_at: binding.updated_at,
                 },
+            )
+            .await?;
+            let stored_binding = cli_runtime_binding::clear_turn_native_goal_state(
+                &transaction,
+                stored_binding.turn_id.as_str(),
+                prepared_at,
             )
             .await?;
             transaction
@@ -13598,18 +13855,19 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 mod tests {
     use super::{
         ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome,
-        ClaimedRecoveryActivation, CliRuntimeNativeEventListFilter,
-        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
-        CliRuntimeProviderSessionLifecycle, CliRuntimeThreadMcpMetadata,
-        CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits,
-        CrudStore, IngestArtifactMetadataRecord, McpAuditEventRecord,
-        McpServerCatalogSnapshotRecord, McpServerInstallationRecord, NewArtifactBlobRecord,
-        NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
-        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord,
-        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
-        NewTurnRuntimeSnapshot, PrepareClaudeProviderSessionBinding,
-        PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
-        SkillInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
+        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
+        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
+        CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
+        CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits, CrudStore,
+        IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
+        McpServerInstallationRecord, NewArtifactBlobRecord, NewCliRuntimeInstructionProjection,
+        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+        NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
+        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
+        PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
+        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
+        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
@@ -14612,6 +14870,178 @@ mod tests {
             .expect("active CLI runtime turn bindings should list");
         assert_eq!(active_turn_bindings.len(), 1);
         assert_eq!(active_turn_bindings[0].turn_id, "turn_cli_running");
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_execution_segments_enforce_attempt_ownership_and_sequence() {
+        let store = test_store_with_workspace("ws_cli_segments").await;
+        let now = unix_to_datetime(1_700_015_000);
+        let turn_id = "turn_cli_segments";
+        let native_thread_id = "codex-thread-segments";
+        let submission_id = "codex-submission-segments";
+        let (_, attempt) = store
+            .prepare_cli_runtime_initial_turn_attempt(
+                NewCliRuntimeTurnBinding {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: "thread_cli_segments".to_owned(),
+                    workspace_id: "ws_cli_segments".to_owned(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: native_thread_id.to_owned(),
+                    native_turn_id: None,
+                    request_id: None,
+                    status: "starting".to_owned(),
+                    model: Some("gpt-5".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    sandbox_json: None,
+                    approval_policy: Some("on-request".to_owned()),
+                    input_mapping_json: "{}".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                "cli-attempt-segments".to_owned(),
+                1,
+            )
+            .await
+            .expect("initial CLI runtime attempt should prepare");
+        store
+            .activate_cli_runtime_turn_attempt(
+                turn_id,
+                attempt.id.as_str(),
+                submission_id,
+                None,
+                now,
+            )
+            .await
+            .expect("initial CLI runtime attempt should activate");
+
+        let (_, _, first) = store
+            .register_cli_runtime_execution_segment(
+                turn_id,
+                native_thread_id,
+                "codex-segment-1",
+                now,
+            )
+            .await
+            .expect("first execution segment should register");
+        assert_eq!(first.segment_index, 1);
+        assert_eq!(first.attempt_id, attempt.id);
+        let (_, _, duplicate) = store
+            .register_cli_runtime_execution_segment(
+                turn_id,
+                native_thread_id,
+                "codex-segment-1",
+                now,
+            )
+            .await
+            .expect("execution segment registration should be idempotent");
+        assert_eq!(duplicate.id, first.id);
+        assert!(
+            store
+                .register_cli_runtime_execution_segment(
+                    turn_id,
+                    native_thread_id,
+                    "codex-segment-2",
+                    now,
+                )
+                .await
+                .expect_err("a second running execution segment must be rejected")
+                .to_string()
+                .contains("already has active execution segment")
+        );
+        assert!(
+            store
+                .register_cli_runtime_execution_segment(
+                    turn_id,
+                    "codex-subagent-thread",
+                    "codex-subagent-segment",
+                    now,
+                )
+                .await
+                .expect_err("a subagent thread must not own a root execution segment")
+                .to_string()
+                .contains("cannot accept this execution segment")
+        );
+
+        let (_, owner_attempt, completed_first) = store
+            .terminalize_cli_runtime_execution_segment(
+                "codex",
+                "codex-segment-1",
+                CliRuntimeExecutionSegmentStatus::Completed,
+                None,
+                now,
+            )
+            .await
+            .expect("first execution segment should terminalize")
+            .expect("first execution segment should exist");
+        assert_eq!(owner_attempt.status, CliRuntimeTurnAttemptStatus::Running);
+        assert_eq!(
+            completed_first.status,
+            CliRuntimeExecutionSegmentStatus::Completed
+        );
+
+        let (_, _, second) = store
+            .register_cli_runtime_execution_segment(
+                turn_id,
+                native_thread_id,
+                "codex-segment-2",
+                now,
+            )
+            .await
+            .expect("next execution segment should register after terminal completion");
+        assert_eq!(second.segment_index, 2);
+        let segment_owner = store
+            .resolve_cli_runtime_native_turn_owner("codex", "codex-segment-2")
+            .await
+            .expect("segment owner lookup should succeed")
+            .expect("segment owner should exist");
+        assert_eq!(segment_owner.attempt.id, attempt.id);
+        assert_eq!(
+            segment_owner
+                .segment
+                .as_ref()
+                .map(|segment| segment.id.as_str()),
+            Some(second.id.as_str())
+        );
+        let submission_owner = store
+            .resolve_cli_runtime_native_turn_owner("codex", submission_id)
+            .await
+            .expect("submission owner lookup should succeed")
+            .expect("submission owner should exist");
+        assert!(submission_owner.segment.is_none());
+        assert_eq!(submission_owner.attempt.id, attempt.id);
+
+        assert!(
+            store
+                .mark_cli_runtime_turn_attempt_terminal(
+                    attempt.id.as_str(),
+                    CliRuntimeTurnAttemptStatus::Interrupted,
+                    Some("user cancelled".to_owned()),
+                    now,
+                )
+                .await
+                .expect("attempt terminalization should succeed")
+        );
+        let terminal_owner = store
+            .resolve_cli_runtime_native_turn_owner("codex", "codex-segment-2")
+            .await
+            .expect("terminal segment owner lookup should succeed")
+            .expect("terminal segment owner should exist");
+        assert_eq!(
+            terminal_owner.attempt.status,
+            CliRuntimeTurnAttemptStatus::Interrupted
+        );
+        let terminal_segment = terminal_owner
+            .segment
+            .expect("terminal segment should remain durable");
+        assert_eq!(
+            terminal_segment.status,
+            CliRuntimeExecutionSegmentStatus::Interrupted
+        );
+        assert_eq!(
+            terminal_segment.failure_reason.as_deref(),
+            Some("user cancelled")
+        );
     }
 
     #[tokio::test]

@@ -1015,19 +1015,71 @@ impl CodexRequiredMcpBridge {
         if turn.pioneer_turn_id != pioneer_turn_id {
             bail!("Codex MCP turn reservation does not match the Pioneer turn")
         }
+        if turn
+            .native_thread_id
+            .as_deref()
+            .is_some_and(|staged| staged != native_thread_id)
+        {
+            bail!("Codex MCP staged segment belongs to a different native thread")
+        }
+        let effective_native_thread_id = turn
+            .native_thread_id
+            .clone()
+            .unwrap_or_else(|| native_thread_id.to_owned());
+        let effective_native_turn_id = turn
+            .native_turn_id
+            .clone()
+            .unwrap_or_else(|| native_turn_id.to_owned());
         self.supervisor
             .coordinator()
             .activate_turn(
                 bound_grant,
                 turn.activation_generation,
-                native_thread_id,
-                native_turn_id,
+                effective_native_thread_id.as_str(),
+                effective_native_turn_id.as_str(),
             )
             .await
             .map_err(|error| anyhow!("failed to activate Codex MCP turn: {error:?}"))?;
         handle
             .set_activation(Some(turn.activation_generation))
             .await;
+        turn.native_thread_id = Some(effective_native_thread_id);
+        turn.native_turn_id = Some(effective_native_turn_id);
+        Ok(())
+    }
+
+    async fn retarget_turn(
+        &self,
+        pioneer_turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let CodexRequiredMcpBridgeState::Ready {
+            bound_grant,
+            active_turn: Some(turn),
+            ..
+        } = &mut *state
+        else {
+            return Ok(());
+        };
+        if turn.pioneer_turn_id != pioneer_turn_id {
+            bail!("Codex MCP retarget does not match the active Pioneer turn")
+        }
+        self.supervisor
+            .coordinator()
+            .retarget_turn(
+                bound_grant,
+                turn.activation_generation,
+                native_thread_id,
+                native_turn_id,
+            )
+            .await
+            .map_err(|error| anyhow!("failed to retarget Codex MCP turn: {error:?}"))?;
+        self.native_items.clear_turn(
+            turn.native_thread_id.as_deref(),
+            turn.native_turn_id.as_deref(),
+        );
         turn.native_thread_id = Some(native_thread_id.to_owned());
         turn.native_turn_id = Some(native_turn_id.to_owned());
         Ok(())
@@ -2062,11 +2114,49 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             .await
     }
 
+    async fn retarget_mcp_turn(
+        &self,
+        pioneer_turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<()> {
+        let Some(bridge) = self.required_mcp_bridge.as_ref() else {
+            return Ok(());
+        };
+        bridge
+            .retarget_turn(pioneer_turn_id, native_thread_id, native_turn_id)
+            .await
+    }
+
     async fn terminal_mcp_turn(&self, pioneer_turn_id: &str) -> Result<()> {
         let Some(bridge) = self.required_mcp_bridge.as_ref() else {
             return Ok(());
         };
         bridge.terminal_turn(pioneer_turn_id).await
+    }
+
+    async fn reset_native_thread_goal(&self, native_thread_id: &str) -> Result<()> {
+        if self
+            .client
+            .thread_goal_get(native_thread_id, self.request_timeout)
+            .await
+            .context("Codex thread/goal/get failed")?
+            .is_some()
+        {
+            self.client
+                .thread_goal_clear(native_thread_id, self.request_timeout)
+                .await
+                .context("Codex thread/goal/clear failed")?;
+        }
+        Ok(())
+    }
+
+    async fn clear_native_thread_goal(&self, native_thread_id: &str) -> Result<()> {
+        self.client
+            .thread_goal_clear(native_thread_id, self.request_timeout)
+            .await
+            .context("Codex thread/goal/clear failed")?;
+        Ok(())
     }
 
     async fn native_mcp_approval_response(

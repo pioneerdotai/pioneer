@@ -15,6 +15,8 @@ pub struct RuntimeEventMappingOptions {
 pub enum RuntimeEvent {
     SessionStateChanged(RuntimeSessionStateChanged),
     ThreadStateChanged(RuntimeThreadStateChanged),
+    ThreadGoalUpdated(RuntimeThreadGoalUpdated),
+    ThreadGoalCleared(RuntimeThreadGoalCleared),
     TurnStarted(RuntimeTurnStarted),
     TurnCompleted(RuntimeTurnCompleted),
     TurnFailed(RuntimeTurnFailed),
@@ -150,6 +152,40 @@ pub struct RuntimeThreadStateChanged {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_thread_id: Option<String>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<RuntimeNativeEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeThreadGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+impl RuntimeThreadGoalStatus {
+    pub const fn keeps_turn_open(self) -> bool {
+        !matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeThreadGoalUpdated {
+    pub native_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
+    pub status: RuntimeThreadGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<RuntimeNativeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeThreadGoalCleared {
+    pub native_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<RuntimeNativeEvent>,
 }
@@ -449,6 +485,8 @@ pub fn map_codex_notification_event(
             status: "unarchived".to_owned(),
             native: native_notification(notification, options),
         }),
+        "thread/goal/updated" => map_codex_thread_goal_updated(notification, options),
+        "thread/goal/cleared" => map_codex_thread_goal_cleared(notification, options),
         "thread/tokenUsage/updated"
         | "fuzzyFileSearch/sessionUpdated"
         | "fuzzyFileSearch/sessionCompleted"
@@ -523,6 +561,75 @@ pub fn map_codex_notification_event(
         }
         _ => raw_notification(notification, options, "unsupported codex notification"),
     }
+}
+
+fn map_codex_thread_goal_updated(
+    notification: &CodexJsonlRpcNotificationEvent,
+    options: RuntimeEventMappingOptions,
+) -> RuntimeEvent {
+    let Some(params) = notification.params.as_ref() else {
+        return raw_notification_with_payload(
+            notification,
+            options,
+            "thread goal update missing params",
+        );
+    };
+    let Some(native_thread_id) = string_path(params, &["threadId"]) else {
+        return raw_notification_with_payload(
+            notification,
+            options,
+            "thread goal update missing thread id",
+        );
+    };
+    if string_path(params, &["goal", "threadId"]).as_deref() != Some(native_thread_id.as_str()) {
+        return raw_notification_with_payload(
+            notification,
+            options,
+            "thread goal update owner mismatch",
+        );
+    }
+    let status = match string_path(params, &["goal", "status"]).as_deref() {
+        Some("active") => RuntimeThreadGoalStatus::Active,
+        Some("paused") => RuntimeThreadGoalStatus::Paused,
+        Some("blocked") => RuntimeThreadGoalStatus::Blocked,
+        Some("usageLimited") => RuntimeThreadGoalStatus::UsageLimited,
+        Some("budgetLimited") => RuntimeThreadGoalStatus::BudgetLimited,
+        Some("complete") => RuntimeThreadGoalStatus::Complete,
+        _ => {
+            return raw_notification_with_payload(
+                notification,
+                options,
+                "thread goal update has unsupported status",
+            );
+        }
+    };
+    RuntimeEvent::ThreadGoalUpdated(RuntimeThreadGoalUpdated {
+        native_thread_id,
+        native_turn_id: string_path(params, &["turnId"]),
+        status,
+        native: native_notification(notification, options),
+    })
+}
+
+fn map_codex_thread_goal_cleared(
+    notification: &CodexJsonlRpcNotificationEvent,
+    options: RuntimeEventMappingOptions,
+) -> RuntimeEvent {
+    let native_thread_id = notification
+        .params
+        .as_ref()
+        .and_then(|params| string_path(params, &["threadId"]));
+    let Some(native_thread_id) = native_thread_id else {
+        return raw_notification_with_payload(
+            notification,
+            options,
+            "thread goal clear missing thread id",
+        );
+    };
+    RuntimeEvent::ThreadGoalCleared(RuntimeThreadGoalCleared {
+        native_thread_id,
+        native: native_notification(notification, options),
+    })
 }
 
 pub fn map_codex_server_request_event(
@@ -1508,6 +1615,75 @@ mod tests {
         assert_eq!(turn.native_thread_id.as_deref(), Some("native_thread_1"));
         assert_eq!(turn.native_turn_id, "native_turn_1");
         assert!(turn.native.is_none());
+    }
+
+    #[test]
+    fn event_codex_thread_goal_updated_maps_typed_owner_and_status() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "thread/goal/updated".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_2",
+                    "goal": {
+                        "threadId": "native_thread_1",
+                        "status": "budgetLimited",
+                        "objective": "Finish the task",
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                        "timeUsedSeconds": 3,
+                        "tokensUsed": 4
+                    }
+                })),
+                raw: json!({"method": "thread/goal/updated"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        let RuntimeEvent::ThreadGoalUpdated(goal) = event else {
+            panic!("expected typed thread Goal update");
+        };
+        assert_eq!(goal.native_thread_id, "native_thread_1");
+        assert_eq!(goal.native_turn_id.as_deref(), Some("native_turn_2"));
+        assert_eq!(goal.status, super::RuntimeThreadGoalStatus::BudgetLimited);
+        assert!(goal.status.keeps_turn_open());
+    }
+
+    #[test]
+    fn event_codex_thread_goal_owner_mismatch_fails_closed_to_raw() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "thread/goal/updated".to_owned(),
+                params: Some(json!({
+                    "threadId": "root_thread",
+                    "goal": {"threadId": "subagent_thread", "status": "active"}
+                })),
+                raw: json!({"method": "thread/goal/updated"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        let RuntimeEvent::Raw(raw) = event else {
+            panic!("mismatched Goal owner must remain untrusted raw data");
+        };
+        assert_eq!(raw.reason, "thread goal update owner mismatch");
+    }
+
+    #[test]
+    fn event_codex_thread_goal_cleared_maps_without_native_turn() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "thread/goal/cleared".to_owned(),
+                params: Some(json!({"threadId": "native_thread_1"})),
+                raw: json!({"method": "thread/goal/cleared"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        let RuntimeEvent::ThreadGoalCleared(goal) = event else {
+            panic!("expected typed thread Goal clear");
+        };
+        assert_eq!(goal.native_thread_id, "native_thread_1");
     }
 
     #[test]

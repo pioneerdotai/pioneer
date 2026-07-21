@@ -36,17 +36,18 @@ use pioneer_cli_agent_runtime::codex::{
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
-    RuntimeItemStarted, RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadStateChanged,
-    RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted, RuntimeTurnRetrying,
+    RuntimeItemStarted, RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadGoalStatus,
+    RuntimeThreadGoalUpdated, RuntimeThreadStateChanged, RuntimeTurnCompleted, RuntimeTurnFailed,
+    RuntimeTurnInterrupted, RuntimeTurnRetrying, RuntimeTurnStarted,
     map_codex_server_request_event,
 };
 use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructionTransport;
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
-    AgentMemoryListFilter, CliRuntimeTurnAttemptStatus, CrudStore, MemoryActorRecord,
-    NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection, NewCliRuntimePendingRequest,
-    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, ThreadAgentsDocSaveReason,
-    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
+    AgentMemoryListFilter, CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus,
+    CrudStore, MemoryActorRecord, NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection,
+    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+    ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -210,6 +211,9 @@ struct RecordingCliRuntimeSession {
     turn_steers: TokioMutex<Vec<CLIAgentRuntimeTurnSteerRequest>>,
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
+    mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
+    goal_resets: TokioMutex<Vec<String>>,
+    goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
@@ -297,6 +301,36 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
                 }
             }),
         })
+    }
+
+    async fn retarget_mcp_turn(
+        &self,
+        pioneer_turn_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> anyhow::Result<()> {
+        self.mcp_retargets.lock().await.push((
+            pioneer_turn_id.to_owned(),
+            native_thread_id.to_owned(),
+            native_turn_id.to_owned(),
+        ));
+        Ok(())
+    }
+
+    async fn reset_native_thread_goal(&self, native_thread_id: &str) -> anyhow::Result<()> {
+        self.goal_resets
+            .lock()
+            .await
+            .push(native_thread_id.to_owned());
+        Ok(())
+    }
+
+    async fn clear_native_thread_goal(&self, native_thread_id: &str) -> anyhow::Result<()> {
+        self.goal_clears
+            .lock()
+            .await
+            .push(native_thread_id.to_owned());
+        Ok(())
     }
 
     async fn respond_to_request(
@@ -16265,6 +16299,37 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
             .text()
             .contains("## Pioneer CLI Runtime Instructions")
     );
+    assert_eq!(
+        harness.cli_session.goal_resets.lock().await.as_slice(),
+        &["native_thread_default".to_owned()],
+        "a new Codex turn must clear stale Goal state before submission"
+    );
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if harness
+                .crud_store
+                .get_cli_runtime_turn_binding("turn_codex_full_access")
+                .await
+                .expect("Codex turn binding should load")
+                .is_some_and(|binding| binding.status == "running")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Codex turn binding should become running");
+    assert!(
+        harness
+            .crud_store
+            .get_cli_runtime_execution_segment_by_native_turn("codex", "native_turn_default")
+            .await
+            .expect("Codex submission segment lookup should succeed")
+            .is_none(),
+        "turn/start response id must remain a submission id until turn/started arrives"
+    );
 
     let persisted =
         load_persisted_security_snapshot_record(&harness.crud_store, "turn_codex_full_access")
@@ -16480,6 +16545,10 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
         .expect("turn/start response payload should decode");
 
     assert_cli_runtime_start_sandbox_none(&harness.cli_session, "bypassPermissions").await;
+    assert!(
+        harness.cli_session.goal_resets.lock().await.is_empty(),
+        "Claude turns must not execute Codex Goal lifecycle operations"
+    );
 
     let persisted =
         load_persisted_security_snapshot(&harness.crud_store, "turn_claude_legacy_sandbox").await;
@@ -18505,6 +18574,559 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
 }
 
+#[test]
+fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents() {
+    run_large_stack_message_test(
+        "Codex Goal execution segment test",
+        codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl(),
+    );
+}
+
+async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let thread_id = "thread_codex_goal_segments";
+    let turn_id = "turn_codex_goal_segments";
+    let native_thread_id = "native_thread_codex_goal_segments";
+    let submission_id = "native_submission_codex_goal_segments";
+    let first_segment_id = "native_turn_codex_goal_segment_1";
+    let second_segment_id = "native_turn_codex_goal_segment_2";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    let (_, attempt) = crud_store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            },
+            "cli_attempt_goal_segments".to_owned(),
+            1,
+        )
+        .await
+        .expect("Codex Goal attempt should prepare");
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+        .expect("session key should build");
+    let session_handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("Codex Goal test session should start");
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: first_segment_id.to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        crud_store
+            .get_cli_runtime_execution_segment_by_native_turn("codex", first_segment_id)
+            .await
+            .expect("early Goal segment lookup should succeed")
+            .is_none(),
+        "turn/started must wait until the submission has an active durable attempt"
+    );
+    crud_store
+        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), submission_id, None, now)
+        .await
+        .expect("Codex Goal attempt should activate");
+    assert!(
+        crud_store
+            .get_cli_runtime_execution_segment_by_native_turn("codex", submission_id)
+            .await
+            .expect("submission segment lookup should succeed")
+            .is_none(),
+        "turn/start submission id must not be materialized as an execution segment"
+    );
+    processor
+        .bind_buffered_codex_root_execution_segments(session_handle.instance(), native_thread_id)
+        .await;
+    let first_segment = crud_store
+        .get_cli_runtime_execution_segment_by_native_turn("codex", first_segment_id)
+        .await
+        .expect("first Goal segment lookup should succeed")
+        .expect("first Goal segment should exist");
+    assert_eq!(first_segment.attempt_id, attempt.id);
+    assert_eq!(first_segment.segment_index, 1);
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::ThreadGoalUpdated(RuntimeThreadGoalUpdated {
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: Some(first_segment_id.to_owned()),
+                status: RuntimeThreadGoalStatus::Active,
+                native: None,
+            }),
+        )
+        .await;
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: first_segment_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_, intermediate_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("intermediate turn should load")
+        .expect("intermediate turn should exist");
+    assert_eq!(intermediate_turn.status, TurnStatus::InProgress);
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_turn_attempt(attempt.id.as_str())
+            .await
+            .expect("attempt should load")
+            .expect("attempt should exist")
+            .status,
+        CliRuntimeTurnAttemptStatus::Running
+    );
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: submission_id.to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    let submission_segment = crud_store
+        .get_cli_runtime_execution_segment_by_native_turn("codex", submission_id)
+        .await
+        .expect("submission-matching Goal segment lookup should succeed")
+        .expect("turn/started must materialize even when its id matches turn/start");
+    assert_eq!(submission_segment.attempt_id, attempt.id);
+    assert_eq!(submission_segment.segment_index, 2);
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: submission_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("submission-matching Goal turn should load")
+            .expect("submission-matching Goal turn should exist")
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: second_segment_id.to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some("native_subagent_thread".to_owned()),
+                native_turn_id: "native_subagent_turn".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    assert!(
+        crud_store
+            .get_cli_runtime_execution_segment_by_native_turn("codex", "native_subagent_turn")
+            .await
+            .expect("subagent segment lookup should succeed")
+            .is_none(),
+        "subagent native turns must not acquire the root Pioneer turn"
+    );
+    let second_segment = crud_store
+        .get_cli_runtime_execution_segment_by_native_turn("codex", second_segment_id)
+        .await
+        .expect("second Goal segment lookup should succeed")
+        .expect("second Goal segment should exist");
+    assert_eq!(second_segment.attempt_id, attempt.id);
+    assert_eq!(second_segment.segment_index, 3);
+    assert_eq!(
+        crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("Goal turn should load after segment registration")
+            .expect("Goal turn should exist")
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .expect("Goal binding should load after segment registration")
+            .expect("Goal binding should exist")
+            .native_goal_status
+            .as_deref(),
+        Some("active")
+    );
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: second_segment_id.to_owned(),
+                native_item_id: "goal_segment_final_answer".to_owned(),
+                item_kind: "agentMessage".to_owned(),
+                text: Some("Goal chain completed".to_owned()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .expect("Goal binding should load after segment item")
+            .expect("Goal binding should exist")
+            .native_goal_status
+            .as_deref(),
+        Some("active")
+    );
+    assert_eq!(
+        crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("Goal turn should load after segment item")
+            .expect("Goal turn should exist")
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: second_segment_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    let (_, held_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("Goal-held turn should load")
+        .expect("Goal-held turn should exist");
+    assert_eq!(held_turn.status, TurnStatus::InProgress);
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            session_handle.instance(),
+            RuntimeEvent::ThreadGoalUpdated(RuntimeThreadGoalUpdated {
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: Some(second_segment_id.to_owned()),
+                status: RuntimeThreadGoalStatus::Complete,
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_, completed_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("completed Goal turn should load")
+        .expect("completed Goal turn should exist");
+    assert_eq!(completed_turn.status, TurnStatus::Completed);
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "goal_segment_final_answer")
+            .await
+            .expect("Goal segment item lookup should succeed")
+            .is_some()
+    );
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_turn_attempt(attempt.id.as_str())
+            .await
+            .expect("completed attempt should load")
+            .expect("completed attempt should exist")
+            .status,
+        CliRuntimeTurnAttemptStatus::Completed
+    );
+    assert_eq!(
+        cli_session.mcp_retargets.lock().await.as_slice(),
+        &[
+            (
+                turn_id.to_owned(),
+                native_thread_id.to_owned(),
+                first_segment_id.to_owned()
+            ),
+            (
+                turn_id.to_owned(),
+                native_thread_id.to_owned(),
+                submission_id.to_owned()
+            ),
+            (
+                turn_id.to_owned(),
+                native_thread_id.to_owned(),
+                second_segment_id.to_owned()
+            )
+        ]
+    );
+    assert!(cli_session.goal_clears.lock().await.is_empty());
+    assert!(cli_session.interrupts.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let thread_id = "thread_codex_goal_cancel";
+    let turn_id = "turn_codex_goal_cancel";
+    let native_thread_id = "native_thread_codex_goal_cancel";
+    let submission_id = "native_submission_codex_goal_cancel";
+    let first_segment_id = "native_turn_codex_goal_cancel_1";
+    let second_segment_id = "native_turn_codex_goal_cancel_2";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    let (_, attempt) = crud_store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            },
+            "cli_attempt_goal_cancel".to_owned(),
+            1,
+        )
+        .await
+        .expect("Codex Goal cancel attempt should prepare");
+    crud_store
+        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), submission_id, None, now)
+        .await
+        .expect("Codex Goal cancel attempt should activate");
+    crud_store
+        .register_cli_runtime_execution_segment(turn_id, native_thread_id, first_segment_id, now)
+        .await
+        .expect("first Codex Goal cancel segment should register");
+    crud_store
+        .terminalize_cli_runtime_execution_segment(
+            "codex",
+            first_segment_id,
+            CliRuntimeExecutionSegmentStatus::Completed,
+            None,
+            now,
+        )
+        .await
+        .expect("first Codex Goal cancel segment should terminalize")
+        .expect("first Codex Goal cancel segment should exist");
+    crud_store
+        .register_cli_runtime_execution_segment(turn_id, native_thread_id, second_segment_id, now)
+        .await
+        .expect("second Codex Goal cancel segment should register");
+    crud_store
+        .set_cli_runtime_turn_native_goal_state(
+            turn_id,
+            Some("active".to_owned()),
+            Some(second_segment_id.to_owned()),
+            now,
+        )
+        .await
+        .expect("active Codex Goal state should persist");
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("Codex Goal cancel session key should build");
+    cli_manager
+        .get_or_start(key)
+        .await
+        .expect("Codex Goal cancel session should start");
+
+    let cancel_request_id = generate_test_request_id("goalcancel", "stop");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": cancel_request_id,
+                "method": "turn/cancel",
+                "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "reason": "user clicked stop"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (cancel_response, failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
+    let cancel_result: TurnCancelResponse = serde_json::from_value(cancel_response.result)
+        .expect("Codex Goal turn/cancel response should decode");
+    assert_eq!(cancel_result.turn.status, TurnStatus::Interrupted);
+    let failed: TurnFailedNotification = serde_json::from_value(
+        failed_notification
+            .params
+            .expect("Codex Goal turn/failed params should exist"),
+    )
+    .expect("Codex Goal turn/failed params should decode");
+    assert_eq!(failed.turn.status, TurnStatus::Interrupted);
+    assert_eq!(
+        cli_session.goal_clears.lock().await.as_slice(),
+        &[native_thread_id.to_owned()]
+    );
+    assert_eq!(
+        cli_session.interrupts.lock().await.as_slice(),
+        &[(
+            (Some(native_thread_id.to_owned())),
+            Some(second_segment_id.to_owned())
+        )]
+    );
+    let terminal_owner = crud_store
+        .resolve_cli_runtime_native_turn_owner("codex", second_segment_id)
+        .await
+        .expect("cancelled Goal segment owner should load")
+        .expect("cancelled Goal segment owner should exist");
+    assert_eq!(
+        terminal_owner.attempt.status,
+        CliRuntimeTurnAttemptStatus::Interrupted
+    );
+    assert_eq!(
+        terminal_owner
+            .segment
+            .expect("cancelled Goal segment should remain durable")
+            .status,
+        CliRuntimeExecutionSegmentStatus::Interrupted
+    );
+    for status in [RecoveryJobStatus::Pending, RecoveryJobStatus::Active] {
+        assert!(
+            crud_store
+                .find_recovery_jobs_by_turn_and_status(turn_id, status)
+                .await
+                .expect("cancelled Codex Goal recovery jobs should load")
+                .is_empty(),
+            "user cancellation must not enqueue recovery for a Codex Goal chain"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_terminal_attempt_fences_late_native_events() {
     let (tx, mut rx) = mpsc::channel(64);
@@ -18877,6 +19499,11 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     let starts = cli_session.turn_starts.lock().await.clone();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].native_thread_id, native_thread_id);
+    assert_eq!(
+        cli_session.goal_resets.lock().await.as_slice(),
+        &[native_thread_id.to_owned()],
+        "Codex recovery must clear stale Goal state before submitting a new attempt"
+    );
     assert!(
         starts[0]
             .elevated_instructions

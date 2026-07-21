@@ -258,7 +258,24 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         Ok(())
     }
 
+    async fn retarget_mcp_turn(
+        &self,
+        _pioneer_turn_id: &str,
+        _native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn terminal_mcp_turn(&self, _pioneer_turn_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn reset_native_thread_goal(&self, _native_thread_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn clear_native_thread_goal(&self, _native_thread_id: &str) -> Result<()> {
         Ok(())
     }
 

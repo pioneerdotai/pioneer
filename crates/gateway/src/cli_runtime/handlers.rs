@@ -1077,7 +1077,23 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            let Some(native_turn_id) = turn_binding.native_turn_id.clone() else {
+            let native_turn_id = match self.cli_runtime_running_native_turn_id(&turn_binding).await
+            {
+                Ok(native_turn_id) => native_turn_id,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to resolve active CLI runtime segment: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let Some(native_turn_id) = native_turn_id else {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -2745,6 +2761,21 @@ impl MessageProcessor {
             _ => {}
         }
 
+        if matches!(
+            &event,
+            RuntimeEvent::ThreadGoalUpdated(_) | RuntimeEvent::ThreadGoalCleared(_)
+        ) {
+            self.handle_codex_thread_goal_event(instance, event).await;
+            return;
+        }
+
+        let turn_started_binding = if let RuntimeEvent::TurnStarted(started) = &event {
+            self.register_codex_execution_segment_for_started_event(instance, started)
+                .await
+        } else {
+            None
+        };
+
         let Some(native_turn_id) = cli_runtime_native_turn_id_for_event(&event).map(str::to_owned)
         else {
             let Some(turn_binding) = self
@@ -2769,13 +2800,13 @@ impl MessageProcessor {
             );
             return;
         };
-        let Some(turn_binding) = self
+        let Some(turn_binding) = turn_started_binding.or(self
             .cli_runtime_turn_binding_for_native_turn(
                 instance,
                 native_thread_id.as_str(),
                 native_turn_id.as_str(),
             )
-            .await
+            .await)
         else {
             match self
                 .crud_store
@@ -2842,8 +2873,310 @@ impl MessageProcessor {
             return;
         };
 
+        let turn_started = matches!(&event, RuntimeEvent::TurnStarted(_));
         self.process_bound_cli_runtime_event(instance, turn_binding, event)
             .await;
+        if turn_started {
+            self.flush_cli_runtime_events_for_native_turn(
+                instance,
+                native_thread_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await;
+        }
+    }
+
+    async fn active_codex_turn_binding_for_root_thread(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
+    ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
+        let bindings = match self
+            .crud_store
+            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .await
+        {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve active Codex root turn binding"
+                );
+                return None;
+            }
+        };
+        let mut candidates = bindings.into_iter().filter(|binding| {
+            binding.workspace_id == key.workspace_id
+                && binding.runtime_id == key.runtime_id
+                && binding.runtime_kind == "codex"
+                && binding.native_thread_id == native_thread_id
+                && cli_runtime_turn_binding_status_is_active(binding.status.as_str())
+        });
+        let binding = candidates.next()?;
+        if candidates.next().is_some() {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_thread_id,
+                "rejected Codex root activity with ambiguous active Pioneer turn owner"
+            );
+            return None;
+        }
+        Some(binding)
+    }
+
+    async fn register_codex_execution_segment_for_started_event(
+        &self,
+        instance: &CliSessionInstanceId,
+        started: &pioneer_cli_agent_runtime::event::RuntimeTurnStarted,
+    ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
+        let key = instance.key();
+        let native_thread_id = started.native_thread_id.as_deref()?;
+        let binding = match self
+            .crud_store
+            .resolve_cli_runtime_native_turn_owner(
+                key.runtime_id.as_str(),
+                started.native_turn_id.as_str(),
+            )
+            .await
+        {
+            Ok(Some(owner)) => {
+                if owner.binding.workspace_id != key.workspace_id
+                    || owner.binding.thread_id != key.thread_id
+                    || owner.binding.native_thread_id != native_thread_id
+                    || !owner.attempt.status.is_active()
+                {
+                    return None;
+                }
+                if owner.segment.is_some() {
+                    return Some(owner.binding);
+                }
+                owner.binding
+            }
+            Ok(None) => {
+                self.active_codex_turn_binding_for_root_thread(key, native_thread_id)
+                    .await?
+            }
+            Err(error) => {
+                warn!(
+                    runtime_id = key.runtime_id.as_str(),
+                    native_turn_id = started.native_turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to resolve Codex execution segment owner"
+                );
+                return None;
+            }
+        };
+        if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
+            return None;
+        }
+        let (binding, _, _) = match self
+            .crud_store
+            .register_cli_runtime_execution_segment(
+                binding.turn_id.as_str(),
+                native_thread_id,
+                started.native_turn_id.as_str(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                warn!(
+                    turn_id = binding.turn_id.as_str(),
+                    native_thread_id,
+                    native_turn_id = started.native_turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to register Codex execution segment"
+                );
+                return None;
+            }
+        };
+        if let Some(manager) = self.cli_runtime_manager.as_ref()
+            && let Some(handle) = manager.existing_session(key).await
+            && let Err(error) = handle
+                .session()
+                .retarget_mcp_turn(
+                    binding.turn_id.as_str(),
+                    native_thread_id,
+                    started.native_turn_id.as_str(),
+                )
+                .await
+        {
+            let message = format!("failed to retarget Codex MCP execution segment: {error:#}");
+            warn!(
+                turn_id = binding.turn_id.as_str(),
+                native_turn_id = started.native_turn_id.as_str(),
+                error = %format!("{error:#}"),
+                "Codex execution segment failed MCP retarget"
+            );
+            let _ = self
+                .report_turn_failure(
+                    binding.thread_id.clone(),
+                    binding.turn_id.clone(),
+                    TurnFailureRecoveryKind::RuntimeFailure,
+                    message,
+                )
+                .await;
+            return None;
+        }
+        Some(binding)
+    }
+
+    pub(super) async fn bind_buffered_codex_root_execution_segments(
+        &self,
+        instance: &CliSessionInstanceId,
+        native_thread_id: &str,
+    ) {
+        let key = instance.key();
+        loop {
+            let next_started = {
+                let pending = self.cli_runtime_pending_turn_events.lock().await;
+                pending
+                    .iter()
+                    .filter(|(pending_key, _)| {
+                        pending_key.workspace_id == key.workspace_id
+                            && pending_key.runtime_id == key.runtime_id
+                            && pending_key.thread_id == key.thread_id
+                            && pending_key.session_generation == instance.generation()
+                            && pending_key.native_thread_id == native_thread_id
+                    })
+                    .flat_map(|(_, events)| events.iter())
+                    .filter_map(|pending| match &pending.event {
+                        RuntimeEvent::TurnStarted(started)
+                            if started.native_thread_id.as_deref() == Some(native_thread_id) =>
+                        {
+                            Some((pending.received_sequence, started.clone()))
+                        }
+                        _ => None,
+                    })
+                    .min_by_key(|(received_sequence, _)| *received_sequence)
+            };
+            let Some((_, started)) = next_started else {
+                return;
+            };
+            if self
+                .register_codex_execution_segment_for_started_event(instance, &started)
+                .await
+                .is_none()
+            {
+                return;
+            }
+            self.flush_cli_runtime_events_for_native_turn(
+                instance,
+                native_thread_id,
+                started.native_turn_id.as_str(),
+            )
+            .await;
+        }
+    }
+
+    async fn handle_codex_thread_goal_event(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: RuntimeEvent,
+    ) {
+        let (native_thread_id, status, native_goal_turn_id) = match event {
+            RuntimeEvent::ThreadGoalUpdated(updated) => (
+                updated.native_thread_id,
+                Some(cli_runtime_native_goal_status_for_storage(updated.status).to_owned()),
+                updated.native_turn_id,
+            ),
+            RuntimeEvent::ThreadGoalCleared(cleared) => (cleared.native_thread_id, None, None),
+            _ => return,
+        };
+        let Some(binding) = self
+            .active_codex_turn_binding_for_root_thread(instance.key(), native_thread_id.as_str())
+            .await
+        else {
+            return;
+        };
+        let binding = match self
+            .crud_store
+            .set_cli_runtime_turn_native_goal_state(
+                binding.turn_id.as_str(),
+                status,
+                native_goal_turn_id,
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                warn!(
+                    turn_id = binding.turn_id.as_str(),
+                    native_thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist Codex Goal state"
+                );
+                return;
+            }
+        };
+        self.reconcile_codex_goal_terminal(instance, binding).await;
+    }
+
+    async fn reconcile_codex_goal_terminal(
+        &self,
+        instance: &CliSessionInstanceId,
+        binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) {
+        if binding.native_goal_observed_at.is_none()
+            || cli_runtime_native_goal_keeps_turn_open(&binding)
+        {
+            return;
+        }
+        let attempt = match self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await
+        {
+            Ok(Some(attempt)) if attempt.status.is_active() => attempt,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to load Codex Goal attempt for terminal reconciliation"
+                );
+                return;
+            }
+        };
+        let segment = match self
+            .crud_store
+            .latest_cli_runtime_execution_segment_for_attempt(attempt.id.as_str())
+            .await
+        {
+            Ok(Some(segment))
+                if segment.status == pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed =>
+            {
+                segment
+            }
+            Ok(_) => return,
+            Err(error) => {
+                warn!(
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to load completed Codex segment for Goal reconciliation"
+                );
+                return;
+            }
+        };
+        self.process_bound_cli_runtime_event(
+            instance,
+            binding,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(segment.native_thread_id),
+                native_turn_id: segment.native_turn_id,
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
     }
 
     pub(super) async fn handle_cli_runtime_event<O: CliSessionInstanceOrigin + ?Sized>(
@@ -3349,15 +3682,15 @@ impl MessageProcessor {
     ) {
         let attempt = match self
             .crud_store
-            .get_cli_runtime_turn_attempt_by_native_turn(key.runtime_id.as_str(), native_turn_id)
+            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
-            Ok(Some(attempt))
-                if attempt.status.is_active()
-                    && attempt.turn_id == turn_binding.turn_id
-                    && attempt.native_thread_id == turn_binding.native_thread_id =>
+            Ok(Some(owner))
+                if owner.attempt.status.is_active()
+                    && owner.attempt.turn_id == turn_binding.turn_id
+                    && owner.attempt.native_thread_id == turn_binding.native_thread_id =>
             {
-                attempt
+                owner.attempt
             }
             Ok(_) => return,
             Err(error) => {
@@ -3392,7 +3725,7 @@ impl MessageProcessor {
     async fn process_bound_cli_runtime_event(
         &self,
         instance: &CliSessionInstanceId,
-        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) -> bool {
         if !self.cli_runtime_instance_is_current(instance).await {
@@ -3405,37 +3738,35 @@ impl MessageProcessor {
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
         let event_label = cli_runtime_event_log_label(&event);
         let terminal_status = cli_runtime_turn_status_for_terminal_event(&event);
-        let turn_attempt = if let Some(native_turn_id) = native_turn_id {
+        let native_owner = if let Some(native_turn_id) = native_turn_id {
             match self
                 .crud_store
-                .get_cli_runtime_turn_attempt_by_native_turn(
-                    key.runtime_id.as_str(),
-                    native_turn_id,
-                )
+                .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
                 .await
             {
-                Ok(Some(attempt)) => {
-                    if attempt.turn_id != turn_binding.turn_id
-                        || attempt.native_thread_id != turn_binding.native_thread_id
+                Ok(Some(owner)) => {
+                    if owner.attempt.turn_id != turn_binding.turn_id
+                        || owner.attempt.native_thread_id != turn_binding.native_thread_id
                     {
                         warn!(
                             turn_id = turn_binding.turn_id.as_str(),
-                            attempt_turn_id = attempt.turn_id.as_str(),
+                            attempt_turn_id = owner.attempt.turn_id.as_str(),
                             native_turn_id,
                             "rejected CLI runtime event with mismatched durable attempt owner"
                         );
                         return false;
                     }
-                    if !attempt.status.is_active() {
+                    if !owner.attempt.status.is_active() {
                         debug!(
                             turn_id = turn_binding.turn_id.as_str(),
                             native_turn_id,
-                            attempt_status = attempt.status.as_str(),
+                            attempt_status = owner.attempt.status.as_str(),
                             "ignored CLI runtime event after durable attempt termination"
                         );
                         return false;
                     }
-                    Some(attempt)
+                    turn_binding = owner.binding.clone();
+                    Some(owner)
                 }
                 Ok(None) => None,
                 Err(error) => {
@@ -3451,6 +3782,22 @@ impl MessageProcessor {
         } else {
             None
         };
+        let turn_attempt = native_owner.as_ref().map(|owner| &owner.attempt);
+        let execution_segment = native_owner
+            .as_ref()
+            .and_then(|owner| owner.segment.as_ref());
+        if let Some(segment) = execution_segment
+            && !cli_runtime_execution_segment_accepts_event(segment, &event)
+        {
+            debug!(
+                turn_id = turn_binding.turn_id.as_str(),
+                native_turn_id = native_turn_id_label,
+                segment_status = segment.status.as_str(),
+                event = %event_label,
+                "ignored CLI runtime event after execution segment termination"
+            );
+            return false;
+        }
         if !self
             .cli_runtime_turn_binding_accepts_native_activity(
                 key,
@@ -3472,7 +3819,7 @@ impl MessageProcessor {
             );
             return false;
         }
-        let recovery = if let Some(attempt) = turn_attempt.as_ref() {
+        let recovery = if let Some(attempt) = turn_attempt {
             match self.cli_runtime_attempt_recovery_state(attempt).await {
                 Ok(CLIRuntimeAttemptRecoveryState::Normal) => None,
                 Ok(CLIRuntimeAttemptRecoveryState::Active(recovery)) => Some(recovery),
@@ -3505,6 +3852,54 @@ impl MessageProcessor {
             self.commit_cli_runtime_final_diff_snapshot(key, &turn_binding, native_turn_id)
                 .await;
         }
+        if matches!(&event, RuntimeEvent::TurnCompleted(_))
+            && execution_segment.is_some()
+            && cli_runtime_native_goal_keeps_turn_open(&turn_binding)
+        {
+            let Some(native_turn_id) = native_turn_id else {
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    "Goal execution segment completion is missing its native turn id"
+                );
+                return false;
+            };
+            match self
+                .crud_store
+                .terminalize_cli_runtime_execution_segment(
+                    key.runtime_id.as_str(),
+                    native_turn_id,
+                    pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed,
+                    None,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    warn!(
+                        turn_id = turn_binding.turn_id.as_str(),
+                        native_turn_id, "Goal execution segment disappeared during completion"
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    warn!(
+                        turn_id = turn_binding.turn_id.as_str(),
+                        native_turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to terminalize completed Goal execution segment"
+                    );
+                    return false;
+                }
+            }
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            if let (Some(attempt), Some(recovery)) = (turn_attempt, recovery.as_ref()) {
+                self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
+                    .await;
+            }
+            return true;
+        }
         if terminal_status.is_some()
             && let Some(recovery) = recovery.as_ref()
             && matches!(
@@ -3529,7 +3924,7 @@ impl MessageProcessor {
                 ),
                 _ => unreachable!(),
             };
-            if let Some(attempt) = turn_attempt.as_ref() {
+            if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
                     .mark_cli_runtime_turn_attempt_terminal(
@@ -3575,7 +3970,7 @@ impl MessageProcessor {
                 RuntimeEvent::TurnInterrupted(interrupted) => interrupted.reason.clone(),
                 _ => unreachable!(),
             };
-            if let Some(attempt) = turn_attempt.as_ref() {
+            if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
                     .mark_cli_runtime_turn_attempt_terminal(
@@ -3675,13 +4070,13 @@ impl MessageProcessor {
         self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
             .await;
         if cli_runtime_event_confirms_recovery(&event)
-            && let (Some(attempt), Some(recovery)) = (turn_attempt.as_ref(), recovery.as_ref())
+            && let (Some(attempt), Some(recovery)) = (turn_attempt, recovery.as_ref())
         {
             self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
                 .await;
         }
         if terminal_status.is_some() {
-            if let Some(attempt) = turn_attempt.as_ref() {
+            if let Some(attempt) = turn_attempt {
                 let attempt_status = match &event {
                     RuntimeEvent::TurnCompleted(_) => {
                         pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
@@ -4255,7 +4650,8 @@ impl MessageProcessor {
             return Ok(());
         }
 
-        let message = if let Some(native_turn_id) = binding.native_turn_id.as_deref() {
+        let latest_native_turn_id = self.cli_runtime_latest_native_turn_id(&binding).await?;
+        let message = if let Some(native_turn_id) = latest_native_turn_id.as_deref() {
             if observed_activity_ms.is_some() {
                 format!(
                     "CLI runtime turn `{}` stopped emitting native events for native turn `{native_turn_id}` after {} ms of inactivity",
@@ -4280,18 +4676,10 @@ impl MessageProcessor {
             &turn,
         )
         .await?;
-        let attempt = if let Some(native_turn_id) = binding.native_turn_id.as_deref() {
-            self.crud_store
-                .get_cli_runtime_turn_attempt_by_native_turn(
-                    binding.runtime_id.as_str(),
-                    native_turn_id,
-                )
-                .await?
-        } else {
-            self.crud_store
-                .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
-                .await?
-        };
+        let attempt = self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await?;
         if let Some(attempt) = attempt.as_ref() {
             if attempt.turn_id != binding.turn_id
                 || attempt.runtime_id != binding.runtime_id
@@ -4350,7 +4738,7 @@ impl MessageProcessor {
         workspace_id: &str,
         turn: &Turn,
     ) -> anyhow::Result<bool> {
-        let Some(native_turn_id) = binding.native_turn_id.as_deref() else {
+        let Some(native_turn_id) = self.cli_runtime_running_native_turn_id(binding).await? else {
             return Ok(false);
         };
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
@@ -4366,7 +4754,7 @@ impl MessageProcessor {
         };
         let Some(observation) = handle
             .session()
-            .observe_turn(binding.native_thread_id.as_str(), native_turn_id)
+            .observe_turn(binding.native_thread_id.as_str(), native_turn_id.as_str())
             .await?
         else {
             return Ok(false);
@@ -4385,7 +4773,7 @@ impl MessageProcessor {
                 runtime_id = binding.runtime_id.as_str(),
                 thread_id = binding.thread_id.as_str(),
                 turn_id = binding.turn_id.as_str(),
-                native_turn_id,
+                native_turn_id = native_turn_id.as_str(),
                 renewed,
                 "runtime reconciliation confirmed stale Pioneer turn is still active"
             );
@@ -4445,23 +4833,23 @@ impl MessageProcessor {
                     .unwrap_or_else(|| "CLI runtime reported a blocked turn".to_owned());
                 if let Some(attempt) = self
                     .crud_store
-                    .get_cli_runtime_turn_attempt_by_native_turn(
+                    .resolve_cli_runtime_native_turn_owner(
                         binding.runtime_id.as_str(),
-                        native_turn_id,
+                        native_turn_id.as_str(),
                     )
                     .await?
                 {
                     let _ = self
                         .crud_store
                         .mark_cli_runtime_turn_attempt_terminal(
-                            attempt.id.as_str(),
+                            attempt.attempt.id.as_str(),
                             pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted,
                             Some(reason.clone()),
                             chrono::Utc::now().fixed_offset(),
                         )
                         .await?;
                 }
-                self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id)
+                self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id.as_str())
                     .await;
                 self.ensure_cli_runtime_execution_event_hub(handle.instance())
                     .await
@@ -4525,7 +4913,7 @@ impl MessageProcessor {
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
     ) -> anyhow::Result<Option<i64>> {
-        let Some(native_turn_id) = binding.native_turn_id.as_ref() else {
+        let Some(native_turn_id) = self.cli_runtime_latest_native_turn_id(binding).await? else {
             return Ok(None);
         };
         let event = self
@@ -4535,7 +4923,7 @@ impl MessageProcessor {
                 thread_id: Some(binding.thread_id.clone()),
                 turn_id: None,
                 native_thread_id: Some(binding.native_thread_id.clone()),
-                native_turn_id: Some(native_turn_id.clone()),
+                native_turn_id: Some(native_turn_id),
                 limit: None,
             })
             .await?;
@@ -5265,10 +5653,17 @@ impl MessageProcessor {
         let Some(native_thread_id) = native_thread_id else {
             return false;
         };
-        if !self
+        let starting = self
             .cli_runtime_has_starting_turn_binding_without_native_turn(key, native_thread_id)
-            .await
-        {
+            .await;
+        let pending_root_segment = if starting {
+            false
+        } else {
+            self.active_codex_turn_binding_for_root_thread(key, native_thread_id)
+                .await
+                .is_some()
+        };
+        if !starting && !pending_root_segment {
             return false;
         }
         self.buffer_cli_runtime_codex_server_request_until_turn_binding(
@@ -5286,7 +5681,7 @@ impl MessageProcessor {
             thread_id = key.thread_id.as_str(),
             native_turn_id,
             method = request.method.as_str(),
-            "buffering Codex CLI runtime server request before Pioneer turn binding has native turn id"
+            "buffering Codex server request until its root execution segment is bound"
         );
         true
     }
@@ -5437,6 +5832,53 @@ impl MessageProcessor {
             .map(|binding| binding.turn_id)
     }
 
+    async fn cli_runtime_running_native_turn_id(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<String>> {
+        if binding.runtime_kind != "codex" {
+            return Ok(binding.native_turn_id.clone());
+        }
+        if let Some(segment) = self
+            .crud_store
+            .latest_running_cli_runtime_execution_segment_for_turn(binding.turn_id.as_str())
+            .await?
+        {
+            return Ok(Some(segment.native_turn_id));
+        }
+        if self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        Ok(binding.native_turn_id.clone())
+    }
+
+    async fn cli_runtime_latest_native_turn_id(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<String>> {
+        if binding.runtime_kind != "codex" {
+            return Ok(binding.native_turn_id.clone());
+        }
+        let Some(attempt) = self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await?
+        else {
+            return Ok(binding.native_turn_id.clone());
+        };
+        Ok(self
+            .crud_store
+            .latest_cli_runtime_execution_segment_for_attempt(attempt.id.as_str())
+            .await?
+            .map(|segment| segment.native_turn_id)
+            .or_else(|| binding.native_turn_id.clone()))
+    }
+
     async fn cli_runtime_turn_binding_for_native_turn(
         &self,
         instance: &CliSessionInstanceId,
@@ -5471,35 +5913,50 @@ impl MessageProcessor {
 
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
-            Ok(bindings) => {
-                let binding = bindings.into_iter().find(|binding| {
-                    binding.workspace_id == key.workspace_id
-                        && binding.runtime_id == key.runtime_id
-                        && binding.native_turn_id.as_deref() == Some(native_turn_id)
-                        && binding.native_thread_id == native_thread_id
-                });
-                let binding = binding?;
-                if !self
-                    .cli_runtime_attempt_accepts_native_activity(
-                        key,
-                        native_turn_id,
-                        "turn binding lookup",
-                    )
-                    .await
+            Ok(Some(owner)) => {
+                let binding = owner.binding;
+                if binding.workspace_id != key.workspace_id
+                    || binding.thread_id != key.thread_id
+                    || binding.native_thread_id != native_thread_id
+                    || !owner.attempt.status.is_active()
+                    || owner.segment.as_ref().is_some_and(|segment| {
+                        segment.status != pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+                    })
                 {
                     return None;
                 }
-                {
-                    self.cli_runtime_turn_binding_cache
-                        .lock()
-                        .await
-                        .insert(cache_key, binding.clone());
-                }
+                self.cli_runtime_turn_binding_cache
+                    .lock()
+                    .await
+                    .insert(cache_key, binding.clone());
                 Some(binding)
             }
+            Ok(None) => match self
+                .crud_store
+                .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+                .await
+            {
+                Ok(bindings) => bindings.into_iter().find(|binding| {
+                    binding.workspace_id == key.workspace_id
+                        && binding.runtime_id == key.runtime_id
+                        && binding.native_thread_id == native_thread_id
+                        && binding.native_turn_id.as_deref() == Some(native_turn_id)
+                }),
+                Err(error) => {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        native_turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to load legacy CLI runtime native turn binding"
+                    );
+                    None
+                }
+            },
             Err(error) => {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
@@ -5522,18 +5979,25 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .get_cli_runtime_turn_attempt_by_native_turn(key.runtime_id.as_str(), native_turn_id)
+            .resolve_cli_runtime_native_turn_owner(key.runtime_id.as_str(), native_turn_id)
             .await
         {
-            Ok(Some(attempt)) if attempt.status.is_active() => true,
-            Ok(Some(attempt)) => {
+            Ok(Some(owner))
+                if owner.attempt.status.is_active()
+                    && owner.segment.as_ref().is_none_or(|segment| {
+                        segment.status == pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+                    }) =>
+            {
+                true
+            }
+            Ok(Some(owner)) => {
                 debug!(
                     workspace_id = key.workspace_id.as_str(),
                     runtime_id = key.runtime_id.as_str(),
                     thread_id = key.thread_id.as_str(),
-                    turn_id = attempt.turn_id.as_str(),
+                    turn_id = owner.attempt.turn_id.as_str(),
                     native_turn_id,
-                    attempt_status = attempt.status.as_str(),
+                    attempt_status = owner.attempt.status.as_str(),
                     source,
                     "rejected native activity from a terminal CLI runtime attempt"
                 );
@@ -5559,18 +6023,14 @@ impl MessageProcessor {
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
     ) {
-        let Some(native_turn_id) = binding.native_turn_id.as_deref() else {
-            return;
-        };
         self.cli_runtime_turn_binding_cache
             .lock()
             .await
-            .retain(|key, _| {
+            .retain(|key, cached_binding| {
                 key.workspace_id != binding.workspace_id
                     || key.runtime_id != binding.runtime_id
                     || key.thread_id != binding.thread_id
-                    || key.native_thread_id != binding.native_thread_id
-                    || key.native_turn_id != native_turn_id
+                    || cached_binding.turn_id != binding.turn_id
             });
     }
 
@@ -5920,11 +6380,26 @@ impl MessageProcessor {
                     binding.native_thread_id
                 );
             }
-            if binding.native_turn_id.as_deref() != Some(native_turn_id) {
-                anyhow::bail!(
-                    "request native turn `{native_turn_id}` does not match binding native turn `{:?}`",
-                    binding.native_turn_id
-                );
+            let owner = self
+                .crud_store
+                .resolve_cli_runtime_native_turn_owner(binding.runtime_id.as_str(), native_turn_id)
+                .await?;
+            match owner {
+                Some(owner)
+                    if owner.binding.turn_id == binding.turn_id
+                        && owner.attempt.turn_id == binding.turn_id
+                        && owner.attempt.status.is_active()
+                        && owner.segment.as_ref().is_none_or(|segment| {
+                            segment.status
+                                == pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+                        }) => {}
+                None if binding.native_turn_id.as_deref() == Some(native_turn_id) => {}
+                _ => {
+                    anyhow::bail!(
+                        "request native turn `{native_turn_id}` is not active for binding `{}`",
+                        binding.turn_id
+                    );
+                }
             }
         }
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
@@ -6275,13 +6750,35 @@ impl MessageProcessor {
                 return;
             }
         };
+        let native_turn_id = match self.cli_runtime_latest_native_turn_id(binding).await {
+            Ok(native_turn_id) => native_turn_id,
+            Err(error) => {
+                warn!(
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to resolve latest CLI runtime segment during terminal cleanup"
+                );
+                binding.native_turn_id.clone()
+            }
+        };
 
         if let Some(handle) = manager.existing_session(&key).await {
             let session = handle.session();
             if let Err(error) = session
+                .clear_native_thread_goal(binding.native_thread_id.as_str())
+                .await
+            {
+                debug!(
+                    turn_id = binding.turn_id.as_str(),
+                    reason,
+                    error = %format!("{error:#}"),
+                    "failed to clear native Goal during terminal cleanup"
+                );
+            }
+            if let Err(error) = session
                 .interrupt_turn(
                     Some(binding.native_thread_id.as_str()),
-                    binding.native_turn_id.as_deref(),
+                    native_turn_id.as_deref(),
                 )
                 .await
             {
@@ -6290,7 +6787,7 @@ impl MessageProcessor {
                     runtime_id = binding.runtime_id.as_str(),
                     thread_id = binding.thread_id.as_str(),
                     turn_id = binding.turn_id.as_str(),
-                    native_turn_id = binding.native_turn_id.as_deref(),
+                    native_turn_id = native_turn_id.as_deref(),
                     reason,
                     error = %format!("{error:#}"),
                     "failed to interrupt CLI runtime turn during terminal cleanup"
@@ -6302,7 +6799,7 @@ impl MessageProcessor {
             .cli_runtime_has_active_other_turn_binding(
                 &key,
                 Some(binding.native_thread_id.as_str()),
-                binding.native_turn_id.as_deref(),
+                native_turn_id.as_deref(),
             )
             .await
         {
@@ -6311,7 +6808,7 @@ impl MessageProcessor {
                 runtime_id = binding.runtime_id.as_str(),
                 thread_id = binding.thread_id.as_str(),
                 turn_id = binding.turn_id.as_str(),
-                native_turn_id = binding.native_turn_id.as_deref(),
+                native_turn_id = native_turn_id.as_deref(),
                 reason,
                 "kept CLI runtime session open during terminal cleanup because another turn binding is active"
             );
@@ -8677,6 +9174,8 @@ fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
         RuntimeEvent::Raw(raw) => raw.native_method.clone(),
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed".to_owned(),
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed".to_owned(),
+        RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated".to_owned(),
+        RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared".to_owned(),
         RuntimeEvent::TurnStarted(_) => "turn_started".to_owned(),
         RuntimeEvent::TurnCompleted(_) => "turn_completed".to_owned(),
         RuntimeEvent::TurnFailed(_) => "turn_failed".to_owned(),
@@ -8700,6 +9199,7 @@ fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
 fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
     match event {
         RuntimeEvent::TurnStarted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::ThreadGoalUpdated(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::TurnCompleted(event) => Some(event.native_turn_id.as_str()),
         RuntimeEvent::TurnFailed(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::TurnInterrupted(event) => Some(event.native_turn_id.as_str()),
@@ -8716,6 +9216,7 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
         RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadStateChanged(_)
+        | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::RequestResolved(_)
         | RuntimeEvent::AccountUpdated(_)
         | RuntimeEvent::AppListUpdated(_) => None,
@@ -8737,6 +9238,8 @@ fn cli_runtime_native_item_id_for_event(event: &RuntimeEvent) -> Option<&str> {
 fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> {
     match event {
         RuntimeEvent::ThreadStateChanged(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ThreadGoalUpdated(event) => Some(event.native_thread_id.as_str()),
+        RuntimeEvent::ThreadGoalCleared(event) => Some(event.native_thread_id.as_str()),
         RuntimeEvent::TurnStarted(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::TurnCompleted(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::TurnFailed(event) => event.native_thread_id.as_deref(),
@@ -8808,6 +9311,8 @@ fn cli_runtime_event_confirms_recovery(event: &RuntimeEvent) -> bool {
         }
         RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadStateChanged(_)
+        | RuntimeEvent::ThreadGoalUpdated(_)
+        | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::TurnStarted(_)
         | RuntimeEvent::TurnFailed(_)
         | RuntimeEvent::TurnInterrupted(_)
@@ -8835,6 +9340,47 @@ fn cli_runtime_turn_binding_status_is_active(status: &str) -> bool {
         crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
             | crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
     )
+}
+
+fn cli_runtime_native_goal_keeps_turn_open(
+    binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> bool {
+    binding.native_goal_observed_at.is_some()
+        && binding.native_goal_status.as_deref() != Some("complete")
+        && binding.native_goal_status.is_some()
+}
+
+fn cli_runtime_native_goal_status_for_storage(
+    status: pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus,
+) -> &'static str {
+    match status {
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::Active => "active",
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::Paused => "paused",
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::Blocked => "blocked",
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::UsageLimited => "usage_limited",
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::BudgetLimited => {
+            "budget_limited"
+        }
+        pioneer_cli_agent_runtime::event::RuntimeThreadGoalStatus::Complete => "complete",
+    }
+}
+
+fn cli_runtime_execution_segment_accepts_event(
+    segment: &pioneer_crud::CliRuntimeExecutionSegmentRecord,
+    event: &RuntimeEvent,
+) -> bool {
+    match segment.status {
+        pioneer_crud::CliRuntimeExecutionSegmentStatus::Running => true,
+        pioneer_crud::CliRuntimeExecutionSegmentStatus::Completed => {
+            matches!(event, RuntimeEvent::TurnCompleted(_))
+        }
+        pioneer_crud::CliRuntimeExecutionSegmentStatus::Failed => {
+            matches!(event, RuntimeEvent::TurnFailed(_) | RuntimeEvent::Error(_))
+        }
+        pioneer_crud::CliRuntimeExecutionSegmentStatus::Interrupted => {
+            matches!(event, RuntimeEvent::TurnInterrupted(_))
+        }
+    }
 }
 
 fn cli_runtime_turn_binding_matches_native_activity(

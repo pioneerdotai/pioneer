@@ -62,6 +62,7 @@ pub use super::thread_timeline_projection_meta::Entity as ThreadTimelineProjecti
 pub use super::turn::Entity as Turn;
 pub use super::turn_cli_runtime_attempt::Entity as TurnCliRuntimeAttempt;
 pub use super::turn_cli_runtime_binding::Entity as TurnCliRuntimeBinding;
+pub use super::turn_cli_runtime_execution_segment::Entity as TurnCliRuntimeExecutionSegment;
 pub use super::turn_cli_runtime_instruction::Entity as TurnCliRuntimeInstruction;
 pub use super::turn_event::Entity as TurnEvent;
 pub use super::turn_event_projection_state::Entity as TurnEventProjectionState;
