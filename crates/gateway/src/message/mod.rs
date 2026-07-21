@@ -14,7 +14,7 @@ mod memory_handlers;
 mod notifications;
 mod permission_handlers;
 mod provider_handlers;
-mod skills;
+pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
 mod task_artifacts;
@@ -577,6 +577,7 @@ impl MessageProcessor {
             RecoveryPolicyRegistry::with_command_execution_timeout_config(
                 resilience_config.command_execution_timeout,
             ),
+            normalized_tool_loop_config.clone(),
         ));
         let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
             resilience_config
@@ -1741,12 +1742,53 @@ impl MessageProcessor {
         &self,
         plan: &crate::cli_runtime::skills::CliRuntimeSkillInstallPlan,
     ) -> anyhow::Result<crate::cli_runtime::skills::CliRuntimeSkillInstallResult> {
+        let candidates = self
+            .external_runtime_receipt_conversion_candidates()
+            .await?;
         crate::cli_runtime::skills::install_one_cli_runtime_skill(
             &self.cli_runtime_skill_destination_locks,
             &self.skills_write_lock,
+            candidates.as_slice(),
             plan,
         )
         .await
+    }
+
+    pub(crate) async fn external_runtime_receipt_conversion_candidates(
+        &self,
+    ) -> anyhow::Result<Vec<pioneer_skills::ExternalRuntimeReceiptConversionCandidate>> {
+        let mut candidates = self
+            .crud_store
+            .list_skill_installations()
+            .await?
+            .into_iter()
+            .map(
+                |row| pioneer_skills::ExternalRuntimeReceiptConversionCandidate {
+                    skill_id: row.skill_id,
+                    owner: row.owner,
+                    slug: row.slug,
+                    source_kind: row.source_kind,
+                },
+            )
+            .collect::<Vec<_>>();
+        for bundled in
+            crate::system_skills::bundled_system_skill_catalog_entries(std::path::Path::new(""))?
+        {
+            if candidates
+                .iter()
+                .any(|candidate| candidate.skill_id == bundled.skill_id)
+            {
+                continue;
+            }
+            candidates.push(pioneer_skills::ExternalRuntimeReceiptConversionCandidate {
+                skill_id: bundled.skill_id,
+                owner: bundled.owner,
+                slug: bundled.slug,
+                source_kind: "system".to_owned(),
+            });
+        }
+        candidates.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+        Ok(candidates)
     }
 
     pub(crate) async fn acquire_skill_upload_lock(&self, upload_id: &str) -> OwnedMutexGuard<()> {
@@ -2181,12 +2223,6 @@ impl MessageProcessor {
             "openai",
             Arc::new(pioneer_provider::providers::EchoProvider::new()),
         ));
-        let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
-            crud_store.clone(),
-            agent_manager.clone(),
-            provider_registry.clone(),
-            RecoveryPolicyRegistry::default(),
-        ));
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
             Ok(duration) => duration.as_secs(),
@@ -2255,6 +2291,9 @@ impl MessageProcessor {
                 registry_roots: vec![
                     "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
                 ],
+                system_import_roots: Vec::new(),
+                user_import_roots: Vec::new(),
+                registry_import_roots: Vec::new(),
                 validation: pioneer_agent::SkillsValidationLoopConfig {
                     strict_agentskills: true,
                     accept_openclaw_profile: true,
@@ -2300,6 +2339,13 @@ impl MessageProcessor {
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
         }
         .normalized();
+        let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
+            crud_store.clone(),
+            agent_manager.clone(),
+            provider_registry.clone(),
+            RecoveryPolicyRegistry::default(),
+            normalized_tool_loop_config.clone(),
+        ));
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =

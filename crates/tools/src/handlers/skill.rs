@@ -16,6 +16,7 @@ use crate::spec::{
     DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ToolPermissionMetadata,
 };
 use async_trait::async_trait;
+use pioneer_protocol::SkillId;
 use pioneer_skills::{DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ pub enum SkillDynamicToolKind {
 #[derive(Debug, Clone)]
 pub struct SkillDynamicToolDescriptor {
     pub canonical_tool_name: String,
+    pub skill_id: SkillId,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub skill_asset_root: String,
     pub skill_fingerprint: String,
@@ -53,6 +56,8 @@ pub struct SkillDynamicToolDescriptor {
 
 #[derive(Debug, Clone)]
 pub struct SkillReadToolEntry {
+    pub skill_id: SkillId,
+    pub owner: Option<String>,
     pub slug: String,
     pub name: String,
     pub description: String,
@@ -258,6 +263,8 @@ fn permission_metadata_for_descriptor(
                 SkillDynamicToolKind::Shell => DynamicSkillPermissionKind::Shell,
                 SkillDynamicToolKind::FunctionProxy => DynamicSkillPermissionKind::FunctionProxy,
             },
+            skill_id: descriptor.skill_id.clone(),
+            skill_owner: descriptor.skill_owner.clone(),
             skill_slug: descriptor.skill_slug.clone(),
             source_kind: format!("{:?}", descriptor.source_kind),
             trust_level: format!("{:?}", descriptor.trust_level),
@@ -302,6 +309,7 @@ fn dynamic_policy_context(
 
     DynamicToolPolicyContext {
         canonical_tool_name: descriptor.canonical_tool_name.clone(),
+        skill_id: descriptor.skill_id.clone(),
         skill_slug: descriptor.skill_slug.clone(),
         skill_fingerprint: descriptor.skill_fingerprint.clone(),
         source_kind: descriptor.source_kind.clone(),
@@ -386,14 +394,14 @@ fn read_skill_spec() -> ConfiguredToolSpec {
     ConfiguredToolSpec::new(
         ToolSpec::new(
             READ_SKILL_TOOL_NAME,
-            "Read full instructions and skill_asset_root for an active skill by its exact source-qualified slug. Relative paths in the returned skill body resolve under skill_asset_root.",
+            "Read full instructions and skill_asset_root for an active skill by its exact skill:<skill_id> reference. Relative paths in the returned skill body resolve under skill_asset_root.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "slug": {
+                    "skill_id": {
                         "type": "string",
-                        "description": "Exact skill slug from the Skills prompt in source:owner/slug format, for example \"system:pioneer/browser\". Do not pass owner/slug, the short slug, or the display name alone.",
-                        "pattern": "^(?:system|user|registry):[^/\\s:]+/[^/\\s:]+$"
+                        "description": "Exact opaque skill reference from the Skills prompt, for example \"skill:mvg02zVNGWuw5z5C4nYDo\". Never reconstruct it from owner, slug, name, or display label.",
+                        "pattern": "^skill:[A-Za-z0-9]{21}$"
                     },
                     "max_chars": {
                         "type": "integer",
@@ -405,7 +413,7 @@ fn read_skill_spec() -> ConfiguredToolSpec {
                         "description": "Whether to include skill metadata before the body."
                     }
                 },
-                "required": ["slug"],
+                "required": ["skill_id"],
                 "additionalProperties": false
             }),
             PayloadKind::Function,
@@ -421,37 +429,19 @@ struct ReadSkillHandler {
 }
 
 impl ReadSkillHandler {
-    fn resolve_requested_slug(&self, requested: &str) -> Result<String, ToolError> {
-        if self.read_skill_index.contains_key(requested) {
-            return Ok(requested.to_owned());
-        }
-
-        if is_source_qualified_skill_slug(requested) {
-            return Ok(requested.to_owned());
-        }
-
-        Err(ToolError::invalid_arguments(
-            "`slug` must be the exact source-qualified skill slug from the Skills prompt, in source:owner/slug format",
-        ))
+    fn resolve_requested_skill_id(&self, requested: &str) -> Result<String, ToolError> {
+        let Some(raw_id) = requested.strip_prefix("skill:") else {
+            return Err(ToolError::invalid_arguments(
+                "`skill_id` must be the exact `skill:<skill_id>` reference from the Skills prompt",
+            ));
+        };
+        let skill_id = SkillId::new(raw_id).map_err(|_| {
+            ToolError::invalid_arguments(
+                "`skill_id` must be the exact `skill:<skill_id>` reference from the Skills prompt",
+            )
+        })?;
+        Ok(format!("skill:{skill_id}"))
     }
-}
-
-fn is_source_qualified_skill_slug(value: &str) -> bool {
-    let Some((source, qualified_slug)) = value.split_once(':') else {
-        return false;
-    };
-    if !matches!(source, "system" | "user" | "registry") || qualified_slug.contains(':') {
-        return false;
-    }
-
-    let Some((owner, slug)) = qualified_slug.split_once('/') else {
-        return false;
-    };
-    !owner.is_empty()
-        && !slug.is_empty()
-        && !owner.chars().any(|ch| ch.is_whitespace() || ch == '/')
-        && !slug.chars().any(char::is_whitespace)
-        && !slug.contains('/')
 }
 
 #[async_trait]
@@ -463,16 +453,16 @@ impl ToolHandler for ReadSkillHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let arguments = function_arguments(&invocation)?;
 
-        let slug = arguments
-            .get("slug")
+        let skill_id = arguments
+            .get("skill_id")
             .and_then(JsonValue::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.strip_prefix('$').unwrap_or(value))
             .map(str::to_owned)
-            .ok_or_else(|| ToolError::invalid_arguments("`slug` is required"))?;
+            .ok_or_else(|| ToolError::invalid_arguments("`skill_id` is required"))?;
 
-        let slug = self.resolve_requested_slug(slug.as_str())?;
+        let skill_id = self.resolve_requested_skill_id(skill_id.as_str())?;
 
         let include_metadata = arguments
             .get("include_metadata")
@@ -486,9 +476,9 @@ impl ToolHandler for ReadSkillHandler {
             .unwrap_or(self.default_max_chars)
             .clamp(1, self.default_max_chars.max(1));
 
-        let Some(entry) = self.read_skill_index.get(slug.as_str()) else {
+        let Some(entry) = self.read_skill_index.get(skill_id.as_str()) else {
             return Err(ToolError::Rejected(format!(
-                "skill `{slug}` is not active for this turn"
+                "skill `{skill_id}` is not active for this turn"
             )));
         };
 
@@ -501,6 +491,8 @@ impl ToolHandler for ReadSkillHandler {
 
         let payload = if include_metadata {
             serde_json::json!({
+                "skill_id": entry.skill_id,
+                "owner": entry.owner,
                 "slug": entry.slug,
                 "name": entry.name,
                 "description": entry.description,
@@ -513,6 +505,7 @@ impl ToolHandler for ReadSkillHandler {
             })
         } else {
             serde_json::json!({
+                "skill_id": entry.skill_id,
                 "slug": entry.slug,
                 "skill_asset_root": entry.skill_asset_root,
                 "relative_path_resolution": "Resolve relative file paths mentioned by this skill under skill_asset_root. Prefer absolute paths built from skill_asset_root for commands and file operations.",
@@ -866,7 +859,7 @@ mod tests {
         ToolRecoveryMetadata,
     };
     use pioneer_protocol::{
-        TurnExecutionSecuritySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        SkillId, TurnExecutionSecuritySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
         TurnPermissionProfileSource,
     };
     use pioneer_skills::{SkillSourceKind, SkillTrustLevel};
@@ -874,30 +867,28 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    fn read_skill_entry(slug: &str, name: &str) -> SkillReadToolEntry {
-        let source_kind = slug
-            .split_once(':')
-            .map(|(source, _)| source)
-            .unwrap_or("user")
-            .to_owned();
+    fn read_skill_entry(skill_id: &str, slug: &str, name: &str) -> SkillReadToolEntry {
+        let skill_id = SkillId::new(skill_id).expect("valid read-skill fixture ID");
         SkillReadToolEntry {
+            skill_id,
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: name.to_owned(),
             description: "Skill description".to_owned(),
             body: "Skill body".to_owned(),
-            skill_asset_root: format!("/tmp/pioneer-skills/{source_kind}/workspace/weather"),
+            skill_asset_root: "/tmp/pioneer-skills/user/workspace/weather".to_owned(),
             fingerprint: "fingerprint".to_owned(),
-            source_kind,
+            source_kind: "user".to_owned(),
         }
     }
 
-    fn read_skill_invocation(slug: &str) -> ToolInvocation {
+    fn read_skill_invocation(skill_ref: &str) -> ToolInvocation {
         ToolInvocation {
             call_id: "call_1".to_owned(),
             tool_name: "read_skill".to_owned(),
             source: ToolCallSource::Model,
             payload: ToolPayload::Function {
-                arguments: json!({ "slug": slug }),
+                arguments: json!({ "skill_id": skill_ref }),
             },
             workdir: PathBuf::from("."),
             environment: Default::default(),
@@ -914,6 +905,8 @@ mod tests {
         SkillHttpToolHandler {
             descriptor: SkillDynamicToolDescriptor {
                 canonical_tool_name: "skill_weather_http".to_owned(),
+                skill_id: SkillId::new("HHHHHHHHHHHHHHHHHHHHH").expect("valid HTTP test SkillId"),
+                skill_owner: Some("workspace".to_owned()),
                 skill_slug: "user:workspace/weather".to_owned(),
                 skill_asset_root: "/tmp/skill-weather".to_owned(),
                 skill_fingerprint: "fingerprint".to_owned(),
@@ -972,35 +965,32 @@ mod tests {
     }
 
     #[test]
-    fn read_skill_schema_points_model_to_exact_qualified_slug() {
+    fn read_skill_schema_points_model_to_exact_skill_id() {
         let spec = read_skill_spec();
-        let slug = &spec.spec.parameters["properties"]["slug"];
+        let skill_id = &spec.spec.parameters["properties"]["skill_id"];
 
-        assert_eq!(
-            slug["pattern"],
-            r"^(?:system|user|registry):[^/\s:]+/[^/\s:]+$"
-        );
+        assert_eq!(skill_id["pattern"], r"^skill:[A-Za-z0-9]{21}$");
         assert!(
-            slug["description"]
+            skill_id["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("source:owner/slug")
+                .contains("skill:mvg02zVNGWuw5z5C4nYDo")
         );
         assert!(
-            slug["description"]
+            skill_id["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Do not pass owner/slug")
+                .contains("Never reconstruct")
         );
         assert!(spec.spec.description.contains("skill_asset_root"));
     }
 
     #[tokio::test]
-    async fn read_skill_handler_rejects_short_slug() {
+    async fn read_skill_handler_rejects_presentation_slug() {
         let mut index = HashMap::<String, SkillReadToolEntry>::new();
         index.insert(
-            "user:workspace/weather".to_owned(),
-            read_skill_entry("user:workspace/weather", "weather"),
+            "skill:TTTTTTTTTTTTTTTTTTTTT".to_owned(),
+            read_skill_entry("TTTTTTTTTTTTTTTTTTTTT", "weather", "weather"),
         );
         let handler = ReadSkillHandler {
             read_skill_index: index,
@@ -1015,10 +1005,10 @@ mod tests {
             .await;
 
         let error = match result {
-            Ok(_) => panic!("short slug should fail"),
+            Ok(_) => panic!("presentation slug should fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("source:owner/slug"));
+        assert!(error.to_string().contains("skill:<skill_id>"));
     }
 
     #[tokio::test]
@@ -1087,12 +1077,12 @@ mod tests {
     async fn read_skill_handler_rejects_owner_slug() {
         let mut index = HashMap::<String, SkillReadToolEntry>::new();
         index.insert(
-            "system:workspace/weather".to_owned(),
-            read_skill_entry("system:workspace/weather", "weather"),
+            "skill:SSSSSSSSSSSSSSSSSSSSS".to_owned(),
+            read_skill_entry("SSSSSSSSSSSSSSSSSSSSS", "weather", "weather"),
         );
         index.insert(
-            "user:workspace/weather".to_owned(),
-            read_skill_entry("user:workspace/weather", "weather"),
+            "skill:UUUUUUUUUUUUUUUUUUUUU".to_owned(),
+            read_skill_entry("UUUUUUUUUUUUUUUUUUUUU", "weather", "weather"),
         );
         let handler = ReadSkillHandler {
             read_skill_index: index,
@@ -1110,19 +1100,19 @@ mod tests {
             Ok(_) => panic!("owner/slug should fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("source:owner/slug"));
+        assert!(error.to_string().contains("skill:<skill_id>"));
     }
 
     #[tokio::test]
-    async fn read_skill_handler_accepts_exact_source_qualified_slug() {
+    async fn read_skill_handler_accepts_exact_id_among_duplicate_labels() {
         let mut index = HashMap::<String, SkillReadToolEntry>::new();
         index.insert(
-            "system:workspace/weather".to_owned(),
-            read_skill_entry("system:workspace/weather", "weather"),
+            "skill:SSSSSSSSSSSSSSSSSSSSS".to_owned(),
+            read_skill_entry("SSSSSSSSSSSSSSSSSSSSS", "weather", "weather"),
         );
         index.insert(
-            "user:workspace/weather".to_owned(),
-            read_skill_entry("user:workspace/weather", "weather"),
+            "skill:UUUUUUUUUUUUUUUUUUUUU".to_owned(),
+            read_skill_entry("UUUUUUUUUUUUUUUUUUUUU", "weather", "weather"),
         );
         let handler = ReadSkillHandler {
             read_skill_index: index,
@@ -1131,22 +1121,23 @@ mod tests {
 
         let output = handler
             .handle(
-                read_skill_invocation("system:workspace/weather"),
+                read_skill_invocation("skill:SSSSSSSSSSSSSSSSSSSSS"),
                 crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
             )
             .await
-            .expect("exact source-qualified slug should resolve");
+            .expect("exact SkillId should resolve");
 
-        assert_eq!(output.raw_json()["slug"], "system:workspace/weather");
+        assert_eq!(output.raw_json()["skill_id"], "SSSSSSSSSSSSSSSSSSSSS");
+        assert_eq!(output.raw_json()["slug"], "weather");
         assert_eq!(
             output.raw_json()["skill_asset_root"],
-            "/tmp/pioneer-skills/system/workspace/weather"
+            "/tmp/pioneer-skills/user/workspace/weather"
         );
-        assert_eq!(output.raw_json()["source_kind"], "system");
+        assert_eq!(output.raw_json()["source_kind"], "user");
     }
 
     #[tokio::test]
-    async fn read_skill_handler_rejects_unknown_slug() {
+    async fn read_skill_handler_rejects_unknown_id() {
         let handler = ReadSkillHandler {
             read_skill_index: HashMap::<String, SkillReadToolEntry>::new(),
             default_max_chars: 1024,
@@ -1154,13 +1145,13 @@ mod tests {
 
         let result = handler
             .handle(
-                read_skill_invocation("system:missing/skill"),
+                read_skill_invocation("skill:MMMMMMMMMMMMMMMMMMMMM"),
                 crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
             )
             .await;
 
         let error = match result {
-            Ok(_) => panic!("inactive exact source-qualified slug should fail"),
+            Ok(_) => panic!("inactive exact SkillId should fail"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("not active"));

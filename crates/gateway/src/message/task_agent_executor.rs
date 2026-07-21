@@ -411,6 +411,14 @@ impl TaskAgentExecutor {
             .context("failed to mark task run execution running")?;
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let skill_catalog = processor
+            .validate_turn_skill_capabilities(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|message| anyhow!(message))
+            .context("failed to validate hidden task skill capabilities")?;
         let resolved_artifacts = processor
             .resolve_provider_artifact_inputs(
                 task.workspace_id.as_str(),
@@ -469,6 +477,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
+                skill_catalog,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -922,6 +931,14 @@ impl TaskAgentExecutor {
             .context("failed to mark revision task run execution running")?;
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let skill_catalog = processor
+            .validate_turn_skill_capabilities(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|message| anyhow!(message))
+            .context("failed to validate revision task skill capabilities")?;
         let resolved_artifacts = processor
             .resolve_provider_artifact_inputs(
                 task.workspace_id.as_str(),
@@ -994,6 +1011,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
+                skill_catalog,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -1269,6 +1287,14 @@ impl TaskAgentExecutor {
         }
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let skill_catalog = processor
+            .validate_turn_skill_capabilities(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|message| anyhow!(message))
+            .context("failed to validate restored task skill capabilities")?;
         let resolved_artifacts = processor
             .resolve_provider_artifact_inputs(
                 task.workspace_id.as_str(),
@@ -1323,6 +1349,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
+                skill_catalog,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -2004,6 +2031,14 @@ impl TaskAgentExecutor {
             .map_err(|error| anyhow!("failed to prepare reviewer agent runtime: {error}"))?;
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let skill_catalog = processor
+            .validate_turn_skill_capabilities(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|message| anyhow!(message))
+            .context("failed to validate reviewer task skill capabilities")?;
         let resolved_artifacts = processor
             .resolve_provider_artifact_inputs(
                 task.workspace_id.as_str(),
@@ -2062,6 +2097,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
+                skill_catalog,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -4803,7 +4839,7 @@ async fn load_workspace_skill_policies(
             .into_iter()
             .map(|record| {
                 (
-                    pioneer_skills::SkillPolicyKey::new(record.skill_slug, record.source_kind),
+                    pioneer_skills::SkillPolicyKey::new(record.skill_id),
                     pioneer_agent::WorkspaceSkillPolicy {
                         enabled: record.enabled,
                         allow_implicit_invocation: record.allow_implicit_invocation,
@@ -5206,6 +5242,9 @@ mod tests {
                 system_roots: Vec::new(),
                 user_roots: Vec::new(),
                 registry_roots: Vec::new(),
+                system_import_roots: Vec::new(),
+                user_import_roots: Vec::new(),
+                registry_import_roots: Vec::new(),
                 validation: SkillsValidationLoopConfig {
                     strict_agentskills: true,
                     accept_openclaw_profile: true,

@@ -10,6 +10,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub turn_id: Option<String>,
+    pub skill_id: String,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub action: String,

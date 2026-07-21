@@ -109,20 +109,12 @@ impl PioneerDesktop {
     pub(crate) fn render_skill_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        let selected_skill = self
-            .selected_skill_target
-            .as_ref()
-            .and_then(|(slug, source_kind)| {
-                skill_catalog::find_skill(
-                    self.installed_skills.as_slice(),
-                    slug.as_str(),
-                    source_kind.as_str(),
-                )
-                .cloned()
-            });
-        let is_pending = selected_skill.as_ref().is_some_and(|skill| {
-            self.is_skill_pending(skill.slug.as_str(), skill.source_kind.as_str())
+        let selected_skill = self.selected_skill_target.as_ref().and_then(|skill_id| {
+            skill_catalog::find_skill(self.installed_skills.as_slice(), skill_id).cloned()
         });
+        let is_pending = selected_skill
+            .as_ref()
+            .is_some_and(|skill| self.is_skill_pending(&skill.skill_id));
         let lifecycle_editable = selected_skill
             .as_ref()
             .is_some_and(|skill| skill.install.lifecycle_editable);
@@ -218,8 +210,7 @@ impl PioneerDesktop {
                                         };
                                         let _ = desktop_entity.update(cx, |view, cx| {
                                             view.open_skill_update_dialog(
-                                                selected_skill.slug.clone(),
-                                                selected_skill.source_kind.clone(),
+                                                selected_skill.skill_id.clone(),
                                                 window,
                                                 cx,
                                             );
@@ -266,8 +257,7 @@ impl PioneerDesktop {
                                         };
                                         let _ = desktop_entity.update(cx, |view, cx| {
                                             view.uninstall_skill(
-                                                selected_skill.slug.clone(),
-                                                selected_skill.source_kind.clone(),
+                                                selected_skill.skill_id.clone(),
                                                 cx,
                                             );
                                             cx.notify();

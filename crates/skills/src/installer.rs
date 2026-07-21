@@ -1,7 +1,5 @@
 use crate::audit::{SkillAuditAction, SkillAuditDecision, SkillAuditEvent};
-use crate::contract::{
-    SkillSourceKind, parse_skill_from_file, qualified_skill_slug, split_qualified_skill_slug,
-};
+use crate::contract::{SkillSourceKind, parse_skill_from_file};
 use crate::dependencies::{
     DependencyCheckInput, DependencyCheckResult, evaluate_skill_dependencies,
 };
@@ -11,8 +9,10 @@ use crate::provenance::{
 };
 use crate::security::{SkillSecurityPolicy, ensure_install_path_contained, scan_skill_directory};
 use anyhow::{Context, Result, bail};
+use pioneer_protocol::SkillId;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,7 @@ impl Default for SkillInstallerPolicy {
 
 #[derive(Debug, Clone)]
 pub struct InstallSkillRequest {
+    pub skill_id: SkillId,
     pub source_kind: SkillSourceKind,
     pub source_ref: String,
     pub source_path: PathBuf,
@@ -47,18 +48,27 @@ pub struct InstallSkillRequest {
 
 #[derive(Debug, Clone)]
 pub struct UpdateSkillRequest {
+    pub skill_id: SkillId,
     pub source_kind: SkillSourceKind,
     pub source_ref: String,
     pub source_path: PathBuf,
     pub install_root: PathBuf,
     pub lock_path: PathBuf,
+    pub previous: PreviousSkillInstallation,
     pub expected_previous_fingerprint: Option<String>,
     pub now_unix: i64,
     pub policy: SkillInstallerPolicy,
 }
 
 #[derive(Debug, Clone)]
+pub struct PreviousSkillInstallation {
+    pub managed_install_path: Option<PathBuf>,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PrepareMaterializedSkillRequest {
+    pub skill_id: SkillId,
     pub source_kind: SkillSourceKind,
     pub source_ref: String,
     pub materialized_source_path: PathBuf,
@@ -81,6 +91,7 @@ pub struct CommitPreparedSkillRequest {
     pub prepared: PreparedMaterializedSkill,
     pub install_root: PathBuf,
     pub lock_path: PathBuf,
+    pub previous: Option<PreviousSkillInstallation>,
     pub expected_previous_fingerprint: Option<String>,
     pub now_unix: i64,
     pub policy: SkillInstallerPolicy,
@@ -88,8 +99,12 @@ pub struct CommitPreparedSkillRequest {
 
 #[derive(Debug, Clone)]
 pub struct UninstallSkillRequest {
+    pub skill_id: SkillId,
+    pub owner: Option<String>,
     pub slug: String,
-    pub source_kind: SkillSourceKind,
+    pub source_kind: String,
+    pub install_path: PathBuf,
+    pub remove_install_path: bool,
     pub install_root: PathBuf,
     pub lock_path: PathBuf,
     pub now_unix: i64,
@@ -104,6 +119,14 @@ pub struct InstallSkillResult {
     pub security_report: crate::security::SecurityScanReport,
     pub lock_entry: SkillLockEntry,
     pub audit_events: Vec<SkillAuditEvent>,
+    prepared_commit_rollback: Option<PreparedCommitRollback>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCommitRollback {
+    previous_path: Option<PathBuf>,
+    backup_path: Option<PathBuf>,
+    previous_lock_entry: Option<SkillLockEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +148,7 @@ pub fn install_skill(request: InstallSkillRequest) -> Result<InstallSkillResult>
     };
 
     let install_result =
-        install_from_staging(InstallOperation::Install, &request, staging_dir, None);
+        commit_staged_skill(InstallOperation::Install, &request, staging_dir, None, None);
 
     if install_result.is_err() {
         cleanup_staging(request.install_root.as_path());
@@ -138,6 +161,7 @@ pub fn update_skill(request: UpdateSkillRequest) -> Result<InstallSkillResult> {
     cleanup_staging(request.install_root.as_path());
 
     let install_request = InstallSkillRequest {
+        skill_id: request.skill_id,
         source_kind: request.source_kind.clone(),
         source_ref: request.source_ref.clone(),
         source_path: request.source_path.clone(),
@@ -155,10 +179,11 @@ pub fn update_skill(request: UpdateSkillRequest) -> Result<InstallSkillResult> {
         }
     };
 
-    let install_result = install_from_staging(
+    let install_result = commit_staged_skill(
         InstallOperation::Update,
         &install_request,
         staging_dir,
+        Some(request.previous),
         request.expected_previous_fingerprint.clone(),
     );
 
@@ -172,62 +197,35 @@ pub fn update_skill(request: UpdateSkillRequest) -> Result<InstallSkillResult> {
 pub fn uninstall_skill(request: UninstallSkillRequest) -> Result<UninstallSkillResult> {
     cleanup_staging(request.install_root.as_path());
 
-    if split_qualified_skill_slug(request.slug.as_str()).is_none() {
-        bail!("cannot uninstall skill: slug must use owner/slug");
-    }
-
     let mut lock = read_skills_lock(request.lock_path.as_path())?;
 
-    let source_kind = request.source_kind.as_db_value().to_owned();
-
-    let lock_entry = find_lock_entry(&lock, request.slug.as_str(), source_kind.as_str())
-        .cloned()
-        .with_context(|| {
-            format!(
-                "cannot uninstall skill `{}` ({source_kind}): lock entry was not found",
-                request.slug
-            )
-        })?;
-
-    let resolved_path = PathBuf::from(lock_entry.install_path.as_str());
-
-    let containment =
-        ensure_install_path_contained(request.install_root.as_path(), resolved_path.as_path());
-    if containment.has_blocking_findings() {
-        bail!("uninstall blocked by containment policy");
-    }
-
-    let removed_path = if resolved_path.exists() {
-        if resolved_path.is_dir() {
-            fs::remove_dir_all(resolved_path.as_path()).with_context(|| {
-                format!(
-                    "failed to remove installed skill directory `{}`",
-                    resolved_path.display()
-                )
-            })?;
-        } else {
-            fs::remove_file(resolved_path.as_path()).with_context(|| {
-                format!(
-                    "failed to remove installed skill path `{}`",
-                    resolved_path.display()
-                )
-            })?;
+    let removed_path = if request.remove_install_path {
+        let containment = ensure_install_path_contained(
+            request.install_root.as_path(),
+            request.install_path.as_path(),
+        );
+        if containment.has_blocking_findings() {
+            bail!("uninstall blocked by containment policy");
         }
-        Some(resolved_path.clone())
+        remove_path_if_present(request.install_path.as_path())?
+            .then(|| request.install_path.clone())
     } else {
         None
     };
 
-    let removed_lock = remove_lock_entry(&mut lock, request.slug.as_str(), source_kind.as_str());
+    let removed_lock = remove_lock_entry(&mut lock, &request.skill_id);
     write_skills_lock_atomic(request.lock_path.as_path(), &lock)?;
 
     let audit_event = SkillAuditEvent::uninstall(
-        request.slug.clone(),
-        source_kind.clone(),
+        request.skill_id,
+        request.owner,
+        request.slug,
+        request.source_kind,
         serde_json::json!({
-            "install_path": resolved_path.display().to_string(),
+            "install_path": request.install_path.display().to_string(),
             "was_present_on_disk": removed_path.is_some(),
             "had_lock_entry": removed_lock.is_some(),
+            "managed_path_removed": request.remove_install_path,
         }),
         request.now_unix,
     );
@@ -243,6 +241,61 @@ pub fn uninstall_skill(request: UninstallSkillRequest) -> Result<UninstallSkillR
 pub enum InstallOperation {
     Install,
     Update,
+}
+
+pub fn canonical_skill_install_path(
+    install_root: &Path,
+    skill_id: &SkillId,
+    slug: &str,
+) -> Result<PathBuf> {
+    let mut components = Path::new(slug).components();
+    let is_single_leaf = matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && slug != "."
+        && slug != "..";
+    if !is_single_leaf {
+        bail!("skill slug must be one relative path component");
+    }
+    Ok(install_root.join(skill_id.as_str()).join(slug))
+}
+
+pub fn finalize_prepared_skill_commit(result: &InstallSkillResult) {
+    if let Some(backup_path) = result
+        .prepared_commit_rollback
+        .as_ref()
+        .and_then(|rollback| rollback.backup_path.as_ref())
+    {
+        let _ = remove_path_if_present(backup_path);
+    }
+}
+
+pub fn rollback_prepared_skill_commit(result: &InstallSkillResult, lock_path: &Path) -> Result<()> {
+    let Some(rollback) = &result.prepared_commit_rollback else {
+        return Ok(());
+    };
+    remove_path_if_present(result.install_path.as_path()).with_context(|| {
+        format!(
+            "failed to remove published package `{}`",
+            result.install_path.display()
+        )
+    })?;
+    if let (Some(backup_path), Some(previous_path)) =
+        (&rollback.backup_path, &rollback.previous_path)
+    {
+        fs::rename(backup_path, previous_path).with_context(|| {
+            format!(
+                "failed to restore previous package `{}`",
+                previous_path.display()
+            )
+        })?;
+    }
+    let mut lock = read_skills_lock(lock_path)?;
+    if let Some(previous) = &rollback.previous_lock_entry {
+        upsert_lock_entry(&mut lock, previous.clone());
+    } else {
+        remove_lock_entry(&mut lock, &result.definition.identity.skill_id);
+    }
+    write_skills_lock_atomic(lock_path, &lock)
 }
 
 pub fn prepare_materialized_skill(
@@ -272,6 +325,7 @@ pub fn prepare_materialized_skill(
     }
 
     let definition = parse_skill_from_file(
+        request.skill_id,
         skill_file.as_path(),
         request.source_kind.clone(),
         source_root.as_path(),
@@ -313,10 +367,11 @@ pub fn prepare_materialized_skill(
 pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<InstallSkillResult> {
     let prepared = request.prepared;
     let definition = prepared.definition.clone();
-    let target_path = request
-        .install_root
-        .join(definition.identity.owner.as_str())
-        .join(definition.identity.slug.as_str());
+    let target_path = canonical_skill_install_path(
+        request.install_root.as_path(),
+        &definition.identity.skill_id,
+        definition.identity.slug.as_str(),
+    )?;
 
     fs::create_dir_all(request.install_root.as_path()).with_context(|| {
         format!(
@@ -348,16 +403,25 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
 
     let source_kind = prepared.source_kind.as_db_value().to_owned();
 
-    let qualified_slug = qualified_skill_slug(
-        definition.identity.owner.as_str(),
-        definition.identity.slug.as_str(),
-    );
+    let previous_lock_entry = find_lock_entry(&lock, &definition.identity.skill_id).cloned();
 
-    let previous_lock_entry =
-        find_lock_entry(&lock, qualified_slug.as_str(), source_kind.as_str()).cloned();
+    let previous_installation = match request.operation {
+        InstallOperation::Install => {
+            if request.previous.is_some() {
+                bail!("install must not include previous installation state");
+            }
+            None
+        }
+        InstallOperation::Update => Some(request.previous.as_ref().with_context(|| {
+            format!(
+                "cannot update skill `{}` without authoritative previous installation state",
+                definition.identity.skill_id
+            )
+        })?),
+    };
 
     if let Some(expected) = request.expected_previous_fingerprint.as_deref()
-        && let Some(previous) = &previous_lock_entry
+        && let Some(previous) = previous_installation
         && previous.fingerprint != expected
     {
         if request.policy.block_on_fingerprint_mismatch {
@@ -368,8 +432,15 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
         }
     }
 
+    let mut update_backup = None;
     match request.operation {
         InstallOperation::Install => {
+            if previous_lock_entry.is_some() {
+                bail!(
+                    "skill `{}` is already installed",
+                    definition.identity.skill_id
+                );
+            }
             if target_path.exists() {
                 bail!(
                     "skill `{}` already installed at `{}`",
@@ -387,27 +458,67 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
             )?;
         }
         InstallOperation::Update => {
-            if !target_path.exists() {
-                bail!(
-                    "cannot update skill `{}` because it is not installed",
-                    definition.identity.slug
-                );
-            }
-
-            let backup_path = request.install_root.join(format!(
-                ".backup-{}-{}",
-                definition.identity.slug,
-                unique_suffix()
-            ));
-            fs::rename(target_path.as_path(), backup_path.as_path()).with_context(|| {
+            let previous = previous_installation.with_context(|| {
                 format!(
-                    "failed to create backup for `{}` before update",
-                    target_path.display()
+                    "cannot update skill `{}` without authoritative previous installation state",
+                    definition.identity.skill_id
                 )
             })?;
+            if let Some(previous_path) = previous.managed_install_path.as_ref() {
+                let previous_containment = ensure_install_path_contained(
+                    request.install_root.as_path(),
+                    previous_path.as_path(),
+                );
+                if previous_containment.has_blocking_findings() {
+                    bail!("update blocked by containment policy for previous installation");
+                }
+                if previous_path.exists() {
+                    let backup_path = request
+                        .install_root
+                        .join(definition.identity.skill_id.as_str())
+                        .join(format!(
+                            ".backup-{}-{}",
+                            definition.identity.slug,
+                            unique_suffix()
+                        ));
+                    if target_path != *previous_path {
+                        remove_path_if_present(target_path.as_path()).with_context(|| {
+                            format!(
+                                "failed to replace stale update target `{}`",
+                                target_path.display()
+                            )
+                        })?;
+                    }
+                    fs::rename(previous_path.as_path(), backup_path.as_path()).with_context(
+                        || {
+                            format!(
+                                "failed to create rollback copy for `{}` before update",
+                                previous_path.display()
+                            )
+                        },
+                    )?;
+                    update_backup = Some((backup_path, previous_path.clone()));
+                } else {
+                    remove_path_if_present(target_path.as_path()).with_context(|| {
+                        format!(
+                            "failed to replace stale update target `{}`",
+                            target_path.display()
+                        )
+                    })?;
+                }
+            } else {
+                remove_path_if_present(target_path.as_path()).with_context(|| {
+                    format!(
+                        "failed to replace stale update target `{}`",
+                        target_path.display()
+                    )
+                })?;
+            }
 
             if let Err(error) = fs::rename(prepared.source_path.as_path(), target_path.as_path()) {
-                let _ = fs::rename(backup_path.as_path(), target_path.as_path());
+                if let Some((backup_path, previous_path)) = &update_backup {
+                    let _ = fs::rename(backup_path.as_path(), previous_path.as_path());
+                }
                 return Err(error).with_context(|| {
                     format!(
                         "failed to move staged update into `{}`",
@@ -415,12 +526,11 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
                     )
                 });
             }
-
-            let _ = fs::remove_dir_all(backup_path.as_path());
         }
     }
 
     let lock_entry = SkillLockEntry {
+        skill_id: definition.identity.skill_id.clone(),
         owner: definition.identity.owner.clone(),
         slug: definition.identity.slug.clone(),
         source_kind: source_kind.clone(),
@@ -429,16 +539,36 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
         version: definition.identity.version_hint.clone(),
         trust_level: definition.runtime.trust_level.clone(),
         fingerprint: definition.identity.fingerprint.clone(),
-        installed_at: request.now_unix,
+        installed_at: previous_lock_entry
+            .as_ref()
+            .map(|entry| entry.installed_at)
+            .unwrap_or(request.now_unix),
     };
     upsert_lock_entry(&mut lock, lock_entry.clone());
-    write_skills_lock_atomic(request.lock_path.as_path(), &lock)?;
+    if let Err(error) = write_skills_lock_atomic(request.lock_path.as_path(), &lock) {
+        let _ = remove_path_if_present(target_path.as_path());
+        if let Some((backup_path, previous_path)) = &update_backup {
+            let _ = fs::rename(backup_path.as_path(), previous_path.as_path());
+        }
+        return Err(error).context("failed to commit skills lock; package publication rolled back");
+    }
+    let prepared_commit_rollback = Some(PreparedCommitRollback {
+        previous_path: update_backup
+            .as_ref()
+            .map(|(_, previous_path)| previous_path.clone()),
+        backup_path: update_backup
+            .as_ref()
+            .map(|(backup_path, _)| backup_path.clone()),
+        previous_lock_entry: previous_lock_entry.clone(),
+    });
 
     let mut audit_events = Vec::new();
 
     match request.operation {
         InstallOperation::Install => audit_events.push(SkillAuditEvent::install(
-            qualified_slug.clone(),
+            definition.identity.skill_id.clone(),
+            definition.identity.owner.clone(),
+            definition.identity.slug.clone(),
             source_kind.clone(),
             serde_json::json!({
                 "fingerprint": definition.identity.fingerprint,
@@ -450,10 +580,12 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
             request.now_unix,
         )),
         InstallOperation::Update => audit_events.push(SkillAuditEvent::update(
-            qualified_slug.clone(),
+            definition.identity.skill_id.clone(),
+            definition.identity.owner.clone(),
+            definition.identity.slug.clone(),
             source_kind.clone(),
             serde_json::json!({
-                "updated_from": previous_lock_entry.as_ref().map(|entry| entry.fingerprint.clone()),
+                "updated_from": previous_installation.map(|previous| previous.fingerprint.clone()),
                 "updated_to": definition.identity.fingerprint,
                 "source_ref": prepared.source_ref,
                 "install_path": target_path.display().to_string(),
@@ -465,12 +597,14 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
     }
 
     if let Some(expected) = request.expected_previous_fingerprint.as_deref()
-        && let Some(previous) = previous_lock_entry
+        && let Some(previous) = previous_installation
         && previous.fingerprint != expected
         && !request.policy.block_on_fingerprint_mismatch
     {
         audit_events.push(SkillAuditEvent::new(
-            qualified_slug,
+            definition.identity.skill_id.clone(),
+            definition.identity.owner.clone(),
+            definition.identity.slug.clone(),
             source_kind,
             SkillAuditAction::SecurityWarn,
             SkillAuditDecision::Warning,
@@ -490,242 +624,37 @@ pub fn commit_prepared_skill(request: CommitPreparedSkillRequest) -> Result<Inst
         security_report: prepared.security_report,
         lock_entry,
         audit_events,
+        prepared_commit_rollback,
     })
 }
 
-fn install_from_staging(
+fn commit_staged_skill(
     operation: InstallOperation,
     request: &InstallSkillRequest,
     staging_dir: PathBuf,
+    previous: Option<PreviousSkillInstallation>,
     expected_previous_fingerprint: Option<String>,
 ) -> Result<InstallSkillResult> {
-    let security_report = scan_skill_directory(
-        request.install_root.as_path(),
-        staging_dir.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    );
-    if security_report.has_blocking_findings() {
-        bail!("install blocked by security scan findings");
-    }
-
-    let skill_file = staging_dir.join("SKILL.md");
-    if !skill_file.is_file() {
-        bail!(
-            "staged skill `{}` is missing required SKILL.md",
-            staging_dir.display()
-        );
-    }
-
-    let parse_source_root = staging_dir
-        .parent()
-        .unwrap_or(request.install_root.as_path())
-        .to_path_buf();
-
-    let definition = parse_skill_from_file(
-        skill_file.as_path(),
-        request.source_kind.clone(),
-        parse_source_root.as_path(),
-        request.policy.security.max_install_file_bytes.max(1),
-    )?;
-
-    if !request.policy.security.allow_untrusted_install
-        && matches!(
-            definition.runtime.trust_level,
-            crate::contract::SkillTrustLevel::Untrusted
-        )
-    {
-        bail!(
-            "untrusted skill `{}` is blocked by policy",
-            definition.identity.slug
-        );
-    }
-
-    let dependency_report =
-        evaluate_skill_dependencies(&definition, &request.policy.dependency_input);
-
-    if request.policy.block_on_dependency_failures && dependency_report.has_failures() {
-        bail!(
-            "install blocked by dependency failures for `{}`",
-            definition.identity.slug
-        );
-    }
-
-    let target_path = request
-        .install_root
-        .join(definition.identity.owner.as_str())
-        .join(definition.identity.slug.as_str());
-
-    fs::create_dir_all(request.install_root.as_path()).with_context(|| {
-        format!(
-            "failed to create install root `{}`",
-            request.install_root.display()
-        )
-    })?;
-
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create install parent directory `{}`",
-                parent.display()
-            )
-        })?;
-    }
-
-    let containment =
-        ensure_install_path_contained(request.install_root.as_path(), target_path.as_path());
-
-    if containment.has_blocking_findings() {
-        bail!(
-            "target install path `{}` is outside install root",
-            target_path.display()
-        );
-    }
-
-    let mut lock = read_skills_lock(request.lock_path.as_path())?;
-
-    let source_kind = request.source_kind.as_db_value().to_owned();
-
-    let qualified_slug = qualified_skill_slug(
-        definition.identity.owner.as_str(),
-        definition.identity.slug.as_str(),
-    );
-
-    let previous_lock_entry =
-        find_lock_entry(&lock, qualified_slug.as_str(), source_kind.as_str()).cloned();
-
-    if let Some(expected) = expected_previous_fingerprint.as_deref()
-        && let Some(previous) = &previous_lock_entry
-        && previous.fingerprint != expected
-    {
-        if request.policy.block_on_fingerprint_mismatch {
-            bail!(
-                "update blocked: expected previous fingerprint `{expected}`, found `{}`",
-                previous.fingerprint
-            );
-        }
-    }
-
-    match operation {
-        InstallOperation::Install => {
-            if target_path.exists() {
-                bail!(
-                    "skill `{}` already installed at `{}`",
-                    definition.identity.slug,
-                    target_path.display()
-                );
-            }
-            fs::rename(staging_dir.as_path(), target_path.as_path()).with_context(|| {
-                format!(
-                    "failed to move staged skill into `{}`",
-                    target_path.display()
-                )
-            })?;
-        }
-        InstallOperation::Update => {
-            if !target_path.exists() {
-                bail!(
-                    "cannot update skill `{}` because it is not installed",
-                    definition.identity.slug
-                );
-            }
-
-            let backup_path = request.install_root.join(format!(
-                ".backup-{}-{}",
-                definition.identity.slug,
-                unique_suffix()
-            ));
-            fs::rename(target_path.as_path(), backup_path.as_path()).with_context(|| {
-                format!(
-                    "failed to create backup for `{}` before update",
-                    target_path.display()
-                )
-            })?;
-
-            if let Err(error) = fs::rename(staging_dir.as_path(), target_path.as_path()) {
-                let _ = fs::rename(backup_path.as_path(), target_path.as_path());
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to move staged update into `{}`",
-                        target_path.display()
-                    )
-                });
-            }
-
-            let _ = fs::remove_dir_all(backup_path.as_path());
-        }
-    }
-
-    let lock_entry = SkillLockEntry {
-        owner: definition.identity.owner.clone(),
-        slug: definition.identity.slug.clone(),
-        source_kind: source_kind.clone(),
+    let prepared = prepare_materialized_skill(PrepareMaterializedSkillRequest {
+        skill_id: request.skill_id.clone(),
+        source_kind: request.source_kind.clone(),
         source_ref: request.source_ref.clone(),
-        install_path: target_path.display().to_string(),
-        version: definition.identity.version_hint.clone(),
-        trust_level: definition.runtime.trust_level.clone(),
-        fingerprint: definition.identity.fingerprint.clone(),
-        installed_at: request.now_unix,
-    };
-    upsert_lock_entry(&mut lock, lock_entry.clone());
-    write_skills_lock_atomic(request.lock_path.as_path(), &lock)?;
-
-    let mut audit_events = Vec::new();
-
-    match operation {
-        InstallOperation::Install => audit_events.push(SkillAuditEvent::install(
-            qualified_slug.clone(),
-            source_kind.clone(),
-            serde_json::json!({
-                "fingerprint": definition.identity.fingerprint,
-                "source_ref": request.source_ref,
-                "install_path": target_path.display().to_string(),
-                "dependency_failures": dependency_report.failing_diagnostics(),
-                "security_decision": security_report.decision,
-            }),
-            request.now_unix,
-        )),
-        InstallOperation::Update => audit_events.push(SkillAuditEvent::update(
-            qualified_slug.clone(),
-            source_kind.clone(),
-            serde_json::json!({
-                "updated_from": previous_lock_entry.as_ref().map(|entry| entry.fingerprint.clone()),
-                "updated_to": definition.identity.fingerprint,
-                "source_ref": request.source_ref,
-                "install_path": target_path.display().to_string(),
-                "dependency_failures": dependency_report.failing_diagnostics(),
-                "security_decision": security_report.decision,
-            }),
-            request.now_unix,
-        )),
-    }
-
-    if let Some(expected) = expected_previous_fingerprint.as_deref()
-        && let Some(previous) = previous_lock_entry
-        && previous.fingerprint != expected
-        && !request.policy.block_on_fingerprint_mismatch
-    {
-        audit_events.push(SkillAuditEvent::new(
-            qualified_slug,
-            source_kind,
-            SkillAuditAction::SecurityWarn,
-            SkillAuditDecision::Warning,
-            Some("provenance.fingerprint_mismatch".to_owned()),
-            serde_json::json!({
-                "expected": expected,
-                "actual": previous.fingerprint,
-            }),
-            request.now_unix,
-        ));
-    }
-
-    Ok(InstallSkillResult {
-        definition,
-        install_path: target_path,
-        dependency_report,
-        security_report,
-        lock_entry,
-        audit_events,
-    })
+        materialized_source_path: staging_dir,
+        policy: request.policy.clone(),
+    })?;
+    let mut result = commit_prepared_skill(CommitPreparedSkillRequest {
+        operation,
+        prepared,
+        install_root: request.install_root.clone(),
+        lock_path: request.lock_path.clone(),
+        previous,
+        expected_previous_fingerprint,
+        now_unix: request.now_unix,
+        policy: request.policy.clone(),
+    })?;
+    finalize_prepared_skill_commit(&result);
+    result.prepared_commit_rollback = None;
+    Ok(result)
 }
 
 fn stage_source(request: &InstallSkillRequest) -> Result<PathBuf> {
@@ -870,6 +799,25 @@ fn reject_non_contained_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_path_if_present(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect path `{}`", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove directory `{}`", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove path `{}`", path.display()))?;
+    }
+    Ok(true)
+}
+
 fn cleanup_staging(install_root: &Path) {
     let staging = install_root.join(".staging");
     if !staging.exists() {
@@ -889,10 +837,14 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallSkillRequest, SkillInstallerPolicy, UninstallSkillRequest, UpdateSkillRequest,
-        install_skill, uninstall_skill, update_skill,
+        CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest,
+        PrepareMaterializedSkillRequest, PreviousSkillInstallation, SkillInstallerPolicy,
+        UninstallSkillRequest, UpdateSkillRequest, commit_prepared_skill, install_skill,
+        prepare_materialized_skill, rollback_prepared_skill_commit, uninstall_skill, update_skill,
     };
-    use crate::contract::{SkillSourceKind, qualified_skill_slug};
+    use crate::contract::SkillSourceKind;
+    use crate::provenance::{find_lock_entry, read_skills_lock};
+    use pioneer_protocol::SkillId;
     use std::fs;
     use std::path::PathBuf;
 
@@ -929,6 +881,10 @@ mod tests {
         .expect("write skill");
     }
 
+    fn id(value: &str) -> SkillId {
+        SkillId::new(value).unwrap()
+    }
+
     #[test]
     fn install_update_uninstall_roundtrip_is_deterministic() {
         let root = temp_case("roundtrip");
@@ -936,8 +892,10 @@ mod tests {
         let install_root = root.join("install");
         let lock_path = install_root.join("skills-lock.toml");
         write_skill(source.as_path(), "Agent Browser", "v1");
+        let skill_id = id("AAAAAAAAAAAAAAAAAAAAA");
 
         let install = install_skill(InstallSkillRequest {
+            skill_id: skill_id.clone(),
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/agent-browser".to_owned(),
             source_path: source.clone(),
@@ -949,19 +907,26 @@ mod tests {
         .expect("install");
         assert!(install.install_path.exists());
         assert!(
-            install.install_path.ends_with("pioneer/agent-browser"),
-            "install path must be owner/slug, got {}",
+            install
+                .install_path
+                .ends_with("AAAAAAAAAAAAAAAAAAAAA/agent-browser"),
+            "install path must be skill-id/slug, got {}",
             install.install_path.display()
         );
         assert_eq!(install.audit_events.len(), 1);
 
         write_skill(source.as_path(), "Agent Browser", "v2");
         let update = update_skill(UpdateSkillRequest {
+            skill_id: skill_id.clone(),
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/agent-browser".to_owned(),
             source_path: source.clone(),
             install_root: install_root.clone(),
             lock_path: lock_path.clone(),
+            previous: PreviousSkillInstallation {
+                managed_install_path: Some(install.install_path.clone()),
+                fingerprint: install.lock_entry.fingerprint.clone(),
+            },
             expected_previous_fingerprint: Some(install.lock_entry.fingerprint.clone()),
             now_unix: 1_700_000_100,
             policy: SkillInstallerPolicy::default(),
@@ -974,11 +939,12 @@ mod tests {
         );
 
         let uninstall = uninstall_skill(UninstallSkillRequest {
-            slug: qualified_skill_slug(
-                update.definition.identity.owner.as_str(),
-                update.definition.identity.slug.as_str(),
-            ),
-            source_kind: SkillSourceKind::Registry,
+            skill_id,
+            owner: update.definition.identity.owner.clone(),
+            slug: update.definition.identity.slug.clone(),
+            source_kind: "registry".to_owned(),
+            install_path: update.install_path.clone(),
+            remove_install_path: true,
             install_root: install_root.clone(),
             lock_path: lock_path.clone(),
             now_unix: 1_700_000_200,
@@ -1005,6 +971,7 @@ mod tests {
         policy.security.max_install_file_bytes = 64;
 
         let result = install_skill(InstallSkillRequest {
+            skill_id: id("BBBBBBBBBBBBBBBBBBBBB"),
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/big".to_owned(),
             source_path: source.clone(),
@@ -1032,8 +999,10 @@ mod tests {
         let install_root = root.join("install");
         let lock_path = install_root.join("skills-lock.toml");
         write_skill(source.as_path(), "Skill", "v1");
+        let skill_id = id("CCCCCCCCCCCCCCCCCCCCC");
 
         let install = install_skill(InstallSkillRequest {
+            skill_id: skill_id.clone(),
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/skill".to_owned(),
             source_path: source.clone(),
@@ -1046,11 +1015,16 @@ mod tests {
 
         write_skill(source.as_path(), "Skill", "v2");
         let result = update_skill(UpdateSkillRequest {
+            skill_id,
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/skill".to_owned(),
             source_path: source.clone(),
             install_root: install_root.clone(),
             lock_path: lock_path.clone(),
+            previous: PreviousSkillInstallation {
+                managed_install_path: Some(install.install_path.clone()),
+                fingerprint: install.lock_entry.fingerprint.clone(),
+            },
             expected_previous_fingerprint: Some("wrong-fingerprint".to_owned()),
             now_unix: 1_700_000_100,
             policy: SkillInstallerPolicy::default(),
@@ -1058,6 +1032,99 @@ mod tests {
         assert!(result.is_err());
         assert!(install.install_path.exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_restores_missing_managed_package_without_lock_entry() {
+        let root = temp_case("restore-missing");
+        let source = root.join("source");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("JJJJJJJJJJJJJJJJJJJJJ");
+        write_skill(source.as_path(), "Restorable", "same revision");
+        let install = install_skill(InstallSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "source".to_owned(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("install package");
+        fs::remove_dir_all(install.install_path.as_path()).expect("remove installed package");
+        fs::remove_file(lock_path.as_path()).expect("remove lock entry with lock file");
+
+        let restored = update_skill(UpdateSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "source".to_owned(),
+            source_path: source,
+            install_root,
+            lock_path: lock_path.clone(),
+            previous: PreviousSkillInstallation {
+                managed_install_path: Some(install.install_path.clone()),
+                fingerprint: install.lock_entry.fingerprint.clone(),
+            },
+            expected_previous_fingerprint: Some(install.lock_entry.fingerprint),
+            now_unix: 2,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("restore missing package with same SkillId");
+
+        assert_eq!(restored.definition.identity.skill_id, skill_id);
+        assert!(restored.install_path.is_dir());
+        let lock = read_skills_lock(lock_path.as_path()).expect("read recreated lock");
+        assert!(find_lock_entry(&lock, &skill_id).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_and_uninstall_never_delete_external_import_source() {
+        let root = temp_case("external-source");
+        let external = root.join("external");
+        let install_root = root.join("managed");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("KKKKKKKKKKKKKKKKKKKKK");
+        write_skill(external.as_path(), "External", "revision");
+
+        let update = update_skill(UpdateSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::Registry,
+            source_ref: "upload:new".to_owned(),
+            source_path: external.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            previous: PreviousSkillInstallation {
+                managed_install_path: None,
+                fingerprint: "pending".to_owned(),
+            },
+            expected_previous_fingerprint: Some("pending".to_owned()),
+            now_unix: 2,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("update external import into managed storage");
+        assert!(external.join("SKILL.md").is_file());
+        assert!(update.install_path.is_dir());
+
+        let pending_id = id("LLLLLLLLLLLLLLLLLLLLL");
+        let uninstall = uninstall_skill(UninstallSkillRequest {
+            skill_id: pending_id,
+            owner: None,
+            slug: "external".to_owned(),
+            source_kind: "registry".to_owned(),
+            install_path: external.clone(),
+            remove_install_path: false,
+            install_root,
+            lock_path,
+            now_unix: 3,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("uninstall pending external identity");
+        assert!(uninstall.removed_path.is_none());
+        assert!(external.join("SKILL.md").is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1082,6 +1149,7 @@ Body"#,
         .expect("write skill");
 
         let result = install_skill(InstallSkillRequest {
+            skill_id: id("DDDDDDDDDDDDDDDDDDDDD"),
             source_kind: SkillSourceKind::Registry,
             source_ref: "github.com/example/skill".to_owned(),
             source_path: source.clone(),
@@ -1092,8 +1160,222 @@ Body"#,
         });
 
         assert!(result.is_err());
-        assert!(!install_root.join("pioneer").join("skill").exists());
+        assert!(
+            !install_root
+                .join("DDDDDDDDDDDDDDDDDDDDD")
+                .join("skill")
+                .exists()
+        );
         assert!(!lock_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_labels_have_isolated_id_paths_and_exact_uninstall() {
+        let root = temp_case("duplicates");
+        let source = root.join("source");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        write_skill(source.as_path(), "Duplicate", "same package");
+        let first_id = id("EEEEEEEEEEEEEEEEEEEEE");
+        let second_id = id("FFFFFFFFFFFFFFFFFFFFF");
+
+        let first = install_skill(InstallSkillRequest {
+            skill_id: first_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "first".to_owned(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("first install");
+        let second = install_skill(InstallSkillRequest {
+            skill_id: second_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "second".to_owned(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 2,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("second install");
+
+        assert_ne!(first.install_path, second.install_path);
+        assert!(first.install_path.exists());
+        assert!(second.install_path.exists());
+        uninstall_skill(UninstallSkillRequest {
+            skill_id: first_id,
+            owner: first.definition.identity.owner.clone(),
+            slug: first.definition.identity.slug.clone(),
+            source_kind: "user".to_owned(),
+            install_path: first.install_path.clone(),
+            remove_install_path: true,
+            install_root: install_root.clone(),
+            lock_path,
+            now_unix: 3,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("exact uninstall");
+        assert!(!first.install_path.exists());
+        assert!(second.install_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_preserves_id_changes_leaf_and_preserves_package_bytes() {
+        let root = temp_case("slug-change");
+        let source = root.join("source");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("GGGGGGGGGGGGGGGGGGGGG");
+        write_skill(source.as_path(), "Old Name", "v1");
+        let original_asset = [0_u8, 1, 2, 3, 254, 255];
+        fs::create_dir_all(source.join("assets")).unwrap();
+        fs::write(source.join("assets/payload.bin"), original_asset).unwrap();
+
+        let install = install_skill(InstallSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::Registry,
+            source_ref: "source".to_owned(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("install old leaf");
+        write_skill(source.as_path(), "New Name", "v2");
+
+        let update = update_skill(UpdateSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::Registry,
+            source_ref: "source".to_owned(),
+            source_path: source.clone(),
+            install_root: install_root.clone(),
+            lock_path,
+            previous: PreviousSkillInstallation {
+                managed_install_path: Some(install.install_path.clone()),
+                fingerprint: install.lock_entry.fingerprint.clone(),
+            },
+            expected_previous_fingerprint: Some(install.lock_entry.fingerprint),
+            now_unix: 2,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("update renamed leaf");
+
+        assert_eq!(update.definition.identity.skill_id, skill_id);
+        assert!(
+            update
+                .install_path
+                .ends_with("GGGGGGGGGGGGGGGGGGGGG/new-name")
+        );
+        assert!(!install.install_path.exists());
+        assert_eq!(
+            fs::read(update.install_path.join("assets/payload.bin")).unwrap(),
+            original_asset
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_update_can_rollback_package_and_lock_after_database_failure() {
+        let root = temp_case("prepared-db-rollback");
+        let source = root.join("source");
+        let materialized = root.join("materialized");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("HHHHHHHHHHHHHHHHHHHHH");
+        write_skill(source.as_path(), "Old Name", "v1");
+        let install = install_skill(InstallSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::Registry,
+            source_ref: "source-v1".to_owned(),
+            source_path: source,
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("install old package");
+
+        write_skill(materialized.as_path(), "New Name", "v2");
+        let prepared = prepare_materialized_skill(PrepareMaterializedSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::Registry,
+            source_ref: "source-v2".to_owned(),
+            materialized_source_path: materialized,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("prepare update");
+        let update = commit_prepared_skill(CommitPreparedSkillRequest {
+            operation: InstallOperation::Update,
+            prepared,
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+            previous: Some(PreviousSkillInstallation {
+                managed_install_path: Some(install.install_path.clone()),
+                fingerprint: install.lock_entry.fingerprint.clone(),
+            }),
+            expected_previous_fingerprint: Some(install.lock_entry.fingerprint.clone()),
+            now_unix: 2,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("publish prepared update");
+        assert!(!install.install_path.exists());
+        assert!(update.install_path.exists());
+
+        rollback_prepared_skill_commit(&update, lock_path.as_path())
+            .expect("roll back prepared update");
+        assert!(install.install_path.exists());
+        assert!(!update.install_path.exists());
+        let lock = read_skills_lock(lock_path.as_path()).expect("read restored lock");
+        let restored = find_lock_entry(&lock, &skill_id).expect("restored lock entry");
+        assert_eq!(restored.install_path, install.lock_entry.install_path);
+        assert_eq!(restored.fingerprint, install.lock_entry.fingerprint);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_install_can_rollback_package_and_lock_after_database_failure() {
+        let root = temp_case("prepared-install-db-rollback");
+        let materialized = root.join("materialized");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let skill_id = id("IIIIIIIIIIIIIIIIIIIII");
+        write_skill(materialized.as_path(), "New Skill", "v1");
+        let prepared = prepare_materialized_skill(PrepareMaterializedSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: SkillSourceKind::User,
+            source_ref: "upload:test".to_owned(),
+            materialized_source_path: materialized,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("prepare install");
+        let install = commit_prepared_skill(CommitPreparedSkillRequest {
+            operation: InstallOperation::Install,
+            prepared,
+            install_root,
+            lock_path: lock_path.clone(),
+            previous: None,
+            expected_previous_fingerprint: None,
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("publish prepared install");
+        assert!(install.install_path.exists());
+
+        rollback_prepared_skill_commit(&install, lock_path.as_path())
+            .expect("roll back prepared install");
+        assert!(!install.install_path.exists());
+        let lock = read_skills_lock(lock_path.as_path()).expect("read rolled-back lock");
+        assert!(find_lock_entry(&lock, &skill_id).is_none());
 
         let _ = fs::remove_dir_all(root);
     }

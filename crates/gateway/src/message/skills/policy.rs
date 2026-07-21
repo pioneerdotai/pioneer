@@ -44,19 +44,72 @@ impl MessageProcessor {
                 return;
             }
         };
+        let context = match self.skills_runtime_context(workspace_id.as_str()) {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to resolve skills runtime context",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let catalog = match self
+            .load_skills_catalog(workspace_id.as_str(), &context)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to load skills catalog",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
-        let payload = SkillsPolicyListResponse {
-            policies: rows
-                .iter()
-                .map(|row| SkillWorkspacePolicy {
+        let catalog_by_id = catalog
+            .skills
+            .iter()
+            .map(|skill| (skill.identity.skill_id.clone(), skill))
+            .collect::<HashMap<_, _>>();
+        let policies = rows
+            .iter()
+            .filter_map(|row| {
+                let Some(skill) = catalog_by_id.get(&row.skill_id) else {
+                    warn!(
+                        workspace_id = %row.workspace_id,
+                        skill_id = %row.skill_id,
+                        "omitting orphaned skill policy from list response"
+                    );
+                    return None;
+                };
+                Some(SkillWorkspacePolicy {
                     workspace_id: row.workspace_id.clone(),
-                    skill_slug: row.skill_slug.clone(),
-                    source_kind: row.source_kind.clone(),
+                    skill_id: row.skill_id.clone(),
+                    owner: skill.identity.owner.clone(),
+                    slug: skill.identity.slug.clone(),
+                    source_kind: skill.identity.source_kind.as_db_value().to_owned(),
                     enabled: row.enabled,
                     allow_implicit_invocation: row.allow_implicit_invocation,
                 })
-                .collect(),
-        };
+            })
+            .collect();
+        let payload = SkillsPolicyListResponse { policies };
         let response = match JsonRpcResponse::from_result(request_id, &payload) {
             Ok(response) => response,
             Err(error) => {
@@ -106,70 +159,66 @@ impl MessageProcessor {
             }
         };
 
-        let skill_slug = params.skill_slug.trim().to_owned();
-        let source_kind = params.source_kind.trim().to_ascii_lowercase();
-
-        if skill_slug.is_empty() || source_kind.is_empty() {
+        let context = match self.skills_runtime_context(workspace_id.as_str()) {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to resolve skills runtime context",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let catalog = match self
+            .load_skills_catalog(workspace_id.as_str(), &context)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to load skills catalog",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(target) = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.skill_id == params.skill_id)
+        else {
             self.send_error(
                 connection_id,
                 skills_error(
                     Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "skill_slug and source_kind are required",
-                    json!({
-                        "skill_slug": skill_slug,
-                        "source_kind": source_kind,
-                    }),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_NOT_FOUND,
+                    "skill was not found",
+                    json!({"skill_id": params.skill_id}),
                 ),
             )
             .await;
             return;
-        }
-        if !matches!(source_kind.as_str(), "system" | "user" | "registry") {
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
-                    "source_kind must be system, user, or registry",
-                    json!({
-                        "skill_slug": skill_slug,
-                        "source_kind": source_kind,
-                    }),
-                ),
-            )
-            .await;
-            return;
-        }
-        if !is_qualified_slug(skill_slug.as_str()) {
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id.clone()),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "skill_slug must use owner/slug",
-                    json!({
-                        "skill_slug": skill_slug,
-                        "source_kind": source_kind,
-                    }),
-                ),
-            )
-            .await;
-            return;
-        }
-
+        };
         let now = now_timestamp_secs();
         if params.enabled.is_none() && params.allow_implicit_invocation.is_none() {
             if let Err(error) = self
                 .crud_store
-                .delete_workspace_skill_policy(
-                    workspace_id.as_str(),
-                    skill_slug.as_str(),
-                    source_kind.as_str(),
-                )
+                .delete_workspace_skill_policy(workspace_id.as_str(), &params.skill_id)
                 .await
             {
                 self.send_error(
@@ -188,8 +237,10 @@ impl MessageProcessor {
 
             let policy = SkillWorkspacePolicy {
                 workspace_id: workspace_id.clone(),
-                skill_slug: skill_slug.clone(),
-                source_kind: source_kind.clone(),
+                skill_id: params.skill_id.clone(),
+                owner: target.identity.owner.clone(),
+                slug: target.identity.slug.clone(),
+                source_kind: target.identity.source_kind.as_db_value().to_owned(),
                 enabled: None,
                 allow_implicit_invocation: None,
             };
@@ -230,7 +281,9 @@ impl MessageProcessor {
                 workspace_id.as_str(),
                 "policy_updated",
                 vec![SkillChangedItem {
-                    slug: policy.skill_slug,
+                    skill_id: policy.skill_id,
+                    owner: policy.owner,
+                    slug: policy.slug,
                     source_kind: policy.source_kind,
                     change_type: "policy".to_owned(),
                     fingerprint_before: None,
@@ -243,51 +296,7 @@ impl MessageProcessor {
         }
 
         if matches!(params.allow_implicit_invocation, Some(false)) {
-            let context = match self.skills_runtime_context(workspace_id.as_str()) {
-                Ok(context) => context,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        skills_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to resolve skills runtime context",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let catalog = match load_catalog(&context.catalog_params) {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        skills_error(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            SKILLS_ERROR_INTERNAL,
-                            "failed to load skills catalog",
-                            json!({"error": format!("{error:#}")}),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            let implicit_invocation_locked = catalog.skills.iter().any(|skill| {
-                skill.identity.source_kind.as_db_value() == source_kind
-                    && qualified_skill_slug(
-                        skill.identity.owner.as_str(),
-                        skill.identity.slug.as_str(),
-                    ) == skill_slug
-                    && !skill_implicit_invocation_editable(skill)
-            });
-
-            if implicit_invocation_locked {
+            if !skill_implicit_invocation_editable(target) {
                 self.send_error(
                     connection_id,
                     skills_error(
@@ -296,8 +305,7 @@ impl MessageProcessor {
                         SKILLS_ERROR_INVALID_REQUEST,
                         "allow_implicit_invocation cannot be disabled for this system skill",
                         json!({
-                            "skill_slug": skill_slug,
-                            "source_kind": source_kind,
+                            "skill_id": params.skill_id,
                             "allow_implicit_invocation": false,
                         }),
                     ),
@@ -308,9 +316,9 @@ impl MessageProcessor {
         }
 
         let record = WorkspaceSkillPolicyRecord {
+            id: pioneer_protocol::generate_id(21),
             workspace_id: workspace_id.clone(),
-            skill_slug,
-            source_kind,
+            skill_id: params.skill_id.clone(),
             enabled: params.enabled,
             allow_implicit_invocation: params.allow_implicit_invocation,
         };
@@ -336,8 +344,10 @@ impl MessageProcessor {
         let payload = SkillsPolicySetResponse {
             policy: SkillWorkspacePolicy {
                 workspace_id: record.workspace_id.clone(),
-                skill_slug: record.skill_slug.clone(),
-                source_kind: record.source_kind.clone(),
+                skill_id: record.skill_id.clone(),
+                owner: target.identity.owner.clone(),
+                slug: target.identity.slug.clone(),
+                source_kind: target.identity.source_kind.as_db_value().to_owned(),
                 enabled: record.enabled,
                 allow_implicit_invocation: record.allow_implicit_invocation,
             },
@@ -373,8 +383,10 @@ impl MessageProcessor {
             workspace_id.as_str(),
             "policy_updated",
             vec![SkillChangedItem {
-                slug: record.skill_slug,
-                source_kind: record.source_kind,
+                skill_id: record.skill_id,
+                owner: target.identity.owner.clone(),
+                slug: target.identity.slug.clone(),
+                source_kind: target.identity.source_kind.as_db_value().to_owned(),
                 change_type: "policy".to_owned(),
                 fingerprint_before: None,
                 fingerprint_after: None,

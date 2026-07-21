@@ -1,10 +1,10 @@
 //! Skills catalog state.
 
-use super::health as skill_health;
+use super::{health as skill_health, presentation};
 use anyhow::Result;
 use pioneer_protocol::{
-    SkillHealthItem, SkillListItem, SkillListParams, SkillListResponse, SkillsHealthParams,
-    SkillsHealthResponse,
+    SkillHealthItem, SkillId, SkillListItem, SkillListParams, SkillListResponse,
+    SkillsHealthParams, SkillsHealthResponse,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -13,13 +13,13 @@ use std::collections::{HashMap, HashSet};
 pub struct SkillCatalogState {
     pub installed: Vec<SkillListItem>,
     pub catalog: Vec<SkillListItem>,
-    pub health_details: HashMap<String, SkillHealthItem>,
+    pub health_details: HashMap<SkillId, SkillHealthItem>,
     pub loading: bool,
     pub error: Option<String>,
     pub refresh_requested: bool,
     pub poller_started: bool,
-    pub pending_actions: HashSet<String>,
-    pub selected_target: Option<(String, String)>,
+    pub pending_actions: HashSet<SkillId>,
+    pub selected_target: Option<SkillId>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -27,7 +27,7 @@ pub struct SkillCatalogState {
 pub struct SkillsCatalogSnapshot {
     pub catalog: Vec<SkillListItem>,
     pub installed: Vec<SkillListItem>,
-    pub health_details: HashMap<String, SkillHealthItem>,
+    pub health_details: HashMap<SkillId, SkillHealthItem>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -41,7 +41,7 @@ pub struct SkillsCatalogSplit {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ReconciledSkillsSnapshot {
     pub snapshot: SkillsCatalogSnapshot,
-    pub selected_target: Option<(String, String)>,
+    pub selected_target: Option<SkillId>,
     pub selected_target_cleared: bool,
 }
 
@@ -50,9 +50,9 @@ pub struct ReconciledSkillsSnapshot {
 pub struct SkillsCatalogRefreshSuccessReduction {
     pub catalog: Vec<SkillListItem>,
     pub installed: Vec<SkillListItem>,
-    pub health_details: HashMap<String, SkillHealthItem>,
-    pub pending_actions: HashSet<String>,
-    pub selected_target: Option<(String, String)>,
+    pub health_details: HashMap<SkillId, SkillHealthItem>,
+    pub pending_actions: HashSet<SkillId>,
+    pub selected_target: Option<SkillId>,
     pub selected_target_cleared: bool,
 }
 
@@ -68,8 +68,8 @@ pub trait SkillSnapshotTransport {
     fn skills_health(&self, params: SkillsHealthParams) -> Result<SkillsHealthResponse>;
 }
 
-pub fn skill_key(slug: &str, source_kind: &str) -> String {
-    format!("{}::{}", slug.trim(), source_kind.trim())
+pub fn skill_key(skill_id: &SkillId) -> SkillId {
+    skill_id.clone()
 }
 
 /// Returns whether a skill has a user-controlled invocation policy.
@@ -82,23 +82,41 @@ pub fn skill_is_user_selectable(skill: &SkillListItem) -> bool {
     skill.policy.allow_implicit_invocation_editable
 }
 
-pub fn normalize_skill_target(slug: &str, source_kind: &str) -> Option<(String, String)> {
-    let slug = slug.trim();
-    let source_kind = source_kind.trim();
-
-    if slug.is_empty() || source_kind.is_empty() {
-        return None;
-    }
-
-    Some((slug.to_owned(), source_kind.to_owned()))
-}
-
 pub fn skill_list_params(workspace_id: impl Into<String>) -> SkillListParams {
     SkillListParams {
         workspace_id: workspace_id.into(),
         include_health: true,
         include_policy: true,
     }
+}
+
+pub fn skill_matches_search(skill: &SkillListItem, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    let label = presentation::compact_skill_label(skill.owner.as_deref(), skill.slug.as_str());
+    [
+        skill.owner.as_deref(),
+        Some(skill.slug.as_str()),
+        Some(label.as_str()),
+        Some(skill.display_name.as_str()),
+        Some(skill.description.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(query.as_str()))
+}
+
+pub fn filter_skills_by_search<'a>(
+    skills: &'a [SkillListItem],
+    query: &str,
+) -> Vec<&'a SkillListItem> {
+    skills
+        .iter()
+        .filter(|skill| skill_matches_search(skill, query))
+        .collect()
 }
 
 pub fn derive_skills_catalog_and_installed(mut catalog: Vec<SkillListItem>) -> SkillsCatalogSplit {
@@ -155,16 +173,13 @@ where
 
 pub fn reconcile_skills_snapshot(
     snapshot: SkillsCatalogSnapshot,
-    pending_actions: &mut HashSet<String>,
-    selected_target: Option<(String, String)>,
+    pending_actions: &mut HashSet<SkillId>,
+    selected_target: Option<SkillId>,
 ) -> ReconciledSkillsSnapshot {
     retain_pending_actions_for_catalog(pending_actions, snapshot.catalog.as_slice());
 
-    let selected_target_cleared = selected_target.as_ref().is_some_and(|(slug, source_kind)| {
-        !selected_skill_still_present(
-            snapshot.installed.as_slice(),
-            Some((slug.as_str(), source_kind.as_str())),
-        )
+    let selected_target_cleared = selected_target.as_ref().is_some_and(|skill_id| {
+        !selected_skill_still_present(snapshot.installed.as_slice(), Some(skill_id))
     });
     let selected_target = if selected_target_cleared {
         None
@@ -181,8 +196,8 @@ pub fn reconcile_skills_snapshot(
 
 pub fn reduce_skills_catalog_refresh_success(
     snapshot: SkillsCatalogSnapshot,
-    mut pending_actions: HashSet<String>,
-    selected_target: Option<(String, String)>,
+    mut pending_actions: HashSet<SkillId>,
+    selected_target: Option<SkillId>,
 ) -> SkillsCatalogRefreshSuccessReduction {
     let reconciled = reconcile_skills_snapshot(snapshot, &mut pending_actions, selected_target);
     let snapshot = reconciled.snapshot;
@@ -206,59 +221,53 @@ pub fn reduce_skills_catalog_refresh_failure(
 }
 
 pub fn retain_pending_actions_for_catalog(
-    pending_actions: &mut HashSet<String>,
+    pending_actions: &mut HashSet<SkillId>,
     catalog: &[SkillListItem],
 ) {
     let catalog_keys = catalog
         .iter()
-        .map(|skill| skill_key(skill.slug.as_str(), skill.source_kind.as_str()))
+        .map(|skill| skill_key(&skill.skill_id))
         .collect::<HashSet<_>>();
 
     pending_actions.retain(|key| catalog_keys.contains(key));
 }
 
-pub fn is_skill_pending(pending_actions: &HashSet<String>, slug: &str, source_kind: &str) -> bool {
-    pending_actions.contains(skill_key(slug, source_kind).as_str())
+pub fn is_skill_pending(pending_actions: &HashSet<SkillId>, skill_id: &SkillId) -> bool {
+    pending_actions.contains(skill_id)
 }
 
 pub fn mark_skill_pending(
-    pending_actions: &mut HashSet<String>,
-    slug: &str,
-    source_kind: &str,
+    pending_actions: &mut HashSet<SkillId>,
+    skill_id: &SkillId,
     pending: bool,
 ) {
-    let key = skill_key(slug, source_kind);
     if pending {
-        pending_actions.insert(key);
+        pending_actions.insert(skill_id.clone());
     } else {
-        pending_actions.remove(key.as_str());
+        pending_actions.remove(skill_id);
     }
 }
 
 pub fn find_skill<'a>(
     skills: &'a [SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
 ) -> Option<&'a SkillListItem> {
-    let (slug, source_kind) = normalize_skill_target(slug, source_kind)?;
-    skills
-        .iter()
-        .find(|skill| skill.slug == slug && skill.source_kind == source_kind)
+    skills.iter().find(|skill| &skill.skill_id == skill_id)
 }
 
-pub fn skill_exists(skills: &[SkillListItem], slug: &str, source_kind: &str) -> bool {
-    find_skill(skills, slug, source_kind).is_some()
+pub fn skill_exists(skills: &[SkillListItem], skill_id: &SkillId) -> bool {
+    find_skill(skills, skill_id).is_some()
 }
 
 pub fn selected_skill_still_present(
     installed: &[SkillListItem],
-    selected_target: Option<(&str, &str)>,
+    selected_target: Option<&SkillId>,
 ) -> bool {
-    let Some((slug, source_kind)) = selected_target else {
+    let Some(skill_id) = selected_target else {
         return true;
     };
 
-    skill_exists(installed, slug, source_kind)
+    skill_exists(installed, skill_id)
 }
 
 #[cfg(test)]
@@ -267,8 +276,18 @@ mod tests {
     use pioneer_protocol::{SkillHealthSummary, SkillInstallState, SkillPolicyState};
     use std::cell::RefCell;
 
+    fn skill_id(slug: &str, source_kind: &str) -> SkillId {
+        let seed = format!("{slug}{source_kind}")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        SkillId::new(seed.chars().cycle().take(21).collect::<String>()).expect("test skill id")
+    }
+
     fn skill(slug: &str, source_kind: &str, installed: bool) -> SkillListItem {
         SkillListItem {
+            skill_id: skill_id(slug, source_kind),
+            owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),
             display_name: slug.to_owned(),
@@ -301,6 +320,8 @@ mod tests {
 
     fn health(slug: &str, source_kind: &str) -> SkillHealthItem {
         SkillHealthItem {
+            skill_id: skill_id(slug, source_kind),
+            owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),
             trust_level: "community".to_owned(),
@@ -313,13 +334,9 @@ mod tests {
     }
 
     #[test]
-    fn skill_targets_are_normalized_and_keyed() {
-        assert_eq!(skill_key(" imagegen ", " user "), "imagegen::user");
-        assert_eq!(
-            normalize_skill_target(" imagegen ", " user "),
-            Some(("imagegen".to_owned(), "user".to_owned()))
-        );
-        assert_eq!(normalize_skill_target(" ", "user"), None);
+    fn skill_targets_are_keyed_only_by_exact_id() {
+        let id = skill_id("imagegen", "user");
+        assert_eq!(skill_key(&id), id);
     }
 
     #[test]
@@ -339,16 +356,22 @@ mod tests {
             split
                 .catalog
                 .iter()
-                .map(|skill| skill_key(&skill.slug, &skill.source_kind))
+                .map(|skill| (skill.slug.as_str(), skill.source_kind.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["browser::system", "beta::user", "zeta::user"]
+            vec![("browser", "system"), ("beta", "user"), ("zeta", "user")]
         );
         assert_eq!(split.installed.len(), 3);
-        assert!(skill_exists(&split.catalog, "browser", "system"));
-        assert!(skill_exists(&split.installed, "browser", "system"));
-        assert!(skill_exists(&split.installed, "beta", "user"));
-        assert!(!skill_exists(&split.catalog, "memory", "system"));
-        assert!(!skill_exists(&split.installed, "memory", "system"));
+        assert!(skill_exists(&split.catalog, &skill_id("browser", "system")));
+        assert!(skill_exists(
+            &split.installed,
+            &skill_id("browser", "system")
+        ));
+        assert!(skill_exists(&split.installed, &skill_id("beta", "user")));
+        assert!(!skill_exists(&split.catalog, &skill_id("memory", "system")));
+        assert!(!skill_exists(
+            &split.installed,
+            &skill_id("memory", "system")
+        ));
     }
 
     #[test]
@@ -357,32 +380,30 @@ mod tests {
             vec![skill("alpha", "user", true), skill("beta", "user", false)],
             vec![health("alpha", "user")],
         );
-        assert!(snapshot.health_details.contains_key("alpha::user"));
+        let alpha_id = skill_id("alpha", "user");
+        assert!(snapshot.health_details.contains_key(&alpha_id));
 
-        let mut pending = HashSet::from(["alpha::user".to_owned(), "missing::user".to_owned()]);
+        let missing_id = skill_id("missing", "user");
+        let mut pending = HashSet::from([alpha_id.clone(), missing_id.clone()]);
         retain_pending_actions_for_catalog(&mut pending, &snapshot.catalog);
-        assert!(pending.contains("alpha::user"));
-        assert!(!pending.contains("missing::user"));
+        assert!(pending.contains(&alpha_id));
+        assert!(!pending.contains(&missing_id));
     }
 
     #[test]
     fn pending_and_selected_target_helpers_use_canonical_keys() {
         let mut pending = HashSet::new();
+        let alpha_id = skill_id("alpha", "user");
+        let missing_id = skill_id("missing", "user");
 
-        mark_skill_pending(&mut pending, " alpha ", " user ", true);
-        assert!(is_skill_pending(&pending, "alpha", "user"));
-        mark_skill_pending(&mut pending, "alpha", "user", false);
-        assert!(!is_skill_pending(&pending, "alpha", "user"));
+        mark_skill_pending(&mut pending, &alpha_id, true);
+        assert!(is_skill_pending(&pending, &alpha_id));
+        mark_skill_pending(&mut pending, &alpha_id, false);
+        assert!(!is_skill_pending(&pending, &alpha_id));
 
         let installed = vec![skill("alpha", "user", true)];
-        assert!(selected_skill_still_present(
-            &installed,
-            Some(("alpha", "user"))
-        ));
-        assert!(!selected_skill_still_present(
-            &installed,
-            Some(("missing", "user"))
-        ));
+        assert!(selected_skill_still_present(&installed, Some(&alpha_id)));
+        assert!(!selected_skill_still_present(&installed, Some(&missing_id)));
         assert!(selected_skill_still_present(&installed, None));
     }
 
@@ -404,7 +425,11 @@ mod tests {
         );
         assert_eq!(snapshot.catalog.len(), 2);
         assert_eq!(snapshot.installed.len(), 1);
-        assert!(snapshot.health_details.contains_key("alpha::user"));
+        assert!(
+            snapshot
+                .health_details
+                .contains_key(&skill_id("alpha", "user"))
+        );
     }
 
     #[test]
@@ -413,15 +438,13 @@ mod tests {
             vec![skill("alpha", "user", true)],
             vec![health("alpha", "user")],
         );
-        let mut pending = HashSet::from([skill_key("alpha", "user"), skill_key("missing", "user")]);
+        let alpha_id = skill_id("alpha", "user");
+        let missing_id = skill_id("missing", "user");
+        let mut pending = HashSet::from([alpha_id.clone(), missing_id.clone()]);
 
-        let reconciled = reconcile_skills_snapshot(
-            snapshot,
-            &mut pending,
-            Some(("missing".to_owned(), "user".to_owned())),
-        );
+        let reconciled = reconcile_skills_snapshot(snapshot, &mut pending, Some(missing_id));
 
-        assert_eq!(pending, HashSet::from([skill_key("alpha", "user")]));
+        assert_eq!(pending, HashSet::from([alpha_id]));
         assert!(reconciled.selected_target.is_none());
         assert!(reconciled.selected_target_cleared);
     }
@@ -432,26 +455,56 @@ mod tests {
             vec![skill("alpha", "user", true), skill("beta", "user", false)],
             vec![health("alpha", "user")],
         );
-        let pending = HashSet::from([skill_key("alpha", "user"), skill_key("missing", "user")]);
+        let alpha_id = skill_id("alpha", "user");
+        let pending = HashSet::from([alpha_id.clone(), skill_id("missing", "user")]);
 
-        let reduction = reduce_skills_catalog_refresh_success(
-            snapshot,
-            pending,
-            Some(("alpha".to_owned(), "user".to_owned())),
-        );
+        let reduction =
+            reduce_skills_catalog_refresh_success(snapshot, pending, Some(alpha_id.clone()));
 
         assert_eq!(reduction.catalog.len(), 2);
         assert_eq!(reduction.installed.len(), 1);
-        assert!(reduction.health_details.contains_key("alpha::user"));
-        assert_eq!(
-            reduction.pending_actions,
-            HashSet::from([skill_key("alpha", "user")])
-        );
-        assert_eq!(
-            reduction.selected_target,
-            Some(("alpha".to_owned(), "user".to_owned()))
-        );
+        assert!(reduction.health_details.contains_key(&alpha_id));
+        assert_eq!(reduction.pending_actions, HashSet::from([alpha_id.clone()]));
+        assert_eq!(reduction.selected_target, Some(alpha_id));
         assert!(!reduction.selected_target_cleared);
+    }
+
+    #[test]
+    fn duplicate_labels_remain_distinct_and_reconcile_independently_by_id() {
+        let mut first = skill("humanizer", "user", true);
+        first.skill_id = SkillId::new("A".repeat(21)).unwrap();
+        first.owner = Some("alex".to_owned());
+        let mut second = first.clone();
+        second.skill_id = SkillId::new("B".repeat(21)).unwrap();
+
+        let snapshot = project_skills_snapshot(vec![first.clone(), second.clone()], Vec::new());
+        assert_eq!(snapshot.catalog.len(), 2);
+        assert_eq!(snapshot.catalog[0].slug, snapshot.catalog[1].slug);
+
+        let mut pending = HashSet::from([first.skill_id.clone(), second.skill_id.clone()]);
+        let reconciled =
+            reconcile_skills_snapshot(snapshot, &mut pending, Some(second.skill_id.clone()));
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(reconciled.selected_target, Some(second.skill_id));
+        assert!(!reconciled.selected_target_cleared);
+    }
+
+    #[test]
+    fn search_preserves_presentation_fields_and_duplicate_rows() {
+        let mut first = skill("humanizer", "user", true);
+        first.skill_id = SkillId::new("A".repeat(21)).unwrap();
+        first.owner = Some("alex".to_owned());
+        first.display_name = "Natural writing".to_owned();
+        first.description = "Remove robotic wording".to_owned();
+        let mut second = first.clone();
+        second.skill_id = SkillId::new("B".repeat(21)).unwrap();
+
+        let skills = vec![first, second];
+        for query in ["alex", "humanizer", "alex/humanizer", "natural", "robotic"] {
+            assert_eq!(filter_skills_by_search(&skills, query).len(), 2, "{query}");
+        }
+        assert!(filter_skills_by_search(&skills, "missing").is_empty());
     }
 
     #[test]

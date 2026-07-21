@@ -63,7 +63,7 @@ pub const SUBAGENTS_POLICY_PROMPT: &str = concat!(
     "Do not delegate tiny, obvious, tightly coupled, single-step, or strictly sequential work where coordination would not improve the outcome.\n\n",
     "The parent agent owns the user outcome. Child results are evidence until the parent reviews, accepts, revises, cancels, detaches, or integrates them.\n\n",
     "Do not finish the parent turn while attached subagent work created by this turn is pending, running, awaiting review, or producing unreviewed candidates.\n\n",
-    "Before creating attached subagents, waiting for them, reviewing candidates, revising, accepting, cancelling, detaching, or synthesizing child results, call `read_skill` with skill slug `system:pioneer/subagents` and follow that skill."
+    "Before creating attached subagents, waiting for them, reviewing candidates, revising, accepting, cancelling, detaching, or synthesizing child results, find `pioneer/subagents` in Internal Skill References, call `read_skill` with that exact reference, and follow that skill."
 );
 
 pub const TASKS_POLICY_PROMPT: &str = concat!(
@@ -71,7 +71,7 @@ pub const TASKS_POLICY_PROMPT: &str = concat!(
     "Use durable tasks when work should run later, repeat on a schedule, continue in the background, be updated later, or deliver results outside the current parent turn.\n\n",
     "Scheduled and recurring tasks are not attached subagents. Do not wait for future scheduled runs unless a current active run is explicitly waitable. Confirm the task id, schedule, timezone, delivery destination, and where results will appear.\n\n",
     "Delivery is separate from execution. A task can finish and store a result without writing a message to this thread unless delivery is configured for a thread surface.\n\n",
-    "Before creating, listing, inspecting, updating, rescheduling, pausing, resuming, or troubleshooting durable tasks, call `read_skill` with skill slug `system:pioneer/tasks` and follow that skill."
+    "Before creating, listing, inspecting, updating, rescheduling, pausing, resuming, or troubleshooting durable tasks, find `pioneer/tasks` in Internal Skill References, call `read_skill` with that exact reference, and follow that skill."
 );
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";
@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn subagents_and_tasks_policies_point_to_separate_system_skills() {
-        assert!(SUBAGENTS_POLICY_PROMPT.contains("system:pioneer/subagents"));
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("pioneer/subagents"));
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("Internal Skill References"));
         assert!(SUBAGENTS_POLICY_PROMPT.contains("read_skill"));
         assert!(SUBAGENTS_POLICY_PROMPT.contains("attached subagents"));
         assert!(SUBAGENTS_POLICY_PROMPT.contains("parent agent owns the user outcome"));
@@ -215,7 +216,8 @@ mod tests {
                 .contains("Do not finish the parent turn while attached subagent work")
         );
 
-        assert!(TASKS_POLICY_PROMPT.contains("system:pioneer/tasks"));
+        assert!(TASKS_POLICY_PROMPT.contains("pioneer/tasks"));
+        assert!(TASKS_POLICY_PROMPT.contains("Internal Skill References"));
         assert!(TASKS_POLICY_PROMPT.contains("read_skill"));
         assert!(TASKS_POLICY_PROMPT.contains("future, recurring, background"));
         assert!(TASKS_POLICY_PROMPT.contains("Delivery is separate from execution"));

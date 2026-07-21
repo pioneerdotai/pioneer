@@ -1,3 +1,4 @@
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -79,6 +80,9 @@ pub enum DynamicSkillPermissionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DynamicSkillPermissionMetadata {
     pub kind: DynamicSkillPermissionKind,
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub trust_level: String,

@@ -47,7 +47,8 @@ use pioneer_crud::{
     AgentMemoryListFilter, CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus,
     CrudStore, MemoryActorRecord, NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection,
     NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-    ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, global_agent_memory_scope_key,
+    SkillInstallationPatch, SkillInstallationRecord, ThreadAgentsDocSaveReason,
+    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -115,14 +116,14 @@ use pioneer_protocol::{
     ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
     ThreadUpdateResponse, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
     ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView, ToolStoragePayload, Turn,
-    TurnAcceptedCapability, TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
-    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
-    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput,
-    UserMessageAttachment, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
-    VoiceStatus, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateResponse,
-    WorkspaceDefaultResponse, WorkspaceListResponse, WorkspaceSelectResponse,
-    WorkspaceUpdateResponse, constants::events,
+    TurnAcceptedCapability, TurnCancelResponse, TurnCapability, TurnCapabilityAcceptedReason,
+    TurnCapabilityKind, TurnCapabilityRejectedReason, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
+    TurnKind, TurnOrigin, TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus,
+    UserInput, UserMessageAttachment, VoiceErrorKind, VoiceSessionOutcome,
+    VoiceSessionResultNotification, VoiceStatus, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -652,16 +653,67 @@ fn cli_runtime_turn_start_request_with_capabilities(
     request.to_string()
 }
 
+fn cli_runtime_skill_test_id(slug: &str, source_kind: &str) -> pioneer_protocol::SkillId {
+    let suffix = match source_kind {
+        "system" => 'S',
+        "user" => 'U',
+        "registry" => 'R',
+        other => panic!("unsupported CLI runtime skill source kind `{other}`"),
+    };
+    let mut value = slug
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    value.truncate(20);
+    while value.len() < 20 {
+        value.push(suffix);
+    }
+    value.push(suffix);
+    pioneer_protocol::SkillId::new(value).expect("valid CLI runtime skill test ID")
+}
+
 fn cli_runtime_skill_capability(slug: &str, source_kind: &str) -> JsonValue {
+    let skill_id = cli_runtime_skill_test_id(slug, source_kind);
     serde_json::to_value(pioneer_protocol::TurnCapability {
-        id: format!("skill:{source_kind}:{slug}"),
-        kind: pioneer_protocol::TurnCapabilityKind::Skill {
-            slug: slug.to_owned(),
-            source_kind: source_kind.to_owned(),
-        },
+        id: format!("skill:{skill_id}"),
+        kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
         label: Some(slug.to_owned()),
     })
     .unwrap()
+}
+
+async fn seed_cli_runtime_skill_installation(
+    harness: &CliRuntimeSkillPreflightHarness,
+    slug: &str,
+    source_kind: &str,
+    install_path: &std::path::Path,
+) -> pioneer_protocol::SkillId {
+    let skill_id = cli_runtime_skill_test_id(slug, source_kind);
+    harness
+        .crud_store
+        .insert_skill_installation(
+            &SkillInstallationRecord {
+                skill_id: skill_id.clone(),
+                owner: slug.split_once('/').map(|(owner, _)| owner.to_owned()),
+                slug: slug.rsplit('/').next().unwrap_or(slug).to_owned(),
+                version: None,
+                source_kind: source_kind.to_owned(),
+                scope_key: harness.workspace_id.clone(),
+                source_ref: format!("test:cli:{source_kind}:{slug}"),
+                install_path: install_path.display().to_string(),
+                trust_level: if source_kind == "system" {
+                    "internal".to_owned()
+                } else {
+                    "community".to_owned()
+                },
+                fingerprint: format!("cli-test-fingerprint-{skill_id}"),
+                updated_at_unix: 1,
+            },
+            1,
+        )
+        .await
+        .expect("seed CLI runtime skill installation");
+    skill_id
 }
 
 fn write_test_skill_with_declared_name(
@@ -749,8 +801,22 @@ where
 async fn capability_persistence_order_impl() {
     for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
-        write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
-        write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
+        let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
+        let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
+        let alpha_id = seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/alpha",
+            "user",
+            alpha_path.as_path(),
+        )
+        .await;
+        let beta_id = seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/beta",
+            "registry",
+            beta_path.as_path(),
+        )
+        .await;
         let thread_id = format!("thread_preflight_{runtime_kind:?}").to_ascii_lowercase();
         let turn_id = format!("turn_preflight_{runtime_kind:?}").to_ascii_lowercase();
         seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
@@ -826,13 +892,17 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("must read persisted CLI runtime turn skill bindings");
         assert_eq!(skill_bindings.len(), 2);
-        assert_eq!(skill_bindings[0].skill_slug, "tests/alpha");
+        assert_eq!(skill_bindings[0].skill_id, alpha_id);
+        assert_eq!(skill_bindings[0].skill_owner.as_deref(), Some("tests"));
+        assert_eq!(skill_bindings[0].skill_slug, "alpha");
         assert_eq!(skill_bindings[0].source_kind, "user");
         assert_eq!(
             skill_bindings[0].resolved_reason,
             "explicit_composer_capability"
         );
-        assert_eq!(skill_bindings[1].skill_slug, "tests/beta");
+        assert_eq!(skill_bindings[1].skill_id, beta_id);
+        assert_eq!(skill_bindings[1].skill_owner.as_deref(), Some("tests"));
+        assert_eq!(skill_bindings[1].skill_slug, "beta");
         assert_eq!(skill_bindings[1].source_kind, "registry");
         assert_eq!(
             skill_bindings[1].resolved_reason,
@@ -946,6 +1016,13 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
     for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
+        let lifecycle_id = seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/lifecycle",
+            "user",
+            source.as_path(),
+        )
+        .await;
         std::fs::create_dir_all(source.join("references")).unwrap();
         std::fs::write(source.join("references/guide.txt"), b"guide-v1\n").unwrap();
         let receipt_path = harness
@@ -981,7 +1058,9 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .await
                 .expect("must read persisted CLI runtime turn skill bindings");
             assert_eq!(bindings.len(), 1);
-            assert_eq!(bindings[0].skill_slug, "tests/lifecycle");
+            assert_eq!(bindings[0].skill_id, lifecycle_id);
+            assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
+            assert_eq!(bindings[0].skill_slug, "lifecycle");
             assert_eq!(bindings[0].source_kind, "user");
             assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
             assert!(!bindings[0].fingerprint.is_empty());
@@ -999,6 +1078,9 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
         assert_eq!(first_receipt.entries.len(), 1);
+        assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
+        assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
+        assert_eq!(first_receipt.entries[0].slug, "lifecycle");
         assert_eq!(first_receipt.entries[0].install_name, "lifecycle");
         assert_eq!(
             first_receipt.entries[0].native_skills_root,
@@ -1048,7 +1130,8 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .await
             .expect("must read updated CLI runtime turn skill bindings");
         assert_eq!(updated_bindings.len(), 1);
-        assert_eq!(updated_bindings[0].skill_slug, "tests/lifecycle");
+        assert_eq!(updated_bindings[0].skill_id, lifecycle_id);
+        assert_eq!(updated_bindings[0].skill_slug, "lifecycle");
 
         let updated_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
         assert_ne!(
@@ -1110,7 +1193,19 @@ fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
 async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+    let skill_path = write_test_skill(
+        &harness.system_root,
+        "memory-like",
+        "implicit-invocation: required",
+        "# system\n",
+    );
+    seed_cli_runtime_skill_installation(
+        &harness,
+        "tests/memory-like",
+        "system",
+        skill_path.as_path(),
+    )
+    .await;
     let thread_id = "thread_system_preflight";
     let turn_id = "turn_system_preflight";
     seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
@@ -1165,7 +1260,14 @@ fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
 async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+    let skill_path = write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+    seed_cli_runtime_skill_installation(
+        &harness,
+        "tests/memory-like",
+        "system",
+        skill_path.as_path(),
+    )
+    .await;
     let thread_id = "thread_native_system_control";
     let turn_id = "turn_native_system_control";
     seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
@@ -1224,7 +1326,9 @@ fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
 async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
     let harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    seed_cli_runtime_skill_installation(&harness, "tests/refresh", "user", skill_path.as_path())
+        .await;
     let thread_id = "thread_codex_skill_refresh";
     seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
     let session_key = CLIAgentRuntimeSessionKey::new(
@@ -1273,7 +1377,9 @@ fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
 async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
     let harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
-    write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    seed_cli_runtime_skill_installation(&harness, "tests/refresh", "user", skill_path.as_path())
+        .await;
     let thread_id = "thread_claude_skill_refresh";
     seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
     let session_key = CLIAgentRuntimeSessionKey::new(
@@ -1326,12 +1432,19 @@ fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
 async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
-    write_test_skill(
+    let skill_path = write_test_skill(
         &harness.user_root,
         "manual-only",
         "disable-model-invocation: true",
         "# manual only\n",
     );
+    seed_cli_runtime_skill_installation(
+        &harness,
+        "tests/manual-only",
+        "user",
+        skill_path.as_path(),
+    )
+    .await;
     let thread_id = "thread_claude_manual_skill";
     let turn_id = "turn_claude_manual_skill";
     seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
@@ -1385,8 +1498,19 @@ fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
 async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn_impl() {
     let mut collision =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    write_test_skill_with_declared_name(&collision.user_root, "first", "same skill");
-    write_test_skill_with_declared_name(&collision.registry_root, "second", "same@skill");
+    let first_path =
+        write_test_skill_with_declared_name(&collision.user_root, "first", "same skill");
+    let second_path =
+        write_test_skill_with_declared_name(&collision.registry_root, "second", "same@skill");
+    seed_cli_runtime_skill_installation(&collision, "tests/first", "user", first_path.as_path())
+        .await;
+    seed_cli_runtime_skill_installation(
+        &collision,
+        "tests/second",
+        "registry",
+        second_path.as_path(),
+    )
+    .await;
     seed_cli_runtime_skill_preflight_thread(&collision, "thread_collision_preflight").await;
     let collision_request_id = generate_test_request_id("p51collision", "fail");
     let request = cli_runtime_turn_start_request_with_capabilities(
@@ -1424,12 +1548,19 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
 
     let mut copy_failure =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, true).await;
-    write_test_skill(
+    let copy_failure_path = write_test_skill(
         &copy_failure.user_root,
         "copy-failure",
         "",
         "# copy failure\n",
     );
+    seed_cli_runtime_skill_installation(
+        &copy_failure,
+        "tests/copy-failure",
+        "user",
+        copy_failure_path.as_path(),
+    )
+    .await;
     seed_cli_runtime_skill_preflight_thread(&copy_failure, "thread_copy_failure_preflight").await;
     let copy_request_id = generate_test_request_id("p51copy", "failure");
     let request = cli_runtime_turn_start_request_with_capabilities(
@@ -4068,6 +4199,9 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             registry_roots: vec![
                 "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
             ],
+            system_import_roots: Vec::new(),
+            user_import_roots: Vec::new(),
+            registry_import_roots: Vec::new(),
             validation: pioneer_agent::SkillsValidationLoopConfig {
                 strict_agentskills: true,
                 accept_openclaw_profile: true,
@@ -4188,6 +4322,39 @@ description: {slug} description
     )
     .expect("must write skill file");
     skill_dir
+}
+
+async fn seed_test_skill_installation(
+    crud_store: &CrudStore,
+    skill_id_character: char,
+    workspace_id: &str,
+    source_kind: &str,
+    install_path: &std::path::Path,
+    owner: Option<&str>,
+    slug: &str,
+) -> pioneer_protocol::SkillId {
+    let skill_id = pioneer_protocol::SkillId::new(skill_id_character.to_string().repeat(21))
+        .expect("valid test SkillId");
+    crud_store
+        .insert_skill_installation(
+            &SkillInstallationRecord {
+                skill_id: skill_id.clone(),
+                owner: owner.map(str::to_owned),
+                slug: slug.to_owned(),
+                version: None,
+                source_kind: source_kind.to_owned(),
+                scope_key: workspace_id.to_owned(),
+                source_ref: format!("test:{source_kind}:{slug}"),
+                install_path: install_path.display().to_string(),
+                trust_level: "community".to_owned(),
+                fingerprint: format!("test-fingerprint-{skill_id_character}"),
+                updated_at_unix: 1,
+            },
+            1,
+        )
+        .await
+        .expect("seed skill installation");
+    skill_id
 }
 
 async fn create_finalized_skill_upload(
@@ -6122,11 +6289,30 @@ async fn edit_file_completed_item_does_not_register_artifact() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_with_capabilities_materializes_user_message_attachments() {
+    let base_dir = unique_temp_dir("turn_capability_user_message");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("create system root");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("create registry root");
+    let weather_path = write_test_skill(&user_root, "weather", "", "weather body");
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let weather_skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'W',
+        workspace_id.as_str(),
+        "user",
+        weather_path.as_path(),
+        Some("tests"),
+        "weather",
+    )
+    .await;
     let capture_provider = Arc::new(CaptureSummaryProvider::new("capability answer"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -6141,7 +6327,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
     let thread = start_thread_for_artifact_test(
         &processor,
@@ -6166,9 +6352,9 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
             ],
             "capabilities": [
                 {
-                    "id": "skill:user:weather",
-                    "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
-                    "label": "weather"
+                    "id": format!("skill:{weather_skill_id}"),
+                    "kind": { "type": "skill", "skillId": weather_skill_id },
+                    "label": "tests/weather"
                 },
                 {
                     "id": "mcp-server:workspace:resend",
@@ -6216,8 +6402,9 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
     assert!(matches!(
         &attachments[0],
         UserMessageAttachment::Skill { capability }
-            if capability.id == "skill:user:weather"
-                && capability.label == "weather"
+            if capability.skill_id == weather_skill_id
+                && capability.label == "tests/weather"
+                && capability.owner.as_deref() == Some("tests")
                 && capability.slug == "weather"
                 && capability.source_kind == "user"
     ));
@@ -6271,7 +6458,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         timeline_attachments.iter().any(|attachment| matches!(
             attachment,
             UserMessageAttachment::Skill { capability }
-                if capability.id == "skill:user:weather"
+                if capability.skill_id == weather_skill_id
         )),
         "semantic timeline user block must preserve skill chips"
     );
@@ -6283,6 +6470,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         )),
         "semantic timeline user block must preserve MCP chips"
     );
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 struct TestGatewayVoiceInstaller;
@@ -6377,11 +6565,30 @@ fn test_gateway_voice_supervisor() -> Arc<crate::voice::supervisor::VoiceInputSu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_session_transcript_starts_turn_and_preserves_context_attachments() {
+    let base_dir = unique_temp_dir("voice_turn_capability");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("create system root");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("create registry root");
+    let weather_path = write_test_skill(&user_root, "weather", "", "weather body");
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let weather_skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'V',
+        workspace_id.as_str(),
+        "user",
+        weather_path.as_path(),
+        Some("tests"),
+        "weather",
+    )
+    .await;
     let capture_provider = Arc::new(CaptureSummaryProvider::new("voice answer"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -6396,7 +6603,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor(
         "voice transcript with context",
@@ -6427,9 +6634,9 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         ],
         "capabilities": [
             {
-                "id": "skill:user:weather",
-                "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
-                "label": "weather"
+                "id": format!("skill:{weather_skill_id}"),
+                "kind": { "type": "skill", "skillId": weather_skill_id },
+                "label": "tests/weather"
             },
             {
                 "id": "mcp-tool:workspace:resend:send_email",
@@ -6561,7 +6768,9 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         attachments.iter().any(|attachment| matches!(
             attachment,
             UserMessageAttachment::Skill { capability }
-                if capability.id == "skill:user:weather"
+                if capability.skill_id == weather_skill_id
+                    && capability.owner.as_deref() == Some("tests")
+                    && capability.slug == "weather"
         )),
         "voice turn must preserve selected skill capability"
     );
@@ -6593,6 +6802,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
 
     let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
     assert_eq!(capture_provider.call_count(), 1);
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13163,20 +13373,20 @@ async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             accepted: vec![TurnAcceptedCapability {
-                id: "skill:user:docs".to_owned(),
+                id: "skill:DDDDDDDDDDDDDDDDDDDDD".to_owned(),
                 label: Some("docs".to_owned()),
                 kind: TurnCapabilityKind::Skill {
-                    slug: "docs".to_owned(),
-                    source_kind: "user".to_owned(),
+                    skill_id: pioneer_protocol::SkillId::new("DDDDDDDDDDDDDDDDDDDDD")
+                        .expect("valid docs SkillId"),
                 },
                 reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
             }],
             rejected: vec![TurnRejectedCapability {
-                id: "skill:user:missing".to_owned(),
+                id: "skill:MMMMMMMMMMMMMMMMMMMMM".to_owned(),
                 label: Some("missing".to_owned()),
                 kind: TurnCapabilityKind::Skill {
-                    slug: "missing".to_owned(),
-                    source_kind: "user".to_owned(),
+                    skill_id: pioneer_protocol::SkillId::new("MMMMMMMMMMMMMMMMMMMMM")
+                        .expect("valid missing SkillId"),
                 },
                 reason: TurnCapabilityRejectedReason::NotFound,
                 message: "Skill `missing` is not installed or not available in this workspace."
@@ -13226,7 +13436,7 @@ async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
         } => {
             assert_eq!(committed_turn_id, turn_id);
             assert_eq!(accepted.len(), 1);
-            assert_eq!(accepted[0].id, "skill:user:docs");
+            assert_eq!(accepted[0].id, "skill:DDDDDDDDDDDDDDDDDDDDD");
             assert_eq!(
                 accepted[0].reason,
                 TurnCapabilityAcceptedReason::ExplicitComposerCapability
@@ -23258,13 +23468,28 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         .handle_durable_agent_event(AgentDurableEvent::TurnSkillsResolved {
             thread_id: "thr_000000000000000020".to_owned(),
             turn_id: turn_id.to_owned(),
-            bindings: vec![TurnSkillBinding {
-                skill_slug: "pioneer/my-skill".to_owned(),
-                skill_version: Some("1.2.3".to_owned()),
-                fingerprint: "fp-my-skill".to_owned(),
-                source_kind: "user".to_owned(),
-                resolved_reason: "explicit_composer_capability".to_owned(),
-            }],
+            bindings: vec![
+                TurnSkillBinding {
+                    skill_id: pioneer_protocol::SkillId::new("SSSSSSSSSSSSSSSSSSSSS")
+                        .expect("valid binding SkillId"),
+                    skill_owner: Some("pioneer".to_owned()),
+                    skill_slug: "pioneer/my-skill".to_owned(),
+                    skill_version: Some("1.2.3".to_owned()),
+                    fingerprint: "fp-my-skill".to_owned(),
+                    source_kind: "user".to_owned(),
+                    resolved_reason: "explicit_composer_capability".to_owned(),
+                },
+                TurnSkillBinding {
+                    skill_id: pioneer_protocol::SkillId::new("TTTTTTTTTTTTTTTTTTTTT")
+                        .expect("valid duplicate-label binding SkillId"),
+                    skill_owner: Some("pioneer".to_owned()),
+                    skill_slug: "pioneer/my-skill".to_owned(),
+                    skill_version: Some("2.0.0".to_owned()),
+                    fingerprint: "fp-neighbor".to_owned(),
+                    source_kind: "user".to_owned(),
+                    resolved_reason: "explicit_composer_capability".to_owned(),
+                },
+            ],
         })
         .await;
 
@@ -23272,9 +23497,13 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         .find_turn_skill_bindings(turn_id)
         .await
         .expect("must read persisted turn skill bindings");
-    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].skill_id.as_str(), "SSSSSSSSSSSSSSSSSSSSS");
+    assert_eq!(bindings[0].skill_owner.as_deref(), Some("pioneer"));
     assert_eq!(bindings[0].skill_slug, "pioneer/my-skill");
     assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
+    assert_eq!(bindings[1].skill_id.as_str(), "TTTTTTTTTTTTTTTTTTTTT");
+    assert_eq!(bindings[1].skill_slug, "pioneer/my-skill");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23296,12 +23525,16 @@ async fn agent_skill_audit_event_persists_audit_rows() {
     );
 
     let turn_id = "turn_000000000000000021";
+    let audit_skill_id =
+        pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid audit SkillId");
     processor
         .handle_durable_agent_event(AgentDurableEvent::SkillAuditEvents {
             thread_id: "thr_000000000000000021".to_owned(),
             turn_id: turn_id.to_owned(),
             events: vec![
                 ProtocolSkillAuditEvent {
+                    skill_id: audit_skill_id.clone(),
+                    skill_owner: Some("pioneer".to_owned()),
                     skill_slug: "pioneer/my-skill".to_owned(),
                     source_kind: "user".to_owned(),
                     action: "resolve_allowed".to_owned(),
@@ -23311,6 +23544,8 @@ async fn agent_skill_audit_event_persists_audit_rows() {
                     created_at_unix: 1_700_000_000,
                 },
                 ProtocolSkillAuditEvent {
+                    skill_id: audit_skill_id.clone(),
+                    skill_owner: Some("pioneer".to_owned()),
                     skill_slug: "pioneer/my-skill".to_owned(),
                     source_kind: "user".to_owned(),
                     action: "runtime_blocked".to_owned(),
@@ -23337,6 +23572,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
         .await
         .expect("must load persisted audit rows");
     assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event.skill_id == audit_skill_id));
     assert_eq!(events[0].skill_slug, "pioneer/my-skill");
     assert_eq!(events[1].action, "runtime_blocked");
 
@@ -23345,6 +23581,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
         .await
         .expect("must load dependency snapshots");
     assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].skill_id, audit_skill_id);
     assert!(snapshots[0].diagnostics_json.contains("\"name\":\"node\""));
 }
 
@@ -30469,10 +30706,23 @@ Gateway skill body"#,
     )
     .expect("write SKILL.md");
 
+    let skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'Y',
+        workspace_id.as_str(),
+        "user",
+        skill_dir.as_path(),
+        Some("tests"),
+        "my-skill",
+    )
+    .await;
+    let skill_ref = format!("skill:{skill_id}");
+    let dynamic_tool_name = format!("skill.{skill_id}.echo-shell");
+
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_gw_dynamic_1".to_owned(),
-            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
+            name: dynamic_tool_name.clone(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -30530,8 +30780,8 @@ Gateway skill body"#,
             ],
             "capabilities": [
                 {
-                    "id": "skill:user:my-skill",
-                    "kind": { "type": "skill", "slug": "my-skill", "sourceKind": "user" },
+                    "id": skill_ref,
+                    "kind": { "type": "skill", "skillId": skill_id },
                     "label": "my-skill"
                 }
             ]
@@ -30563,7 +30813,7 @@ Gateway skill body"#,
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.user-tests-my-skill.echo-shell")
+        Some(dynamic_tool_name.as_str())
     );
     assert!(dynamic_result.content.contains("gw-shell-ok"));
 
@@ -30581,7 +30831,7 @@ Gateway skill body"#,
                 && let pioneer_protocol::TurnItem::DynamicToolCall {
                     tool_name, storage, ..
                 } = item
-                && tool_name == "skill.user-tests-my-skill.echo-shell"
+                && tool_name == &dynamic_tool_name
             {
                 return Some(storage);
             }
@@ -30790,10 +31040,23 @@ Gateway HTTP skill body"#
     )
     .expect("write SKILL.md");
 
+    let skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'Z',
+        workspace_id.as_str(),
+        "user",
+        skill_dir.as_path(),
+        Some("tests"),
+        "http-skill",
+    )
+    .await;
+    let skill_ref = format!("skill:{skill_id}");
+    let dynamic_tool_name = format!("skill.{skill_id}.fetch-secret");
+
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_gw_dynamic_http_1".to_owned(),
-            name: "skill.user-tests-http-skill.fetch-secret".to_owned(),
+            name: dynamic_tool_name.clone(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -30850,8 +31113,8 @@ Gateway HTTP skill body"#
             ],
             "capabilities": [
                 {
-                    "id": "skill:user:http-skill",
-                    "kind": { "type": "skill", "slug": "http-skill", "sourceKind": "user" },
+                    "id": skill_ref,
+                    "kind": { "type": "skill", "skillId": skill_id },
                     "label": "http-skill"
                 }
             ]
@@ -30880,7 +31143,7 @@ Gateway HTTP skill body"#
         .expect("second round must include dynamic http tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.user-tests-http-skill.fetch-secret")
+        Some(dynamic_tool_name.as_str())
     );
     assert!(dynamic_result.content.contains(SECRET));
 
@@ -30962,23 +31225,54 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(&system_root, "sys-b", "", "system skill body");
-    write_test_skill(
-        &system_root,
-        "locked-implicit",
-        "implicit-invocation: required",
-        "locked implicit system skill body",
-    );
-    write_test_skill(&system_root, "shared-skill", "", "system shared body");
-    write_test_skill(&user_root, "shared-skill", "", "user shared body");
-    write_test_skill(&user_root, "user-a", "", "user skill body");
-    write_test_skill(&registry_root, "registry-c", "", "registry skill body");
+    let tasks_id = pioneer_protocol::SkillId::new("AzBYfaNgS6u1tiPaSlwnm")
+        .expect("valid bundled tasks SkillId");
+    let tasks_path = system_root.join(tasks_id.as_str()).join("tasks");
+    std::fs::create_dir_all(&tasks_path).expect("create bundled tasks path");
+    std::fs::write(
+        tasks_path.join("SKILL.md"),
+        "---\nname: tasks\nslug: tasks\ndescription: tasks\nimplicit-invocation: required\n---\ntasks body",
+    )
+    .expect("write bundled tasks fixture");
+    let shared_path = write_test_skill(&user_root, "shared-skill", "", "user shared body");
+    let user_path = write_test_skill(&user_root, "user-a", "", "user skill body");
+    let registry_path = write_test_skill(&registry_root, "registry-c", "", "registry skill body");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let shared_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'S',
+        workspace_id.as_str(),
+        "user",
+        shared_path.as_path(),
+        Some("tests"),
+        "shared-skill",
+    )
+    .await;
+    let user_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'U',
+        workspace_id.as_str(),
+        "user",
+        user_path.as_path(),
+        Some("tests"),
+        "user-a",
+    )
+    .await;
+    let registry_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'R',
+        workspace_id.as_str(),
+        "registry",
+        registry_path.as_path(),
+        Some("tests"),
+        "registry-c",
+    )
+    .await;
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -31020,16 +31314,25 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         let left = &pair[0];
         let right = &pair[1];
         assert!(
-            (left.source_kind.clone(), left.slug.clone())
-                <= (right.source_kind.clone(), right.slug.clone()),
-            "skills/list must be sorted by source_kind then slug"
+            (
+                left.source_kind.clone(),
+                left.owner.clone(),
+                left.slug.clone(),
+                left.skill_id.clone(),
+            ) <= (
+                right.source_kind.clone(),
+                right.owner.clone(),
+                right.slug.clone(),
+                right.skill_id.clone(),
+            ),
+            "skills/list must be sorted by source, owner, slug, and SkillId"
         );
     }
 
     let system_skill = payload
         .skills
         .iter()
-        .find(|skill| skill.source_kind == "system" && skill.slug == "tests/sys-b")
+        .find(|skill| skill.skill_id == tasks_id)
         .expect("system skill should be listed");
     assert!(system_skill.install.installed);
     assert!(system_skill.install.managed);
@@ -31040,43 +31343,22 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
             .install
             .install_path
             .as_ref()
-            .is_some_and(|path| std::path::Path::new(path).ends_with("tests/sys-b")),
+            .is_some_and(|path| std::path::Path::new(path).ends_with("tasks")),
         "system install path should point at the skill directory"
     );
-    assert!(system_skill.policy.allow_implicit_invocation_editable);
-    let locked_system_skill = payload
-        .skills
-        .iter()
-        .find(|skill| skill.source_kind == "system" && skill.slug == "tests/locked-implicit")
-        .expect("locked implicit system skill should be listed");
-    assert!(locked_system_skill.policy.allow_implicit_invocation);
-    assert!(
-        !locked_system_skill
-            .policy
-            .allow_implicit_invocation_editable
-    );
+    assert!(system_skill.policy.allow_implicit_invocation);
+    assert!(!system_skill.policy.allow_implicit_invocation_editable);
     assert!(
         payload
             .skills
             .iter()
-            .any(|skill| skill.source_kind == "system" && skill.slug == "tests/shared-skill")
+            .any(|skill| skill.skill_id == shared_id)
     );
-    assert!(
-        payload
-            .skills
-            .iter()
-            .any(|skill| skill.source_kind == "user" && skill.slug == "tests/shared-skill")
-    );
-    assert!(
-        payload
-            .skills
-            .iter()
-            .any(|skill| skill.source_kind == "user" && skill.slug == "tests/user-a")
-    );
+    assert!(payload.skills.iter().any(|skill| skill.skill_id == user_id));
     let user_skill = payload
         .skills
         .iter()
-        .find(|skill| skill.source_kind == "user" && skill.slug == "tests/user-a")
+        .find(|skill| skill.skill_id == user_id)
         .expect("user skill should be listed");
     assert!(user_skill.install.lifecycle_editable);
     assert!(user_skill.policy.allow_implicit_invocation_editable);
@@ -31084,8 +31366,128 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         payload
             .skills
             .iter()
-            .any(|skill| skill.source_kind == "registry" && skill.slug == "tests/registry-c")
+            .any(|skill| skill.skill_id == registry_id)
     );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_skill_capability_validation_uses_only_exact_id() {
+    let base_dir = unique_temp_dir("turn_skill_exact_id_validation");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let package_path = write_test_skill(&user_root, "same-label", "", "same label body");
+    std::fs::create_dir_all(&system_root).expect("create system root");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("create registry root");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let first_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'X',
+        workspace_id.as_str(),
+        "user",
+        package_path.as_path(),
+        Some("same-owner"),
+        "same-label",
+    )
+    .await;
+    let second_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'Y',
+        workspace_id.as_str(),
+        "user",
+        package_path.as_path(),
+        Some("same-owner"),
+        "same-label",
+    )
+    .await;
+    let missing_package_path = base_dir.join("missing-package");
+    let unavailable_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'Z',
+        workspace_id.as_str(),
+        "user",
+        missing_package_path.as_path(),
+        Some("same-owner"),
+        "same-label",
+    )
+    .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    );
+
+    for skill_id in [&first_id, &second_id] {
+        let capability = TurnCapability {
+            id: format!("skill:{skill_id}"),
+            kind: TurnCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+            },
+            label: Some("same-owner/same-label".to_owned()),
+        };
+        processor
+            .validate_turn_skill_capabilities(
+                workspace_id.as_str(),
+                std::slice::from_ref(&capability),
+            )
+            .await
+            .expect("each duplicate label must resolve by its own exact ID");
+    }
+
+    let unavailable = TurnCapability {
+        id: format!("skill:{unavailable_id}"),
+        kind: TurnCapabilityKind::Skill {
+            skill_id: unavailable_id,
+        },
+        label: Some("same-owner/same-label".to_owned()),
+    };
+    let unavailable_error = processor
+        .validate_turn_skill_capabilities(workspace_id.as_str(), std::slice::from_ref(&unavailable))
+        .await
+        .expect_err("unavailable exact ID must fail");
+    assert!(unavailable_error.contains("is unavailable"));
+
+    let missing_id =
+        pioneer_protocol::SkillId::new("NNNNNNNNNNNNNNNNNNNNN").expect("valid missing SkillId");
+    let missing = TurnCapability {
+        id: format!("skill:{missing_id}"),
+        kind: TurnCapabilityKind::Skill {
+            skill_id: missing_id,
+        },
+        label: Some("same-owner/same-label".to_owned()),
+    };
+    let missing_error = processor
+        .validate_turn_skill_capabilities(workspace_id.as_str(), std::slice::from_ref(&missing))
+        .await
+        .expect_err("missing exact ID must fail");
+    assert!(missing_error.contains("was not found"));
+
+    let mismatched_key = TurnCapability {
+        id: format!("skill:{second_id}"),
+        kind: TurnCapabilityKind::Skill { skill_id: first_id },
+        label: Some("same-owner/same-label".to_owned()),
+    };
+    let key_error = processor
+        .validate_turn_skill_capabilities(
+            workspace_id.as_str(),
+            std::slice::from_ref(&mismatched_key),
+        )
+        .await
+        .expect_err("capability key must match the exact SkillId");
+    assert!(key_error.contains("must use exact ID"));
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -31102,13 +31504,23 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(&user_root, "policy-skill", "", "policy skill body");
+    let policy_path = write_test_skill(&user_root, "policy-skill", "", "policy skill body");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let policy_skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'P',
+        workspace_id.as_str(),
+        "user",
+        policy_path.as_path(),
+        Some("tests"),
+        "policy-skill",
+    )
+    .await;
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -31128,8 +31540,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         "method": "skills/policy/set",
         "params": {
             "workspace_id": workspace_id,
-            "skill_slug": "tests/policy-skill",
-            "source_kind": "user",
+            "skill_id": policy_skill_id,
             "enabled": false,
             "allow_implicit_invocation": false
         }
@@ -31141,7 +31552,9 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     let set_response = recv_response_by_id(&mut rx, "skillspolicy000000001").await;
     let set_payload: SkillsPolicySetResponse =
         serde_json::from_value(set_response.result).expect("skills/policy/set decode");
-    assert_eq!(set_payload.policy.skill_slug, "tests/policy-skill");
+    assert_eq!(set_payload.policy.skill_id, policy_skill_id);
+    assert_eq!(set_payload.policy.owner.as_deref(), Some("tests"));
+    assert_eq!(set_payload.policy.slug, "policy-skill");
     assert_eq!(set_payload.policy.source_kind, "user");
     assert_eq!(set_payload.policy.enabled, Some(false));
     assert_eq!(set_payload.policy.allow_implicit_invocation, Some(false));
@@ -31158,7 +31571,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         changed_payload
             .changes
             .iter()
-            .any(|change| change.slug == "tests/policy-skill" && change.change_type == "policy")
+            .any(|change| change.skill_id == policy_skill_id && change.change_type == "policy")
     );
 
     let list_request = json!({
@@ -31181,7 +31594,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     let policy_skill = list_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/policy-skill" && skill.source_kind == "user")
+        .find(|skill| skill.skill_id == policy_skill_id)
         .expect("policy-skill should exist in skills/list");
     assert!(!policy_skill.policy.enabled);
     assert_eq!(policy_skill.status, "disabled");
@@ -31201,12 +31614,15 @@ async fn skills_policy_set_can_disable_system_skill() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(
-        &system_root,
-        "system-policy-skill",
-        "",
-        "system policy skill body",
-    );
+    let system_skill_id = pioneer_protocol::SkillId::new("24ZiAJnkBQ3WtGYx7XGeh")
+        .expect("valid bundled browser SkillId");
+    let system_skill_path = system_root.join(system_skill_id.as_str()).join("browser");
+    std::fs::create_dir_all(&system_skill_path).expect("create bundled browser path");
+    std::fs::write(
+        system_skill_path.join("SKILL.md"),
+        "---\nname: browser\nslug: browser\ndescription: browser\n---\nbrowser body",
+    )
+    .expect("write bundled browser fixture");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -31232,8 +31648,7 @@ async fn skills_policy_set_can_disable_system_skill() {
         "method": "skills/policy/set",
         "params": {
             "workspace_id": workspace_id,
-            "skill_slug": "tests/system-policy-skill",
-            "source_kind": "system",
+            "skill_id": system_skill_id,
             "enabled": false,
             "allow_implicit_invocation": false
         }
@@ -31245,7 +31660,9 @@ async fn skills_policy_set_can_disable_system_skill() {
     let set_response = recv_response_by_id(&mut rx, "syspolicyset000000001").await;
     let set_payload: SkillsPolicySetResponse =
         serde_json::from_value(set_response.result).expect("skills/policy/set decode");
-    assert_eq!(set_payload.policy.skill_slug, "tests/system-policy-skill");
+    assert_eq!(set_payload.policy.skill_id, system_skill_id);
+    assert_eq!(set_payload.policy.owner.as_deref(), Some("pioneer"));
+    assert_eq!(set_payload.policy.slug, "browser");
     assert_eq!(set_payload.policy.source_kind, "system");
     assert_eq!(set_payload.policy.enabled, Some(false));
 
@@ -31257,7 +31674,7 @@ async fn skills_policy_set_can_disable_system_skill() {
         serde_json::from_value(changed_params).expect("skills/changed payload should decode");
     assert_eq!(changed_payload.reason, "policy_updated");
     assert!(changed_payload.changes.iter().any(|change| {
-        change.slug == "tests/system-policy-skill"
+        change.skill_id == system_skill_id
             && change.source_kind == "system"
             && change.change_type == "policy"
     }));
@@ -31282,7 +31699,7 @@ async fn skills_policy_set_can_disable_system_skill() {
     let system_skill = list_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/system-policy-skill" && skill.source_kind == "system")
+        .find(|skill| skill.skill_id == system_skill_id)
         .expect("system policy skill should exist in skills/list");
     assert!(system_skill.install.installed);
     assert!(system_skill.install.managed);
@@ -31305,12 +31722,15 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(
-        &system_root,
-        "locked-system-policy-skill",
-        "implicit-invocation: required",
-        "locked system policy skill body",
-    );
+    let locked_skill_id = pioneer_protocol::SkillId::new("AzBYfaNgS6u1tiPaSlwnm")
+        .expect("valid bundled tasks SkillId");
+    let locked_skill_path = system_root.join(locked_skill_id.as_str()).join("tasks");
+    std::fs::create_dir_all(&locked_skill_path).expect("create bundled tasks path");
+    std::fs::write(
+        locked_skill_path.join("SKILL.md"),
+        "---\nname: tasks\nslug: tasks\ndescription: tasks\nimplicit-invocation: required\n---\ntasks body",
+    )
+    .expect("write bundled tasks fixture");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -31336,8 +31756,7 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
         "method": "skills/policy/set",
         "params": {
             "workspace_id": workspace_id,
-            "skill_slug": "tests/locked-system-policy-skill",
-            "source_kind": "system",
+            "skill_id": locked_skill_id,
             "enabled": true,
             "allow_implicit_invocation": false
         }
@@ -31366,8 +31785,7 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
         "method": "skills/policy/set",
         "params": {
             "workspace_id": workspace_id,
-            "skill_slug": "tests/locked-system-policy-skill",
-            "source_kind": "system",
+            "skill_id": locked_skill_id,
             "enabled": false,
             "allow_implicit_invocation": true
         }
@@ -31404,9 +31822,7 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
     let locked_skill = list_payload
         .skills
         .iter()
-        .find(|skill| {
-            skill.slug == "tests/locked-system-policy-skill" && skill.source_kind == "system"
-        })
+        .find(|skill| skill.skill_id == locked_skill_id)
         .expect("locked system policy skill should exist in skills/list");
     assert!(!locked_skill.policy.enabled);
     assert!(locked_skill.policy.allow_implicit_invocation);
@@ -31440,7 +31856,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     );
     let source_v2 = write_test_skill(
         &source_v2_root,
-        "registry-skill",
+        "registry-skill-v2",
         "version: \"2.0.0\"",
         "registry skill body v2",
     );
@@ -31503,7 +31919,10 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     let install_payload: SkillsInstallResponse =
         serde_json::from_value(install_response.result).expect("skills/install payload decode");
     assert_eq!(install_payload.status, "installed");
-    assert_eq!(install_payload.skill.slug, "pioneer/registry-skill");
+    assert_eq!(install_payload.skill.owner, None);
+    assert_eq!(install_payload.skill.slug, "registry-skill");
+    assert_ne!(install_payload.skill.skill_id.as_str(), install_upload_id);
+    let skill_id = install_payload.skill.skill_id.clone();
 
     let install_changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
     let install_changed_payload: SkillsChangedNotification = serde_json::from_value(
@@ -31513,9 +31932,14 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     )
     .expect("skills/changed decode");
     assert_eq!(install_changed_payload.reason, "installed");
+    assert!(install_changed_payload.changes.iter().any(|change| {
+        change.skill_id == skill_id
+            && change.slug == "registry-skill"
+            && change.change_type == "install"
+    }));
 
     let installed_row = crud_store_for_assert
-        .find_skill_installation("pioneer/registry-skill", "registry", workspace_id.as_str())
+        .find_skill_installation(&skill_id)
         .await
         .expect("read installed row should succeed");
     assert!(
@@ -31526,17 +31950,129 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         .as_ref()
         .map(|row| row.fingerprint.clone())
         .expect("installed row should be present");
+    let initial_install_path = installed_row
+        .as_ref()
+        .map(|row| std::path::PathBuf::from(row.install_path.as_str()))
+        .expect("installed row should expose install_path");
     let installed_policy = crud_store_for_assert
         .list_workspace_skill_policies(workspace_id.as_str())
         .await
         .expect("read workspace skill policies should succeed")
         .into_iter()
-        .find(|policy| {
-            policy.skill_slug == "pioneer/registry-skill" && policy.source_kind == "registry"
-        })
+        .find(|policy| policy.skill_id == skill_id)
         .expect("default policy should be persisted on install");
     assert_eq!(installed_policy.enabled, Some(true));
     assert_eq!(installed_policy.allow_implicit_invocation, Some(false));
+
+    let duplicate_upload_id = create_finalized_skill_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        source_v1.as_path(),
+        "skilllifedup",
+    )
+    .await;
+    let duplicate_install_request = json!({
+        "jsonrpc": "2.0",
+        "id": "skillslifecycle000004",
+        "method": "skills/install",
+        "params": {
+            "workspace_id": workspace_id,
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": duplicate_upload_id
+            },
+            "target_source_kind": "registry"
+        }
+    });
+    processor
+        .process_request(connection_id, &duplicate_install_request.to_string())
+        .await;
+    let duplicate_install_response = recv_response_by_id(&mut rx, "skillslifecycle000004").await;
+    let duplicate_install_payload: SkillsInstallResponse =
+        serde_json::from_value(duplicate_install_response.result)
+            .expect("duplicate skills/install payload decode");
+    let duplicate_skill_id = duplicate_install_payload.skill.skill_id.clone();
+    assert_ne!(duplicate_skill_id, skill_id);
+    assert_eq!(duplicate_install_payload.skill.slug, "registry-skill");
+    assert_ne!(
+        duplicate_install_payload.skill.install_path,
+        install_payload.skill.install_path
+    );
+    let duplicate_changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
+    let duplicate_changed_payload: SkillsChangedNotification = serde_json::from_value(
+        duplicate_changed
+            .params
+            .expect("duplicate skills/changed params expected"),
+    )
+    .expect("duplicate skills/changed decode");
+    assert!(duplicate_changed_payload.changes.iter().any(|change| {
+        change.skill_id == duplicate_skill_id && change.change_type == "install"
+    }));
+    assert!(
+        crud_store_for_assert
+            .find_skill_installation(&duplicate_skill_id)
+            .await
+            .expect("read duplicate installation")
+            .is_some(),
+        "duplicate label must remain a separate installation"
+    );
+
+    std::fs::remove_dir_all(initial_install_path.as_path())
+        .expect("remove installed package to exercise same-ID restore");
+    let registry_lock_path = workspace_root
+        .join(workspace_id.as_str())
+        .join("registry")
+        .join("skills-lock.toml");
+    std::fs::remove_file(registry_lock_path.as_path())
+        .expect("remove lock file to verify DB-authoritative restore");
+    let restore_upload_id = create_finalized_skill_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        source_v1.as_path(),
+        "skillliferestore",
+    )
+    .await;
+    let restore_request = json!({
+        "jsonrpc": "2.0",
+        "id": "skillslifecycle000005",
+        "method": "skills/update",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_id": skill_id,
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": restore_upload_id
+            },
+            "expected_previous_fingerprint": initial_fingerprint
+        }
+    });
+    processor
+        .process_request(connection_id, &restore_request.to_string())
+        .await;
+    let restore_response = recv_response_by_id(&mut rx, "skillslifecycle000005").await;
+    let restore_payload: SkillsUpdateResponse = serde_json::from_value(restore_response.result)
+        .expect("restored skills/update payload decode");
+    assert_eq!(restore_payload.status, "updated");
+    assert_eq!(restore_payload.skill.skill_id, skill_id);
+    assert_eq!(restore_payload.skill.fingerprint, initial_fingerprint);
+    assert!(initial_install_path.join("SKILL.md").is_file());
+    let restore_changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
+    let restore_changed_payload: SkillsChangedNotification = serde_json::from_value(
+        restore_changed
+            .params
+            .expect("restored skills/changed params expected"),
+    )
+    .expect("restored skills/changed decode");
+    assert!(
+        restore_changed_payload
+            .changes
+            .iter()
+            .any(|change| { change.skill_id == skill_id && change.change_type == "update" })
+    );
 
     let update_upload_id = create_finalized_skill_upload(
         &processor,
@@ -31553,8 +32089,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         "method": "skills/update",
         "params": {
             "workspace_id": workspace_id,
-            "slug": "pioneer/registry-skill",
-            "source_kind": "registry",
+            "skill_id": skill_id,
             "source": {
                 "type": "uploaded_archive",
                 "upload_id": update_upload_id
@@ -31569,7 +32104,8 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     let update_payload: SkillsUpdateResponse =
         serde_json::from_value(update_response.result).expect("skills/update payload decode");
     assert_eq!(update_payload.status, "updated");
-    assert_eq!(update_payload.skill.slug, "pioneer/registry-skill");
+    assert_eq!(update_payload.skill.skill_id, skill_id);
+    assert_eq!(update_payload.skill.slug, "registry-skill-v2");
     assert_ne!(
         update_payload.skill.fingerprint, initial_fingerprint,
         "update should change fingerprint for modified source"
@@ -31587,7 +32123,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         update_changed_payload
             .changes
             .iter()
-            .any(|change| change.change_type == "update")
+            .any(|change| change.skill_id == skill_id && change.change_type == "update")
     );
 
     let uninstall_request = json!({
@@ -31596,8 +32132,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         "method": "skills/uninstall",
         "params": {
             "workspace_id": workspace_id,
-            "slug": "pioneer/registry-skill",
-            "source_kind": "registry"
+            "skill_id": skill_id
         }
     });
     processor
@@ -31608,7 +32143,8 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     let uninstall_payload: SkillsUninstallResponse =
         serde_json::from_value(uninstall_response.result).expect("skills/uninstall payload decode");
     assert_eq!(uninstall_payload.status, "uninstalled");
-    assert_eq!(uninstall_payload.slug, "pioneer/registry-skill");
+    assert_eq!(uninstall_payload.skill_id, skill_id);
+    assert_eq!(uninstall_payload.slug, "registry-skill-v2");
     assert!(uninstall_payload.removed_install_path.is_some());
 
     let uninstall_changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
@@ -31623,20 +32159,37 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         uninstall_changed_payload
             .changes
             .iter()
-            .any(|change| change.change_type == "uninstall")
+            .any(|change| change.skill_id == skill_id && change.change_type == "uninstall")
     );
 
     let removed_row = crud_store_for_assert
-        .find_skill_installation("pioneer/registry-skill", "registry", workspace_id.as_str())
+        .find_skill_installation(&skill_id)
         .await
         .expect("read removed row should succeed");
     assert!(
         removed_row.is_none(),
         "uninstall should remove skill_installation row"
     );
+    assert!(
+        crud_store_for_assert
+            .find_skill_installation(&duplicate_skill_id)
+            .await
+            .expect("read neighboring duplicate after exact uninstall")
+            .is_some(),
+        "exact uninstall must not remove a neighboring duplicate"
+    );
+    assert!(
+        crud_store_for_assert
+            .list_workspace_skill_policies(workspace_id.as_str())
+            .await
+            .expect("read policies after exact uninstall")
+            .into_iter()
+            .all(|policy| policy.skill_id != skill_id),
+        "uninstall must remove the active policy for the exact installation"
+    );
 
     let audit_rows = crud_store_for_assert
-        .list_skill_audit_event_records_for_source("pioneer/registry-skill", "registry", 64)
+        .list_skill_audit_event_records(&skill_id, 64)
         .await
         .expect("audit rows read should succeed");
     assert!(
@@ -31648,7 +32201,96 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn skills_lifecycle_rejects_system_source_kind() {
+async fn skills_uninstall_removes_pending_identity_without_deleting_external_source() {
+    let base_dir = unique_temp_dir("skills_external_uninstall");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let external_root = base_dir.join("external");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create lifecycle root");
+    }
+    let external_path = write_test_skill(
+        external_root.as_path(),
+        "pending-external",
+        "",
+        "external source must survive uninstall",
+    );
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'O',
+        workspace_id.as_str(),
+        "user",
+        external_path.as_path(),
+        None,
+        "pending-external",
+    )
+    .await;
+    crud_store
+        .update_skill_installation(
+            &skill_id,
+            &SkillInstallationPatch {
+                source_ref: Some(format!("import-path:{}", external_path.display())),
+                ..SkillInstallationPatch::default()
+            },
+            2,
+        )
+        .await
+        .expect("mark row import-pending");
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "externaluninstall0001",
+        "method": "skills/uninstall",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_id": skill_id
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "externaluninstall0001").await;
+    let payload: SkillsUninstallResponse =
+        serde_json::from_value(response.result).expect("external uninstall response decode");
+    assert_eq!(payload.status, "uninstalled");
+    assert_eq!(payload.skill_id, skill_id);
+    assert!(external_path.join("SKILL.md").is_file());
+    assert!(
+        crud_store_for_assert
+            .find_skill_installation(&skill_id)
+            .await
+            .expect("read uninstalled external row")
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_lifecycle_rejects_system_install_and_unknown_mutation_id() {
     let base_dir = unique_temp_dir("skills_system_lifecycle_reject");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -31671,7 +32313,6 @@ async fn skills_lifecycle_rejects_system_source_kind() {
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let crud_store_for_assert = crud_store.clone();
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -31723,8 +32364,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
         "method": "skills/update",
         "params": {
             "workspace_id": workspace_id,
-            "slug": "tests/system-lifecycle",
-            "source_kind": "system",
+            "skill_id": "AAAAAAAAAAAAAAAAAAAAA",
             "source": {
                 "type": "uploaded_archive",
                 "upload_id": "unused-upload-id"
@@ -31737,7 +32377,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
     let update_error = recv_error_by_id(&mut rx, update_id.as_str()).await;
     assert_eq!(
         update_error.error.code,
-        pioneer_protocol::INVALID_PARAMS_CODE
+        pioneer_protocol::INVALID_REQUEST_CODE
     );
     let update_code = update_error
         .error
@@ -31746,7 +32386,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
         .and_then(|data| data.get("code"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    assert_eq!(update_code, "skills.source_not_supported");
+    assert_eq!(update_code, "skills.not_found");
 
     let uninstall_id = generate_test_request_id("syslife", "uninstall");
     let uninstall_request = json!({
@@ -31755,8 +32395,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
         "method": "skills/uninstall",
         "params": {
             "workspace_id": workspace_id,
-            "slug": "tests/system-lifecycle",
-            "source_kind": "system"
+            "skill_id": "AAAAAAAAAAAAAAAAAAAAA"
         }
     });
     processor
@@ -31765,7 +32404,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
     let uninstall_error = recv_error_by_id(&mut rx, uninstall_id.as_str()).await;
     assert_eq!(
         uninstall_error.error.code,
-        pioneer_protocol::INVALID_PARAMS_CODE
+        pioneer_protocol::INVALID_REQUEST_CODE
     );
     let uninstall_code = uninstall_error
         .error
@@ -31774,16 +32413,7 @@ async fn skills_lifecycle_rejects_system_source_kind() {
         .and_then(|data| data.get("code"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    assert_eq!(uninstall_code, "skills.source_not_supported");
-
-    let system_row = crud_store_for_assert
-        .find_skill_installation("tests/system-lifecycle", "system", workspace_id.as_str())
-        .await
-        .expect("read system installation row should succeed");
-    assert!(
-        system_row.is_none(),
-        "system lifecycle requests must not create installation rows"
-    );
+    assert_eq!(uninstall_code, "skills.not_found");
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -31800,28 +32430,32 @@ async fn skills_health_returns_dependency_diagnostics() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(
+    let dep_path = write_test_skill(
         &user_root,
         "dep-skill",
         "dependencies:\n  bins:\n    - pioneer_missing_bin_for_health_test",
         "dep skill body",
     );
-    write_test_skill(
-        &system_root,
-        "system-dep-skill",
-        "dependencies:\n  bins:\n    - pioneer_missing_system_bin_for_health_test",
-        "system dep skill body",
-    );
+    let system_dep_id = pioneer_protocol::SkillId::new("24ZiAJnkBQ3WtGYx7XGeh")
+        .expect("valid bundled browser SkillId");
+    let system_dep_path = system_root.join(system_dep_id.as_str()).join("browser");
+    std::fs::create_dir_all(&system_dep_path).expect("create bundled browser fixture");
+    std::fs::write(
+        system_dep_path.join("SKILL.md"),
+        "---\nname: browser\nslug: browser\ndescription: browser\ndependencies:\n  bins:\n    - pioneer_missing_system_bin_for_health_test\n---\nsystem dep skill body",
+    )
+    .expect("write bundled browser fixture");
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
 
-        let insecure_skill = write_test_skill(
-            &system_root,
-            "system-security-skill",
-            "",
-            "system security skill body",
-        );
+        let insecure_skill = system_root.join("TYotuYDUMUbxl37lej8cv").join("memory");
+        std::fs::create_dir_all(&insecure_skill).expect("create bundled memory fixture");
+        std::fs::write(
+            insecure_skill.join("SKILL.md"),
+            "---\nname: memory\nslug: memory\ndescription: memory\n---\nsystem security skill body",
+        )
+        .expect("write bundled memory fixture");
         let outside_file = base_dir.join("outside-secret.txt");
         std::fs::write(outside_file.as_path(), "outside").expect("write outside file");
         symlink(outside_file.as_path(), insecure_skill.join("leak"))
@@ -31833,6 +32467,16 @@ async fn skills_health_returns_dependency_diagnostics() {
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let dep_skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'D',
+        workspace_id.as_str(),
+        "user",
+        dep_path.as_path(),
+        Some("tests"),
+        "dep-skill",
+    )
+    .await;
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -31866,7 +32510,7 @@ async fn skills_health_returns_dependency_diagnostics() {
     let dep_skill = health_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/dep-skill" && skill.source_kind == "user")
+        .find(|skill| skill.skill_id == dep_skill_id)
         .expect("dep-skill should exist in health payload");
     assert!(
         dep_skill
@@ -31878,7 +32522,7 @@ async fn skills_health_returns_dependency_diagnostics() {
     let system_dep_skill = health_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/system-dep-skill" && skill.source_kind == "system")
+        .find(|skill| skill.skill_id == system_dep_id)
         .expect("system dep-skill should exist in health payload");
     assert!(
         system_dep_skill
@@ -31892,9 +32536,7 @@ async fn skills_health_returns_dependency_diagnostics() {
         let system_security_skill = health_payload
             .skills
             .iter()
-            .find(|skill| {
-                skill.slug == "tests/system-security-skill" && skill.source_kind == "system"
-            })
+            .find(|skill| skill.skill_id.as_str() == "TYotuYDUMUbxl37lej8cv")
             .expect("system security skill should exist in health payload");
         assert!(
             system_security_skill
@@ -31904,6 +32546,26 @@ async fn skills_health_returns_dependency_diagnostics() {
             "skills/health should expose system skill security diagnostics"
         );
     }
+
+    let exact_health_request = json!({
+        "jsonrpc": "2.0",
+        "id": "skillshealth000000002",
+        "method": "skills/health",
+        "params": {
+            "workspace_id": workspace_id,
+            "skills": [{"skill_id": dep_skill_id}],
+            "audit_limit": 16
+        }
+    });
+    processor
+        .process_request(connection_id, &exact_health_request.to_string())
+        .await;
+    let exact_health_response = recv_response_by_id(&mut rx, "skillshealth000000002").await;
+    let exact_health_payload: SkillsHealthResponse =
+        serde_json::from_value(exact_health_response.result)
+            .expect("exact skills/health payload decode");
+    assert_eq!(exact_health_payload.skills.len(), 1);
+    assert_eq!(exact_health_payload.skills[0].skill_id, dep_skill_id);
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -32275,6 +32937,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         serde_json::from_value(response.result).expect("skills/install payload decode");
     assert_eq!(payload.status, "installed");
     assert_eq!(payload.skill.source_kind, "user");
+    let user_skill_id = payload.skill.skill_id.clone();
     assert!(
         payload.skill.install_path.starts_with(
             workspace_root
@@ -32293,38 +32956,29 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
             .expect("skills/changed decode");
     assert!(changed_payload.changes.iter().any(|change| {
         change.change_type == "install"
-            && change.slug == "pioneer/user-target-skill"
+            && change.skill_id == user_skill_id
+            && change.slug == "user-target-skill"
             && change.source_kind == "user"
     }));
 
     let user_row = crud_store_for_assert
-        .find_skill_installation("pioneer/user-target-skill", "user", workspace_id.as_str())
+        .find_skill_installation(&user_skill_id)
         .await
         .expect("read installed user row should succeed");
     assert!(
         user_row.is_some(),
         "install should persist skill_installation for user source kind"
     );
-    let registry_row = crud_store_for_assert
-        .find_skill_installation(
-            "pioneer/user-target-skill",
-            "registry",
-            workspace_id.as_str(),
-        )
-        .await
-        .expect("read installed registry row should succeed");
-    assert!(
-        registry_row.is_none(),
-        "install should not persist registry row for user target"
+    assert_eq!(
+        user_row.as_ref().map(|row| row.source_kind.as_str()),
+        Some("user")
     );
     let user_policy = crud_store_for_assert
         .list_workspace_skill_policies(workspace_id.as_str())
         .await
         .expect("read workspace skill policies should succeed")
         .into_iter()
-        .find(|policy| {
-            policy.skill_slug == "pioneer/user-target-skill" && policy.source_kind == "user"
-        })
+        .find(|policy| policy.skill_id == user_skill_id)
         .expect("default user policy should be persisted on install");
     assert_eq!(user_policy.enabled, Some(true));
     assert_eq!(user_policy.allow_implicit_invocation, Some(false));
@@ -32417,6 +33071,7 @@ async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
         serde_json::from_value(install_response.result).expect("skills/install payload decode");
     assert_eq!(install_payload.status, "installed");
     assert_eq!(install_payload.skill.source_kind, "user");
+    let installed_skill_id = install_payload.skill.skill_id.clone();
     assert!(
         install_payload.skill.install_path.starts_with(
             workspace_base
@@ -32430,20 +33085,16 @@ async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
     );
 
     let workspace_row = crud_store_for_assert
-        .find_skill_installation("pioneer/user-default-skill", "user", workspace_a.as_str())
+        .find_skill_installation(&installed_skill_id)
         .await
         .expect("read installed workspace row should succeed");
     assert!(
         workspace_row.is_some(),
         "install should persist skill_installation for the installing workspace"
     );
-    let other_workspace_row = crud_store_for_assert
-        .find_skill_installation("pioneer/user-default-skill", "user", workspace_b.as_str())
-        .await
-        .expect("read other workspace row should succeed");
-    assert!(
-        other_workspace_row.is_none(),
-        "install should not persist a row for another workspace"
+    assert_eq!(
+        workspace_row.as_ref().map(|row| row.scope_key.as_str()),
+        Some(workspace_a.as_str())
     );
 
     write_test_skill(
@@ -32468,14 +33119,12 @@ async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
     let list_b_response = recv_response_by_id(&mut rx, list_b_request_id.as_str()).await;
     let list_b_payload: SkillListResponse =
         serde_json::from_value(list_b_response.result).expect("skills/list payload decode");
-    let workspace_b_skill = list_b_payload
-        .skills
-        .iter()
-        .find(|skill| skill.slug == "pioneer/user-default-skill" && skill.source_kind == "user")
-        .expect("workspace B should discover its local skill file");
     assert!(
-        !workspace_b_skill.install.installed,
-        "workspace A installation must not mark workspace B skill as installed"
+        list_b_payload
+            .skills
+            .iter()
+            .all(|skill| skill.skill_id != installed_skill_id),
+        "workspace A installation must not appear in workspace B"
     );
 
     let _ = std::fs::remove_dir_all(base_dir);

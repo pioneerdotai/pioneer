@@ -64,7 +64,6 @@ use pioneer_protocol::{
     WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     validate_voice_streaming_audio_format,
 };
-use pioneer_skills::is_qualified_skill_slug;
 use std::time::Duration;
 
 pub const PROVIDER_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1472,12 +1471,6 @@ where
         "workspace_id",
         methods::SKILLS_UPDATE,
     )?;
-    require_non_empty_field(params.slug.as_str(), "slug", methods::SKILLS_UPDATE)?;
-    require_condition(
-        is_qualified_skill_slug(params.slug.as_str()),
-        "slug must use owner/slug for skills/update",
-    )?;
-
     send_json_rpc_request_typed(
         transport,
         methods::SKILLS_UPDATE,
@@ -1498,12 +1491,6 @@ where
         "workspace_id",
         methods::SKILLS_UNINSTALL,
     )?;
-    require_non_empty_field(params.slug.as_str(), "slug", methods::SKILLS_UNINSTALL)?;
-    require_condition(
-        is_qualified_skill_slug(params.slug.as_str()),
-        "slug must use owner/slug for skills/uninstall",
-    )?;
-
     send_json_rpc_request_typed(
         transport,
         methods::SKILLS_UNINSTALL,
@@ -1524,14 +1511,6 @@ where
         "workspace_id",
         methods::SKILLS_HEALTH,
     )?;
-    require_condition(
-        !params
-            .skills
-            .iter()
-            .any(|target| !is_qualified_skill_slug(target.slug.as_str())),
-        "skills/health targets must use owner/slug in slug",
-    )?;
-
     send_json_rpc_request_typed(
         transport,
         methods::SKILLS_HEALTH,
@@ -1573,21 +1552,6 @@ where
         "workspace_id",
         methods::SKILLS_POLICY_SET,
     )?;
-    require_non_empty_field(
-        params.skill_slug.as_str(),
-        "skill_slug",
-        methods::SKILLS_POLICY_SET,
-    )?;
-    require_condition(
-        is_qualified_skill_slug(params.skill_slug.as_str()),
-        "skill_slug must use owner/slug for skills/policy/set",
-    )?;
-    require_non_empty_field(
-        params.source_kind.as_str(),
-        "source_kind",
-        methods::SKILLS_POLICY_SET,
-    )?;
-
     send_json_rpc_request_typed(
         transport,
         methods::SKILLS_POLICY_SET,
@@ -2283,8 +2247,8 @@ mod tests {
     use crate::rpc::{JsonRpcResponseSender, WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE};
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
-        SkillHealthTarget, SkillLifecycleSource, TaskCancelScope, VoiceAudioEncoding,
-        VoiceSessionStartContext, VoiceTurnContext, Workspace,
+        SkillHealthTarget, SkillId, SkillLifecycleSource, TaskCancelScope, TurnCapability,
+        VoiceAudioEncoding, VoiceSessionStartContext, VoiceTurnContext, Workspace,
     };
     use serde_json::json;
 
@@ -2340,6 +2304,32 @@ mod tests {
             _response_tx: JsonRpcResponseSender,
         ) -> std::result::Result<(), String> {
             panic!("validation should run before transport dispatch");
+        }
+    }
+
+    struct ExactSkillTurnTransport;
+
+    impl JsonRpcRequestTransport for ExactSkillTurnTransport {
+        fn send_json_rpc_request(
+            &self,
+            _request_id: String,
+            payload: String,
+            _response_tx: JsonRpcResponseSender,
+        ) -> std::result::Result<(), String> {
+            let request: JsonRpcRequest =
+                serde_json::from_str(payload.as_str()).expect("request payload");
+            let params = request.params.expect("turn params");
+            let capabilities = match request.method.as_str() {
+                methods::TURN_START => &params["capabilities"],
+                methods::VOICE_SESSION_FINALIZE => &params["context"]["capabilities"],
+                method => panic!("unexpected method {method}"),
+            };
+            assert_eq!(capabilities[0]["id"], json!("skill:TTTTTTTTTTTTTTTTTTTTT"));
+            assert_eq!(
+                capabilities[0]["kind"]["skillId"],
+                json!("TTTTTTTTTTTTTTTTTTTTT")
+            );
+            Err(WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE.to_owned())
         }
     }
 
@@ -2663,6 +2653,31 @@ mod tests {
             ),
             "turn_id is required for turn/start"
         );
+
+        let skill_id = SkillId::new("T".repeat(21)).expect("valid skill id");
+        let error = turn_start(
+            &ExactSkillTurnTransport,
+            TurnStartParams {
+                thread_id: "thread_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                input: Vec::new(),
+                capabilities: vec![TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(&skill_id),
+                    kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
+                    label: Some("owner/slug".to_owned()),
+                }],
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+        )
+        .expect_err("test transport stops after payload inspection");
+        assert_eq!(format!("{error:#}"), WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE);
     }
 
     #[test]
@@ -2732,6 +2747,23 @@ mod tests {
             ),
             "reason must not be empty for voice/session/cancel"
         );
+
+        let skill_id = SkillId::new("T".repeat(21)).expect("valid skill id");
+        let mut context = voice_turn_context();
+        context.capabilities = vec![TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
+            label: Some("owner/slug".to_owned()),
+        }];
+        let error = voice_session_finalize(
+            &ExactSkillTurnTransport,
+            VoiceSessionFinalizeParams {
+                session_id: "voice_session_1".to_owned(),
+                context,
+            },
+        )
+        .expect_err("test transport stops after payload inspection");
+        assert_eq!(format!("{error:#}"), WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE);
     }
 
     #[test]
@@ -2857,24 +2889,24 @@ mod tests {
             ),
             "compressed_size_bytes must be positive for skills/upload/start"
         );
+        let skill_id = SkillId::new("S".repeat(21)).expect("valid skill id");
         assert_eq!(
             format!(
                 "{:#}",
                 skills_update(
                     &PanicTransport,
                     SkillsUpdateParams {
-                        workspace_id: "ws_1".to_owned(),
-                        slug: "bad-slug".to_owned(),
-                        source_kind: "user".to_owned(),
+                        workspace_id: "".to_owned(),
+                        skill_id: skill_id.clone(),
                         source: SkillLifecycleSource::UploadedArchive {
                             upload_id: "upload_1".to_owned(),
                         },
                         expected_previous_fingerprint: None,
                     },
                 )
-                .expect_err("slug should be qualified")
+                .expect_err("workspace should be required")
             ),
-            "slug must use owner/slug for skills/update"
+            "workspace_id is required for skills/update"
         );
         assert_eq!(
             format!(
@@ -2882,17 +2914,14 @@ mod tests {
                 skills_health(
                     &PanicTransport,
                     SkillsHealthParams {
-                        workspace_id: "ws_1".to_owned(),
-                        skills: vec![SkillHealthTarget {
-                            slug: "bad-slug".to_owned(),
-                            source_kind: "user".to_owned(),
-                        }],
+                        workspace_id: "".to_owned(),
+                        skills: vec![SkillHealthTarget { skill_id }],
                         audit_limit: 16,
                     },
                 )
-                .expect_err("health target slug should be qualified")
+                .expect_err("workspace should be required")
             ),
-            "skills/health targets must use owner/slug in slug"
+            "workspace_id is required for skills/health"
         );
     }
 

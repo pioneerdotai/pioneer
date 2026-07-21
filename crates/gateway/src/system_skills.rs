@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use pioneer_protocol::SkillId;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -10,10 +11,36 @@ struct BundledSystemSkillFile {
     unix_mode: u32,
 }
 
+struct BundledSystemSkillRecord {
+    skill_id: &'static str,
+    owner: &'static str,
+    slug: &'static str,
+    resource_path: &'static str,
+    files: &'static [BundledSystemSkillFile],
+}
+
 include!(concat!(env!("OUT_DIR"), "/bundled_system_skills.rs"));
 
+pub(crate) fn bundled_system_skill_catalog_entries(
+    materialized_root: &Path,
+) -> Result<Vec<pioneer_skills::BundledSkillCatalogEntry>> {
+    BUNDLED_SYSTEM_SKILLS
+        .iter()
+        .map(|entry| {
+            let skill_id = SkillId::new(entry.skill_id).map_err(anyhow::Error::new)?;
+            Ok(pioneer_skills::BundledSkillCatalogEntry {
+                skill_id,
+                owner: Some(entry.owner.to_owned()),
+                slug: entry.slug.to_owned(),
+                source_root: materialized_root.to_path_buf(),
+                install_path: materialized_root.join(entry.skill_id).join(entry.slug),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn materialize_bundled_system_skill_roots(runtime_home: &Path) -> Result<Vec<String>> {
-    if BUNDLED_SYSTEM_SKILL_FILES.is_empty() {
+    if BUNDLED_SYSTEM_SKILLS.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -93,27 +120,46 @@ pub(crate) fn materialize_bundled_system_skill_roots(runtime_home: &Path) -> Res
 }
 
 fn bundled_system_skills_hash() -> String {
+    bundled_system_skills_hash_with_manifest(BUNDLED_SKILLS_MANIFEST_BYTES)
+}
+
+fn bundled_system_skills_hash_with_manifest(manifest_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    for file in BUNDLED_SYSTEM_SKILL_FILES {
-        hasher.update(file.relative_path.as_bytes());
+    hasher.update(manifest_bytes);
+    hasher.update([0]);
+    for skill in BUNDLED_SYSTEM_SKILLS {
+        hasher.update(skill.skill_id.as_bytes());
         hasher.update([0]);
-        hasher.update(file.bytes);
+        hasher.update(skill.owner.as_bytes());
         hasher.update([0]);
+        hasher.update(skill.slug.as_bytes());
+        hasher.update([0]);
+        hasher.update(skill.resource_path.as_bytes());
+        hasher.update([0]);
+        for file in skill.files {
+            hasher.update(file.relative_path.as_bytes());
+            hasher.update([0]);
+            hasher.update(file.bytes);
+            hasher.update([0]);
+        }
     }
     hex::encode(hasher.finalize())
 }
 
 fn materialize_bundle_root(root: &Path) -> Result<()> {
-    for file in BUNDLED_SYSTEM_SKILL_FILES {
-        let target = root.join(file.relative_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    for skill in BUNDLED_SYSTEM_SKILLS {
+        let package_root = root.join(skill.skill_id).join(skill.slug);
+        for file in skill.files {
+            let target = package_root.join(file.relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            }
+            fs::write(target.as_path(), file.bytes)
+                .with_context(|| format!("failed to write {}", target.display()))?;
+            set_file_mode(target.as_path(), file.unix_mode)
+                .with_context(|| format!("failed to set permissions for {}", target.display()))?;
         }
-        fs::write(target.as_path(), file.bytes)
-            .with_context(|| format!("failed to write {}", target.display()))?;
-        set_file_mode(target.as_path(), file.unix_mode)
-            .with_context(|| format!("failed to set permissions for {}", target.display()))?;
     }
     Ok(())
 }
@@ -123,13 +169,18 @@ fn validate_bundle_root(root: &Path) -> bool {
         return false;
     }
 
-    BUNDLED_SYSTEM_SKILL_FILES.iter().all(|file| {
-        let path = root.join(file.relative_path);
-        let bytes_match = match fs::read(path.as_path()) {
-            Ok(bytes) => bytes == file.bytes,
-            Err(_) => return false,
-        };
-        bytes_match && file_mode_matches(path.as_path(), file.unix_mode)
+    BUNDLED_SYSTEM_SKILLS.iter().all(|skill| {
+        skill.files.iter().all(|file| {
+            let path = root
+                .join(skill.skill_id)
+                .join(skill.slug)
+                .join(file.relative_path);
+            let bytes_match = match fs::read(path.as_path()) {
+                Ok(bytes) => bytes == file.bytes,
+                Err(_) => return false,
+            };
+            bytes_match && file_mode_matches(path.as_path(), file.unix_mode)
+        })
     })
 }
 
@@ -223,7 +274,9 @@ fn is_bundle_staging_dir_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundled_system_skills_hash, is_bundle_hash_dir_name, is_bundle_staging_dir_name,
+        BUNDLED_SKILLS_MANIFEST_BYTES, BUNDLED_SYSTEM_SKILLS, bundled_system_skill_catalog_entries,
+        bundled_system_skills_hash, bundled_system_skills_hash_with_manifest,
+        is_bundle_hash_dir_name, is_bundle_staging_dir_name,
         materialize_bundled_system_skill_roots,
     };
     use pioneer_protocol::CLIAgentRuntimeKind;
@@ -241,7 +294,8 @@ mod tests {
 
         assert_eq!(roots.len(), 1);
         let root = std::path::PathBuf::from(&roots[0]);
-        let skill_file = root.join("pioneer/browser/SKILL.md");
+        let browser_id = "24ZiAJnkBQ3WtGYx7XGeh";
+        let skill_file = root.join(browser_id).join("browser/SKILL.md");
         assert!(skill_file.is_file());
         assert!(
             std::fs::read_to_string(skill_file.as_path())
@@ -250,10 +304,9 @@ mod tests {
         );
 
         let catalog = load_catalog(&SkillCatalogLoadParams {
-            system_roots: vec![root.clone()],
-            user_roots: Vec::new(),
-            registry_roots: Vec::new(),
-            max_skills_per_source: 16,
+            installations: Vec::new(),
+            bundled: bundled_system_skill_catalog_entries(root.as_path())
+                .expect("load bundled manifest entries"),
             max_file_bytes: 1024 * 1024,
         })
         .expect("load catalog");
@@ -267,13 +320,13 @@ mod tests {
             browser.identity.source_kind,
             SkillSourceKind::System
         ));
-        assert_eq!(browser.identity.owner, "pioneer");
+        assert_eq!(browser.identity.owner.as_deref(), Some("pioneer"));
 
-        let root_canonical = std::fs::canonicalize(root.as_path()).expect("canonicalize root");
-        let expected_asset_root = root_canonical.join("pioneer/browser").display().to_string();
+        let expected_asset_root = root.join(browser_id).join("browser").display().to_string();
         assert_eq!(browser.identity.skill_dir, expected_asset_root);
 
         let active = vec![ResolvedSkill {
+            skill_id: browser.identity.skill_id.clone(),
             slug: "pioneer/browser".to_owned(),
             reason: SkillResolvedReason::ExplicitCapability,
             definition: browser.clone(),
@@ -301,9 +354,13 @@ mod tests {
             },
         );
         assert!(
-            prompt
-                .text
-                .contains("Skill slug for read_skill: `system:pioneer/browser`")
+            prompt.text.contains(
+                format!(
+                    "Exact skill reference for read_skill: `skill:{}`",
+                    browser.identity.skill_id
+                )
+                .as_str()
+            )
         );
         assert!(
             prompt
@@ -328,7 +385,7 @@ mod tests {
         assert_eq!(
             runtime_plan
                 .read_skill_index
-                .get("system:pioneer/browser")
+                .get(format!("skill:{}", browser.identity.skill_id).as_str())
                 .expect("system browser read_skill entry")
                 .skill_asset_root,
             expected_asset_root
@@ -343,13 +400,14 @@ mod tests {
             subagents.identity.source_kind,
             SkillSourceKind::System
         ));
-        assert_eq!(subagents.identity.owner, "pioneer");
+        assert_eq!(subagents.identity.owner.as_deref(), Some("pioneer"));
         assert_eq!(
             subagents.policy_hints.implicit_invocation,
             SkillImplicitInvocationPolicy::Required
         );
         assert!(subagents.policy_hints.catalog_hidden);
         let required = [ResolvedSkill {
+            skill_id: subagents.identity.skill_id.clone(),
             slug: "pioneer/subagents".to_owned(),
             reason: SkillResolvedReason::ExplicitCapability,
             definition: subagents.clone(),
@@ -358,11 +416,13 @@ mod tests {
             crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&required).is_err()
         );
 
-        let expected_subagents_asset_root = root_canonical
-            .join("pioneer/subagents")
+        let expected_subagents_asset_root = root
+            .join("7Ejrf61g4oqigkv3LMNE9")
+            .join("subagents")
             .display()
             .to_string();
         let subagents_active = vec![ResolvedSkill {
+            skill_id: subagents.identity.skill_id.clone(),
             slug: "pioneer/subagents".to_owned(),
             reason: SkillResolvedReason::Implicit,
             definition: subagents.clone(),
@@ -376,9 +436,16 @@ mod tests {
             },
         );
         assert!(
-            !subagents_prompt.text.contains("system:pioneer/subagents"),
-            "catalog-hidden subagents skill should not appear in the ordinary skills prompt"
+            subagents_prompt
+                .text
+                .contains("[Internal Skill References]")
         );
+        assert!(
+            subagents_prompt
+                .text
+                .contains(format!("skill:{}", subagents.identity.skill_id).as_str())
+        );
+        assert!(!subagents_prompt.text.contains("Use when:"));
 
         let subagents_runtime_plan = build_skill_runtime_plan(
             subagents_active.as_slice(),
@@ -397,7 +464,7 @@ mod tests {
         assert_eq!(
             subagents_runtime_plan
                 .read_skill_index
-                .get("system:pioneer/subagents")
+                .get(format!("skill:{}", subagents.identity.skill_id).as_str())
                 .expect("system subagents read_skill entry")
                 .skill_asset_root,
             expected_subagents_asset_root
@@ -412,15 +479,20 @@ mod tests {
             tasks.identity.source_kind,
             SkillSourceKind::System
         ));
-        assert_eq!(tasks.identity.owner, "pioneer");
+        assert_eq!(tasks.identity.owner.as_deref(), Some("pioneer"));
         assert_eq!(
             tasks.policy_hints.implicit_invocation,
             SkillImplicitInvocationPolicy::Required
         );
         assert!(tasks.policy_hints.catalog_hidden);
 
-        let expected_tasks_asset_root = root_canonical.join("pioneer/tasks").display().to_string();
+        let expected_tasks_asset_root = root
+            .join("AzBYfaNgS6u1tiPaSlwnm")
+            .join("tasks")
+            .display()
+            .to_string();
         let tasks_active = vec![ResolvedSkill {
+            skill_id: tasks.identity.skill_id.clone(),
             slug: "pioneer/tasks".to_owned(),
             reason: SkillResolvedReason::Implicit,
             definition: tasks.clone(),
@@ -433,10 +505,13 @@ mod tests {
                 include_read_skill_hint: true,
             },
         );
+        assert!(tasks_prompt.text.contains("[Internal Skill References]"));
         assert!(
-            !tasks_prompt.text.contains("system:pioneer/tasks"),
-            "catalog-hidden tasks skill should not appear in the ordinary skills prompt"
+            tasks_prompt
+                .text
+                .contains(format!("skill:{}", tasks.identity.skill_id).as_str())
         );
+        assert!(!tasks_prompt.text.contains("Use when:"));
 
         let tasks_runtime_plan = build_skill_runtime_plan(
             tasks_active.as_slice(),
@@ -455,7 +530,7 @@ mod tests {
         assert_eq!(
             tasks_runtime_plan
                 .read_skill_index
-                .get("system:pioneer/tasks")
+                .get(format!("skill:{}", tasks.identity.skill_id).as_str())
                 .expect("system tasks read_skill entry")
                 .skill_asset_root,
             expected_tasks_asset_root
@@ -470,16 +545,20 @@ mod tests {
             memory.identity.source_kind,
             SkillSourceKind::System
         ));
-        assert_eq!(memory.identity.owner, "pioneer");
+        assert_eq!(memory.identity.owner.as_deref(), Some("pioneer"));
         assert_eq!(
             memory.policy_hints.implicit_invocation,
             SkillImplicitInvocationPolicy::Required
         );
         assert!(memory.policy_hints.catalog_hidden);
 
-        let expected_memory_asset_root =
-            root_canonical.join("pioneer/memory").display().to_string();
+        let expected_memory_asset_root = root
+            .join("TYotuYDUMUbxl37lej8cv")
+            .join("memory")
+            .display()
+            .to_string();
         let memory_active = vec![ResolvedSkill {
+            skill_id: memory.identity.skill_id.clone(),
             slug: "pioneer/memory".to_owned(),
             reason: SkillResolvedReason::Implicit,
             definition: memory.clone(),
@@ -492,10 +571,13 @@ mod tests {
                 include_read_skill_hint: true,
             },
         );
+        assert!(memory_prompt.text.contains("[Internal Skill References]"));
         assert!(
-            !memory_prompt.text.contains("system:pioneer/memory"),
-            "catalog-hidden memory skill should not appear in the ordinary skills prompt"
+            memory_prompt
+                .text
+                .contains(format!("skill:{}", memory.identity.skill_id).as_str())
         );
+        assert!(!memory_prompt.text.contains("Use when:"));
 
         let memory_runtime_plan = build_skill_runtime_plan(
             memory_active.as_slice(),
@@ -514,7 +596,7 @@ mod tests {
         assert_eq!(
             memory_runtime_plan
                 .read_skill_index
-                .get("system:pioneer/memory")
+                .get(format!("skill:{}", memory.identity.skill_id).as_str())
                 .expect("system memory read_skill entry")
                 .skill_asset_root,
             expected_memory_asset_root
@@ -528,21 +610,82 @@ mod tests {
             .expect("materialize bundled system skills");
         let root = std::path::PathBuf::from(&roots[0]);
 
-        for file in super::BUNDLED_SYSTEM_SKILL_FILES {
-            let path = root.join(file.relative_path);
-            assert!(path.is_file(), "{} should materialize", file.relative_path);
-            assert_eq!(
-                std::fs::read(path.as_path()).expect("read materialized file"),
-                file.bytes,
-                "{} should materialize exact bytes",
-                file.relative_path
-            );
-            assert!(
-                super::file_mode_matches(path.as_path(), file.unix_mode),
-                "{} should preserve mode",
-                file.relative_path
-            );
+        for skill in BUNDLED_SYSTEM_SKILLS {
+            for file in skill.files {
+                let path = root
+                    .join(skill.skill_id)
+                    .join(skill.slug)
+                    .join(file.relative_path);
+                assert!(path.is_file(), "{} should materialize", path.display());
+                assert_eq!(
+                    std::fs::read(path.as_path()).expect("read materialized file"),
+                    file.bytes,
+                    "{} should materialize exact bytes",
+                    path.display()
+                );
+                assert!(
+                    super::file_mode_matches(path.as_path(), file.unix_mode),
+                    "{} should preserve mode",
+                    path.display()
+                );
+            }
         }
+        assert!(!root.join("bundled-system-skills.toml").exists());
+    }
+
+    #[test]
+    fn bundled_manifest_drives_exact_stable_catalog_identity() {
+        let expected = [
+            (
+                "24ZiAJnkBQ3WtGYx7XGeh",
+                "pioneer",
+                "browser",
+                "pioneer/browser",
+            ),
+            (
+                "TYotuYDUMUbxl37lej8cv",
+                "pioneer",
+                "memory",
+                "pioneer/memory",
+            ),
+            (
+                "7Ejrf61g4oqigkv3LMNE9",
+                "pioneer",
+                "subagents",
+                "pioneer/subagents",
+            ),
+            ("AzBYfaNgS6u1tiPaSlwnm", "pioneer", "tasks", "pioneer/tasks"),
+        ];
+        let actual = BUNDLED_SYSTEM_SKILLS
+            .iter()
+            .map(|entry| (entry.skill_id, entry.owner, entry.slug, entry.resource_path))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let first_root = std::path::Path::new("/bundle-revision-one");
+        let second_root = std::path::Path::new("/bundle-revision-two");
+        let first_ids = bundled_system_skill_catalog_entries(first_root)
+            .expect("first revision entries")
+            .into_iter()
+            .map(|entry| entry.skill_id)
+            .collect::<Vec<_>>();
+        let second_ids = bundled_system_skill_catalog_entries(second_root)
+            .expect("second revision entries")
+            .into_iter()
+            .map(|entry| entry.skill_id)
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, second_ids);
+    }
+
+    #[test]
+    fn bundled_manifest_bytes_participate_in_bundle_hash() {
+        let current = bundled_system_skills_hash();
+        let mut changed_manifest = BUNDLED_SKILLS_MANIFEST_BYTES.to_vec();
+        changed_manifest.extend_from_slice(b"\n# revision marker\n");
+        assert_ne!(
+            current,
+            bundled_system_skills_hash_with_manifest(changed_manifest.as_slice())
+        );
     }
 
     #[test]

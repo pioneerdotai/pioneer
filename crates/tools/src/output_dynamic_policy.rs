@@ -3,6 +3,7 @@ use crate::output_policy::{
     RecoveryOutputPolicy, StorageOutputPolicy, TimelineOutputPolicy, ToolOutputPolicySnapshot,
     ToolOutputProjectionKind,
 };
+use pioneer_protocol::SkillId;
 use pioneer_skills::{
     DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel, trust_satisfies_minimum,
 };
@@ -78,6 +79,7 @@ impl Default for DynamicToolOutputPolicyCaps {
 #[derive(Debug, Clone)]
 pub struct DynamicToolPolicyContext {
     pub canonical_tool_name: String,
+    pub skill_id: SkillId,
     pub skill_slug: String,
     pub skill_fingerprint: String,
     pub source_kind: SkillSourceKind,
@@ -633,6 +635,7 @@ mod tests {
     fn context(kind: DynamicToolKind, trust_level: SkillTrustLevel) -> DynamicToolPolicyContext {
         DynamicToolPolicyContext {
             canonical_tool_name: "skill.workspace-tool.test".to_owned(),
+            skill_id: SkillId::new("PPPPPPPPPPPPPPPPPPPPP").expect("valid policy test SkillId"),
             skill_slug: "workspace/tool".to_owned(),
             skill_fingerprint: "fp".to_owned(),
             source_kind: SkillSourceKind::User,

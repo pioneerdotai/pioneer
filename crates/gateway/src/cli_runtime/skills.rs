@@ -7,11 +7,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use pioneer_agent::{AgentMcpServerRef, AgentMcpToolRef};
-use pioneer_protocol::{TurnCapability, TurnCapabilityKind, TurnSkillBinding};
+use pioneer_protocol::{SkillId, TurnCapability, TurnCapabilityKind, TurnSkillBinding};
 use pioneer_skills::{
-    ExternalRuntimeSkillReceiptEntry, compute_skill_folder_hash, external_runtime_skill_is_current,
-    find_external_runtime_receipt_entry, read_external_runtime_receipt,
-    remove_external_runtime_receipt_entry, replace_external_runtime_skill,
+    ExternalRuntimeReceiptConversionCandidate, ExternalRuntimeSkillReceiptEntry,
+    compute_skill_folder_hash, ensure_external_runtime_receipt_v2,
+    external_runtime_skill_is_current, find_external_runtime_receipt_destination_entry,
+    remove_external_runtime_receipt_destination_entry, replace_external_runtime_skill,
     upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -98,6 +99,8 @@ pub(crate) fn cli_runtime_turn_skill_bindings(
     resolved
         .iter()
         .map(|skill| TurnSkillBinding {
+            skill_id: skill.skill_id.clone(),
+            skill_owner: skill.definition.identity.owner.clone(),
             skill_slug: skill.slug.clone(),
             skill_version: skill.definition.identity.version_hint.clone(),
             fingerprint: skill.definition.identity.fingerprint.clone(),
@@ -147,6 +150,9 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
             );
         }
         plans.push(CliRuntimeSkillInstallPlan {
+            skill_id: skill.skill_id.clone(),
+            owner: skill.definition.identity.owner.clone(),
+            slug: skill.definition.identity.slug.clone(),
             source: PathBuf::from(&skill.definition.identity.skill_dir),
             destination,
             native_skills_root: native_skills_root.clone(),
@@ -174,8 +180,7 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
 pub(crate) struct CliRuntimeSkillAttachment {
     pub capability_id: String,
     pub label: Option<String>,
-    pub slug: String,
-    pub claimed_source_kind: String,
+    pub skill_id: SkillId,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -222,12 +227,11 @@ pub(crate) fn partition_cli_runtime_capabilities(
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
-            TurnCapabilityKind::Skill { slug, source_kind } => {
+            TurnCapabilityKind::Skill { skill_id } => {
                 partition.skills.push(CliRuntimeSkillAttachment {
                     capability_id: capability.id.clone(),
                     label: capability.label.clone(),
-                    slug: slug.clone(),
-                    claimed_source_kind: source_kind.clone(),
+                    skill_id: skill_id.clone(),
                 });
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -300,6 +304,9 @@ pub(crate) async fn acquire_cli_runtime_skill_destination_lock(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallPlan {
+    pub skill_id: SkillId,
+    pub owner: Option<String>,
+    pub slug: String,
     pub source: PathBuf,
     pub destination: PathBuf,
     pub native_skills_root: PathBuf,
@@ -341,6 +348,9 @@ fn planned_receipt_entry(
     updated_at_unix_ms: u64,
 ) -> ExternalRuntimeSkillReceiptEntry {
     ExternalRuntimeSkillReceiptEntry {
+        skill_id: plan.skill_id.clone(),
+        owner: plan.owner.clone(),
+        slug: plan.slug.clone(),
         runtime_id: plan.runtime_id.clone(),
         runtime_kind: plan.runtime_kind.clone(),
         native_skills_root: plan.native_skills_root.to_string_lossy().into_owned(),
@@ -357,6 +367,7 @@ fn planned_receipt_entry(
 pub(crate) async fn install_one_cli_runtime_skill(
     destination_locks: &CliRuntimeSkillDestinationLocks,
     skills_write_lock: &Arc<Mutex<()>>,
+    receipt_conversion_candidates: &[ExternalRuntimeReceiptConversionCandidate],
     plan: &CliRuntimeSkillInstallPlan,
 ) -> Result<CliRuntimeSkillInstallResult> {
     let _destination_guard =
@@ -366,8 +377,9 @@ pub(crate) async fn install_one_cli_runtime_skill(
 
     let (receipt, previous) = {
         let _receipt_guard = skills_write_lock.clone().lock_owned().await;
-        let receipt = read_external_runtime_receipt(&plan.receipt_path)?;
-        let previous = find_external_runtime_receipt_entry(
+        let receipt =
+            ensure_external_runtime_receipt_v2(&plan.receipt_path, receipt_conversion_candidates)?;
+        let previous = find_external_runtime_receipt_destination_entry(
             &receipt,
             &plan.native_skills_root,
             &plan.install_name,
@@ -389,8 +401,9 @@ pub(crate) async fn install_one_cli_runtime_skill(
 
     {
         let _receipt_guard = skills_write_lock.clone().lock_owned().await;
-        let mut receipt = read_external_runtime_receipt(&plan.receipt_path)?;
-        if remove_external_runtime_receipt_entry(
+        let mut receipt =
+            ensure_external_runtime_receipt_v2(&plan.receipt_path, receipt_conversion_candidates)?;
+        if remove_external_runtime_receipt_destination_entry(
             &mut receipt,
             &plan.native_skills_root,
             &plan.install_name,
@@ -412,6 +425,7 @@ pub(crate) async fn install_one_cli_runtime_skill(
     let updated_at_unix_ms = unix_timestamp_millis();
     let installed_at_unix_ms = previous
         .as_ref()
+        .filter(|entry| entry.skill_id == plan.skill_id)
         .map(|entry| entry.installed_at_unix_ms)
         .unwrap_or(updated_at_unix_ms);
     let entry = planned_receipt_entry(
@@ -422,7 +436,8 @@ pub(crate) async fn install_one_cli_runtime_skill(
     );
     {
         let _receipt_guard = skills_write_lock.clone().lock_owned().await;
-        let mut receipt = read_external_runtime_receipt(&plan.receipt_path)?;
+        let mut receipt =
+            ensure_external_runtime_receipt_v2(&plan.receipt_path, receipt_conversion_candidates)?;
         upsert_external_runtime_receipt_entry(&mut receipt, entry)?;
         write_external_runtime_receipt_atomic(&plan.receipt_path, &receipt)?;
     }
@@ -470,8 +485,27 @@ mod tests {
         SkillTrustLevel,
         compile::{CompileSkillInput, compile_skill_definition},
         contract::default_skill_conformance,
+        read_external_runtime_receipt,
     };
     use tokio::time::{Duration, timeout};
+
+    fn test_skill_id(slug: &str, source_kind: SkillSourceKind) -> SkillId {
+        let suffix = match source_kind {
+            SkillSourceKind::System => 'S',
+            SkillSourceKind::User => 'U',
+            SkillSourceKind::Registry => 'R',
+        };
+        let mut value = slug
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(20);
+        while value.len() < 20 {
+            value.push(suffix);
+        }
+        value.push(suffix);
+        SkillId::new(value).expect("valid CLI runtime test SkillId")
+    }
 
     fn install_plan(root: &Path, name: &str) -> CliRuntimeSkillInstallPlan {
         let source = root.join(format!("source-{name}"));
@@ -479,6 +513,9 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("SKILL.md"), format!("# {name}\n")).unwrap();
         CliRuntimeSkillInstallPlan {
+            skill_id: test_skill_id(name, SkillSourceKind::Registry),
+            owner: Some("registry".to_owned()),
+            slug: name.to_owned(),
             source,
             destination: native_skills_root.join(name),
             native_skills_root,
@@ -491,20 +528,33 @@ mod tests {
         }
     }
 
-    fn skill_capability(id: &str, slug: &str, source_kind: &str) -> TurnCapability {
+    fn receipt_candidate(
+        plan: &CliRuntimeSkillInstallPlan,
+    ) -> ExternalRuntimeReceiptConversionCandidate {
+        ExternalRuntimeReceiptConversionCandidate {
+            skill_id: plan.skill_id.clone(),
+            owner: plan.owner.clone(),
+            slug: plan.slug.clone(),
+            source_kind: plan.source_kind.clone(),
+        }
+    }
+
+    fn skill_capability(slug: &str, source_kind: SkillSourceKind) -> TurnCapability {
+        let skill_id = test_skill_id(slug, source_kind);
         TurnCapability {
-            id: id.to_owned(),
+            id: format!("skill:{skill_id}"),
             kind: TurnCapabilityKind::Skill {
-                slug: slug.to_owned(),
-                source_kind: source_kind.to_owned(),
+                skill_id: skill_id.clone(),
             },
-            label: Some(format!("label-{id}")),
+            label: Some(format!("label-{slug}")),
         }
     }
 
     fn resolved_skill(slug: &str, source_kind: SkillSourceKind) -> pioneer_skills::ResolvedSkill {
+        let skill_id = test_skill_id(slug, source_kind);
         let definition = compile_skill_definition(CompileSkillInput {
-            owner: "workspace".to_owned(),
+            skill_id: skill_id.clone(),
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: format!("Display {slug}"),
@@ -529,7 +579,8 @@ mod tests {
             conformance: default_skill_conformance(),
         });
         pioneer_skills::ResolvedSkill {
-            slug: format!("workspace/{slug}"),
+            skill_id,
+            slug: slug.to_owned(),
             reason: SkillResolvedReason::ExplicitCapability,
             definition,
         }
@@ -576,24 +627,28 @@ mod tests {
             CliRuntimeCapabilityPartition::default()
         );
         let input = [
-            skill_capability("one", "registry/one", "registry"),
-            skill_capability("two", "two", "user"),
+            skill_capability("one", SkillSourceKind::Registry),
+            skill_capability("two", SkillSourceKind::User),
         ];
         assert_eq!(
             partition_cli_runtime_capabilities(&input),
             CliRuntimeCapabilityPartition {
                 skills: vec![
                     CliRuntimeSkillAttachment {
-                        capability_id: "one".to_owned(),
+                        capability_id: format!(
+                            "skill:{}",
+                            test_skill_id("one", SkillSourceKind::Registry)
+                        ),
                         label: Some("label-one".to_owned()),
-                        slug: "registry/one".to_owned(),
-                        claimed_source_kind: "registry".to_owned(),
+                        skill_id: test_skill_id("one", SkillSourceKind::Registry),
                     },
                     CliRuntimeSkillAttachment {
-                        capability_id: "two".to_owned(),
+                        capability_id: format!(
+                            "skill:{}",
+                            test_skill_id("two", SkillSourceKind::User)
+                        ),
                         label: Some("label-two".to_owned()),
-                        slug: "two".to_owned(),
-                        claimed_source_kind: "user".to_owned(),
+                        skill_id: test_skill_id("two", SkillSourceKind::User),
                     },
                 ],
                 ..CliRuntimeCapabilityPartition::default()
@@ -635,7 +690,7 @@ mod tests {
         assert!(tool_only.has_mcp());
 
         let mixed = partition_cli_runtime_capabilities(&[
-            skill_capability("one", "one", "user"),
+            skill_capability("one", SkillSourceKind::User),
             server,
             tool,
         ]);
@@ -660,7 +715,7 @@ mod tests {
         subagents.definition.policy_hints.implicit_invocation =
             SkillImplicitInvocationPolicy::Required;
         let error = ensure_cli_runtime_skills_exportable(&[user, subagents, registry]).unwrap_err();
-        assert_eq!(error.skill_slug, "workspace/subagents");
+        assert_eq!(error.skill_slug, "subagents");
         let message = error.to_string();
         assert!(message.contains(CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE));
         assert!(message.contains("required system skill"));
@@ -718,7 +773,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plans.len(), 1);
-            assert_eq!(plans[0].skill_slug, "workspace/browser");
+            assert_eq!(plans[0].skill_id, browser.skill_id);
+            assert_eq!(plans[0].owner.as_deref(), Some("workspace"));
+            assert_eq!(plans[0].slug, "browser");
+            assert_eq!(plans[0].skill_slug, "browser");
             assert_eq!(plans[0].source_kind, "system");
             assert_eq!(plans[0].install_name, "browser");
         }
@@ -847,6 +905,56 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_skill_without_frontmatter_name_keeps_folder_name_fallback() {
+        use pioneer_config::GatewayCliAgentRuntimeKindConfig;
+        use pioneer_protocol::CLIAgentRuntimeKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("source/folder-fallback");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: no explicit name\n---\nFallback body",
+        )
+        .unwrap();
+        let skill_id = test_skill_id("folder-fallback", SkillSourceKind::User);
+        let definition = pioneer_skills::parse_skill_from_file(
+            skill_id.clone(),
+            &skill_dir.join("SKILL.md"),
+            SkillSourceKind::User,
+            temp.path(),
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(definition.identity.name, "folder-fallback");
+        let resolved = pioneer_skills::ResolvedSkill {
+            skill_id,
+            slug: "folder-fallback".to_owned(),
+            reason: SkillResolvedReason::ExplicitCapability,
+            definition,
+        };
+        let runtime = runtime_instance(
+            GatewayCliAgentRuntimeKindConfig::Codex,
+            temp.path().join("codex").to_string_lossy().into_owned(),
+            None,
+        );
+
+        let plans = build_cli_runtime_skill_install_plans(
+            &runtime,
+            CLIAgentRuntimeKind::Codex,
+            &[resolved],
+            &temp.path().join("receipt.json"),
+        )
+        .unwrap();
+
+        assert_eq!(plans[0].install_name, "folder-fallback");
+        assert_eq!(
+            plans[0].destination,
+            temp.path().join("codex/skills/folder-fallback")
+        );
+    }
+
+    #[test]
     fn combined_cli_preflight_skill_collision_with_mcp_is_side_effect_free() {
         use pioneer_config::GatewayCliAgentRuntimeKindConfig;
         use pioneer_protocol::{CLIAgentRuntimeKind, McpScopeKind};
@@ -876,8 +984,8 @@ mod tests {
         let mut second = resolved_skill("second", SkillSourceKind::Registry);
         second.definition.identity.name = "same@skill".to_owned();
         let partition = partition_cli_runtime_capabilities(&[
-            skill_capability("first", "first", "user"),
-            skill_capability("second", "second", "registry"),
+            skill_capability("first", SkillSourceKind::User),
+            skill_capability("second", SkillSourceKind::Registry),
             TurnCapability {
                 id: "mcp-tool:workspace:resend:send".to_owned(),
                 kind: TurnCapabilityKind::McpTool {
@@ -907,8 +1015,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("cli_runtime.skill_destination_collision"));
-        assert!(error.contains("workspace/first"));
-        assert!(error.contains("workspace/second"));
+        assert!(error.contains("first"));
+        assert!(error.contains("second"));
         assert!(!collision_home.join("skills").exists());
         assert!(!collision_receipt.exists());
     }
@@ -1083,7 +1191,8 @@ mod tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &plan)
+                let candidates = [receipt_candidate(&plan)];
+                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
                     .await
                     .unwrap()
             }));
@@ -1098,6 +1207,63 @@ mod tests {
             first.receipt_updated_at_unix_ms,
             second.receipt_updated_at_unix_ms
         );
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_first_projection_race_converts_legacy_receipt_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = install_plan(temp.path(), "one");
+        fs::create_dir_all(plan.receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &plan.receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": [{
+                    "runtime_id": plan.runtime_id,
+                    "runtime_kind": plan.runtime_kind,
+                    "native_skills_root": plan.native_skills_root,
+                    "install_name": plan.install_name,
+                    "skill_slug": "registry/one",
+                    "source_kind": "registry",
+                    "source_folder_hash": "old-hash",
+                    "install_path": plan.destination,
+                    "installed_at_unix_ms": 7,
+                    "updated_at_unix_ms": 8
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let destination_locks = new_cli_runtime_skill_destination_locks();
+        let receipt_lock = Arc::new(Mutex::new(()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let plan = plan.clone();
+            let destination_locks = destination_locks.clone();
+            let receipt_lock = receipt_lock.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let candidates = [receipt_candidate(&plan)];
+                barrier.wait().await;
+                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
+                    .await
+                    .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        let first = tasks.remove(0).await.unwrap();
+        let second = tasks.remove(0).await.unwrap();
+        let statuses = [first.status, second.status];
+        assert!(statuses.contains(&CliRuntimeSkillInstallStatus::Updated));
+        assert!(statuses.contains(&CliRuntimeSkillInstallStatus::Current));
+        let receipt = read_external_runtime_receipt(&plan.receipt_path).unwrap();
+        assert_eq!(
+            receipt.version,
+            pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_VERSION
+        );
+        assert_eq!(receipt.entries.len(), 1);
+        assert_eq!(receipt.entries[0].skill_id, plan.skill_id);
     }
 
     #[tokio::test]
@@ -1117,7 +1283,8 @@ mod tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &plan)
+                let candidates = [receipt_candidate(&plan)];
+                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
                     .await
                     .unwrap()
             }));
@@ -1145,12 +1312,15 @@ mod tests {
         let destination_locks = new_cli_runtime_skill_destination_locks();
         let receipt_lock = Arc::new(Mutex::new(()));
 
-        install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &plan)
+        let candidates = [receipt_candidate(&plan)];
+        install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
             .await
             .unwrap();
         fs::write(plan.source.join("changed"), b"changed").unwrap();
         symlink("loop", plan.source.join("loop")).unwrap();
-        let failed = install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &plan).await;
+        let failed =
+            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
+                .await;
         assert!(failed.is_err());
         assert!(
             read_external_runtime_receipt(&plan.receipt_path)
@@ -1160,9 +1330,10 @@ mod tests {
         );
 
         fs::remove_file(plan.source.join("loop")).unwrap();
-        let retried = install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &plan)
-            .await
-            .unwrap();
+        let retried =
+            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
+                .await
+                .unwrap();
         assert_eq!(retried.status, CliRuntimeSkillInstallStatus::Installed);
     }
 }

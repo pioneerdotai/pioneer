@@ -2015,18 +2015,24 @@ mod tests {
                     },
                     "rows": [
                         {
-                            "key": "skill:system:browser",
-                            "label": "Browser",
+                            "key": "skill:BBBBBBBBBBBBBBBBBBBBB",
+                            "skill_id": "BBBBBBBBBBBBBBBBBBBBB",
+                            "label": "pioneer/browser",
+                            "display_name": "Browser",
                             "description": "User-controlled bundled browser",
+                            "owner": "pioneer",
                             "slug": "browser",
                             "source_kind": "system",
                             "selectable": true,
                             "unavailable_reason": null
                         },
                         {
-                            "key": "skill:user:writer",
-                            "label": "Writer",
+                            "key": "skill:WWWWWWWWWWWWWWWWWWWWW",
+                            "skill_id": "WWWWWWWWWWWWWWWWWWWWW",
+                            "label": "writer",
+                            "display_name": "Writer",
                             "description": "User-installed writer",
+                            "owner": null,
                             "slug": "writer",
                             "source_kind": "user",
                             "selectable": true,
@@ -2039,8 +2045,27 @@ mod tests {
             )
             .expect("skill picker rows");
         assert_eq!(skill_rows.len(), 2);
-        assert_eq!(skill_rows[0].key, "skill:system:browser");
-        assert_eq!(skill_rows[1].key, "skill:user:writer");
+        assert_eq!(skill_rows[0].key, "skill:BBBBBBBBBBBBBBBBBBBBB");
+        assert_eq!(skill_rows[1].key, "skill:WWWWWWWWWWWWWWWWWWWWW");
+        let selected_skill = runtime
+            .composer_skill_capability_from_row(
+                serde_json::json!({ "row": skill_rows[0] })
+                    .to_string()
+                    .as_str(),
+            )
+            .expect("skill row conversion");
+        assert_eq!(selected_skill.id, "skill:BBBBBBBBBBBBBBBBBBBBB");
+        assert!(matches!(
+            selected_skill.kind,
+            pioneer_client::composer::capabilities::ComposerCapabilityKind::Skill {
+                ref skill_id,
+                ref owner,
+                ref slug,
+                ..
+            } if skill_id.as_str() == "BBBBBBBBBBBBBBBBBBBBB"
+                && owner.as_deref() == Some("pioneer")
+                && slug == "browser"
+        ));
 
         let capabilities = serde_json::json!([
             {
@@ -2054,10 +2079,12 @@ mod tests {
                 }
             },
             {
-                "id": "skill:system:browser",
-                "label": "browser",
+                "id": "skill:BBBBBBBBBBBBBBBBBBBBB",
+                "label": "pioneer/browser",
                 "kind": {
                     "Skill": {
+                        "skill_id": "BBBBBBBBBBBBBBBBBBBBB",
+                        "owner": "pioneer",
                         "slug": "browser",
                         "source_kind": "system"
                     }
@@ -2096,10 +2123,33 @@ mod tests {
             text.capabilities[0].id,
             "mcp-server:workspace:appstoreconnect"
         );
-        assert_eq!(text.capabilities[1].id, "skill:system:browser");
+        assert_eq!(text.capabilities[1].id, "skill:BBBBBBBBBBBBBBBBBBBBB");
         assert!(text.removed.is_empty());
         assert!(text.has_composer_payload);
         assert!(voice.has_composer_payload);
+
+        let missing_skill_id = runtime.composer_submission_plan(
+            serde_json::json!({
+                "provider": "openai",
+                "text": "missing id",
+                "capabilities": [{
+                    "id": "skill:BBBBBBBBBBBBBBBBBBBBB",
+                    "label": "browser",
+                    "kind": {
+                        "Skill": {
+                            "slug": "browser",
+                            "source_kind": "system"
+                        }
+                    }
+                }]
+            })
+            .to_string()
+            .as_str(),
+        );
+        assert!(
+            missing_skill_id.is_err(),
+            "skill capability without exact id must be rejected"
+        );
     }
 
     #[test]

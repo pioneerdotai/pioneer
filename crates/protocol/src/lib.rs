@@ -74,7 +74,7 @@ pub use cli_runtime::{
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
     sanitize_runtime_diagnostic_lines,
 };
-pub use id::generate_id;
+pub use id::{SKILL_ID_LEN, SkillId, SkillIdError, generate_id};
 pub use jsonrpc::{
     INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
@@ -296,7 +296,7 @@ pub use turn::{
     build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
     build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
     collect_execution_checkpoint_strict_obligations, normalize_metadata_reasoning_effort,
-    reasoning_effort_comparison_key, resolve_turn_permission_profile,
+    reasoning_effort_comparison_key, resolve_turn_permission_profile, skill_capability_key,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,

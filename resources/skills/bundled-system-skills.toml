@@ -1,0 +1,25 @@
+version = 1
+
+[[skills]]
+skill_id = "24ZiAJnkBQ3WtGYx7XGeh"
+owner = "pioneer"
+slug = "browser"
+resource_path = "pioneer/browser"
+
+[[skills]]
+skill_id = "TYotuYDUMUbxl37lej8cv"
+owner = "pioneer"
+slug = "memory"
+resource_path = "pioneer/memory"
+
+[[skills]]
+skill_id = "7Ejrf61g4oqigkv3LMNE9"
+owner = "pioneer"
+slug = "subagents"
+resource_path = "pioneer/subagents"
+
+[[skills]]
+skill_id = "AzBYfaNgS6u1tiPaSlwnm"
+owner = "pioneer"
+slug = "tasks"
+resource_path = "pioneer/tasks"

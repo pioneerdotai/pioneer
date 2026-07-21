@@ -27,17 +27,19 @@
     "SkillHealthTarget": {
       "type": "object",
       "properties": {
-        "slug": {
-          "type": "string"
-        },
-        "source_kind": {
-          "type": "string"
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
         }
       },
       "required": [
-        "slug",
-        "source_kind"
+        "skill_id"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     }
   }
 }

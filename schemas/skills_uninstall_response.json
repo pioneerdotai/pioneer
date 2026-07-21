@@ -6,11 +6,20 @@
     "audit": {
       "$ref": "#/$defs/SkillLifecycleAuditSummary"
     },
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "removed_install_path": {
       "type": [
         "string",
         "null"
       ]
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
     },
     "slug": {
       "type": "string"
@@ -24,11 +33,18 @@
   },
   "required": [
     "status",
+    "skill_id",
     "slug",
     "source_kind",
     "audit"
   ],
   "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "SkillLifecycleAuditSummary": {
       "type": "object",
       "properties": {

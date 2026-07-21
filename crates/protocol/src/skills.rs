@@ -1,6 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::SkillId;
+
 fn default_true() -> bool {
     true
 }
@@ -118,6 +120,9 @@ pub struct SkillListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillListItem {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     pub display_name: String,
@@ -213,8 +218,7 @@ pub struct SkillsInstallResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsUpdateParams {
     pub workspace_id: String,
-    pub slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
     pub source: SkillLifecycleSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_previous_fingerprint: Option<String>,
@@ -230,13 +234,15 @@ pub struct SkillsUpdateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsUninstallParams {
     pub workspace_id: String,
-    pub slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsUninstallResponse {
     pub status: String,
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +252,9 @@ pub struct SkillsUninstallResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillLifecycleResultSkill {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,7 +283,10 @@ pub struct SkillsPolicyListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillWorkspacePolicy {
     pub workspace_id: String,
-    pub skill_slug: String,
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub slug: String,
     pub source_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -285,8 +297,7 @@ pub struct SkillWorkspacePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsPolicySetParams {
     pub workspace_id: String,
-    pub skill_slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,8 +320,7 @@ pub struct SkillsHealthParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillHealthTarget {
-    pub slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -323,6 +333,9 @@ pub struct SkillsHealthResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillHealthItem {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     pub trust_level: String,
@@ -367,6 +380,9 @@ pub struct SkillsChangedNotification {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillChangedItem {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     pub change_type: String,
@@ -380,6 +396,10 @@ pub struct SkillChangedItem {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn skill_id(character: char) -> SkillId {
+        SkillId::new(character.to_string().repeat(21)).expect("valid test skill id")
+    }
 
     #[test]
     fn uploaded_archive_lifecycle_source_round_trips_and_rejects_path() {
@@ -417,6 +437,210 @@ mod tests {
         .expect("install params should decode without target_source_kind");
 
         assert_eq!(params.target_source_kind, "user");
+    }
+
+    #[test]
+    fn management_mutations_require_exact_skill_id() {
+        let update: SkillsUpdateParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "skill_id": "AAAAAAAAAAAAAAAAAAAAA",
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": "upload_00000000000001"
+            },
+            "expected_previous_fingerprint": "previous"
+        }))
+        .expect("ID-based update should decode");
+        assert_eq!(update.skill_id, skill_id('A'));
+
+        let uninstall: SkillsUninstallParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "skill_id": "BBBBBBBBBBBBBBBBBBBBB"
+        }))
+        .expect("ID-based uninstall should decode");
+        assert_eq!(uninstall.skill_id, skill_id('B'));
+
+        let policy: SkillsPolicySetParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "skill_id": "CCCCCCCCCCCCCCCCCCCCC",
+            "enabled": true
+        }))
+        .expect("ID-based policy should decode");
+        assert_eq!(policy.skill_id, skill_id('C'));
+
+        let health: SkillsHealthParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "skills": [{"skill_id": "DDDDDDDDDDDDDDDDDDDDD"}]
+        }))
+        .expect("ID-based health request should decode");
+        assert_eq!(health.skills[0].skill_id, skill_id('D'));
+
+        let mut update_without_id = serde_json::to_value(&update).expect("update should encode");
+        update_without_id
+            .as_object_mut()
+            .expect("update must encode as object")
+            .remove("skill_id");
+        assert!(serde_json::from_value::<SkillsUpdateParams>(update_without_id).is_err());
+
+        let mut uninstall_without_id =
+            serde_json::to_value(&uninstall).expect("uninstall should encode");
+        uninstall_without_id
+            .as_object_mut()
+            .expect("uninstall must encode as object")
+            .remove("skill_id");
+        assert!(serde_json::from_value::<SkillsUninstallParams>(uninstall_without_id).is_err());
+
+        let mut policy_without_id = serde_json::to_value(&policy).expect("policy should encode");
+        policy_without_id
+            .as_object_mut()
+            .expect("policy must encode as object")
+            .remove("skill_id");
+        assert!(serde_json::from_value::<SkillsPolicySetParams>(policy_without_id).is_err());
+
+        let mut health_without_id = serde_json::to_value(&health).expect("health should encode");
+        health_without_id["skills"][0]
+            .as_object_mut()
+            .expect("health target must encode as object")
+            .remove("skill_id");
+        assert!(serde_json::from_value::<SkillsHealthParams>(health_without_id).is_err());
+    }
+
+    #[test]
+    fn management_results_and_notifications_carry_id_and_presentation() {
+        let list_item = SkillListItem {
+            skill_id: skill_id('E'),
+            owner: Some("owner".to_owned()),
+            slug: "skill".to_owned(),
+            source_kind: "user".to_owned(),
+            display_name: "Skill".to_owned(),
+            description: "Description".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            fingerprint: "fingerprint".to_owned(),
+            trust_level: "community".to_owned(),
+            install: SkillInstallState {
+                managed: true,
+                installed: true,
+                lifecycle_editable: true,
+                install_path: Some("/managed/E/skill".to_owned()),
+                updated_at: Some(1),
+            },
+            policy: SkillPolicyState {
+                enabled: true,
+                allow_implicit_invocation: false,
+                allow_implicit_invocation_editable: true,
+            },
+            health: SkillHealthSummary {
+                status: "ready".to_owned(),
+                dependency_failures: Vec::new(),
+                security_blocks: Vec::new(),
+                validation_issues: Vec::new(),
+            },
+            status: "available".to_owned(),
+            status_reason: None,
+        };
+        let list_json = serde_json::to_value(&list_item).expect("list item encodes");
+        assert_eq!(list_json["skill_id"], "EEEEEEEEEEEEEEEEEEEEE");
+        assert_eq!(list_json["owner"], "owner");
+        assert_eq!(list_json["slug"], "skill");
+
+        let lifecycle = SkillLifecycleResultSkill {
+            skill_id: skill_id('F'),
+            owner: None,
+            slug: "authorless".to_owned(),
+            source_kind: "registry".to_owned(),
+            version: None,
+            fingerprint: "fingerprint".to_owned(),
+            trust_level: "community".to_owned(),
+            install_path: "/managed/F/authorless".to_owned(),
+        };
+        let install = SkillsInstallResponse {
+            status: "installed".to_owned(),
+            skill: lifecycle,
+            audit: SkillLifecycleAuditSummary { events_written: 1 },
+        };
+        let install_json = serde_json::to_value(&install).expect("install response encodes");
+        assert_eq!(install_json["skill"]["skill_id"], "FFFFFFFFFFFFFFFFFFFFF");
+        assert!(install_json["skill"].get("owner").is_none());
+
+        let uninstall = SkillsUninstallResponse {
+            status: "uninstalled".to_owned(),
+            skill_id: skill_id('J'),
+            owner: Some("owner".to_owned()),
+            slug: "skill".to_owned(),
+            source_kind: "user".to_owned(),
+            removed_install_path: Some("/managed/J/skill".to_owned()),
+            audit: SkillLifecycleAuditSummary { events_written: 1 },
+        };
+        let uninstall_json = serde_json::to_value(&uninstall).expect("uninstall response encodes");
+        assert_eq!(uninstall_json["skill_id"], "JJJJJJJJJJJJJJJJJJJJJ");
+        assert_eq!(uninstall_json["owner"], "owner");
+        assert_eq!(uninstall_json["slug"], "skill");
+
+        let policy = SkillWorkspacePolicy {
+            workspace_id: "ws_000000000000000001".to_owned(),
+            skill_id: skill_id('G'),
+            owner: Some("owner".to_owned()),
+            slug: "skill".to_owned(),
+            source_kind: "user".to_owned(),
+            enabled: Some(true),
+            allow_implicit_invocation: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_value(&policy).unwrap()["skill_id"],
+            "GGGGGGGGGGGGGGGGGGGGG"
+        );
+
+        let health = SkillHealthItem {
+            skill_id: skill_id('H'),
+            owner: None,
+            slug: "health".to_owned(),
+            source_kind: "system".to_owned(),
+            trust_level: "internal".to_owned(),
+            dependency_diagnostics: Vec::new(),
+            security_findings: Vec::new(),
+            validation_issues: Vec::new(),
+            trust_gate: Vec::new(),
+            recent_audit: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&health).unwrap()["skill_id"],
+            "HHHHHHHHHHHHHHHHHHHHH"
+        );
+
+        let changed = SkillChangedItem {
+            skill_id: skill_id('I'),
+            owner: Some("owner".to_owned()),
+            slug: "skill".to_owned(),
+            source_kind: "user".to_owned(),
+            change_type: "updated".to_owned(),
+            fingerprint_before: Some("before".to_owned()),
+            fingerprint_after: Some("after".to_owned()),
+        };
+        let changed_json = serde_json::to_value(&changed).expect("change encodes");
+        assert_eq!(changed_json["skill_id"], "IIIIIIIIIIIIIIIIIIIII");
+        assert_eq!(changed_json["owner"], "owner");
+        assert_eq!(changed_json["slug"], "skill");
+    }
+
+    #[test]
+    fn install_upload_id_is_not_skill_id() {
+        let source = SkillLifecycleSource::UploadedArchive {
+            upload_id: "UUUUUUUUUUUUUUUUUUUUU".to_owned(),
+        };
+        let result = SkillLifecycleResultSkill {
+            skill_id: skill_id('S'),
+            owner: None,
+            slug: "skill".to_owned(),
+            source_kind: "user".to_owned(),
+            version: None,
+            fingerprint: "fingerprint".to_owned(),
+            trust_level: "community".to_owned(),
+            install_path: "/managed/S/skill".to_owned(),
+        };
+
+        let source_json = serde_json::to_value(source).unwrap();
+        let result_json = serde_json::to_value(result).unwrap();
+        assert_ne!(source_json["upload_id"], result_json["skill_id"]);
     }
 
     #[test]

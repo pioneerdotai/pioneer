@@ -424,12 +424,18 @@ fn claude_config_identity(generation: u64) -> Result<ClaudeManagedMcpConfigIdent
 }
 
 fn skill_capability(id: &str) -> TurnCapability {
+    let mut value = id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    value.truncate(21);
+    while value.len() < 21 {
+        value.push('C');
+    }
+    let skill_id = pioneer_protocol::SkillId::new(value).expect("valid conformance SkillId");
     TurnCapability {
-        id: id.to_owned(),
-        kind: TurnCapabilityKind::Skill {
-            slug: format!("workspace/{id}"),
-            source_kind: "workspace".to_owned(),
-        },
+        id: format!("skill:{skill_id}"),
+        kind: TurnCapabilityKind::Skill { skill_id },
         label: Some(format!("Skill {id}")),
     }
 }

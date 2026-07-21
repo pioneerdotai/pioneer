@@ -319,7 +319,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         },
     });
 
-    let mut skill_system_roots =
+    let skill_system_roots =
         match system_skills::materialize_bundled_system_skill_roots(runtime_home.as_path()) {
             Ok(roots) => roots,
             Err(error) => {
@@ -330,16 +330,28 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
                 Vec::new()
             }
         };
-    skill_system_roots.extend(expand_home_directory_templates(
+    let skill_system_import_roots = expand_home_directory_templates(
         skills_cfg.paths.system.as_slice(),
         &runtime_home_directory,
-    ));
-    let skill_user_roots =
+    );
+    let skill_user_import_roots =
         expand_home_directory_templates(skills_cfg.paths.user.as_slice(), &runtime_home_directory);
-    let skill_registry_roots = expand_home_directory_templates(
+    let skill_registry_import_roots = expand_home_directory_templates(
         skills_cfg.paths.registry.as_slice(),
         &runtime_home_directory,
     );
+    let skill_user_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/user")
+            .display()
+            .to_string(),
+    ];
+    let skill_registry_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/registry")
+            .display()
+            .to_string(),
+    ];
     let min_trust_for_shell_tools = parse_skill_trust_level(
         skills_cfg.security.min_trust_for_shell_tools.as_str(),
         "gateway.skills.security.min_trust_for_shell_tools",
@@ -419,6 +431,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             system_roots: skill_system_roots,
             user_roots: skill_user_roots,
             registry_roots: skill_registry_roots,
+            system_import_roots: skill_system_import_roots,
+            user_import_roots: skill_user_import_roots,
+            registry_import_roots: skill_registry_import_roots,
             validation: pioneer_agent::SkillsValidationLoopConfig {
                 strict_agentskills: skills_cfg.validation.strict_agentskills,
                 accept_openclaw_profile: skills_cfg.validation.accept_openclaw_profile,
@@ -553,6 +568,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_thread_episodic_vector_refill_status_notifications();
 
     database::startup::spawn(
+        message_processor.clone(),
         message_processor.crud_store.clone(),
         thread_episodic_storage_root.clone(),
         config.gateway.thread_episodic.vector_search.clone(),
@@ -576,7 +592,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .cleanup_stale_skill_uploads(now_timestamp_secs())
         .await;
     message_processor.start_resilience_workers().await;
-    message_processor.start_skills_watcher().await;
     message_processor.start_mcp_workspace_supervisor().await;
 
     let remote_access_config = config.gateway.remote_access.clone();

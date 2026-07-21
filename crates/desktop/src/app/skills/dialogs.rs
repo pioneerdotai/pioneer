@@ -1,10 +1,11 @@
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
+use pioneer_protocol::SkillId;
 
 #[derive(Clone)]
 enum SkillSourcePickerTarget {
     Install,
-    Update { slug: String, source_kind: String },
+    Update { skill_id: SkillId },
 }
 
 #[derive(Copy, Clone)]
@@ -23,16 +24,11 @@ impl PioneerDesktop {
 
     pub(super) fn open_skill_update_dialog(
         &mut self,
-        slug: String,
-        source_kind: String,
+        skill_id: SkillId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_skill_source_picker(
-            SkillSourcePickerTarget::Update { slug, source_kind },
-            window,
-            cx,
-        );
+        self.open_skill_source_picker(SkillSourcePickerTarget::Update { skill_id }, window, cx);
     }
 
     fn open_skill_source_picker(
@@ -103,8 +99,8 @@ impl PioneerDesktop {
     ) {
         match target {
             SkillSourcePickerTarget::Install => self.install_skill_from_path(source_path, cx),
-            SkillSourcePickerTarget::Update { slug, source_kind } => {
-                self.update_skill_from_path(slug, source_kind, source_path, cx)
+            SkillSourcePickerTarget::Update { skill_id } => {
+                self.update_skill_from_path(skill_id, source_path, cx)
             }
         }
     }

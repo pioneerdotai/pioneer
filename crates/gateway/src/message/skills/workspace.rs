@@ -1,5 +1,134 @@
 use super::*;
 
+pub(crate) fn skills_runtime_context_from_config(
+    tool_loop_config: &ToolLoopConfig,
+    workspace_id: &str,
+) -> Result<SkillsRuntimeContext> {
+    let skills = &tool_loop_config.skills;
+    let system_roots = skills
+        .system_roots
+        .iter()
+        .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
+        .collect::<Vec<_>>();
+    let bundled = system_roots
+        .first()
+        .map(|root| crate::system_skills::bundled_system_skill_catalog_entries(root.as_path()))
+        .transpose()?
+        .unwrap_or_default();
+    let user_roots = skills
+        .user_roots
+        .iter()
+        .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
+        .collect::<Vec<_>>();
+    let registry_roots = skills
+        .registry_roots
+        .iter()
+        .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
+        .collect::<Vec<_>>();
+    let catalog_params = SkillCatalogLoadParams {
+        installations: Vec::new(),
+        bundled,
+        max_file_bytes: skills.max_skill_file_bytes,
+    };
+    let Some(registry_root) = registry_roots.first().cloned() else {
+        bail!("skills registry root is not configured");
+    };
+    let Some(user_root) = user_roots.first().cloned() else {
+        bail!("skills user root is not configured");
+    };
+    let skill_runtime_root = user_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| user_root.clone());
+
+    Ok(SkillsRuntimeContext {
+        user_lock_path: user_root.join("skills-lock.toml"),
+        registry_lock_path: registry_root.join("skills-lock.toml"),
+        user_root,
+        registry_root,
+        upload_root: skill_runtime_root.join("uploads"),
+        materialized_root: skill_runtime_root.join(".materialized"),
+        upload_ttl_secs: skills.security.upload_ttl_secs.max(60),
+        upload_recommended_chunk_size_bytes: skills
+            .security
+            .upload_recommended_chunk_size_bytes
+            .max(1),
+        upload_max_chunk_size_bytes: skills.security.upload_max_chunk_size_bytes.max(1),
+        max_upload_compressed_bytes: skills.security.max_install_archive_compressed_bytes.max(1),
+        max_upload_uncompressed_bytes: skills
+            .security
+            .max_install_archive_uncompressed_bytes
+            .max(1),
+        max_upload_archive_entries: skills.security.max_install_archive_entries.max(1),
+        catalog_params,
+        validation_policy: SkillValidationPolicy {
+            strict_agentskills: skills.validation.strict_agentskills,
+            accept_openclaw_profile: skills.validation.accept_openclaw_profile,
+            preflight_on_resolve: skills.dependencies.preflight_on_resolve,
+            allow_untrusted_install: skills.security.allow_untrusted_install,
+            security_scan_on_resolve: true,
+            max_security_scan_file_bytes: skills.security.max_install_file_bytes,
+        },
+        security_policy: SkillSecurityPolicy {
+            allow_untrusted_install: skills.security.allow_untrusted_install,
+            min_trust_for_shell_tools: skills.security.min_trust_for_shell_tools.clone(),
+            min_trust_for_http_tools: skills.security.min_trust_for_http_tools.clone(),
+            min_trust_for_function_proxy_tools: skills
+                .security
+                .min_trust_for_function_proxy_tools
+                .clone(),
+            max_install_archive_bytes: skills.security.max_install_archive_bytes,
+            max_install_file_bytes: skills.security.max_install_file_bytes,
+        },
+        global_policy_defaults: SkillPolicy {
+            enabled: Some(skills.enabled),
+            allow_implicit_invocation: Some(skills.allow_implicit_invocation),
+        },
+    })
+}
+
+pub(crate) async fn load_skills_catalog_from_store(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    context: &SkillsRuntimeContext,
+) -> Result<pioneer_skills::SkillCatalogSnapshot> {
+    let installations = crud_store
+        .list_skill_installations()
+        .await?
+        .into_iter()
+        .filter(|row| row.scope_key == workspace_id || row.source_kind == "system")
+        .map(|row| {
+            let source_kind = match row.source_kind.as_str() {
+                "system" => SkillSourceKind::System,
+                "user" => SkillSourceKind::User,
+                "registry" => SkillSourceKind::Registry,
+                other => bail!("unknown installed skill source kind `{other}`"),
+            };
+            let trust_level = match row.trust_level.as_str() {
+                "internal" => pioneer_skills::SkillTrustLevel::Internal,
+                "verified" => pioneer_skills::SkillTrustLevel::Verified,
+                "community" => pioneer_skills::SkillTrustLevel::Community,
+                "untrusted" => pioneer_skills::SkillTrustLevel::Untrusted,
+                other => bail!("unknown installed skill trust level `{other}`"),
+            };
+            Ok(pioneer_skills::SkillCatalogInstallation {
+                skill_id: row.skill_id,
+                owner: row.owner,
+                slug: row.slug,
+                version: row.version,
+                source_kind,
+                source_ref: row.source_ref,
+                install_path: PathBuf::from(row.install_path),
+                trust_level,
+                fingerprint: row.fingerprint,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut params = context.catalog_params.clone();
+    params.installations = installations;
+    load_catalog(&params)
+}
+
 impl MessageProcessor {
     pub(super) async fn validate_skills_workspace(
         &self,
@@ -57,88 +186,19 @@ impl MessageProcessor {
         Ok(workspace_id)
     }
 
-    pub(super) fn skills_runtime_context(
+    pub(crate) fn skills_runtime_context(
         &self,
         workspace_id: &str,
     ) -> Result<SkillsRuntimeContext> {
-        let skills = &self.tool_loop_config.skills;
-        let catalog_params = SkillCatalogLoadParams {
-            system_roots: skills
-                .system_roots
-                .iter()
-                .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
-                .collect(),
-            user_roots: skills
-                .user_roots
-                .iter()
-                .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
-                .collect(),
-            registry_roots: skills
-                .registry_roots
-                .iter()
-                .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
-                .collect(),
-            max_skills_per_source: skills.max_skills_per_source,
-            max_file_bytes: skills.max_skill_file_bytes,
-        };
-        let Some(registry_root) = catalog_params.registry_roots.first().cloned() else {
-            bail!("skills registry root is not configured");
-        };
-        let Some(user_root) = catalog_params.user_roots.first().cloned() else {
-            bail!("skills user root is not configured");
-        };
-        let skill_runtime_root = user_root
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| user_root.clone());
+        skills_runtime_context_from_config(&self.tool_loop_config, workspace_id)
+    }
 
-        Ok(SkillsRuntimeContext {
-            user_lock_path: user_root.join("skills-lock.toml"),
-            registry_lock_path: registry_root.join("skills-lock.toml"),
-            user_root,
-            registry_root,
-            upload_root: skill_runtime_root.join("uploads"),
-            materialized_root: skill_runtime_root.join(".materialized"),
-            upload_ttl_secs: skills.security.upload_ttl_secs.max(60),
-            upload_recommended_chunk_size_bytes: skills
-                .security
-                .upload_recommended_chunk_size_bytes
-                .max(1),
-            upload_max_chunk_size_bytes: skills.security.upload_max_chunk_size_bytes.max(1),
-            max_upload_compressed_bytes: skills
-                .security
-                .max_install_archive_compressed_bytes
-                .max(1),
-            max_upload_uncompressed_bytes: skills
-                .security
-                .max_install_archive_uncompressed_bytes
-                .max(1),
-            max_upload_archive_entries: skills.security.max_install_archive_entries.max(1),
-            catalog_params,
-            validation_policy: SkillValidationPolicy {
-                strict_agentskills: skills.validation.strict_agentskills,
-                accept_openclaw_profile: skills.validation.accept_openclaw_profile,
-                preflight_on_resolve: skills.dependencies.preflight_on_resolve,
-                allow_untrusted_install: skills.security.allow_untrusted_install,
-                security_scan_on_resolve: true,
-                max_security_scan_file_bytes: skills.security.max_install_file_bytes,
-            },
-            security_policy: SkillSecurityPolicy {
-                allow_untrusted_install: skills.security.allow_untrusted_install,
-                min_trust_for_shell_tools: skills.security.min_trust_for_shell_tools.clone(),
-                min_trust_for_http_tools: skills.security.min_trust_for_http_tools.clone(),
-                min_trust_for_function_proxy_tools: skills
-                    .security
-                    .min_trust_for_function_proxy_tools
-                    .clone(),
-                max_install_archive_bytes: skills.security.max_install_archive_bytes,
-                max_install_file_bytes: skills.security.max_install_file_bytes,
-            },
-            global_policy_defaults: SkillPolicy {
-                enabled: Some(skills.enabled),
-                allow_implicit_invocation: Some(skills.allow_implicit_invocation),
-            },
-        })
+    pub(crate) async fn load_skills_catalog(
+        &self,
+        workspace_id: &str,
+        context: &SkillsRuntimeContext,
+    ) -> Result<pioneer_skills::SkillCatalogSnapshot> {
+        load_skills_catalog_from_store(self.crud_store.as_ref(), workspace_id, context).await
     }
 
     pub(super) fn build_policy_set(
@@ -151,13 +211,7 @@ impl MessageProcessor {
             .iter()
             .map(|skill| {
                 (
-                    SkillPolicyKey::new(
-                        qualified_skill_slug(
-                            skill.identity.owner.as_str(),
-                            skill.identity.slug.as_str(),
-                        ),
-                        skill.identity.source_kind.as_db_value().to_owned(),
-                    ),
+                    SkillPolicyKey::new(skill.identity.skill_id.clone()),
                     context.global_policy_defaults.clone(),
                 )
             })
@@ -166,7 +220,7 @@ impl MessageProcessor {
             .iter()
             .map(|policy| {
                 (
-                    SkillPolicyKey::new(policy.skill_slug.clone(), policy.source_kind.clone()),
+                    SkillPolicyKey::new(policy.skill_id.clone()),
                     SkillPolicy {
                         enabled: policy.enabled,
                         allow_implicit_invocation: policy.allow_implicit_invocation,

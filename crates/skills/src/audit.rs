@@ -1,3 +1,4 @@
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -49,6 +50,9 @@ impl SkillAuditDecision {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillAuditEvent {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub action: SkillAuditAction,
@@ -62,6 +66,8 @@ pub struct SkillAuditEvent {
 
 impl SkillAuditEvent {
     pub fn new(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         action: SkillAuditAction,
@@ -71,6 +77,8 @@ impl SkillAuditEvent {
         created_at_unix: i64,
     ) -> Self {
         Self {
+            skill_id,
+            skill_owner,
             skill_slug: skill_slug.into(),
             source_kind: source_kind.into(),
             action,
@@ -82,12 +90,16 @@ impl SkillAuditEvent {
     }
 
     pub fn install(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         details: JsonValue,
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::Install,
@@ -99,12 +111,16 @@ impl SkillAuditEvent {
     }
 
     pub fn update(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         details: JsonValue,
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::Update,
@@ -116,12 +132,16 @@ impl SkillAuditEvent {
     }
 
     pub fn uninstall(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         details: JsonValue,
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::Uninstall,
@@ -133,12 +153,16 @@ impl SkillAuditEvent {
     }
 
     pub fn resolution_allowed(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         details: JsonValue,
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::ResolveAllowed,
@@ -150,6 +174,8 @@ impl SkillAuditEvent {
     }
 
     pub fn resolution_blocked(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         reason_code: impl Into<String>,
@@ -157,6 +183,8 @@ impl SkillAuditEvent {
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::ResolveBlocked,
@@ -168,6 +196,8 @@ impl SkillAuditEvent {
     }
 
     pub fn runtime_blocked(
+        skill_id: SkillId,
+        skill_owner: Option<String>,
         skill_slug: impl Into<String>,
         source_kind: impl Into<String>,
         reason_code: impl Into<String>,
@@ -175,6 +205,8 @@ impl SkillAuditEvent {
         created_at_unix: i64,
     ) -> Self {
         Self::new(
+            skill_id,
+            skill_owner,
             skill_slug,
             source_kind,
             SkillAuditAction::RuntimeBlocked,
@@ -189,18 +221,24 @@ impl SkillAuditEvent {
 #[cfg(test)]
 mod tests {
     use super::{SkillAuditAction, SkillAuditDecision, SkillAuditEvent};
+    use pioneer_protocol::SkillId;
     use serde_json::json;
 
     #[test]
     fn audit_event_builders_are_stable() {
         let created = 1_700_000_000;
+        let skill_id = SkillId::new("AAAAAAAAAAAAAAAAAAAAA").unwrap();
         let install = SkillAuditEvent::install(
+            skill_id.clone(),
+            Some("pioneer".to_owned()),
             "agent-browser",
             "registry",
             json!({"fingerprint":"fp1"}),
             created,
         );
         let blocked = SkillAuditEvent::runtime_blocked(
+            skill_id.clone(),
+            Some("pioneer".to_owned()),
             "agent-browser",
             "registry",
             "runtime.dependency_missing",
@@ -211,6 +249,7 @@ mod tests {
         assert_eq!(install.action, SkillAuditAction::Install);
         assert_eq!(install.decision, SkillAuditDecision::Allowed);
         assert!(install.reason_code.is_none());
+        assert_eq!(install.skill_id, skill_id);
 
         assert_eq!(blocked.action, SkillAuditAction::RuntimeBlocked);
         assert_eq!(blocked.decision, SkillAuditDecision::Blocked);

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_entity::skill_workspace_policy;
+use pioneer_protocol::SkillId;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
@@ -10,11 +11,27 @@ pub async fn list_workspace_skill_policies<C: ConnectionTrait>(
 ) -> Result<Vec<skill_workspace_policy::Model>> {
     skill_workspace_policy::Entity::find()
         .filter(skill_workspace_policy::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .order_by_asc(skill_workspace_policy::Column::SkillSlug)
-        .order_by_asc(skill_workspace_policy::Column::SourceKind)
+        .order_by_asc(skill_workspace_policy::Column::SkillId)
         .all(db)
         .await
         .context("failed to query workspace skill policies")
+}
+
+pub async fn find_workspace_skill_policy<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    skill_id: &SkillId,
+) -> Result<Option<skill_workspace_policy::Model>> {
+    skill_workspace_policy::Entity::find()
+        .filter(skill_workspace_policy::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(skill_workspace_policy::Column::SkillId.eq(skill_id.to_string()))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query workspace skill policy `{skill_id}` for workspace `{workspace_id}`"
+            )
+        })
 }
 
 pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
@@ -24,10 +41,9 @@ pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     skill_workspace_policy::Entity::insert(skill_workspace_policy::ActiveModel {
-        id: Set(pioneer_protocol::generate_id(21)),
+        id: Set(record.id.clone()),
         workspace_id: Set(record.workspace_id.clone()),
-        skill_slug: Set(record.skill_slug.clone()),
-        source_kind: Set(record.source_kind.clone()),
+        skill_id: Set(record.skill_id.to_string()),
         enabled: Set(record.enabled),
         allow_implicit_invocation: Set(record.allow_implicit_invocation),
         created_at: Set(created_at),
@@ -36,8 +52,7 @@ pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
     .on_conflict(
         OnConflict::columns([
             skill_workspace_policy::Column::WorkspaceId,
-            skill_workspace_policy::Column::SkillSlug,
-            skill_workspace_policy::Column::SourceKind,
+            skill_workspace_policy::Column::SkillId,
         ])
         .update_columns([
             skill_workspace_policy::Column::Enabled,
@@ -50,8 +65,8 @@ pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
     .await
     .with_context(|| {
         format!(
-            "failed to upsert workspace skill policy `{}` for workspace `{}` ({})",
-            record.skill_slug, record.workspace_id, record.source_kind
+            "failed to upsert workspace skill policy `{}` for workspace `{}`",
+            record.skill_id, record.workspace_id
         )
     })?;
 
@@ -61,20 +76,18 @@ pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
 pub async fn delete_workspace_skill_policy<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
-    skill_slug: &str,
-    source_kind: &str,
-) -> Result<()> {
-    skill_workspace_policy::Entity::delete_many()
+    skill_id: &SkillId,
+) -> Result<bool> {
+    let result = skill_workspace_policy::Entity::delete_many()
         .filter(skill_workspace_policy::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(skill_workspace_policy::Column::SkillSlug.eq(skill_slug.to_owned()))
-        .filter(skill_workspace_policy::Column::SourceKind.eq(source_kind.to_owned()))
+        .filter(skill_workspace_policy::Column::SkillId.eq(skill_id.to_string()))
         .exec(db)
         .await
         .with_context(|| {
             format!(
-                "failed to delete workspace skill policy `{skill_slug}` for workspace `{workspace_id}` ({source_kind})"
+                "failed to delete workspace skill policy `{skill_id}` for workspace `{workspace_id}`"
             )
         })?;
 
-    Ok(())
+    Ok(result.rows_affected == 1)
 }

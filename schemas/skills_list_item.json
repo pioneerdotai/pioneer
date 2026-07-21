@@ -18,8 +18,17 @@
     "install": {
       "$ref": "#/$defs/SkillInstallState"
     },
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "policy": {
       "$ref": "#/$defs/SkillPolicyState"
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
     },
     "slug": {
       "type": "string"
@@ -47,6 +56,7 @@
     }
   },
   "required": [
+    "skill_id",
     "slug",
     "source_kind",
     "display_name",
@@ -113,6 +123,12 @@
       "required": [
         "status"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "SkillInstallState": {
       "type": "object",

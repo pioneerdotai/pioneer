@@ -10,13 +10,14 @@ use crate::validation::{
     ValidationInput, build_conformance_report,
 };
 use anyhow::{Context, Result, bail};
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSourceKind {
     System,
@@ -34,7 +35,7 @@ impl SkillSourceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillTrustLevel {
     Internal,
@@ -459,7 +460,7 @@ fn parse_runtime_tools(
         .tools
         .into_iter()
         .filter_map(|tool| {
-            let tool_slug = normalize_slug(tool.tool_slug.as_str());
+            let tool_slug = normalize_skill_slug(tool.tool_slug.as_str());
             if tool_slug.is_empty() {
                 issues.push(SkillValidationIssue::error(
                     "contract.runtime.tools.tool_slug",
@@ -633,7 +634,7 @@ fn normalize_implicit_invocation_policy_for_source(
     }
 }
 
-fn normalize_slug(input: &str) -> String {
+pub fn normalize_skill_slug(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut previous_dash = false;
 
@@ -655,39 +656,7 @@ fn normalize_slug(input: &str) -> String {
 }
 
 fn normalize_owner(input: &str) -> String {
-    normalize_slug(input)
-}
-
-fn default_owner_for_source_kind(source_kind: &SkillSourceKind) -> &'static str {
-    match source_kind {
-        SkillSourceKind::System => "pioneer",
-        SkillSourceKind::User => "pioneer",
-        SkillSourceKind::Registry => "pioneer",
-    }
-}
-
-fn owner_from_relative_path(skill_dir: &Path, source_root: &Path) -> Option<String> {
-    let relative = skill_dir.strip_prefix(source_root).ok()?;
-    let mut components = relative.components();
-    let owner_component = components.next()?;
-    if components.next().is_none() {
-        return None;
-    }
-    let owner_raw = owner_component
-        .as_os_str()
-        .to_string_lossy()
-        .trim()
-        .to_owned();
-    if owner_raw.is_empty() {
-        return None;
-    }
-
-    let normalized = normalize_owner(owner_raw.as_str());
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    normalize_skill_slug(input)
 }
 
 fn parse_sidecar_meta(skill_dir: &Path) -> Result<ParsedSidecarMeta> {
@@ -773,29 +742,6 @@ fn fingerprint_for_content(content: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub fn qualified_skill_slug(owner: &str, slug: &str) -> String {
-    format!("{owner}/{slug}")
-}
-
-pub fn source_qualified_skill_slug(source_kind: &SkillSourceKind, qualified_slug: &str) -> String {
-    format!("{}:{qualified_slug}", source_kind.as_db_value())
-}
-
-pub fn split_qualified_skill_slug(value: &str) -> Option<(String, String)> {
-    let trimmed = value.trim();
-    let (owner, slug) = trimmed.split_once('/')?;
-    let owner = owner.trim();
-    let slug = slug.trim();
-    if owner.is_empty() || slug.is_empty() {
-        return None;
-    }
-    Some((owner.to_owned(), slug.to_owned()))
-}
-
-pub fn is_qualified_skill_slug(value: &str) -> bool {
-    split_qualified_skill_slug(value).is_some()
-}
-
 pub fn default_skill_conformance() -> SkillConformanceReport {
     SkillConformanceReport {
         agentskills_strict: ConformanceResult {
@@ -810,6 +756,7 @@ pub fn default_skill_conformance() -> SkillConformanceReport {
 }
 
 pub fn parse_skill_from_file(
+    skill_id: SkillId,
     skill_file: &Path,
     source_kind: SkillSourceKind,
     source_root: &Path,
@@ -857,7 +804,7 @@ pub fn parse_skill_from_file(
         .as_deref()
         .or(frontmatter.slug.as_deref())
         .unwrap_or(parent_directory_name.as_str());
-    let slug = normalize_slug(raw_slug);
+    let slug = normalize_skill_slug(raw_slug);
 
     if slug.is_empty() {
         bail!(
@@ -871,9 +818,7 @@ pub fn parse_skill_from_file(
         .as_deref()
         .or(frontmatter.owner.as_deref())
         .map(normalize_owner)
-        .filter(|value| !value.is_empty())
-        .or_else(|| owner_from_relative_path(skill_dir, source_root))
-        .unwrap_or_else(|| default_owner_for_source_kind(&source_kind).to_owned());
+        .filter(|value| !value.is_empty());
 
     let name = frontmatter
         .name
@@ -904,6 +849,7 @@ pub fn parse_skill_from_file(
     });
 
     let mut definition = compile_skill_definition(CompileSkillInput {
+        skill_id,
         owner,
         slug: slug.clone(),
         name: name.clone(),
@@ -944,14 +890,30 @@ pub fn parse_skill_from_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillSourceKind, parse_skill_from_file};
+    use super::{SkillDefinition, SkillSourceKind, parse_skill_from_file as parse_skill_with_id};
     use crate::compile::SkillImplicitInvocationPolicy;
     use crate::runtime::{
         DynamicDeltaOutputRequest, DynamicStorageOutputRequest, DynamicTimelineOutputRequest,
         SkillRuntimeToolKind,
     };
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+
+    fn parse_skill_from_file(
+        skill_file: &Path,
+        source_kind: SkillSourceKind,
+        source_root: &Path,
+        max_file_bytes: usize,
+    ) -> anyhow::Result<SkillDefinition> {
+        parse_skill_with_id(
+            pioneer_protocol::SkillId::new("EEEEEEEEEEEEEEEEEEEEE").expect("valid test skill id"),
+            skill_file,
+            source_kind,
+            source_root,
+            max_file_bytes,
+        )
+    }
 
     fn temp_case(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1157,11 +1119,11 @@ Instructions
     }
 
     #[test]
-    fn derives_slug_from_skill_directory_when_metadata_omits_slug() {
+    fn derives_and_normalizes_slug_from_skill_directory_when_metadata_omits_slug() {
         let dir = temp_case("directory-slug");
         let skill_file = write_skill(
             &dir,
-            "docx",
+            "Folder_Name",
             r#"---
 name: docx
 description: Word document helper
@@ -1178,8 +1140,10 @@ Use scripts under this skill.
         )
         .expect("skill parses");
 
-        assert_eq!(skill.identity.slug, "docx");
+        assert_eq!(skill.identity.slug, "folder-name");
         assert_eq!(skill.identity.name, "docx");
+        assert_eq!(skill.identity.owner, None);
+        assert_eq!(skill.identity.skill_id.as_str(), "EEEEEEEEEEEEEEEEEEEEE");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1567,6 +1531,8 @@ Body"#,
             skill_dir.join("SKILL.md"),
             r#"---
 name: Browser Helper
+owner: FrontmatterOwner
+slug: frontmatter-slug
 description: desc
 ---
 Body"#,
@@ -1585,6 +1551,9 @@ Body"#,
         )
         .expect("write sidecar");
 
+        let skill_bytes_before = fs::read(skill_dir.join("SKILL.md")).expect("read skill before");
+        let meta_bytes_before = fs::read(skill_dir.join("_meta.json")).expect("read meta before");
+
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
             SkillSourceKind::Registry,
@@ -1593,10 +1562,48 @@ Body"#,
         )
         .expect("skill parses");
 
-        assert_eq!(skill.identity.owner, "clawd");
+        assert_eq!(skill.identity.owner.as_deref(), Some("clawd"));
         assert_eq!(skill.identity.slug, "agent-browser");
         assert_eq!(skill.identity.version_hint.as_deref(), Some("0.2.0"));
         assert_eq!(skill.identity.display_name, "Browser Helper");
+        assert_eq!(
+            fs::read(skill_dir.join("SKILL.md")).expect("read skill after"),
+            skill_bytes_before
+        );
+        assert_eq!(
+            fs::read(skill_dir.join("_meta.json")).expect("read meta after"),
+            meta_bytes_before
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn frontmatter_slug_and_owner_override_folder_fallbacks() {
+        let dir = temp_case("frontmatter-identity-metadata");
+        let skill_file = write_skill(
+            &dir,
+            "Folder_Name",
+            r#"---
+name: Presentation Name
+owner: Explicit_Owner
+slug: Frontmatter_Slug
+description: desc
+---
+Body"#,
+        );
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            4 * 1024,
+        )
+        .expect("skill parses");
+
+        assert_eq!(skill.identity.owner.as_deref(), Some("explicit-owner"));
+        assert_eq!(skill.identity.slug, "frontmatter-slug");
+        assert_eq!(skill.identity.name, "Presentation Name");
 
         let _ = fs::remove_dir_all(dir);
     }

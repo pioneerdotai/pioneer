@@ -687,10 +687,9 @@ mod tests {
                 path: "/tmp/image.png".to_owned(),
             }],
             capabilities: vec![TurnCapability {
-                id: "skill:demo".to_owned(),
+                id: "skill:mvg02zVNGWuw5z5C4nYDo".to_owned(),
                 kind: TurnCapabilityKind::Skill {
-                    slug: "demo".to_owned(),
-                    source_kind: "workspace".to_owned(),
+                    skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
                 },
                 label: Some("Demo".to_owned()),
             }],

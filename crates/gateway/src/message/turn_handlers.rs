@@ -12,8 +12,10 @@ use pioneer_protocol::{
 
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
+    user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
     workspace_skill_policies:
         HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
+    skill_catalog: pioneer_skills::SkillCatalogSnapshot,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
@@ -24,6 +26,7 @@ pub(super) struct PreparedApiProviderTurnStart {
 
 struct PreparedCliRuntimeNativeTurnStart {
     outcome: crate::thread::TurnStartOutcome,
+    user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
     session_instance: crate::cli_runtime::session_instance::CliSessionInstanceId,
     cli_session: std::sync::Arc<dyn crate::cli_runtime::manager::CLIAgentRuntimeSession>,
     native_thread_id: String,
@@ -58,6 +61,50 @@ fn cli_runtime_execution_disabled_message() -> String {
 }
 
 impl MessageProcessor {
+    pub(super) async fn validate_turn_skill_capabilities(
+        &self,
+        workspace_id: &str,
+        capabilities: &[pioneer_protocol::TurnCapability],
+    ) -> Result<pioneer_skills::SkillCatalogSnapshot, String> {
+        let selected = capabilities
+            .iter()
+            .filter_map(|capability| match &capability.kind {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id } => {
+                    Some((capability, skill_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let context = self
+            .skills_runtime_context(workspace_id)
+            .map_err(|error| format!("failed to resolve skills runtime context: {error:#}"))?;
+        let catalog = self
+            .load_skills_catalog(workspace_id, &context)
+            .await
+            .map_err(|error| format!("failed to load skills catalog: {error:#}"))?;
+
+        for (capability, skill_id) in selected {
+            let expected_capability_id = format!("skill:{skill_id}");
+            if capability.id != expected_capability_id {
+                return Err(format!(
+                    "skill capability `{}` must use exact ID `{expected_capability_id}`",
+                    capability.id
+                ));
+            }
+            let Some(skill) = catalog
+                .skills
+                .iter()
+                .find(|skill| &skill.identity.skill_id == skill_id)
+            else {
+                return Err(format!("skill `{skill_id}` was not found"));
+            };
+            if !skill.is_available() {
+                return Err(format!("skill `{skill_id}` is unavailable"));
+            }
+        }
+        Ok(catalog)
+    }
+
     pub(super) fn turn_start<'a>(
         &'a self,
         connection_id: ConnectionId,
@@ -160,6 +207,7 @@ impl MessageProcessor {
                 connection_id,
                 request_id,
                 &prepared.outcome,
+                prepared.user_message_capability_attachments.as_slice(),
             ))
             .await;
             self.dispatch_prepared_api_provider_turn_start(prepared)
@@ -210,6 +258,36 @@ impl MessageProcessor {
                 .await;
             return Err(format!("failed to validate artifact input: {error:#}"));
         }
+        let skill_catalog = match self
+            .validate_turn_skill_capabilities(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(message) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(message);
+            }
+        };
+        let user_message_capability_attachments =
+            match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
+                outcome.materialization.capabilities.as_slice(),
+                &skill_catalog,
+            ) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(format!(
+                        "failed to snapshot selected skill presentation: {error:#}"
+                    ));
+                }
+            };
 
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
             Ok(event) => event,
@@ -293,7 +371,7 @@ impl MessageProcessor {
                 .into_iter()
                 .map(|record| {
                     (
-                        pioneer_skills::SkillPolicyKey::new(record.skill_slug, record.source_kind),
+                        pioneer_skills::SkillPolicyKey::new(record.skill_id),
                         pioneer_agent::WorkspaceSkillPolicy {
                             enabled: record.enabled,
                             allow_implicit_invocation: record.allow_implicit_invocation,
@@ -403,7 +481,9 @@ impl MessageProcessor {
 
         Ok(PreparedApiProviderTurnStart {
             outcome,
+            user_message_capability_attachments,
             workspace_skill_policies,
+            skill_catalog,
             resolved_artifacts,
             runtime_environment,
             history,
@@ -424,7 +504,11 @@ impl MessageProcessor {
                 Some(prepared.outcome.started_notification.workspace_id.clone()),
             )
             .await;
-        message_future(self.publish_turn_start_success(&prepared.outcome)).await;
+        message_future(self.publish_turn_start_success(
+            &prepared.outcome,
+            prepared.user_message_capability_attachments.as_slice(),
+        ))
+        .await;
     }
 
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
@@ -441,6 +525,7 @@ impl MessageProcessor {
                 &outcome.materialization.thread.model,
                 &outcome.materialization.thread.model_provider,
                 prepared.workspace_skill_policies,
+                prepared.skill_catalog,
                 outcome.materialization.input.clone(),
                 outcome.materialization.capabilities.clone(),
                 prepared.resolved_artifacts,
@@ -709,8 +794,8 @@ impl MessageProcessor {
                                 event = "cli_runtime_skill_preflight",
                                 runtime_id = runtime_id.as_str(),
                                 runtime_kind = ?runtime_kind,
-                                skill_slug = attachment.slug.as_str(),
-                                source_kind = attachment.claimed_source_kind.as_str(),
+                                skill_id = %attachment.skill_id,
+                                capability_id = attachment.capability_id.as_str(),
                                 result = "failed",
                                 failure_reason = failure_reason.as_str(),
                                 elapsed_ms = preflight_started.elapsed().as_millis(),
@@ -1076,6 +1161,35 @@ impl MessageProcessor {
                     return;
                 }
             };
+            if let Err(message) = self
+                .validate_turn_skill_capabilities(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                send_turn_start_failure!(message);
+                return;
+            }
+            let user_message_capability_attachments =
+                match super::agent_runtime::user_message_attachments_from_capabilities_and_bindings(
+                    outcome.materialization.capabilities.as_slice(),
+                    combined_preflight.skill_bindings.as_slice(),
+                ) {
+                    Ok(attachments) => attachments,
+                    Err(error) => {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                        send_turn_start_failure!(format!(
+                            "failed to snapshot selected skill presentation: {error:#}"
+                        ));
+                        return;
+                    }
+                };
             let effective_cli_runtime_effort = match self
                 .resolve_turn_reasoning_effort(
                     outcome.started_notification.workspace_id.as_str(),
@@ -1800,6 +1914,7 @@ impl MessageProcessor {
                 };
             let native_turn_start = PreparedCliRuntimeNativeTurnStart {
                 outcome,
+                user_message_capability_attachments,
                 session_instance: session_handle.instance().clone(),
                 cli_session,
                 native_thread_id,
@@ -1809,11 +1924,16 @@ impl MessageProcessor {
 
             let success_sent = match success_response {
                 TurnStartSuccessResponse::TurnStart => {
-                    message_future(self.finish_turn_start_success(
-                        connection_id,
-                        request_id,
-                        &native_turn_start.outcome,
-                    ))
+                    message_future(
+                        self.finish_turn_start_success(
+                            connection_id,
+                            request_id,
+                            &native_turn_start.outcome,
+                            native_turn_start
+                                .user_message_capability_attachments
+                                .as_slice(),
+                        ),
+                    )
                     .await
                 }
                 TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
@@ -1821,6 +1941,9 @@ impl MessageProcessor {
                         self.finish_voice_session_finalize_accepted_turn_start_success(
                             connection_id,
                             &native_turn_start.outcome,
+                            native_turn_start
+                                .user_message_capability_attachments
+                                .as_slice(),
                             &session_id,
                         ),
                     )
@@ -1849,6 +1972,7 @@ impl MessageProcessor {
     ) {
         let PreparedCliRuntimeNativeTurnStart {
             outcome,
+            user_message_capability_attachments: _,
             session_instance,
             cli_session,
             native_thread_id,
@@ -3071,6 +3195,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request_id: RequestId,
         outcome: &crate::thread::TurnStartOutcome,
+        user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
         self.session_manager
             .set_connection_workspace(
@@ -3101,13 +3226,17 @@ impl MessageProcessor {
             );
             return false;
         }
-        message_future(self.publish_turn_start_success(outcome)).await
+        message_future(
+            self.publish_turn_start_success(outcome, user_message_capability_attachments),
+        )
+        .await
     }
 
     async fn finish_voice_session_finalize_accepted_turn_start_success(
         &self,
         connection_id: ConnectionId,
         outcome: &crate::thread::TurnStartOutcome,
+        user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
         session_id: &str,
     ) -> bool {
         self.session_manager
@@ -3116,7 +3245,11 @@ impl MessageProcessor {
                 Some(outcome.started_notification.workspace_id.clone()),
             )
             .await;
-        if !message_future(self.publish_turn_start_success(outcome)).await {
+        if !message_future(
+            self.publish_turn_start_success(outcome, user_message_capability_attachments),
+        )
+        .await
+        {
             self.send_voice_session_result_notification(
                 connection_id,
                 VoiceSessionResultNotification {
@@ -3145,7 +3278,11 @@ impl MessageProcessor {
         true
     }
 
-    async fn publish_turn_start_success(&self, outcome: &crate::thread::TurnStartOutcome) -> bool {
+    async fn publish_turn_start_success(
+        &self,
+        outcome: &crate::thread::TurnStartOutcome,
+        user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
+    ) -> bool {
         let notification = match JsonRpcNotification::from_params(
             events::TURN_STARTED,
             &outcome.started_notification,
@@ -3183,7 +3320,7 @@ impl MessageProcessor {
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.input.as_slice(),
-            outcome.materialization.capabilities.as_slice(),
+            user_message_capability_attachments,
         ))
         .await;
 

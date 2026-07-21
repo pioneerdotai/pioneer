@@ -90,6 +90,14 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    fn empty_skill_catalog() -> pioneer_skills::SkillCatalogSnapshot {
+        pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        }
+    }
+
     #[test]
     fn recovery_adjustments_preserve_turn_request_inputs() {
         let mut turn_request = ActiveTurnRequest {
@@ -102,6 +110,7 @@ mod tests {
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
+            skill_catalog: empty_skill_catalog(),
             input: vec![UserInput::Text {
                 text: "retry".to_owned(),
                 text_elements: Vec::new(),
@@ -167,6 +176,7 @@ mod tests {
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
+            skill_catalog: empty_skill_catalog(),
             input: vec![UserInput::Text {
                 text: "continue".to_owned(),
                 text_elements: Vec::new(),
@@ -288,6 +298,7 @@ mod tests {
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
+            skill_catalog: empty_skill_catalog(),
             input: vec![
                 UserInput::Text {
                     text: "describe this".to_owned(),
@@ -302,10 +313,10 @@ mod tests {
             ],
             capabilities: vec![
                 TurnCapability {
-                    id: "skill:workspace:docs".to_owned(),
+                    id: "skill:RRRRRRRRRRRRRRRRRRRRR".to_owned(),
                     kind: TurnCapabilityKind::Skill {
-                        slug: "docs".to_owned(),
-                        source_kind: "workspace".to_owned(),
+                        skill_id: pioneer_protocol::SkillId::new("RRRRRRRRRRRRRRRRRRRRR")
+                            .expect("valid recovery fixture SkillId"),
                     },
                     label: None,
                 },

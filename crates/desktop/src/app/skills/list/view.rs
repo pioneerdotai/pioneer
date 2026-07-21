@@ -255,13 +255,9 @@ impl PioneerDesktop {
                         visible_range
                             .filter_map(|ix| {
                                 installed_skills.get(ix).map(|skill| {
-                                    let is_pending = view.is_skill_pending(
-                                        skill.slug.as_str(),
-                                        skill.source_kind.as_str(),
-                                    );
+                                    let is_pending = view.is_skill_pending(&skill.skill_id);
 
                                     Self::render_installed_skill_row(
-                                        ix,
                                         skill,
                                         is_pending,
                                         desktop_entity.clone(),
@@ -288,7 +284,6 @@ impl PioneerDesktop {
     }
 
     fn render_installed_skill_row(
-        index: usize,
         skill: &SkillListItem,
         is_pending: bool,
         desktop_entity: Entity<Self>,
@@ -301,18 +296,20 @@ impl PioneerDesktop {
         let version_label = summary.version.as_deref().unwrap_or("-");
 
         v_flex()
-            .id(("installed-skill-row", index))
+            .id(SharedString::from(format!(
+                "installed-skill-row:{}",
+                skill.skill_id
+            )))
             .w_full()
             .h(px(INSTALLED_SKILL_ROW_HEIGHT))
             .pb(px(INSTALLED_SKILL_ROW_GAP))
             .cursor_pointer()
             .on_click({
                 let desktop_entity = desktop_entity.clone();
-                let slug = skill.slug.clone();
-                let source_kind = skill.source_kind.clone();
+                let skill_id = skill.skill_id.clone();
                 move |_, _, cx| {
                     let _ = desktop_entity.update(cx, |view, cx| {
-                        view.open_skill_from_sidebar(slug.clone(), source_kind.clone(), cx);
+                        view.open_skill_from_sidebar(skill_id.clone(), cx);
                         cx.notify();
                     });
                 }
@@ -357,7 +354,7 @@ impl PioneerDesktop {
                                                         .flex_none()
                                                         .text_sm()
                                                         .opacity(0.6)
-                                                        .child(format!("@{}", owner.to_owned())),
+                                                        .child(owner.to_owned()),
                                                 )
                                                 .child(
                                                     div()
@@ -375,7 +372,7 @@ impl PioneerDesktop {
                                                     .overflow_hidden()
                                                     .whitespace_nowrap()
                                                     .text_ellipsis()
-                                                    .child(skill.display_name.clone()),
+                                                    .child(skill.slug.clone()),
                                             ),
                                     ),
                             )

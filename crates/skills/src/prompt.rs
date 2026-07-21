@@ -1,5 +1,5 @@
+use crate::compact_skill_label;
 use crate::resolver::{ResolvedSkill, SkillResolvedReason};
-use crate::source_qualified_skill_slug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPromptBuild {
@@ -16,36 +16,72 @@ pub struct SkillPromptBudget {
 }
 
 fn compact_skill_block(skill: &ResolvedSkill) -> String {
-    let read_skill_slug =
-        source_qualified_skill_slug(&skill.definition.identity.source_kind, skill.slug.as_str());
+    let label = compact_skill_label(
+        skill.definition.identity.owner.as_deref(),
+        skill.definition.identity.slug.as_str(),
+    );
+    let machine_ref = format!("skill:{}", skill.skill_id);
     format!(
-        "- {}\n  Skill slug for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
+        "- {} ({})\n  Exact skill reference for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
         skill.definition.identity.display_name,
-        read_skill_slug,
+        label,
+        machine_ref,
         skill.definition.identity.skill_dir,
         skill.definition.instructions.description,
     )
 }
 
 fn full_skill_block(skill: &ResolvedSkill) -> String {
-    let read_skill_slug =
-        source_qualified_skill_slug(&skill.definition.identity.source_kind, skill.slug.as_str());
+    let machine_ref = format!("skill:{}", skill.skill_id);
     format!(
         "\nSkill asset root for ${}: `{}`\nResolve relative paths mentioned by this skill under Skill asset root. Prefer absolute paths built from Skill asset root for commands and file operations.\n[Skill Body: ${}]\n{}\n",
-        read_skill_slug,
+        machine_ref,
         skill.definition.identity.skill_dir,
-        read_skill_slug,
+        machine_ref,
         skill.definition.instructions.body
     )
 }
 
+fn internal_skill_reference_block(skills: &[&ResolvedSkill]) -> String {
+    let mut skills = skills.to_vec();
+    skills.sort_by(|left, right| {
+        let left_label = compact_skill_label(
+            left.definition.identity.owner.as_deref(),
+            left.definition.identity.slug.as_str(),
+        );
+        let right_label = compact_skill_label(
+            right.definition.identity.owner.as_deref(),
+            right.definition.identity.slug.as_str(),
+        );
+        left_label
+            .cmp(&right_label)
+            .then_with(|| left.skill_id.cmp(&right.skill_id))
+    });
+
+    let mut block = String::from(
+        "[Internal Skill References]\nUse these exact references when a system policy names a catalog-hidden skill:\n",
+    );
+    for skill in skills {
+        let label = compact_skill_label(
+            skill.definition.identity.owner.as_deref(),
+            skill.definition.identity.slug.as_str(),
+        );
+        block.push_str(format!("- {label}: `skill:{}`\n", skill.skill_id).as_str());
+    }
+    block
+}
+
 pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -> SkillPromptBuild {
+    let hidden_skills = active
+        .iter()
+        .filter(|skill| skill.definition.policy_hints.catalog_hidden)
+        .collect::<Vec<_>>();
     let catalog_skills = active
         .iter()
         .filter(|skill| !skill.definition.policy_hints.catalog_hidden)
         .collect::<Vec<_>>();
 
-    if catalog_skills.is_empty() {
+    if catalog_skills.is_empty() && hidden_skills.is_empty() {
         return SkillPromptBuild {
             text: String::new(),
             omitted_slugs: Vec::new(),
@@ -55,11 +91,37 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
 
     let max_chars = budget.max_chars.max(1);
     let compact_mode_threshold = budget.compact_mode_threshold;
-
-    let mut text = String::from("[Skills]\nThe following skills are available for this turn:\n");
+    let mut text = String::new();
     let mut omitted_slugs = std::collections::BTreeSet::new();
 
-    for skill in catalog_skills.iter().copied() {
+    if !hidden_skills.is_empty() {
+        let block = internal_skill_reference_block(hidden_skills.as_slice());
+        if block.len() <= max_chars {
+            text.push_str(block.as_str());
+        } else {
+            omitted_slugs.extend(hidden_skills.iter().map(|skill| skill.slug.clone()));
+        }
+    }
+
+    let mut catalog_header_added = false;
+    if !catalog_skills.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let header = "[Skills]\nThe following skills are available for this turn:\n";
+        if text.len() + header.len() <= max_chars {
+            text.push_str(header);
+            catalog_header_added = true;
+        } else {
+            omitted_slugs.extend(catalog_skills.iter().map(|skill| skill.slug.clone()));
+        }
+    }
+
+    for skill in catalog_skills
+        .iter()
+        .copied()
+        .filter(|_| catalog_header_added)
+    {
         let block = compact_skill_block(skill);
         if text.len() + block.len() > max_chars {
             omitted_slugs.insert(skill.slug.clone());
@@ -68,7 +130,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         text.push_str(block.as_str());
     }
 
-    let can_expand_full = catalog_skills.len() <= compact_mode_threshold;
+    let can_expand_full = catalog_header_added && catalog_skills.len() <= compact_mode_threshold;
 
     if can_expand_full {
         let mut full_body_candidates = catalog_skills
@@ -93,8 +155,8 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         }
     }
 
-    if text.len() < max_chars {
-        let footer = "\nWhen a skill is relevant, call `read_skill` with the exact `Skill slug for read_skill` value before executing specialized actions. Do not use the display name alone. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
+    if catalog_header_added && text.len() < max_chars {
+        let footer = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
         if text.len() + footer.len() <= max_chars {
             text.push_str(footer);
         }
@@ -109,7 +171,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         }
 
         if budget.include_read_skill_hint {
-            let hint = "\nUse `read_skill` with the exact `Skill slug for read_skill` value, not the display name.";
+            let hint = "\nUse `read_skill` with the exact `skill:<skill_id>` reference, not the readable label.";
             if text.len() + hint.len() <= max_chars {
                 text.push_str(hint);
             } else if hint.len() < max_chars {
@@ -138,6 +200,7 @@ mod tests {
         SkillDependencies, SkillSourceKind, SkillTrustLevel, default_skill_conformance,
     };
     use crate::resolver::{ResolvedSkill, SkillResolvedReason};
+    use pioneer_protocol::SkillId;
     use serde_json::json;
 
     fn resolved(slug: &str, description: &str) -> ResolvedSkill {
@@ -159,9 +222,11 @@ mod tests {
         source_kind: SkillSourceKind,
     ) -> ResolvedSkill {
         let owner = "workspace";
+        let skill_id = test_skill_id(slug, source_kind);
         let conformance = default_skill_conformance();
         let definition = compile_skill_definition(CompileSkillInput {
-            owner: owner.to_owned(),
+            skill_id: skill_id.clone(),
+            owner: Some(owner.to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: slug.to_owned(),
@@ -187,10 +252,29 @@ mod tests {
         });
 
         ResolvedSkill {
-            slug: format!("{owner}/{slug}"),
+            skill_id,
+            slug: slug.to_owned(),
             reason,
             definition,
         }
+    }
+
+    fn test_skill_id(value: &str, source_kind: SkillSourceKind) -> SkillId {
+        let suffix = match source_kind {
+            SkillSourceKind::System => 'S',
+            SkillSourceKind::User => 'U',
+            SkillSourceKind::Registry => 'R',
+        };
+        let mut value = value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(20);
+        while value.len() < 20 {
+            value.push(suffix);
+        }
+        value.push(suffix);
+        SkillId::new(value).unwrap()
     }
 
     #[test]
@@ -248,11 +332,11 @@ mod tests {
 
         assert!(built.truncated);
         assert!(built.text.contains("Use `read_skill`"));
-        assert!(!built.text.contains("[Skill Body: $user:workspace/one]"));
+        assert!(!built.text.contains("[Skill Body:"));
     }
 
     #[test]
-    fn compact_prompt_uses_exact_read_skill_slug_and_asset_root() {
+    fn compact_prompt_uses_exact_read_skill_id_and_asset_root() {
         let active = vec![resolved("weather", "Get weather forecasts.")];
 
         let built = build_skill_prompt(
@@ -264,15 +348,15 @@ mod tests {
             },
         );
 
+        assert!(built.text.contains(&format!(
+            "Exact skill reference for read_skill: `skill:{}`",
+            active[0].skill_id
+        )));
+        assert!(built.text.contains("workspace/weather"));
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `user:workspace/weather`")
-        );
-        assert!(
-            built
-                .text
-                .contains("call `read_skill` with the exact `Skill slug for read_skill` value")
+                .contains("call `read_skill` with its exact `skill:<skill_id>` reference")
         );
         assert!(
             built
@@ -317,9 +401,9 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `user:workspace/weather`")
+                .contains(&format!("skill:{}", active[0].skill_id))
         );
-        assert!(!built.text.contains("[Skill Body: $user:workspace/weather]"));
+        assert!(!built.text.contains("[Skill Body:"));
         assert!(!built.text.contains("\nbody\n"));
     }
 
@@ -340,12 +424,15 @@ mod tests {
             },
         );
 
-        assert!(built.text.contains("[Skill Body: $user:workspace/weather]"));
         assert!(
             built
                 .text
-                .contains("Skill asset root for $user:workspace/weather: `/tmp/weather`")
+                .contains(&format!("[Skill Body: $skill:{}]", active[0].skill_id))
         );
+        assert!(built.text.contains(&format!(
+            "Skill asset root for $skill:{}: `/tmp/weather`",
+            active[0].skill_id
+        )));
         assert!(
             built
                 .text
@@ -355,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn same_qualified_slug_across_sources_gets_distinct_read_skill_slugs() {
+    fn same_readable_label_gets_distinct_exact_skill_references() {
         let active = vec![
             resolved_with_reason_and_source(
                 "browser",
@@ -383,19 +470,20 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `system:workspace/browser`")
+                .contains(&format!("skill:{}", active[0].skill_id))
         );
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `user:workspace/browser`")
+                .contains(&format!("skill:{}", active[1].skill_id))
         );
     }
 
     #[test]
-    fn catalog_hidden_skill_is_omitted_from_prompt_without_truncation() {
+    fn catalog_hidden_skill_is_omitted_from_public_catalog_but_keeps_exact_internal_reference() {
         let mut hidden = resolved("hidden", "Hidden from prompt catalog.");
         hidden.definition.policy_hints.catalog_hidden = true;
+        let hidden_id = hidden.skill_id.clone();
         let visible = resolved("visible", "Visible in prompt catalog.");
 
         let built = build_skill_prompt(
@@ -409,8 +497,10 @@ mod tests {
 
         assert!(!built.truncated);
         assert!(built.omitted_slugs.is_empty());
-        assert!(built.text.contains("user:workspace/visible"));
-        assert!(!built.text.contains("user:workspace/hidden"));
+        assert!(built.text.contains("workspace/visible"));
+        assert!(built.text.contains("[Internal Skill References]"));
+        assert!(built.text.contains(&format!("skill:{hidden_id}")));
+        assert!(!built.text.contains("- hidden (workspace/hidden)"));
         assert!(!built.text.contains("Hidden from prompt catalog."));
     }
 
@@ -422,6 +512,7 @@ mod tests {
             SkillResolvedReason::PathMatch,
         );
         hidden.definition.policy_hints.catalog_hidden = true;
+        let hidden_id = hidden.skill_id.clone();
 
         let built = build_skill_prompt(
             &[hidden],
@@ -432,7 +523,9 @@ mod tests {
             },
         );
 
-        assert_eq!(built.text, "");
+        assert!(built.text.contains("[Internal Skill References]"));
+        assert!(built.text.contains(&format!("skill:{hidden_id}")));
+        assert!(!built.text.contains("Hidden from prompt catalog."));
         assert!(!built.truncated);
         assert!(built.omitted_slugs.is_empty());
     }

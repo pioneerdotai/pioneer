@@ -6,8 +6,8 @@ use pioneer_agent::{
 use pioneer_crud::{NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
 use pioneer_protocol::ReasoningEffort;
 use pioneer_protocol::{
-    ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot, TurnPermissionProfileSnapshot,
-    UserInput,
+    SkillId, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
+    TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, ReasoningConfig};
 use pioneer_skills::SkillPolicyKey;
@@ -16,8 +16,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredWorkspaceSkillPolicy {
-    slug: String,
-    source_kind: String,
+    skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +87,11 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
         workspace_skill_policies: restore_workspace_skill_policies(
             &snapshot.workspace_skill_policies_json,
         )?,
+        skill_catalog: pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
         input: from_snapshot_json(&snapshot.input_json, "turn input")?,
         capabilities: from_snapshot_json(&snapshot.capabilities_json, "turn capabilities")?,
         resolved_artifacts: from_snapshot_json(
@@ -116,17 +120,12 @@ fn stored_workspace_skill_policies(
     let mut stored = policies
         .iter()
         .map(|(key, policy)| StoredWorkspaceSkillPolicy {
-            slug: key.slug.clone(),
-            source_kind: key.source_kind.clone(),
+            skill_id: key.skill_id.clone(),
             enabled: policy.enabled,
             allow_implicit_invocation: policy.allow_implicit_invocation,
         })
         .collect::<Vec<_>>();
-    stored.sort_by(|left, right| {
-        left.source_kind
-            .cmp(&right.source_kind)
-            .then_with(|| left.slug.cmp(&right.slug))
-    });
+    stored.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
     stored
 }
 
@@ -139,7 +138,7 @@ fn restore_workspace_skill_policies(
         .into_iter()
         .map(|policy| {
             (
-                SkillPolicyKey::new(policy.slug, policy.source_kind),
+                SkillPolicyKey::new(policy.skill_id),
                 WorkspaceSkillPolicy {
                     enabled: policy.enabled,
                     allow_implicit_invocation: policy.allow_implicit_invocation,

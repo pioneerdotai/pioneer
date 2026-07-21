@@ -756,6 +756,7 @@ mod tests {
         ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadCapabilities,
         ArtifactUploadChunkAckNotification, ArtifactUploadFinishParams,
         ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+        SkillId,
     };
     use std::sync::Mutex;
 
@@ -1099,10 +1100,13 @@ mod tests {
     #[test]
     fn voice_snapshot_freezes_attachment_capability_and_turn_context() {
         let artifact = artifact_ref("art_a");
+        let skill_id = SkillId::new("V".repeat(21)).expect("valid skill id");
         let capability = ComposerCapability {
-            id: "skill_cap".to_owned(),
+            id: pioneer_protocol::skill_capability_key(&skill_id),
             label: "Skill Cap".to_owned(),
             kind: ComposerCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+                owner: Some("pioneer".to_owned()),
                 slug: "skill-a".to_owned(),
                 source_kind: "workspace".to_owned(),
             },
@@ -1132,6 +1136,15 @@ mod tests {
         assert_eq!(snapshot.context.model_provider.as_deref(), Some("openai"));
         assert!(snapshot.context.permission_profile.is_some());
         assert_eq!(snapshot.context.capabilities.len(), 1);
+        assert_eq!(
+            snapshot.context.capabilities[0].id,
+            pioneer_protocol::skill_capability_key(&skill_id)
+        );
+        assert!(matches!(
+            snapshot.context.capabilities[0].kind,
+            pioneer_protocol::TurnCapabilityKind::Skill { skill_id: ref actual }
+                if actual == &skill_id
+        ));
         assert!(matches!(
             snapshot.context.prepared_input[0],
             UserInput::Artifact {

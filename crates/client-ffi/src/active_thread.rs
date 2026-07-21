@@ -1789,11 +1789,23 @@ mod tests {
     use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
     use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_protocol::{
-        CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
+        CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, SkillId,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
         TurnPermissionApprovalRequest, TurnStatus,
     };
     use serde_json::json;
+
+    fn skill_id(seed: &str) -> SkillId {
+        let mut value = seed
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(21)
+            .collect::<String>();
+        while value.len() < 21 {
+            value.push('X');
+        }
+        SkillId::new(value).expect("test skill id")
+    }
 
     fn thread(thread_id: &str, workspace_id: &str) -> Thread {
         Thread {
@@ -1877,10 +1889,13 @@ mod tests {
     }
 
     fn capability(slug: &str, source_kind: &str) -> ComposerCapability {
+        let skill_id = skill_id(format!("{source_kind}{slug}").as_str());
         ComposerCapability {
-            id: format!("skill:{source_kind}:{slug}"),
+            id: pioneer_protocol::skill_capability_key(&skill_id),
             label: slug.to_owned(),
             kind: pioneer_client::composer::capabilities::ComposerCapabilityKind::Skill {
+                skill_id,
+                owner: None,
                 slug: slug.to_owned(),
                 source_kind: source_kind.to_owned(),
             },
@@ -1945,13 +1960,10 @@ mod tests {
                 ),
             ),
         ];
-        let expected_ids = vec![
-            "skill:user:user",
-            "mcp-server:workspace:docs",
-            "skill:registry:registry",
-            "skill:system:browser",
-            "mcp-tool:workspace:docs:search",
-        ];
+        let expected_ids = [0, 1, 2, 3, 5]
+            .into_iter()
+            .map(|index| capabilities[index].id.clone())
+            .collect::<Vec<_>>();
 
         for (case, runtime) in cases {
             let provider = format!("cli_runtime:{}", runtime.runtime_id);
@@ -1977,16 +1989,13 @@ mod tests {
                 assert_eq!(
                     plan.capabilities
                         .iter()
-                        .map(|capability| capability.id.as_str())
+                        .map(|capability| capability.id.clone())
                         .collect::<Vec<_>>(),
-                    expected_ids,
+                    expected_ids.clone(),
                     "{case}"
                 );
                 assert_eq!(plan.removed.len(), 1, "{case}");
-                assert_eq!(
-                    plan.removed[0].capability.id, "skill:future:unknown",
-                    "{case}"
-                );
+                assert_eq!(plan.removed[0].capability.id, capabilities[4].id, "{case}");
             }
             assert_eq!(text_plan.capabilities, voice_plan.capabilities, "{case}");
             assert_eq!(text_plan.removed, voice_plan.removed, "{case}");
@@ -2021,15 +2030,9 @@ mod tests {
             stale_plan
                 .capabilities
                 .iter()
-                .map(|capability| capability.id.as_str())
+                .map(|capability| capability.id.clone())
                 .collect::<Vec<_>>(),
-            vec![
-                "skill:user:user",
-                "mcp-server:workspace:docs",
-                "skill:registry:registry",
-                "skill:system:browser",
-                "mcp-tool:workspace:docs:search",
-            ]
+            expected_ids
         );
         assert_eq!(
             stale_plan

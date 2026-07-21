@@ -2,7 +2,7 @@
 
 use super::catalog;
 use pioneer_protocol::{
-    SkillLifecycleSource, SkillListItem, SkillsInstallParams, SkillsPolicySetParams,
+    SkillId, SkillLifecycleSource, SkillListItem, SkillsInstallParams, SkillsPolicySetParams,
     SkillsUninstallParams, SkillsUpdateParams,
 };
 
@@ -57,29 +57,23 @@ pub fn plan_skill_action_scope(
 pub fn skill_lifecycle_editable(
     installed: &[SkillListItem],
     catalog: &[SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
 ) -> Option<bool> {
-    find_skill_in_installed_or_catalog(installed, catalog, slug, source_kind)
+    find_skill_in_installed_or_catalog(installed, catalog, skill_id)
         .map(|skill| skill.install.lifecycle_editable)
 }
 
 pub fn skill_policy_implicit_editable(
     installed: &[SkillListItem],
     catalog: &[SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
 ) -> Option<bool> {
-    find_skill_in_installed_or_catalog(installed, catalog, slug, source_kind)
+    find_skill_in_installed_or_catalog(installed, catalog, skill_id)
         .map(|skill| skill.policy.allow_implicit_invocation_editable)
 }
 
-pub fn skill_policy_values(
-    catalog: &[SkillListItem],
-    slug: &str,
-    source_kind: &str,
-) -> Option<(bool, bool)> {
-    catalog::find_skill(catalog, slug, source_kind)
+pub fn skill_policy_values(catalog: &[SkillListItem], skill_id: &SkillId) -> Option<(bool, bool)> {
+    catalog::find_skill(catalog, skill_id)
         .map(|skill| (skill.policy.enabled, skill.policy.allow_implicit_invocation))
 }
 
@@ -97,25 +91,12 @@ pub fn effective_allow_implicit_invocation(
 pub fn apply_local_skill_policy(
     catalog: &mut [SkillListItem],
     installed: &mut [SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
     enabled: bool,
     allow_implicit_invocation: bool,
 ) {
-    apply_local_skill_policy_to_slice(
-        catalog,
-        slug,
-        source_kind,
-        enabled,
-        allow_implicit_invocation,
-    );
-    apply_local_skill_policy_to_slice(
-        installed,
-        slug,
-        source_kind,
-        enabled,
-        allow_implicit_invocation,
-    );
+    apply_local_skill_policy_to_slice(catalog, skill_id, enabled, allow_implicit_invocation);
+    apply_local_skill_policy_to_slice(installed, skill_id, enabled, allow_implicit_invocation);
 }
 
 pub fn skills_install_uploaded_archive_params(
@@ -133,15 +114,13 @@ pub fn skills_install_uploaded_archive_params(
 
 pub fn skills_update_uploaded_archive_params(
     workspace_id: impl Into<String>,
-    slug: impl Into<String>,
-    source_kind: impl Into<String>,
+    skill_id: SkillId,
     upload_id: impl Into<String>,
     expected_previous_fingerprint: Option<String>,
 ) -> SkillsUpdateParams {
     SkillsUpdateParams {
         workspace_id: workspace_id.into(),
-        slug: slug.into(),
-        source_kind: source_kind.into(),
+        skill_id,
         source: SkillLifecycleSource::UploadedArchive {
             upload_id: upload_id.into(),
         },
@@ -151,27 +130,23 @@ pub fn skills_update_uploaded_archive_params(
 
 pub fn skills_uninstall_params(
     workspace_id: impl Into<String>,
-    slug: impl Into<String>,
-    source_kind: impl Into<String>,
+    skill_id: SkillId,
 ) -> SkillsUninstallParams {
     SkillsUninstallParams {
         workspace_id: workspace_id.into(),
-        slug: slug.into(),
-        source_kind: source_kind.into(),
+        skill_id,
     }
 }
 
 pub fn skills_policy_set_params(
     workspace_id: impl Into<String>,
-    slug: impl Into<String>,
-    source_kind: impl Into<String>,
+    skill_id: SkillId,
     enabled: bool,
     allow_implicit_invocation: bool,
 ) -> SkillsPolicySetParams {
     SkillsPolicySetParams {
         workspace_id: workspace_id.into(),
-        skill_slug: slug.into(),
-        source_kind: source_kind.into(),
+        skill_id,
         enabled: Some(enabled),
         allow_implicit_invocation: Some(allow_implicit_invocation),
     }
@@ -186,16 +161,12 @@ pub fn skill_action_matches_connection(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillActionTarget {
-    pub slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
 }
 
 impl SkillActionTarget {
-    pub fn new(slug: impl Into<String>, source_kind: impl Into<String>) -> Self {
-        Self {
-            slug: slug.into(),
-            source_kind: source_kind.into(),
-        }
+    pub fn new(skill_id: SkillId) -> Self {
+        Self { skill_id }
     }
 }
 
@@ -291,22 +262,19 @@ fn available_connection_id(gateway_connected: bool, connection_id: Option<u64>) 
 fn find_skill_in_installed_or_catalog<'a>(
     installed: &'a [SkillListItem],
     catalog: &'a [SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
 ) -> Option<&'a SkillListItem> {
-    catalog::find_skill(installed, slug, source_kind)
-        .or_else(|| catalog::find_skill(catalog, slug, source_kind))
+    catalog::find_skill(installed, skill_id).or_else(|| catalog::find_skill(catalog, skill_id))
 }
 
 fn apply_local_skill_policy_to_slice(
     skills: &mut [SkillListItem],
-    slug: &str,
-    source_kind: &str,
+    skill_id: &SkillId,
     enabled: bool,
     allow_implicit_invocation: bool,
 ) {
     for skill in skills {
-        if skill.slug == slug && skill.source_kind == source_kind {
+        if &skill.skill_id == skill_id {
             let allow_implicit_invocation = if skill.policy.allow_implicit_invocation_editable {
                 allow_implicit_invocation
             } else {
@@ -332,6 +300,11 @@ mod tests {
     use super::*;
     use pioneer_protocol::{SkillHealthSummary, SkillInstallState, SkillPolicyState};
 
+    fn test_id(slug: &str, source_kind: &str) -> SkillId {
+        let seed = format!("{slug}{source_kind}");
+        SkillId::new(seed.chars().cycle().take(21).collect::<String>()).unwrap()
+    }
+
     fn skill(
         slug: &str,
         source_kind: &str,
@@ -340,6 +313,8 @@ mod tests {
         health_status: &str,
     ) -> SkillListItem {
         SkillListItem {
+            skill_id: test_id(slug, source_kind),
+            owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),
             display_name: slug.to_owned(),
@@ -380,19 +355,18 @@ mod tests {
 
         let installed = vec![skill("alpha", "user", false, true, "ok")];
         let catalog = vec![skill("beta", "registry", true, false, "ok")];
+        let alpha_id = test_id("alpha", "user");
+        let beta_id = test_id("beta", "registry");
 
         assert_eq!(
-            skill_lifecycle_editable(&installed, &catalog, "alpha", "user"),
+            skill_lifecycle_editable(&installed, &catalog, &alpha_id),
             Some(false)
         );
         assert_eq!(
-            skill_policy_implicit_editable(&installed, &catalog, "beta", "registry"),
+            skill_policy_implicit_editable(&installed, &catalog, &beta_id),
             Some(false)
         );
-        assert_eq!(
-            skill_policy_values(&catalog, "beta", "registry"),
-            Some((true, false))
-        );
+        assert_eq!(skill_policy_values(&catalog, &beta_id), Some((true, false)));
         assert!(effective_allow_implicit_invocation(false, Some(true)) == false);
         assert!(effective_allow_implicit_invocation(false, Some(false)));
     }
@@ -437,7 +411,7 @@ mod tests {
 
     #[test]
     fn skill_action_finish_reducer_projects_update_failure() {
-        let target = SkillActionTarget::new("alpha", "user");
+        let target = SkillActionTarget::new(test_id("alpha", "user"));
         let reduction = reduce_skill_action_finish(
             SkillActionFinishKind::Update(target.clone()),
             SkillActionFinishOutcome::Failure {
@@ -461,7 +435,7 @@ mod tests {
 
     #[test]
     fn skill_action_finish_reducer_requests_policy_rollback_on_failure() {
-        let target = SkillActionTarget::new("alpha", "user");
+        let target = SkillActionTarget::new(test_id("alpha", "user"));
         let reduction = reduce_skill_action_finish(
             SkillActionFinishKind::Policy(target),
             SkillActionFinishOutcome::Failure {
@@ -480,17 +454,37 @@ mod tests {
     fn local_policy_projection_updates_catalog_and_installed() {
         let mut catalog = vec![skill("alpha", "user", true, false, "blocked")];
         let mut installed = vec![skill("alpha", "user", true, true, "ok")];
+        let alpha_id = test_id("alpha", "user");
 
-        apply_local_skill_policy(&mut catalog, &mut installed, "alpha", "user", true, false);
+        apply_local_skill_policy(&mut catalog, &mut installed, &alpha_id, true, false);
 
         assert!(catalog[0].policy.allow_implicit_invocation);
         assert_eq!(catalog[0].status, "blocked");
         assert!(!installed[0].policy.allow_implicit_invocation);
         assert_eq!(installed[0].status, "active");
 
-        apply_local_skill_policy(&mut catalog, &mut installed, "alpha", "user", false, true);
+        apply_local_skill_policy(&mut catalog, &mut installed, &alpha_id, false, true);
         assert_eq!(catalog[0].status, "disabled");
         assert_eq!(installed[0].status, "disabled");
+    }
+
+    #[test]
+    fn duplicate_labels_are_independently_actionable_by_id() {
+        let mut first = skill("humanizer", "user", true, true, "ok");
+        first.skill_id = SkillId::new("A".repeat(21)).unwrap();
+        first.owner = Some("alex".to_owned());
+        let mut second = first.clone();
+        second.skill_id = SkillId::new("B".repeat(21)).unwrap();
+        let mut catalog = vec![first.clone(), second.clone()];
+        let mut installed = catalog.clone();
+
+        apply_local_skill_policy(&mut catalog, &mut installed, &first.skill_id, false, false);
+
+        assert_eq!(catalog[0].status, "disabled");
+        assert_eq!(installed[0].status, "disabled");
+        assert_eq!(catalog[1].status, "active");
+        assert_eq!(installed[1].status, "active");
+        assert_eq!(catalog[0].slug, catalog[1].slug);
     }
 
     #[test]
@@ -503,26 +497,24 @@ mod tests {
             SkillLifecycleSource::UploadedArchive { ref upload_id } if upload_id == "upload"
         ));
 
+        let alpha_id = test_id("alpha", "user");
         let update = skills_update_uploaded_archive_params(
             "workspace",
-            "alpha",
-            "user",
+            alpha_id.clone(),
             "upload",
             Some("fingerprint".to_owned()),
         );
-        assert_eq!(update.slug, "alpha");
-        assert_eq!(update.source_kind, "user");
+        assert_eq!(update.skill_id, alpha_id);
         assert_eq!(
             update.expected_previous_fingerprint.as_deref(),
             Some("fingerprint")
         );
 
-        let uninstall = skills_uninstall_params("workspace", "alpha", "user");
-        assert_eq!(uninstall.slug, "alpha");
-        assert_eq!(uninstall.source_kind, "user");
+        let uninstall = skills_uninstall_params("workspace", alpha_id.clone());
+        assert_eq!(uninstall.skill_id, alpha_id);
 
-        let policy = skills_policy_set_params("workspace", "alpha", "user", true, false);
-        assert_eq!(policy.skill_slug, "alpha");
+        let policy = skills_policy_set_params("workspace", alpha_id.clone(), true, false);
+        assert_eq!(policy.skill_id, alpha_id);
         assert_eq!(policy.enabled, Some(true));
         assert_eq!(policy.allow_implicit_invocation, Some(false));
     }

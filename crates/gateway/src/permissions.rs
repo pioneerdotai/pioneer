@@ -118,6 +118,7 @@ fn permission_request_details(
         ("tool", "MCP tool", true),
         ("mcp_safety", "MCP safety", false),
         ("dynamic_skill_kind", "Dynamic skill kind", false),
+        ("skill_id", "Skill ID", true),
         ("skill_slug", "Skill", true),
         ("source_kind", "Skill source", false),
         ("trust_level", "Skill trust", false),

@@ -1,17 +1,51 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ClientComposerSkillCapabilityFromRowRequest",
+  "title": "ClientComposerSkillRowsForTargetRequest",
   "type": "object",
   "properties": {
-    "row": {
-      "$ref": "#/$defs/SelectableSkillCapability"
+    "rows": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SelectableSkillCapability"
+      }
+    },
+    "target": {
+      "$ref": "#/$defs/ComposerCapabilityTarget"
     }
   },
   "additionalProperties": false,
   "required": [
-    "row"
+    "target"
   ],
   "$defs": {
+    "ComposerCapabilityTarget": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityTargetKind"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "supports_skills",
+        "supports_mcp_tools"
+      ]
+    },
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    },
     "SelectableSkillCapability": {
       "type": "object",
       "properties": {

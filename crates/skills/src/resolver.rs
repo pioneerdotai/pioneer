@@ -1,12 +1,14 @@
 use crate::compile::SkillDefinition;
-use crate::contract::{SkillCatalogSnapshot, qualified_skill_slug};
+use crate::contract::SkillCatalogSnapshot;
 use crate::dependencies::{
     DependencyCheckInput, DependencyDiagnostic, evaluate_skill_dependencies,
 };
 use crate::path_match::path_matches_any_pattern;
 use crate::policy::{SkillPolicySet, effective_policy_for_skill};
 use crate::security::{SecurityFinding, scan_skill_directory};
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +61,8 @@ impl SkillResolvedReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillExcludedReason {
+    Unavailable,
+    NotFound,
     DisabledByPolicy,
     DisabledModelInvocation,
     ValidationRejected,
@@ -72,6 +76,8 @@ pub enum SkillExcludedReason {
 impl SkillExcludedReason {
     pub fn as_db_value(&self) -> &'static str {
         match self {
+            Self::Unavailable => "unavailable",
+            Self::NotFound => "not_found",
             Self::DisabledByPolicy => "disabled_by_policy",
             Self::DisabledModelInvocation => "disabled_model_invocation",
             Self::ValidationRejected => "validation_rejected",
@@ -86,6 +92,7 @@ impl SkillExcludedReason {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSkill {
+    pub skill_id: SkillId,
     pub slug: String,
     pub reason: SkillResolvedReason,
     pub definition: SkillDefinition,
@@ -93,6 +100,9 @@ pub struct ResolvedSkill {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExcludedSkill {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     pub reason: SkillExcludedReason,
@@ -120,52 +130,18 @@ pub struct SkillResolutionInput<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillExplicitRef {
-    pub capability_id: String,
+    pub skill_id: SkillId,
     pub label: Option<String>,
-    pub slug: String,
-    pub source_kind: String,
 }
 
-fn normalize_key(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+impl SkillExplicitRef {
+    pub fn capability_id(&self) -> String {
+        format!("skill:{}", self.skill_id)
+    }
 }
 
 pub fn explicit_ref_matches_skill(input: &SkillExplicitRef, skill: &SkillDefinition) -> bool {
-    if !input.source_kind.trim().is_empty()
-        && input.source_kind.as_str() != skill.identity.source_kind.as_db_value()
-    {
-        return false;
-    }
-
-    let normalized_ref = normalize_key(input.slug.as_str());
-    if normalized_ref.is_empty() {
-        return false;
-    }
-
-    let normalized_slug = normalize_key(skill.identity.slug.as_str());
-    let normalized_qualified_slug = normalize_key(
-        qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()).as_str(),
-    );
-    let normalized_name = normalize_key(skill.identity.name.as_str());
-    let normalized_display_name = normalize_key(skill.identity.display_name.as_str());
-
-    normalized_ref == normalized_slug
-        || normalized_ref == normalized_qualified_slug
-        || normalized_ref == normalized_name
-        || normalized_ref == normalized_display_name
+    input.skill_id == skill.identity.skill_id
 }
 
 fn dependency_failures(
@@ -267,21 +243,42 @@ fn has_critical_metadata_issues(skill: &SkillDefinition) -> bool {
 pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult {
     let mut active = Vec::new();
     let mut excluded = Vec::new();
+    let catalog_ids = input
+        .catalog
+        .skills
+        .iter()
+        .map(|skill| skill.identity.skill_id.clone())
+        .collect::<HashSet<_>>();
+    let mut processed_ids = HashSet::new();
 
     for skill in &input.catalog.skills {
-        let skill_slug =
-            qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str());
-
+        if !processed_ids.insert(skill.identity.skill_id.clone()) {
+            continue;
+        }
         let effective_policy = effective_policy_for_skill(skill, input.policy_set);
+        let mut exclude = |reason, dependency_diagnostics, security_findings| {
+            excluded.push(ExcludedSkill {
+                skill_id: skill.identity.skill_id.clone(),
+                owner: skill.identity.owner.clone(),
+                slug: skill.identity.slug.clone(),
+                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
+                reason,
+                dependency_diagnostics,
+                security_findings,
+            });
+        };
+
+        if !skill.is_available() {
+            exclude(SkillExcludedReason::Unavailable, Vec::new(), Vec::new());
+            continue;
+        }
 
         if !effective_policy.enabled {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::DisabledByPolicy,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(
+                SkillExcludedReason::DisabledByPolicy,
+                Vec::new(),
+                Vec::new(),
+            );
             continue;
         }
 
@@ -291,102 +288,95 @@ pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult 
             input.touched_paths,
             effective_policy.allow_implicit_invocation,
         ) else {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::NotMatched,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(SkillExcludedReason::NotMatched, Vec::new(), Vec::new());
             continue;
         };
 
         if !matches!(reason, SkillResolvedReason::ExplicitCapability)
             && skill.runtime.disable_model_invocation
         {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::DisabledModelInvocation,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(
+                SkillExcludedReason::DisabledModelInvocation,
+                Vec::new(),
+                Vec::new(),
+            );
             continue;
         }
 
         if !passes_validation_policy(skill, input.validation_policy) {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::ValidationRejected,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(
+                SkillExcludedReason::ValidationRejected,
+                Vec::new(),
+                Vec::new(),
+            );
             continue;
         }
 
         if has_critical_metadata_issues(skill) {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::InvalidMetadata,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(SkillExcludedReason::InvalidMetadata, Vec::new(), Vec::new());
             continue;
         }
 
         if trust_blocked(skill, input.validation_policy) {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::TrustBlocked,
-                dependency_diagnostics: Vec::new(),
-                security_findings: Vec::new(),
-            });
+            exclude(SkillExcludedReason::TrustBlocked, Vec::new(), Vec::new());
             continue;
         }
 
         let security_findings = security_blocking_findings(skill, input.validation_policy);
         if !security_findings.is_empty() {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::SecurityBlocked,
-                dependency_diagnostics: Vec::new(),
+            exclude(
+                SkillExcludedReason::SecurityBlocked,
+                Vec::new(),
                 security_findings,
-            });
+            );
             continue;
         }
 
         let dependency_diagnostics =
             dependency_failures(skill, input.validation_policy, input.dependency_input);
         if !dependency_diagnostics.is_empty() {
-            excluded.push(ExcludedSkill {
-                slug: skill_slug.clone(),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
-                reason: SkillExcludedReason::DependencyMissing,
+            exclude(
+                SkillExcludedReason::DependencyMissing,
                 dependency_diagnostics,
-                security_findings: Vec::new(),
-            });
+                Vec::new(),
+            );
             continue;
         }
 
         active.push(ResolvedSkill {
-            slug: skill_slug,
+            skill_id: skill.identity.skill_id.clone(),
+            slug: skill.identity.slug.clone(),
             reason,
             definition: skill.clone(),
         });
+    }
+
+    for explicit_ref in input.explicit_refs {
+        if !catalog_ids.contains(&explicit_ref.skill_id)
+            && !excluded
+                .iter()
+                .any(|skill| skill.skill_id == explicit_ref.skill_id)
+        {
+            excluded.push(ExcludedSkill {
+                skill_id: explicit_ref.skill_id.clone(),
+                owner: None,
+                slug: String::new(),
+                source_kind: String::new(),
+                reason: SkillExcludedReason::NotFound,
+                dependency_diagnostics: Vec::new(),
+                security_findings: Vec::new(),
+            });
+        }
     }
 
     active.sort_by(|left, right| {
         left.reason
             .rank()
             .cmp(&right.reason.rank())
-            .then_with(|| left.slug.cmp(&right.slug))
+            .then_with(|| left.skill_id.cmp(&right.skill_id))
     });
 
-    excluded.sort_by(|left, right| left.slug.cmp(&right.slug));
+    excluded.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
 
     SkillResolutionResult { active, excluded }
 }
@@ -406,25 +396,39 @@ mod tests {
     };
     use crate::dependencies::DependencyCheckInput;
     use crate::policy::{SkillPolicy, SkillPolicyKey, SkillPolicySet};
+    use pioneer_protocol::SkillId;
 
     fn explicit_ref(name: &str) -> SkillExplicitRef {
-        explicit_ref_with_source_kind(name, SkillSourceKind::User)
+        SkillExplicitRef {
+            skill_id: test_skill_id(name),
+            label: Some(name.to_owned()),
+        }
     }
 
-    fn explicit_ref_with_source_kind(name: &str, source_kind: SkillSourceKind) -> SkillExplicitRef {
-        let source_kind = source_kind.as_db_value().to_owned();
-        SkillExplicitRef {
-            capability_id: format!("skill:{source_kind}:{name}"),
-            label: Some(name.to_owned()),
-            slug: name.to_owned(),
-            source_kind,
+    fn explicit_ref_with_source_kind(
+        name: &str,
+        _source_kind: SkillSourceKind,
+    ) -> SkillExplicitRef {
+        explicit_ref(name)
+    }
+
+    fn test_skill_id(value: &str) -> SkillId {
+        let mut value = value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(21);
+        while value.len() < 21 {
+            value.push('A');
         }
+        SkillId::new(value).unwrap()
     }
 
     fn skill(slug: &str, paths: &[&str], source_kind: SkillSourceKind) -> SkillDefinition {
         let conformance = default_skill_conformance();
         let definition = compile_skill_definition(CompileSkillInput {
-            owner: "workspace".to_owned(),
+            skill_id: test_skill_id(slug),
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: slug.to_owned(),
@@ -473,12 +477,12 @@ mod tests {
         });
 
         assert_eq!(result.active.len(), 2);
-        assert_eq!(result.active[0].slug, "workspace/explicit-skill");
+        assert_eq!(result.active[0].slug, "explicit-skill");
         assert_eq!(
             result.active[0].reason,
             SkillResolvedReason::ExplicitCapability
         );
-        assert_eq!(result.active[1].slug, "workspace/path-skill");
+        assert_eq!(result.active[1].slug, "path-skill");
         assert_eq!(result.active[1].reason, SkillResolvedReason::PathMatch);
     }
 
@@ -492,7 +496,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/explicit-skill", "user"),
+            SkillPolicyKey::new(test_skill_id("explicit-skill")),
             SkillPolicy {
                 enabled: Some(false),
                 allow_implicit_invocation: None,
@@ -526,7 +530,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/system-skill", "system"),
+            SkillPolicyKey::new(test_skill_id("system-skill")),
             SkillPolicy {
                 enabled: Some(false),
                 allow_implicit_invocation: None,
@@ -793,7 +797,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/implicit-skill", "user"),
+            SkillPolicyKey::new(test_skill_id("implicit-skill")),
             SkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(true),
@@ -810,7 +814,7 @@ mod tests {
         });
 
         assert_eq!(result.active.len(), 1);
-        assert_eq!(result.active[0].slug, "workspace/implicit-skill");
+        assert_eq!(result.active[0].slug, "implicit-skill");
         assert_eq!(result.active[0].reason, SkillResolvedReason::Implicit);
     }
 
@@ -827,7 +831,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/required-implicit", "system"),
+            SkillPolicyKey::new(test_skill_id("required-implicit")),
             SkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(false),
@@ -844,7 +848,7 @@ mod tests {
         });
 
         assert_eq!(result.active.len(), 1);
-        assert_eq!(result.active[0].slug, "workspace/required-implicit");
+        assert_eq!(result.active[0].slug, "required-implicit");
         assert_eq!(result.active[0].reason, SkillResolvedReason::Implicit);
     }
 
@@ -861,7 +865,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/implicit-blocked", "user"),
+            SkillPolicyKey::new(test_skill_id("implicit-blocked")),
             SkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(true),
@@ -883,5 +887,107 @@ mod tests {
             result.excluded[0].reason,
             SkillExcludedReason::DisabledModelInvocation
         );
+    }
+
+    #[test]
+    fn duplicate_labels_resolve_independently_by_exact_id() {
+        let first_id = SkillId::new("AAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let second_id = SkillId::new("BBBBBBBBBBBBBBBBBBBBB").unwrap();
+        let mut first = skill("duplicate", &[], SkillSourceKind::User);
+        first.identity.skill_id = first_id.clone();
+        let mut second = skill("duplicate", &[], SkillSourceKind::Registry);
+        second.identity.skill_id = second_id.clone();
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![first, second],
+        };
+
+        let result = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[SkillExplicitRef {
+                skill_id: second_id.clone(),
+                label: Some("workspace/duplicate".to_owned()),
+            }],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &SkillPolicySet::default(),
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        assert_eq!(result.active.len(), 1);
+        assert_eq!(result.active[0].skill_id, second_id);
+        assert!(result.active.iter().all(|skill| skill.skill_id != first_id));
+    }
+
+    #[test]
+    fn readable_label_cannot_retarget_selected_id() {
+        let selected_id = SkillId::new("CCCCCCCCCCCCCCCCCCCCC").unwrap();
+        let mut selected = skill("selected", &[], SkillSourceKind::User);
+        selected.identity.skill_id = selected_id.clone();
+        let mut alias_target = skill("alias-target", &[], SkillSourceKind::User);
+        alias_target.identity.skill_id = SkillId::new("DDDDDDDDDDDDDDDDDDDDD").unwrap();
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![selected, alias_target],
+        };
+
+        let result = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[SkillExplicitRef {
+                skill_id: selected_id.clone(),
+                label: Some("workspace/alias-target".to_owned()),
+            }],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &SkillPolicySet::default(),
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        assert_eq!(result.active.len(), 1);
+        assert_eq!(result.active[0].skill_id, selected_id);
+    }
+
+    #[test]
+    fn missing_and_unavailable_ids_are_not_executable() {
+        let unavailable_id = SkillId::new("EEEEEEEEEEEEEEEEEEEEE").unwrap();
+        let missing_id = SkillId::new("FFFFFFFFFFFFFFFFFFFFF").unwrap();
+        let mut unavailable = skill("unavailable", &[], SkillSourceKind::User);
+        unavailable.identity.skill_id = unavailable_id.clone();
+        unavailable.availability = crate::compile::SkillAvailability::Unavailable {
+            reason: crate::compile::SkillUnavailableReason::MissingPackage,
+        };
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![unavailable],
+        };
+
+        let result = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[
+                SkillExplicitRef {
+                    skill_id: unavailable_id.clone(),
+                    label: None,
+                },
+                SkillExplicitRef {
+                    skill_id: missing_id.clone(),
+                    label: None,
+                },
+            ],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &SkillPolicySet::default(),
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        assert!(result.active.is_empty());
+        assert!(result.excluded.iter().any(|skill| {
+            skill.skill_id == unavailable_id && skill.reason == SkillExcludedReason::Unavailable
+        }));
+        assert!(result.excluded.iter().any(|skill| {
+            skill.skill_id == missing_id && skill.reason == SkillExcludedReason::NotFound
+        }));
     }
 }

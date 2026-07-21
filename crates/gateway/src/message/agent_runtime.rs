@@ -824,6 +824,8 @@ impl MessageProcessor {
         let binding_records = bindings
             .iter()
             .map(|binding| pioneer_crud::TurnSkillBindingRecord {
+                skill_id: binding.skill_id.clone(),
+                skill_owner: binding.skill_owner.clone(),
                 skill_slug: binding.skill_slug.clone(),
                 skill_version: binding.skill_version.clone(),
                 fingerprint: binding.fingerprint.clone(),
@@ -1054,6 +1056,8 @@ impl MessageProcessor {
                 let mut dependency_snapshots = Vec::new();
 
                 for event in events {
+                    let skill_id = event.skill_id;
+                    let skill_owner = event.skill_owner;
                     let skill_slug = event.skill_slug;
                     let source_kind = event.source_kind;
                     let created_at_unix = event.created_at_unix;
@@ -1069,6 +1073,8 @@ impl MessageProcessor {
 
                     records.push(pioneer_crud::SkillAuditEventRecord {
                         turn_id: Some(turn_id.clone()),
+                        skill_id: skill_id.clone(),
+                        skill_owner: skill_owner.clone(),
                         skill_slug: skill_slug.clone(),
                         source_kind: source_kind.clone(),
                         action: event.action,
@@ -1081,6 +1087,8 @@ impl MessageProcessor {
                     if let Some(diagnostics_json) = dependency_snapshot_json {
                         dependency_snapshots.push(pioneer_crud::SkillDependencySnapshotRecord {
                             turn_id: Some(turn_id.clone()),
+                            skill_id,
+                            skill_owner,
                             skill_slug,
                             source_kind,
                             diagnostics_json,
@@ -5061,7 +5069,7 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
         input: &[pioneer_protocol::UserInput],
-        capabilities: &[pioneer_protocol::TurnCapability],
+        capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) {
         let item_id = user_message_item_id(turn_id);
         let payload = match self
@@ -5086,9 +5094,8 @@ impl MessageProcessor {
                 return;
             }
         };
-        let capability_attachments = user_message_attachments_from_capabilities(capabilities);
         let (text, mut attachments) = payload.unwrap_or_default();
-        attachments.extend(capability_attachments);
+        attachments.extend_from_slice(capability_attachments);
 
         if text.is_empty() && attachments.is_empty() {
             return;
@@ -5464,50 +5471,102 @@ impl MessageProcessor {
     }
 }
 
-fn user_message_attachments_from_capabilities(
+fn user_message_attachments_from_capabilities_with_lookup<'a>(
     capabilities: &[pioneer_protocol::TurnCapability],
-) -> Vec<pioneer_protocol::UserMessageAttachment> {
+    mut skill_lookup: impl FnMut(
+        &pioneer_protocol::SkillId,
+    ) -> Option<(Option<&'a str>, &'a str, &'a str)>,
+) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
     capabilities
         .iter()
-        .map(|capability| match &capability.kind {
-            pioneer_protocol::TurnCapabilityKind::Skill { slug, source_kind } => {
-                pioneer_protocol::UserMessageAttachment::Skill {
-                    capability: pioneer_protocol::TurnSkillCapabilitySummary {
-                        id: capability.id.clone(),
-                        label: capability_label(capability.label.as_deref(), slug),
-                        slug: slug.clone(),
-                        source_kind: source_kind.clone(),
-                    },
+        .map(|capability| {
+            Ok(match &capability.kind {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id } => {
+                    let (owner, slug, source_kind) = skill_lookup(skill_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing immutable presentation snapshot for selected skill `{skill_id}`"
+                    )
+                })?;
+                    let fallback_label = pioneer_skills::compact_skill_label(owner, slug);
+                    pioneer_protocol::UserMessageAttachment::Skill {
+                        capability: pioneer_protocol::TurnSkillCapabilitySummary {
+                            skill_id: skill_id.clone(),
+                            label: capability_label(
+                                capability.label.as_deref(),
+                                fallback_label.as_str(),
+                            ),
+                            owner: owner.map(str::to_owned),
+                            slug: slug.to_owned(),
+                            source_kind: source_kind.to_owned(),
+                        },
+                    }
                 }
-            }
-            pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => {
-                pioneer_protocol::UserMessageAttachment::McpServer {
-                    capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
-                        id: capability.id.clone(),
-                        label: capability_label(capability.label.as_deref(), name),
-                        name: name.clone(),
-                        scope_kind: *scope_kind,
-                    },
+                pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => {
+                    pioneer_protocol::UserMessageAttachment::McpServer {
+                        capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
+                            id: capability.id.clone(),
+                            label: capability_label(capability.label.as_deref(), name),
+                            name: name.clone(),
+                            scope_kind: *scope_kind,
+                        },
+                    }
                 }
-            }
-            pioneer_protocol::TurnCapabilityKind::McpTool {
-                server_name,
-                raw_tool_name,
-                scope_kind,
-            } => {
-                let fallback = format!("{server_name} / {raw_tool_name}");
-                pioneer_protocol::UserMessageAttachment::McpTool {
-                    capability: pioneer_protocol::TurnMcpToolCapabilitySummary {
-                        id: capability.id.clone(),
-                        label: capability_label(capability.label.as_deref(), fallback.as_str()),
-                        server_name: server_name.clone(),
-                        raw_tool_name: raw_tool_name.clone(),
-                        scope_kind: *scope_kind,
-                    },
+                pioneer_protocol::TurnCapabilityKind::McpTool {
+                    server_name,
+                    raw_tool_name,
+                    scope_kind,
+                } => {
+                    let fallback = format!("{server_name} / {raw_tool_name}");
+                    pioneer_protocol::UserMessageAttachment::McpTool {
+                        capability: pioneer_protocol::TurnMcpToolCapabilitySummary {
+                            id: capability.id.clone(),
+                            label: capability_label(capability.label.as_deref(), fallback.as_str()),
+                            server_name: server_name.clone(),
+                            raw_tool_name: raw_tool_name.clone(),
+                            scope_kind: *scope_kind,
+                        },
+                    }
                 }
-            }
+            })
         })
         .collect()
+}
+
+pub(super) fn user_message_attachments_from_capabilities_and_catalog(
+    capabilities: &[pioneer_protocol::TurnCapability],
+    catalog: &pioneer_skills::SkillCatalogSnapshot,
+) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
+    user_message_attachments_from_capabilities_with_lookup(capabilities, |skill_id| {
+        catalog
+            .skills
+            .iter()
+            .find(|skill| &skill.identity.skill_id == skill_id)
+            .map(|skill| {
+                (
+                    skill.identity.owner.as_deref(),
+                    skill.identity.slug.as_str(),
+                    skill.identity.source_kind.as_db_value(),
+                )
+            })
+    })
+}
+
+pub(super) fn user_message_attachments_from_capabilities_and_bindings(
+    capabilities: &[pioneer_protocol::TurnCapability],
+    bindings: &[pioneer_protocol::TurnSkillBinding],
+) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
+    user_message_attachments_from_capabilities_with_lookup(capabilities, |skill_id| {
+        bindings
+            .iter()
+            .find(|binding| &binding.skill_id == skill_id)
+            .map(|binding| {
+                (
+                    binding.skill_owner.as_deref(),
+                    binding.skill_slug.as_str(),
+                    binding.source_kind.as_str(),
+                )
+            })
+    })
 }
 
 fn capability_label(label: Option<&str>, fallback: &str) -> String {
@@ -5516,4 +5575,76 @@ fn capability_label(label: Option<&str>, fallback: &str) -> String {
         .filter(|label| !label.is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+#[cfg(test)]
+mod user_message_attachment_tests {
+    use super::user_message_attachments_from_capabilities_and_bindings;
+    use pioneer_protocol::{
+        SkillId, TurnCapability, TurnCapabilityKind, TurnSkillBinding, UserMessageAttachment,
+    };
+
+    #[test]
+    fn selected_skill_attachment_is_an_owned_binding_snapshot() {
+        let skill_id = SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid skill id");
+        let capability = TurnCapability {
+            id: format!("skill:{skill_id}"),
+            kind: TurnCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+            },
+            label: None,
+        };
+        let mut bindings = vec![TurnSkillBinding {
+            skill_id: skill_id.clone(),
+            skill_owner: Some("owner-before".to_owned()),
+            skill_slug: "slug-before".to_owned(),
+            skill_version: None,
+            fingerprint: "fingerprint".to_owned(),
+            source_kind: "user".to_owned(),
+            resolved_reason: "explicit".to_owned(),
+        }];
+
+        let attachments = user_message_attachments_from_capabilities_and_bindings(
+            std::slice::from_ref(&capability),
+            bindings.as_slice(),
+        )
+        .expect("binding must snapshot");
+        bindings[0].skill_owner = Some("owner-after".to_owned());
+        bindings[0].skill_slug = "slug-after".to_owned();
+
+        assert_eq!(
+            attachments,
+            vec![UserMessageAttachment::Skill {
+                capability: pioneer_protocol::TurnSkillCapabilitySummary {
+                    skill_id,
+                    label: "owner-before/slug-before".to_owned(),
+                    owner: Some("owner-before".to_owned()),
+                    slug: "slug-before".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn selected_skill_attachment_requires_an_exact_binding_snapshot() {
+        let skill_id = SkillId::new("BBBBBBBBBBBBBBBBBBBBB").expect("valid skill id");
+        let capability = TurnCapability {
+            id: format!("skill:{skill_id}"),
+            kind: TurnCapabilityKind::Skill { skill_id },
+            label: None,
+        };
+
+        let error = user_message_attachments_from_capabilities_and_bindings(
+            std::slice::from_ref(&capability),
+            &[],
+        )
+        .expect_err("missing binding must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing immutable presentation snapshot")
+        );
+    }
 }

@@ -1,8 +1,8 @@
 use crate::{
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, TaskEvent,
-    TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
+    ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, SkillId,
+    TaskEvent, TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
     TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
     TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
     TurnExecutionWindowStartedNotification, TurnItemType, TurnPermissionActionKind,
@@ -161,6 +161,9 @@ pub enum DurableEventCausalityKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TurnSkillBinding {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_version: Option<String>,
@@ -213,6 +216,9 @@ pub enum TurnCapabilityRejectedReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct SkillAuditEvent {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub action: String,
@@ -692,6 +698,64 @@ mod tests {
         let decoded: TurnPermissionAuditEvent =
             serde_json::from_value(encoded).expect("audit event should decode");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn skill_binding_and_audit_use_exact_id_with_presentation_snapshots() {
+        let binding: TurnSkillBinding = serde_json::from_value(serde_json::json!({
+            "skill_id": "mvg02zVNGWuw5z5C4nYDo",
+            "skill_owner": "pioneer",
+            "skill_slug": "browser",
+            "skill_version": "1.0.0",
+            "fingerprint": "sha256:revision",
+            "source_kind": "system",
+            "resolved_reason": "explicit"
+        }))
+        .expect("binding should decode");
+        assert_eq!(binding.skill_id.as_ref(), "mvg02zVNGWuw5z5C4nYDo");
+        assert_eq!(binding.skill_owner.as_deref(), Some("pioneer"));
+        assert_eq!(binding.skill_slug, "browser");
+
+        let audit: SkillAuditEvent = serde_json::from_value(serde_json::json!({
+            "skill_id": "mvg02zVNGWuw5z5C4nYDo",
+            "skill_slug": "browser",
+            "source_kind": "system",
+            "action": "resolve",
+            "decision": "accepted",
+            "created_at_unix": 10
+        }))
+        .expect("audit should decode without an owner snapshot");
+        assert_eq!(audit.skill_id, binding.skill_id);
+        assert_eq!(audit.skill_owner, None);
+    }
+
+    #[test]
+    fn skill_binding_and_audit_require_exact_id() {
+        let binding_without_id = serde_json::from_value::<TurnSkillBinding>(serde_json::json!({
+            "skill_owner": "pioneer",
+            "skill_slug": "browser",
+            "fingerprint": "sha256:revision",
+            "source_kind": "system",
+            "resolved_reason": "explicit"
+        }));
+        assert!(binding_without_id.is_err());
+
+        let audit_without_id = serde_json::from_value::<SkillAuditEvent>(serde_json::json!({
+            "skill_owner": "pioneer",
+            "skill_slug": "browser",
+            "source_kind": "system",
+            "action": "resolve",
+            "decision": "accepted",
+            "created_at_unix": 10
+        }));
+        assert!(audit_without_id.is_err());
+
+        let binding_schema = serde_json::to_value(schemars::schema_for!(TurnSkillBinding))
+            .expect("binding schema should encode")
+            .to_string();
+        assert!(binding_schema.contains("skill_id"));
+        assert!(binding_schema.contains("skill_owner"));
+        assert!(binding_schema.contains("^[A-Za-z0-9]{21}$"));
     }
 
     #[test]

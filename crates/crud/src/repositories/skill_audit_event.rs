@@ -16,6 +16,8 @@ pub async fn insert_skill_audit_events<C: ConnectionTrait>(
             turn_id: Set(turn_id
                 .map(str::to_owned)
                 .or_else(|| record.turn_id.clone())),
+            skill_id: Set(record.skill_id.to_string()),
+            skill_owner: Set(record.skill_owner.clone()),
             skill_slug: Set(record.skill_slug.clone()),
             source_kind: Set(record.source_kind.clone()),
             action: Set(record.action.clone()),
@@ -29,7 +31,7 @@ pub async fn insert_skill_audit_events<C: ConnectionTrait>(
         .with_context(|| {
             format!(
                 "failed to insert skill audit event `{}` ({})",
-                record.skill_slug, record.action
+                record.skill_id, record.action
             )
         })?;
     }
@@ -39,34 +41,16 @@ pub async fn insert_skill_audit_events<C: ConnectionTrait>(
 
 pub async fn list_skill_audit_events<C: ConnectionTrait>(
     db: &C,
-    skill_slug: &str,
+    skill_id: &pioneer_protocol::SkillId,
     limit: u64,
 ) -> Result<Vec<skill_audit_event::Model>> {
     skill_audit_event::Entity::find()
-        .filter(skill_audit_event::Column::SkillSlug.eq(skill_slug.to_owned()))
+        .filter(skill_audit_event::Column::SkillId.eq(skill_id.to_string()))
         .order_by_desc(skill_audit_event::Column::CreatedAt)
         .limit(limit)
         .all(db)
         .await
-        .with_context(|| format!("failed to query skill audit events for `{skill_slug}`"))
-}
-
-pub async fn list_skill_audit_events_for_source<C: ConnectionTrait>(
-    db: &C,
-    skill_slug: &str,
-    source_kind: &str,
-    limit: u64,
-) -> Result<Vec<skill_audit_event::Model>> {
-    skill_audit_event::Entity::find()
-        .filter(skill_audit_event::Column::SkillSlug.eq(skill_slug.to_owned()))
-        .filter(skill_audit_event::Column::SourceKind.eq(source_kind.to_owned()))
-        .order_by_desc(skill_audit_event::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!("failed to query skill audit events for `{skill_slug}` ({source_kind})")
-        })
+        .with_context(|| format!("failed to query skill audit events for `{skill_id}`"))
 }
 
 pub async fn list_turn_skill_audit_events<C: ConnectionTrait>(
@@ -75,7 +59,7 @@ pub async fn list_turn_skill_audit_events<C: ConnectionTrait>(
 ) -> Result<Vec<skill_audit_event::Model>> {
     skill_audit_event::Entity::find()
         .filter(skill_audit_event::Column::TurnId.eq(turn_id.to_owned()))
-        .order_by_asc(skill_audit_event::Column::SkillSlug)
+        .order_by_asc(skill_audit_event::Column::SkillId)
         .order_by_asc(skill_audit_event::Column::CreatedAt)
         .all(db)
         .await

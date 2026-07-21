@@ -1,15 +1,12 @@
 use crate::{AgentMcpAvailability, SkillsLoopConfig, WorkspaceSkillPolicy};
 use pioneer_protocol::{TurnSkillBinding, UserInput};
 use pioneer_skills::{
-    ResolvedSkill, SkillAuditEvent, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy,
+    ResolvedSkill, SkillAuditEvent, SkillCatalogSnapshot, SkillExplicitRef, SkillPolicy,
     SkillPolicyKey, SkillPolicySet, SkillPromptBudget, SkillResolutionInput, SkillResolutionResult,
     SkillRuntimePlan, SkillValidationPolicy, build_skill_prompt, build_skill_runtime_plan,
-    load_catalog, qualified_skill_slug, resolve_skills,
+    resolve_skills,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
-const WORKSPACE_ID_TOKEN: &str = "{workspaceId}";
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnSkillResolution {
@@ -17,59 +14,6 @@ pub(super) struct TurnSkillResolution {
     pub result: SkillResolutionResult,
     pub runtime_plan: SkillRuntimePlan,
     pub audit_events: Vec<SkillAuditEvent>,
-}
-
-fn expand_home(path: &str) -> String {
-    if path == "~" {
-        return dirs::home_dir()
-            .map(|home| home.display().to_string())
-            .unwrap_or_else(|| path.to_owned());
-    }
-
-    if let Some(suffix) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(suffix).display().to_string();
-    }
-
-    path.to_owned()
-}
-
-fn sanitize_workspace_id_component(workspace_id: &str) -> String {
-    let mut sanitized = String::with_capacity(workspace_id.len());
-    for ch in workspace_id.trim().chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        "workspace".to_owned()
-    } else {
-        sanitized
-    }
-}
-
-fn expand_workspace_id_token(path: &str, workspace_id: &str) -> String {
-    if !path.contains(WORKSPACE_ID_TOKEN) {
-        return path.to_owned();
-    }
-
-    let sanitized_workspace_id = sanitize_workspace_id_component(workspace_id);
-    path.replace(WORKSPACE_ID_TOKEN, sanitized_workspace_id.as_str())
-}
-
-fn resolve_root_path(raw: &str, workdir: &Path, workspace_id: &str) -> PathBuf {
-    let expanded_workspace = expand_workspace_id_token(raw, workspace_id);
-    let expanded = expand_home(expanded_workspace.as_str());
-    let candidate = PathBuf::from(expanded);
-    if candidate.is_absolute() {
-        candidate
-    } else {
-        workdir.join(candidate)
-    }
 }
 
 fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
@@ -124,10 +68,9 @@ fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
 }
 
 pub(super) fn resolve_turn_skills_with_explicit_refs(
-    workdir: &Path,
-    workspace_id: &str,
     input: &[UserInput],
     explicit_refs: &[SkillExplicitRef],
+    catalog: &SkillCatalogSnapshot,
     skills: &SkillsLoopConfig,
     workspace_skill_policies: &HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     mcp_availability: &AgentMcpAvailability,
@@ -148,33 +91,10 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
         });
     }
 
-    let catalog = load_catalog(&SkillCatalogLoadParams {
-        system_roots: skills
-            .system_roots
-            .iter()
-            .map(|raw| resolve_root_path(raw, workdir, workspace_id))
-            .collect(),
-        user_roots: skills
-            .user_roots
-            .iter()
-            .map(|raw| resolve_root_path(raw, workdir, workspace_id))
-            .collect(),
-        registry_roots: skills
-            .registry_roots
-            .iter()
-            .map(|raw| resolve_root_path(raw, workdir, workspace_id))
-            .collect(),
-        max_skills_per_source: skills.max_skills_per_source,
-        max_file_bytes: skills.max_skill_file_bytes,
-    })?;
-
     let mut global_by_key = HashMap::new();
     for skill in &catalog.skills {
         global_by_key.insert(
-            SkillPolicyKey::new(
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()),
-                skill.identity.source_kind.as_db_value().to_owned(),
-            ),
+            SkillPolicyKey::new(skill.identity.skill_id.clone()),
             SkillPolicy {
                 enabled: Some(skills.enabled),
                 allow_implicit_invocation: Some(skills.allow_implicit_invocation),
@@ -205,7 +125,7 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
     let result = resolve_skills(SkillResolutionInput {
         explicit_refs,
         touched_paths: touched_paths.as_slice(),
-        catalog: &catalog,
+        catalog,
         policy_set: &SkillPolicySet {
             global_by_key,
             workspace_by_key,
@@ -230,6 +150,8 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
 
     for active in &result.active {
         audit_events.push(SkillAuditEvent::resolution_allowed(
+            active.skill_id.clone(),
+            active.definition.identity.owner.clone(),
             active.slug.clone(),
             active
                 .definition
@@ -247,6 +169,8 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
 
     for excluded in &result.excluded {
         audit_events.push(SkillAuditEvent::resolution_blocked(
+            excluded.skill_id.clone(),
+            excluded.owner.clone(),
             excluded.slug.clone(),
             excluded.source_kind.clone(),
             format!("resolve.{}", excluded.reason.as_db_value()),
@@ -260,9 +184,8 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
     }
 
     audit_events.sort_by(|left, right| {
-        left.skill_slug
-            .as_str()
-            .cmp(right.skill_slug.as_str())
+        left.skill_id
+            .cmp(&right.skill_id)
             .then_with(|| left.action.cmp(&right.action))
     });
 
@@ -306,6 +229,8 @@ pub(super) fn to_turn_skill_bindings(active: &[ResolvedSkill]) -> Vec<TurnSkillB
     active
         .iter()
         .map(|skill| TurnSkillBinding {
+            skill_id: skill.skill_id.clone(),
+            skill_owner: skill.definition.identity.owner.clone(),
             skill_slug: skill.slug.clone(),
             skill_version: skill.definition.identity.version_hint.clone(),
             fingerprint: skill.definition.identity.fingerprint.clone(),
@@ -322,17 +247,17 @@ pub(super) fn to_turn_skill_bindings(active: &[ResolvedSkill]) -> Vec<TurnSkillB
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        expand_workspace_id_token, resolve_root_path, resolve_turn_skills_with_explicit_refs,
-    };
+    use super::resolve_turn_skills_with_explicit_refs;
     use crate::{
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
     };
-    use pioneer_skills::{SkillExplicitRef, SkillPolicyKey, SkillTrustLevel};
+    use pioneer_skills::{
+        SkillCatalogInstallation, SkillCatalogLoadParams, SkillCatalogSnapshot, SkillExplicitRef,
+        SkillPolicyKey, SkillSourceKind, SkillTrustLevel, load_catalog,
+    };
     use std::collections::HashMap;
     use std::fs;
-    use std::path::Path;
     use std::path::PathBuf;
 
     fn temp_case(name: &str) -> PathBuf {
@@ -355,6 +280,9 @@ mod tests {
             system_roots: Vec::new(),
             user_roots: vec![root.display().to_string()],
             registry_roots: Vec::new(),
+            system_import_roots: Vec::new(),
+            user_import_roots: Vec::new(),
+            registry_import_roots: Vec::new(),
             validation: SkillsValidationLoopConfig {
                 strict_agentskills: true,
                 accept_openclaw_profile: true,
@@ -390,43 +318,42 @@ mod tests {
         }
     }
 
+    fn test_skill_id(value: &str) -> pioneer_protocol::SkillId {
+        let mut value = value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(21);
+        while value.len() < 21 {
+            value.push('T');
+        }
+        pioneer_protocol::SkillId::new(value).expect("valid test SkillId")
+    }
+
+    fn test_catalog(root: &std::path::Path, slug: &str) -> SkillCatalogSnapshot {
+        load_catalog(&SkillCatalogLoadParams {
+            installations: vec![SkillCatalogInstallation {
+                skill_id: test_skill_id(slug),
+                owner: Some("tests".to_owned()),
+                slug: slug.to_owned(),
+                version: None,
+                source_kind: SkillSourceKind::User,
+                source_ref: format!("test:{slug}"),
+                install_path: root.join("tests").join(slug),
+                trust_level: SkillTrustLevel::Community,
+                fingerprint: format!("fingerprint-{slug}"),
+            }],
+            bundled: Vec::new(),
+            max_file_bytes: 1024 * 1024,
+        })
+        .expect("test catalog must load")
+    }
+
     fn explicit_skill_ref(name: &str) -> SkillExplicitRef {
         SkillExplicitRef {
-            capability_id: format!("skill:user:{name}"),
+            skill_id: test_skill_id(name),
             label: Some(name.to_owned()),
-            slug: name.to_owned(),
-            source_kind: "user".to_owned(),
         }
-    }
-
-    #[test]
-    fn workspace_id_token_expands_into_relative_root() {
-        let workdir = Path::new("/tmp/workdir");
-        let resolved = resolve_root_path(
-            "{homeDirectory}/skills/workspace/{workspaceId}",
-            workdir,
-            "ws_000000000000000001",
-        );
-        assert_eq!(
-            resolved.to_string_lossy(),
-            "/tmp/workdir/{homeDirectory}/skills/workspace/ws_000000000000000001"
-        );
-    }
-
-    #[test]
-    fn workspace_id_token_sanitizes_unsafe_chars() {
-        let expanded = expand_workspace_id_token(
-            "{homeDirectory}/skills/workspace/{workspaceId}",
-            "../workspace?01",
-        );
-        assert_eq!(expanded, "{homeDirectory}/skills/workspace/.._workspace_01");
-    }
-
-    #[test]
-    fn workspace_id_token_blocks_parent_dir_component() {
-        let expanded =
-            expand_workspace_id_token("{homeDirectory}/skills/workspace/{workspaceId}", "..");
-        assert_eq!(expanded, "{homeDirectory}/skills/workspace/workspace");
     }
 
     #[test]
@@ -448,11 +375,11 @@ Instructions
         .expect("write skill");
 
         let explicit_refs = [explicit_skill_ref("agent-browser")];
+        let catalog = test_catalog(root.as_path(), "agent-browser");
         let result = resolve_turn_skills_with_explicit_refs(
-            root.as_path(),
-            "ws_000000000000000001",
             &[],
             &explicit_refs,
+            &catalog,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -460,7 +387,7 @@ Instructions
         .expect("resolve skills");
 
         assert_eq!(result.result.active.len(), 1);
-        assert_eq!(result.result.active[0].slug, "tests/agent-browser");
+        assert_eq!(result.result.active[0].slug, "agent-browser");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -483,11 +410,11 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         .expect("write skill");
 
         let explicit_refs = [explicit_skill_ref("weather")];
+        let catalog = test_catalog(root.as_path(), "weather");
         let result = resolve_turn_skills_with_explicit_refs(
-            root.as_path(),
-            "ws_000000000000000001",
             &[],
             &explicit_refs,
+            &catalog,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -495,11 +422,11 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         .expect("resolve skills");
 
         assert_eq!(result.result.active.len(), 1);
-        assert_eq!(result.result.active[0].slug, "tests/weather");
+        assert_eq!(result.result.active[0].slug, "weather");
         assert!(
             result
                 .prompt
-                .contains("Skill slug for read_skill: `user:tests/weather`")
+                .contains(&format!("skill:{}", test_skill_id("weather")))
         );
         assert!(
             !result
@@ -510,7 +437,7 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
             result
                 .runtime_plan
                 .read_skill_index
-                .get("user:tests/weather")
+                .get(&format!("skill:{}", test_skill_id("weather")))
                 .expect("read_skill entry")
                 .body
                 .trim(),
@@ -521,7 +448,7 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
     }
 
     #[test]
-    fn catalog_hidden_skill_stays_active_but_is_omitted_from_prompt() {
+    fn catalog_hidden_skill_stays_active_with_only_an_internal_exact_reference() {
         let root = temp_case("catalog-hidden-prompt");
         let skill_dir = root.join("tests").join("hidden");
         fs::create_dir_all(&skill_dir).expect("create skill dir");
@@ -539,11 +466,11 @@ HIDDEN SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         .expect("write skill");
 
         let explicit_refs = [explicit_skill_ref("hidden")];
+        let catalog = test_catalog(root.as_path(), "hidden");
         let result = resolve_turn_skills_with_explicit_refs(
-            root.as_path(),
-            "ws_000000000000000001",
             &[],
             &explicit_refs,
+            &catalog,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -551,13 +478,20 @@ HIDDEN SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         .expect("resolve skills");
 
         assert_eq!(result.result.active.len(), 1);
-        assert_eq!(result.result.active[0].slug, "tests/hidden");
-        assert!(result.prompt.is_empty());
+        assert_eq!(result.result.active[0].slug, "hidden");
+        assert!(result.prompt.contains("[Internal Skill References]"));
+        assert!(
+            result
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("hidden")))
+        );
+        assert!(!result.prompt.contains("Hidden skill prompt catalog entry."));
+        assert!(!result.prompt.contains("HIDDEN SKILL BODY"));
         assert_eq!(
             result
                 .runtime_plan
                 .read_skill_index
-                .get("user:tests/hidden")
+                .get(&format!("skill:{}", test_skill_id("hidden")))
                 .expect("read_skill entry")
                 .body
                 .trim(),
@@ -586,11 +520,11 @@ Instructions
         .expect("write skill");
 
         let explicit_refs = [explicit_skill_ref("agent-browser")];
+        let catalog = test_catalog(root.as_path(), "agent-browser");
         let result = resolve_turn_skills_with_explicit_refs(
-            root.as_path(),
-            "ws_000000000000000001",
             &[],
             &explicit_refs,
+            &catalog,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),

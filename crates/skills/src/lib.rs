@@ -18,16 +18,17 @@ pub mod security;
 pub mod validation;
 
 pub use audit::{SkillAuditAction, SkillAuditDecision, SkillAuditEvent};
-pub use catalog::{SkillCatalogLoadParams, load_catalog};
+pub use catalog::{
+    BundledSkillCatalogEntry, SkillCatalogInstallation, SkillCatalogLoadParams, load_catalog,
+};
 pub use compile::{
-    ClawdbotMetadata, OpenClawMetadata, SkillDefinition, SkillDependencySet, SkillIdentity,
-    SkillImplicitInvocationPolicy, SkillKnownMetadata, SkillPolicyHints, SkillRuntime,
-    compile_skill_definition,
+    ClawdbotMetadata, OpenClawMetadata, SkillAvailability, SkillDefinition, SkillDependencySet,
+    SkillIdentity, SkillImplicitInvocationPolicy, SkillKnownMetadata, SkillPolicyHints,
+    SkillRuntime, SkillUnavailableReason, compact_skill_label, compile_skill_definition,
 };
 pub use contract::{
     SkillCatalogSnapshot, SkillDependencies, SkillSourceKind, SkillTrustLevel,
-    is_qualified_skill_slug, parse_skill_from_file, qualified_skill_slug,
-    source_qualified_skill_slug, split_qualified_skill_slug,
+    normalize_skill_slug, parse_skill_from_file,
 };
 pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
@@ -39,26 +40,32 @@ pub use external_runtime_installer::{
 };
 pub use external_runtime_receipt::{
     EXTERNAL_RUNTIME_RECEIPT_FILE_NAME, EXTERNAL_RUNTIME_RECEIPT_VERSION,
-    ExternalRuntimeSkillReceipt, ExternalRuntimeSkillReceiptEntry,
-    external_runtime_skill_is_current, find_external_runtime_receipt_entry,
-    read_external_runtime_receipt, remove_external_runtime_receipt_entry,
+    ExternalRuntimeReceiptConversionCandidate, ExternalRuntimeSkillReceipt,
+    ExternalRuntimeSkillReceiptEntry, ensure_external_runtime_receipt_v2,
+    external_runtime_skill_is_current, find_external_runtime_receipt_destination_entry,
+    find_external_runtime_receipt_entry, read_external_runtime_receipt,
+    remove_external_runtime_receipt_destination_entry, remove_external_runtime_receipt_entry,
     upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
 };
 pub use file_metadata::file_link_count;
 pub use installer::{
     CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest, InstallSkillResult,
-    PrepareMaterializedSkillRequest, PreparedMaterializedSkill, SkillInstallerPolicy,
-    UninstallSkillRequest, UninstallSkillResult, UpdateSkillRequest, commit_prepared_skill,
-    install_skill, prepare_materialized_skill, uninstall_skill, update_skill,
+    PrepareMaterializedSkillRequest, PreparedMaterializedSkill, PreviousSkillInstallation,
+    SkillInstallerPolicy, UninstallSkillRequest, UninstallSkillResult, UpdateSkillRequest,
+    canonical_skill_install_path, commit_prepared_skill, finalize_prepared_skill_commit,
+    install_skill, prepare_materialized_skill, rollback_prepared_skill_commit, uninstall_skill,
+    update_skill,
 };
+pub use pioneer_protocol::SkillId;
 pub use policy::{
     EffectiveSkillPolicy, SkillPolicy, SkillPolicyKey, SkillPolicySet, effective_policy_for_skill,
     merge_policy, skill_implicit_invocation_editable,
 };
 pub use prompt::{SkillPromptBudget, SkillPromptBuild, build_skill_prompt};
 pub use provenance::{
-    SkillLockEntry, SkillsLock, find_lock_entry, read_skills_lock, remove_lock_entry,
-    upsert_lock_entry, write_skills_lock_atomic,
+    SkillLockConversionCandidate, SkillLockEntry, SkillsLock, ensure_skills_lock_v2,
+    find_lock_entry, read_skills_lock, remove_lock_entry, upsert_lock_entry,
+    write_skills_lock_atomic,
 };
 pub use resolver::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillResolutionInput,

@@ -1568,7 +1568,7 @@ mod tests {
     use super::*;
     use crate::conversation::reducer::TurnView;
     use pioneer_protocol::{
-        ArtifactKind, ArtifactStatus, McpScopeKind, TimelineLane, TimelineOrigin,
+        ArtifactKind, ArtifactStatus, McpScopeKind, SkillId, TimelineLane, TimelineOrigin,
         TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
         ToolOutputPolicySnapshot, ToolOutputSummary, ToolStoragePayload, TurnItem,
         TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary,
@@ -1641,8 +1641,9 @@ mod tests {
             },
             UserMessageAttachment::Skill {
                 capability: TurnSkillCapabilitySummary {
-                    id: "skill:user:docs".to_owned(),
+                    skill_id: SkillId::new("D".repeat(21)).expect("valid skill id"),
                     label: "docs".to_owned(),
+                    owner: None,
                     slug: "docs".to_owned(),
                     source_kind: "user".to_owned(),
                 },

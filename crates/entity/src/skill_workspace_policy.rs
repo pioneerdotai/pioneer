@@ -9,12 +9,10 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uq_skill_workspace_policy_workspace_skill_source")]
+    #[sea_orm(unique_key = "uq_skill_workspace_policy_workspace_skill_id")]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uq_skill_workspace_policy_workspace_skill_source")]
-    pub skill_slug: String,
-    #[sea_orm(unique_key = "uq_skill_workspace_policy_workspace_skill_source")]
-    pub source_kind: String,
+    #[sea_orm(unique_key = "uq_skill_workspace_policy_workspace_skill_id")]
+    pub skill_id: String,
     pub enabled: Option<bool>,
     pub allow_implicit_invocation: Option<bool>,
     pub created_at: DateTimeWithTimeZone,

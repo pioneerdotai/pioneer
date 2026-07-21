@@ -885,6 +885,8 @@ fn protocol_skill_audit_event(
     event: pioneer_skills::SkillAuditEvent,
 ) -> pioneer_protocol::SkillAuditEvent {
     pioneer_protocol::SkillAuditEvent {
+        skill_id: event.skill_id,
+        skill_owner: event.skill_owner,
         skill_slug: event.skill_slug,
         source_kind: event.source_kind,
         action: event.action.as_db_value().to_owned(),
@@ -904,23 +906,6 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
-}
-
-fn normalize_skill_capability_token(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 fn normalize_mcp_capability_token(value: &str) -> String {
@@ -958,22 +943,17 @@ fn resolve_turn_capability_input(
         }
 
         let canonical_key = match &capability.kind {
-            TurnCapabilityKind::Skill { slug, source_kind } => {
-                let slug = slug.trim();
-                let source_kind = source_kind.trim();
-                if slug.is_empty() || source_kind.is_empty() {
+            TurnCapabilityKind::Skill { skill_id } => {
+                let expected_id = format!("skill:{skill_id}");
+                if capability.id != expected_id {
                     normalized.rejected.push(rejected_capability(
                         capability,
                         TurnCapabilityRejectedReason::InvalidInput,
-                        "Skill capability is missing a slug or source kind.",
+                        format!("Skill capability must use exact ID `{expected_id}`."),
                     ));
                     continue;
                 }
-                format!(
-                    "skill:{}:{}",
-                    source_kind.to_ascii_lowercase(),
-                    normalize_skill_capability_token(slug)
-                )
+                expected_id
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 let name = name.trim();
@@ -1025,12 +1005,10 @@ fn resolve_turn_capability_input(
         }
 
         match &capability.kind {
-            TurnCapabilityKind::Skill { slug, source_kind } => {
+            TurnCapabilityKind::Skill { skill_id } => {
                 normalized.skill_refs.push(SkillExplicitRef {
-                    capability_id: capability.id.clone(),
+                    skill_id: skill_id.clone(),
                     label: capability.label.clone(),
-                    slug: slug.trim().to_owned(),
-                    source_kind: source_kind.trim().to_owned(),
                 });
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -1066,14 +1044,13 @@ fn normalize_turn_capabilities(capabilities: &[TurnCapability]) -> TurnCapabilit
 
 fn skill_capability_kind(reference: &SkillExplicitRef) -> TurnCapabilityKind {
     TurnCapabilityKind::Skill {
-        slug: reference.slug.clone(),
-        source_kind: reference.source_kind.clone(),
+        skill_id: reference.skill_id.clone(),
     }
 }
 
 fn accepted_skill_capability(reference: &SkillExplicitRef) -> TurnAcceptedCapability {
     TurnAcceptedCapability {
-        id: reference.capability_id.clone(),
+        id: reference.capability_id(),
         label: reference.label.clone(),
         kind: skill_capability_kind(reference),
         reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
@@ -1086,7 +1063,7 @@ fn rejected_skill_capability(
     message: impl Into<String>,
 ) -> TurnRejectedCapability {
     TurnRejectedCapability {
-        id: reference.capability_id.clone(),
+        id: reference.capability_id(),
         label: reference.label.clone(),
         kind: skill_capability_kind(reference),
         reason,
@@ -1095,44 +1072,17 @@ fn rejected_skill_capability(
 }
 
 fn skill_ref_matches_resolved_skill(reference: &SkillExplicitRef, skill: &ResolvedSkill) -> bool {
-    if !reference.source_kind.trim().is_empty()
-        && reference.source_kind.as_str() != skill.definition.identity.source_kind.as_db_value()
-    {
-        return false;
-    }
-
-    let normalized_ref = normalize_skill_capability_token(reference.slug.as_str());
-    if normalized_ref.is_empty() {
-        return false;
-    }
-
-    [
-        skill.slug.as_str(),
-        skill.definition.identity.slug.as_str(),
-        skill.definition.identity.name.as_str(),
-        skill.definition.identity.display_name.as_str(),
-    ]
-    .into_iter()
-    .any(|candidate| normalized_ref == normalize_skill_capability_token(candidate))
+    reference.skill_id == skill.skill_id
 }
 
 fn skill_ref_matches_excluded_skill(reference: &SkillExplicitRef, skill: &ExcludedSkill) -> bool {
-    if !reference.source_kind.trim().is_empty() && reference.source_kind != skill.source_kind {
-        return false;
-    }
-
-    let normalized_ref = normalize_skill_capability_token(reference.slug.as_str());
-    let normalized_slug = normalize_skill_capability_token(skill.slug.as_str());
-    normalized_ref == normalized_slug
-        || skill
-            .slug
-            .rsplit('/')
-            .next()
-            .is_some_and(|slug| normalized_ref == normalize_skill_capability_token(slug))
+    reference.skill_id == skill.skill_id
 }
 
 fn skill_rejection_reason(reason: &SkillExcludedReason) -> TurnCapabilityRejectedReason {
     match reason {
+        SkillExcludedReason::Unavailable => TurnCapabilityRejectedReason::Unavailable,
+        SkillExcludedReason::NotFound => TurnCapabilityRejectedReason::NotFound,
         SkillExcludedReason::DisabledByPolicy => TurnCapabilityRejectedReason::DisabledByPolicy,
         SkillExcludedReason::DependencyMissing => TurnCapabilityRejectedReason::DependencyMissing,
         SkillExcludedReason::ValidationRejected | SkillExcludedReason::InvalidMetadata => {
@@ -1151,8 +1101,11 @@ fn skill_rejection_message(reference: &SkillExplicitRef, reason: &SkillExcludedR
         .label
         .as_deref()
         .filter(|label| !label.trim().is_empty())
-        .unwrap_or(reference.slug.as_str());
+        .map(str::to_owned)
+        .unwrap_or_else(|| reference.skill_id.to_string());
     match reason {
+        SkillExcludedReason::Unavailable => format!("Skill `{label}` is unavailable."),
+        SkillExcludedReason::NotFound => format!("Skill `{label}` was not found."),
         SkillExcludedReason::DisabledByPolicy => {
             format!("Skill `{label}` is disabled by workspace policy.")
         }
@@ -1205,7 +1158,8 @@ fn resolve_skill_capability_summary(
             .label
             .as_deref()
             .filter(|label| !label.trim().is_empty())
-            .unwrap_or(reference.slug.as_str());
+            .map(str::to_owned)
+            .unwrap_or_else(|| reference.skill_id.to_string());
         summary.rejected.push(rejected_skill_capability(
             reference,
             TurnCapabilityRejectedReason::NotFound,
@@ -1290,7 +1244,7 @@ fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     }
 
     match &rejected.kind {
-        TurnCapabilityKind::Skill { slug, .. } => slug.clone(),
+        TurnCapabilityKind::Skill { skill_id } => skill_id.to_string(),
         TurnCapabilityKind::McpServer { name, .. } => name.clone(),
         TurnCapabilityKind::McpTool {
             server_name,
@@ -2245,6 +2199,7 @@ pub(super) async fn execute_chat_turn_flow(
     hook_runtime_context: AgentTurnHookRuntimeContext,
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    skill_catalog: pioneer_skills::SkillCatalogSnapshot,
     input: Vec<UserInput>,
     capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -2311,6 +2266,7 @@ pub(super) async fn execute_chat_turn_flow(
                 &input,
                 &capabilities,
                 &workspace_skill_policies,
+                &skill_catalog,
                 runtime_environment,
                 retained_llm_context,
                 execution_window_index,
@@ -2872,6 +2828,7 @@ async fn execute_agent_provider_response(
     input: &[UserInput],
     capabilities: &[TurnCapability],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     runtime_environment: HashMap<String, String>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_window_index: u32,
@@ -3010,10 +2967,9 @@ async fn execute_agent_provider_response(
     };
 
     let skills_resolution = match skills::resolve_turn_skills_with_explicit_refs(
-        workdir.as_path(),
-        workspace_id,
         input,
         normalized_capabilities.skill_refs.as_slice(),
+        skill_catalog,
         &tool_loop_config.skills,
         workspace_skill_policies,
         &projected_mcp_availability,
@@ -4759,6 +4715,7 @@ async fn execute_agent_provider_response(
                                     "error": check.message,
                                     "code": check.reason_code,
                                     "dependency_diagnostics": check.dependency_diagnostics,
+                                    "skill_id": descriptor.skill_id,
                                     "skill_slug": descriptor.skill_slug,
                                     "source_kind": descriptor.source_kind.as_db_value(),
                                 });
@@ -4821,6 +4778,8 @@ async fn execute_agent_provider_response(
                                         turn_id: turn_id.clone(),
                                         events: vec![protocol_skill_audit_event(
                                             pioneer_skills::SkillAuditEvent::runtime_blocked(
+                                                descriptor.skill_id.clone(),
+                                                descriptor.skill_owner.clone(),
                                                 descriptor.skill_slug.clone(),
                                                 descriptor.source_kind.as_db_value().to_owned(),
                                                 check
@@ -5948,30 +5907,39 @@ mod tests {
         assert!(signature.contains("max_revision_rounds_reached"));
     }
 
-    fn skill_capability(id: &str, slug: &str) -> TurnCapability {
+    fn test_skill_id(seed: &str) -> pioneer_protocol::SkillId {
+        let mut value = seed
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(21);
+        while value.len() < 21 {
+            value.push('T');
+        }
+        pioneer_protocol::SkillId::new(value).expect("valid test SkillId")
+    }
+
+    fn skill_capability(seed: &str, label: &str) -> TurnCapability {
+        let skill_id = test_skill_id(seed);
         TurnCapability {
-            id: id.to_owned(),
-            label: Some(slug.to_owned()),
-            kind: TurnCapabilityKind::Skill {
-                slug: slug.to_owned(),
-                source_kind: "user".to_owned(),
-            },
+            id: format!("skill:{skill_id}"),
+            label: Some(label.to_owned()),
+            kind: TurnCapabilityKind::Skill { skill_id },
         }
     }
 
-    fn explicit_skill_ref(id: &str, slug: &str) -> SkillExplicitRef {
+    fn explicit_skill_ref(seed: &str, label: &str) -> SkillExplicitRef {
         SkillExplicitRef {
-            capability_id: id.to_owned(),
-            label: Some(slug.to_owned()),
-            slug: slug.to_owned(),
-            source_kind: "user".to_owned(),
+            skill_id: test_skill_id(seed),
+            label: Some(label.to_owned()),
         }
     }
 
     fn test_skill_definition(slug: &str) -> pioneer_skills::SkillDefinition {
         let conformance = default_skill_conformance();
         compile_skill_definition(CompileSkillInput {
-            owner: "workspace".to_owned(),
+            skill_id: test_skill_id(slug),
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: slug.to_owned(),
@@ -6059,26 +6027,24 @@ mod tests {
     }
 
     #[test]
-    fn normalize_turn_capabilities_deduplicates_by_canonical_key() {
+    fn normalize_turn_capabilities_keeps_duplicate_labels_with_distinct_ids() {
         let normalized = normalize_turn_capabilities(&[
-            skill_capability("skill:user:docs-a", "docs"),
-            skill_capability("skill:user:docs-b", "docs"),
+            skill_capability("docs-a", "docs"),
+            skill_capability("docs-b", "docs"),
         ]);
 
-        assert_eq!(normalized.skill_refs.len(), 1);
-        assert_eq!(normalized.skill_refs[0].capability_id, "skill:user:docs-a");
-        assert_eq!(normalized.rejected.len(), 1);
-        assert_eq!(normalized.rejected[0].id, "skill:user:docs-b");
-        assert_eq!(
-            normalized.rejected[0].reason,
-            TurnCapabilityRejectedReason::Duplicate
+        assert_eq!(normalized.skill_refs.len(), 2);
+        assert_ne!(
+            normalized.skill_refs[0].skill_id,
+            normalized.skill_refs[1].skill_id
         );
+        assert!(normalized.rejected.is_empty());
     }
 
     #[test]
     fn normalize_turn_capabilities_splits_skill_server_and_tool_refs() {
         let normalized = normalize_turn_capabilities(&[
-            skill_capability("skill:user:docs", "docs"),
+            skill_capability("docs", "docs"),
             mcp_server_capability("mcp-server:workspace:browser", " browser "),
             mcp_tool_capability("mcp-tool:workspace:browser:open", " browser ", " open "),
         ]);
@@ -6086,9 +6052,7 @@ mod tests {
         assert_eq!(normalized.rejected, Vec::new());
 
         assert_eq!(normalized.skill_refs.len(), 1);
-        assert_eq!(normalized.skill_refs[0].capability_id, "skill:user:docs");
-        assert_eq!(normalized.skill_refs[0].slug, "docs");
-        assert_eq!(normalized.skill_refs[0].source_kind, "user");
+        assert_eq!(normalized.skill_refs[0].skill_id, test_skill_id("docs"));
 
         assert_eq!(normalized.mcp_server_refs.len(), 1);
         assert_eq!(
@@ -6116,9 +6080,10 @@ mod tests {
 
     #[test]
     fn resolve_skill_capability_summary_accepts_explicit_skill_with_stable_reason() {
-        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let explicit_ref = explicit_skill_ref("docs", "docs");
         let resolution = turn_skill_resolution(
             vec![ResolvedSkill {
+                skill_id: test_skill_id("docs"),
                 slug: "workspace/docs".to_owned(),
                 reason: SkillResolvedReason::ExplicitCapability,
                 definition: test_skill_definition("docs"),
@@ -6130,7 +6095,10 @@ mod tests {
 
         assert!(summary.rejected.is_empty());
         assert_eq!(summary.accepted.len(), 1);
-        assert_eq!(summary.accepted[0].id, "skill:user:docs");
+        assert_eq!(
+            summary.accepted[0].id,
+            format!("skill:{}", test_skill_id("docs"))
+        );
         assert_eq!(summary.accepted[0].label.as_deref(), Some("docs"));
         assert_eq!(
             summary.accepted[0].reason,
@@ -6139,22 +6107,24 @@ mod tests {
         assert_eq!(
             summary.accepted[0].kind,
             TurnCapabilityKind::Skill {
-                slug: "docs".to_owned(),
-                source_kind: "user".to_owned()
+                skill_id: test_skill_id("docs")
             }
         );
     }
 
     #[test]
     fn resolve_skill_capability_summary_rejects_missing_skill() {
-        let explicit_ref = explicit_skill_ref("skill:user:missing", "missing");
+        let explicit_ref = explicit_skill_ref("missing", "missing");
         let resolution = turn_skill_resolution(Vec::new(), Vec::new());
 
         let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
 
         assert!(summary.accepted.is_empty());
         assert_eq!(summary.rejected.len(), 1);
-        assert_eq!(summary.rejected[0].id, "skill:user:missing");
+        assert_eq!(
+            summary.rejected[0].id,
+            format!("skill:{}", test_skill_id("missing"))
+        );
         assert_eq!(
             summary.rejected[0].reason,
             TurnCapabilityRejectedReason::NotFound
@@ -6168,10 +6138,12 @@ mod tests {
 
     #[test]
     fn resolve_skill_capability_summary_rejects_disabled_skill() {
-        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let explicit_ref = explicit_skill_ref("docs", "docs");
         let resolution = turn_skill_resolution(
             Vec::new(),
             vec![ExcludedSkill {
+                skill_id: test_skill_id("docs"),
+                owner: Some("workspace".to_owned()),
                 slug: "workspace/docs".to_owned(),
                 source_kind: "user".to_owned(),
                 reason: SkillExcludedReason::DisabledByPolicy,
@@ -6184,7 +6156,10 @@ mod tests {
 
         assert!(summary.accepted.is_empty());
         assert_eq!(summary.rejected.len(), 1);
-        assert_eq!(summary.rejected[0].id, "skill:user:docs");
+        assert_eq!(
+            summary.rejected[0].id,
+            format!("skill:{}", test_skill_id("docs"))
+        );
         assert_eq!(
             summary.rejected[0].reason,
             TurnCapabilityRejectedReason::DisabledByPolicy
@@ -6193,10 +6168,12 @@ mod tests {
 
     #[test]
     fn resolve_skill_capability_summary_rejects_security_blocked_skill() {
-        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let explicit_ref = explicit_skill_ref("docs", "docs");
         let resolution = turn_skill_resolution(
             Vec::new(),
             vec![ExcludedSkill {
+                skill_id: test_skill_id("docs"),
+                owner: Some("workspace".to_owned()),
                 slug: "workspace/docs".to_owned(),
                 source_kind: "user".to_owned(),
                 reason: SkillExcludedReason::SecurityBlocked,
@@ -6209,7 +6186,10 @@ mod tests {
 
         assert!(summary.accepted.is_empty());
         assert_eq!(summary.rejected.len(), 1);
-        assert_eq!(summary.rejected[0].id, "skill:user:docs");
+        assert_eq!(
+            summary.rejected[0].id,
+            format!("skill:{}", test_skill_id("docs"))
+        );
         assert_eq!(
             summary.rejected[0].reason,
             TurnCapabilityRejectedReason::SecurityBlocked

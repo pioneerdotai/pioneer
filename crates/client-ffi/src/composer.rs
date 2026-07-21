@@ -385,9 +385,11 @@ pub fn skill_capability_from_row(
     request: ClientComposerSkillCapabilityFromRowRequest,
 ) -> ComposerCapability {
     ComposerCapability {
-        id: request.row.key,
+        id: pioneer_protocol::skill_capability_key(&request.row.skill_id),
         label: request.row.label,
         kind: pioneer_client::composer::capabilities::ComposerCapabilityKind::Skill {
+            skill_id: request.row.skill_id,
+            owner: request.row.owner,
             slug: request.row.slug,
             source_kind: request.row.source_kind,
         },

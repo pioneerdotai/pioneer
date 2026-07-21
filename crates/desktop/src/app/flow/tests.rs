@@ -12,9 +12,30 @@ use pioneer_client::composer::capabilities::{
 };
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_protocol::{
-    CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+    CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillId,
+    skill_capability_key,
 };
 use std::time::Duration;
+
+fn desktop_skill_capability(
+    seed: char,
+    owner: Option<&str>,
+    slug: &str,
+    source_kind: &str,
+    label: &str,
+) -> ComposerCapability {
+    let skill_id = SkillId::new(seed.to_string().repeat(21)).expect("valid test skill id");
+    ComposerCapability {
+        id: skill_capability_key(&skill_id),
+        label: label.to_owned(),
+        kind: ComposerCapabilityKind::Skill {
+            skill_id,
+            owner: owner.map(str::to_owned),
+            slug: slug.to_owned(),
+            source_kind: source_kind.to_owned(),
+        },
+    }
+}
 
 #[test]
 fn ws_connect_spec_uses_resolved_in_memory_auth_token() {
@@ -141,22 +162,8 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
         recent_stderr: Vec::new(),
     };
     let capabilities = vec![
-        ComposerCapability {
-            id: "user".to_owned(),
-            label: "User".to_owned(),
-            kind: ComposerCapabilityKind::Skill {
-                slug: "user".to_owned(),
-                source_kind: "user".to_owned(),
-            },
-        },
-        ComposerCapability {
-            id: "system".to_owned(),
-            label: "System".to_owned(),
-            kind: ComposerCapabilityKind::Skill {
-                slug: "system".to_owned(),
-                source_kind: "system".to_owned(),
-            },
-        },
+        desktop_skill_capability('U', None, "user", "user", "User"),
+        desktop_skill_capability('S', Some("pioneer"), "system", "system", "System"),
         ComposerCapability {
             id: "server".to_owned(),
             label: "Docs".to_owned(),
@@ -187,7 +194,12 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
             .iter()
             .map(|capability| capability.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["user", "server", "tool"]
+        vec![
+            "skill:UUUUUUUUUUUUUUUUUUUUU",
+            "skill:SSSSSSSSSSSSSSSSSSSSS",
+            "server",
+            "tool",
+        ]
     );
     assert_eq!(
         composer_capability_target_for_provider(Some("cli_runtime:missing"), &[runtime]),
@@ -197,6 +209,36 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
         composer_capability_target_for_provider(Some("openai"), &[]),
         ComposerCapabilityTarget::native()
     );
+}
+
+#[test]
+fn desktop_composer_keeps_duplicate_skill_labels_as_exact_id_rows() {
+    let first = desktop_skill_capability('A', Some("alex"), "humanizer", "user", "alex/humanizer");
+    let second = desktop_skill_capability('B', Some("alex"), "humanizer", "user", "alex/humanizer");
+
+    let rows = filter_composer_capabilities_for_target(
+        &[first.clone(), second.clone()],
+        ComposerCapabilityTarget::native(),
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].label, rows[1].label);
+    assert_ne!(rows[0].id, rows[1].id);
+    assert_eq!(rows[0].id, first.id);
+    assert_eq!(rows[1].id, second.id);
+    assert!(matches!(
+        (&rows[0].kind, &rows[1].kind),
+        (
+            ComposerCapabilityKind::Skill {
+                skill_id: first_id,
+                ..
+            },
+            ComposerCapabilityKind::Skill {
+                skill_id: second_id,
+                ..
+            }
+        ) if first_id != second_id
+    ));
 }
 
 #[test]
@@ -210,14 +252,7 @@ fn desktop_submission_preserves_explicit_mcp_when_presentation_catalog_is_stale(
                 scope_kind: McpScopeKind::Workspace,
             },
         },
-        ComposerCapability {
-            id: "system".to_owned(),
-            label: "Memory".to_owned(),
-            kind: ComposerCapabilityKind::Skill {
-                slug: "memory".to_owned(),
-                source_kind: "system".to_owned(),
-            },
-        },
+        desktop_skill_capability('M', Some("pioneer"), "memory", "system", "Memory"),
     ];
 
     assert_eq!(
@@ -239,8 +274,9 @@ fn desktop_submission_preserves_explicit_mcp_when_presentation_catalog_is_stale(
 
     assert_eq!(text.capabilities, voice.capabilities);
     assert_eq!(text.removed, voice.removed);
-    assert_eq!(text.capabilities.len(), 1);
+    assert_eq!(text.capabilities.len(), 2);
     assert_eq!(text.capabilities[0].id, "server");
+    assert_eq!(text.capabilities[1].id, "skill:MMMMMMMMMMMMMMMMMMMMM");
     assert!(text.has_composer_payload);
     assert!(voice.has_composer_payload);
 }

@@ -7,6 +7,7 @@ use pioneer_client::{
     skills::actions as skill_actions, skills::catalog as skill_catalog,
     workspaces::selectors as workspace_selectors,
 };
+use pioneer_protocol::SkillId;
 use std::time::Duration;
 use tracing::warn;
 
@@ -22,22 +23,17 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn open_skill_from_sidebar(
         &mut self,
-        slug: String,
-        source_kind: String,
+        skill_id: SkillId,
         cx: &mut Context<Self>,
     ) {
-        let exists = skill_catalog::skill_exists(
-            self.installed_skills.as_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
-        );
+        let exists = skill_catalog::skill_exists(self.installed_skills.as_slice(), &skill_id);
 
         if !exists {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
             return;
         }
 
-        self.selected_skill_target = Some((slug, source_kind));
+        self.selected_skill_target = Some(skill_id);
         self.set_main_content_view(MainContentView::SkillDetails, cx);
     }
 
@@ -147,17 +143,12 @@ impl PioneerDesktop {
         });
     }
 
-    pub(super) fn is_skill_pending(&self, slug: &str, source_kind: &str) -> bool {
-        skill_catalog::is_skill_pending(&self.skills_pending_actions, slug, source_kind)
+    pub(super) fn is_skill_pending(&self, skill_id: &SkillId) -> bool {
+        skill_catalog::is_skill_pending(&self.skills_pending_actions, skill_id)
     }
 
-    pub(super) fn mark_skill_pending(&mut self, slug: &str, source_kind: &str, pending: bool) {
-        skill_catalog::mark_skill_pending(
-            &mut self.skills_pending_actions,
-            slug,
-            source_kind,
-            pending,
-        );
+    pub(super) fn mark_skill_pending(&mut self, skill_id: &SkillId, pending: bool) {
+        skill_catalog::mark_skill_pending(&mut self.skills_pending_actions, skill_id, pending);
     }
 
     pub(super) fn apply_skills_catalog_refresh_success_reduction(

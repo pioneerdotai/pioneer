@@ -27,6 +27,7 @@ mod m20260715_000001_cli_runtime_recovery_confirmation;
 mod m20260715_000002_turn_mcp_projection;
 mod m20260716_000001_turn_cli_runtime_instruction;
 mod m20260720_000001_cli_runtime_execution_segment;
+mod m20260720_000002_stable_skill_id;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -57,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260715_000001_cli_runtime_recovery_confirmation::Migration),
             Box::new(m20260716_000001_turn_cli_runtime_instruction::Migration),
             Box::new(m20260720_000001_cli_runtime_execution_segment::Migration),
+            Box::new(m20260720_000002_stable_skill_id::Migration),
         ]
     }
 }

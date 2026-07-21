@@ -17,18 +17,19 @@ use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
     ArtifactSummary, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
     PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams,
-    TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
-    TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
-    TaskGetResponse, TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus,
-    TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
-    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnPermissionProfileSnapshot,
-    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
+    RecoveryTrigger, SandboxMode, SkillId, StorageOutputPolicy, Task, TaskAgendaItem,
+    TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskDependency, TaskError,
+    TaskEventsResponse, TaskExecutorKind, TaskGetResponse, TaskListParams, TaskResult,
+    TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewEvent, TaskRun,
+    TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskThreadLineage, TaskTree,
+    TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement, TimelineOutputPolicy,
+    ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
+    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsResponse, TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
+    UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -698,6 +699,8 @@ pub enum ClaimedRecoveryActivation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSkillBindingRecord {
+    pub skill_id: SkillId,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub skill_version: Option<String>,
     pub fingerprint: String,
@@ -707,15 +710,17 @@ pub struct TurnSkillBindingRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSkillPolicyRecord {
+    pub id: String,
     pub workspace_id: String,
-    pub skill_slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
     pub enabled: Option<bool>,
     pub allow_implicit_invocation: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInstallationRecord {
+    pub skill_id: SkillId,
+    pub owner: Option<String>,
     pub slug: String,
     pub version: Option<String>,
     pub source_kind: String,
@@ -727,9 +732,66 @@ pub struct SkillInstallationRecord {
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillInstallationPatch {
+    pub owner: Option<Option<String>>,
+    pub slug: Option<String>,
+    pub version: Option<Option<String>>,
+    pub source_kind: Option<String>,
+    pub scope_key: Option<String>,
+    pub source_ref: Option<String>,
+    pub install_path: Option<String>,
+    pub trust_level: Option<String>,
+    pub fingerprint: Option<String>,
+}
+
+fn skill_installation_record_from_model(
+    model: pioneer_entity::skill_installation::Model,
+) -> Result<SkillInstallationRecord> {
+    let skill_id = SkillId::new(model.id.clone()).with_context(|| {
+        format!(
+            "skill installation primary key `{}` is not a valid SkillId",
+            model.id
+        )
+    })?;
+    Ok(SkillInstallationRecord {
+        skill_id,
+        owner: model.owner,
+        slug: model.slug,
+        version: model.version,
+        source_kind: model.source_kind,
+        scope_key: model.scope_key,
+        source_ref: model.source_ref,
+        install_path: model.install_path,
+        trust_level: model.trust_level,
+        fingerprint: model.fingerprint,
+        updated_at_unix: model.updated_at.timestamp(),
+    })
+}
+
+fn workspace_skill_policy_record_from_model(
+    model: pioneer_entity::skill_workspace_policy::Model,
+) -> Result<WorkspaceSkillPolicyRecord> {
+    let skill_id = SkillId::new(model.skill_id.clone()).with_context(|| {
+        format!(
+            "workspace skill policy key `{}` is not a valid SkillId",
+            model.skill_id
+        )
+    })?;
+    Ok(WorkspaceSkillPolicyRecord {
+        id: model.id,
+        workspace_id: model.workspace_id,
+        skill_id,
+        enabled: model.enabled,
+        allow_implicit_invocation: model.allow_implicit_invocation,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillAuditEventRecord {
     pub turn_id: Option<String>,
+    pub skill_id: SkillId,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub action: String,
@@ -742,10 +804,75 @@ pub struct SkillAuditEventRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDependencySnapshotRecord {
     pub turn_id: Option<String>,
+    pub skill_id: SkillId,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub source_kind: String,
     pub diagnostics_json: String,
     pub created_at_unix: i64,
+}
+
+fn turn_skill_binding_record_from_model(
+    model: pioneer_entity::turn_skill_binding::Model,
+) -> Result<TurnSkillBindingRecord> {
+    let skill_id = SkillId::new(model.skill_id.clone()).with_context(|| {
+        format!(
+            "turn skill binding key `{}` is not a valid SkillId",
+            model.skill_id
+        )
+    })?;
+    Ok(TurnSkillBindingRecord {
+        skill_id,
+        skill_owner: model.skill_owner,
+        skill_slug: model.skill_slug,
+        skill_version: model.skill_version,
+        fingerprint: model.fingerprint,
+        source_kind: model.source_kind,
+        resolved_reason: model.resolved_reason,
+    })
+}
+
+fn skill_audit_event_record_from_model(
+    model: pioneer_entity::skill_audit_event::Model,
+) -> Result<SkillAuditEventRecord> {
+    let skill_id = SkillId::new(model.skill_id.clone()).with_context(|| {
+        format!(
+            "skill audit event key `{}` is not a valid SkillId",
+            model.skill_id
+        )
+    })?;
+    Ok(SkillAuditEventRecord {
+        turn_id: model.turn_id,
+        skill_id,
+        skill_owner: model.skill_owner,
+        skill_slug: model.skill_slug,
+        source_kind: model.source_kind,
+        action: model.action,
+        decision: model.decision,
+        reason_code: model.reason_code,
+        details_json: model.details_json,
+        created_at_unix: model.created_at.timestamp(),
+    })
+}
+
+fn skill_dependency_snapshot_record_from_model(
+    model: pioneer_entity::skill_dependency_snapshot::Model,
+) -> Result<SkillDependencySnapshotRecord> {
+    let skill_id = SkillId::new(model.skill_id.clone()).with_context(|| {
+        format!(
+            "skill dependency snapshot key `{}` is not a valid SkillId",
+            model.skill_id
+        )
+    })?;
+    Ok(SkillDependencySnapshotRecord {
+        turn_id: model.turn_id,
+        skill_id,
+        skill_owner: model.skill_owner,
+        skill_slug: model.skill_slug,
+        source_kind: model.source_kind,
+        diagnostics_json: model.diagnostics_json,
+        created_at_unix: model.created_at.timestamp(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9015,14 +9142,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let rows = turn_skill_binding::list_turn_skill_bindings(&self.connection, turn_id).await?;
         Ok(rows
             .into_iter()
-            .map(|row| TurnSkillBindingRecord {
-                skill_slug: row.skill_slug,
-                skill_version: row.skill_version,
-                fingerprint: row.fingerprint,
-                source_kind: row.source_kind,
-                resolved_reason: row.resolved_reason,
-            })
-            .collect())
+            .map(turn_skill_binding_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn find_turn_skill_bindings(
@@ -9032,14 +9153,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let rows = turn_skill_binding::find_turn_skill_bindings(&self.connection, turn_id).await?;
         Ok(rows
             .into_iter()
-            .map(|row| TurnSkillBindingRecord {
-                skill_slug: row.skill_slug,
-                skill_version: row.skill_version,
-                fingerprint: row.fingerprint,
-                source_kind: row.source_kind,
-                resolved_reason: row.resolved_reason,
-            })
-            .collect())
+            .map(turn_skill_binding_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn list_workspace_skill_policies(
@@ -9051,14 +9166,23 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 .await?;
         Ok(rows
             .into_iter()
-            .map(|row| WorkspaceSkillPolicyRecord {
-                workspace_id: row.workspace_id,
-                skill_slug: row.skill_slug,
-                source_kind: row.source_kind,
-                enabled: row.enabled,
-                allow_implicit_invocation: row.allow_implicit_invocation,
-            })
-            .collect())
+            .map(workspace_skill_policy_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
+    }
+
+    pub async fn find_workspace_skill_policy(
+        &self,
+        workspace_id: &str,
+        skill_id: &SkillId,
+    ) -> Result<Option<WorkspaceSkillPolicyRecord>> {
+        skill_workspace_policy::find_workspace_skill_policy(
+            &self.connection,
+            workspace_id,
+            skill_id,
+        )
+        .await?
+        .map(workspace_skill_policy_record_from_model)
+        .transpose()
     }
 
     pub async fn upsert_workspace_skill_policy(
@@ -9082,93 +9206,153 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     pub async fn delete_workspace_skill_policy(
         &self,
         workspace_id: &str,
-        skill_slug: &str,
-        source_kind: &str,
-    ) -> Result<()> {
+        skill_id: &SkillId,
+    ) -> Result<bool> {
         self.run_serialized_write(|| async {
             skill_workspace_policy::delete_workspace_skill_policy(
                 &self.connection,
                 workspace_id,
-                skill_slug,
-                source_kind,
+                skill_id,
             )
             .await
         })
         .await
     }
 
-    pub async fn upsert_skill_installation(
+    pub async fn insert_skill_installation(
         &self,
         record: &SkillInstallationRecord,
         event_timestamp_secs: i64,
     ) -> Result<()> {
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(event_timestamp_secs);
-            skill_installation::upsert_skill_installation(&self.connection, record, now, now).await
+            skill_installation::insert_skill_installation(&self.connection, record, now, now).await
         })
         .await
     }
 
-    pub async fn delete_skill_installation(
+    pub async fn insert_skill_installation_with_policy(
         &self,
-        slug: &str,
-        source_kind: &str,
-        scope_key: &str,
+        installation: &SkillInstallationRecord,
+        policy: &WorkspaceSkillPolicyRecord,
+        event_timestamp_secs: i64,
     ) -> Result<()> {
         self.run_serialized_write(|| async {
-            skill_installation::delete_skill_installation(
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin skill installation transaction")?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            if let Err(error) =
+                skill_installation::insert_skill_installation(&transaction, installation, now, now)
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if let Err(error) = skill_workspace_policy::upsert_workspace_skill_policy(
+                &transaction,
+                policy,
+                now,
+                now,
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit skill installation transaction")
+        })
+        .await
+    }
+
+    pub async fn update_skill_installation(
+        &self,
+        skill_id: &SkillId,
+        patch: &SkillInstallationPatch,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            skill_installation::update_skill_installation(
                 &self.connection,
-                slug,
-                source_kind,
-                scope_key,
+                skill_id,
+                patch,
+                unix_to_datetime(event_timestamp_secs),
             )
             .await
         })
         .await
     }
 
+    pub async fn delete_skill_installation(&self, skill_id: &SkillId) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            skill_installation::delete_skill_installation(&self.connection, skill_id).await
+        })
+        .await
+    }
+
+    pub async fn delete_skill_installation_with_workspace_policy(
+        &self,
+        workspace_id: &str,
+        skill_id: &SkillId,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin skill uninstall transaction")?;
+            let removed =
+                match skill_installation::delete_skill_installation(&transaction, skill_id).await {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+            if !removed {
+                let _ = transaction.rollback().await;
+                return Ok(false);
+            }
+            if let Err(error) = skill_workspace_policy::delete_workspace_skill_policy(
+                &transaction,
+                workspace_id,
+                skill_id,
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit skill uninstall transaction")?;
+            Ok(true)
+        })
+        .await
+    }
+
     pub async fn find_skill_installation(
         &self,
-        slug: &str,
-        source_kind: &str,
-        scope_key: &str,
+        skill_id: &SkillId,
     ) -> Result<Option<SkillInstallationRecord>> {
-        let row = skill_installation::find_skill_installation(
-            &self.connection,
-            slug,
-            source_kind,
-            scope_key,
-        )
-        .await?;
-        Ok(row.map(|model| SkillInstallationRecord {
-            slug: model.slug,
-            version: model.version,
-            source_kind: model.source_kind,
-            scope_key: model.scope_key,
-            source_ref: model.source_ref,
-            install_path: model.install_path,
-            trust_level: model.trust_level,
-            fingerprint: model.fingerprint,
-            updated_at_unix: model.updated_at.timestamp(),
-        }))
+        skill_installation::find_skill_installation(&self.connection, skill_id)
+            .await?
+            .map(skill_installation_record_from_model)
+            .transpose()
     }
 
     pub async fn list_skill_installations(&self) -> Result<Vec<SkillInstallationRecord>> {
         let rows = skill_installation::list_skill_installations(&self.connection).await?;
         Ok(rows
             .into_iter()
-            .map(|model| SkillInstallationRecord {
-                slug: model.slug,
-                version: model.version,
-                source_kind: model.source_kind,
-                scope_key: model.scope_key,
-                source_ref: model.source_ref,
-                install_path: model.install_path,
-                trust_level: model.trust_level,
-                fingerprint: model.fingerprint,
-                updated_at_unix: model.updated_at.timestamp(),
-            })
-            .collect())
+            .map(skill_installation_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn upsert_skill_upload_session(
@@ -9734,67 +9918,21 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             skill_audit_event::list_turn_skill_audit_events(&self.connection, turn_id).await?;
         Ok(rows
             .into_iter()
-            .map(|model| SkillAuditEventRecord {
-                turn_id: model.turn_id,
-                skill_slug: model.skill_slug,
-                source_kind: model.source_kind,
-                action: model.action,
-                decision: model.decision,
-                reason_code: model.reason_code,
-                details_json: model.details_json,
-                created_at_unix: model.created_at.timestamp(),
-            })
-            .collect())
+            .map(skill_audit_event_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn list_skill_audit_event_records(
         &self,
-        skill_slug: &str,
+        skill_id: &SkillId,
         limit: u64,
     ) -> Result<Vec<SkillAuditEventRecord>> {
         let rows =
-            skill_audit_event::list_skill_audit_events(&self.connection, skill_slug, limit).await?;
+            skill_audit_event::list_skill_audit_events(&self.connection, skill_id, limit).await?;
         Ok(rows
             .into_iter()
-            .map(|model| SkillAuditEventRecord {
-                turn_id: model.turn_id,
-                skill_slug: model.skill_slug,
-                source_kind: model.source_kind,
-                action: model.action,
-                decision: model.decision,
-                reason_code: model.reason_code,
-                details_json: model.details_json,
-                created_at_unix: model.created_at.timestamp(),
-            })
-            .collect())
-    }
-
-    pub async fn list_skill_audit_event_records_for_source(
-        &self,
-        skill_slug: &str,
-        source_kind: &str,
-        limit: u64,
-    ) -> Result<Vec<SkillAuditEventRecord>> {
-        let rows = skill_audit_event::list_skill_audit_events_for_source(
-            &self.connection,
-            skill_slug,
-            source_kind,
-            limit,
-        )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|model| SkillAuditEventRecord {
-                turn_id: model.turn_id,
-                skill_slug: model.skill_slug,
-                source_kind: model.source_kind,
-                action: model.action,
-                decision: model.decision,
-                reason_code: model.reason_code,
-                details_json: model.details_json,
-                created_at_unix: model.created_at.timestamp(),
-            })
-            .collect())
+            .map(skill_audit_event_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn insert_skill_dependency_snapshot_record(
@@ -9819,14 +9957,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|model| SkillDependencySnapshotRecord {
-                turn_id: model.turn_id,
-                skill_slug: model.skill_slug,
-                source_kind: model.source_kind,
-                diagnostics_json: model.diagnostics_json,
-                created_at_unix: model.created_at.timestamp(),
-            })
-            .collect())
+            .map(skill_dependency_snapshot_record_from_model)
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub async fn get_thread_by_id(
@@ -13949,7 +14081,8 @@ mod tests {
         NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
-        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
+        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillDependencySnapshotRecord,
+        SkillInstallationPatch, SkillInstallationRecord,
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
@@ -13976,8 +14109,8 @@ mod tests {
         PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
         PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
         PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-        RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SystemEventLevel, Task,
-        TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
+        RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SystemEventLevel,
+        Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
         TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate,
         TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
         TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus,
@@ -13994,13 +14127,23 @@ mod tests {
         TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
         TurnItemType, TurnKind, TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
-        TurnToolLoopBudgetExceededNotification, UserInput,
+        TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
         QueryOrder, Set, Statement,
     };
     use std::collections::BTreeMap;
+
+    struct ReversibleMigrator;
+
+    impl MigratorTrait for ReversibleMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            let mut migrations = Migrator::migrations();
+            migrations.pop();
+            migrations
+        }
+    }
 
     async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
@@ -19425,7 +19568,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
+        ReversibleMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -19508,7 +19651,7 @@ mod tests {
             .expect("turn_llm_context entity should match migration columns");
         assert!(rows.is_empty());
 
-        Migrator::down(&connection, None)
+        ReversibleMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         let table_after_down = connection
@@ -19530,7 +19673,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
+        ReversibleMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -19676,7 +19819,7 @@ mod tests {
                 .is_empty()
         );
 
-        Migrator::down(&connection, None)
+        ReversibleMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         for table_name in ["turn_execution_window", "turn_execution_checkpoint"] {
@@ -19990,7 +20133,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
+        ReversibleMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -20092,7 +20235,7 @@ mod tests {
             "unique scope/name index should reject duplicate MCP installations"
         );
 
-        Migrator::down(&connection, None)
+        ReversibleMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         for table_name in [
@@ -20798,14 +20941,18 @@ mod tests {
 
         let first = vec![
             TurnSkillBindingRecord {
-                skill_slug: "pioneer/alpha-skill".to_owned(),
+                skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "duplicate-label".to_owned(),
                 skill_version: Some("1.0.0".to_owned()),
                 fingerprint: "fp-alpha".to_owned(),
                 source_kind: "registry".to_owned(),
                 resolved_reason: "explicit_composer_capability".to_owned(),
             },
             TurnSkillBindingRecord {
-                skill_slug: "pioneer/beta-skill".to_owned(),
+                skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "duplicate-label".to_owned(),
                 skill_version: None,
                 fingerprint: "fp-beta".to_owned(),
                 source_kind: "user".to_owned(),
@@ -20825,7 +20972,9 @@ mod tests {
         assert_eq!(first_read, first);
 
         let second = vec![TurnSkillBindingRecord {
-            skill_slug: "pioneer/gamma-skill".to_owned(),
+            skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
+            skill_owner: None,
+            skill_slug: "gamma-skill".to_owned(),
             skill_version: Some("2.1.0".to_owned()),
             fingerprint: "fp-gamma".to_owned(),
             source_kind: "system".to_owned(),
@@ -20845,7 +20994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_installation_upsert_is_unique_by_slug_source_and_scope() {
+    async fn skill_installation_mutations_target_exact_id_with_duplicate_metadata() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -20856,7 +21005,9 @@ mod tests {
         let store = CrudStore::new(connection);
 
         let first = SkillInstallationRecord {
-            slug: "pioneer/agent-browser".to_owned(),
+            skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
+            owner: Some("pioneer".to_owned()),
+            slug: "agent-browser".to_owned(),
             version: Some("1.0.0".to_owned()),
             source_kind: "registry".to_owned(),
             scope_key: "ws_one".to_owned(),
@@ -20867,43 +21018,105 @@ mod tests {
             updated_at_unix: 1_700_000_000,
         };
         store
-            .upsert_skill_installation(&first, 1_700_000_000)
+            .insert_skill_installation(&first, 1_700_000_000)
             .await
-            .expect("first upsert");
+            .expect("first insert");
 
         let second = SkillInstallationRecord {
-            fingerprint: "fp-2".to_owned(),
-            version: Some("1.1.0".to_owned()),
+            skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
             ..first.clone()
         };
         store
-            .upsert_skill_installation(&second, 1_700_000_100)
+            .insert_skill_installation(&second, 1_700_000_100)
             .await
-            .expect("second upsert");
+            .expect("duplicate-metadata insert");
 
         let rows = store
             .list_skill_installations()
             .await
             .expect("list skill installations");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].fingerprint, "fp-2");
-        assert_eq!(rows[0].version.as_deref(), Some("1.1.0"));
+        assert_eq!(rows.len(), 2);
 
-        let scoped = SkillInstallationRecord {
-            scope_key: "ws_two".to_owned(),
-            fingerprint: "fp-3".to_owned(),
-            ..first.clone()
+        let patch = SkillInstallationPatch {
+            version: Some(Some("1.1.0".to_owned())),
+            fingerprint: Some("fp-updated".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .update_skill_installation(&first.skill_id, &patch, 1_700_000_200)
+                .await
+                .expect("exact update")
+        );
+
+        let updated = store
+            .find_skill_installation(&first.skill_id)
+            .await
+            .expect("find updated row")
+            .expect("updated row exists");
+        let untouched = store
+            .find_skill_installation(&second.skill_id)
+            .await
+            .expect("find duplicate row")
+            .expect("duplicate row exists");
+        assert_eq!(updated.fingerprint, "fp-updated");
+        assert_eq!(updated.version.as_deref(), Some("1.1.0"));
+        assert_eq!(untouched.fingerprint, "fp-1");
+
+        assert!(
+            store
+                .delete_skill_installation(&first.skill_id)
+                .await
+                .expect("exact delete")
+        );
+        assert!(
+            store
+                .find_skill_installation(&first.skill_id)
+                .await
+                .expect("find deleted row")
+                .is_none()
+        );
+        assert!(
+            store
+                .find_skill_installation(&second.skill_id)
+                .await
+                .expect("find surviving duplicate")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn insertion_rejects_duplicate_skill_id_without_retargeting_metadata() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let record = SkillInstallationRecord {
+            skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
+            owner: None,
+            slug: "same".to_owned(),
+            version: None,
+            source_kind: "user".to_owned(),
+            scope_key: "ws_one".to_owned(),
+            source_ref: "upload:first".to_owned(),
+            install_path: "/tmp/skills/C/same".to_owned(),
+            trust_level: "community".to_owned(),
+            fingerprint: "fp".to_owned(),
+            updated_at_unix: 1_700_000_000,
         };
         store
-            .upsert_skill_installation(&scoped, 1_700_000_200)
+            .insert_skill_installation(&record, 1_700_000_000)
             .await
-            .expect("scoped upsert");
-
-        let rows = store
-            .list_skill_installations()
-            .await
-            .expect("list scoped skill installations");
-        assert_eq!(rows.len(), 2);
+            .expect("first insert");
+        assert!(
+            store
+                .insert_skill_installation(&record, 1_700_000_001)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -21343,7 +21556,9 @@ mod tests {
 
         let older = SkillAuditEventRecord {
             turn_id: Some(turn_id.to_owned()),
-            skill_slug: "pioneer/agent-browser".to_owned(),
+            skill_id: SkillId::new("E".repeat(21)).expect("valid skill id"),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "agent-browser".to_owned(),
             source_kind: "registry".to_owned(),
             action: "resolve_blocked".to_owned(),
             decision: "blocked".to_owned(),
@@ -21353,7 +21568,9 @@ mod tests {
         };
         let newer = SkillAuditEventRecord {
             turn_id: Some(turn_id.to_owned()),
-            skill_slug: "pioneer/agent-browser".to_owned(),
+            skill_id: older.skill_id.clone(),
+            skill_owner: older.skill_owner.clone(),
+            skill_slug: older.skill_slug.clone(),
             source_kind: "registry".to_owned(),
             action: "runtime_blocked".to_owned(),
             decision: "blocked".to_owned(),
@@ -21376,12 +21593,118 @@ mod tests {
         assert_eq!(rows[1].action, newer.action);
 
         let timeline = store
-            .list_skill_audit_event_records("pioneer/agent-browser", 16)
+            .list_skill_audit_event_records(&older.skill_id, 16)
             .await
             .expect("list audit timeline");
         assert_eq!(timeline.len(), 2);
         assert_eq!(timeline[0].action, newer.action);
         assert_eq!(timeline[1].action, older.action);
+    }
+
+    #[tokio::test]
+    async fn skill_history_survives_exact_installation_delete() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let skill_id = SkillId::new("G".repeat(21)).expect("valid skill id");
+        let turn_id = "turn_000000000000000088";
+
+        store
+            .insert_skill_installation(
+                &SkillInstallationRecord {
+                    skill_id: skill_id.clone(),
+                    owner: Some("pioneer".to_owned()),
+                    slug: "historical".to_owned(),
+                    version: Some("1.0.0".to_owned()),
+                    source_kind: "user".to_owned(),
+                    scope_key: "ws_history".to_owned(),
+                    source_ref: "upload:history".to_owned(),
+                    install_path: "/tmp/skills/G/historical".to_owned(),
+                    trust_level: "community".to_owned(),
+                    fingerprint: "fp-history".to_owned(),
+                    updated_at_unix: 1_700_000_000,
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("insert active installation");
+
+        let binding = TurnSkillBindingRecord {
+            skill_id: skill_id.clone(),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "historical".to_owned(),
+            skill_version: Some("1.0.0".to_owned()),
+            fingerprint: "fp-history".to_owned(),
+            source_kind: "user".to_owned(),
+            resolved_reason: "explicit_composer_capability".to_owned(),
+        };
+        store
+            .replace_turn_skill_bindings(turn_id, &[binding.clone()], 1_700_000_001)
+            .await
+            .expect("insert binding history");
+
+        let audit = SkillAuditEventRecord {
+            turn_id: Some(turn_id.to_owned()),
+            skill_id: skill_id.clone(),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "historical".to_owned(),
+            source_kind: "user".to_owned(),
+            action: "resolve".to_owned(),
+            decision: "accepted".to_owned(),
+            reason_code: None,
+            details_json: "{}".to_owned(),
+            created_at_unix: 1_700_000_002,
+        };
+        store
+            .append_skill_audit_event_records(turn_id, &[audit.clone()])
+            .await
+            .expect("insert audit history");
+
+        let dependency = SkillDependencySnapshotRecord {
+            turn_id: Some(turn_id.to_owned()),
+            skill_id: skill_id.clone(),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "historical".to_owned(),
+            source_kind: "user".to_owned(),
+            diagnostics_json: "[]".to_owned(),
+            created_at_unix: 1_700_000_003,
+        };
+        store
+            .insert_skill_dependency_snapshot_record(&dependency)
+            .await
+            .expect("insert dependency history");
+
+        assert!(
+            store
+                .delete_skill_installation(&skill_id)
+                .await
+                .expect("delete active installation")
+        );
+        assert_eq!(
+            store
+                .find_turn_skill_bindings(turn_id)
+                .await
+                .expect("read binding history"),
+            vec![binding]
+        );
+        assert_eq!(
+            store
+                .list_skill_audit_event_records(&skill_id, 16)
+                .await
+                .expect("read audit history"),
+            vec![audit]
+        );
+        assert_eq!(
+            store
+                .list_turn_skill_dependency_snapshot_records(turn_id)
+                .await
+                .expect("read dependency history"),
+            vec![dependency]
+        );
     }
 
     #[tokio::test]
@@ -21396,12 +21719,21 @@ mod tests {
         let store = CrudStore::new(connection);
 
         let first = WorkspaceSkillPolicyRecord {
+            id: generate_id(21),
             workspace_id: "ws_000000000000000001".to_owned(),
-            skill_slug: "pioneer/agent-browser".to_owned(),
-            source_kind: "registry".to_owned(),
+            skill_id: SkillId::new("D".repeat(21)).expect("valid bundled skill id"),
             enabled: Some(false),
             allow_implicit_invocation: Some(false),
         };
+
+        assert!(
+            store
+                .find_skill_installation(&first.skill_id)
+                .await
+                .expect("bundled installation lookup")
+                .is_none(),
+            "bundled policy must not require an installation row"
+        );
 
         store
             .upsert_workspace_skill_policy(&first, 1_700_000_000)
@@ -21424,21 +21756,99 @@ mod tests {
             .expect("list workspace policies");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], second);
+        assert_eq!(
+            store
+                .find_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+                .await
+                .expect("find exact policy"),
+            Some(second.clone())
+        );
 
-        store
-            .delete_workspace_skill_policy(
-                first.workspace_id.as_str(),
-                first.skill_slug.as_str(),
-                first.source_kind.as_str(),
-            )
-            .await
-            .expect("delete workspace policy");
+        assert!(
+            store
+                .delete_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+                .await
+                .expect("delete exact workspace policy")
+        );
 
         let rows = store
             .list_workspace_skill_policies(first.workspace_id.as_str())
             .await
             .expect("list workspace policies after delete");
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installation_and_default_policy_are_created_and_removed_atomically() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let skill_id = SkillId::new("I".repeat(21)).expect("valid skill id");
+        let workspace_id = "ws_atomic_skill";
+        let installation = SkillInstallationRecord {
+            skill_id: skill_id.clone(),
+            owner: Some("pioneer".to_owned()),
+            slug: "atomic-skill".to_owned(),
+            version: None,
+            source_kind: "user".to_owned(),
+            scope_key: workspace_id.to_owned(),
+            source_ref: "upload:atomic".to_owned(),
+            install_path: "/tmp/skills/atomic-skill".to_owned(),
+            trust_level: "community".to_owned(),
+            fingerprint: "atomic-fingerprint".to_owned(),
+            updated_at_unix: 1_700_000_000,
+        };
+        let policy = WorkspaceSkillPolicyRecord {
+            id: generate_id(21),
+            workspace_id: workspace_id.to_owned(),
+            skill_id: skill_id.clone(),
+            enabled: Some(true),
+            allow_implicit_invocation: Some(false),
+        };
+
+        store
+            .insert_skill_installation_with_policy(&installation, &policy, 1_700_000_000)
+            .await
+            .expect("atomic install persistence");
+        assert!(
+            store
+                .find_skill_installation(&skill_id)
+                .await
+                .expect("find installation")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .find_workspace_skill_policy(workspace_id, &skill_id)
+                .await
+                .expect("find policy"),
+            Some(policy)
+        );
+
+        assert!(
+            store
+                .delete_skill_installation_with_workspace_policy(workspace_id, &skill_id)
+                .await
+                .expect("atomic uninstall persistence")
+        );
+        assert!(
+            store
+                .find_skill_installation(&skill_id)
+                .await
+                .expect("find deleted installation")
+                .is_none()
+        );
+        assert!(
+            store
+                .find_workspace_skill_policy(workspace_id, &skill_id)
+                .await
+                .expect("find deleted policy")
+                .is_none()
+        );
     }
 
     #[tokio::test]

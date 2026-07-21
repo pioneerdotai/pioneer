@@ -6,14 +6,26 @@
     "description": {
       "type": "string"
     },
+    "display_name": {
+      "type": "string"
+    },
     "key": {
       "type": "string"
     },
     "label": {
       "type": "string"
     },
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "selectable": {
       "type": "boolean"
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
     },
     "slug": {
       "type": "string"
@@ -34,7 +46,9 @@
   },
   "required": [
     "key",
+    "skill_id",
     "label",
+    "display_name",
     "description",
     "slug",
     "source_kind",
@@ -70,6 +84,12 @@
           ]
         }
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     }
   }
 }

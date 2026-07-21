@@ -1513,6 +1513,9 @@ mod tests {
         invocation.permission_metadata = pioneer_tools::ToolPermissionMetadata {
             dynamic_skill: Some(pioneer_tools::DynamicSkillPermissionMetadata {
                 kind: pioneer_tools::DynamicSkillPermissionKind::FunctionProxy,
+                skill_id: pioneer_protocol::SkillId::new("SSSSSSSSSSSSSSSSSSSSS")
+                    .expect("valid security test SkillId"),
+                skill_owner: Some("workspace".to_owned()),
                 skill_slug: "user:workspace/proxy".to_owned(),
                 source_kind: "User".to_owned(),
                 trust_level: "Community".to_owned(),

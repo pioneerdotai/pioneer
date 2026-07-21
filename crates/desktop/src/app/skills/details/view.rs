@@ -30,7 +30,7 @@ impl PioneerDesktop {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some((slug, source_kind)) = self.selected_skill_target.clone() else {
+        let Some(skill_id) = self.selected_skill_target.clone() else {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().background)
@@ -45,12 +45,9 @@ impl PioneerDesktop {
                 .into_any_element();
         };
 
-        let Some(skill) = skill_catalog::find_skill(
-            self.installed_skills.as_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
-        )
-        .cloned() else {
+        let Some(skill) =
+            skill_catalog::find_skill(self.installed_skills.as_slice(), &skill_id).cloned()
+        else {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().background)
@@ -65,13 +62,10 @@ impl PioneerDesktop {
                 .into_any_element();
         };
 
-        let health_detail = skill_health::skill_health_detail(
-            &self.skills_health_details,
-            skill.slug.as_str(),
-            skill.source_kind.as_str(),
-        )
-        .cloned();
-        let is_pending = self.is_skill_pending(skill.slug.as_str(), skill.source_kind.as_str());
+        let health_detail =
+            skill_health::skill_health_detail(&self.skills_health_details, &skill.skill_id)
+                .cloned();
+        let is_pending = self.is_skill_pending(&skill.skill_id);
         let desktop_entity = cx.entity().clone();
         let skill_summary = skill_presentation::skill_summary_presentation(&skill);
         let version_label = skill_summary
@@ -129,10 +123,7 @@ impl PioneerDesktop {
                                                             .overflow_hidden()
                                                             .whitespace_nowrap()
                                                             .text_ellipsis()
-                                                            .child(format!(
-                                                                "@{}",
-                                                                owner.to_owned()
-                                                            )),
+                                                            .child(owner.to_owned()),
                                                     )
                                                     .child(
                                                         div()
@@ -150,7 +141,7 @@ impl PioneerDesktop {
                                                         .overflow_hidden()
                                                         .whitespace_nowrap()
                                                         .text_ellipsis()
-                                                        .child(skill.display_name.clone()),
+                                                        .child(skill.slug.clone()),
                                                 ),
                                         )
                                         .child(
@@ -198,15 +189,13 @@ impl PioneerDesktop {
                                     .label(t!("skills.button.enabled").to_string())
                                     .on_click({
                                         let desktop_entity = desktop_entity.clone();
-                                        let slug = skill.slug.clone();
-                                        let source_kind = skill.source_kind.clone();
+                                        let skill_id = skill.skill_id.clone();
                                         let next_enabled = !skill.policy.enabled;
                                         let allow_implicit = skill.policy.allow_implicit_invocation;
                                         move |_, _, cx| {
                                             let _ = desktop_entity.update(cx, |view, cx| {
                                                 view.set_skill_policy(
-                                                    slug.clone(),
-                                                    source_kind.clone(),
+                                                    skill_id.clone(),
                                                     next_enabled,
                                                     allow_implicit,
                                                     cx,
@@ -235,15 +224,13 @@ impl PioneerDesktop {
                                     .label(t!("skills.button.implicit").to_string())
                                     .on_click({
                                         let desktop_entity = desktop_entity.clone();
-                                        let slug = skill.slug.clone();
-                                        let source_kind = skill.source_kind.clone();
+                                        let skill_id = skill.skill_id.clone();
                                         let enabled = skill.policy.enabled;
                                         let next_implicit = !skill.policy.allow_implicit_invocation;
                                         move |_, _, cx| {
                                             let _ = desktop_entity.update(cx, |view, cx| {
                                                 view.set_skill_policy(
-                                                    slug.clone(),
-                                                    source_kind.clone(),
+                                                    skill_id.clone(),
                                                     enabled,
                                                     next_implicit,
                                                     cx,

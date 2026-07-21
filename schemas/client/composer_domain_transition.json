@@ -290,6 +290,15 @@
             "Skill": {
               "type": "object",
               "properties": {
+                "owner": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "skill_id": {
+                  "$ref": "#/$defs/SkillId"
+                },
                 "slug": {
                   "type": "string"
                 },
@@ -298,6 +307,7 @@
                 }
               },
               "required": [
+                "skill_id",
                 "slug",
                 "source_kind"
               ]
@@ -456,6 +466,12 @@
         "workspace",
         "user"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "ThreadMode": {
       "type": "string",

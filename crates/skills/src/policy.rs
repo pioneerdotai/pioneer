@@ -1,20 +1,18 @@
 use crate::compile::{SkillDefinition, SkillImplicitInvocationPolicy};
-use crate::contract::{SkillSourceKind, qualified_skill_slug};
+use crate::contract::SkillSourceKind;
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SkillPolicyKey {
-    pub slug: String,
-    pub source_kind: String,
+    pub skill_id: SkillId,
 }
 
 impl SkillPolicyKey {
-    pub fn new(slug: impl Into<String>, source_kind: impl Into<String>) -> Self {
-        Self {
-            slug: slug.into(),
-            source_kind: source_kind.into(),
-        }
+    pub fn new(skill_id: SkillId) -> Self {
+        Self { skill_id }
     }
 }
 
@@ -49,12 +47,12 @@ fn apply(base: &mut EffectiveSkillPolicy, patch: &SkillPolicy) {
     }
 }
 
-pub fn merge_policy(slug: &str, source_kind: &str, set: &SkillPolicySet) -> EffectiveSkillPolicy {
+pub fn merge_policy(skill_id: &SkillId, set: &SkillPolicySet) -> EffectiveSkillPolicy {
     let mut effective = EffectiveSkillPolicy {
         enabled: true,
         allow_implicit_invocation: false,
     };
-    let key = SkillPolicyKey::new(slug.to_owned(), source_kind.to_owned());
+    let key = SkillPolicyKey::new(skill_id.clone());
 
     if let Some(global) = set.global_by_key.get(&key) {
         apply(&mut effective, global);
@@ -87,8 +85,7 @@ pub fn effective_policy_for_skill(
     skill: &SkillDefinition,
     set: &SkillPolicySet,
 ) -> EffectiveSkillPolicy {
-    let slug = qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str());
-    let mut effective = merge_policy(slug.as_str(), skill.identity.source_kind.as_db_value(), set);
+    let mut effective = merge_policy(&skill.identity.skill_id, set);
     apply_skill_policy_constraints(skill, &mut effective);
     effective
 }
@@ -96,11 +93,13 @@ pub fn effective_policy_for_skill(
 #[cfg(test)]
 mod tests {
     use super::{SkillPolicy, SkillPolicyKey, SkillPolicySet, merge_policy};
+    use pioneer_protocol::SkillId;
 
     #[test]
     fn workspace_overrides_global() {
         let mut set = SkillPolicySet::default();
-        let key = SkillPolicyKey::new("pioneer/test", "user");
+        let skill_id = SkillId::new("AAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let key = SkillPolicyKey::new(skill_id.clone());
         set.global_by_key.insert(
             key.clone(),
             SkillPolicy {
@@ -116,7 +115,7 @@ mod tests {
             },
         );
 
-        let effective = merge_policy("pioneer/test", "user", &set);
+        let effective = merge_policy(&skill_id, &set);
         assert!(!effective.enabled);
         assert!(effective.allow_implicit_invocation);
     }

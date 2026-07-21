@@ -8,31 +8,29 @@ fn ordered_cli_runtime_explicit_skills(
 ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
     let mut ordered = Vec::with_capacity(attachments.len());
     for (attachment, explicit_ref) in attachments.iter().zip(explicit_refs) {
-        let matching_catalog = catalog
-            .skills
-            .iter()
-            .filter(|definition| explicit_ref_matches_skill(explicit_ref, definition))
-            .collect::<Vec<_>>();
-        if matching_catalog.len() != 1 {
+        let expected_capability_id = explicit_ref.capability_id();
+        if attachment.capability_id != expected_capability_id {
             anyhow::bail!(
-                "cli_runtime.skill_resolve_failed: capability `{}` skill `{}` ({}) matched {} authoritative catalog entries",
+                "cli_runtime.skill_resolve_failed: capability `{}` must use exact ID `{expected_capability_id}`",
                 attachment.capability_id,
-                attachment.slug,
-                attachment.claimed_source_kind,
-                matching_catalog.len()
             );
         }
-        let definition = matching_catalog[0];
-        let qualified_slug = qualified_skill_slug(
-            definition.identity.owner.as_str(),
-            definition.identity.slug.as_str(),
-        );
+        let Some(definition) = catalog
+            .skills
+            .iter()
+            .find(|definition| explicit_ref_matches_skill(explicit_ref, definition))
+        else {
+            anyhow::bail!(
+                "cli_runtime.skill_resolve_failed: capability `{}` references missing skill `{}`",
+                attachment.capability_id,
+                attachment.skill_id,
+            );
+        };
         if let Some(resolved) = resolution.active.iter().find(|resolved| {
             matches!(
                 resolved.reason,
                 pioneer_skills::SkillResolvedReason::ExplicitCapability
-            ) && resolved.slug == qualified_slug
-                && resolved.definition.identity.source_kind == definition.identity.source_kind
+            ) && resolved.skill_id == definition.identity.skill_id
         }) {
             ordered.push(resolved.clone());
             continue;
@@ -40,17 +38,13 @@ fn ordered_cli_runtime_explicit_skills(
         let excluded_reason = resolution
             .excluded
             .iter()
-            .find(|excluded| {
-                excluded.slug == qualified_slug
-                    && excluded.source_kind == definition.identity.source_kind.as_db_value()
-            })
+            .find(|excluded| excluded.skill_id == definition.identity.skill_id)
             .map(|excluded| excluded.reason.as_db_value())
             .unwrap_or("not_matched");
         anyhow::bail!(
-            "cli_runtime.skill_resolve_failed: capability `{}` skill `{}` ({}) was excluded at resolve stage: {excluded_reason}",
+            "cli_runtime.skill_resolve_failed: capability `{}` skill `{}` was excluded at resolve stage: {excluded_reason}",
             attachment.capability_id,
-            attachment.slug,
-            attachment.claimed_source_kind
+            attachment.skill_id,
         );
     }
     Ok(ordered)
@@ -66,9 +60,28 @@ mod cli_runtime_resolver_tests {
         contract::default_skill_conformance,
     };
 
+    fn test_skill_id(slug: &str, source_kind: SkillSourceKind) -> pioneer_protocol::SkillId {
+        let suffix = match source_kind {
+            SkillSourceKind::System => 'S',
+            SkillSourceKind::User => 'U',
+            SkillSourceKind::Registry => 'R',
+        };
+        let mut value = slug
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(20);
+        while value.len() < 20 {
+            value.push(suffix);
+        }
+        value.push(suffix);
+        pioneer_protocol::SkillId::new(value).expect("valid CLI resolver test SkillId")
+    }
+
     fn definition(slug: &str, source_kind: SkillSourceKind) -> pioneer_skills::SkillDefinition {
         compile_skill_definition(CompileSkillInput {
-            owner: "workspace".to_owned(),
+            skill_id: test_skill_id(slug, source_kind),
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: slug.to_owned(),
@@ -95,15 +108,14 @@ mod cli_runtime_resolver_tests {
     }
 
     fn attachment(
-        id: &str,
         slug: &str,
-        source_kind: &str,
+        source_kind: SkillSourceKind,
     ) -> crate::cli_runtime::skills::CliRuntimeSkillAttachment {
+        let skill_id = test_skill_id(slug, source_kind);
         crate::cli_runtime::skills::CliRuntimeSkillAttachment {
-            capability_id: id.to_owned(),
+            capability_id: format!("skill:{skill_id}"),
             label: Some(slug.to_owned()),
-            slug: slug.to_owned(),
-            claimed_source_kind: source_kind.to_owned(),
+            skill_id,
         }
     }
 
@@ -116,10 +128,8 @@ mod cli_runtime_resolver_tests {
         let refs = attachments
             .iter()
             .map(|attachment| SkillExplicitRef {
-                capability_id: attachment.capability_id.clone(),
+                skill_id: attachment.skill_id.clone(),
                 label: attachment.label.clone(),
-                slug: attachment.slug.clone(),
-                source_kind: attachment.claimed_source_kind.clone(),
             })
             .collect::<Vec<_>>();
         let dependency_input = DependencyCheckInput {
@@ -149,8 +159,8 @@ mod cli_runtime_resolver_tests {
             ],
         };
         let attachments = [
-            attachment("z", "zeta", "registry"),
-            attachment("a", "alpha", "user"),
+            attachment("zeta", SkillSourceKind::Registry),
+            attachment("alpha", SkillSourceKind::User),
         ];
         let resolved = resolve_for(
             &catalog,
@@ -165,13 +175,63 @@ mod cli_runtime_resolver_tests {
     }
 
     #[test]
+    fn cli_runtime_skill_resolver_selects_duplicate_labels_by_exact_id() {
+        let first = definition("shared", SkillSourceKind::User);
+        let second = definition("shared", SkillSourceKind::Registry);
+        let first_id = first.identity.skill_id.clone();
+        let second_id = second.identity.skill_id.clone();
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![first, second],
+        };
+
+        let resolved = resolve_for(
+            &catalog,
+            &[attachment("shared", SkillSourceKind::Registry)],
+            &SkillPolicySet::default(),
+            &pioneer_agent::AgentMcpAvailability::default(),
+        )
+        .expect("duplicate labels must resolve by the selected exact ID");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].skill_id, second_id);
+        assert_ne!(resolved[0].skill_id, first_id);
+    }
+
+    #[test]
+    fn cli_runtime_skill_resolver_rejects_capability_id_mismatch() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![definition("alpha", SkillSourceKind::User)],
+        };
+        let mut mismatched = attachment("alpha", SkillSourceKind::User);
+        mismatched.capability_id = format!(
+            "skill:{}",
+            test_skill_id("different", SkillSourceKind::Registry)
+        );
+
+        let error = resolve_for(
+            &catalog,
+            &[mismatched],
+            &SkillPolicySet::default(),
+            &pioneer_agent::AgentMcpAvailability::default(),
+        )
+        .expect_err("capability ID must agree with its exact SkillId")
+        .to_string();
+
+        assert!(error.contains("must use exact ID"));
+    }
+
+    #[test]
     fn cli_runtime_skill_resolver_accepts_explicit_user_controlled_system_browser() {
         let catalog = SkillCatalogSnapshot {
             version: 1,
             generated_at_unix: 1,
             skills: vec![definition("browser", SkillSourceKind::System)],
         };
-        let attachments = [attachment("browser", "browser", "system")];
+        let attachments = [attachment("browser", SkillSourceKind::System)];
 
         let resolved = resolve_for(
             &catalog,
@@ -201,8 +261,8 @@ mod cli_runtime_resolver_tests {
             skills: vec![definition("alpha", SkillSourceKind::User)],
         };
         for attachments in [
-            vec![attachment("mismatch", "alpha", "registry")],
-            vec![attachment("missing", "missing", "user")],
+            vec![attachment("alpha", SkillSourceKind::Registry)],
+            vec![attachment("missing", SkillSourceKind::User)],
         ] {
             assert!(
                 resolve_for(
@@ -218,8 +278,9 @@ mod cli_runtime_resolver_tests {
         }
 
         let mut policy_set = SkillPolicySet::default();
+        let alpha_id = test_skill_id("alpha", SkillSourceKind::User);
         policy_set.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/alpha", "user"),
+            SkillPolicyKey::new(alpha_id),
             SkillPolicy {
                 enabled: Some(false),
                 allow_implicit_invocation: None,
@@ -227,7 +288,7 @@ mod cli_runtime_resolver_tests {
         );
         let error = resolve_for(
             &catalog,
-            &[attachment("disabled", "alpha", "user")],
+            &[attachment("alpha", SkillSourceKind::User)],
             &policy_set,
             &pioneer_agent::AgentMcpAvailability::default(),
         )
@@ -248,7 +309,7 @@ mod cli_runtime_resolver_tests {
             generated_at_unix: 1,
             skills: vec![dependent],
         };
-        let attachments = [attachment("dependent", "mcp-dependent", "user")];
+        let attachments = [attachment("mcp-dependent", SkillSourceKind::User)];
 
         let projected = pioneer_agent::AgentMcpAvailability {
             available_mcp: vec!["resend/send".to_owned()],
@@ -293,7 +354,7 @@ impl MessageProcessor {
             return Ok(Vec::new());
         }
         let context = self.skills_runtime_context(workspace_id)?;
-        let catalog = load_catalog(&context.catalog_params)?;
+        let catalog = self.load_skills_catalog(workspace_id, &context).await?;
         let workspace_policies = self
             .crud_store
             .list_workspace_skill_policies(workspace_id)
@@ -306,10 +367,8 @@ impl MessageProcessor {
         let explicit_refs = attachments
             .iter()
             .map(|attachment| SkillExplicitRef {
-                capability_id: attachment.capability_id.clone(),
+                skill_id: attachment.skill_id.clone(),
                 label: attachment.label.clone(),
-                slug: attachment.slug.clone(),
-                source_kind: attachment.claimed_source_kind.clone(),
             })
             .collect::<Vec<_>>();
         let dependency_input = DependencyCheckInput {
@@ -369,7 +428,10 @@ impl MessageProcessor {
             }
         };
 
-        let catalog = match load_catalog(&context.catalog_params) {
+        let catalog = match self
+            .load_skills_catalog(workspace_id.as_str(), &context)
+            .await
+        {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.send_error(
@@ -405,10 +467,10 @@ impl MessageProcessor {
             }
         };
 
-        let installation_by_key = installations
+        let installation_by_id = installations
             .into_iter()
             .filter(|row| row.scope_key.as_str() == workspace_id.as_str())
-            .map(|row| (skill_key(row.slug.as_str(), row.source_kind.as_str()), row))
+            .map(|row| (row.skill_id.clone(), row))
             .collect::<HashMap<_, _>>();
 
         let workspace_policies = match self
@@ -443,20 +505,8 @@ impl MessageProcessor {
             .skills
             .iter()
             .map(|skill| SkillExplicitRef {
-                capability_id: format!(
-                    "skills/list:{}:{}",
-                    skill.identity.source_kind.as_db_value(),
-                    qualified_skill_slug(
-                        skill.identity.owner.as_str(),
-                        skill.identity.slug.as_str()
-                    )
-                ),
+                skill_id: skill.identity.skill_id.clone(),
                 label: Some(skill.identity.display_name.clone()),
-                slug: qualified_skill_slug(
-                    skill.identity.owner.as_str(),
-                    skill.identity.slug.as_str(),
-                ),
-                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
             })
             .collect::<Vec<_>>();
 
@@ -469,44 +519,23 @@ impl MessageProcessor {
             dependency_input: &DependencyCheckInput::baseline(),
         });
 
-        let active_by_key = resolution
+        let active_by_id = resolution
             .active
             .iter()
-            .map(|resolved| {
-                (
-                    skill_key(
-                        resolved.slug.as_str(),
-                        resolved.definition.identity.source_kind.as_db_value(),
-                    ),
-                    resolved,
-                )
-            })
+            .map(|resolved| (resolved.skill_id.clone(), resolved))
             .collect::<HashMap<_, _>>();
 
-        let excluded_by_key = resolution
+        let excluded_by_id = resolution
             .excluded
             .iter()
-            .map(|excluded| {
-                (
-                    skill_key(excluded.slug.as_str(), excluded.source_kind.as_str()),
-                    excluded,
-                )
-            })
+            .map(|excluded| (excluded.skill_id.clone(), excluded))
             .collect::<HashMap<_, _>>();
 
         let mut response_items = catalog
             .skills
             .iter()
             .map(|skill| {
-                let qualified_slug = qualified_skill_slug(
-                    skill.identity.owner.as_str(),
-                    skill.identity.slug.as_str(),
-                );
-                let key = skill_key(
-                    qualified_slug.as_str(),
-                    skill.identity.source_kind.as_db_value(),
-                );
-                let installation = installation_by_key.get(&key);
+                let installation = installation_by_id.get(&skill.identity.skill_id);
                 let is_system = matches!(&skill.identity.source_kind, SkillSourceKind::System);
                 let effective_policy = effective_policy_for_skill(skill, &policy_set);
                 let health = if params.include_health {
@@ -520,19 +549,23 @@ impl MessageProcessor {
                     }
                 };
 
-                let status = if !effective_policy.enabled {
+                let status = if !skill.is_available() {
+                    "unavailable".to_owned()
+                } else if !effective_policy.enabled {
                     "disabled".to_owned()
-                } else if active_by_key.contains_key(&key) {
+                } else if active_by_id.contains_key(&skill.identity.skill_id) {
                     "active".to_owned()
                 } else {
                     "blocked".to_owned()
                 };
-                let status_reason = excluded_by_key
-                    .get(&key)
+                let status_reason = excluded_by_id
+                    .get(&skill.identity.skill_id)
                     .map(|excluded| excluded.reason.as_db_value().to_owned());
 
                 SkillListItem {
-                    slug: qualified_slug,
+                    skill_id: skill.identity.skill_id.clone(),
+                    owner: skill.identity.owner.clone(),
+                    slug: skill.identity.slug.clone(),
                     source_kind: skill.identity.source_kind.as_db_value().to_owned(),
                     display_name: skill.identity.display_name.clone(),
                     description: skill.instructions.description.clone(),
@@ -572,7 +605,9 @@ impl MessageProcessor {
         response_items.sort_by(|left, right| {
             left.source_kind
                 .cmp(&right.source_kind)
+                .then_with(|| left.owner.cmp(&right.owner))
                 .then_with(|| left.slug.cmp(&right.slug))
+                .then_with(|| left.skill_id.cmp(&right.skill_id))
         });
 
         let response_payload = SkillListResponse {
@@ -648,7 +683,10 @@ impl MessageProcessor {
             }
         };
 
-        let catalog = match load_catalog(&context.catalog_params) {
+        let catalog = match self
+            .load_skills_catalog(workspace_id.as_str(), &context)
+            .await
+        {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.send_error(
@@ -666,32 +704,10 @@ impl MessageProcessor {
             }
         };
 
-        if let Some(invalid) = params
-            .skills
-            .iter()
-            .find(|target| !is_qualified_slug(target.slug.as_str()))
-        {
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id.clone()),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "skills/health targets must use owner/slug",
-                    json!({
-                        "slug": invalid.slug,
-                        "source_kind": invalid.source_kind,
-                    }),
-                ),
-            )
-            .await;
-            return;
-        }
-
         let filter = params
             .skills
             .iter()
-            .map(|target| skill_key(target.slug.as_str(), target.source_kind.as_str()))
+            .map(|target| target.skill_id.clone())
             .collect::<std::collections::HashSet<_>>();
 
         let include_all = filter.is_empty();
@@ -699,13 +715,7 @@ impl MessageProcessor {
         let mut health_items = Vec::new();
 
         for skill in &catalog.skills {
-            let qualified_slug =
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str());
-            let key = skill_key(
-                qualified_slug.as_str(),
-                skill.identity.source_kind.as_db_value(),
-            );
-            if !include_all && !filter.contains(&key) {
+            if !include_all && !filter.contains(&skill.identity.skill_id) {
                 continue;
             }
 
@@ -739,16 +749,14 @@ impl MessageProcessor {
 
             let recent_audit_rows = self
                 .crud_store
-                .list_skill_audit_event_records_for_source(
-                    qualified_slug.as_str(),
-                    skill.identity.source_kind.as_db_value(),
-                    params.audit_limit.max(1),
-                )
+                .list_skill_audit_event_records(&skill.identity.skill_id, params.audit_limit.max(1))
                 .await
                 .unwrap_or_default();
 
             health_items.push(SkillHealthItem {
-                slug: qualified_slug,
+                skill_id: skill.identity.skill_id.clone(),
+                owner: skill.identity.owner.clone(),
+                slug: skill.identity.slug.clone(),
                 source_kind: skill.identity.source_kind.as_db_value().to_owned(),
                 trust_level: trust_level_as_str(&skill.runtime.trust_level).to_owned(),
                 dependency_diagnostics: dependency_result
@@ -781,7 +789,9 @@ impl MessageProcessor {
         health_items.sort_by(|left, right| {
             left.source_kind
                 .cmp(&right.source_kind)
+                .then_with(|| left.owner.cmp(&right.owner))
                 .then_with(|| left.slug.cmp(&right.slug))
+                .then_with(|| left.skill_id.cmp(&right.skill_id))
         });
 
         let payload = SkillsHealthResponse {

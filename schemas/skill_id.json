@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillId",
+  "type": "string",
+  "maxLength": 21,
+  "minLength": 21,
+  "pattern": "^[A-Za-z0-9]{21}$"
+}

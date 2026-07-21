@@ -346,17 +346,51 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::composer::capabilities::ComposerCapabilityKind;
-    use pioneer_protocol::McpScopeKind;
+    use pioneer_protocol::{McpScopeKind, SkillId};
 
     fn mcp_capability() -> ComposerCapability {
         ComposerCapability {
-            id: "mcp:workspace:mail".to_owned(),
+            id: "mcp-server:workspace:mail".to_owned(),
             label: "mail".to_owned(),
             kind: ComposerCapabilityKind::McpServer {
                 name: "mail".to_owned(),
                 scope_kind: McpScopeKind::Workspace,
             },
         }
+    }
+
+    fn skill_capability() -> ComposerCapability {
+        let skill_id = SkillId::new("R".repeat(21)).expect("valid skill id");
+        ComposerCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            label: "owner/reviewer".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                skill_id,
+                owner: Some("owner".to_owned()),
+                slug: "reviewer".to_owned(),
+                source_kind: "user".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn draft_round_trip_preserves_exact_skill_id_and_label_snapshot() {
+        let state = ComposerDomainState {
+            capabilities: vec![skill_capability()],
+            ..ComposerDomainState::default()
+        };
+
+        let encoded = serde_json::to_value(&state).expect("encode draft state");
+        let decoded =
+            serde_json::from_value::<ComposerDomainState>(encoded).expect("decode draft state");
+
+        assert_eq!(decoded.capabilities, state.capabilities);
+        assert_eq!(decoded.capabilities[0].label, "owner/reviewer");
+        assert!(matches!(
+            decoded.capabilities[0].kind,
+            ComposerCapabilityKind::Skill { ref skill_id, .. }
+                if skill_id.as_str() == "RRRRRRRRRRRRRRRRRRRRR"
+        ));
     }
 
     #[test]

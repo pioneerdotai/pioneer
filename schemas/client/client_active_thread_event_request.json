@@ -5328,6 +5328,15 @@
             "null"
           ]
         },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
         "slug": {
           "type": "string"
         },
@@ -5336,10 +5345,17 @@
         }
       },
       "required": [
+        "skill_id",
         "slug",
         "source_kind",
         "change_type"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "SkillsChangedNotification": {
       "type": "object",
@@ -11303,11 +11319,17 @@
     "TurnSkillCapabilitySummary": {
       "type": "object",
       "properties": {
-        "id": {
-          "type": "string"
-        },
         "label": {
           "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skillId": {
+          "$ref": "#/$defs/SkillId"
         },
         "slug": {
           "type": "string"
@@ -11317,7 +11339,7 @@
         }
       },
       "required": [
-        "id",
+        "skillId",
         "label",
         "slug",
         "sourceKind"

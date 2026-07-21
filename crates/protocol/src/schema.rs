@@ -120,7 +120,7 @@ use crate::{
     RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SandboxBackendKind, SandboxBackendRequirement,
     SandboxMode, SandboxPolicy, SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem,
-    SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillHealthTarget,
+    SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillHealthTarget, SkillId,
     SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource,
     SkillListItem, SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
     SkillTrustGateStatus, SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams,
@@ -1687,6 +1687,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             ProviderDeleteApiKeyResponse
         ),
         schema_doc!("skills_list_params.json", SkillListParams),
+        schema_doc!("skill_id.json", SkillId),
         schema_doc!("skills_list_response.json", SkillListResponse),
         schema_doc!("skills_list_item.json", SkillListItem),
         schema_doc!("skill_install_state.json", SkillInstallState),

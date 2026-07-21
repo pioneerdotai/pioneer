@@ -5,9 +5,9 @@ use crate::{
 use anyhow::Result;
 use gpui::{prelude::*, *};
 use pioneer_client::skills::{
-    actions as skill_actions, archive::build_skill_upload_archive, catalog as skill_catalog,
-    upload as skill_upload,
+    actions as skill_actions, archive::build_skill_upload_archive, upload as skill_upload,
 };
+use pioneer_protocol::SkillId;
 use std::{
     path::PathBuf,
     sync::{
@@ -115,22 +115,14 @@ impl PioneerDesktop {
 
     pub(super) fn update_skill_from_path(
         &mut self,
-        slug: String,
-        source_kind: String,
+        skill_id: SkillId,
         source_path: String,
         cx: &mut Context<Self>,
     ) {
-        let Some((slug, source_kind)) =
-            skill_catalog::normalize_skill_target(slug.as_str(), source_kind.as_str())
-        else {
-            self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
-            return;
-        };
         if skill_actions::skill_lifecycle_editable(
             self.installed_skills.as_slice(),
             self.skills_catalog.as_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
+            &skill_id,
         ) == Some(false)
         {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
@@ -166,13 +158,12 @@ impl PioneerDesktop {
             0,
             0,
         ));
-        self.mark_skill_pending(slug.as_str(), source_kind.as_str(), true);
+        self.mark_skill_pending(&skill_id, true);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let slug_for_request = slug.clone();
-            let source_kind_for_request = source_kind.clone();
+            let skill_id_for_request = skill_id.clone();
             let upload_workspace_id = workspace_id.clone();
             let upload_source_path = source_path.clone();
             let upload_cancel_token = cancel_token.clone();
@@ -193,8 +184,7 @@ impl PioneerDesktop {
                         ws_sender.skills_update(
                             skill_actions::skills_update_uploaded_archive_params(
                                 workspace_id,
-                                slug_for_request,
-                                source_kind_for_request,
+                                skill_id_for_request,
                                 upload_id,
                                 None,
                             ),
@@ -218,8 +208,7 @@ impl PioneerDesktop {
                         Err(error) => {
                             let error = format!("{}: {error:#}", t!("skills.error.update_failed"));
                             warn!(
-                                slug = slug.as_str(),
-                                source_kind = source_kind.as_str(),
+                                skill_id = %skill_id,
                                 error = %format!("{error:#}"),
                                 "failed to update skill"
                             );
@@ -228,10 +217,7 @@ impl PioneerDesktop {
                     };
                     let reduction = skill_actions::reduce_skill_action_finish(
                         skill_actions::SkillActionFinishKind::Update(
-                            skill_actions::SkillActionTarget::new(
-                                slug.clone(),
-                                source_kind.clone(),
-                            ),
+                            skill_actions::SkillActionTarget::new(skill_id.clone()),
                         ),
                         outcome,
                     );
@@ -244,23 +230,11 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn uninstall_skill(
-        &mut self,
-        slug: String,
-        source_kind: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((slug, source_kind)) =
-            skill_catalog::normalize_skill_target(slug.as_str(), source_kind.as_str())
-        else {
-            self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
-            return;
-        };
+    pub(super) fn uninstall_skill(&mut self, skill_id: SkillId, cx: &mut Context<Self>) {
         if skill_actions::skill_lifecycle_editable(
             self.installed_skills.as_slice(),
             self.skills_catalog.as_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
+            &skill_id,
         ) == Some(false)
         {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
@@ -284,21 +258,19 @@ impl PioneerDesktop {
         let workspace_id = scope.workspace_id;
 
         self.skills_error = None;
-        self.mark_skill_pending(slug.as_str(), source_kind.as_str(), true);
+        self.mark_skill_pending(&skill_id, true);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let slug_for_request = slug.clone();
-            let source_kind_for_request = source_kind.clone();
+            let skill_id_for_request = skill_id.clone();
 
             async move {
                 let result = cx
                     .background_spawn(async move {
                         ws_sender.skills_uninstall(skill_actions::skills_uninstall_params(
                             workspace_id,
-                            slug_for_request,
-                            source_kind_for_request,
+                            skill_id_for_request,
                         ))
                     })
                     .await;
@@ -317,8 +289,7 @@ impl PioneerDesktop {
                             let error =
                                 format!("{}: {error:#}", t!("skills.error.uninstall_failed"));
                             warn!(
-                                slug = slug.as_str(),
-                                source_kind = source_kind.as_str(),
+                                skill_id = %skill_id,
                                 error = %format!("{error:#}"),
                                 "failed to uninstall skill"
                             );
@@ -327,10 +298,7 @@ impl PioneerDesktop {
                     };
                     let reduction = skill_actions::reduce_skill_action_finish(
                         skill_actions::SkillActionFinishKind::Uninstall(
-                            skill_actions::SkillActionTarget::new(
-                                slug.clone(),
-                                source_kind.clone(),
-                            ),
+                            skill_actions::SkillActionTarget::new(skill_id.clone()),
                         ),
                         outcome,
                     );
@@ -345,25 +313,17 @@ impl PioneerDesktop {
 
     pub(super) fn set_skill_policy(
         &mut self,
-        slug: String,
-        source_kind: String,
+        skill_id: SkillId,
         enabled: bool,
         allow_implicit_invocation: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some((slug, source_kind)) =
-            skill_catalog::normalize_skill_target(slug.as_str(), source_kind.as_str())
-        else {
-            self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
-            return;
-        };
         let allow_implicit_invocation = skill_actions::effective_allow_implicit_invocation(
             allow_implicit_invocation,
             skill_actions::skill_policy_implicit_editable(
                 self.installed_skills.as_slice(),
                 self.skills_catalog.as_slice(),
-                slug.as_str(),
-                source_kind.as_str(),
+                &skill_id,
             ),
         );
 
@@ -384,19 +344,15 @@ impl PioneerDesktop {
         let connection_id = scope.connection_id;
         let workspace_id = scope.workspace_id;
 
-        let previous_policy = skill_actions::skill_policy_values(
-            self.skills_catalog.as_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
-        );
+        let previous_policy =
+            skill_actions::skill_policy_values(self.skills_catalog.as_slice(), &skill_id);
 
         self.skills_error = None;
-        self.mark_skill_pending(slug.as_str(), source_kind.as_str(), true);
+        self.mark_skill_pending(&skill_id, true);
         skill_actions::apply_local_skill_policy(
             self.skills_catalog.as_mut_slice(),
             self.installed_skills.as_mut_slice(),
-            slug.as_str(),
-            source_kind.as_str(),
+            &skill_id,
             enabled,
             allow_implicit_invocation,
         );
@@ -404,15 +360,13 @@ impl PioneerDesktop {
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let slug_for_request = slug.clone();
-            let source_kind_for_request = source_kind.clone();
+            let skill_id_for_request = skill_id.clone();
             async move {
                 let result = cx
                     .background_spawn(async move {
                         ws_sender.skills_policy_set(skill_actions::skills_policy_set_params(
                             workspace_id,
-                            slug_for_request,
-                            source_kind_for_request,
+                            skill_id_for_request,
                             enabled,
                             allow_implicit_invocation,
                         ))
@@ -432,8 +386,7 @@ impl PioneerDesktop {
                         Err(error) => {
                             let error = format!("{}: {error:#}", t!("skills.error.policy_failed"));
                             warn!(
-                                slug = slug.as_str(),
-                                source_kind = source_kind.as_str(),
+                                skill_id = %skill_id,
                                 error = %format!("{error:#}"),
                                 "failed to set skill policy"
                             );
@@ -442,10 +395,7 @@ impl PioneerDesktop {
                     };
                     let reduction = skill_actions::reduce_skill_action_finish(
                         skill_actions::SkillActionFinishKind::Policy(
-                            skill_actions::SkillActionTarget::new(
-                                slug.clone(),
-                                source_kind.clone(),
-                            ),
+                            skill_actions::SkillActionTarget::new(skill_id.clone()),
                         ),
                         outcome,
                     );
@@ -455,8 +405,7 @@ impl PioneerDesktop {
                         skill_actions::apply_local_skill_policy(
                             view.skills_catalog.as_mut_slice(),
                             view.installed_skills.as_mut_slice(),
-                            slug.as_str(),
-                            source_kind.as_str(),
+                            &skill_id,
                             prev_enabled,
                             prev_implicit,
                         );
@@ -503,11 +452,7 @@ impl PioneerDesktop {
             self.skills_upload_cancel_token = None;
         }
         if let Some(pending) = reduction.pending {
-            self.mark_skill_pending(
-                pending.target.slug.as_str(),
-                pending.target.source_kind.as_str(),
-                pending.pending,
-            );
+            self.mark_skill_pending(&pending.target.skill_id, pending.pending);
         }
         self.skills_error = reduction.error;
         if reduction.queue_refresh {

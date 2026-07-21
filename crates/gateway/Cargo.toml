@@ -64,3 +64,8 @@ fs4.workspace = true
 transcribe-rs.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+pioneer-protocol.workspace = true
+serde.workspace = true
+toml.workspace = true

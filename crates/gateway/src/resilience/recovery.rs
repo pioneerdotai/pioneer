@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
-    RestoredRecoveryTurnRequest, RetainedToolLlmContext,
+    RestoredRecoveryTurnRequest, RetainedToolLlmContext, ToolLoopConfig,
 };
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
@@ -490,6 +490,7 @@ pub struct RecoveryCoordinator {
     crud_store: Arc<CrudStore>,
     agent_manager: Arc<AgentManager>,
     policy_registry: RecoveryPolicyRegistry,
+    tool_loop_config: ToolLoopConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -666,11 +667,13 @@ impl RecoveryCoordinator {
         agent_manager: Arc<AgentManager>,
         _provider_registry: Arc<ProviderRegistry>,
         policy_registry: RecoveryPolicyRegistry,
+        tool_loop_config: ToolLoopConfig,
     ) -> Self {
         Self {
             crud_store,
             agent_manager,
             policy_registry,
+            tool_loop_config,
         }
     }
 
@@ -2255,6 +2258,37 @@ impl RecoveryCoordinator {
                     ));
                 }
             };
+        let skills_context =
+            match crate::message::skills::workspace::skills_runtime_context_from_config(
+                &self.tool_loop_config,
+                workspace_id.as_str(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                            error: format!("failed to resolve recovery skills context: {error:#}"),
+                        },
+                    ));
+                }
+            };
+        request.skill_catalog =
+            match crate::message::skills::workspace::load_skills_catalog_from_store(
+                self.crud_store.as_ref(),
+                workspace_id.as_str(),
+                &skills_context,
+            )
+            .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                            error: format!("failed to load recovery skill catalog: {error:#}"),
+                        },
+                    ));
+                }
+            };
         let execution_window_index = self
             .next_recovery_execution_window_index(
                 turn_id,
@@ -2908,7 +2942,7 @@ mod tests {
     use pioneer_crud::{
         ClaimedRecoveryActivation, CrudStore, NewCliRuntimeTurnBinding,
         NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot,
-        RecoveryJobRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
+        RecoveryJobRecord, SkillInstallationRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
         TurnExecutionWindowStatsRecord,
     };
     use pioneer_protocol::{
@@ -3001,8 +3035,11 @@ mod tests {
                 prompt_max_chars: 24_000,
                 allow_implicit_invocation: false,
                 system_roots: Vec::new(),
-                user_roots: Vec::new(),
-                registry_roots: Vec::new(),
+                user_roots: vec!["/tmp/pioneer-recovery-user-skills".to_owned()],
+                registry_roots: vec!["/tmp/pioneer-recovery-registry-skills".to_owned()],
+                system_import_roots: Vec::new(),
+                user_import_roots: Vec::new(),
+                registry_import_roots: Vec::new(),
                 validation: SkillsValidationLoopConfig {
                     strict_agentskills: true,
                     accept_openclaw_profile: true,
@@ -3071,6 +3108,7 @@ mod tests {
             agent_manager.clone(),
             provider_registry,
             RecoveryPolicyRegistry::default(),
+            test_tool_loop_config().normalized(),
         );
         (crud_store, agent_manager, coordinator)
     }
@@ -3295,18 +3333,19 @@ mod tests {
         turn_id: &str,
     ) {
         let mut workspace_skill_policies = HashMap::new();
+        let writer_skill_id =
+            pioneer_protocol::SkillId::new("WWWWWWWWWWWWWWWWWWWWW").expect("valid writer SkillId");
         workspace_skill_policies.insert(
-            SkillPolicyKey::new("writer", "user"),
+            SkillPolicyKey::new(writer_skill_id.clone()),
             WorkspaceSkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(false),
             },
         );
         let capabilities = vec![TurnCapability {
-            id: "cap_writer".to_owned(),
+            id: format!("skill:{writer_skill_id}"),
             kind: TurnCapabilityKind::Skill {
-                slug: "writer".to_owned(),
-                source_kind: "user".to_owned(),
+                skill_id: writer_skill_id,
             },
             label: Some("Writer".to_owned()),
         }];
@@ -3405,6 +3444,34 @@ mod tests {
             None,
         )
         .await;
+        let skill_dir = std::env::temp_dir().join(format!("pioneer-recovery-skill-{turn_id}"));
+        std::fs::create_dir_all(&skill_dir).expect("recovery skill directory should exist");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Writer\nslug: writer\ndescription: Recovery writer skill\n---\nWrite carefully.",
+        )
+        .expect("recovery skill package should exist");
+        let writer_skill_id =
+            pioneer_protocol::SkillId::new("WWWWWWWWWWWWWWWWWWWWW").expect("valid writer SkillId");
+        crud_store
+            .insert_skill_installation(
+                &SkillInstallationRecord {
+                    skill_id: writer_skill_id.clone(),
+                    owner: Some("tests".to_owned()),
+                    slug: "writer".to_owned(),
+                    version: None,
+                    source_kind: "user".to_owned(),
+                    scope_key: workspace_id.to_owned(),
+                    source_ref: "test:recovery:writer".to_owned(),
+                    install_path: skill_dir.display().to_string(),
+                    trust_level: "verified".to_owned(),
+                    fingerprint: "recovery-writer-fingerprint".to_owned(),
+                    updated_at_unix: 1,
+                },
+                1,
+            )
+            .await
+            .expect("recovery skill installation should persist");
         persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
 
         let restored = coordinator
@@ -3423,6 +3490,25 @@ mod tests {
         );
         assert_eq!(restored.workspace_skill_policies.len(), 1);
         assert_eq!(restored.capabilities.len(), 1);
+        let restored_skill_id = writer_skill_id;
+        assert!(
+            restored
+                .workspace_skill_policies
+                .contains_key(&SkillPolicyKey::new(restored_skill_id.clone()))
+        );
+        assert!(matches!(
+            &restored.capabilities[0].kind,
+            TurnCapabilityKind::Skill { skill_id } if skill_id == &restored_skill_id
+        ));
+        assert_eq!(
+            restored.capabilities[0].id,
+            format!("skill:{restored_skill_id}")
+        );
+        assert!(restored.skill_catalog.skills.iter().any(|skill| {
+            skill.identity.skill_id == restored_skill_id
+                && skill.identity.owner.as_deref() == Some("tests")
+                && skill.identity.slug == "writer"
+        }));
         assert_eq!(restored.resolved_artifacts.len(), 1);
         assert_eq!(
             restored
@@ -3441,6 +3527,7 @@ mod tests {
             security_snapshot.sandbox.mode,
             TurnSandboxMode::WorkspaceWrite
         );
+        let _ = std::fs::remove_dir_all(skill_dir);
     }
 
     #[tokio::test]

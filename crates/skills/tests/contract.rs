@@ -1,5 +1,5 @@
 use pioneer_skills::{
-    DependencyCheckInput, SkillExcludedReason, SkillExplicitRef, SkillPolicySet,
+    DependencyCheckInput, SkillExcludedReason, SkillExplicitRef, SkillId, SkillPolicySet,
     SkillResolutionInput, SkillSourceKind, SkillTrustLevel, SkillValidationPolicy,
     parse_skill_from_file, resolve_skills,
 };
@@ -16,6 +16,7 @@ fn parse_fixture(dir_name: &str) -> pioneer_skills::SkillDefinition {
     let root = fixtures_root();
     let skill_file = root.join(dir_name).join("SKILL.md");
     parse_skill_from_file(
+        SkillId::new("FFFFFFFFFFFFFFFFFFFFF").expect("valid fixture skill id"),
         skill_file.as_path(),
         SkillSourceKind::User,
         root.as_path(),
@@ -144,10 +145,8 @@ fn metadata_command_dependency_can_block_resolution_when_binary_missing() {
 
     let result = resolve_skills(SkillResolutionInput {
         explicit_refs: &[SkillExplicitRef {
-            capability_id: "skill:user:agent-browser".to_owned(),
+            skill_id: SkillId::new("FFFFFFFFFFFFFFFFFFFFF").expect("valid fixture skill id"),
             label: Some("agent-browser".to_owned()),
-            slug: "agent-browser".to_owned(),
-            source_kind: "user".to_owned(),
         }],
         touched_paths: &[],
         catalog: &catalog,
@@ -173,6 +172,7 @@ fn local_and_registry_sources_compile_to_equivalent_runtime_manifest() {
     let skill_file = root.join("agent-browser").join("SKILL.md");
 
     let local = parse_skill_from_file(
+        SkillId::new("GGGGGGGGGGGGGGGGGGGGG").expect("valid local skill id"),
         skill_file.as_path(),
         SkillSourceKind::User,
         root.as_path(),
@@ -180,6 +180,7 @@ fn local_and_registry_sources_compile_to_equivalent_runtime_manifest() {
     )
     .expect("local skill should parse");
     let registry = parse_skill_from_file(
+        SkillId::new("HHHHHHHHHHHHHHHHHHHHH").expect("valid registry skill id"),
         skill_file.as_path(),
         SkillSourceKind::Registry,
         root.as_path(),

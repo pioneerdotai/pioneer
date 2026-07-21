@@ -1,10 +1,10 @@
-use crate::contract::{SkillSourceKind, SkillTrustLevel, source_qualified_skill_slug};
+use crate::contract::{SkillSourceKind, SkillTrustLevel};
 use crate::dependencies::{DependencyCheckInput, DependencyDiagnostic, evaluate_dependency_set};
 use crate::resolver::ResolvedSkill;
 use crate::security::{SkillSecurityPolicy, minimum_trust_for_tool_kind, trust_satisfies_minimum};
 use pioneer_protocol::{
     DeltaOutputPolicy, DiagnosticExcerptPolicy, LlmOutputPolicy, LlmRetentionPolicy,
-    RecoveryOutputPolicy, StorageOutputPolicy, TimelineOutputPolicy,
+    RecoveryOutputPolicy, SkillId, StorageOutputPolicy, TimelineOutputPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -285,6 +285,9 @@ pub struct SkillRuntimeToolDefinition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillRuntimeDescriptor {
     pub canonical_tool_name: String,
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub skill_name: String,
     #[serde(default)]
@@ -298,6 +301,9 @@ pub struct SkillRuntimeDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadSkillEntry {
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub name: String,
     pub description: String,
@@ -321,6 +327,7 @@ pub enum RuntimeToolExcludedReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExcludedRuntimeTool {
+    pub skill_id: SkillId,
     pub skill_slug: String,
     pub tool_slug: String,
     pub reason: RuntimeToolExcludedReason,
@@ -408,15 +415,14 @@ fn normalize_slug(input: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
-fn canonical_runtime_tool_name(skill_slug: &str, tool_slug: &str) -> Option<(String, String)> {
-    let normalized_skill = normalize_slug(skill_slug);
+fn canonical_runtime_tool_name(skill_id: &SkillId, tool_slug: &str) -> Option<(String, String)> {
     let normalized_tool = normalize_slug(tool_slug);
-    if normalized_skill.is_empty() || normalized_tool.is_empty() {
+    if normalized_tool.is_empty() {
         return None;
     }
 
     Some((
-        format!("{CANONICAL_PREFIX}.{normalized_skill}.{normalized_tool}"),
+        format!("{CANONICAL_PREFIX}.{skill_id}.{normalized_tool}"),
         normalized_tool,
     ))
 }
@@ -514,14 +520,13 @@ pub fn build_skill_runtime_plan(
 
     let mut read_skill_index = HashMap::new();
     for skill in active {
-        let read_skill_slug = source_qualified_skill_slug(
-            &skill.definition.identity.source_kind,
-            skill.slug.as_str(),
-        );
+        let machine_ref = format!("skill:{}", skill.skill_id);
         read_skill_index.insert(
-            read_skill_slug.clone(),
+            machine_ref,
             ReadSkillEntry {
-                slug: read_skill_slug,
+                skill_id: skill.skill_id.clone(),
+                owner: skill.definition.identity.owner.clone(),
+                slug: skill.definition.identity.slug.clone(),
                 name: skill.definition.identity.display_name.clone(),
                 description: skill.definition.instructions.description.clone(),
                 body: skill.definition.instructions.body.clone(),
@@ -543,6 +548,7 @@ pub fn build_skill_runtime_plan(
         for skill in active {
             for definition in &skill.definition.runtime.runtime_tools {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::DynamicToolsDisabled,
@@ -550,9 +556,8 @@ pub fn build_skill_runtime_plan(
             }
         }
         excluded_tools.sort_by(|left, right| {
-            left.skill_slug
-                .as_str()
-                .cmp(right.skill_slug.as_str())
+            left.skill_id
+                .cmp(&right.skill_id)
                 .then_with(|| left.tool_slug.as_str().cmp(right.tool_slug.as_str()))
         });
         return SkillRuntimePlan {
@@ -566,13 +571,9 @@ pub fn build_skill_runtime_plan(
     let mut used_names = HashSet::new();
 
     let mut ordered_skills = active.to_vec();
-    ordered_skills.sort_by(|left, right| left.slug.as_str().cmp(right.slug.as_str()));
+    ordered_skills.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
 
     for skill in ordered_skills {
-        let source_qualified_slug = source_qualified_skill_slug(
-            &skill.definition.identity.source_kind,
-            skill.slug.as_str(),
-        );
         let mut definitions = skill.definition.runtime.runtime_tools.clone();
         definitions.sort_by(|left, right| {
             normalize_slug(left.tool_slug.as_str()).cmp(&normalize_slug(right.tool_slug.as_str()))
@@ -583,6 +584,7 @@ pub fn build_skill_runtime_plan(
         for definition in definitions {
             if !kind_allowed(&definition.kind, &budget) {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::DisabledByConfig,
@@ -596,6 +598,7 @@ pub fn build_skill_runtime_plan(
                 &trust_policy,
             ) {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::TrustLevelTooLow,
@@ -605,6 +608,7 @@ pub fn build_skill_runtime_plan(
 
             if accepted_for_skill >= budget.max_dynamic_tools_per_skill {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::MaxDynamicToolsPerSkill,
@@ -612,11 +616,11 @@ pub fn build_skill_runtime_plan(
                 continue;
             }
 
-            let Some((canonical_tool_name, normalized_tool_slug)) = canonical_runtime_tool_name(
-                source_qualified_slug.as_str(),
-                definition.tool_slug.as_str(),
-            ) else {
+            let Some((canonical_tool_name, normalized_tool_slug)) =
+                canonical_runtime_tool_name(&skill.skill_id, definition.tool_slug.as_str())
+            else {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::InvalidToolSlug,
@@ -626,6 +630,7 @@ pub fn build_skill_runtime_plan(
 
             if !used_names.insert(canonical_tool_name.clone()) {
                 excluded_tools.push(ExcludedRuntimeTool {
+                    skill_id: skill.skill_id.clone(),
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
                     reason: RuntimeToolExcludedReason::DuplicateCanonicalName,
@@ -635,6 +640,8 @@ pub fn build_skill_runtime_plan(
 
             accepted.push(SkillRuntimeDescriptor {
                 canonical_tool_name,
+                skill_id: skill.skill_id.clone(),
+                skill_owner: skill.definition.identity.owner.clone(),
                 skill_slug: skill.slug.clone(),
                 skill_name: skill.definition.identity.display_name.clone(),
                 skill_asset_root: skill.definition.identity.skill_dir.clone(),
@@ -658,20 +665,16 @@ pub fn build_skill_runtime_plan(
     }
 
     accepted.sort_by(|left, right| {
-        left.skill_slug
-            .as_str()
-            .cmp(right.skill_slug.as_str())
-            .then_with(|| {
-                left.definition
-                    .tool_slug
-                    .as_str()
-                    .cmp(right.definition.tool_slug.as_str())
-            })
+        left.skill_id.cmp(&right.skill_id).then_with(|| {
+            left.definition
+                .tool_slug
+                .as_str()
+                .cmp(right.definition.tool_slug.as_str())
+        })
     });
     excluded_tools.sort_by(|left, right| {
-        left.skill_slug
-            .as_str()
-            .cmp(right.skill_slug.as_str())
+        left.skill_id
+            .cmp(&right.skill_id)
             .then_with(|| left.tool_slug.as_str().cmp(right.tool_slug.as_str()))
     });
 
@@ -700,6 +703,7 @@ mod tests {
         ResolvedSkill, SkillExplicitRef, SkillResolutionInput, SkillResolvedReason,
         SkillValidationPolicy, resolve_skills,
     };
+    use pioneer_protocol::SkillId;
     use serde_json::json;
 
     fn skill_with_runtime_tools(
@@ -715,8 +719,10 @@ mod tests {
         source_kind: SkillSourceKind,
     ) -> SkillDefinition {
         let conformance = default_skill_conformance();
+        let skill_id = test_skill_id(slug, source_kind);
         let definition = compile_skill_definition(CompileSkillInput {
-            owner: "workspace".to_owned(),
+            skill_id,
+            owner: Some("workspace".to_owned()),
             slug: slug.to_owned(),
             name: slug.to_owned(),
             display_name: slug.to_owned(),
@@ -744,6 +750,24 @@ mod tests {
         definition
     }
 
+    fn test_skill_id(value: &str, source_kind: SkillSourceKind) -> SkillId {
+        let suffix = match source_kind {
+            SkillSourceKind::System => 'S',
+            SkillSourceKind::User => 'U',
+            SkillSourceKind::Registry => 'R',
+        };
+        let mut value = value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        value.truncate(20);
+        while value.len() < 20 {
+            value.push(suffix);
+        }
+        value.push(suffix);
+        SkillId::new(value).unwrap()
+    }
+
     fn resolved_active_with_tools(
         slug: &str,
         tools: Vec<SkillRuntimeToolDefinition>,
@@ -753,12 +777,11 @@ mod tests {
             generated_at_unix: 1,
             skills: vec![skill_with_runtime_tools(slug, tools)],
         };
+        let skill_id = catalog.skills[0].identity.skill_id.clone();
         resolve_skills(SkillResolutionInput {
             explicit_refs: &[SkillExplicitRef {
-                capability_id: format!("skill:user:{slug}"),
+                skill_id,
                 label: Some(slug.to_owned()),
-                slug: slug.to_owned(),
-                source_kind: "user".to_owned(),
             }],
             touched_paths: &[],
             catalog: &catalog,
@@ -813,11 +836,11 @@ mod tests {
         assert_eq!(plan.tools.len(), 2);
         assert_eq!(
             plan.tools[0].canonical_tool_name,
-            "skill.user-workspace-my-skill.a-tool"
+            format!("skill.{}.a-tool", active[0].skill_id)
         );
         assert_eq!(
             plan.tools[1].canonical_tool_name,
-            "skill.user-workspace-my-skill.b-tool"
+            format!("skill.{}.b-tool", active[0].skill_id)
         );
     }
 
@@ -904,8 +927,9 @@ mod tests {
         };
 
         let mut policy_set = SkillPolicySet::default();
+        let system_skill_id = catalog.skills[0].identity.skill_id.clone();
         policy_set.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/system-tools", "system"),
+            SkillPolicyKey::new(system_skill_id.clone()),
             SkillPolicy {
                 enabled: Some(false),
                 allow_implicit_invocation: None,
@@ -914,10 +938,8 @@ mod tests {
 
         let active = resolve_skills(SkillResolutionInput {
             explicit_refs: &[SkillExplicitRef {
-                capability_id: "skill:system:system-tools".to_owned(),
+                skill_id: system_skill_id,
                 label: Some("system-tools".to_owned()),
-                slug: "system-tools".to_owned(),
-                source_kind: "system".to_owned(),
             }],
             touched_paths: &[],
             catalog: &catalog,
@@ -958,12 +980,14 @@ mod tests {
 
         let active = vec![
             ResolvedSkill {
-                slug: "workspace/browser".to_owned(),
+                skill_id: system.identity.skill_id.clone(),
+                slug: "browser".to_owned(),
                 reason: SkillResolvedReason::ExplicitCapability,
                 definition: system,
             },
             ResolvedSkill {
-                slug: "workspace/browser".to_owned(),
+                skill_id: user.identity.skill_id.clone(),
+                slug: "browser".to_owned(),
                 reason: SkillResolvedReason::ExplicitCapability,
                 definition: user,
             },
@@ -985,11 +1009,11 @@ mod tests {
         );
 
         assert_eq!(
-            plan.read_skill_index["system:workspace/browser"].skill_asset_root,
+            plan.read_skill_index[&format!("skill:{}", active[0].skill_id)].skill_asset_root,
             "/tmp/system/browser"
         );
         assert_eq!(
-            plan.read_skill_index["user:workspace/browser"].skill_asset_root,
+            plan.read_skill_index[&format!("skill:{}", active[1].skill_id)].skill_asset_root,
             "/tmp/user/browser"
         );
     }
@@ -1018,12 +1042,14 @@ mod tests {
 
         let active = vec![
             ResolvedSkill {
-                slug: "workspace/browser".to_owned(),
+                skill_id: system.identity.skill_id.clone(),
+                slug: "browser".to_owned(),
                 reason: SkillResolvedReason::ExplicitCapability,
                 definition: system,
             },
             ResolvedSkill {
-                slug: "workspace/browser".to_owned(),
+                skill_id: user.identity.skill_id.clone(),
+                slug: "browser".to_owned(),
                 reason: SkillResolvedReason::ExplicitCapability,
                 definition: user,
             },
@@ -1050,8 +1076,8 @@ mod tests {
             .map(|tool| tool.canonical_tool_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(plan.tools.len(), 2);
-        assert!(tool_names.contains(&"skill.system-workspace-browser.fetch"));
-        assert!(tool_names.contains(&"skill.user-workspace-browser.fetch"));
+        assert!(tool_names.contains(&format!("skill.{}.fetch", active[0].skill_id).as_str()));
+        assert!(tool_names.contains(&format!("skill.{}.fetch", active[1].skill_id).as_str()));
         assert!(plan.excluded_tools.is_empty());
     }
 
@@ -1124,12 +1150,11 @@ mod tests {
             generated_at_unix: 1,
             skills: vec![skill],
         };
+        let skill_id = catalog.skills[0].identity.skill_id.clone();
         let active = resolve_skills(SkillResolutionInput {
             explicit_refs: &[SkillExplicitRef {
-                capability_id: "skill:user:untrusted-shell".to_owned(),
+                skill_id,
                 label: Some("untrusted-shell".to_owned()),
-                slug: "untrusted-shell".to_owned(),
-                source_kind: "user".to_owned(),
             }],
             touched_paths: &[],
             catalog: &catalog,

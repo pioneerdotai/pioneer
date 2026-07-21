@@ -255,6 +255,14 @@ fn extract_dynamic_skill_permission_intent(
         .insert("operation".to_owned(), "dynamic skill tool".to_owned());
     scope
         .entries
+        .insert("skill_id".to_owned(), metadata.skill_id.to_string());
+    if let Some(owner) = metadata.skill_owner.as_ref() {
+        scope
+            .entries
+            .insert("skill_owner".to_owned(), owner.clone());
+    }
+    scope
+        .entries
         .insert("skill_slug".to_owned(), metadata.skill_slug.clone());
     scope
         .entries
@@ -1416,6 +1424,9 @@ mod tests {
         ToolPermissionMetadata {
             dynamic_skill: Some(DynamicSkillPermissionMetadata {
                 kind,
+                skill_id: pioneer_protocol::SkillId::new("PPPPPPPPPPPPPPPPPPPPP")
+                    .expect("valid permission test SkillId"),
+                skill_owner: Some("workspace".to_owned()),
                 skill_slug: "user:weather".to_owned(),
                 source_kind: "User".to_owned(),
                 trust_level: "Trusted".to_owned(),
@@ -2303,6 +2314,14 @@ mod tests {
         let payload = serde_json::to_string(&intent.scope.entries).expect("scope serializes");
 
         assert_eq!(intent.action, PermissionActionKind::Network);
+        assert_eq!(
+            intent.scope.entries.get("skill_id"),
+            Some(&"PPPPPPPPPPPPPPPPPPPPP".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("skill_owner"),
+            Some(&"workspace".to_owned())
+        );
         assert_eq!(intent.scope.entries.get("method"), Some(&"POST".to_owned()));
         assert_eq!(
             intent.scope.entries.get("dynamic_skill_kind"),

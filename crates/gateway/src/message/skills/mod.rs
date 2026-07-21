@@ -1,10 +1,13 @@
 use super::*;
 use anyhow::{Result, bail};
-use pioneer_crud::{SkillAuditEventRecord, SkillInstallationRecord, WorkspaceSkillPolicyRecord};
+use pioneer_crud::{
+    SkillAuditEventRecord, SkillInstallationPatch, SkillInstallationRecord,
+    WorkspaceSkillPolicyRecord,
+};
 use pioneer_protocol::constants::{events, methods};
 use pioneer_protocol::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcResponse, RequestId, SkillAuditTimelineItem,
-    SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary,
+    SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillId,
     SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource,
     SkillListItem, SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
     SkillTrustGateStatus, SkillValidationDiagnostic, SkillWorkspacePolicy,
@@ -16,8 +19,7 @@ use pioneer_protocol::{
 use pioneer_skills::{
     DependencyCheckInput, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy, SkillPolicyKey,
     SkillPolicySet, SkillResolutionInput, SkillSecurityPolicy, SkillSourceKind,
-    SkillValidationPolicy, effective_policy_for_skill, explicit_ref_matches_skill,
-    is_qualified_skill_slug as is_qualified_slug, load_catalog, qualified_skill_slug,
+    SkillValidationPolicy, effective_policy_for_skill, explicit_ref_matches_skill, load_catalog,
     resolve_skills, skill_implicit_invocation_editable,
 };
 use serde_json::json;
@@ -48,7 +50,7 @@ const SKILLS_ERROR_INTERNAL: &str = "skills.internal_error";
 const SKILLS_WATCH_DEBOUNCE_MS: u64 = 1_500;
 
 #[derive(Clone)]
-struct SkillsRuntimeContext {
+pub(crate) struct SkillsRuntimeContext {
     catalog_params: SkillCatalogLoadParams,
     validation_policy: SkillValidationPolicy,
     security_policy: SkillSecurityPolicy,
@@ -72,13 +74,9 @@ mod lifecycle;
 mod policy;
 mod upload;
 mod watcher;
-mod workspace;
+pub(crate) mod workspace;
 
 pub(in crate::message) use upload::SKILL_UPLOAD_CHUNK_FRAME_MAGIC;
-
-fn skill_key(slug: &str, source_kind: &str) -> String {
-    format!("{slug}::{source_kind}")
-}
 
 fn to_protocol_dependency(
     diagnostic: &pioneer_skills::DependencyDiagnostic,
@@ -168,15 +166,6 @@ fn parse_installable_source_kind(raw: &str) -> Option<SkillSourceKind> {
     }
 }
 
-fn skill_installation_scope_key(source_kind: &SkillSourceKind, workspace_id: &str) -> String {
-    match source_kind {
-        SkillSourceKind::User | SkillSourceKind::Registry => workspace_id.to_owned(),
-        SkillSourceKind::System => {
-            unreachable!("only user and registry skill installations are supported")
-        }
-    }
-}
-
 fn install_location_for_source_kind(
     context: &SkillsRuntimeContext,
     source_kind: &SkillSourceKind,
@@ -192,6 +181,31 @@ fn install_location_for_source_kind(
         }),
         SkillSourceKind::System => None,
     }
+}
+
+fn install_location_for_stored_source_kind(
+    context: &SkillsRuntimeContext,
+    stored_source_kind: &str,
+) -> Result<(SkillSourceKind, SkillInstallLocation)> {
+    let Some(source_kind) = parse_installable_source_kind(stored_source_kind) else {
+        bail!("stored skill source kind `{stored_source_kind}` is not lifecycle-editable");
+    };
+    let Some(location) = install_location_for_source_kind(context, &source_kind) else {
+        bail!("stored skill source kind `{stored_source_kind}` has no managed location");
+    };
+    Ok((source_kind, location))
+}
+
+fn pioneer_owned_install_path(
+    location: &SkillInstallLocation,
+    stored_install_path: &str,
+) -> Option<PathBuf> {
+    let path = PathBuf::from(stored_install_path);
+    let containment = pioneer_skills::ensure_install_path_contained(
+        location.install_root.as_path(),
+        path.as_path(),
+    );
+    (!containment.has_blocking_findings()).then_some(path)
 }
 
 fn installer_policy(context: &SkillsRuntimeContext) -> pioneer_skills::SkillInstallerPolicy {
@@ -323,6 +337,8 @@ fn skill_audit_records(events: &[pioneer_skills::SkillAuditEvent]) -> Vec<SkillA
         .iter()
         .map(|event| SkillAuditEventRecord {
             turn_id: None,
+            skill_id: event.skill_id.clone(),
+            skill_owner: event.skill_owner.clone(),
             skill_slug: event.skill_slug.clone(),
             source_kind: event.source_kind.clone(),
             action: event.action.as_db_value().to_owned(),
@@ -364,6 +380,49 @@ fn trust_level_as_str(level: &pioneer_skills::SkillTrustLevel) -> &'static str {
     }
 }
 
+fn parse_persisted_trust_level(value: &str) -> Result<pioneer_skills::SkillTrustLevel> {
+    match value {
+        "internal" => Ok(pioneer_skills::SkillTrustLevel::Internal),
+        "verified" => Ok(pioneer_skills::SkillTrustLevel::Verified),
+        "community" => Ok(pioneer_skills::SkillTrustLevel::Community),
+        "untrusted" => Ok(pioneer_skills::SkillTrustLevel::Untrusted),
+        other => bail!("unsupported persisted skill trust level `{other}`"),
+    }
+}
+
+impl MessageProcessor {
+    pub(crate) async fn ensure_skills_lock_v2_locked(
+        &self,
+        lock_path: &Path,
+        source_kind: SkillSourceKind,
+        scope_key: &str,
+    ) -> Result<pioneer_skills::SkillsLock> {
+        let candidates = self
+            .crud_store
+            .list_skill_installations()
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.source_kind == source_kind.as_db_value() && row.scope_key == scope_key
+            })
+            .map(|row| {
+                Ok(pioneer_skills::SkillLockConversionCandidate {
+                    skill_id: row.skill_id,
+                    owner: row.owner,
+                    slug: row.slug,
+                    source_kind: row.source_kind,
+                    source_ref: row.source_ref,
+                    install_path: row.install_path,
+                    version: row.version,
+                    trust_level: parse_persisted_trust_level(row.trust_level.as_str())?,
+                    fingerprint: row.fingerprint,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        pioneer_skills::ensure_skills_lock_v2(lock_path, candidates.as_slice())
+    }
+}
+
 fn sanitize_workspace_id_component(workspace_id: &str) -> String {
     let mut sanitized = String::with_capacity(workspace_id.len());
     for ch in workspace_id.trim().chars() {
@@ -400,7 +459,7 @@ fn expand_home(path: &str) -> String {
     path.to_owned()
 }
 
-fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
+pub(crate) fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
     let expanded_workspace = expand_workspace_id_token(raw, workspace_id);
     let expanded = expand_home(expanded_workspace.as_str());
     let candidate = PathBuf::from(expanded);
@@ -411,24 +470,6 @@ fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(candidate)
     }
-}
-
-fn watch_roots(raw_roots: &[String]) -> Vec<PathBuf> {
-    raw_roots
-        .iter()
-        .map(|raw| {
-            if let Some((prefix, _)) = raw.split_once(WORKSPACE_ID_TOKEN) {
-                let prefix = prefix.trim_end_matches('/').trim_end_matches('\\');
-                if prefix.is_empty() {
-                    resolve_root_path(raw, "workspace")
-                } else {
-                    resolve_root_path(prefix, "workspace")
-                }
-            } else {
-                resolve_root_path(raw, "workspace")
-            }
-        })
-        .collect()
 }
 
 fn hash_skill_roots(roots: &[PathBuf]) -> u64 {
@@ -468,9 +509,6 @@ fn hash_skill_root(root: &Path, hasher: &mut DefaultHasher) {
                 continue;
             }
             if !meta.is_file() {
-                continue;
-            }
-            if path.file_name().and_then(|value| value.to_str()) != Some("SKILL.md") {
                 continue;
             }
             path.display().to_string().hash(hasher);

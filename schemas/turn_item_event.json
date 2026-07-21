@@ -832,6 +832,12 @@
         }
       ]
     },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "StorageOutputPolicy": {
       "oneOf": [
         {
@@ -4128,11 +4134,17 @@
     "TurnSkillCapabilitySummary": {
       "type": "object",
       "properties": {
-        "id": {
-          "type": "string"
-        },
         "label": {
           "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skillId": {
+          "$ref": "#/$defs/SkillId"
         },
         "slug": {
           "type": "string"
@@ -4142,7 +4154,7 @@
         }
       },
       "required": [
-        "id",
+        "skillId",
         "label",
         "slug",
         "sourceKind"

@@ -49,6 +49,8 @@ fn runtime_descriptor_to_dynamic_descriptor(
 ) -> SkillDynamicToolDescriptor {
     SkillDynamicToolDescriptor {
         canonical_tool_name: descriptor.canonical_tool_name.clone(),
+        skill_id: descriptor.skill_id.clone(),
+        skill_owner: descriptor.skill_owner.clone(),
         skill_slug: descriptor.skill_slug.clone(),
         skill_asset_root: descriptor.skill_asset_root.clone(),
         skill_fingerprint: descriptor.skill_fingerprint.clone(),
@@ -84,10 +86,12 @@ fn map_read_skill_index(
 ) -> HashMap<String, SkillReadToolEntry> {
     source
         .iter()
-        .map(|(slug, entry)| {
+        .map(|(skill_ref, entry)| {
             (
-                slug.clone(),
+                skill_ref.clone(),
                 SkillReadToolEntry {
+                    skill_id: entry.skill_id.clone(),
+                    owner: entry.owner.clone(),
                     slug: entry.slug.clone(),
                     name: entry.name.clone(),
                     description: entry.description.clone(),

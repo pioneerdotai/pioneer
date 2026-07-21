@@ -410,6 +410,12 @@
         "mode"
       ]
     },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "TextElement": {
       "type": "object",
       "properties": {
@@ -490,11 +496,8 @@
         {
           "type": "object",
           "properties": {
-            "slug": {
-              "type": "string"
-            },
-            "sourceKind": {
-              "type": "string"
+            "skillId": {
+              "$ref": "#/$defs/SkillId"
             },
             "type": {
               "type": "string",
@@ -503,8 +506,7 @@
           },
           "required": [
             "type",
-            "slug",
-            "sourceKind"
+            "skillId"
           ]
         },
         {

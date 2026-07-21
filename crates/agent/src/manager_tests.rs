@@ -43,7 +43,10 @@ use pioneer_provider::{
     MessageContentPart, Provider, ProviderCapabilities, ProviderInputCapabilities,
     ProviderRegistry, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
 };
-use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillPolicyKey, SkillTrustLevel};
+use pioneer_skills::{
+    SkillAuditAction, SkillAuditDecision, SkillCatalogInstallation, SkillCatalogLoadParams,
+    SkillCatalogSnapshot, SkillPolicyKey, SkillSourceKind, SkillTrustLevel, load_catalog,
+};
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
     FunctionToolOutput, PayloadKind, ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler,
@@ -100,6 +103,9 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             registry_roots: vec![
                 "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
             ],
+            system_import_roots: Vec::new(),
+            user_import_roots: Vec::new(),
+            registry_import_roots: Vec::new(),
             validation: super::SkillsValidationLoopConfig {
                 strict_agentskills: true,
                 accept_openclaw_profile: true,
@@ -144,6 +150,98 @@ fn test_tool_loop_config() -> ToolLoopConfig {
         execution_windows: ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
     }
+}
+
+fn test_skill_id_for_path(path: &std::path::Path) -> pioneer_protocol::SkillId {
+    let mut value = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("skill")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    value.truncate(21);
+    while value.len() < 21 {
+        value.push('T');
+    }
+    pioneer_protocol::SkillId::new(value).expect("test path must produce a valid SkillId")
+}
+
+fn test_skill_catalog(config: &super::SkillsLoopConfig) -> SkillCatalogSnapshot {
+    let mut installations = Vec::new();
+    for (source_kind, roots) in [
+        (SkillSourceKind::System, &config.system_roots),
+        (SkillSourceKind::User, &config.user_roots),
+        (SkillSourceKind::Registry, &config.registry_roots),
+    ] {
+        for raw_root in roots {
+            let root = std::path::PathBuf::from(raw_root);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut candidates = Vec::new();
+            if root.join("SKILL.md").is_file() {
+                candidates.push(root.clone());
+            }
+            if let Ok(first_level) = std::fs::read_dir(&root) {
+                for first in first_level.flatten() {
+                    let first_path = first.path();
+                    if !first_path.is_dir() {
+                        continue;
+                    }
+                    if first_path.join("SKILL.md").is_file() {
+                        candidates.push(first_path.clone());
+                        continue;
+                    }
+                    if let Ok(second_level) = std::fs::read_dir(&first_path) {
+                        for second in second_level.flatten() {
+                            let second_path = second.path();
+                            if second_path.is_dir() && second_path.join("SKILL.md").is_file() {
+                                candidates.push(second_path);
+                            }
+                        }
+                    }
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            for path in candidates {
+                let slug = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("skill")
+                    .to_owned();
+                let owner = path
+                    .parent()
+                    .filter(|parent| *parent != root)
+                    .and_then(std::path::Path::file_name)
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned);
+                installations.push(SkillCatalogInstallation {
+                    skill_id: test_skill_id_for_path(path.as_path()),
+                    owner,
+                    slug,
+                    version: None,
+                    source_kind,
+                    source_ref: format!("test:{}", path.display()),
+                    install_path: path,
+                    trust_level: match source_kind {
+                        SkillSourceKind::System => SkillTrustLevel::Internal,
+                        SkillSourceKind::User | SkillSourceKind::Registry => {
+                            SkillTrustLevel::Community
+                        }
+                    },
+                    fingerprint: "test-fingerprint".to_owned(),
+                });
+            }
+        }
+    }
+    load_catalog(&SkillCatalogLoadParams {
+        installations,
+        bundled: Vec::new(),
+        max_file_bytes: config.max_skill_file_bytes,
+    })
+    .expect("test skill catalog must load")
 }
 
 impl AgentManager {
@@ -192,6 +290,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
+            test_skill_catalog(&self.tool_loop_config.skills),
             input,
             capabilities,
             Vec::new(),
@@ -227,6 +326,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
+            test_skill_catalog(&self.tool_loop_config.skills),
             input,
             capabilities,
             resolved_artifacts,
@@ -263,6 +363,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
+            test_skill_catalog(&self.tool_loop_config.skills),
             input,
             capabilities,
             resolved_artifacts,
@@ -312,14 +413,27 @@ fn test_manager() -> AgentManager {
 }
 
 fn skill_capability(slug: &str) -> TurnCapability {
+    let skill_id = test_skill_id_for_path(std::path::Path::new(slug));
     TurnCapability {
-        id: format!("skill:user:{slug}"),
-        kind: TurnCapabilityKind::Skill {
-            slug: slug.to_owned(),
-            source_kind: "user".to_owned(),
-        },
+        id: format!("skill:{skill_id}"),
+        kind: TurnCapabilityKind::Skill { skill_id },
         label: Some(slug.to_owned()),
     }
+}
+
+fn test_skill_ref(slug: &str) -> String {
+    format!(
+        "skill:{}",
+        test_skill_id_for_path(std::path::Path::new(slug))
+    )
+}
+
+fn test_skill_tool_name(slug: &str, tool_slug: &str) -> String {
+    format!(
+        "skill.{}.{}",
+        test_skill_id_for_path(std::path::Path::new(slug)),
+        tool_slug.replace('_', "-")
+    )
 }
 
 fn mcp_tool_capability(server_name: &str, raw_tool_name: &str) -> TurnCapability {
@@ -342,7 +456,9 @@ fn assert_compact_skill_prompt(
 ) {
     assert!(system_text.contains("[Skills]"));
     assert!(system_text.contains(display_name));
-    assert!(system_text.contains(&format!("Skill slug for read_skill: `{skill_slug}`")));
+    assert!(system_text.contains(&format!(
+        "Exact skill reference for read_skill: `{skill_slug}`"
+    )));
     assert!(!system_text.contains(&format!("[Skill Body: ${skill_slug}]")));
     assert!(!system_text.contains(body));
 }
@@ -3117,6 +3233,8 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             events: events
                 .into_iter()
                 .map(|event| pioneer_skills::SkillAuditEvent {
+                    skill_id: event.skill_id,
+                    skill_owner: event.skill_owner,
                     skill_slug: event.skill_slug,
                     source_kind: event.source_kind,
                     action: match event.action.as_str() {
@@ -10919,7 +11037,12 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
     let saw_binding_event = observed.iter().any(|event| match event {
         AgentEvent::TurnSkillsResolved { bindings, .. } => {
             assert_eq!(bindings.len(), 1);
-            assert_eq!(bindings[0].skill_slug, "tests/my-skill");
+            assert_eq!(
+                bindings[0].skill_id,
+                test_skill_id_for_path(std::path::Path::new("my-skill"))
+            );
+            assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
+            assert_eq!(bindings[0].skill_slug, "my-skill");
             assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
             true
         }
@@ -10931,7 +11054,7 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
         } => {
             assert!(rejected.is_empty());
             assert_eq!(accepted.len(), 1);
-            assert_eq!(accepted[0].id, "skill:user:my-skill");
+            assert_eq!(accepted[0].id, test_skill_ref("my-skill"));
             assert_eq!(
                 accepted[0].reason,
                 TurnCapabilityAcceptedReason::ExplicitComposerCapability
@@ -10962,7 +11085,7 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
         .expect("compiled prompt should be attached to provider request");
     assert_compact_skill_prompt(
         compiled_prompt.full_system_text.as_str(),
-        "user:tests/my-skill",
+        &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
     );
@@ -11049,13 +11172,9 @@ async fn rejected_capability_emits_event_warning_and_blocks_before_prompt_compil
         .expect("capability resolution event should be emitted");
     assert!(accepted.is_empty());
     assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0].id, "skill:user:missing-skill");
+    assert_eq!(rejected[0].id, test_skill_ref("missing-skill"));
     assert_eq!(rejected[0].reason, TurnCapabilityRejectedReason::NotFound);
-    assert!(
-        rejected[0]
-            .message
-            .contains("not installed or not available")
-    );
+    assert!(rejected[0].message.contains("was not found"));
 
     let serialized = serde_json::to_string(&AgentDurableEvent::TurnCapabilitiesResolved {
         thread_id: thread_id.to_owned(),
@@ -11066,7 +11185,7 @@ async fn rejected_capability_emits_event_warning_and_blocks_before_prompt_compil
     })
     .expect("capability event should serialize");
     assert!(serialized.contains("turn_capabilities_resolved"));
-    assert!(serialized.contains("not installed or not available"));
+    assert!(serialized.contains("was not found"));
     assert!(!serialized.contains("SKILL.md"));
 
     let warning = observed
@@ -11188,7 +11307,7 @@ async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provid
         .expect("compiled prompt should be attached to provider request");
     assert_compact_skill_prompt(
         compiled_prompt.full_system_text.as_str(),
-        "user:tests/my-skill",
+        &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
     );
@@ -11333,7 +11452,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"skill.user-tests-my-skill.fetch-data"));
+    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
     assert!(tool_names.contains(&"read_skill"));
 
     let _ = fs::remove_dir_all(skill_root);
@@ -11620,7 +11739,7 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
         .expect("agent request should include compiled prompt");
     assert_compact_skill_prompt(
         prompt.full_system_text.as_str(),
-        "user:tests/my-skill",
+        &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
     );
@@ -11654,7 +11773,7 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
     assert!(
         accepted
             .iter()
-            .any(|capability| capability.id == "skill:user:my-skill")
+            .any(|capability| capability.id == test_skill_ref("my-skill"))
     );
     assert!(
         accepted
@@ -11771,7 +11890,11 @@ async fn mixed_skill_mcp_unprojected_workspace_dependency_blocks_before_provider
     let (accepted, rejected, mcp_bindings) =
         capability_event.expect("combined rejection must remain visible as one capability event");
     assert!(accepted.iter().any(|item| item.id == capability_id));
-    assert!(rejected.iter().any(|item| item.id == "skill:user:my-skill"));
+    assert!(
+        rejected
+            .iter()
+            .any(|item| item.id == test_skill_ref("my-skill"))
+    );
     assert!(
         mcp_bindings.is_empty(),
         "failed combined preflight must not commit MCP bindings"
@@ -11815,7 +11938,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_dynamic_1".to_owned(),
-            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
+            name: test_skill_tool_name("my-skill", "echo-shell"),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -11904,7 +12027,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.user-tests-my-skill.echo-shell")
+        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result.content.contains("shell-ok"),
@@ -11922,7 +12045,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
                     output_policy,
                     ..
                 } = &notification.item
-                && tool_name == "skill.user-tests-my-skill.echo-shell"
+                && tool_name == &test_skill_tool_name("my-skill", "echo-shell")
             {
                 return Some((storage, output_policy));
             }
@@ -11968,7 +12091,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: tool_call_id.to_owned(),
-            name: "skill.user-tests-my-skill.slow-shell".to_owned(),
+            name: test_skill_tool_name("my-skill", "slow-shell"),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -12105,7 +12228,7 @@ runtime:
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_dynamic_2".to_owned(),
-            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
+            name: test_skill_tool_name("my-skill", "echo-shell"),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -12172,7 +12295,7 @@ runtime:
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.user-tests-my-skill.echo-shell")
+        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result
@@ -12253,7 +12376,7 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
     for event in &observed {
         if let AgentEvent::SkillAuditEvents { events, .. } = event {
             for item in events {
-                if item.skill_slug == "tests/good-skill"
+                if item.skill_slug == "good-skill"
                     && item.action == SkillAuditAction::ResolveAllowed
                 {
                     assert_eq!(
@@ -12264,7 +12387,7 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
                     );
                     saw_allowed = true;
                 }
-                if item.skill_slug == "tests/bad-skill"
+                if item.skill_slug == "bad-skill"
                     && item.action == SkillAuditAction::ResolveBlocked
                     && item.reason_code.as_deref() == Some("resolve.dependency_missing")
                 {
@@ -12301,7 +12424,7 @@ async fn read_skill_returns_active_skill_body() {
         vec![ProviderToolCall {
             id: "call_read_1".to_owned(),
             name: "read_skill".to_owned(),
-            arguments: r#"{"slug":"user:tests/my-skill"}"#.to_owned(),
+            arguments: format!(r#"{{"skill_id":"{}"}}"#, test_skill_ref("my-skill")),
         }],
         "done",
     ));
@@ -12396,26 +12519,22 @@ async fn read_skill_returns_active_skill_body() {
         .find(|message| message.role == pioneer_provider::Role::Tool)
         .expect("second round must include tool result message");
     assert_eq!(read_skill_result.name.as_deref(), Some("read_skill"));
-    assert!(
-        read_skill_result
-            .content
-            .contains("\"slug\":\"user:tests/my-skill\"")
-    );
+    assert!(read_skill_result.content.contains("\"slug\":\"my-skill\""));
+    assert!(read_skill_result.content.contains(&format!(
+        "\"skill_id\":\"{}\"",
+        test_skill_id_for_path(std::path::Path::new("my-skill"))
+    )));
     assert!(
         read_skill_result
             .content
             .contains("Full body text for read_skill.")
     );
     assert!(
-        read_skill_result.content.contains(
-            format!(
-                "\"skill_asset_root\":\"{}\"",
-                fs::canonicalize(skill_dir.as_path())
-                    .expect("skill dir canonicalizes")
-                    .display()
-            )
-            .as_str()
-        )
+        read_skill_result
+            .content
+            .contains(format!("\"skill_asset_root\":\"{}\"", skill_dir.display()).as_str()),
+        "unexpected read_skill result: {}",
+        read_skill_result.content,
     );
     assert!(
         read_skill_result
@@ -12427,7 +12546,7 @@ async fn read_skill_returns_active_skill_body() {
 }
 
 #[tokio::test]
-async fn read_skill_rejects_non_active_slug() {
+async fn read_skill_rejects_non_active_id() {
     let skill_root = unique_temp_dir("read-skill-miss");
     write_skill(
         skill_root.as_path(),
@@ -12440,7 +12559,7 @@ async fn read_skill_rejects_non_active_slug() {
         vec![ProviderToolCall {
             id: "call_read_miss".to_owned(),
             name: "read_skill".to_owned(),
-            arguments: r#"{"slug":"unknown/skill"}"#.to_owned(),
+            arguments: r#"{"skill_id":"skill:MMMMMMMMMMMMMMMMMMMMM"}"#.to_owned(),
         }],
         "done",
     ));
@@ -12608,7 +12727,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"read_file"));
-    assert!(!tool_names.contains(&"skill.user-tests-my-skill.bad-proxy"));
+    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -12698,8 +12817,8 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"skill.user-tests-my-skill.fetch-data"));
-    assert!(!tool_names.contains(&"skill.user-tests-my-skill.bad-proxy"));
+    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
+    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }

@@ -999,7 +999,7 @@ mod tests {
         VoiceTranscriptionDiagnostics, VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
     };
     use pioneer_protocol::{
-        AgentExecutionBackend, ThreadMode, TurnCapability, TurnCapabilityKind, UserInput,
+        AgentExecutionBackend, SkillId, ThreadMode, TurnCapability, TurnCapabilityKind, UserInput,
         VoiceTurnContext,
     };
 
@@ -1012,10 +1012,10 @@ mod tests {
                 path: "/tmp/prepared.txt".to_owned(),
             }],
             capabilities: vec![TurnCapability {
-                id: "skill:workspace:demo".to_owned(),
+                id: "skill:VVVVVVVVVVVVVVVVVVVVV".to_owned(),
                 kind: TurnCapabilityKind::Skill {
-                    slug: "demo".to_owned(),
-                    source_kind: "workspace".to_owned(),
+                    skill_id: SkillId::new("VVVVVVVVVVVVVVVVVVVVV")
+                        .expect("valid voice fixture SkillId"),
                 },
                 label: Some("Demo".to_owned()),
             }],

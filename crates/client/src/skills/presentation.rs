@@ -235,7 +235,7 @@ pub enum SkillJsonValuePreview {
 
 pub fn skill_summary_presentation(skill: &SkillListItem) -> SkillSummaryPresentation {
     SkillSummaryPresentation {
-        slug: split_skill_slug_for_view(skill.slug.as_str()),
+        slug: skill_slug_presentation(skill.owner.as_deref(), skill.slug.as_str()),
         version: non_empty_text(skill.version.as_deref().unwrap_or_default()),
         source: skill_source_kind(skill.source_kind.as_str()),
         trust: skill_trust_level(skill.trust_level.as_str()),
@@ -245,23 +245,16 @@ pub fn skill_summary_presentation(skill: &SkillListItem) -> SkillSummaryPresenta
     }
 }
 
-pub fn split_skill_slug_for_view(skill_slug: &str) -> SkillSlugPresentation {
-    let trimmed = skill_slug.trim();
-    if let Some((owner, slug)) = trimmed.split_once('/') {
-        let owner = owner.trim();
-        let slug = slug.trim();
-        if !owner.is_empty() && !slug.is_empty() {
-            return SkillSlugPresentation {
-                owner: Some(owner.to_owned()),
-                slug: slug.to_owned(),
-            };
-        }
-    }
-
+pub fn skill_slug_presentation(owner: Option<&str>, slug: &str) -> SkillSlugPresentation {
     SkillSlugPresentation {
-        owner: None,
-        slug: trimmed.to_owned(),
+        owner: owner.and_then(non_empty_text),
+        slug: slug.trim().to_owned(),
     }
+}
+
+pub fn compact_skill_label(owner: Option<&str>, slug: &str) -> String {
+    let presentation = skill_slug_presentation(owner, slug);
+    pioneer_skills::compact_skill_label(presentation.owner.as_deref(), presentation.slug.as_str())
 }
 
 pub fn short_fingerprint(fingerprint: &str) -> String {
@@ -603,11 +596,17 @@ pub fn optional_non_empty_text(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        SkillHealthSummary, SkillInstallState, SkillPolicyState, SkillTrustGateStatus,
+        SkillHealthSummary, SkillId, SkillInstallState, SkillPolicyState, SkillTrustGateStatus,
     };
 
-    fn skill(slug: &str) -> SkillListItem {
+    fn test_id(character: char) -> SkillId {
+        SkillId::new(character.to_string().repeat(21)).unwrap()
+    }
+
+    fn skill(owner: Option<&str>, slug: &str) -> SkillListItem {
         SkillListItem {
+            skill_id: test_id('A'),
+            owner: owner.map(str::to_owned),
             slug: slug.to_owned(),
             source_kind: "user".to_owned(),
             display_name: slug.to_owned(),
@@ -645,7 +644,7 @@ mod tests {
 
     #[test]
     fn skill_summary_normalizes_slug_version_fingerprint_and_status() {
-        let summary = skill_summary_presentation(&skill("@owner/example"));
+        let summary = skill_summary_presentation(&skill(Some("@owner"), "example"));
 
         assert_eq!(summary.slug.owner.as_deref(), Some("@owner"));
         assert_eq!(summary.slug.slug, "example");
@@ -655,15 +654,22 @@ mod tests {
         assert_eq!(summary.trust, SkillTrustLevel::Community);
         assert_eq!(summary.status, SkillStatus::Active);
         assert_eq!(summary.status_tone, SkillDiagnosticsTone::Success);
+        assert_eq!(
+            compact_skill_label(Some("@owner"), "example"),
+            "@owner/example"
+        );
+        assert_eq!(compact_skill_label(None, "example"), "example");
     }
 
     #[test]
     fn detail_diagnostics_prefers_health_detail_with_skill_fallback() {
-        let skill = skill("alpha");
+        let skill = skill(None, "alpha");
         let fallback = skill_detail_diagnostics(&skill, None);
         assert_eq!(fallback.dependency_diagnostics.len(), 1);
 
         let health = SkillHealthItem {
+            skill_id: skill.skill_id.clone(),
+            owner: None,
             slug: "alpha".to_owned(),
             source_kind: "user".to_owned(),
             trust_level: "community".to_owned(),

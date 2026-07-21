@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uq_turn_skill_binding_turn_id_skill_source")]
+    #[sea_orm(unique_key = "uq_turn_skill_binding_turn_id_skill_id")]
     pub turn_id: String,
-    #[sea_orm(unique_key = "uq_turn_skill_binding_turn_id_skill_source")]
+    #[sea_orm(unique_key = "uq_turn_skill_binding_turn_id_skill_id")]
+    pub skill_id: String,
+    pub skill_owner: Option<String>,
     pub skill_slug: String,
     pub skill_version: Option<String>,
     pub fingerprint: String,
-    #[sea_orm(unique_key = "uq_turn_skill_binding_turn_id_skill_source")]
     pub source_kind: String,
     pub resolved_reason: String,
     pub created_at: DateTimeWithTimeZone,

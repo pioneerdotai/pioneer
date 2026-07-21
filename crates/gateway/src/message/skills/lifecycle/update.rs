@@ -22,57 +22,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
-        let source_kind = match parse_installable_source_kind(params.source_kind.as_str()) {
-            Some(kind) => kind,
-            None => {
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
-                        "update supports only `user` or `registry` source_kind",
-                        json!({"source_kind": params.source_kind}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let source_kind_db = source_kind.as_db_value().to_owned();
-        let scope_key = skill_installation_scope_key(&source_kind, workspace_id.as_str());
-
-        if params.slug.trim().is_empty() {
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "slug is required",
-                    json!({}),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        if !is_qualified_slug(params.slug.as_str()) {
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id.clone()),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "slug must use owner/slug",
-                    json!({"slug": params.slug, "source_kind": params.source_kind}),
-                ),
-            )
-            .await;
-            return;
-        }
-
         let context = match self.skills_runtime_context(workspace_id.as_str()) {
             Ok(context) => context,
             Err(error) => {
@@ -90,7 +39,66 @@ impl MessageProcessor {
                 return;
             }
         };
-
+        let existing = match self
+            .crud_store
+            .find_skill_installation(&params.skill_id)
+            .await
+        {
+            Ok(Some(existing))
+                if existing.scope_key == workspace_id
+                    && matches!(existing.source_kind.as_str(), "user" | "registry") =>
+            {
+                existing
+            }
+            Ok(_) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_NOT_FOUND,
+                        "skill installation was not found",
+                        json!({"skill_id": params.skill_id}),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to read existing installation",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let (source_kind, location) = match install_location_for_stored_source_kind(
+            &context,
+            existing.source_kind.as_str(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "stored skill installation has an invalid lifecycle source",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let upload_id = match parse_lifecycle_upload_id(params.source) {
             Ok(upload_id) => upload_id,
             Err(error) => {
@@ -108,7 +116,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
         let materialized = match self
             .materialize_uploaded_skill_source(
                 connection_id,
@@ -125,11 +132,11 @@ impl MessageProcessor {
                 return;
             }
         };
-
         let source_ref = format!("upload:{}", materialized.upload.upload_id);
         let prepared = match pioneer_skills::prepare_materialized_skill(
             pioneer_skills::PrepareMaterializedSkillRequest {
-                source_kind: source_kind.clone(),
+                skill_id: params.skill_id.clone(),
+                source_kind,
                 source_ref: source_ref.clone(),
                 materialized_source_path: materialized.source_dir.clone(),
                 policy: installer_policy(&context),
@@ -155,97 +162,86 @@ impl MessageProcessor {
                 return;
             }
         };
-
-        let preview_slug = qualified_skill_slug(
-            prepared.definition.identity.owner.as_str(),
-            prepared.definition.identity.slug.as_str(),
-        );
-
-        if preview_slug != params.slug {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    SKILLS_ERROR_INVALID_REQUEST,
-                    "source skill slug does not match requested slug",
-                    json!({
-                        "requested_slug": params.slug,
-                        "source_slug": preview_slug,
-                    }),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let now = now_timestamp_secs();
-        let install_location = match install_location_for_source_kind(&context, &source_kind) {
-            Some(location) => location,
-            None => {
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
-                        "update supports only `user` or `registry` source_kind",
-                        json!({"source_kind": params.source_kind}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
         let _guard = self.acquire_skills_write_lock().await;
-
-        let existing = match self
-            .crud_store
-            .find_skill_installation(
-                params.slug.as_str(),
-                source_kind_db.as_str(),
-                scope_key.as_str(),
+        if let Err(error) = self
+            .ensure_skills_lock_v2_locked(
+                location.lock_path.as_path(),
+                source_kind,
+                workspace_id.as_str(),
             )
             .await
         {
-            Ok(row) => row,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "failed to read existing installation",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let Some(existing) = existing else {
             let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
             self.send_error(
                 connection_id,
                 skills_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_NOT_FOUND,
-                    "skill installation was not found",
-                    json!({"slug": params.slug, "source_kind": source_kind_db.clone()}),
+                    SKILLS_ERROR_INTERNAL,
+                    "failed to convert skills lock",
+                    json!({"error": format!("{error:#}")}),
                 ),
             )
             .await;
             return;
-        };
-
-        if prepared.definition.identity.fingerprint == existing.fingerprint {
+        }
+        let row_unchanged = self
+            .crud_store
+            .find_skill_installation(&params.skill_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|current| current == existing);
+        if !row_unchanged {
+            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            self.send_error(
+                connection_id,
+                skills_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_UPDATE_CONFLICT_FINGERPRINT,
+                    "skill installation changed while update was prepared",
+                    json!({"skill_id": params.skill_id}),
+                ),
+            )
+            .await;
+            return;
+        }
+        let previous_managed_install_path =
+            pioneer_owned_install_path(&location, existing.install_path.as_str());
+        if let Some(expected) = params.expected_previous_fingerprint.as_deref()
+            && expected != existing.fingerprint
+        {
+            let error = anyhow::anyhow!(
+                "update blocked: expected previous fingerprint `{expected}`, found `{}`",
+                existing.fingerprint
+            );
+            let mapped = map_lifecycle_error(&error, methods::SKILLS_UPDATE);
+            let (message, details) =
+                lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
+            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            self.send_error(
+                connection_id,
+                skills_error(
+                    Some(request_id),
+                    mapped.jsonrpc_code,
+                    mapped.code,
+                    message,
+                    details,
+                ),
+            )
+            .await;
+            return;
+        }
+        let now = now_timestamp_secs();
+        if prepared.definition.identity.fingerprint == existing.fingerprint
+            && stored_skill_revision_is_available(
+                &existing,
+                source_kind,
+                previous_managed_install_path.as_deref(),
+                context.security_policy.max_install_file_bytes,
+            )
+        {
             if let Err(error) = self
                 .mark_upload_consumed(materialized.upload.upload_id.as_str(), now)
                 .await
@@ -271,16 +267,17 @@ impl MessageProcessor {
             let payload = SkillsUpdateResponse {
                 status: "already_up_to_date".to_owned(),
                 skill: SkillLifecycleResultSkill {
+                    skill_id: existing.skill_id,
+                    owner: existing.owner,
                     slug: existing.slug,
                     source_kind: existing.source_kind,
-                    version: prepared.definition.identity.version_hint.clone(),
+                    version: existing.version,
                     fingerprint: existing.fingerprint,
                     trust_level: existing.trust_level,
                     install_path: existing.install_path,
                 },
                 audit: SkillLifecycleAuditSummary { events_written: 0 },
             };
-
             let response = match JsonRpcResponse::from_result(request_id, &payload) {
                 Ok(response) => response,
                 Err(error) => {
@@ -298,7 +295,6 @@ impl MessageProcessor {
                     return;
                 }
             };
-
             if let Err(error) = self.send_json(connection_id, &response).await {
                 warn!(
                     connection_id,
@@ -313,9 +309,13 @@ impl MessageProcessor {
             pioneer_skills::CommitPreparedSkillRequest {
                 operation: pioneer_skills::InstallOperation::Update,
                 prepared,
-                install_root: install_location.install_root.clone(),
-                lock_path: install_location.lock_path.clone(),
-                expected_previous_fingerprint: params.expected_previous_fingerprint.clone(),
+                install_root: location.install_root.clone(),
+                lock_path: location.lock_path.clone(),
+                previous: Some(pioneer_skills::PreviousSkillInstallation {
+                    managed_install_path: previous_managed_install_path,
+                    fingerprint: existing.fingerprint.clone(),
+                }),
+                expected_previous_fingerprint: params.expected_previous_fingerprint,
                 now_unix: now,
                 policy: installer_policy(&context),
             },
@@ -340,47 +340,53 @@ impl MessageProcessor {
                 return;
             }
         };
-
         let install_path = update_result.install_path.display().to_string();
-
-        let installation_record = SkillInstallationRecord {
-            slug: qualified_skill_slug(
-                update_result.definition.identity.owner.as_str(),
-                update_result.definition.identity.slug.as_str(),
+        let patch = SkillInstallationPatch {
+            owner: Some(update_result.definition.identity.owner.clone()),
+            slug: Some(update_result.definition.identity.slug.clone()),
+            version: Some(update_result.definition.identity.version_hint.clone()),
+            source_ref: Some(source_ref),
+            install_path: Some(install_path.clone()),
+            trust_level: Some(
+                trust_level_as_str(&update_result.definition.runtime.trust_level).to_owned(),
             ),
-            version: update_result.definition.identity.version_hint.clone(),
-            source_kind: source_kind_db.clone(),
-            scope_key: scope_key.clone(),
-            source_ref,
-            install_path: install_path.clone(),
-            trust_level: trust_level_as_str(&update_result.definition.runtime.trust_level)
-                .to_owned(),
-            fingerprint: update_result.definition.identity.fingerprint.clone(),
-            updated_at_unix: now,
+            fingerprint: Some(update_result.definition.identity.fingerprint.clone()),
+            ..SkillInstallationPatch::default()
         };
-
-        if let Err(error) = self
+        match self
             .crud_store
-            .upsert_skill_installation(&installation_record, now)
+            .update_skill_installation(&params.skill_id, &patch, now)
             .await
         {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to persist skill installation",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                if let Err(error) = pioneer_skills::rollback_prepared_skill_commit(
+                    &update_result,
+                    location.lock_path.as_path(),
+                ) {
+                    warn!(
+                        skill_id = %params.skill_id,
+                        error = %format!("{error:#}"),
+                        "failed to roll back updated skill after database error"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to persist updated skill installation",
+                        json!({"skill_id": params.skill_id}),
+                    ),
+                )
+                .await;
+                return;
+            }
         }
-
+        pioneer_skills::finalize_prepared_skill_commit(&update_result);
         let audit_records = skill_audit_records(update_result.audit_events.as_slice());
-
         if let Err(error) = self
             .crud_store
             .insert_skill_audit_event_records(audit_records.as_slice())
@@ -400,7 +406,6 @@ impl MessageProcessor {
             .await;
             return;
         }
-
         if let Err(error) = self
             .mark_upload_consumed(materialized.upload.upload_id.as_str(), now)
             .await
@@ -420,22 +425,27 @@ impl MessageProcessor {
             return;
         }
         self.cleanup_upload_artifacts(&materialized.upload, materialized.cleanup_root.as_path());
-
+        let updated_owner = update_result.definition.identity.owner;
+        let updated_slug = update_result.definition.identity.slug;
+        let updated_fingerprint = update_result.definition.identity.fingerprint;
+        let updated_trust =
+            trust_level_as_str(&update_result.definition.runtime.trust_level).to_owned();
         let payload = SkillsUpdateResponse {
             status: "updated".to_owned(),
             skill: SkillLifecycleResultSkill {
-                slug: installation_record.slug.clone(),
-                source_kind: installation_record.source_kind.clone(),
-                version: installation_record.version.clone(),
-                fingerprint: installation_record.fingerprint.clone(),
-                trust_level: installation_record.trust_level.clone(),
+                skill_id: params.skill_id.clone(),
+                owner: updated_owner.clone(),
+                slug: updated_slug.clone(),
+                source_kind: existing.source_kind.clone(),
+                version: update_result.definition.identity.version_hint,
+                fingerprint: updated_fingerprint.clone(),
+                trust_level: updated_trust,
                 install_path,
             },
             audit: SkillLifecycleAuditSummary {
                 events_written: audit_records.len(),
             },
         };
-
         let response = match JsonRpcResponse::from_result(request_id, &payload) {
             Ok(response) => response,
             Err(error) => {
@@ -453,28 +463,57 @@ impl MessageProcessor {
                 return;
             }
         };
-
         if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(
-                connection_id,
-                error = %format!("{error:#}"),
-                "failed to send skills/update response"
-            );
+            warn!(connection_id, error = %format!("{error:#}"), "failed to send skills/update response");
             return;
         }
-
         self.notify_skills_changed(
             workspace_id.as_str(),
             "updated",
             vec![SkillChangedItem {
-                slug: installation_record.slug,
-                source_kind: installation_record.source_kind,
+                skill_id: params.skill_id,
+                owner: updated_owner,
+                slug: updated_slug,
+                source_kind: existing.source_kind,
                 change_type: "update".to_owned(),
                 fingerprint_before: Some(existing.fingerprint),
-                fingerprint_after: Some(installation_record.fingerprint),
+                fingerprint_after: Some(updated_fingerprint),
             }],
             now,
         )
         .await;
     }
+}
+
+fn stored_skill_revision_is_available(
+    existing: &SkillInstallationRecord,
+    source_kind: SkillSourceKind,
+    managed_install_path: Option<&Path>,
+    max_skill_file_bytes: usize,
+) -> bool {
+    if existing
+        .source_ref
+        .strip_prefix("import-path:")
+        .is_some_and(|source_path| existing.install_path == source_path)
+    {
+        return false;
+    }
+    let Some(install_path) = managed_install_path else {
+        return false;
+    };
+    if !install_path.is_dir() || !install_path.join("SKILL.md").is_file() {
+        return false;
+    }
+    let source_root = install_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(install_path);
+    pioneer_skills::parse_skill_from_file(
+        existing.skill_id.clone(),
+        install_path.join("SKILL.md").as_path(),
+        source_kind,
+        source_root,
+        max_skill_file_bytes.max(1),
+    )
+    .is_ok_and(|definition| definition.identity.fingerprint == existing.fingerprint)
 }

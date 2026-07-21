@@ -855,12 +855,12 @@ mod tests {
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("`read_skill` with skill slug `system:pioneer/subagents`")
+                .contains("find `pioneer/subagents` in Internal Skill References")
         );
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("`read_skill` with skill slug `system:pioneer/tasks`")
+                .contains("find `pioneer/tasks` in Internal Skill References")
         );
         assert!(
             compiled

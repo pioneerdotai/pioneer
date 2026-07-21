@@ -1,29 +1,59 @@
 //! Composer capability selection helpers.
 
 use crate::{
-    providers::list::runtime_id_from_cli_runtime_provider_key, skills::catalog as skill_catalog,
+    providers::list::runtime_id_from_cli_runtime_provider_key,
+    skills::{catalog as skill_catalog, presentation as skill_presentation},
 };
 
 use pioneer_protocol::{
     McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillListItem, SkillListResponse,
+    RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillId, SkillListItem, SkillListResponse,
     TurnCapability, TurnCapabilityKind, TurnMcpServerCapabilitySummary,
     TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
 };
 use std::collections::HashSet;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct ComposerCapability {
     pub id: String,
     pub label: String,
     pub kind: ComposerCapabilityKind,
 }
 
+#[derive(serde::Deserialize)]
+struct ComposerCapabilityWire {
+    id: String,
+    label: String,
+    kind: ComposerCapabilityKind,
+}
+
+impl<'de> serde::Deserialize<'de> for ComposerCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <ComposerCapabilityWire as serde::Deserialize>::deserialize(deserializer)?;
+        let expected = wire.kind.key();
+        if wire.id != expected {
+            return Err(serde::de::Error::custom(format!(
+                "composer capability id must be {expected}"
+            )));
+        }
+        Ok(Self {
+            id: wire.id,
+            label: wire.label,
+            kind: wire.kind,
+        })
+    }
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ComposerCapabilityKind {
     Skill {
+        skill_id: SkillId,
+        owner: Option<String>,
         slug: String,
         source_kind: String,
     },
@@ -425,8 +455,11 @@ pub fn filter_composer_capabilities_for_target(
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SelectableSkillCapability {
     pub key: String,
+    pub skill_id: SkillId,
     pub label: String,
+    pub display_name: String,
     pub description: String,
+    pub owner: Option<String>,
     pub slug: String,
     pub source_kind: String,
     pub selectable: bool,
@@ -438,9 +471,11 @@ pub fn selectable_skill_capability_is_eligible_for_target(
     target: ComposerCapabilityTarget,
 ) -> bool {
     let capability = ComposerCapability {
-        id: row.key.clone(),
+        id: pioneer_protocol::skill_capability_key(&row.skill_id),
         label: row.label.clone(),
         kind: ComposerCapabilityKind::Skill {
+            skill_id: row.skill_id.clone(),
+            owner: row.owner.clone(),
             slug: row.slug.clone(),
             source_kind: row.source_kind.clone(),
         },
@@ -556,11 +591,10 @@ impl ComposerCapability {
 
     pub fn to_turn_capability(&self) -> TurnCapability {
         TurnCapability {
-            id: self.id.clone(),
+            id: self.key(),
             kind: match &self.kind {
-                ComposerCapabilityKind::Skill { slug, source_kind } => TurnCapabilityKind::Skill {
-                    slug: slug.clone(),
-                    source_kind: source_kind.clone(),
+                ComposerCapabilityKind::Skill { skill_id, .. } => TurnCapabilityKind::Skill {
+                    skill_id: skill_id.clone(),
                 },
                 ComposerCapabilityKind::McpServer { name, scope_kind } => {
                     TurnCapabilityKind::McpServer {
@@ -584,10 +618,16 @@ impl ComposerCapability {
 
     pub fn to_user_message_attachment(&self) -> UserMessageAttachment {
         match &self.kind {
-            ComposerCapabilityKind::Skill { slug, source_kind } => UserMessageAttachment::Skill {
+            ComposerCapabilityKind::Skill {
+                skill_id,
+                owner,
+                slug,
+                source_kind,
+            } => UserMessageAttachment::Skill {
                 capability: TurnSkillCapabilitySummary {
-                    id: self.id.clone(),
+                    skill_id: skill_id.clone(),
                     label: self.label.clone(),
+                    owner: owner.clone(),
                     slug: slug.clone(),
                     source_kind: source_kind.clone(),
                 },
@@ -622,7 +662,7 @@ impl ComposerCapability {
 impl ComposerCapabilityKind {
     pub fn key(&self) -> String {
         match self {
-            Self::Skill { slug, source_kind } => format!("skill:{source_kind}:{slug}"),
+            Self::Skill { skill_id, .. } => pioneer_protocol::skill_capability_key(skill_id),
             Self::McpServer { name, scope_kind } => {
                 format!("mcp-server:{}:{name}", scope_kind.as_str())
             }
@@ -917,9 +957,11 @@ pub fn selected_skill_composer_capabilities_from_rows(
     rows.iter()
         .filter(|row| selected.contains(row.key.as_str()) && row.selectable)
         .map(|row| ComposerCapability {
-            id: row.key.clone(),
+            id: pioneer_protocol::skill_capability_key(&row.skill_id),
             label: row.label.clone(),
             kind: ComposerCapabilityKind::Skill {
+                skill_id: row.skill_id.clone(),
+                owner: row.owner.clone(),
                 slug: row.slug.clone(),
                 source_kind: row.source_kind.clone(),
             },
@@ -982,6 +1024,16 @@ pub fn filter_selectable_skill_capability_rows(
         .filter(|row| {
             query.is_empty()
                 || row.label.to_ascii_lowercase().contains(query.as_str())
+                || row
+                    .display_name
+                    .to_ascii_lowercase()
+                    .contains(query.as_str())
+                || row
+                    .owner
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains(query.as_str())
                 || row.slug.to_ascii_lowercase().contains(query.as_str())
                 || row
                     .description
@@ -1044,16 +1096,17 @@ pub fn selectable_skill_from_item(skill: &SkillListItem) -> SelectableSkillCapab
     } else {
         None
     };
-    let key = ComposerCapabilityKind::Skill {
-        slug: skill.slug.clone(),
-        source_kind: skill.source_kind.clone(),
-    }
-    .key();
+    let key = pioneer_protocol::skill_capability_key(&skill.skill_id);
+    let label =
+        skill_presentation::compact_skill_label(skill.owner.as_deref(), skill.slug.as_str());
 
     SelectableSkillCapability {
         key,
-        label: skill.display_name.clone(),
+        skill_id: skill.skill_id.clone(),
+        label,
+        display_name: skill.display_name.clone(),
         description: skill.description.clone(),
+        owner: skill.owner.clone(),
         slug: skill.slug.clone(),
         source_kind: skill.source_kind.clone(),
         selectable: unavailable_reason.is_none(),
@@ -1303,6 +1356,22 @@ mod tests {
         SkillHealthSummary, SkillInstallState, SkillPolicyState,
     };
 
+    fn skill_id(seed: &str) -> SkillId {
+        let mut value = seed
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(21)
+            .collect::<String>();
+        while value.len() < 21 {
+            value.push('X');
+        }
+        SkillId::new(value).expect("test skill id")
+    }
+
+    fn skill_key(seed: &str) -> String {
+        pioneer_protocol::skill_capability_key(&skill_id(seed))
+    }
+
     #[test]
     fn canonical_capability_matrix_covers_every_supported_policy_shape() {
         assert_eq!(
@@ -1348,10 +1417,13 @@ mod tests {
     }
 
     fn skill_capability_from_source(slug: &str, source_kind: &str) -> ComposerCapability {
+        let skill_id = skill_id(format!("{source_kind}{slug}").as_str());
         ComposerCapability {
-            id: format!("skill:{source_kind}:{slug}"),
+            id: pioneer_protocol::skill_capability_key(&skill_id),
             label: slug.to_owned(),
             kind: ComposerCapabilityKind::Skill {
+                skill_id,
+                owner: None,
                 slug: slug.to_owned(),
                 source_kind: source_kind.to_owned(),
             },
@@ -1383,6 +1455,8 @@ mod tests {
 
     fn skill_item(slug: &str) -> SkillListItem {
         SkillListItem {
+            skill_id: skill_id(slug),
+            owner: None,
             slug: slug.to_owned(),
             source_kind: "user".to_owned(),
             display_name: "Example".to_owned(),
@@ -1465,18 +1539,22 @@ mod tests {
             skill_capability_from_source("unknown", "future"),
         ];
         let original = input.clone();
+        let user_first = input[0].id.as_str();
+        let registry_second = input[2].id.as_str();
+        let browser = input[3].id.as_str();
+        let unknown = input[5].id.as_str();
 
         let cases = [
             (
                 "native",
                 ComposerCapabilityTarget::native(),
                 vec![
-                    "skill:user:user-first",
+                    user_first,
                     "mcp-server:workspace:docs",
-                    "skill:registry:registry-second",
-                    "skill:system:browser",
+                    registry_second,
+                    browser,
                     "mcp-tool:workspace:docs:search",
-                    "skill:future:unknown",
+                    unknown,
                 ],
             ),
             (
@@ -1487,11 +1565,7 @@ mod tests {
             (
                 "skills-only CLI",
                 ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
-                vec![
-                    "skill:user:user-first",
-                    "skill:registry:registry-second",
-                    "skill:system:browser",
-                ],
+                vec![user_first, registry_second, browser],
             ),
             (
                 "MCP-only CLI",
@@ -1505,10 +1579,10 @@ mod tests {
                 "combined CLI",
                 ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, true)),
                 vec![
-                    "skill:user:user-first",
+                    user_first,
                     "mcp-server:workspace:docs",
-                    "skill:registry:registry-second",
-                    "skill:system:browser",
+                    registry_second,
+                    browser,
                     "mcp-tool:workspace:docs:search",
                 ],
             ),
@@ -1575,7 +1649,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:future:unknown",
+                input[2].id.as_str(),
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1622,9 +1696,9 @@ mod tests {
                 .map(|capability| capability.id.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "skill:user:user",
-                "skill:registry:registry",
-                "skill:system:browser",
+                input[0].id.as_str(),
+                input[1].id.as_str(),
+                input[2].id.as_str(),
                 "mcp-server:workspace:docs",
                 "mcp-tool:workspace:docs:search",
             ]
@@ -1636,7 +1710,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:future:unknown",
+                input[3].id.as_str(),
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1678,8 +1752,8 @@ mod tests {
                 .map(|capability| capability.id.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "skill:user:user",
-                "skill:system:browser",
+                input[0].id.as_str(),
+                input[1].id.as_str(),
                 "mcp-server:workspace:docs",
                 "mcp-tool:workspace:docs:search",
             ]
@@ -1691,7 +1765,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:future:unknown",
+                input[2].id.as_str(),
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1829,13 +1903,16 @@ mod tests {
 
     #[test]
     fn composer_capability_key_is_canonical_by_kind() {
+        let skill_id = skill_id("imagegen");
         assert_eq!(
             ComposerCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+                owner: Some("owner".to_owned()),
                 slug: "imagegen".to_owned(),
                 source_kind: "user".to_owned(),
             }
             .key(),
-            "skill:user:imagegen"
+            pioneer_protocol::skill_capability_key(&skill_id)
         );
         assert_eq!(
             ComposerCapabilityKind::McpServer {
@@ -1858,17 +1935,50 @@ mod tests {
 
     #[test]
     fn composer_capability_converts_to_turn_capability_without_text_tokens() {
-        let turn_capability = skill_capability("imagegen").to_turn_capability();
+        let capability = skill_capability("imagegen");
+        let expected_skill_id = match &capability.kind {
+            ComposerCapabilityKind::Skill { skill_id, .. } => skill_id.clone(),
+            _ => unreachable!(),
+        };
+        let turn_capability = capability.to_turn_capability();
 
-        assert_eq!(turn_capability.id, "skill:user:imagegen");
+        assert_eq!(
+            turn_capability.id,
+            pioneer_protocol::skill_capability_key(&expected_skill_id)
+        );
         assert_eq!(turn_capability.label.as_deref(), Some("imagegen"));
         assert_eq!(
             turn_capability.kind,
             TurnCapabilityKind::Skill {
-                slug: "imagegen".to_owned(),
-                source_kind: "user".to_owned(),
+                skill_id: expected_skill_id,
             }
         );
+    }
+
+    #[test]
+    fn skill_capability_without_exact_id_is_rejected() {
+        let mut without_id =
+            serde_json::to_value(skill_capability("docs")).expect("capability should encode");
+        without_id["kind"]["Skill"]
+            .as_object_mut()
+            .expect("skill kind must encode as object")
+            .remove("skill_id");
+
+        assert!(serde_json::from_value::<ComposerCapability>(without_id).is_err());
+
+        let mismatched = serde_json::json!({
+            "id": "skill:AAAAAAAAAAAAAAAAAAAAA",
+            "label": "docs",
+            "kind": {
+                "Skill": {
+                    "skill_id": "BBBBBBBBBBBBBBBBBBBBB",
+                    "owner": null,
+                    "slug": "docs",
+                    "source_kind": "user"
+                }
+            }
+        });
+        assert!(serde_json::from_value::<ComposerCapability>(mismatched).is_err());
     }
 
     #[test]
@@ -1944,7 +2054,7 @@ mod tests {
 
         assert!(remove_composer_capability_at(&mut capabilities, 0));
         assert_eq!(capabilities.len(), 1);
-        assert_eq!(capabilities[0].key(), "skill:user:imagegen");
+        assert_eq!(capabilities[0].key(), skill_key("userimagegen"));
         assert!(!remove_composer_capability_at(&mut capabilities, 9));
     }
 
@@ -1997,8 +2107,57 @@ mod tests {
 
         let rows = filter_skill_capability_rows(&[image, docs], "imagegen");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, "skill:user:tests/imagegen");
+        assert_eq!(rows[0].key, skill_key("tests/imagegen"));
         assert!(rows[0].selectable);
+    }
+
+    #[test]
+    fn duplicate_skill_labels_remain_distinct_by_exact_id() {
+        let mut first = skill_item("humanizer");
+        first.skill_id = SkillId::new("A".repeat(21)).unwrap();
+        first.owner = Some("alexander".to_owned());
+        first.display_name = "Humanizer".to_owned();
+        let mut second = first.clone();
+        second.skill_id = SkillId::new("B".repeat(21)).unwrap();
+
+        let rows = filter_skill_capability_rows(&[first, second], "alexander/humanizer");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "alexander/humanizer");
+        assert_eq!(rows[1].label, "alexander/humanizer");
+        assert_ne!(rows[0].key, rows[1].key);
+
+        let selected = rows
+            .iter()
+            .map(|row| row.key.clone())
+            .collect::<HashSet<_>>();
+        let capabilities = selected_skill_composer_capabilities_from_rows(&rows, &selected);
+        assert_eq!(capabilities.len(), 2);
+        assert_ne!(capabilities[0].key(), capabilities[1].key());
+    }
+
+    #[test]
+    fn skill_attachment_keeps_exact_id_and_presentation_snapshot_separate() {
+        let mut item = skill_item("docs");
+        item.skill_id = SkillId::new("Q".repeat(21)).unwrap();
+        item.owner = Some("owner".to_owned());
+        item.display_name = "Documentation".to_owned();
+        let row = selectable_skill_from_item(&item);
+        let selected = HashSet::from([row.key.clone()]);
+        let capability =
+            selected_skill_composer_capabilities_from_rows(std::slice::from_ref(&row), &selected)
+                .remove(0);
+
+        item.owner = Some("changed".to_owned());
+        item.slug = "renamed".to_owned();
+
+        assert!(matches!(
+            capability.to_user_message_attachment(),
+            UserMessageAttachment::Skill { capability }
+                if capability.skill_id == SkillId::new("Q".repeat(21)).unwrap()
+                    && capability.owner.as_deref() == Some("owner")
+                    && capability.slug == "docs"
+                    && capability.label == "owner/docs"
+        ));
     }
 
     #[test]
@@ -2079,7 +2238,7 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(capabilities.len(), 1);
-        assert_eq!(capabilities[0].id, "skill:user:tests/imagegen");
+        assert_eq!(capabilities[0].id, skill_key("tests/imagegen"));
     }
 
     #[test]

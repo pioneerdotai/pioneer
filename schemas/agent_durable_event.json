@@ -2319,6 +2319,15 @@
             "null"
           ]
         },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "skill_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "skill_slug": {
           "type": "string"
         },
@@ -2327,12 +2336,19 @@
         }
       },
       "required": [
+        "skill_id",
         "skill_slug",
         "source_kind",
         "action",
         "decision",
         "created_at_unix"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "StorageOutputPolicy": {
       "oneOf": [
@@ -7763,11 +7779,8 @@
         {
           "type": "object",
           "properties": {
-            "slug": {
-              "type": "string"
-            },
-            "sourceKind": {
-              "type": "string"
+            "skillId": {
+              "$ref": "#/$defs/SkillId"
             },
             "type": {
               "type": "string",
@@ -7776,8 +7789,7 @@
           },
           "required": [
             "type",
-            "slug",
-            "sourceKind"
+            "skillId"
           ]
         },
         {
@@ -9745,6 +9757,15 @@
         "resolved_reason": {
           "type": "string"
         },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "skill_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "skill_slug": {
           "type": "string"
         },
@@ -9759,6 +9780,7 @@
         }
       },
       "required": [
+        "skill_id",
         "skill_slug",
         "fingerprint",
         "source_kind",
@@ -9768,11 +9790,17 @@
     "TurnSkillCapabilitySummary": {
       "type": "object",
       "properties": {
-        "id": {
-          "type": "string"
-        },
         "label": {
           "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skillId": {
+          "$ref": "#/$defs/SkillId"
         },
         "slug": {
           "type": "string"
@@ -9782,7 +9810,7 @@
         }
       },
       "required": [
-        "id",
+        "skillId",
         "label",
         "slug",
         "sourceKind"

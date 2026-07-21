@@ -1,12 +1,15 @@
 use crate::contract::{SkillDependencies, SkillSourceKind, SkillTrustLevel};
 use crate::runtime::SkillRuntimeToolDefinition;
 use crate::validation::{IssueLevel, SkillConformanceReport};
+use pioneer_protocol::SkillId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillIdentity {
-    pub owner: String,
+    pub skill_id: SkillId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     pub name: String,
     pub display_name: String,
@@ -17,6 +20,21 @@ pub struct SkillIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_hint: Option<String>,
     pub fingerprint: String,
+}
+
+impl PartialEq for SkillIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.skill_id == other.skill_id
+    }
+}
+
+impl Eq for SkillIdentity {}
+
+pub fn compact_skill_label(owner: Option<&str>, slug: &str) -> String {
+    match owner {
+        Some(owner) => format!("{owner}/{slug}"),
+        None => slug.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,11 +151,55 @@ pub struct SkillDefinition {
     pub metadata_known: SkillKnownMetadata,
     pub metadata_raw: JsonValue,
     pub conformance: SkillConformanceReport,
+    #[serde(default)]
+    pub availability: SkillAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SkillAvailability {
+    #[default]
+    Available,
+    Unavailable {
+        reason: SkillUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUnavailableReason {
+    ImportPending,
+    MissingPackage,
+    InvalidPackage,
+}
+
+impl SkillUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ImportPending => "import_pending",
+            Self::MissingPackage => "missing_package",
+            Self::InvalidPackage => "invalid_package",
+        }
+    }
+}
+
+impl SkillDefinition {
+    pub fn is_available(&self) -> bool {
+        matches!(self.availability, SkillAvailability::Available)
+    }
+
+    pub fn unavailable_reason(&self) -> Option<SkillUnavailableReason> {
+        match self.availability {
+            SkillAvailability::Available => None,
+            SkillAvailability::Unavailable { reason } => Some(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CompileSkillInput {
-    pub owner: String,
+    pub skill_id: SkillId,
+    pub owner: Option<String>,
     pub slug: String,
     pub name: String,
     pub display_name: String,
@@ -169,6 +231,7 @@ pub fn compile_skill_definition(input: CompileSkillInput) -> SkillDefinition {
 
     SkillDefinition {
         identity: SkillIdentity {
+            skill_id: input.skill_id,
             owner: input.owner,
             slug: input.slug,
             name: input.name,
@@ -199,6 +262,7 @@ pub fn compile_skill_definition(input: CompileSkillInput) -> SkillDefinition {
         metadata_known,
         metadata_raw: input.metadata_raw,
         conformance: input.conformance,
+        availability: SkillAvailability::Available,
     }
 }
 
@@ -388,10 +452,15 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileSkillInput, SkillDependencySet, SkillImplicitInvocationPolicy, SkillSourceKind,
-        compile_skill_definition, normalize_string_list,
+        CompileSkillInput, SkillDependencySet, SkillIdentity, SkillImplicitInvocationPolicy,
+        SkillSourceKind, compact_skill_label, compile_skill_definition, normalize_string_list,
     };
     use crate::contract::{SkillDependencies, SkillTrustLevel, default_skill_conformance};
+    use pioneer_protocol::SkillId;
+
+    fn skill_id(value: &str) -> SkillId {
+        SkillId::new(value).expect("valid test skill id")
+    }
 
     #[test]
     fn normalize_string_list_deduplicates_and_sorts() {
@@ -407,7 +476,8 @@ mod tests {
     #[test]
     fn metadata_dependencies_are_merged_and_deduped() {
         let manifest = compile_skill_definition(CompileSkillInput {
-            owner: "local".to_owned(),
+            skill_id: skill_id("AAAAAAAAAAAAAAAAAAAAA"),
+            owner: Some("local".to_owned()),
             slug: "agent-browser".to_owned(),
             name: "agent-browser".to_owned(),
             display_name: "Agent Browser".to_owned(),
@@ -479,7 +549,8 @@ mod tests {
         conformance.openclaw_compat.compliant = false;
 
         let manifest = compile_skill_definition(CompileSkillInput {
-            owner: "local".to_owned(),
+            skill_id: skill_id("BBBBBBBBBBBBBBBBBBBBB"),
+            owner: Some("local".to_owned()),
             slug: "bad".to_owned(),
             name: "bad".to_owned(),
             display_name: "bad".to_owned(),
@@ -513,5 +584,40 @@ mod tests {
             manifest.policy_hints.block_issue_codes,
             vec!["contract.metadata.invalid_json".to_owned()]
         );
+    }
+
+    #[test]
+    fn skill_identity_equality_uses_only_skill_id() {
+        let first = SkillIdentity {
+            skill_id: skill_id("CCCCCCCCCCCCCCCCCCCCC"),
+            owner: Some("owner-a".to_owned()),
+            slug: "first".to_owned(),
+            name: "First".to_owned(),
+            display_name: "First Display".to_owned(),
+            source_kind: SkillSourceKind::User,
+            source_root: "/one".to_owned(),
+            skill_dir: "/one/first".to_owned(),
+            skill_file: "/one/first/SKILL.md".to_owned(),
+            version_hint: Some("1.0.0".to_owned()),
+            fingerprint: "first-fingerprint".to_owned(),
+        };
+        let mut changed_revision = first.clone();
+        changed_revision.owner = None;
+        changed_revision.slug = "renamed".to_owned();
+        changed_revision.fingerprint = "second-fingerprint".to_owned();
+        let mut different_installation = first.clone();
+        different_installation.skill_id = skill_id("DDDDDDDDDDDDDDDDDDDDD");
+
+        assert_eq!(first, changed_revision);
+        assert_ne!(first, different_installation);
+    }
+
+    #[test]
+    fn compact_label_uses_owner_only_when_present() {
+        assert_eq!(
+            compact_skill_label(Some("pioneer"), "browser"),
+            "pioneer/browser"
+        );
+        assert_eq!(compact_skill_label(None, "browser"), "browser");
     }
 }

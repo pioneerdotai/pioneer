@@ -1,4 +1,6 @@
-use crate::{ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, TaskTurnItem, ThreadMode};
+use crate::{
+    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, SkillId, TaskTurnItem, ThreadMode,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -1310,7 +1312,7 @@ pub struct TurnCLIRuntimeOptions {
 #[serde(transparent)]
 pub struct CLIAgentRuntimeSandboxPolicy(pub JsonValue);
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnCapability {
     pub id: String,
@@ -1319,13 +1321,48 @@ pub struct TurnCapability {
     pub label: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnCapabilityWire {
+    id: String,
+    kind: TurnCapabilityKind,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for TurnCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TurnCapabilityWire::deserialize(deserializer)?;
+        if let TurnCapabilityKind::Skill { skill_id } = &wire.kind {
+            let expected = skill_capability_key(skill_id);
+            if wire.id != expected {
+                return Err(serde::de::Error::custom(format!(
+                    "skill capability id must be {expected}"
+                )));
+            }
+        }
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            label: wire.label,
+        })
+    }
+}
+
+/// Builds the canonical internal key for a selected skill capability.
+pub fn skill_capability_key(skill_id: &SkillId) -> String {
+    format!("skill:{skill_id}")
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnCapabilityKind {
     Skill {
-        slug: String,
-        #[serde(rename = "sourceKind")]
-        source_kind: String,
+        #[serde(rename = "skillId")]
+        skill_id: SkillId,
     },
     McpServer {
         name: String,
@@ -3292,8 +3329,11 @@ pub enum UserMessageAttachment {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnSkillCapabilitySummary {
-    pub id: String,
+    #[serde(rename = "skillId")]
+    pub skill_id: SkillId,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub slug: String,
     #[serde(rename = "sourceKind")]
     pub source_kind: String,
@@ -5301,12 +5341,11 @@ mod tests {
             "input": [],
             "capabilities": [
                 {
-                    "id": "skill:workspace:imagegen",
+                    "id": "skill:mvg02zVNGWuw5z5C4nYDo",
                     "label": "imagegen",
                     "kind": {
                         "type": "skill",
-                        "slug": "imagegen",
-                        "sourceKind": "workspace"
+                        "skillId": "mvg02zVNGWuw5z5C4nYDo"
                     }
                 },
                 {
@@ -5336,11 +5375,10 @@ mod tests {
         assert_eq!(
             params.capabilities[0],
             TurnCapability {
-                id: "skill:workspace:imagegen".to_owned(),
+                id: "skill:mvg02zVNGWuw5z5C4nYDo".to_owned(),
                 label: Some("imagegen".to_owned()),
                 kind: TurnCapabilityKind::Skill {
-                    slug: "imagegen".to_owned(),
-                    source_kind: "workspace".to_owned(),
+                    skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
                 },
             }
         );
@@ -5364,6 +5402,48 @@ mod tests {
         assert_eq!(encoded["capabilities"][0]["kind"]["type"], "skill");
         assert_eq!(encoded["capabilities"][1]["kind"]["type"], "mcpServer");
         assert_eq!(encoded["capabilities"][2]["kind"]["type"], "mcpTool");
+    }
+
+    #[test]
+    fn skill_capability_uses_exact_validated_id_and_canonical_key() {
+        let skill_id: SkillId = "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id");
+        assert_eq!(
+            skill_capability_key(&skill_id),
+            "skill:mvg02zVNGWuw5z5C4nYDo"
+        );
+
+        let missing_id = serde_json::from_value::<TurnCapabilityKind>(json!({
+            "type": "skill"
+        }));
+        assert!(
+            missing_id.is_err(),
+            "skill capability must require an exact id"
+        );
+
+        let invalid = serde_json::from_value::<TurnCapabilityKind>(json!({
+            "type": "skill",
+            "skillId": "too-short"
+        }));
+        assert!(invalid.is_err(), "invalid skill id must be rejected");
+
+        let mismatched_key = serde_json::from_value::<TurnCapability>(json!({
+            "id": "skill:AAAAAAAAAAAAAAAAAAAAA",
+            "kind": {
+                "type": "skill",
+                "skillId": "mvg02zVNGWuw5z5C4nYDo"
+            }
+        }));
+        assert!(
+            mismatched_key.is_err(),
+            "skill capability key must be derived from the exact skill id"
+        );
+
+        let capability_schema = serde_json::to_value(schemars::schema_for!(TurnCapabilityKind))
+            .expect("capability schema should encode");
+        let capability_schema = capability_schema.to_string();
+        assert!(capability_schema.contains("skillId"));
+        assert!(capability_schema.contains("^[A-Za-z0-9]{21}$"));
+        assert!(!capability_schema.contains("sourceKind\":{\"type\":\"string\"}"));
     }
 
     #[test]
@@ -5429,8 +5509,9 @@ mod tests {
         let attachments = vec![
             UserMessageAttachment::Skill {
                 capability: TurnSkillCapabilitySummary {
-                    id: "skill:user:docs".to_owned(),
+                    skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
                     label: "docs".to_owned(),
+                    owner: Some("pioneer".to_owned()),
                     slug: "docs".to_owned(),
                     source_kind: "user".to_owned(),
                 },
@@ -5475,6 +5556,30 @@ mod tests {
 
         let decoded: TurnItem = serde_json::from_value(encoded).expect("item should decode");
         assert_eq!(decoded, item);
+    }
+
+    #[test]
+    fn skill_attachment_requires_exact_skill_id() {
+        let without_id = serde_json::from_value::<UserMessageAttachment>(json!({
+            "type": "skill",
+            "capability": {
+                "label": "docs",
+                "slug": "docs",
+                "sourceKind": "user"
+            }
+        }));
+        assert!(
+            without_id.is_err(),
+            "skill attachment must require an exact id"
+        );
+
+        let summary_schema =
+            serde_json::to_value(schemars::schema_for!(TurnSkillCapabilitySummary))
+                .expect("summary schema should encode")
+                .to_string();
+        assert!(summary_schema.contains("skillId"));
+        assert!(summary_schema.contains("owner"));
+        assert!(!summary_schema.contains("\"id\""));
     }
 
     #[test]

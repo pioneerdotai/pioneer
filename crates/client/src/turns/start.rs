@@ -213,18 +213,16 @@ pub fn local_turn_start_rejected_event(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpScopeKind, Turn, TurnCapabilityKind, TurnKind, TurnOrigin, TurnPermissionMode,
-        TurnStartResponse, TurnStatus, UserMessageAttachment,
+        SkillId, Turn, TurnCapabilityKind, TurnKind, TurnOrigin, TurnPermissionMode,
+        TurnSkillCapabilitySummary, TurnStartResponse, TurnStatus, UserMessageAttachment,
     };
 
     fn skill_capability() -> TurnCapability {
+        let skill_id = SkillId::new("D".repeat(21)).expect("valid skill id");
         TurnCapability {
-            id: "skill:user:docs".to_owned(),
+            id: pioneer_protocol::skill_capability_key(&skill_id),
             label: Some("Docs".to_owned()),
-            kind: TurnCapabilityKind::Skill {
-                slug: "docs".to_owned(),
-                source_kind: "user".to_owned(),
-            },
+            kind: TurnCapabilityKind::Skill { skill_id },
         }
     }
 
@@ -414,12 +412,14 @@ mod tests {
 
     #[test]
     fn local_turn_start_events_preserve_ids_and_payloads() {
-        let attachment = UserMessageAttachment::McpServer {
-            capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
-                id: "mcp-server:workspace:browser".to_owned(),
-                label: "browser".to_owned(),
-                name: "browser".to_owned(),
-                scope_kind: McpScopeKind::Workspace,
+        let skill_id = SkillId::new("E".repeat(21)).expect("valid skill id");
+        let attachment = UserMessageAttachment::Skill {
+            capability: TurnSkillCapabilitySummary {
+                skill_id: skill_id.clone(),
+                label: "pioneer/browser".to_owned(),
+                owner: Some("pioneer".to_owned()),
+                slug: "browser".to_owned(),
+                source_kind: "system".to_owned(),
             },
         };
 
@@ -442,7 +442,12 @@ mod tests {
                 && turn_id == "turn"
                 && pending_request_id == "pending"
                 && user_text == "hello"
-                && attachments.len() == 1
+                && matches!(
+                    attachments.as_slice(),
+                    [UserMessageAttachment::Skill { capability }]
+                        if capability.skill_id == skill_id
+                            && capability.label == "pioneer/browser"
+                )
         ));
 
         let accepted = local_turn_start_accepted_event("thread", "turn", "pending");

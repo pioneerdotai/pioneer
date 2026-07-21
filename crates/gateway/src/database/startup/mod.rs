@@ -1,5 +1,6 @@
 mod agent_diff_event_compaction;
 mod cli_runtime_native_event_compaction;
+pub(crate) mod skill_storage_relocation;
 mod task_anchor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod timeline_pagination_backfill;
@@ -118,6 +119,7 @@ impl Drop for ThreadEpisodicWorkspaceRefillLease {
 }
 
 pub(crate) fn spawn(
+    message_processor: Arc<crate::message::MessageProcessor>,
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -132,6 +134,8 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
+        message_processor.run_skill_storage_startup_pass().await;
+        message_processor.start_skills_watcher().await;
         task_anchor_backfill::run(crud_store.as_ref()).await;
         turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
         timeline_pagination_backfill::run(crud_store.as_ref()).await;

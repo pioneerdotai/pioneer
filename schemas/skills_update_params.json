@@ -9,14 +9,11 @@
         "null"
       ]
     },
-    "slug": {
-      "type": "string"
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
     },
     "source": {
       "$ref": "#/$defs/SkillLifecycleSource"
-    },
-    "source_kind": {
-      "type": "string"
     },
     "workspace_id": {
       "type": "string"
@@ -24,11 +21,16 @@
   },
   "required": [
     "workspace_id",
-    "slug",
-    "source_kind",
+    "skill_id",
     "source"
   ],
   "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "SkillLifecycleSource": {
       "oneOf": [
         {

@@ -15,7 +15,16 @@
         "null"
       ]
     },
-    "skill_slug": {
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
+    },
+    "slug": {
       "type": "string"
     },
     "source_kind": {
@@ -27,7 +36,16 @@
   },
   "required": [
     "workspace_id",
-    "skill_slug",
+    "skill_id",
+    "slug",
     "source_kind"
-  ]
+  ],
+  "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
 }

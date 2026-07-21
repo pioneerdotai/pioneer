@@ -88,6 +88,12 @@
             "$ref": "#/$defs/SkillDependencyDiagnostic"
           }
         },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "recent_audit": {
           "type": "array",
           "default": [],
@@ -101,6 +107,9 @@
           "items": {
             "$ref": "#/$defs/SkillSecurityFinding"
           }
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
         },
         "slug": {
           "type": "string"
@@ -127,10 +136,17 @@
         }
       },
       "required": [
+        "skill_id",
         "slug",
         "source_kind",
         "trust_level"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "SkillSecurityFinding": {
       "type": "object",

@@ -57,8 +57,8 @@ pub(super) use pioneer_client::{
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
-    ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
+    SkillHealthItem, SkillId, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder,
+    ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -357,15 +357,15 @@ pub struct PioneerDesktop {
     pub(super) mcp_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
     pub(super) installed_skills: Vec<SkillListItem>,
     pub(super) skills_catalog: Vec<SkillListItem>,
-    pub(super) skills_health_details: HashMap<String, SkillHealthItem>,
+    pub(super) skills_health_details: HashMap<SkillId, SkillHealthItem>,
     pub(super) skills_loading: bool,
     pub(super) skills_error: Option<String>,
     pub(super) skills_upload_progress: Option<SkillUploadProgress>,
     pub(super) skills_upload_cancel_token: Option<Arc<AtomicBool>>,
     pub(super) skills_refresh_requested: bool,
     pub(super) skills_poller_started: bool,
-    pub(super) skills_pending_actions: HashSet<String>,
-    pub(super) selected_skill_target: Option<(String, String)>,
+    pub(super) skills_pending_actions: HashSet<SkillId>,
+    pub(super) selected_skill_target: Option<SkillId>,
     pub(super) skills_list_scroll_handle: VirtualListScrollHandle,
     pub(super) skills_details_expanded_sections: HashSet<String>,
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
