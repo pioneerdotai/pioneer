@@ -1,3 +1,4 @@
+use super::{MessageProcessor, installer_policy, resolve_root_path};
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{CrudStore, SkillInstallationPatch, SkillInstallationRecord};
 use pioneer_protocol::SkillId;
@@ -150,6 +151,125 @@ pub(crate) struct ExistingInstallationRelocationSummary {
     pub(crate) failed: usize,
 }
 
+impl MessageProcessor {
+    pub(crate) fn configured_root_import_config(
+        &self,
+        workspace_id: &str,
+        force_refresh: bool,
+    ) -> Result<ConfiguredRootImportConfig> {
+        let context = self.skills_runtime_context(workspace_id)?;
+        let system_managed_root = self
+            .artifact_runtime_home
+            .join("skills")
+            .join("system")
+            .join("imported");
+        let mut roots = Vec::new();
+        roots.extend(
+            self.tool_loop_config
+                .skills
+                .system_import_roots
+                .iter()
+                .map(|raw| ConfiguredSkillImportRoot {
+                    source_kind: SkillSourceKind::System,
+                    scope_key: "system".to_owned(),
+                    source_root: resolve_root_path(raw.as_str(), workspace_id),
+                    managed_root: system_managed_root.clone(),
+                    source_is_pioneer_managed: false,
+                }),
+        );
+        roots.extend(
+            self.tool_loop_config
+                .skills
+                .user_import_roots
+                .iter()
+                .map(|raw| {
+                    configured_workspace_import_root(
+                        raw,
+                        workspace_id,
+                        SkillSourceKind::User,
+                        context.user_root.as_path(),
+                    )
+                }),
+        );
+        roots.extend(
+            self.tool_loop_config
+                .skills
+                .registry_import_roots
+                .iter()
+                .map(|raw| {
+                    configured_workspace_import_root(
+                        raw,
+                        workspace_id,
+                        SkillSourceKind::Registry,
+                        context.registry_root.as_path(),
+                    )
+                }),
+        );
+        Ok(ConfiguredRootImportConfig {
+            roots,
+            installer_policy: installer_policy(&context),
+            max_skills_per_root: self.tool_loop_config.skills.max_skills_per_source.max(1),
+            force_refresh,
+            mode: ConfiguredRootImportMode::ImportAndRefresh,
+            reserved_skill_ids: context
+                .catalog_params
+                .bundled
+                .iter()
+                .map(|entry| entry.skill_id.clone())
+                .collect(),
+        })
+    }
+
+    pub(crate) fn managed_root_scan_config(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ManagedRootScanConfig> {
+        let context = self.skills_runtime_context(workspace_id)?;
+        Ok(ManagedRootScanConfig {
+            roots: vec![
+                ManagedSkillRoot {
+                    source_kind: SkillSourceKind::System,
+                    scope_key: "system".to_owned(),
+                    managed_root: self
+                        .artifact_runtime_home
+                        .join("skills")
+                        .join("system")
+                        .join("imported"),
+                },
+                ManagedSkillRoot {
+                    source_kind: SkillSourceKind::User,
+                    scope_key: workspace_id.to_owned(),
+                    managed_root: context.user_root.clone(),
+                },
+                ManagedSkillRoot {
+                    source_kind: SkillSourceKind::Registry,
+                    scope_key: workspace_id.to_owned(),
+                    managed_root: context.registry_root.clone(),
+                },
+            ],
+            installer_policy: installer_policy(&context),
+        })
+    }
+}
+
+fn configured_workspace_import_root(
+    raw: &str,
+    workspace_id: &str,
+    source_kind: SkillSourceKind,
+    managed_root: &Path,
+) -> ConfiguredSkillImportRoot {
+    let source_root = resolve_root_path(raw, workspace_id);
+    let source_is_pioneer_managed = normalize_absolute_path(source_root.as_path()).ok()
+        == normalize_absolute_path(managed_root).ok();
+    ConfiguredSkillImportRoot {
+        source_kind,
+        scope_key: workspace_id.to_owned(),
+        source_root,
+        managed_root: managed_root.to_path_buf(),
+        source_is_pioneer_managed,
+    }
+}
+
 pub(crate) async fn relocate_existing_installations(
     crud_store: &CrudStore,
     skills_write_lock: &Arc<Mutex<()>>,
@@ -169,10 +289,7 @@ pub(crate) async fn relocate_existing_installations(
             summary.skipped_unsupported = summary.skipped_unsupported.saturating_add(1);
             continue;
         };
-        let install_root = crate::message::skills::resolve_root_path(
-            install_root_template,
-            row.scope_key.as_str(),
-        );
+        let install_root = resolve_root_path(install_root_template, row.scope_key.as_str());
         let destination = match canonical_skill_install_path(
             install_root.as_path(),
             &row.skill_id,

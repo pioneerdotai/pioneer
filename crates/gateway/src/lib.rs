@@ -567,19 +567,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_voice_input_status_notifications();
     message_processor.start_thread_episodic_vector_refill_status_notifications();
 
-    database::startup::spawn(
-        message_processor.clone(),
-        message_processor.crud_store.clone(),
-        thread_episodic_storage_root.clone(),
-        config.gateway.thread_episodic.vector_search.clone(),
-        thread_episodic_workspace_vector_search_configs.clone(),
-        provider_registry.clone(),
-        runtime_home.clone(),
-        Some(message_processor.thread_episodic_vector_refill_status_sender()),
-        message_processor.thread_episodic_workspace_refill_supervisor(),
-    );
-    database::maintenance::spawn(message_processor.crud_store.clone());
-
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
         .context("failed to apply gateway keepawake setting")?;
@@ -595,7 +582,23 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_mcp_workspace_supervisor().await;
 
     let remote_access_config = config.gateway.remote_access.clone();
+    let startup_thread_episodic_vector_search_config =
+        config.gateway.thread_episodic.vector_search.clone();
     let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
+    message_processor.start_skills_watcher().await;
+    // Long-running migrations and backfills start only after the Gateway listener exists.
+    database::startup::spawn(
+        message_processor.clone(),
+        message_processor.crud_store.clone(),
+        thread_episodic_storage_root.clone(),
+        startup_thread_episodic_vector_search_config,
+        thread_episodic_workspace_vector_search_configs.clone(),
+        provider_registry.clone(),
+        runtime_home.clone(),
+        Some(message_processor.thread_episodic_vector_refill_status_sender()),
+        message_processor.thread_episodic_workspace_refill_supervisor(),
+    );
+    database::maintenance::spawn(message_processor.crud_store.clone());
     remote_access_supervisor
         .apply(remote_access_desired_state(
             &remote_access_config,

@@ -1,6 +1,6 @@
 mod agent_diff_event_compaction;
 mod cli_runtime_native_event_compaction;
-pub(crate) mod skill_storage_relocation;
+mod stable_skill_id_backfill;
 mod task_anchor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod timeline_pagination_backfill;
@@ -134,8 +134,7 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
-        message_processor.run_skill_storage_startup_pass().await;
-        message_processor.start_skills_watcher().await;
+        stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
         task_anchor_backfill::run(crud_store.as_ref()).await;
         turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
         timeline_pagination_backfill::run(crud_store.as_ref()).await;

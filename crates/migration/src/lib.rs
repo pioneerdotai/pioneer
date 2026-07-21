@@ -2,6 +2,8 @@ pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
+pub mod stable_skill_id;
+
 mod m20260313_125253_create_workspace_table;
 mod m20260510_000001_add_hook_run_resume_state;
 mod m20260515_000001_unique_thread_lineage_task_run;
