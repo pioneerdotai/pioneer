@@ -1373,7 +1373,7 @@ impl RemoteEmbeddingProvider {
         error: anyhow::Error,
     ) -> ThreadEpisodicEmbeddingError {
         let message = format!("{error:#}");
-        if provider_embedding_error_is_retryable(message.as_str()) {
+        if provider_embedding_error_is_retryable(&error) {
             ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1385,17 +1385,47 @@ impl RemoteEmbeddingProvider {
     }
 }
 
-fn provider_embedding_error_is_retryable(message: &str) -> bool {
+fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_body()
+                || error.is_decode()
+                || error.status().is_some_and(|status| {
+                    matches!(
+                        status,
+                        reqwest::StatusCode::REQUEST_TIMEOUT
+                            | reqwest::StatusCode::TOO_EARLY
+                            | reqwest::StatusCode::TOO_MANY_REQUESTS
+                    ) || status.is_server_error()
+                })
+        })
+    }) {
+        return true;
+    }
+
+    provider_embedding_error_message_is_retryable(format!("{error:#}").as_str())
+}
+
+pub(crate) fn provider_embedding_error_message_is_retryable(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("429")
+    embedding_api_error_status(lower.as_str())
+        .is_some_and(|status| matches!(status, 408 | 425 | 429) || (500..=599).contains(&status))
         || lower.contains("too many requests")
         || lower.contains("rate limit")
         || lower.contains("timeout")
+        || lower.contains("timed out")
         || lower.contains("connection")
         || lower.contains("temporar")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
+        || lower.contains("error decoding response body")
+        || lower.contains("request or response body error")
+        || lower.contains("missing field `data`")
+}
+
+fn embedding_api_error_status(message: &str) -> Option<u16> {
+    let status = message.split_once("api error (")?.1;
+    status.split_whitespace().next()?.parse().ok()
 }
 
 impl Debug for RemoteEmbeddingProvider {
@@ -1509,6 +1539,25 @@ mod tests {
     use memvid_core::types::ask::VecEmbedder;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn remote_embedding_retryability_covers_observed_transient_response_failures() {
+        assert!(provider_embedding_error_message_is_retryable(
+            "error decoding response body: request or response body error: operation timed out"
+        ));
+        assert!(provider_embedding_error_message_is_retryable(
+            "error decoding response body: missing field `data` at line 1 column 82"
+        ));
+        assert!(provider_embedding_error_message_is_retryable(
+            "embedding API error (503 Service Unavailable)"
+        ));
+        assert!(!provider_embedding_error_message_is_retryable(
+            "embedding API error (401 Unauthorized)"
+        ));
+        assert!(!provider_embedding_error_message_is_retryable(
+            "embedding dimension mismatch: expected 1536, got 3072"
+        ));
+    }
 
     struct FakeRemoteProvider {
         name: &'static str,

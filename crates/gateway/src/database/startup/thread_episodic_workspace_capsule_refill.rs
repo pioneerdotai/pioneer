@@ -7,6 +7,7 @@ use crate::thread_episodic::{
     ThreadEpisodicResolvedIndexRequest, ThreadEpisodicThreadReindexRequest,
     memvid_stats_reach_capacity_threshold,
 };
+use crate::thread_episodic_embedding::provider_embedding_error_message_is_retryable;
 use anyhow::{Context, Result, anyhow, bail};
 use fs4::{FileExt as Fs4FileExt, TryLockError as Fs4TryLockError};
 use pioneer_config::{
@@ -14,12 +15,14 @@ use pioneer_config::{
 };
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_BACKFILLING,
-    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, ProjectionMetaConfigRecord,
-    ProjectionMetaRecord, ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
-    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
-    ThreadEpisodicIndexJobRecord, ThreadEpisodicItemIndexedUpdate,
-    ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    find_projection_meta, list_projection_meta_by_key_prefix, upsert_projection_meta_with_config,
+    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING,
+    ProjectionMetaConfigRecord, ProjectionMetaRecord, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleWriteState, ThreadEpisodicIndexJobCompletionUpdate,
+    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
+    ThreadEpisodicItemIndexedUpdate, ThreadEpisodicThreadDirectoryStatus,
+    ThreadEpisodicThreadDirectoryVisibility, find_projection_meta,
+    list_projection_meta_by_key_prefix, update_projection_meta_status,
+    upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
     MemvidThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
@@ -33,7 +36,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -45,6 +48,7 @@ const THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_CONFIG_VERSION: u32 = 1;
 const REFILL_ENQUEUE_BATCH_SIZE: u64 = 1024;
 const REFILL_EXECUTOR_MAX_BATCHES: u64 = 100_000;
 const REFILL_JOB_CLAIM_LIMIT: u64 = 1;
+const REFILL_RECOVERY_SCAN_LIMIT: u64 = 100_000;
 const REFILL_LOCK_FILE_NAME: &str = ".thread_episodic_workspace_capsule_refill.lock";
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
 const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
@@ -246,6 +250,7 @@ fn projection_embedding_model(config: &GatewayThreadEpisodicVectorSearchConfig) 
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillSummary {
     pub(crate) skipped: bool,
     pub(crate) lock_contended: bool,
+    pub(crate) resumed: bool,
     pub(crate) capsule_files_deleted: u64,
     pub(crate) capsule_files_missing: u64,
     pub(crate) non_file_storage_uris: u64,
@@ -266,6 +271,8 @@ pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillSummary {
     pub(crate) failed_retryable_jobs: usize,
     pub(crate) failed_terminal_jobs: usize,
     pub(crate) incomplete_jobs: u64,
+    pub(crate) interrupted_jobs_requeued: u64,
+    pub(crate) legacy_retryable_jobs_requeued: usize,
 }
 
 pub(super) async fn run(
@@ -277,6 +284,7 @@ pub(super) async fn run(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<super::ThreadEpisodicWorkspaceRefillSupervisor>,
+    interrupted_before_unix: Option<i64>,
 ) {
     let workspace_ids = match crud_store.list_thread_episodic_refill_workspace_ids().await {
         Ok(workspace_ids) => workspace_ids,
@@ -309,6 +317,7 @@ pub(super) async fn run(
             provider_registry.clone(),
             runtime_home.clone(),
             refill_status_sender.clone(),
+            interrupted_before_unix,
             cancellation,
         )
         .await;
@@ -326,6 +335,7 @@ pub(super) async fn run_workspace(
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    interrupted_before_unix: Option<i64>,
     cancellation: CancellationToken,
 ) {
     if cancellation.is_cancelled() {
@@ -432,6 +442,7 @@ pub(super) async fn run_workspace(
             projection_target,
             embedding_provider_resolver,
             refill_status_sender.as_ref(),
+            interrupted_before_unix,
         ) => refill,
     };
     match refill {
@@ -443,6 +454,7 @@ pub(super) async fn run_workspace(
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
             info!(
+                resumed = summary.resumed,
                 capsule_files_deleted = summary.capsule_files_deleted,
                 capsule_files_missing = summary.capsule_files_missing,
                 non_file_storage_uris = summary.non_file_storage_uris,
@@ -458,6 +470,8 @@ pub(super) async fn run_workspace(
                 refill_jobs_enqueued = summary.refill_jobs_enqueued,
                 executor_batches = summary.executor_batches,
                 completed_jobs = summary.completed_jobs,
+                interrupted_jobs_requeued = summary.interrupted_jobs_requeued,
+                legacy_retryable_jobs_requeued = summary.legacy_retryable_jobs_requeued,
                 "thread episodic workspace capsule refill completed"
             );
         }
@@ -628,6 +642,7 @@ pub(crate) async fn refill_once_with_workspace_projection(
         projection_target,
         embedding_provider_resolver,
         None,
+        Some(chrono::Utc::now().timestamp()),
     )
     .await
 }
@@ -636,9 +651,33 @@ pub(crate) async fn refill_once_with_projection_resolver(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
     workspace_id: &str,
+    projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    refill_status_sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    interrupted_before_unix: Option<i64>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    refill_once_with_projection_resolver_and_config(
+        crud_store,
+        thread_episodic_storage_root,
+        workspace_id,
+        projection_target,
+        embedding_provider_resolver,
+        refill_status_sender,
+        ThreadEpisodicIndexExecutorConfig::default(),
+        interrupted_before_unix,
+    )
+    .await
+}
+
+async fn refill_once_with_projection_resolver_and_config(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: &Path,
+    workspace_id: &str,
     mut projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
     mut embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     refill_status_sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
+    interrupted_before_unix: Option<i64>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
     if projection_target.requires_embedding_provider() {
@@ -676,26 +715,22 @@ pub(crate) async fn refill_once_with_projection_resolver(
         });
     };
 
-    let started_at = now_datetime();
-    let projection_key = refill_projection_key_for_workspace(workspace_id)?;
+    if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
+        .await?
+    {
+        return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
+            skipped: true,
+            ..Default::default()
+        });
+    }
 
-    upsert_projection_meta_with_config(
-        &db,
-        ProjectionMetaRecord {
-            projection_key: projection_key.clone(),
-            projection_version: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
-            status: PROJECTION_META_STATUS_BACKFILLING.to_owned(),
-            source_thread_count: 0,
-            source_turn_count: 0,
-            source_turn_item_count: 0,
-            source_turn_event_count: 0,
-            last_error: None,
-            backfill_started_at: Some(started_at),
-            backfilled_at: None,
-            created_at: started_at,
-            updated_at: started_at,
-        },
-        projection_target.meta_config_record(),
+    let existing_meta =
+        find_refill_projection_meta_for_workspace(crud_store.as_ref(), workspace_id).await?;
+    let resume_existing = refill_can_resume_existing_projection(
+        crud_store.as_ref(),
+        workspace_id,
+        existing_meta.as_ref(),
+        &projection_target,
     )
     .await?;
 
@@ -705,26 +740,76 @@ pub(crate) async fn refill_once_with_projection_resolver(
         GatewayThreadEpisodicVectorRefillStatus::Running,
     );
 
-    let result = async {
-        preflight_refill_embedding_resolver(
+    if let Err(error) = preflight_refill_embedding_resolver(
+        workspace_id,
+        &projection_target,
+        embedding_provider_resolver.as_ref(),
+    )
+    .await
+    {
+        if resume_existing {
+            mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
+        } else {
+            mark_refill_preparation_failed(&db, workspace_id, &error, &projection_target).await?;
+        }
+        notify_refill_status(
+            refill_status_sender,
             workspace_id,
-            &projection_target,
-            embedding_provider_resolver.as_ref(),
-        )
-        .await?;
+            GatewayThreadEpisodicVectorRefillStatus::Failed,
+        );
+        return Err(error);
+    }
 
-        refill_after_marker(
+    let prepared = if resume_existing {
+        prepare_resumed_refill(
+            crud_store.clone(),
+            workspace_id,
+            existing_meta.as_ref(),
+            executor_config,
+            interrupted_before_unix,
+        )
+        .await
+    } else {
+        mark_refill_preparing(&db, workspace_id, &projection_target).await?;
+        prepare_fresh_refill(
             crud_store.clone(),
             thread_episodic_storage_root,
             workspace_id,
-            embedding_provider_resolver,
         )
         .await
-    }
+    };
+
+    let mut summary = match prepared {
+        Ok(summary) => summary,
+        Err(error) => {
+            if resume_existing {
+                mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
+            } else {
+                mark_refill_preparation_failed(&db, workspace_id, &error, &projection_target)
+                    .await?;
+            }
+            notify_refill_status(
+                refill_status_sender,
+                workspace_id,
+                GatewayThreadEpisodicVectorRefillStatus::Failed,
+            );
+            return Err(error);
+        }
+    };
+
+    mark_refill_backfilling(&db, workspace_id, &summary, &projection_target).await?;
+    let result = execute_refill_jobs(
+        crud_store,
+        thread_episodic_storage_root,
+        workspace_id,
+        embedding_provider_resolver,
+        executor_config,
+        &mut summary,
+    )
     .await;
 
     match result {
-        Ok(summary) => {
+        Ok(()) => {
             mark_refill_complete(&db, workspace_id, &summary, &projection_target).await?;
             notify_refill_status(
                 refill_status_sender,
@@ -1007,6 +1092,12 @@ pub(crate) async fn refill_status_for_workspace_target(
         PROJECTION_META_STATUS_COMPLETE => {
             pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
         }
+        PROJECTION_META_STATUS_PENDING if meta.last_error.is_some() => {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed
+        }
+        PROJECTION_META_STATUS_PENDING => {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        }
         PROJECTION_META_STATUS_BACKFILLING => {
             pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
         }
@@ -1033,11 +1124,52 @@ async fn find_refill_projection_meta_for_workspace(
     find_projection_meta(&db, THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY).await
 }
 
-async fn refill_after_marker(
+async fn refill_can_resume_existing_projection(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    meta: Option<&pioneer_entity::thread_timeline_projection_meta::Model>,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<bool> {
+    let Some(meta) = meta else {
+        return Ok(false);
+    };
+    if meta.projection_version != THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
+        || !matches!(
+            meta.status.as_str(),
+            PROJECTION_META_STATUS_BACKFILLING | PROJECTION_META_STATUS_FAILED
+        )
+    {
+        return Ok(false);
+    }
+
+    let marker = ProjectionMetaRecordLike {
+        projection_config_hash: meta.projection_config_hash.as_deref(),
+        projection_config_json: meta.projection_config_json.as_deref(),
+    };
+    if !projection_target.matches_projection_meta(&marker)
+        && !projection_target.matches_projection_meta_selection(&marker)
+    {
+        return Ok(false);
+    }
+
+    let incomplete = crud_store
+        .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id)
+        .await
+        .context("failed to count resumable thread episodic refill jobs")?;
+    if incomplete > 0 {
+        return Ok(true);
+    }
+    let canceled = crud_store
+        .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id)
+        .await
+        .context("failed to count terminal thread episodic refill jobs")?;
+    Ok(canceled > 0 || meta.source_turn_item_count > 0)
+}
+
+async fn prepare_fresh_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
     workspace_id: &str,
-    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let now_unix = chrono::Utc::now().timestamp();
     let mut summary = cleanup_derived_artifacts(
@@ -1050,6 +1182,57 @@ async fn refill_after_marker(
 
     rebuild_refill_items_from_history(crud_store.clone(), workspace_id, now_unix, &mut summary)
         .await?;
+    populate_refill_source_counts(crud_store.as_ref(), workspace_id, &mut summary).await?;
+    enqueue_refill_jobs(crud_store.as_ref(), workspace_id, now_unix, &mut summary).await?;
+    Ok(summary)
+}
+
+async fn prepare_resumed_refill(
+    crud_store: Arc<CrudStore>,
+    workspace_id: &str,
+    existing_meta: Option<&pioneer_entity::thread_timeline_projection_meta::Model>,
+    config: ThreadEpisodicIndexExecutorConfig,
+    interrupted_before_unix: Option<i64>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    let now_unix = chrono::Utc::now().timestamp();
+    let mut summary = ThreadEpisodicWorkspaceCapsuleRefillSummary {
+        resumed: true,
+        ..Default::default()
+    };
+    populate_refill_source_counts(crud_store.as_ref(), workspace_id, &mut summary).await?;
+    if let Some(existing_meta) = existing_meta {
+        summary.source_thread_count = summary
+            .source_thread_count
+            .max(existing_meta.source_thread_count);
+        summary.source_turn_count = summary
+            .source_turn_count
+            .max(existing_meta.source_turn_count);
+        summary.source_turn_item_count = summary
+            .source_turn_item_count
+            .max(existing_meta.source_turn_item_count);
+    }
+    if let Some(interrupted_before_unix) = interrupted_before_unix {
+        summary.interrupted_jobs_requeued = crud_store
+            .requeue_running_thread_episodic_index_jobs_for_workspace(
+                workspace_id,
+                interrupted_before_unix,
+                now_unix,
+            )
+            .await
+            .context("failed to requeue interrupted thread episodic refill jobs")?;
+    }
+    summary.legacy_retryable_jobs_requeued =
+        recover_misclassified_retryable_jobs(crud_store.as_ref(), workspace_id, now_unix, config)
+            .await?;
+    enqueue_refill_jobs(crud_store.as_ref(), workspace_id, now_unix, &mut summary).await?;
+    Ok(summary)
+}
+
+async fn populate_refill_source_counts(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
+) -> Result<()> {
     summary.workspace_count = 1;
     let source_counts = crud_store
         .count_thread_episodic_refill_sources_for_workspace(workspace_id)
@@ -1058,17 +1241,47 @@ async fn refill_after_marker(
     summary.source_thread_count = source_counts.source_thread_count;
     summary.source_turn_count = source_counts.source_turn_count;
     summary.source_turn_item_count = source_counts.source_turn_item_count;
+    Ok(())
+}
 
-    enqueue_refill_jobs(crud_store.as_ref(), workspace_id, now_unix, &mut summary).await?;
-    execute_refill_jobs(
-        crud_store,
-        thread_episodic_storage_root,
-        workspace_id,
-        embedding_provider_resolver,
-        &mut summary,
-    )
-    .await?;
-    Ok(summary)
+async fn recover_misclassified_retryable_jobs(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+) -> Result<usize> {
+    let jobs = crud_store
+        .list_canceled_thread_episodic_index_jobs_for_workspace(
+            workspace_id,
+            REFILL_RECOVERY_SCAN_LIMIT,
+        )
+        .await
+        .context("failed to list canceled thread episodic refill jobs")?;
+    let mut recovered = 0usize;
+    for job in jobs {
+        let retryable = job.attempt_count < config.max_attempts
+            && job
+                .last_error
+                .as_deref()
+                .is_some_and(provider_embedding_error_message_is_retryable);
+        if !retryable {
+            continue;
+        }
+        if crud_store
+            .requeue_canceled_thread_episodic_index_job(job.id.as_str(), now_unix)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to recover misclassified thread episodic refill job `{}`",
+                    job.id
+                )
+            })?
+            .is_some()
+        {
+            recovered = recovered.saturating_add(1);
+        }
+    }
+    Ok(recovered)
 }
 
 async fn preflight_refill_embedding_resolver(
@@ -1228,6 +1441,7 @@ async fn execute_refill_jobs(
     thread_episodic_storage_root: &Path,
     workspace_id: &str,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    config: ThreadEpisodicIndexExecutorConfig,
     summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
 ) -> Result<()> {
     let storage_uri_root = thread_episodic_storage_uri_from_path(thread_episodic_storage_root);
@@ -1244,9 +1458,10 @@ async fn execute_refill_jobs(
         } else {
             base_payload_provider
         };
-    let config = ThreadEpisodicIndexExecutorConfig::default();
-
-    for _ in 0..REFILL_EXECUTOR_MAX_BATCHES {
+    loop {
+        if summary.executor_batches >= REFILL_EXECUTOR_MAX_BATCHES {
+            break;
+        }
         let now_unix = chrono::Utc::now().timestamp();
         let jobs = crud_store
             .claim_due_thread_episodic_index_jobs_for_workspace(
@@ -1257,7 +1472,43 @@ async fn execute_refill_jobs(
             .await
             .context("failed to claim thread episodic workspace refill index jobs")?;
         if jobs.is_empty() {
-            break;
+            let canceled_jobs = crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id)
+                .await
+                .context("failed to count terminal thread episodic refill jobs")?;
+            if canceled_jobs > 0 {
+                summary.failed_terminal_jobs = usize::try_from(canceled_jobs).unwrap_or(usize::MAX);
+                bail!(
+                    "thread episodic workspace refill failed {} index jobs terminally",
+                    canceled_jobs
+                );
+            }
+
+            summary.incomplete_jobs = crud_store
+                .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id)
+                .await
+                .context("failed to count incomplete thread episodic index jobs")?;
+            if summary.incomplete_jobs == 0 {
+                return Ok(());
+            }
+
+            let next_run_at = crud_store
+                .next_scheduled_thread_episodic_index_job_at_for_workspace(workspace_id)
+                .await
+                .context("failed to find the next scheduled thread episodic refill job")?;
+            let Some(next_run_at) = next_run_at else {
+                bail!(
+                    "thread episodic workspace refill stalled with {} incomplete index jobs",
+                    summary.incomplete_jobs
+                );
+            };
+            let delay_secs = next_run_at.saturating_sub(chrono::Utc::now().timestamp());
+            if delay_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(delay_secs as u64)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            continue;
         }
 
         summary.executor_batches = summary.executor_batches.saturating_add(1);
@@ -1309,15 +1560,20 @@ async fn execute_refill_jobs(
         .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id)
         .await
         .context("failed to count incomplete thread episodic index jobs")?;
-    if summary.failed_terminal_jobs > 0 {
+    let canceled_jobs = crud_store
+        .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id)
+        .await
+        .context("failed to count terminal thread episodic refill jobs")?;
+    if canceled_jobs > 0 {
+        summary.failed_terminal_jobs = usize::try_from(canceled_jobs).unwrap_or(usize::MAX);
         bail!(
             "thread episodic workspace refill failed {} index jobs terminally",
-            summary.failed_terminal_jobs
+            canceled_jobs
         );
     }
     if summary.incomplete_jobs > 0 {
         bail!(
-            "thread episodic workspace refill left {} incomplete index jobs",
+            "thread episodic workspace refill reached its executor limit with {} incomplete index jobs",
             summary.incomplete_jobs
         );
     }
@@ -1695,6 +1951,87 @@ async fn delete_capsule_file(storage_uri: &str) -> Result<CapsuleFileDeleteOutco
     }
 }
 
+async fn mark_refill_preparing(
+    db: &sea_orm::DatabaseConnection,
+    workspace_id: &str,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<()> {
+    upsert_refill_progress_marker(
+        db,
+        workspace_id,
+        PROJECTION_META_STATUS_PENDING,
+        None,
+        None,
+        projection_target,
+    )
+    .await
+}
+
+async fn mark_refill_backfilling(
+    db: &sea_orm::DatabaseConnection,
+    workspace_id: &str,
+    summary: &ThreadEpisodicWorkspaceCapsuleRefillSummary,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<()> {
+    upsert_refill_progress_marker(
+        db,
+        workspace_id,
+        PROJECTION_META_STATUS_BACKFILLING,
+        Some(summary),
+        None,
+        projection_target,
+    )
+    .await
+}
+
+async fn mark_refill_preparation_failed(
+    db: &sea_orm::DatabaseConnection,
+    workspace_id: &str,
+    error: &anyhow::Error,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<()> {
+    upsert_refill_progress_marker(
+        db,
+        workspace_id,
+        PROJECTION_META_STATUS_PENDING,
+        None,
+        Some(format!("{error:#}")),
+        projection_target,
+    )
+    .await
+}
+
+async fn upsert_refill_progress_marker(
+    db: &sea_orm::DatabaseConnection,
+    workspace_id: &str,
+    status: &str,
+    summary: Option<&ThreadEpisodicWorkspaceCapsuleRefillSummary>,
+    last_error: Option<String>,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<()> {
+    let now = now_datetime();
+    let projection_key = refill_projection_key_for_workspace(workspace_id)?;
+    upsert_projection_meta_with_config(
+        db,
+        ProjectionMetaRecord {
+            projection_key,
+            projection_version: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            status: status.to_owned(),
+            source_thread_count: summary.map_or(0, |summary| summary.source_thread_count),
+            source_turn_count: summary.map_or(0, |summary| summary.source_turn_count),
+            source_turn_item_count: summary.map_or(0, |summary| summary.source_turn_item_count),
+            source_turn_event_count: 0,
+            last_error,
+            backfill_started_at: Some(now),
+            backfilled_at: None,
+            created_at: now,
+            updated_at: now,
+        },
+        projection_target.meta_config_record(),
+    )
+    .await
+}
+
 async fn mark_refill_complete(
     db: &sea_orm::DatabaseConnection,
     workspace_id: &str,
@@ -1739,6 +2076,19 @@ async fn mark_refill_failed(
 ) -> Result<()> {
     let now = now_datetime();
     let projection_key = refill_projection_key_for_workspace(workspace_id)?;
+    let last_error = format!("{error:#}");
+    if update_projection_meta_status(
+        db,
+        projection_key.as_str(),
+        PROJECTION_META_STATUS_FAILED,
+        Some(last_error.as_str()),
+        now,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     upsert_projection_meta_with_config(
         db,
         ProjectionMetaRecord {
@@ -1749,7 +2099,7 @@ async fn mark_refill_failed(
             source_turn_count: 0,
             source_turn_item_count: 0,
             source_turn_event_count: 0,
-            last_error: Some(format!("{error:#}")),
+            last_error: Some(last_error),
             backfill_started_at: None,
             backfilled_at: None,
             created_at: now,
@@ -1842,6 +2192,8 @@ mod tests {
         ThreadStatus, Turn, TurnItem, TurnItemType, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -1973,6 +2325,91 @@ mod tests {
             }
             Ok(self.embedding.clone())
         }
+    }
+
+    struct ScriptedThreadEpisodicEmbeddingProvider {
+        responses: Mutex<VecDeque<std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError>>>,
+        fallback_embedding: Vec<f32>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedThreadEpisodicEmbeddingProvider {
+        fn new(
+            responses: Vec<std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                fallback_embedding: vec![0.1, 0.2, 0.3],
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ThreadEpisodicEmbeddingProvider for ScriptedThreadEpisodicEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            "openai"
+        }
+
+        fn model(&self) -> &str {
+            "text-embedding-3-small"
+        }
+
+        fn dimension(&self) -> usize {
+            self.fallback_embedding.len()
+        }
+
+        fn normalized(&self) -> bool {
+            true
+        }
+
+        fn embed_text(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .expect("scripted embedding responses lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(self.fallback_embedding.clone()))
+        }
+    }
+
+    fn immediate_retry_config(max_attempts: i64) -> ThreadEpisodicIndexExecutorConfig {
+        ThreadEpisodicIndexExecutorConfig {
+            retry_base_delay_secs: 0,
+            retry_max_delay_secs: 0,
+            max_attempts,
+            ..ThreadEpisodicIndexExecutorConfig::default()
+        }
+    }
+
+    async fn refill_once_with_test_executor_config(
+        crud_store: Arc<CrudStore>,
+        thread_episodic_storage_root: &Path,
+        workspace_id: &str,
+        projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+        embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+        executor_config: ThreadEpisodicIndexExecutorConfig,
+    ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+        let resolver = Arc::new(FixedThreadEpisodicIndexEmbeddingProviderResolver::new(
+            Some(embedding_provider),
+        )) as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>;
+        refill_once_with_projection_resolver_and_config(
+            crud_store,
+            thread_episodic_storage_root,
+            workspace_id,
+            projection_target,
+            Some(resolver),
+            None,
+            executor_config,
+            Some(chrono::Utc::now().timestamp().saturating_add(2)),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2649,7 +3086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_episodic_vector_refill_retryable_embedding_failure_does_not_complete_marker() {
+    async fn thread_episodic_vector_refill_retries_transient_embedding_failure_until_success() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill_retryable";
         ingest_materialized_user_item(
@@ -2658,7 +3095,63 @@ mod tests {
             thread_id,
             "turn_vector_refill_retryable",
             "item_vector_refill_retryable",
-            "vector refill provider failure should leave refill incomplete",
+            "vector refill provider failure should retry automatically",
+        )
+        .await;
+        let embedding_provider = Arc::new(ScriptedThreadEpisodicEmbeddingProvider::new(vec![
+            Err(ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                "openai",
+                "text-embedding-3-small",
+                "rate limited",
+            )),
+            Ok(vec![0.1, 0.2, 0.3]),
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            embedding_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("transient embedding failure should recover in the same refill");
+
+        assert_eq!(embedding_provider.calls(), 2);
+        assert_eq!(summary.failed_retryable_jobs, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &target)
+                .await
+                .expect("recovered vector marker should be current")
+        );
+
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+        assert_eq!(jobs[0].attempt_count, 2);
+        assert!(jobs[0].last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_stops_after_bounded_transient_retries() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_retry_exhausted";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_retry_exhausted",
+            "item_vector_refill_retry_exhausted",
+            "vector refill should stop after its bounded retry budget",
         )
         .await;
         let embedding_provider =
@@ -2668,51 +3161,376 @@ mod tests {
         )
         .expect("test provider target");
 
-        let error = refill_once_with_projection(
+        let error = refill_once_with_test_executor_config(
             crud_store.clone(),
             temp_dir.path(),
+            workspace_id.as_str(),
             target.clone(),
-            Some(embedding_provider.clone()),
+            embedding_provider.clone(),
+            immediate_retry_config(2),
         )
         .await
-        .expect_err("retryable embedding failure should fail refill");
+        .expect_err("exhausted transient failures should fail refill");
 
         assert!(
             error
                 .to_string()
-                .contains("thread episodic workspace refill left"),
+                .contains("thread episodic workspace refill failed 1 index jobs terminally"),
             "unexpected error: {error:#}"
         );
-        assert_eq!(embedding_provider.calls(), 1);
+        assert_eq!(embedding_provider.calls(), 2);
         assert!(
             !refill_is_current_for_target(crud_store.as_ref(), &target)
                 .await
                 .expect("failed vector marker should not be current")
         );
-        let meta = find_projection_meta(
-            &crud_store.database_connection(),
-            refill_projection_key_for_workspace(workspace_id.as_str())
-                .expect("workspace refill key should build")
-                .as_str(),
-        )
-        .await
-        .expect("meta query should succeed")
-        .expect("meta exists");
-        assert_eq!(meta.status, PROJECTION_META_STATUS_FAILED);
-
         let jobs = crud_store
             .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
             .await
             .expect("jobs should list");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Failed);
-        assert!(jobs[0].attempt_count >= 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(jobs[0].attempt_count, 2);
         assert!(
             jobs[0]
                 .last_error
                 .as_deref()
                 .is_some_and(|error| error.contains("rate limited"))
         );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_restart_resumes_legacy_transient_failures() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_resume";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_resume_a",
+            "item_vector_refill_resume_a",
+            "first vector should remain intact across refill restart",
+        )
+        .await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_resume_b",
+            "item_vector_refill_resume_b",
+            "second vector should resume after a transient response failure",
+        )
+        .await;
+
+        let legacy_provider = Arc::new(ScriptedThreadEpisodicEmbeddingProvider::new(vec![
+            Ok(vec![0.1, 0.2, 0.3]),
+            Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    "openai",
+                    "text-embedding-3-small",
+                    "error decoding response body: request or response body error: operation timed out",
+                ),
+            ),
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            legacy_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            legacy_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect_err("legacy transient classification should leave a failed marker");
+        assert_eq!(legacy_provider.calls(), 2);
+
+        let before_items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("items should list before resume");
+        assert_eq!(before_items.len(), 2);
+        let retained_item = before_items
+            .iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::Active)
+            .expect("one item should already be indexed");
+        let retained_item_id = retained_item.id.clone();
+        let retained_frame_uri = retained_item
+            .frame_uri
+            .clone()
+            .expect("completed item should retain its frame URI");
+        assert_eq!(
+            before_items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Failed)
+                .count(),
+            1
+        );
+
+        let resume_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            resume_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("same projection should resume the failed refill");
+
+        assert!(summary.resumed);
+        assert_eq!(summary.legacy_retryable_jobs_requeued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(summary.capsule_files_deleted, 0);
+        assert_eq!(summary.capsule_rows_deleted, 0);
+        assert_eq!(summary.item_rows_deleted, 0);
+        assert_eq!(summary.index_jobs_deleted, 0);
+        assert_eq!(resume_provider.calls(), 1);
+
+        let retained_item = crud_store
+            .find_thread_episodic_item(retained_item_id.as_str())
+            .await
+            .expect("retained item lookup should succeed")
+            .expect("retained item should still exist");
+        assert_eq!(
+            retained_item.frame_uri.as_deref(),
+            Some(retained_frame_uri.as_str())
+        );
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list after resume");
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ThreadEpisodicIndexJobStatus::Completed)
+        );
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target
+            )
+            .await
+            .expect("resumed marker should be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_restart_finalizes_completed_projection_without_rebuild()
+    {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_completed_before_marker";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_completed_before_marker",
+            "item_vector_refill_completed_before_marker",
+            "completed vector data must survive a final marker failure",
+        )
+        .await;
+        let initial_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            initial_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            initial_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("initial refill should complete");
+        assert_eq!(initial_provider.calls(), 1);
+        let before_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("item should list before marker failure")
+            .into_iter()
+            .next()
+            .expect("indexed item should exist");
+        let before_frame_uri = before_item
+            .frame_uri
+            .clone()
+            .expect("indexed item should have a frame URI");
+
+        let projection_key = refill_projection_key_for_workspace(workspace_id.as_str())
+            .expect("workspace refill key should build");
+        assert!(
+            update_projection_meta_status(
+                &crud_store.database_connection(),
+                projection_key.as_str(),
+                PROJECTION_META_STATUS_FAILED,
+                Some("simulated final marker failure"),
+                now_datetime(),
+            )
+            .await
+            .expect("marker status should update")
+        );
+
+        let resume_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            resume_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("completed projection should finalize without rebuilding");
+
+        assert!(summary.resumed);
+        assert_eq!(summary.completed_jobs, 0);
+        assert_eq!(summary.source_turn_item_count, 1);
+        assert_eq!(summary.capsule_files_deleted, 0);
+        assert_eq!(summary.capsule_rows_deleted, 0);
+        assert_eq!(summary.item_rows_deleted, 0);
+        assert_eq!(summary.index_jobs_deleted, 0);
+        assert_eq!(resume_provider.calls(), 0);
+        let after_item = crud_store
+            .find_thread_episodic_item(before_item.id.as_str())
+            .await
+            .expect("retained item lookup should succeed")
+            .expect("retained item should still exist");
+        assert_eq!(
+            after_item.frame_uri.as_deref(),
+            Some(before_frame_uri.as_str())
+        );
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("finalized marker should be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_restart_requeues_interrupted_running_job() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_interrupted";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_interrupted",
+            "item_vector_refill_interrupted",
+            "an interrupted refill job should resume after gateway restart",
+        )
+        .await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_BACKFILLING,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &target,
+        )
+        .await;
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                chrono::Utc::now().timestamp().saturating_add(1),
+                1,
+            )
+            .await
+            .expect("job should be claimed before simulated restart");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, ThreadEpisodicIndexJobStatus::Running);
+
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            embedding_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("interrupted running job should resume");
+
+        assert!(summary.resumed);
+        assert_eq!(summary.interrupted_jobs_requeued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(summary.item_rows_deleted, 0);
+        assert_eq!(embedding_provider.calls(), 1);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list after interrupted refill resumes");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+        assert_eq!(jobs[0].attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_does_not_requeue_current_process_running_job() {
+        let (crud_store, _temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_current_process";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_current_process",
+            "item_vector_refill_current_process",
+            "a current process job must keep its execution lease",
+        )
+        .await;
+        let startup_cutoff = chrono::Utc::now().timestamp();
+        let claimed_at = startup_cutoff.saturating_add(1);
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                claimed_at,
+                1,
+            )
+            .await
+            .expect("current process job should be claimed");
+        assert_eq!(claimed.len(), 1);
+
+        let summary = prepare_resumed_refill(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            None,
+            immediate_retry_config(5),
+            Some(startup_cutoff),
+        )
+        .await
+        .expect("resume preparation should preserve a current process lease");
+
+        assert_eq!(summary.interrupted_jobs_requeued, 0);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list after resume preparation");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(jobs[0].attempt_count, 1);
     }
 
     #[tokio::test]

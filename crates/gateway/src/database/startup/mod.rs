@@ -130,6 +130,7 @@ pub(crate) fn spawn(
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
 ) {
+    let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
         task_anchor_backfill::run(crud_store.as_ref()).await;
         turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
@@ -147,6 +148,7 @@ pub(crate) fn spawn(
             runtime_home,
             refill_status_sender,
             refill_supervisor,
+            Some(interrupted_before_unix),
         )
         .await;
     });
@@ -175,6 +177,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
             runtime_home,
             refill_status_sender,
             refill_supervisor,
+            None,
         )
         .await;
     });
@@ -227,6 +230,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
+    interrupted_before_unix: Option<i64>,
 ) {
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
@@ -237,6 +241,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
         runtime_home,
         refill_status_sender,
         refill_supervisor,
+        interrupted_before_unix,
     )
     .await;
 }
@@ -266,6 +271,7 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
         provider_registry,
         runtime_home,
         refill_status_sender,
+        None,
         cancellation,
     )
     .await;

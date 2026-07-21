@@ -488,10 +488,11 @@ pub async fn count_refill_sources<C: ConnectionTrait>(
             thread_episodic_items::Column::TurnId,
             thread_episodic_items::Column::ItemId,
         ])
-        .filter(
-            thread_episodic_items::Column::Status
-                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
-        )
+        .filter(thread_episodic_items::Column::Status.is_in([
+            item_status_to_db(ThreadEpisodicItemStatus::PendingIndex).to_owned(),
+            item_status_to_db(ThreadEpisodicItemStatus::Active).to_owned(),
+            item_status_to_db(ThreadEpisodicItemStatus::Failed).to_owned(),
+        ]))
         .filter(thread_episodic_items::Column::DeletedAt.is_null())
         .filter(
             thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
@@ -529,10 +530,11 @@ pub async fn count_refill_sources_for_workspace<C: ConnectionTrait>(
             thread_episodic_items::Column::ItemId,
         ])
         .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(
-            thread_episodic_items::Column::Status
-                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
-        )
+        .filter(thread_episodic_items::Column::Status.is_in([
+            item_status_to_db(ThreadEpisodicItemStatus::PendingIndex).to_owned(),
+            item_status_to_db(ThreadEpisodicItemStatus::Active).to_owned(),
+            item_status_to_db(ThreadEpisodicItemStatus::Failed).to_owned(),
+        ]))
         .filter(thread_episodic_items::Column::DeletedAt.is_null())
         .filter(
             thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
@@ -661,6 +663,26 @@ pub async fn count_incomplete_index_jobs_for_workspace<C: ConnectionTrait>(
         .with_context(|| {
             format!(
                 "failed to count incomplete thread episodic index jobs for workspace `{workspace_id}`"
+            )
+        })
+}
+
+pub async fn count_canceled_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_index_jobs::Column::Status.eq(index_job_status_to_db(
+                ThreadEpisodicIndexJobStatus::Canceled,
+            )),
+        )
+        .count(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to count canceled thread episodic index jobs for workspace `{workspace_id}`"
             )
         })
 }
@@ -1166,6 +1188,50 @@ pub async fn list_due_index_jobs_for_workspace<C: ConnectionTrait>(
         })
 }
 
+pub async fn find_next_scheduled_index_job_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Option<thread_episodic_index_jobs::Model>> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_index_jobs::Column::Status.is_in([
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Queued).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Failed).to_owned(),
+        ]))
+        .order_by_asc(thread_episodic_index_jobs::Column::NextRunAt)
+        .order_by_asc(thread_episodic_index_jobs::Column::CreatedAt)
+        .one(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to find next scheduled thread episodic index job for workspace `{workspace_id}`"
+            )
+        })
+}
+
+pub async fn list_canceled_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    limit: u64,
+) -> Result<Vec<thread_episodic_index_jobs::Model>> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_index_jobs::Column::Status.eq(index_job_status_to_db(
+                ThreadEpisodicIndexJobStatus::Canceled,
+            )),
+        )
+        .order_by_asc(thread_episodic_index_jobs::Column::UpdatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to list canceled thread episodic index jobs for workspace `{workspace_id}`"
+            )
+        })
+}
+
 pub async fn mark_index_job_running<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
@@ -1284,6 +1350,68 @@ pub async fn retry_failed_or_stale_index_job<C: ConnectionTrait>(
         .await
         .with_context(|| format!("failed to retry thread episodic index job `{job_id}`"))?;
     Ok(Some(row))
+}
+
+pub async fn requeue_canceled_index_job<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<thread_episodic_index_jobs::Model>> {
+    let Some(row) = find_index_job_by_id(db, job_id).await? else {
+        return Ok(None);
+    };
+    if index_job_status_from_db(row.status.as_str())? != ThreadEpisodicIndexJobStatus::Canceled {
+        return Ok(None);
+    }
+
+    let mut active = row.into_active_model();
+    active.status = Set(index_job_status_to_db(ThreadEpisodicIndexJobStatus::Failed).to_owned());
+    active.next_run_at = Set(now);
+    active.updated_at = Set(now);
+    active.completed_at = Set(None);
+    let row = active.update(db).await.with_context(|| {
+        format!("failed to requeue canceled thread episodic index job `{job_id}`")
+    })?;
+    Ok(Some(row))
+}
+
+pub async fn requeue_running_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    interrupted_before: DateTimeWithTimeZone,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let result = thread_episodic_index_jobs::Entity::update_many()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_index_jobs::Column::Status
+                .eq(index_job_status_to_db(ThreadEpisodicIndexJobStatus::Running)),
+        )
+        .filter(thread_episodic_index_jobs::Column::UpdatedAt.lte(interrupted_before))
+        .col_expr(
+            thread_episodic_index_jobs::Column::Status,
+            Expr::value(index_job_status_to_db(ThreadEpisodicIndexJobStatus::Queued).to_owned()),
+        )
+        .col_expr(
+            thread_episodic_index_jobs::Column::NextRunAt,
+            Expr::value(now),
+        )
+        .col_expr(
+            thread_episodic_index_jobs::Column::UpdatedAt,
+            Expr::value(now),
+        )
+        .col_expr(
+            thread_episodic_index_jobs::Column::CompletedAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to requeue interrupted thread episodic index jobs for workspace `{workspace_id}`"
+            )
+        })?;
+    Ok(result.rows_affected)
 }
 
 pub async fn mark_index_job_canceled<C: ConnectionTrait>(

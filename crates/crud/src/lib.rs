@@ -5137,6 +5137,47 @@ impl CrudStore {
         .await
     }
 
+    pub async fn count_canceled_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        thread_episodic_repository::count_canceled_index_jobs_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn list_canceled_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::list_canceled_index_jobs_for_workspace(
+            &self.connection,
+            workspace_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect()
+    }
+
+    pub async fn next_scheduled_thread_episodic_index_job_at_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(
+            thread_episodic_repository::find_next_scheduled_index_job_for_workspace(
+                &self.connection,
+                workspace_id,
+            )
+            .await?
+            .map(|row| row.next_run_at.timestamp()),
+        )
+    }
+
     pub async fn insert_thread_episodic_index_job_if_absent(
         &self,
         job: NewThreadEpisodicIndexJobRecord,
@@ -5213,6 +5254,48 @@ impl CrudStore {
                 .await?
                 .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
                 .transpose()
+            }
+        })
+        .await
+    }
+
+    pub async fn requeue_canceled_thread_episodic_index_job(
+        &self,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            async move {
+                thread_episodic_repository::requeue_canceled_index_job(
+                    &self.connection,
+                    job_id.as_str(),
+                    unix_to_datetime(now_unix),
+                )
+                .await?
+                .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+                .transpose()
+            }
+        })
+        .await
+    }
+
+    pub async fn requeue_running_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+        interrupted_before_unix: i64,
+        now_unix: i64,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::requeue_running_index_jobs_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                    unix_to_datetime(interrupted_before_unix),
+                    unix_to_datetime(now_unix),
+                )
+                .await
             }
         })
         .await
