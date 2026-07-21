@@ -1466,7 +1466,7 @@ impl JsonSurface {
             )),
             Self::TurnEvent => Some((
                 "turn_event",
-                "source.event_type IN ('item_started', 'item_completed', 'item_updated')",
+                "source.event_type IN ('item/started', 'item/completed', 'item/updated')",
                 "$.payload.item.attachments",
                 PayloadKind::TurnEvent,
             )),
@@ -1892,7 +1892,7 @@ mod tests {
             (
                 "EEEEEEEEEEEEEEEEEEEEE",
                 1_i64,
-                "item_started",
+                "item/started",
                 legacy_event.as_str(),
             ),
             (
