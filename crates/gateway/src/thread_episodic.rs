@@ -365,6 +365,14 @@ pub(crate) struct ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
     runtime_home: PathBuf,
     config: StdRwLock<GatewayThreadEpisodicVectorSearchConfig>,
     workspace_configs: StdRwLock<BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>>,
+    openrouter_model_cache: StdRwLock<BTreeMap<String, CachedOpenRouterEmbeddingModel>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedOpenRouterEmbeddingModel {
+    config: GatewayThreadEpisodicVectorSearchConfig,
+    dimension: usize,
+    max_input_tokens: usize,
 }
 
 impl StoreThreadEpisodicIndexPayloadProvider {
@@ -474,12 +482,16 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
             runtime_home,
             config: StdRwLock::new(config),
             workspace_configs: StdRwLock::new(BTreeMap::new()),
+            openrouter_model_cache: StdRwLock::new(BTreeMap::new()),
         }
     }
 
     pub(crate) fn apply_config(&self, config: GatewayThreadEpisodicVectorSearchConfig) {
         if let Ok(mut current) = self.config.write() {
             *current = config;
+        }
+        if let Ok(mut cache) = self.openrouter_model_cache.write() {
+            cache.clear();
         }
     }
 
@@ -489,6 +501,9 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
     ) {
         if let Ok(mut current) = self.workspace_configs.write() {
             *current = configs;
+        }
+        if let Ok(mut cache) = self.openrouter_model_cache.write() {
+            cache.clear();
         }
     }
 
@@ -510,7 +525,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
             .unwrap_or_else(|| self.config_snapshot())
     }
 
-    fn resolve_configured_provider(
+    async fn resolve_configured_provider(
         &self,
         workspace_id: &str,
         config: &GatewayThreadEpisodicVectorSearchConfig,
@@ -566,14 +581,57 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                             ),
                         )
                     })?;
-                let provider = RemoteEmbeddingProvider::openrouter(
+                let cached = self
+                    .openrouter_model_cache
+                    .read()
+                    .ok()
+                    .and_then(|cache| cache.get(workspace_id).cloned())
+                    .filter(|cached| cached.config == *config);
+                let (explicit_dimension, explicit_max_input_tokens) = cached
+                    .as_ref()
+                    .map(|cached| (Some(cached.dimension), Some(cached.max_input_tokens)))
+                    .unwrap_or((None, None));
+                let catalog_max_input_tokens = if explicit_max_input_tokens.is_none() {
+                    match api_provider.list_embedding_models().await {
+                        Ok(models) => models
+                            .into_iter()
+                            .find(|candidate| candidate.id == model)
+                            .and_then(|candidate| candidate.limits.max_input_tokens)
+                            .and_then(|limit| usize::try_from(limit).ok()),
+                        Err(error) => {
+                            tracing::warn!(
+                                workspace_id,
+                                model,
+                                error = %format!("{error:#}"),
+                                "failed to resolve OpenRouter embedding input limit; using conservative fallback"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let provider = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
                     model,
-                    None,
+                    explicit_dimension,
+                    explicit_max_input_tokens.or(catalog_max_input_tokens),
                     config.embedding_normalized,
                     config.use_search_instructions,
                     api_provider,
                 )
                 .map_err(embedding_resolution_error)?;
+                if cached.is_none() {
+                    if let Ok(mut cache) = self.openrouter_model_cache.write() {
+                        cache.insert(
+                            workspace_id.to_owned(),
+                            CachedOpenRouterEmbeddingModel {
+                                config: config.clone(),
+                                dimension: provider.dimension(),
+                                max_input_tokens: provider.max_input_tokens(),
+                            },
+                        );
+                    }
+                }
                 Ok(Arc::new(provider))
             }
             Some(GatewayThreadEpisodicVectorProviderConfig::Local) => {
@@ -628,6 +686,7 @@ impl ThreadEpisodicIndexEmbeddingProviderResolver
             return Ok(None);
         }
         self.resolve_configured_provider(workspace_id, &config)
+            .await
             .map(Some)
     }
 
@@ -4098,6 +4157,93 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
+    struct CatalogEmbeddingProvider {
+        list_calls: AtomicUsize,
+        embed_calls: AtomicUsize,
+    }
+
+    impl CatalogEmbeddingProvider {
+        fn new() -> Self {
+            Self {
+                list_calls: AtomicUsize::new(0),
+                embed_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl pioneer_provider::Provider for CatalogEmbeddingProvider {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: false,
+                vision: false,
+                tool_calling: false,
+                embeddings: true,
+                transcription: false,
+                input_types:
+                    pioneer_provider::ProviderInputCapabilities::disabled_for_all_file_types(),
+            }
+        }
+
+        async fn chat(
+            &self,
+            _request: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("catalog embedding provider does not support chat")
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<pioneer_provider::StreamChunk>>,
+        > {
+            anyhow::bail!("catalog embedding provider does not support streaming")
+        }
+
+        async fn list_embedding_models(
+            &self,
+        ) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![pioneer_protocol::ProviderModelInfo {
+                id: "vendor/custom-embed".to_owned(),
+                name: Some("Custom Embed".to_owned()),
+                description: None,
+                created: None,
+                provider: "openrouter".to_owned(),
+                owned_by: Some("vendor".to_owned()),
+                limits: pioneer_protocol::ProviderModelLimits {
+                    max_input_tokens: Some(32_768),
+                    max_output_tokens: None,
+                    context_window: Some(32_768),
+                },
+                capabilities: pioneer_protocol::ProviderModelCapabilities {
+                    embeddings: Some(true),
+                    ..Default::default()
+                },
+                transcription: None,
+                pricing: None,
+                active: Some(true),
+                family: Some("embedding".to_owned()),
+                lifecycle_status: None,
+            }])
+        }
+
+        async fn embed(
+            &self,
+            request: pioneer_provider::EmbeddingRequest,
+        ) -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(pioneer_provider::EmbeddingResponse {
+                embeddings: vec![vec![0.5; 4]; request.input.len()],
+            })
+        }
+    }
+
     struct FakeThreadEpisodicMemvidBackend {
         capabilities: ThreadEpisodicMemvidBackendCapabilities,
         outcomes: Mutex<
@@ -6290,6 +6436,44 @@ mod tests {
                 segment_index: self.segment_index,
             })
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_backed_openrouter_resolver_caches_model_metadata_between_jobs() {
+        let provider = Arc::new(CatalogEmbeddingProvider::new());
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "openrouter",
+            provider.clone(),
+        ));
+        let runtime_home = tempfile::tempdir().expect("runtime home");
+        let resolver = ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
+            registry,
+            runtime_home.path().to_path_buf(),
+            GatewayThreadEpisodicVectorSearchConfig {
+                enabled: true,
+                provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+                model: Some("vendor/custom-embed".to_owned()),
+                local_model: None,
+                embedding_normalized: true,
+                use_search_instructions: false,
+            },
+        );
+
+        let first = resolver
+            .resolve_active_embedding_provider("workspace_cache")
+            .await
+            .expect("first provider resolution should succeed")
+            .expect("provider should be configured");
+        let second = resolver
+            .resolve_active_embedding_provider("workspace_cache")
+            .await
+            .expect("second provider resolution should succeed")
+            .expect("provider should remain configured");
+
+        assert_eq!(first.dimension(), 4);
+        assert_eq!(second.dimension(), 4);
+        assert_eq!(provider.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.embed_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

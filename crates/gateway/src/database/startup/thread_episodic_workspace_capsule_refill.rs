@@ -7,7 +7,9 @@ use crate::thread_episodic::{
     ThreadEpisodicResolvedIndexRequest, ThreadEpisodicThreadReindexRequest,
     memvid_stats_reach_capacity_threshold,
 };
-use crate::thread_episodic_embedding::provider_embedding_error_message_is_retryable;
+use crate::thread_episodic_embedding::{
+    CHUNKED_EMBEDDING_INPUT_ERROR_MARKER, provider_embedding_error_message_is_retryable,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use fs4::{FileExt as Fs4FileExt, TryLockError as Fs4TryLockError};
 use pioneer_config::{
@@ -1259,11 +1261,13 @@ async fn recover_misclassified_retryable_jobs(
         .context("failed to list canceled thread episodic refill jobs")?;
     let mut recovered = 0usize;
     for job in jobs {
-        let retryable = job.attempt_count < config.max_attempts
-            && job
-                .last_error
-                .as_deref()
-                .is_some_and(provider_embedding_error_message_is_retryable);
+        let last_error = job.last_error.as_deref().unwrap_or_default();
+        let exhausted_before_bounded_input_support = job.attempt_count == config.max_attempts
+            && last_error.contains("missing field `data`")
+            && !last_error.contains(CHUNKED_EMBEDDING_INPUT_ERROR_MARKER);
+        let retryable = (job.attempt_count < config.max_attempts
+            || exhausted_before_bounded_input_support)
+            && provider_embedding_error_message_is_retryable(last_error);
         if !retryable {
             continue;
         }
@@ -3321,6 +3325,124 @@ mod tests {
             .await
             .expect("resumed marker should be current")
         );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_recovers_exhausted_pre_chunking_response_failure_once() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_vector_refill_pre_chunking",
+            "turn_vector_refill_pre_chunking",
+            "item_vector_refill_pre_chunking",
+            "oversized source retained in full while its bounded embedding is retried",
+        )
+        .await;
+        let legacy_provider = Arc::new(ScriptedThreadEpisodicEmbeddingProvider::new(vec![Err(
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                "openrouter",
+                "qwen/qwen3-embedding-8b",
+                "error decoding response body: missing field `data`",
+            ),
+        )]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            legacy_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            legacy_provider,
+            immediate_retry_config(1),
+        )
+        .await
+        .expect_err("pre-chunking response failure should exhaust the old retry budget");
+
+        let resume_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            resume_provider.clone(),
+            immediate_retry_config(1),
+        )
+        .await
+        .expect("bounded-input release should get one recovery attempt");
+
+        assert!(summary.resumed);
+        assert_eq!(summary.legacy_retryable_jobs_requeued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(resume_provider.calls(), 1);
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target
+            )
+            .await
+            .expect("recovered marker should be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_does_not_reopen_exhausted_chunked_failure() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_vector_refill_chunked_terminal",
+            "turn_vector_refill_chunked_terminal",
+            "item_vector_refill_chunked_terminal",
+            "bounded input still receives a terminal retry budget",
+        )
+        .await;
+        let failed_provider = Arc::new(ScriptedThreadEpisodicEmbeddingProvider::new(vec![Err(
+            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                "openrouter",
+                "qwen/qwen3-embedding-8b",
+                format!(
+                    "{CHUNKED_EMBEDDING_INPUT_ERROR_MARKER}: error decoding response body: missing field `data`"
+                ),
+            ),
+        )]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            failed_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            failed_provider,
+            immediate_retry_config(1),
+        )
+        .await
+        .expect_err("chunked provider failure should exhaust its retry budget");
+
+        let next_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        refill_once_with_test_executor_config(
+            crud_store,
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            next_provider.clone(),
+            immediate_retry_config(1),
+        )
+        .await
+        .expect_err("restart must not reset a chunked failure's bounded retry budget");
+
+        assert_eq!(next_provider.calls(), 0);
     }
 
     #[tokio::test]
