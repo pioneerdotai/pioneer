@@ -9,6 +9,7 @@ impl PioneerDesktop {
         ComposerDomainState {
             attachments: self.composer_attachments.clone(),
             capabilities: self.composer_capabilities.clone(),
+            skill_selections: self.composer_skill_selections.clone(),
             selected_mode: self.composer_turn_mode,
             mode_manually_selected: self.composer_mode_manually_selected,
             selected_provider: self.composer_selected_provider.clone(),
@@ -23,6 +24,7 @@ impl PioneerDesktop {
     pub(in crate::app) fn apply_composer_domain_state(&mut self, state: ComposerDomainState) {
         self.composer_attachments = state.attachments;
         self.composer_capabilities = state.capabilities;
+        self.composer_skill_selections = state.skill_selections;
         self.composer_turn_mode = state.selected_mode;
         self.composer_mode_manually_selected = state.mode_manually_selected;
         self.composer_selected_provider = state.selected_provider;

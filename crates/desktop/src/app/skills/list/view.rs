@@ -1,25 +1,168 @@
-use crate::{app::root::PioneerDesktop, assets::PioneerIconName};
+use crate::{
+    app::root::{GatewayConnectionState, PioneerDesktop},
+    assets::PioneerIconName,
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::{Button, ButtonVariants},
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     scroll::Scrollbar,
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::skills::{presentation as skill_presentation, upload as skill_upload};
-use pioneer_protocol::SkillListItem;
+use pioneer_client::skills::{
+    catalog::SkillManagementProjection, presentation as skill_presentation, upload as skill_upload,
+};
+#[cfg(test)]
+use pioneer_protocol::SkillId;
+use pioneer_protocol::{SkillListItem, SkillPackId, SkillPackInstallationItem};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 const INSTALLED_SKILL_CARD_HEIGHT: f32 = 112.0;
 const INSTALLED_SKILL_ROW_GAP: f32 = 10.0;
 const INSTALLED_SKILL_ROW_HEIGHT: f32 = INSTALLED_SKILL_CARD_HEIGHT + INSTALLED_SKILL_ROW_GAP;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DesktopSkillManagementRow {
+    Standalone(SkillListItem),
+    Pack {
+        pack: SkillPackInstallationItem,
+        child_count: usize,
+        expanded: bool,
+    },
+    PackChild(SkillListItem),
+}
+
+impl DesktopSkillManagementRow {
+    #[cfg(test)]
+    fn navigation_target(&self) -> Option<&SkillId> {
+        match self {
+            Self::Standalone(skill) | Self::PackChild(skill) => Some(&skill.skill_id),
+            Self::Pack { .. } => None,
+        }
+    }
+}
+
+fn project_desktop_skill_management_rows(
+    management: &SkillManagementProjection,
+    expanded_pack_ids: &HashSet<SkillPackId>,
+) -> Vec<DesktopSkillManagementRow> {
+    let mut rows = management
+        .standalone
+        .iter()
+        .cloned()
+        .map(DesktopSkillManagementRow::Standalone)
+        .collect::<Vec<_>>();
+
+    for pack_row in &management.packs {
+        let expanded = expanded_pack_ids.contains(&pack_row.pack.id);
+        rows.push(DesktopSkillManagementRow::Pack {
+            pack: pack_row.pack.clone(),
+            child_count: pack_row.children.len(),
+            expanded,
+        });
+        if expanded {
+            rows.extend(
+                pack_row
+                    .children
+                    .iter()
+                    .cloned()
+                    .map(DesktopSkillManagementRow::PackChild),
+            );
+        }
+    }
+    rows
+}
+
+fn skill_pack_context_actions_enabled(is_connected: bool, is_pending: bool) -> bool {
+    is_connected && !is_pending
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillCountForm {
+    One,
+    Few,
+    Many,
+}
+
+fn skill_count_form(count: usize, is_russian: bool) -> SkillCountForm {
+    if !is_russian {
+        return if count == 1 {
+            SkillCountForm::One
+        } else {
+            SkillCountForm::Many
+        };
+    }
+
+    let last_two_digits = count % 100;
+    if (11..=14).contains(&last_two_digits) {
+        return SkillCountForm::Many;
+    }
+
+    match count % 10 {
+        1 => SkillCountForm::One,
+        2..=4 => SkillCountForm::Few,
+        _ => SkillCountForm::Many,
+    }
+}
+
+fn skill_count_label(count: usize) -> String {
+    let locale = rust_i18n::locale();
+    match skill_count_form(count, &*locale == "ru") {
+        SkillCountForm::One => t!("skills.card.skill_count_one", count = count).to_string(),
+        SkillCountForm::Few => t!("skills.card.skill_count_few", count = count).to_string(),
+        SkillCountForm::Many => t!("skills.card.skill_count_many", count = count).to_string(),
+    }
+}
+
+fn skill_pack_context_menu(
+    menu: PopupMenu,
+    pack_id: SkillPackId,
+    pack_name: String,
+    actions_enabled: bool,
+    desktop_entity: Entity<PioneerDesktop>,
+) -> PopupMenu {
+    let update_pack_id = pack_id.clone();
+    let update_desktop_entity = desktop_entity.clone();
+    menu.item(
+        PopupMenuItem::new(t!("skills.button.update").to_string())
+            .disabled(!actions_enabled)
+            .on_click(move |_, window, cx| {
+                let _ = update_desktop_entity.update(cx, |view, cx| {
+                    view.open_skill_pack_update_dialog(update_pack_id.clone(), window, cx);
+                    cx.notify();
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new(t!("skills.button.uninstall").to_string())
+            .disabled(!actions_enabled)
+            .on_click(move |_, window, cx| {
+                let _ = desktop_entity.update(cx, |view, cx| {
+                    view.confirm_uninstall_skill_pack(
+                        pack_id.clone(),
+                        pack_name.clone(),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                });
+            }),
+    )
+}
+
 impl PioneerDesktop {
     pub(crate) fn render_skills(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let skills_error = self.skills_error.clone();
         let skills_upload_progress = self.skills_upload_progress.clone();
-        let installed_skills = Rc::new(self.installed_skills.clone());
+        let management_rows = Rc::new(project_desktop_skill_management_rows(
+            &self.skills_management,
+            &self.skills_expanded_pack_ids,
+        ));
+        let installed_count =
+            self.skills_management.standalone.len() + self.skills_management.packs.len();
 
         v_flex()
             .size_full()
@@ -51,7 +194,7 @@ impl PioneerDesktop {
                         div().text_xs().opacity(0.6).child(format!(
                             "{} {}",
                             t!("skills.screen.installed_count"),
-                            installed_skills.len()
+                            installed_count
                         )),
                     )),
             )
@@ -157,7 +300,7 @@ impl PioneerDesktop {
                                         ),
                                 )
                             })
-                            .when(installed_skills.is_empty(), |this| {
+                            .when(management_rows.is_empty(), |this| {
                                 this.child(
                                     v_flex()
                                         .w_full()
@@ -216,9 +359,9 @@ impl PioneerDesktop {
                                         ),
                                 )
                             })
-                            .when(!installed_skills.is_empty(), |this| {
-                                this.child(self.render_installed_skills_virtual_list(
-                                    installed_skills.clone(),
+                            .when(!management_rows.is_empty(), |this| {
+                                this.child(self.render_skill_management_virtual_list(
+                                    management_rows.clone(),
                                     desktop_entity.clone(),
                                     cx,
                                 ))
@@ -228,14 +371,14 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn render_installed_skills_virtual_list(
+    fn render_skill_management_virtual_list(
         &self,
-        installed_skills: Rc<Vec<SkillListItem>>,
+        rows: Rc<Vec<DesktopSkillManagementRow>>,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item_sizes = Rc::new(
-            (0..installed_skills.len())
+            (0..rows.len())
                 .map(|_| size(px(0.), px(INSTALLED_SKILL_ROW_HEIGHT)))
                 .collect::<Vec<_>>(),
         );
@@ -254,15 +397,37 @@ impl PioneerDesktop {
                     move |view, visible_range, _, cx| {
                         visible_range
                             .filter_map(|ix| {
-                                installed_skills.get(ix).map(|skill| {
-                                    let is_pending = view.is_skill_pending(&skill.skill_id);
-
-                                    Self::render_installed_skill_row(
-                                        skill,
-                                        is_pending,
+                                rows.get(ix).map(|row| match row {
+                                    DesktopSkillManagementRow::Standalone(skill) => {
+                                        Self::render_installed_skill_row(
+                                            skill,
+                                            view.is_skill_pending(&skill.skill_id),
+                                            desktop_entity.clone(),
+                                            cx,
+                                        )
+                                    }
+                                    DesktopSkillManagementRow::Pack {
+                                        pack,
+                                        child_count,
+                                        expanded,
+                                    } => Self::render_installed_skill_pack_row(
+                                        pack,
+                                        *child_count,
+                                        *expanded,
+                                        view.gateway.connection_state
+                                            == GatewayConnectionState::Connected,
+                                        view.is_skill_pack_pending(&pack.id),
                                         desktop_entity.clone(),
                                         cx,
-                                    )
+                                    ),
+                                    DesktopSkillManagementRow::PackChild(skill) => {
+                                        Self::render_installed_skill_row(
+                                            skill,
+                                            view.is_skill_pending(&skill.skill_id),
+                                            desktop_entity.clone(),
+                                            cx,
+                                        )
+                                    }
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -443,6 +608,96 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    fn render_installed_skill_pack_row(
+        pack: &SkillPackInstallationItem,
+        child_count: usize,
+        expanded: bool,
+        is_connected: bool,
+        is_pending: bool,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pack_id = pack.id.clone();
+        let context_pack_id = pack.id.clone();
+        let context_pack_name = pack.name.clone();
+        let context_desktop_entity = desktop_entity.clone();
+        let context_actions_enabled = skill_pack_context_actions_enabled(is_connected, is_pending);
+        h_flex()
+            .id(SharedString::from(format!(
+                "installed-skill-pack-row:{}",
+                pack.id
+            )))
+            .w_full()
+            .h(px(INSTALLED_SKILL_ROW_HEIGHT))
+            .pb(px(INSTALLED_SKILL_ROW_GAP))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                let _ = desktop_entity.update(cx, |view, cx| {
+                    view.toggle_skill_pack_expanded(pack_id.clone(), cx);
+                });
+            })
+            .context_menu(move |menu, _, _| {
+                skill_pack_context_menu(
+                    menu,
+                    context_pack_id.clone(),
+                    context_pack_name.clone(),
+                    context_actions_enabled,
+                    context_desktop_entity.clone(),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(INSTALLED_SKILL_CARD_HEIGHT))
+                    .pt_3()
+                    .px_4()
+                    .pb_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .hover(|this| this.bg(cx.theme().secondary.opacity(0.45)))
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .h_full()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(Icon::new(IconName::Folder).size_3p5())
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(pack.name.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(skill_count_label(child_count)),
+                            ),
+                    )
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size_4(),
+                    ),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn source_label(source_kind: &skill_presentation::SkillSourceKind) -> String {
         match source_kind {
             skill_presentation::SkillSourceKind::System => t!("skills.source.system").to_string(),
@@ -491,5 +746,148 @@ impl PioneerDesktop {
             skill_presentation::SkillDiagnosticsTone::Warning => cx.theme().warning,
             _ => cx.theme().foreground.opacity(1.),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DesktopSkillManagementRow, project_desktop_skill_management_rows,
+        skill_pack_context_actions_enabled,
+    };
+    use pioneer_client::skills::catalog::{SkillManagementProjection, SkillPackManagementRow};
+    use pioneer_protocol::{
+        SkillHealthSummary, SkillId, SkillInstallState, SkillListItem, SkillPackId,
+        SkillPackInstallationItem, SkillPackMembership, SkillPolicyState,
+    };
+    use std::collections::HashSet;
+
+    fn skill_id(character: char) -> SkillId {
+        SkillId::new(character.to_string().repeat(21)).expect("skill id")
+    }
+
+    fn pack_id(character: char) -> SkillPackId {
+        SkillPackId::new(character.to_string().repeat(21)).expect("pack id")
+    }
+
+    fn skill(character: char, pack_id: Option<SkillPackId>) -> SkillListItem {
+        SkillListItem {
+            skill_id: skill_id(character),
+            pack: pack_id.map(|pack_id| SkillPackMembership {
+                pack_id,
+                member_key: "member".to_owned(),
+            }),
+            owner: None,
+            slug: character.to_string(),
+            source_kind: "user".to_owned(),
+            display_name: character.to_string(),
+            description: String::new(),
+            version: None,
+            fingerprint: "fingerprint".to_owned(),
+            trust_level: "community".to_owned(),
+            install: SkillInstallState {
+                managed: true,
+                installed: true,
+                lifecycle_editable: true,
+                install_path: None,
+                updated_at: None,
+            },
+            policy: SkillPolicyState {
+                enabled: true,
+                allow_implicit_invocation: true,
+                allow_implicit_invocation_editable: true,
+            },
+            health: SkillHealthSummary {
+                status: "ok".to_owned(),
+                dependency_failures: Vec::new(),
+                security_blocks: Vec::new(),
+                validation_issues: Vec::new(),
+            },
+            status: "active".to_owned(),
+            status_reason: None,
+        }
+    }
+
+    fn pack(id: SkillPackId, name: &str) -> SkillPackInstallationItem {
+        SkillPackInstallationItem {
+            id,
+            name: name.to_owned(),
+            source_kind: "user".to_owned(),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn management_rows_keep_packs_collapsed_and_non_navigating_by_default() {
+        let populated_id = pack_id('P');
+        let empty_id = pack_id('E');
+        let management = SkillManagementProjection {
+            standalone: vec![skill('S', None)],
+            packs: vec![
+                SkillPackManagementRow {
+                    pack: pack(populated_id.clone(), "Pack"),
+                    children: vec![skill('C', Some(populated_id))],
+                    attachable: true,
+                },
+                SkillPackManagementRow {
+                    pack: pack(empty_id, "Empty"),
+                    children: Vec::new(),
+                    attachable: false,
+                },
+            ],
+        };
+
+        let rows = project_desktop_skill_management_rows(&management, &HashSet::new());
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].navigation_target().is_some());
+        assert!(rows[1].navigation_target().is_none());
+        assert!(rows[2].navigation_target().is_none());
+        assert!(matches!(
+            rows[2],
+            DesktopSkillManagementRow::Pack { child_count: 0, .. }
+        ));
+    }
+
+    #[::core::prelude::v1::test]
+    fn expanding_parent_inserts_navigable_children_inline() {
+        let populated_id = pack_id('P');
+        let child = skill('C', Some(populated_id.clone()));
+        let management = SkillManagementProjection {
+            standalone: Vec::new(),
+            packs: vec![SkillPackManagementRow {
+                pack: pack(populated_id.clone(), "Pack"),
+                children: vec![child.clone()],
+                attachable: true,
+            }],
+        };
+        let rows =
+            project_desktop_skill_management_rows(&management, &HashSet::from([populated_id]));
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].navigation_target().is_none());
+        assert_eq!(rows[1].navigation_target(), Some(&child.skill_id));
+        assert!(matches!(rows[1], DesktopSkillManagementRow::PackChild(_)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn pack_context_actions_require_connection_and_no_pending_operation() {
+        assert!(skill_pack_context_actions_enabled(true, false));
+        assert!(!skill_pack_context_actions_enabled(false, false));
+        assert!(!skill_pack_context_actions_enabled(true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn pack_skill_count_uses_russian_plural_forms() {
+        assert_eq!(skill_count_form(1, true), SkillCountForm::One);
+        assert_eq!(skill_count_form(2, true), SkillCountForm::Few);
+        assert_eq!(skill_count_form(5, true), SkillCountForm::Many);
+        assert_eq!(skill_count_form(10, true), SkillCountForm::Many);
+        assert_eq!(skill_count_form(11, true), SkillCountForm::Many);
+        assert_eq!(skill_count_form(15, true), SkillCountForm::Many);
+        assert_eq!(skill_count_form(21, true), SkillCountForm::One);
+        assert_eq!(skill_count_form(22, true), SkillCountForm::Few);
+        assert_eq!(skill_count_form(25, true), SkillCountForm::Many);
     }
 }

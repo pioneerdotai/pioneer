@@ -175,7 +175,9 @@ pub fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<Pars
 
 pub fn attachment_kind(attachment: &UserMessageAttachment) -> ParsedUserAttachmentKind {
     match attachment {
-        UserMessageAttachment::Skill { .. } => ParsedUserAttachmentKind::Skill,
+        UserMessageAttachment::Skill { .. } | UserMessageAttachment::SkillPack { .. } => {
+            ParsedUserAttachmentKind::Skill
+        }
         UserMessageAttachment::McpServer { .. } | UserMessageAttachment::McpTool { .. } => {
             ParsedUserAttachmentKind::Mcp
         }
@@ -194,7 +196,13 @@ pub fn display_name_from_attachment(attachment: &UserMessageAttachment) -> Strin
         | UserMessageAttachment::LocalAudio { path }
         | UserMessageAttachment::LocalVideo { path } => path.as_str(),
         UserMessageAttachment::Artifact { artifact } => return artifact.display_name.clone(),
-        UserMessageAttachment::Skill { capability } => return capability.label.clone(),
+        UserMessageAttachment::Skill { capability } => {
+            return capability.pack.as_ref().map_or_else(
+                || capability.label.clone(),
+                |pack| format!("{} / {}", pack.label, capability.label),
+            );
+        }
+        UserMessageAttachment::SkillPack { capability } => return capability.label.clone(),
         UserMessageAttachment::McpServer { capability } => return capability.label.clone(),
         UserMessageAttachment::McpTool { capability } => return capability.label.clone(),
     };
@@ -1637,10 +1645,11 @@ mod tests {
     use super::*;
     use crate::conversation::reducer::TurnView;
     use pioneer_protocol::{
-        ArtifactKind, ArtifactStatus, McpScopeKind, SkillId, TimelineLane, TimelineOrigin,
-        TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
+        ArtifactKind, ArtifactStatus, McpScopeKind, SkillId, SkillPackId, TimelineLane,
+        TimelineOrigin, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
         ToolOutputPolicySnapshot, ToolOutputSummary, ToolStoragePayload, TurnItem,
-        TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary,
+        TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
+        TurnSkillPackPresentationSummary,
     };
     use serde_json::json;
 
@@ -1715,6 +1724,26 @@ mod tests {
                     owner: None,
                     slug: "docs".to_owned(),
                     source_kind: "user".to_owned(),
+                    pack: None,
+                },
+            },
+            UserMessageAttachment::SkillPack {
+                capability: TurnSkillPackCapabilitySummary {
+                    pack_id: SkillPackId::new("P".repeat(21)).expect("valid pack id"),
+                    label: "research".to_owned(),
+                },
+            },
+            UserMessageAttachment::Skill {
+                capability: TurnSkillCapabilitySummary {
+                    skill_id: SkillId::new("S".repeat(21)).expect("valid skill id"),
+                    label: "search".to_owned(),
+                    owner: None,
+                    slug: "search".to_owned(),
+                    source_kind: "user".to_owned(),
+                    pack: Some(TurnSkillPackPresentationSummary {
+                        pack_id: SkillPackId::new("P".repeat(21)).expect("valid pack id"),
+                        label: "research".to_owned(),
+                    }),
                 },
             },
             UserMessageAttachment::McpTool {
@@ -1735,11 +1764,20 @@ mod tests {
                 .iter()
                 .map(|attachment| attachment.display_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["report.pdf", "report.pdf", "docs", "resend/send"]
+            vec![
+                "report.pdf",
+                "report.pdf",
+                "docs",
+                "research",
+                "research / search",
+                "resend/send"
+            ]
         );
         assert_eq!(parsed[0].kind, ParsedUserAttachmentKind::File);
         assert_eq!(parsed[2].kind, ParsedUserAttachmentKind::Skill);
-        assert_eq!(parsed[3].kind, ParsedUserAttachmentKind::Mcp);
+        assert_eq!(parsed[3].kind, ParsedUserAttachmentKind::Skill);
+        assert_eq!(parsed[4].kind, ParsedUserAttachmentKind::Skill);
+        assert_eq!(parsed[5].kind, ParsedUserAttachmentKind::Mcp);
         assert_eq!(parsed[1].artifact.as_ref(), Some(&artifact));
         assert_ne!(
             stable_user_message_attachment_chip_id("user_1", 0),

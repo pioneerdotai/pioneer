@@ -15,6 +15,9 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::composer::skill_selection::{
+    ComposerSkillChip, ComposerSkillChipKind, ComposerSkillSelection, project_composer_skill_chips,
+};
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +82,7 @@ impl PioneerDesktop {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
         let capabilities = self.effective_composer_capabilities();
+        let skill_chips = self.composer_skill_chips();
         let upload_error = self.composer_upload_error.clone();
         let microphone_error = self.desktop_microphone_error_message();
         let task_child_locked = self.active_task_thread_navigation().is_some();
@@ -115,6 +119,7 @@ impl PioneerDesktop {
             && !self.composer_upload_in_progress
             && attachments.is_empty()
             && capabilities.is_empty()
+            && self.composer_skill_selections.is_empty()
             && !composer_text.is_empty();
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
@@ -178,7 +183,9 @@ impl PioneerDesktop {
                                 .bg(cx.theme().background)
                                 .rounded_t_2xl()
                                 .when(
-                                    !attachments.is_empty() || !capabilities.is_empty(),
+                                    !attachments.is_empty()
+                                        || !capabilities.is_empty()
+                                        || !skill_chips.is_empty(),
                                     |this| this.child(self.render_composer_chip_badges(cx)),
                                 )
                                 .when_some(upload_error, |this, error| {
@@ -409,6 +416,13 @@ impl PioneerDesktop {
                     items: chunk.to_vec(),
                 });
         let effective_capabilities = self.effective_composer_capabilities();
+        let skill_chips = self.composer_skill_chips();
+        let skill_rows = skill_chips.chunks(3).enumerate().map(|(row_index, chunk)| {
+            ComposerChipRow::SkillSelections {
+                start_index: row_index * 3,
+                items: chunk.to_vec(),
+            }
+        });
         let capability_rows =
             effective_capabilities
                 .chunks(3)
@@ -417,7 +431,10 @@ impl PioneerDesktop {
                     start_index: row_index * 3,
                     items: chunk.to_vec(),
                 });
-        let rows = attachment_rows.chain(capability_rows).collect::<Vec<_>>();
+        let rows = attachment_rows
+            .chain(skill_rows)
+            .chain(capability_rows)
+            .collect::<Vec<_>>();
 
         v_flex()
             .w_full()
@@ -454,6 +471,14 @@ impl PioneerDesktop {
                                     absolute_index,
                                     cx,
                                 )
+                            })
+                            .collect::<Vec<_>>(),
+                        ComposerChipRow::SkillSelections { start_index, items } => items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(column_index, chip)| {
+                                let absolute_index = start_index + column_index;
+                                self.render_composer_skill_selection_badge(chip, absolute_index, cx)
                             })
                             .collect::<Vec<_>>(),
                     })
@@ -650,6 +675,109 @@ impl PioneerDesktop {
             )
             .into_any_element()
     }
+
+    fn composer_skill_chips(&self) -> Vec<ComposerSkillChip> {
+        let picker = self.composer_skill_picker_projection("");
+        project_composer_skill_chips(self.composer_skill_selections.as_slice(), &picker)
+    }
+
+    fn render_composer_skill_selection_badge(
+        &self,
+        chip: ComposerSkillChip,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(selection) = composer_skill_selection_from_chip(&chip) else {
+            return div().into_any_element();
+        };
+        let group_id = format!("composer-skill-selection-chip-{index}");
+
+        h_flex()
+            .id(("composer-skill-selection-chip", index))
+            .flex_initial()
+            .max_w(px(196.))
+            .min_w_0()
+            .h(px(32.))
+            .pl_2()
+            .pr_1p5()
+            .items_center()
+            .gap_1()
+            .rounded_full()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .group(group_id)
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(20.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(PioneerIconName::Zap)
+                            .size_3()
+                            .opacity(0.8)
+                            .text_color(cx.theme().foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_initial()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .pr(COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH)
+                    .text_xs()
+                    .child(chip.label)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH)
+                            .bg(linear_gradient(
+                                90.,
+                                linear_color_stop(cx.theme().background.opacity(0.), 0.),
+                                linear_color_stop(cx.theme().background, 1.),
+                            )),
+                    ),
+            )
+            .child(
+                Button::new(("composer-skill-selection-remove", index))
+                    .flex_none()
+                    .ghost()
+                    .xsmall()
+                    .compact()
+                    .icon(IconName::Close)
+                    .disabled(
+                        self.composer_upload_in_progress || self.desktop_voice_context_locked(),
+                    )
+                    .rounded_full()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_composer_skill_selection(selection.clone());
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+fn composer_skill_selection_from_chip(chip: &ComposerSkillChip) -> Option<ComposerSkillSelection> {
+    match chip.kind {
+        ComposerSkillChipKind::SkillPack => Some(ComposerSkillSelection::SkillPack {
+            pack_id: chip.pack_id.clone()?,
+        }),
+        ComposerSkillChipKind::PackedSkill | ComposerSkillChipKind::StandaloneSkill => {
+            Some(ComposerSkillSelection::Skill {
+                skill_id: chip.skill_id.clone()?,
+                pack_id: chip.pack_id.clone(),
+            })
+        }
+    }
 }
 
 enum ComposerChipRow {
@@ -661,11 +789,16 @@ enum ComposerChipRow {
         start_index: usize,
         items: Vec<ComposerCapability>,
     },
+    SkillSelections {
+        start_index: usize,
+        items: Vec<ComposerSkillChip>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_protocol::{SkillId, SkillPackId};
 
     const READY_INPUT: DesktopComposerPrimaryActionInput = DesktopComposerPrimaryActionInput {
         voice_hold_ui_active: false,
@@ -807,5 +940,54 @@ mod tests {
                 loading: true,
             },
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_skill_chip_removal_recovers_full_partial_and_standalone_intent() {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+        let skill_id = SkillId::new("S".repeat(21)).expect("skill id");
+
+        for (chip, expected) in [
+            (
+                ComposerSkillChip {
+                    key: "pack".to_owned(),
+                    label: "Pack".to_owned(),
+                    kind: ComposerSkillChipKind::SkillPack,
+                    skill_id: None,
+                    pack_id: Some(pack_id.clone()),
+                },
+                ComposerSkillSelection::SkillPack {
+                    pack_id: pack_id.clone(),
+                },
+            ),
+            (
+                ComposerSkillChip {
+                    key: "packed".to_owned(),
+                    label: "Pack / Skill".to_owned(),
+                    kind: ComposerSkillChipKind::PackedSkill,
+                    skill_id: Some(skill_id.clone()),
+                    pack_id: Some(pack_id.clone()),
+                },
+                ComposerSkillSelection::Skill {
+                    skill_id: skill_id.clone(),
+                    pack_id: Some(pack_id.clone()),
+                },
+            ),
+            (
+                ComposerSkillChip {
+                    key: "standalone".to_owned(),
+                    label: "Skill".to_owned(),
+                    kind: ComposerSkillChipKind::StandaloneSkill,
+                    skill_id: Some(skill_id.clone()),
+                    pack_id: None,
+                },
+                ComposerSkillSelection::Skill {
+                    skill_id: skill_id.clone(),
+                    pack_id: None,
+                },
+            ),
+        ] {
+            assert_eq!(composer_skill_selection_from_chip(&chip), Some(expected));
+        }
     }
 }

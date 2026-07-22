@@ -100,6 +100,45 @@ impl MessageProcessor {
                 return;
             }
         };
+        let parent = if let Some(pack_id) = existing.pack_id.as_ref() {
+            match self
+                .crud_store
+                .find_skill_pack_installation(workspace_id.as_str(), pack_id)
+                .await
+            {
+                Ok(Some(parent)) => Some(parent),
+                Ok(None) => {
+                    self.send_error(
+                        connection_id,
+                        skills_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            "skill pack for the installed child was not found",
+                            json!({"pack_id": pack_id, "skill_id": existing.skill_id}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        skills_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            "failed to read skill pack for installed child",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = self
             .ensure_skills_lock_v2_locked(
                 location.lock_path.as_path(),
@@ -155,14 +194,21 @@ impl MessageProcessor {
                 }
             };
 
-        match self
-            .crud_store
-            .delete_skill_installation_with_workspace_policy(
-                workspace_id.as_str(),
-                &params.skill_id,
-            )
-            .await
-        {
+        let audit_records = skill_audit_records(uninstall_result.audit_events.as_slice());
+        let packed_child = parent.is_some();
+        let removed = if packed_child {
+            self.crud_store
+                .uninstall_skill_installation_lifecycle(&existing, audit_records.as_slice(), now)
+                .await
+        } else {
+            self.crud_store
+                .delete_skill_installation_with_workspace_policy(
+                    workspace_id.as_str(),
+                    &params.skill_id,
+                )
+                .await
+        };
+        match removed {
             Ok(true) => {}
             Ok(false) | Err(_) => {
                 self.send_error(
@@ -179,11 +225,11 @@ impl MessageProcessor {
                 return;
             }
         }
-        let audit_records = skill_audit_records(uninstall_result.audit_events.as_slice());
-        if let Err(error) = self
-            .crud_store
-            .insert_skill_audit_event_records(audit_records.as_slice())
-            .await
+        if !packed_child
+            && let Err(error) = self
+                .crud_store
+                .insert_skill_audit_event_records(audit_records.as_slice())
+                .await
         {
             self.send_error(
                 connection_id,
@@ -235,20 +281,37 @@ impl MessageProcessor {
             warn!(connection_id, error = %format!("{error:#}"), "failed to send skills/uninstall response");
             return;
         }
-        self.notify_skills_changed(
-            workspace_id.as_str(),
-            "uninstalled",
-            vec![SkillChangedItem {
-                skill_id: params.skill_id,
-                owner: existing.owner,
-                slug: existing.slug,
-                source_kind: existing.source_kind,
-                change_type: "uninstall".to_owned(),
-                fingerprint_before: Some(existing.fingerprint),
-                fingerprint_after: None,
-            }],
-            now,
-        )
-        .await;
+        let child_change = SkillChangedItem {
+            skill_id: params.skill_id,
+            owner: existing.owner,
+            slug: existing.slug,
+            source_kind: existing.source_kind,
+            change_type: "uninstall".to_owned(),
+            fingerprint_before: Some(existing.fingerprint),
+            fingerprint_after: None,
+        };
+        if let Some(parent) = parent {
+            self.notify_skill_projection_changed(
+                workspace_id.as_str(),
+                "uninstalled",
+                vec![child_change],
+                vec![SkillPackChangedItem {
+                    pack_id: parent.pack_id,
+                    change_type: "updated".to_owned(),
+                    name_before: Some(parent.name.clone()),
+                    name_after: Some(parent.name),
+                }],
+                now,
+            )
+            .await;
+        } else {
+            self.notify_skills_changed(
+                workspace_id.as_str(),
+                "uninstalled",
+                vec![child_change],
+                now,
+            )
+            .await;
+        }
     }
 }

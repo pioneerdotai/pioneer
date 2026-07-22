@@ -317,6 +317,7 @@ mod tests {
                     kind: TurnCapabilityKind::Skill {
                         skill_id: pioneer_protocol::SkillId::new("RRRRRRRRRRRRRRRRRRRRR")
                             .expect("valid recovery fixture SkillId"),
+                        pack_id: None,
                     },
                     label: None,
                 },

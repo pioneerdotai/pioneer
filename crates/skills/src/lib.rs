@@ -28,7 +28,7 @@ pub use compile::{
 };
 pub use contract::{
     SkillCatalogSnapshot, SkillDependencies, SkillSourceKind, SkillTrustLevel,
-    normalize_skill_slug, parse_skill_from_file,
+    normalize_skill_markdown_plain_description, normalize_skill_slug, parse_skill_from_file,
 };
 pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
@@ -51,10 +51,12 @@ pub use file_metadata::file_link_count;
 pub use installer::{
     CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest, InstallSkillResult,
     PrepareMaterializedSkillRequest, PreparedMaterializedSkill, PreviousSkillInstallation,
-    SkillInstallerPolicy, UninstallSkillRequest, UninstallSkillResult, UpdateSkillRequest,
-    canonical_skill_install_path, commit_prepared_skill, finalize_prepared_skill_commit,
-    install_skill, prepare_materialized_skill, rollback_prepared_skill_commit, uninstall_skill,
-    update_skill,
+    ReversibleSkillRemoval, ReversibleSkillRemovalBatch, ReversibleSkillRemovalTarget,
+    SkillInstallerPolicy, StageReversibleSkillRemovalsRequest, UninstallSkillRequest,
+    UninstallSkillResult, UpdateSkillRequest, canonical_skill_install_path, commit_prepared_skill,
+    finalize_prepared_skill_commit, finalize_reversible_skill_removals, install_skill,
+    prepare_materialized_skill, rollback_prepared_skill_commit, rollback_reversible_skill_removals,
+    stage_reversible_skill_removals, uninstall_skill, update_skill,
 };
 pub use pioneer_protocol::SkillId;
 pub use policy::{

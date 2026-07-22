@@ -4,18 +4,20 @@ use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntrySta
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    SystemEventLevel, Thread, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
-    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
-    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-    ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, ToolStoragePayload, Turn, TurnBlockedResumeMetadata,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
-    TurnPermissionActionKind, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
-    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnPermissionDecisionReason,
-    TurnPermissionMode, TurnPermissionProfileSource, TurnStatus, UserInput, UserMessageAttachment,
+    SkillId, SkillPackId, SystemEventLevel, Thread, ThreadHistoryEvent, ThreadHistoryEventPayload,
+    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+    ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
+    ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+    ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
+    ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemTimeoutReason, TurnItemType, TurnPermissionActionKind, TurnPermissionAuditDecision,
+    TurnPermissionAuditEvent, TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey,
+    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
+    TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary,
+    TurnStatus, UserInput, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -685,6 +687,71 @@ fn local_turn_start_projects_optimistic_user_message_with_artifacts() {
         attachments,
         &vec![UserMessageAttachment::Artifact { artifact }]
     );
+}
+
+#[test]
+fn durable_pack_attachments_replace_optimistic_message_without_duplicates() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+    let attachments = vec![
+        UserMessageAttachment::SkillPack {
+            capability: TurnSkillPackCapabilitySummary {
+                pack_id: pack_id.clone(),
+                label: "Research Pack".to_owned(),
+            },
+        },
+        UserMessageAttachment::Skill {
+            capability: TurnSkillCapabilitySummary {
+                skill_id: SkillId::new("S".repeat(21)).expect("skill id"),
+                label: "Search".to_owned(),
+                owner: None,
+                slug: "search".to_owned(),
+                source_kind: "user".to_owned(),
+                pack: Some(TurnSkillPackPresentationSummary {
+                    pack_id,
+                    label: "Research Pack".to_owned(),
+                }),
+            },
+        },
+    ];
+
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        user_text: "research this".to_owned(),
+        attachments: attachments.clone(),
+    });
+    let durable_item = TurnItem::UserMessage {
+        id: format!("user_{TURN_ID}"),
+        text: "research this".to_owned(),
+        attachments: attachments.clone(),
+    };
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: durable_item.clone(),
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: durable_item,
+    });
+
+    let user_messages = conversation
+        .projection()
+        .items
+        .iter()
+        .filter(|item| matches!(item.item, TurnItem::UserMessage { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert!(matches!(
+        &user_messages[0].item,
+        TurnItem::UserMessage {
+            attachments: actual,
+            ..
+        } if actual == &attachments
+    ));
 }
 
 #[test]

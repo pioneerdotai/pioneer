@@ -884,6 +884,8 @@ async fn import_one_configured_package(
                     trust_level: "community".to_owned(),
                     fingerprint: String::new(),
                     updated_at_unix: now,
+                    pack_id: None,
+                    pack_member_key: None,
                 };
                 crud_store
                     .insert_skill_installation(&pending, now)
@@ -1673,6 +1675,8 @@ mod tests {
             trust_level: "community".to_owned(),
             fingerprint: fingerprint.to_owned(),
             updated_at_unix: 1_700_000_000,
+            pack_id: None,
+            pack_member_key: None,
         }
     }
 
@@ -1781,6 +1785,8 @@ mod tests {
             trust_level: "community".to_owned(),
             fingerprint,
             updated_at_unix: 1_700_000_000,
+            pack_id: None,
+            pack_member_key: None,
         }
     }
 
@@ -2903,6 +2909,8 @@ mod tests {
             trust_level: "community".to_owned(),
             fingerprint: String::new(),
             updated_at_unix: 1_700_000_000,
+            pack_id: None,
+            pack_member_key: None,
         };
         store
             .insert_skill_installation(&missing, missing.updated_at_unix)

@@ -542,11 +542,64 @@
             "string",
             "null"
           ]
+        },
+        "skill_selections": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerSkillSelection"
+          }
         }
       },
       "additionalProperties": false,
       "required": [
         "capability_target"
+      ]
+    },
+    "ComposerSkillSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "pack_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        }
       ]
     },
     "McpScopeKind": {
@@ -557,6 +610,12 @@
       ]
     },
     "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
       "type": "string",
       "maxLength": 21,
       "minLength": 21,

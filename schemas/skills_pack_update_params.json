@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsPackUpdateParams",
+  "type": "object",
+  "properties": {
+    "pack_id": {
+      "$ref": "#/$defs/SkillPackId"
+    },
+    "source": {
+      "$ref": "#/$defs/SkillLifecycleSource"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "pack_id",
+    "source"
+  ],
+  "$defs": {
+    "SkillLifecycleSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "uploaded_archive"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "upload_id"
+          ]
+        }
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

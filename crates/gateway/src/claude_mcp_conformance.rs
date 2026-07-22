@@ -195,7 +195,8 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
             },
             label: Some("Server A".to_owned()),
         },
-    ]);
+    ])
+    .map_err(anyhow::Error::msg)?;
     let mixed_tool = partition_cli_runtime_capabilities(&[
         skill_capability("tool-skill"),
         TurnCapability {
@@ -207,7 +208,8 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
             },
             label: Some("Tool B".to_owned()),
         },
-    ]);
+    ])
+    .map_err(anyhow::Error::msg)?;
     let mixed_skill_server_preflight_preserved =
         mixed_server.skills.len() == 1 && mixed_server.mcp_servers.len() == 1;
     let mixed_skill_tool_preflight_preserved =
@@ -435,7 +437,10 @@ fn skill_capability(id: &str) -> TurnCapability {
     let skill_id = pioneer_protocol::SkillId::new(value).expect("valid conformance SkillId");
     TurnCapability {
         id: format!("skill:{skill_id}"),
-        kind: TurnCapabilityKind::Skill { skill_id },
+        kind: TurnCapabilityKind::Skill {
+            skill_id,
+            pack_id: None,
+        },
         label: Some(format!("Skill {id}")),
     }
 }

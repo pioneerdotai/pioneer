@@ -154,6 +154,8 @@ fn prepare_composer_turn_uploads_small_fixture_and_returns_artifact_input() {
                 upload_state: ComposerAttachmentUploadState::Uploading,
             }],
             capabilities: Vec::new(),
+            skill_selections: Vec::new(),
+            skill_picker: Default::default(),
         })
         .expect("prepare composer turn");
 

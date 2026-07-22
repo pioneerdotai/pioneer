@@ -1067,13 +1067,21 @@ installed_count = "已找到："
 title = "未安装任何技能"
 description = "安装新技能，扩展智能体能力。"
 
+[skills.dialog]
+uninstall_pack_title = "卸载 %{name}？"
+uninstall_pack_description = "从工作区移除此技能包及其当前包含的所有已安装技能。"
+
 [skills.error]
 gateway_not_connected = "网关未连接。"
 workspace_not_selected = "未选择活动工作区。"
 load_failed = "无法加载已安装技能"
 path_required = "必须填写路径。"
 invalid_skill_target = "技能目标无效。"
+invalid_pack_target = "技能包目标无效。"
 install_failed = "无法安装技能"
+install_pack_failed = "无法安装技能包"
+update_pack_failed = "无法更新技能包"
+uninstall_pack_failed = "无法卸载技能包"
 update_failed = "无法更新技能"
 uninstall_failed = "无法卸载技能"
 policy_failed = "无法更新技能策略"
@@ -1082,6 +1090,9 @@ path_picker_failed = "无法打开来源选择器"
 [skills.card]
 version = "版本"
 fingerprint = "指纹"
+skill_count_one = "%{count} 个技能"
+skill_count_few = "%{count} 个技能"
+skill_count_many = "%{count} 个技能"
 
 [skills.status]
 active = "活跃"
@@ -1109,7 +1120,9 @@ implicit = "隐式"
 [skills.upload]
 preparing = "正在准备上传技能"
 installing = "正在上传技能"
+installing_pack = "正在上传技能包"
 updating = "正在上传更新"
+updating_pack = "正在上传技能包更新"
 cancelling = "正在取消上传"
 
 [skills.diagnostics]

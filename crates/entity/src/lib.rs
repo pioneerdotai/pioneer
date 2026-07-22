@@ -29,6 +29,7 @@ pub mod recovery_job;
 pub mod skill_audit_event;
 pub mod skill_dependency_snapshot;
 pub mod skill_installation;
+pub mod skill_pack_installation;
 pub mod skill_upload_session;
 pub mod skill_workspace_policy;
 pub mod task;

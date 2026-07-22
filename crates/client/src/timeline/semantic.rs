@@ -2812,6 +2812,70 @@ mod tests {
     }
 
     #[test]
+    fn durable_pack_snapshot_replaces_optimistic_user_block_without_live_lookup() {
+        let mut state = SemanticTimelineState::default();
+        let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+        let attachments = vec![
+            pioneer_protocol::UserMessageAttachment::SkillPack {
+                capability: pioneer_protocol::TurnSkillPackCapabilitySummary {
+                    pack_id: pack_id.clone(),
+                    label: "Research Pack".to_owned(),
+                },
+            },
+            pioneer_protocol::UserMessageAttachment::Skill {
+                capability: pioneer_protocol::TurnSkillCapabilitySummary {
+                    skill_id: pioneer_protocol::SkillId::new("S".repeat(21)).expect("skill id"),
+                    label: "Search".to_owned(),
+                    owner: None,
+                    slug: "search".to_owned(),
+                    source_kind: "user".to_owned(),
+                    pack: Some(pioneer_protocol::TurnSkillPackPresentationSummary {
+                        pack_id,
+                        label: "Research Pack".to_owned(),
+                    }),
+                },
+            },
+        ];
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                user_text: "research".to_owned(),
+                attachments: attachments.clone(),
+            },
+            10,
+        );
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item: TurnItem::UserMessage {
+                    id: "user_turn_a".to_owned(),
+                    text: "research".to_owned(),
+                    attachments: attachments.clone(),
+                },
+            },
+            11,
+        );
+
+        let thread = state.thread("thread_a").expect("thread cache");
+        let user_blocks = thread
+            .top_level
+            .ordered_blocks()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::UserMessage { attachments, .. } => Some(attachments),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_blocks, vec![&attachments]);
+    }
+
+    #[test]
     fn live_timeline_update_patch_removes_stale_top_level_blocks() {
         let mut state = SemanticTimelineState::default();
         apply_conversation_event_to_semantic_timeline_with_patch(

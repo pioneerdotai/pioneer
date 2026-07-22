@@ -22,6 +22,17 @@ pub struct Model {
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub pack_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub pack_member_key: Option<String>,
+    #[sea_orm(
+        belongs_to,
+        from = "pack_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "Restrict"
+    )]
+    pub pack: HasOne<super::skill_pack_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

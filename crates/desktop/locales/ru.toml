@@ -908,13 +908,21 @@ installed_count = "Найдено:"
 title = "Нет установленных навыков"
 description = "Установите новые навыки и расширьте возможности агентов."
 
+[skills.dialog]
+uninstall_pack_title = "Удалить %{name}?"
+uninstall_pack_description = "Удаляет этот пакет навыков и все входящие в него установленные навыки из рабочего пространства."
+
 [skills.error]
 gateway_not_connected = "Шлюз не подключен."
 workspace_not_selected = "Активное пространство не выбрано."
 load_failed = "Не удалось загрузить установленные навыки"
 path_required = "Нужно указать путь."
 invalid_skill_target = "Некорректная цель навыка."
+invalid_pack_target = "Некорректная цель пакета навыков."
 install_failed = "Не удалось установить навык"
+install_pack_failed = "Не удалось установить пакет навыков"
+update_pack_failed = "Не удалось обновить пакет навыков"
+uninstall_pack_failed = "Не удалось удалить пакет навыков"
 update_failed = "Не удалось обновить навык"
 uninstall_failed = "Не удалось удалить навык"
 policy_failed = "Не удалось обновить политику навыка"
@@ -923,6 +931,9 @@ path_picker_failed = "Не удалось открыть выбор источн
 [skills.card]
 version = "Версия"
 fingerprint = "Отпечаток"
+skill_count_one = "%{count} скилл"
+skill_count_few = "%{count} скилла"
+skill_count_many = "%{count} скиллов"
 
 [skills.button]
 install = "Установить"
@@ -934,7 +945,9 @@ implicit = "Неявно"
 [skills.upload]
 preparing = "Подготовка загрузки навыка"
 installing = "Загрузка навыка"
+installing_pack = "Загрузка пакета навыков"
 updating = "Загрузка обновления"
+updating_pack = "Загрузка обновления пакета навыков"
 cancelling = "Отмена загрузки"
 
 [skills.diagnostics]

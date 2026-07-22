@@ -335,6 +335,12 @@
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
     },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "TextElement": {
       "type": "object",
       "properties": {
@@ -378,6 +384,16 @@
         {
           "type": "object",
           "properties": {
+            "packId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "skillId": {
               "$ref": "#/$defs/SkillId"
             },
@@ -389,6 +405,22 @@
           "required": [
             "type",
             "skillId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "packId": {
+              "$ref": "#/$defs/SkillPackId"
+            },
+            "type": {
+              "type": "string",
+              "const": "skillPack"
+            }
+          },
+          "required": [
+            "type",
+            "packId"
           ]
         },
         {
@@ -499,6 +531,16 @@
             "null"
           ]
         },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSkillPackPresentationSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "skillId": {
           "$ref": "#/$defs/SkillId"
         },
@@ -514,6 +556,36 @@
         "label",
         "slug",
         "sourceKind"
+      ]
+    },
+    "TurnSkillPackCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "packId": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "packId",
+        "label"
+      ]
+    },
+    "TurnSkillPackPresentationSummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "packId": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "packId",
+        "label"
       ]
     },
     "UserInput": {
@@ -868,6 +940,22 @@
             "type": {
               "type": "string",
               "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skillPack"
             }
           },
           "required": [

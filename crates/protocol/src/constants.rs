@@ -57,6 +57,9 @@ pub mod methods {
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";
     pub const SKILLS_UNINSTALL: &str = "skills/uninstall";
+    pub const SKILLS_PACK_INSTALL: &str = "skills/pack/install";
+    pub const SKILLS_PACK_UPDATE: &str = "skills/pack/update";
+    pub const SKILLS_PACK_UNINSTALL: &str = "skills/pack/uninstall";
     pub const SKILLS_HEALTH: &str = "skills/health";
     pub const SKILLS_UPLOAD_START: &str = "skills/upload/start";
     pub const SKILLS_UPLOAD_FINISH: &str = "skills/upload/finish";

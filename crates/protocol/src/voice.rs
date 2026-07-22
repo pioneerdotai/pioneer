@@ -690,6 +690,7 @@ mod tests {
                 id: "skill:mvg02zVNGWuw5z5C4nYDo".to_owned(),
                 kind: TurnCapabilityKind::Skill {
                     skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
+                    pack_id: None,
                 },
                 label: Some("Demo".to_owned()),
             }],

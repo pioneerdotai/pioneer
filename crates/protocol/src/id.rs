@@ -6,6 +6,7 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const SKILL_ID_LEN: usize = 21;
+pub const SKILL_PACK_ID_LEN: usize = SKILL_ID_LEN;
 
 const ALPHANUMERIC: [char; 62] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
@@ -18,29 +19,43 @@ pub fn generate_id(len: usize) -> String {
     nanoid!(len, &ALPHANUMERIC)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckedIdValidationError {
+    InvalidLength { expected: usize, actual: usize },
+    InvalidCharacter { index: usize, character: char },
+}
+
+fn validate_checked_id(
+    value: String,
+    expected_len: usize,
+) -> Result<String, CheckedIdValidationError> {
+    let actual = value.chars().count();
+    if actual != expected_len {
+        return Err(CheckedIdValidationError::InvalidLength {
+            expected: expected_len,
+            actual,
+        });
+    }
+
+    if let Some((index, character)) = value
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_alphanumeric())
+    {
+        return Err(CheckedIdValidationError::InvalidCharacter { index, character });
+    }
+
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct SkillId(#[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String);
 
 impl SkillId {
     pub fn new(value: impl Into<String>) -> Result<Self, SkillIdError> {
-        let value = value.into();
-        let actual = value.chars().count();
-        if actual != SKILL_ID_LEN {
-            return Err(SkillIdError::InvalidLength {
-                expected: SKILL_ID_LEN,
-                actual,
-            });
-        }
-
-        if let Some((index, character)) = value
-            .char_indices()
-            .find(|(_, character)| !character.is_ascii_alphanumeric())
-        {
-            return Err(SkillIdError::InvalidCharacter { index, character });
-        }
-
-        Ok(Self(value))
+        validate_checked_id(value.into(), SKILL_ID_LEN)
+            .map(Self)
+            .map_err(SkillIdError::from)
     }
 
     pub fn as_str(&self) -> &str {
@@ -119,9 +134,125 @@ impl fmt::Display for SkillIdError {
 
 impl std::error::Error for SkillIdError {}
 
+impl From<CheckedIdValidationError> for SkillIdError {
+    fn from(error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => {
+                Self::InvalidLength { expected, actual }
+            }
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter { index, character }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SkillPackId(
+    #[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String,
+);
+
+impl SkillPackId {
+    pub fn new(value: impl Into<String>) -> Result<Self, SkillPackIdError> {
+        validate_checked_id(value.into(), SKILL_PACK_ID_LEN)
+            .map(Self)
+            .map_err(SkillPackIdError::from)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl FromStr for SkillPackId {
+    type Err = SkillPackIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for SkillPackId {
+    type Error = SkillPackIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for SkillPackId {
+    type Error = SkillPackIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for SkillPackId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for SkillPackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SkillPackId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillPackIdError {
+    InvalidLength { expected: usize, actual: usize },
+    InvalidCharacter { index: usize, character: char },
+}
+
+impl fmt::Display for SkillPackIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { expected, actual } => write!(
+                f,
+                "skill pack id must be exactly {expected} characters, got {actual}"
+            ),
+            Self::InvalidCharacter { index, character } => write!(
+                f,
+                "skill pack id must contain only ASCII alphanumeric characters; found {character:?} at byte {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SkillPackIdError {}
+
+impl From<CheckedIdValidationError> for SkillPackIdError {
+    fn from(error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => {
+                Self::InvalidLength { expected, actual }
+            }
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter { index, character }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SKILL_ID_LEN, SkillId, SkillIdError, generate_id};
+    use super::{
+        SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
+        generate_id,
+    };
     use serde_json::json;
 
     #[test]
@@ -187,6 +318,67 @@ mod tests {
         assert_eq!(schema["type"], "string");
         assert_eq!(schema["minLength"], SKILL_ID_LEN);
         assert_eq!(schema["maxLength"], SKILL_ID_LEN);
+        assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
+    }
+
+    #[test]
+    fn skill_pack_id_round_trips_as_a_string() {
+        let value = "ZyXwVuTsRqPoNmLkJi987";
+        let id = SkillPackId::new(value).expect("valid skill pack id");
+
+        assert_eq!(id.as_str(), value);
+        assert_eq!(id.to_string(), value);
+        assert_eq!(serde_json::to_value(&id).unwrap(), json!(value));
+        assert_eq!(
+            serde_json::from_value::<SkillPackId>(json!(value)).unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn skill_pack_id_rejects_invalid_lengths() {
+        assert_eq!(
+            SkillPackId::new("short"),
+            Err(SkillPackIdError::InvalidLength {
+                expected: SKILL_PACK_ID_LEN,
+                actual: 5,
+            })
+        );
+        assert!(matches!(
+            SkillPackId::new("ZyXwVuTsRqPoNmLkJi9876"),
+            Err(SkillPackIdError::InvalidLength { .. })
+        ));
+        assert!(matches!(
+            SkillPackId::new(""),
+            Err(SkillPackIdError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn skill_pack_id_rejects_punctuation_whitespace_and_unicode() {
+        for value in [
+            "ZyXwVuTsRqPoNmLkJi98-",
+            "ZyXwVuTsRqPoNmLkJi98 ",
+            "ZyXwVuTsRqPoNmLkJi98é",
+        ] {
+            assert!(
+                SkillPackId::new(value).is_err(),
+                "expected {value:?} to be rejected"
+            );
+            assert!(
+                serde_json::from_value::<SkillPackId>(json!(value)).is_err(),
+                "expected serialized {value:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_pack_id_schema_is_a_constrained_string() {
+        let schema = serde_json::to_value(schemars::schema_for!(SkillPackId)).unwrap();
+
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["minLength"], SKILL_PACK_ID_LEN);
+        assert_eq!(schema["maxLength"], SKILL_PACK_ID_LEN);
         assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
     }
 }

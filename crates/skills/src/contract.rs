@@ -547,6 +547,62 @@ fn parse_catalog_hidden(map: &serde_yaml::Mapping, issues: &mut Vec<SkillValidat
     parse_bool_value(map, "catalog-hide", false, issues)
 }
 
+fn normalize_plain_description_scalar(frontmatter: &str) -> Option<String> {
+    let mut candidate = None;
+
+    for (index, line) in frontmatter.lines().enumerate() {
+        let Some(value) = line.strip_prefix("description:") else {
+            continue;
+        };
+        let value = value.trim();
+        let is_explicit_yaml_scalar = value.starts_with(['\'', '"', '|', '>']);
+        let contains_mapping_separator = value.contains(": ") || value.contains(":\t");
+        if value.is_empty() || is_explicit_yaml_scalar || !contains_mapping_separator {
+            return None;
+        }
+        if candidate.replace((index, value)).is_some() {
+            return None;
+        }
+    }
+
+    let (candidate_index, candidate_value) = candidate?;
+    let mut normalized = String::with_capacity(frontmatter.len() + 8);
+    for (index, line) in frontmatter.lines().enumerate() {
+        if index == candidate_index {
+            normalized.push_str("description: >-\n  ");
+            normalized.push_str(candidate_value);
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push('\n');
+    }
+    Some(normalized)
+}
+
+/// Canonicalizes one compatibility case without mutating the caller's source:
+/// an otherwise valid frontmatter whose top-level, unquoted `description` contains `: `.
+/// Strict-valid input is left unchanged and unrelated YAML errors remain errors.
+pub fn normalize_skill_markdown_plain_description(content: &str) -> Result<Option<String>> {
+    let normalized_content = content.replace("\r\n", "\n");
+    let (frontmatter, body) = split_frontmatter(normalized_content.as_str());
+    let Some(frontmatter) = frontmatter else {
+        return Ok(None);
+    };
+
+    let strict_error = match serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
+        Ok(_) => return Ok(None),
+        Err(error) => error,
+    };
+    let Some(normalized_frontmatter) = normalize_plain_description_scalar(frontmatter) else {
+        return Err(strict_error).context("failed to parse YAML frontmatter");
+    };
+    if serde_yaml::from_str::<serde_yaml::Value>(normalized_frontmatter.as_str()).is_err() {
+        return Err(strict_error).context("failed to parse YAML frontmatter");
+    }
+
+    Ok(Some(format!("---\n{normalized_frontmatter}---\n{body}")))
+}
+
 fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
     let mut parsed = ParsedFrontmatter {
         user_invocable: true,
@@ -890,7 +946,10 @@ pub fn parse_skill_from_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillDefinition, SkillSourceKind, parse_skill_from_file as parse_skill_with_id};
+    use super::{
+        SkillDefinition, SkillSourceKind, normalize_skill_markdown_plain_description,
+        parse_skill_from_file as parse_skill_with_id,
+    };
     use crate::compile::SkillImplicitInvocationPolicy;
     use crate::runtime::{
         DynamicDeltaOutputRequest, DynamicStorageOutputRequest, DynamicTimelineOutputRequest,
@@ -982,6 +1041,72 @@ Instructions
         assert!(skill.conformance.openclaw_compat.compliant);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_unquoted_plain_description_with_mapping_separator() {
+        let dir = temp_case("plain-description-mapping-separator");
+        let raw = r#"---
+name: aso-router
+description: Routes ambiguous ASO requests. Triggers: "/aso", "aso help".
+metadata:
+  version: 1.0.0
+---
+Route the request to the correct specialist.
+"#;
+        let skill_file = write_skill(&dir, "aso-router", raw);
+        let source_before = fs::read(&skill_file).expect("read source before parsing");
+
+        parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect_err("strict parser must reject the original malformed YAML");
+
+        let normalized = normalize_skill_markdown_plain_description(raw)
+            .expect("compatibility normalization should succeed")
+            .expect("description should require normalization");
+        assert!(normalized.contains("description: >-\n  Routes ambiguous ASO requests."));
+        assert_eq!(
+            fs::read(&skill_file).expect("read source after pure normalization"),
+            source_before,
+            "normalization must not rewrite the caller's source file"
+        );
+        fs::write(&skill_file, normalized).expect("write staged normalized skill");
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("compatibility description should parse");
+
+        assert_eq!(
+            skill.instructions.description,
+            "Routes ambiguous ASO requests. Triggers: \"/aso\", \"aso help\"."
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn description_compatibility_does_not_mask_other_invalid_yaml() {
+        let error = normalize_skill_markdown_plain_description(
+            "---\n\
+             name: aso-router\n\
+             description: Routes requests. Triggers: /aso\n\
+             metadata: [unterminated\n\
+             ---\n\
+             Instructions\n",
+        )
+        .expect_err("unrelated invalid YAML must remain rejected");
+
+        assert!(
+            format!("{error:#}").contains("failed to parse YAML frontmatter"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

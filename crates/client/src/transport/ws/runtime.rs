@@ -32,6 +32,8 @@ use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, SkillListParams, SkillListResponse,
     SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse,
+    SkillsPackInstallParams, SkillsPackInstallResponse, SkillsPackUninstallParams,
+    SkillsPackUninstallResponse, SkillsPackUpdateParams, SkillsPackUpdateResponse,
     SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
     SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
     SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,

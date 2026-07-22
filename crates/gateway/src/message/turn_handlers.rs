@@ -24,6 +24,13 @@ pub(super) struct PreparedApiProviderTurnStart {
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct NormalizedTurnCapabilities {
+    pub(super) presentation: Vec<pioneer_protocol::TurnCapability>,
+    pub(super) execution: Vec<pioneer_protocol::TurnCapability>,
+    pub(super) pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
+}
+
 struct PreparedCliRuntimeNativeTurnStart {
     outcome: crate::thread::TurnStartOutcome,
     user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
@@ -69,12 +76,30 @@ impl MessageProcessor {
         let selected = capabilities
             .iter()
             .filter_map(|capability| match &capability.kind {
-                pioneer_protocol::TurnCapabilityKind::Skill { skill_id } => {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                    if pack_id.is_some() {
+                        return None;
+                    }
                     Some((capability, skill_id))
                 }
-                _ => None,
+                pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
+                | pioneer_protocol::TurnCapabilityKind::McpServer { .. }
+                | pioneer_protocol::TurnCapabilityKind::McpTool { .. } => None,
             })
             .collect::<Vec<_>>();
+        if capabilities.iter().any(|capability| {
+            matches!(
+                capability.kind,
+                pioneer_protocol::TurnCapabilityKind::Skill {
+                    pack_id: Some(_),
+                    ..
+                } | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
+            )
+        }) {
+            return Err(
+                "skill pack metadata reached the ordinary skill validation boundary".to_owned(),
+            );
+        }
         let context = self
             .skills_runtime_context(workspace_id)
             .map_err(|error| format!("failed to resolve skills runtime context: {error:#}"))?;
@@ -103,6 +128,201 @@ impl MessageProcessor {
             }
         }
         Ok(catalog)
+    }
+
+    pub(super) async fn normalize_turn_skill_capabilities(
+        &self,
+        workspace_id: &str,
+        capabilities: &[pioneer_protocol::TurnCapability],
+    ) -> Result<NormalizedTurnCapabilities, String> {
+        use pioneer_protocol::{TurnCapability, TurnCapabilityKind};
+
+        let _skills_guard = self.acquire_skills_write_lock().await;
+        let mut presentation = Vec::with_capacity(capabilities.len());
+        let mut full_pack_ids = HashSet::new();
+        let mut pack_children = HashMap::new();
+        let mut pack_names = HashMap::new();
+
+        for capability in capabilities {
+            match &capability.kind {
+                TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                    let installation = self
+                        .crud_store
+                        .find_skill_installation(skill_id)
+                        .await
+                        .map_err(|error| {
+                            format!("failed to load skill `{skill_id}` installation: {error:#}")
+                        })?;
+                    let Some(installation) = installation else {
+                        if let Some(requested_pack_id) = pack_id {
+                            return Err(format!(
+                                "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
+                            ));
+                        }
+                        presentation.push(TurnCapability {
+                            id: capability.id.clone(),
+                            label: capability.label.clone(),
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: skill_id.clone(),
+                                pack_id: None,
+                            },
+                        });
+                        continue;
+                    };
+                    if installation.source_kind != "system"
+                        && installation.scope_key != workspace_id
+                    {
+                        return Err(format!(
+                            "skill `{skill_id}` is not installed in workspace `{workspace_id}`"
+                        ));
+                    }
+
+                    let authoritative_pack_id = installation.pack_id.clone();
+                    if let Some(requested_pack_id) = pack_id {
+                        if authoritative_pack_id.as_ref() != Some(requested_pack_id) {
+                            return Err(format!(
+                                "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
+                            ));
+                        }
+                    }
+                    if let Some(authoritative_pack_id) = authoritative_pack_id.as_ref() {
+                        if installation.scope_key != workspace_id {
+                            return Err(format!(
+                                "skill `{skill_id}` pack membership is outside workspace `{workspace_id}`"
+                            ));
+                        }
+                        let parent = self
+                            .crud_store
+                            .find_skill_pack_installation(workspace_id, authoritative_pack_id)
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "failed to load skill pack `{authoritative_pack_id}`: {error:#}"
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                format!(
+                                    "skill `{skill_id}` references missing pack `{authoritative_pack_id}`"
+                                )
+                            })?;
+                        pack_names.insert(authoritative_pack_id.clone(), parent.name);
+                    }
+
+                    presentation.push(TurnCapability {
+                        id: capability.id.clone(),
+                        label: capability.label.clone(),
+                        kind: TurnCapabilityKind::Skill {
+                            skill_id: skill_id.clone(),
+                            pack_id: authoritative_pack_id,
+                        },
+                    });
+                }
+                TurnCapabilityKind::SkillPack { pack_id } => {
+                    if !full_pack_ids.insert(pack_id.clone()) {
+                        return Err(format!("skill pack `{pack_id}` is selected more than once"));
+                    }
+                    let parent = self
+                        .crud_store
+                        .find_skill_pack_installation(workspace_id, pack_id)
+                        .await
+                        .map_err(|error| {
+                            format!("failed to load skill pack `{pack_id}`: {error:#}")
+                        })?
+                        .ok_or_else(|| {
+                            format!(
+                                "skill pack `{pack_id}` was not found in workspace `{workspace_id}`"
+                            )
+                        })?;
+                    pack_names.insert(pack_id.clone(), parent.name);
+                    let children = self
+                        .crud_store
+                        .list_skill_installations_for_pack(workspace_id, pack_id)
+                        .await
+                        .map_err(|error| {
+                            format!("failed to load children for skill pack `{pack_id}`: {error:#}")
+                        })?;
+                    if children.is_empty() {
+                        return Err(format!("skill pack `{pack_id}` is empty"));
+                    }
+                    if children.iter().any(|child| {
+                        child.scope_key != workspace_id
+                            || child.pack_id.as_ref() != Some(pack_id)
+                            || child.pack_member_key.as_deref().is_none_or(str::is_empty)
+                    }) {
+                        return Err(format!(
+                            "skill pack `{pack_id}` has invalid authoritative membership"
+                        ));
+                    }
+                    pack_children.insert(pack_id.clone(), children);
+                    presentation.push(capability.clone());
+                }
+                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
+                    presentation.push(capability.clone());
+                }
+            }
+        }
+
+        let mut execution = Vec::new();
+        let mut seen_skill_ids = HashSet::new();
+        for capability in &presentation {
+            match &capability.kind {
+                TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                    if pack_id
+                        .as_ref()
+                        .is_some_and(|pack_id| full_pack_ids.contains(pack_id))
+                    {
+                        return Err(format!(
+                            "skill pack and child `{skill_id}` cannot be selected together"
+                        ));
+                    }
+                    if !seen_skill_ids.insert(skill_id.clone()) {
+                        return Err(format!("skill `{skill_id}` is selected more than once"));
+                    }
+                    execution.push(TurnCapability {
+                        id: pioneer_protocol::skill_capability_key(skill_id),
+                        label: if pack_id.is_some() {
+                            None
+                        } else {
+                            capability.label.clone()
+                        },
+                        kind: TurnCapabilityKind::Skill {
+                            skill_id: skill_id.clone(),
+                            pack_id: None,
+                        },
+                    });
+                }
+                TurnCapabilityKind::SkillPack { pack_id } => {
+                    let children = pack_children
+                        .get(pack_id)
+                        .expect("validated skill pack children");
+                    for child in children {
+                        if !seen_skill_ids.insert(child.skill_id.clone()) {
+                            return Err(format!(
+                                "skill `{}` is duplicated after pack expansion",
+                                child.skill_id
+                            ));
+                        }
+                        execution.push(TurnCapability {
+                            id: pioneer_protocol::skill_capability_key(&child.skill_id),
+                            label: None,
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: child.skill_id.clone(),
+                                pack_id: None,
+                            },
+                        });
+                    }
+                }
+                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
+                    execution.push(capability.clone());
+                }
+            }
+        }
+
+        Ok(NormalizedTurnCapabilities {
+            presentation,
+            execution,
+            pack_names,
+        })
     }
 
     pub(super) fn turn_start<'a>(
@@ -218,9 +438,21 @@ impl MessageProcessor {
     pub(super) async fn prepare_api_provider_turn_start(
         &self,
         connection_id: ConnectionId,
-        params: TurnStartParams,
+        mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
     ) -> Result<PreparedApiProviderTurnStart, String> {
+        let thread = self
+            .thread_manager
+            .thread_get(params.thread_id.trim())
+            .await
+            .ok_or_else(|| format!("thread `{}` is not loaded", params.thread_id.trim()))?;
+        let normalized_capabilities = self
+            .normalize_turn_skill_capabilities(
+                thread.workspace_id.as_str(),
+                params.capabilities.as_slice(),
+            )
+            .await?;
+        params.capabilities = normalized_capabilities.execution.clone();
         let security_params = params.clone();
         let outcome = self
             .thread_manager
@@ -275,8 +507,9 @@ impl MessageProcessor {
         };
         let user_message_capability_attachments =
             match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
-                outcome.materialization.capabilities.as_slice(),
+                normalized_capabilities.presentation.as_slice(),
                 &skill_catalog,
+                &normalized_capabilities.pack_names,
             ) {
                 Ok(attachments) => attachments,
                 Err(error) => {
@@ -629,10 +862,44 @@ impl MessageProcessor {
             };
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
+            let Some(thread) = self
+                .thread_manager
+                .thread_get(params.thread_id.trim())
+                .await
+            else {
+                send_turn_start_failure!(format!(
+                    "thread `{}` is not loaded",
+                    params.thread_id.trim()
+                ));
+                return;
+            };
+            let normalized_capabilities = match self
+                .normalize_turn_skill_capabilities(
+                    thread.workspace_id.as_str(),
+                    params.capabilities.as_slice(),
+                )
+                .await
+            {
+                Ok(normalized) => normalized,
+                Err(message) => {
+                    send_turn_start_failure!(message);
+                    return;
+                }
+            };
+            let normalized_presentation_capabilities = normalized_capabilities.presentation;
+            let normalized_pack_names = normalized_capabilities.pack_names;
+            params.capabilities = normalized_capabilities.execution;
+
             let capability_partition =
-                crate::cli_runtime::skills::partition_cli_runtime_capabilities(
+                match crate::cli_runtime::skills::partition_cli_runtime_capabilities(
                     &params.capabilities,
-                );
+                ) {
+                    Ok(partition) => partition,
+                    Err(message) => {
+                        send_turn_start_failure!(message);
+                        return;
+                    }
+                };
             let requested_mcp = capability_partition.has_mcp();
             let provider_claim_matches = submitted_model_provider
                 .as_deref()
@@ -674,17 +941,6 @@ impl MessageProcessor {
                 return;
             }
 
-            let Some(thread) = self
-                .thread_manager
-                .thread_get(params.thread_id.trim())
-                .await
-            else {
-                send_turn_start_failure!(format!(
-                    "thread `{}` is not loaded",
-                    params.thread_id.trim()
-                ));
-                return;
-            };
             let Some(manager) = self.cli_runtime_manager.as_ref() else {
                 send_turn_start_failure!(
                     "CLI runtime manager is not available for turn start".to_owned()
@@ -1176,8 +1432,9 @@ impl MessageProcessor {
             }
             let user_message_capability_attachments =
                 match super::agent_runtime::user_message_attachments_from_capabilities_and_bindings(
-                    outcome.materialization.capabilities.as_slice(),
+                    normalized_presentation_capabilities.as_slice(),
                     combined_preflight.skill_bindings.as_slice(),
+                    &normalized_pack_names,
                 ) {
                     Ok(attachments) => attachments,
                     Err(error) => {

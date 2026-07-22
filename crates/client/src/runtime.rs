@@ -1005,6 +1005,7 @@ mod tests {
             snapshot_version: 42,
             reason: "updated".to_owned(),
             changes: Vec::new(),
+            pack_changes: Vec::new(),
             created_at: 123,
         });
 

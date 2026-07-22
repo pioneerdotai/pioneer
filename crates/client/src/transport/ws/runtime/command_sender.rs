@@ -553,6 +553,27 @@ impl GatewayWsCommandSender {
         client_ws_commands::skills_install(self, params)
     }
 
+    pub fn skills_pack_install(
+        &self,
+        params: SkillsPackInstallParams,
+    ) -> Result<SkillsPackInstallResponse> {
+        client_ws_commands::skills_pack_install(self, params)
+    }
+
+    pub fn skills_pack_update(
+        &self,
+        params: SkillsPackUpdateParams,
+    ) -> Result<SkillsPackUpdateResponse> {
+        client_ws_commands::skills_pack_update(self, params)
+    }
+
+    pub fn skills_pack_uninstall(
+        &self,
+        params: SkillsPackUninstallParams,
+    ) -> Result<SkillsPackUninstallResponse> {
+        client_ws_commands::skills_pack_uninstall(self, params)
+    }
+
     pub fn skills_upload_start(
         &self,
         params: SkillsUploadStartParams,

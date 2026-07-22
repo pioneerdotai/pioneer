@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillPackMembership",
+  "type": "object",
+  "properties": {
+    "member_key": {
+      "type": "string"
+    },
+    "pack_id": {
+      "$ref": "#/$defs/SkillPackId"
+    }
+  },
+  "required": [
+    "pack_id",
+    "member_key"
+  ],
+  "$defs": {
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

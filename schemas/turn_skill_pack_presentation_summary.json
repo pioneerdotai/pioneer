@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSkillPackPresentationSummary",
+  "type": "object",
+  "properties": {
+    "label": {
+      "type": "string"
+    },
+    "packId": {
+      "$ref": "#/$defs/SkillPackId"
+    }
+  },
+  "required": [
+    "packId",
+    "label"
+  ],
+  "$defs": {
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

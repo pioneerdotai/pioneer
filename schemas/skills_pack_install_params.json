@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsPackInstallParams",
+  "type": "object",
+  "properties": {
+    "source": {
+      "$ref": "#/$defs/SkillLifecycleSource"
+    },
+    "target_source_kind": {
+      "type": "string",
+      "default": "user"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "source"
+  ],
+  "$defs": {
+    "SkillLifecycleSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "uploaded_archive"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "upload_id"
+          ]
+        }
+      ]
+    }
+  }
+}

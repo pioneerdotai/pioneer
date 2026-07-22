@@ -2,19 +2,22 @@ use super::*;
 use anyhow::{Result, bail};
 use pioneer_crud::{
     SkillAuditEventRecord, SkillInstallationPatch, SkillInstallationRecord,
-    WorkspaceSkillPolicyRecord,
+    SkillPackInstallationRecord, WorkspaceSkillPolicyRecord,
 };
 use pioneer_protocol::constants::{events, methods};
 use pioneer_protocol::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcResponse, RequestId, SkillAuditTimelineItem,
     SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillId,
-    SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource,
-    SkillListItem, SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
-    SkillTrustGateStatus, SkillValidationDiagnostic, SkillWorkspacePolicy,
-    SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams,
-    SkillsInstallResponse, SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
-    SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
-    SkillsUpdateResponse,
+    SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleRemovedSkill,
+    SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem, SkillListParams,
+    SkillListResponse, SkillPackChangedItem, SkillPackId, SkillPackInstallationItem,
+    SkillPackMembership, SkillPolicyState, SkillSecurityFinding, SkillTrustGateStatus,
+    SkillValidationDiagnostic, SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams,
+    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams,
+    SkillsPackInstallResponse, SkillsPackUninstallParams, SkillsPackUninstallResponse,
+    SkillsPackUpdateParams, SkillsPackUpdateResponse, SkillsPolicyListParams,
+    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
+    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
 };
 use pioneer_skills::{
     DependencyCheckInput, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy, SkillPolicyKey,

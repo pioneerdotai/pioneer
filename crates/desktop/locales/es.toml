@@ -1067,13 +1067,21 @@ installed_count = "Encontradas:"
 title = "No hay habilidades instaladas"
 description = "Instala nuevas habilidades y amplía las capacidades de los agentes."
 
+[skills.dialog]
+uninstall_pack_title = "¿Desinstalar %{name}?"
+uninstall_pack_description = "Elimina este paquete de habilidades y todas sus habilidades instaladas actualmente del espacio de trabajo."
+
 [skills.error]
 gateway_not_connected = "La pasarela no está conectada."
 workspace_not_selected = "No se ha seleccionado un espacio de trabajo activo."
 load_failed = "No se pudieron cargar las habilidades instaladas"
 path_required = "La ruta es obligatoria."
 invalid_skill_target = "Destino de habilidad no válido."
+invalid_pack_target = "Destino de paquete de habilidades no válido."
 install_failed = "No se pudo instalar la habilidad"
+install_pack_failed = "No se pudo instalar el paquete de habilidades"
+update_pack_failed = "No se pudo actualizar el paquete de habilidades"
+uninstall_pack_failed = "No se pudo desinstalar el paquete de habilidades"
 update_failed = "No se pudo actualizar la habilidad"
 uninstall_failed = "No se pudo desinstalar la habilidad"
 policy_failed = "No se pudo actualizar la política de la habilidad"
@@ -1082,6 +1090,9 @@ path_picker_failed = "No se pudo abrir el selector de origen"
 [skills.card]
 version = "Versión"
 fingerprint = "Huella"
+skill_count_one = "%{count} habilidad"
+skill_count_few = "%{count} habilidades"
+skill_count_many = "%{count} habilidades"
 
 [skills.status]
 active = "Activa"
@@ -1109,7 +1120,9 @@ implicit = "Implícita"
 [skills.upload]
 preparing = "Preparando subida de habilidad"
 installing = "Subiendo habilidad"
+installing_pack = "Subiendo paquete de habilidades"
 updating = "Subiendo actualización"
+updating_pack = "Subiendo actualización del paquete de habilidades"
 cancelling = "Cancelando subida"
 
 [skills.diagnostics]

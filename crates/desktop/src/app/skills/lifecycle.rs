@@ -7,7 +7,7 @@ use pioneer_client::{
     skills::actions as skill_actions, skills::catalog as skill_catalog,
     workspaces::selectors as workspace_selectors,
 };
-use pioneer_protocol::SkillId;
+use pioneer_protocol::{SkillId, SkillPackId};
 use std::time::Duration;
 use tracing::warn;
 
@@ -39,6 +39,25 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn close_skill_details_screen(&mut self, cx: &mut Context<Self>) {
         self.set_main_content_view(MainContentView::Skills, cx);
+    }
+
+    pub(super) fn toggle_skill_pack_expanded(
+        &mut self,
+        pack_id: SkillPackId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .skills_management
+            .packs
+            .iter()
+            .any(|row| row.pack.id == pack_id)
+        {
+            return;
+        }
+        if !self.skills_expanded_pack_ids.remove(&pack_id) {
+            self.skills_expanded_pack_ids.insert(pack_id);
+        }
+        cx.notify();
     }
 
     pub(in crate::app) fn queue_skills_refresh(&mut self) {
@@ -147,8 +166,31 @@ impl PioneerDesktop {
         skill_catalog::is_skill_pending(&self.skills_pending_actions, skill_id)
     }
 
+    pub(super) fn is_skill_pack_pending(&self, pack_id: &SkillPackId) -> bool {
+        self.skills_pending_pack_actions.contains(pack_id)
+    }
+
     pub(super) fn mark_skill_pending(&mut self, skill_id: &SkillId, pending: bool) {
         skill_catalog::mark_skill_pending(&mut self.skills_pending_actions, skill_id, pending);
+    }
+
+    pub(super) fn mark_skill_pack_pending(&mut self, pack_id: &SkillPackId, pending: bool) {
+        if pending {
+            self.skills_pending_pack_actions.insert(pack_id.clone());
+        } else {
+            self.skills_pending_pack_actions.remove(pack_id);
+        }
+    }
+
+    pub(super) fn reproject_skill_management(&mut self) {
+        let packs = self
+            .skills_management
+            .packs
+            .iter()
+            .map(|row| row.pack.clone())
+            .collect();
+        self.skills_management =
+            skill_catalog::project_skill_management(self.installed_skills.as_slice(), packs);
     }
 
     pub(super) fn apply_skills_catalog_refresh_success_reduction(
@@ -156,8 +198,23 @@ impl PioneerDesktop {
         reduction: skill_catalog::SkillsCatalogRefreshSuccessReduction,
         cx: &mut Context<Self>,
     ) {
+        self.skills_expanded_pack_ids.retain(|pack_id| {
+            reduction
+                .management
+                .packs
+                .iter()
+                .any(|row| &row.pack.id == pack_id)
+        });
+        self.skills_pending_pack_actions.retain(|pack_id| {
+            reduction
+                .management
+                .packs
+                .iter()
+                .any(|row| &row.pack.id == pack_id)
+        });
         self.skills_catalog = reduction.catalog;
         self.installed_skills = reduction.installed;
+        self.skills_management = reduction.management;
         self.skills_health_details = reduction.health_details;
         self.skills_pending_actions = reduction.pending_actions;
         self.selected_skill_target = reduction.selected_target;

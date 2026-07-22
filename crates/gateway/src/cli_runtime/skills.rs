@@ -223,16 +223,27 @@ pub(crate) struct CliRuntimeCombinedPreflightPlan {
 
 pub(crate) fn partition_cli_runtime_capabilities(
     capabilities: &[TurnCapability],
-) -> CliRuntimeCapabilityPartition {
+) -> Result<CliRuntimeCapabilityPartition, String> {
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
-            TurnCapabilityKind::Skill { skill_id } => {
+            TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            } => {
                 partition.skills.push(CliRuntimeSkillAttachment {
                     capability_id: capability.id.clone(),
                     label: capability.label.clone(),
                     skill_id: skill_id.clone(),
                 });
+            }
+            TurnCapabilityKind::Skill {
+                pack_id: Some(_), ..
+            }
+            | TurnCapabilityKind::SkillPack { .. } => {
+                return Err(
+                    "skill pack metadata reached the CLI runtime capability boundary".to_owned(),
+                );
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 partition.mcp_servers.push(AgentMcpServerRef {
@@ -257,7 +268,7 @@ pub(crate) fn partition_cli_runtime_capabilities(
             }
         }
     }
-    partition
+    Ok(partition)
 }
 
 pub(crate) fn new_cli_runtime_skill_destination_locks() -> CliRuntimeSkillDestinationLocks {
@@ -545,6 +556,7 @@ mod tests {
             id: format!("skill:{skill_id}"),
             kind: TurnCapabilityKind::Skill {
                 skill_id: skill_id.clone(),
+                pack_id: None,
             },
             label: Some(format!("label-{slug}")),
         }
@@ -623,7 +635,7 @@ mod tests {
     #[test]
     fn combined_cli_preflight_partition_preserves_skills_and_empty_fast_path() {
         assert_eq!(
-            partition_cli_runtime_capabilities(&[]),
+            partition_cli_runtime_capabilities(&[]).expect("empty partition"),
             CliRuntimeCapabilityPartition::default()
         );
         let input = [
@@ -631,7 +643,7 @@ mod tests {
             skill_capability("two", SkillSourceKind::User),
         ];
         assert_eq!(
-            partition_cli_runtime_capabilities(&input),
+            partition_cli_runtime_capabilities(&input).expect("skill partition"),
             CliRuntimeCapabilityPartition {
                 skills: vec![
                     CliRuntimeSkillAttachment {
@@ -677,13 +689,15 @@ mod tests {
             },
             label: None,
         };
-        let server_only = partition_cli_runtime_capabilities(std::slice::from_ref(&server));
+        let server_only = partition_cli_runtime_capabilities(std::slice::from_ref(&server))
+            .expect("server partition");
         assert!(server_only.skills.is_empty());
         assert_eq!(server_only.mcp_servers.len(), 1);
         assert!(server_only.mcp_tools.is_empty());
         assert!(server_only.has_mcp());
 
-        let tool_only = partition_cli_runtime_capabilities(std::slice::from_ref(&tool));
+        let tool_only = partition_cli_runtime_capabilities(std::slice::from_ref(&tool))
+            .expect("tool partition");
         assert!(tool_only.skills.is_empty());
         assert!(tool_only.mcp_servers.is_empty());
         assert_eq!(tool_only.mcp_tools.len(), 1);
@@ -693,11 +707,34 @@ mod tests {
             skill_capability("one", SkillSourceKind::User),
             server,
             tool,
-        ]);
+        ])
+        .expect("mixed partition");
         assert_eq!(mixed.skills.len(), 1);
         assert_eq!(mixed.mcp_servers.len(), 1);
         assert_eq!(mixed.mcp_tools.len(), 1);
         assert!(mixed.has_mcp());
+    }
+
+    #[test]
+    fn cli_runtime_partition_rejects_pack_metadata_at_execution_boundary() {
+        let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+        let skill_id = test_skill_id("one", SkillSourceKind::User);
+        let packed_child = TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            kind: TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: Some(pack_id.clone()),
+            },
+            label: None,
+        };
+        let full_pack = TurnCapability {
+            id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+            kind: TurnCapabilityKind::SkillPack { pack_id },
+            label: None,
+        };
+
+        assert!(partition_cli_runtime_capabilities(&[packed_child]).is_err());
+        assert!(partition_cli_runtime_capabilities(&[full_pack]).is_err());
     }
 
     #[test]
@@ -995,7 +1032,8 @@ mod tests {
                 },
                 label: Some("resend/send".to_owned()),
             },
-        ]);
+        ])
+        .expect("collision partition");
         assert_eq!(partition.skills.len(), 2);
         assert_eq!(partition.mcp_tools.len(), 1);
         let temp = tempfile::tempdir().unwrap();

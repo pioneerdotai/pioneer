@@ -12,6 +12,16 @@
         "null"
       ]
     },
+    "pack": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnSkillPackPresentationSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "skillId": {
       "$ref": "#/$defs/SkillId"
     },
@@ -34,6 +44,27 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TurnSkillPackPresentationSummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "packId": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "packId",
+        "label"
+      ]
     }
   }
 }

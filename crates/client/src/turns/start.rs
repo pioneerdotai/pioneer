@@ -222,7 +222,10 @@ mod tests {
         TurnCapability {
             id: pioneer_protocol::skill_capability_key(&skill_id),
             label: Some("Docs".to_owned()),
-            kind: TurnCapabilityKind::Skill { skill_id },
+            kind: TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            },
         }
     }
 
@@ -420,6 +423,7 @@ mod tests {
                 owner: Some("pioneer".to_owned()),
                 slug: "browser".to_owned(),
                 source_kind: "system".to_owned(),
+                pack: None,
             },
         };
 

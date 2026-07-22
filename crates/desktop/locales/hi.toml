@@ -1067,13 +1067,21 @@ installed_count = "मिले:"
 title = "कोई इंस्टॉल किए गए कौशल नहीं"
 description = "नए कौशल इंस्टॉल करें और एजेंटों की क्षमताओं का विस्तार करें।"
 
+[skills.dialog]
+uninstall_pack_title = "%{name} को अनइंस्टॉल करें?"
+uninstall_pack_description = "इस कौशल पैक और इसमें वर्तमान में इंस्टॉल सभी कौशलों को कार्यक्षेत्र से हटाता है।"
+
 [skills.error]
 gateway_not_connected = "गेटवे कनेक्ट नहीं है."
 workspace_not_selected = "कोई सक्रिय कार्यक्षेत्र चयनित नहीं है."
 load_failed = "इंस्टॉल किए गए कौशल लोड नहीं हो सके"
 path_required = "पथ आवश्यक है."
 invalid_skill_target = "अमान्य कौशल लक्ष्य."
+invalid_pack_target = "अमान्य कौशल पैक लक्ष्य."
 install_failed = "कौशल इंस्टॉल नहीं किया जा सका"
+install_pack_failed = "कौशल पैक इंस्टॉल नहीं किया जा सका"
+update_pack_failed = "कौशल पैक अपडेट नहीं किया जा सका"
+uninstall_pack_failed = "कौशल पैक अनइंस्टॉल नहीं किया जा सका"
 update_failed = "कौशल अपडेट नहीं किया जा सका"
 uninstall_failed = "कौशल अनइंस्टॉल नहीं किया जा सका"
 policy_failed = "कौशल नीति अपडेट नहीं की जा सकी"
@@ -1082,6 +1090,9 @@ path_picker_failed = "स्रोत चयनकर्ता नहीं ख�
 [skills.card]
 version = "संस्करण"
 fingerprint = "फिंगरप्रिंट"
+skill_count_one = "%{count} कौशल"
+skill_count_few = "%{count} कौशल"
+skill_count_many = "%{count} कौशल"
 
 [skills.status]
 active = "सक्रिय"
@@ -1109,7 +1120,9 @@ implicit = "अंतर्निहित"
 [skills.upload]
 preparing = "कौशल अपलोड की तैयारी"
 installing = "कौशल अपलोड हो रहा है"
+installing_pack = "कौशल पैक अपलोड हो रहा है"
 updating = "अपडेट अपलोड हो रहा है"
+updating_pack = "कौशल पैक अपडेट अपलोड हो रहा है"
 cancelling = "अपलोड रद्द हो रहा है"
 
 [skills.diagnostics]

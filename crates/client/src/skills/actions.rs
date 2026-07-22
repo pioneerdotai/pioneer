@@ -2,8 +2,9 @@
 
 use super::catalog;
 use pioneer_protocol::{
-    SkillId, SkillLifecycleSource, SkillListItem, SkillsInstallParams, SkillsPolicySetParams,
-    SkillsUninstallParams, SkillsUpdateParams,
+    SkillId, SkillLifecycleSource, SkillListItem, SkillPackId, SkillsInstallParams,
+    SkillsPackInstallParams, SkillsPackUninstallParams, SkillsPackUpdateParams,
+    SkillsPolicySetParams, SkillsUninstallParams, SkillsUpdateParams,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -138,6 +139,43 @@ pub fn skills_uninstall_params(
     }
 }
 
+pub fn skills_pack_install_uploaded_archive_params(
+    workspace_id: impl Into<String>,
+    upload_id: impl Into<String>,
+) -> SkillsPackInstallParams {
+    SkillsPackInstallParams {
+        workspace_id: workspace_id.into(),
+        source: SkillLifecycleSource::UploadedArchive {
+            upload_id: upload_id.into(),
+        },
+        target_source_kind: "user".to_owned(),
+    }
+}
+
+pub fn skills_pack_update_uploaded_archive_params(
+    workspace_id: impl Into<String>,
+    pack_id: SkillPackId,
+    upload_id: impl Into<String>,
+) -> SkillsPackUpdateParams {
+    SkillsPackUpdateParams {
+        workspace_id: workspace_id.into(),
+        pack_id,
+        source: SkillLifecycleSource::UploadedArchive {
+            upload_id: upload_id.into(),
+        },
+    }
+}
+
+pub fn skills_pack_uninstall_params(
+    workspace_id: impl Into<String>,
+    pack_id: SkillPackId,
+) -> SkillsPackUninstallParams {
+    SkillsPackUninstallParams {
+        workspace_id: workspace_id.into(),
+        pack_id,
+    }
+}
+
 pub fn skills_policy_set_params(
     workspace_id: impl Into<String>,
     skill_id: SkillId,
@@ -198,6 +236,77 @@ pub struct SkillActionFinishReduction {
     pub error: Option<String>,
     pub queue_refresh: bool,
     pub rollback_policy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPackActionTarget {
+    pub pack_id: SkillPackId,
+}
+
+impl SkillPackActionTarget {
+    pub fn new(pack_id: SkillPackId) -> Self {
+        Self { pack_id }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillPackActionFinishKind {
+    Install,
+    Update(SkillPackActionTarget),
+    Uninstall(SkillPackActionTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPackPendingReduction {
+    pub target: SkillPackActionTarget,
+    pub pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPackActionFinishReduction {
+    pub loading: Option<bool>,
+    pub clear_upload_state: bool,
+    pub pending: Option<SkillPackPendingReduction>,
+    pub error: Option<String>,
+    pub queue_refresh: bool,
+}
+
+pub fn reduce_skill_pack_action_finish(
+    kind: SkillPackActionFinishKind,
+    outcome: SkillActionFinishOutcome,
+) -> SkillPackActionFinishReduction {
+    let (loading, clear_upload_state, pending) = match kind {
+        SkillPackActionFinishKind::Install => (Some(false), true, None),
+        SkillPackActionFinishKind::Update(target) => (
+            None,
+            true,
+            Some(SkillPackPendingReduction {
+                target,
+                pending: false,
+            }),
+        ),
+        SkillPackActionFinishKind::Uninstall(target) => (
+            None,
+            false,
+            Some(SkillPackPendingReduction {
+                target,
+                pending: false,
+            }),
+        ),
+    };
+
+    let (error, queue_refresh) = match outcome {
+        SkillActionFinishOutcome::Success => (None, true),
+        SkillActionFinishOutcome::Failure { error } => (Some(error), false),
+    };
+
+    SkillPackActionFinishReduction {
+        loading,
+        clear_upload_state,
+        pending,
+        error,
+        queue_refresh,
+    }
 }
 
 pub fn reduce_skill_action_finish(
@@ -305,6 +414,10 @@ mod tests {
         SkillId::new(seed.chars().cycle().take(21).collect::<String>()).unwrap()
     }
 
+    fn test_pack_id(character: char) -> SkillPackId {
+        SkillPackId::new(character.to_string().repeat(21)).expect("valid test pack id")
+    }
+
     fn skill(
         slug: &str,
         source_kind: &str,
@@ -314,6 +427,7 @@ mod tests {
     ) -> SkillListItem {
         SkillListItem {
             skill_id: test_id(slug, source_kind),
+            pack: None,
             owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),
@@ -517,6 +631,76 @@ mod tests {
         assert_eq!(policy.skill_id, alpha_id);
         assert_eq!(policy.enabled, Some(true));
         assert_eq!(policy.allow_implicit_invocation, Some(false));
+    }
+
+    #[test]
+    fn skill_pack_action_params_preserve_pack_identity_and_upload_source() {
+        let install = skills_pack_install_uploaded_archive_params("workspace", "upload-install");
+        assert_eq!(install.workspace_id, "workspace");
+        assert_eq!(install.target_source_kind, "user");
+        assert!(matches!(
+            install.source,
+            SkillLifecycleSource::UploadedArchive { ref upload_id }
+                if upload_id == "upload-install"
+        ));
+
+        let pack_id = test_pack_id('P');
+        let update = skills_pack_update_uploaded_archive_params(
+            "workspace",
+            pack_id.clone(),
+            "upload-update",
+        );
+        assert_eq!(update.workspace_id, "workspace");
+        assert_eq!(update.pack_id, pack_id);
+        assert!(matches!(
+            update.source,
+            SkillLifecycleSource::UploadedArchive { ref upload_id }
+                if upload_id == "upload-update"
+        ));
+
+        let uninstall = skills_pack_uninstall_params("workspace", pack_id.clone());
+        assert_eq!(uninstall.workspace_id, "workspace");
+        assert_eq!(uninstall.pack_id, pack_id);
+    }
+
+    #[test]
+    fn skill_pack_action_finish_reducer_tracks_group_lifecycle_state() {
+        let target = SkillPackActionTarget::new(test_pack_id('P'));
+        let update = reduce_skill_pack_action_finish(
+            SkillPackActionFinishKind::Update(target.clone()),
+            SkillActionFinishOutcome::Failure {
+                error: "update failed".to_owned(),
+            },
+        );
+        assert_eq!(update.loading, None);
+        assert!(update.clear_upload_state);
+        assert_eq!(
+            update.pending,
+            Some(SkillPackPendingReduction {
+                target: target.clone(),
+                pending: false,
+            })
+        );
+        assert_eq!(update.error.as_deref(), Some("update failed"));
+        assert!(!update.queue_refresh);
+
+        let uninstall = reduce_skill_pack_action_finish(
+            SkillPackActionFinishKind::Uninstall(target),
+            SkillActionFinishOutcome::Success,
+        );
+        assert!(!uninstall.clear_upload_state);
+        assert!(uninstall.pending.is_some());
+        assert!(uninstall.error.is_none());
+        assert!(uninstall.queue_refresh);
+
+        let install = reduce_skill_pack_action_finish(
+            SkillPackActionFinishKind::Install,
+            SkillActionFinishOutcome::Success,
+        );
+        assert_eq!(install.loading, Some(false));
+        assert!(install.clear_upload_state);
+        assert!(install.pending.is_none());
+        assert!(install.queue_refresh);
     }
 
     #[test]

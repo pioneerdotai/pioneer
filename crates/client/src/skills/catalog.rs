@@ -4,7 +4,7 @@ use super::{health as skill_health, presentation};
 use anyhow::Result;
 use pioneer_protocol::{
     SkillHealthItem, SkillId, SkillListItem, SkillListParams, SkillListResponse,
-    SkillsHealthParams, SkillsHealthResponse,
+    SkillPackInstallationItem, SkillsHealthParams, SkillsHealthResponse,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 pub struct SkillCatalogState {
     pub installed: Vec<SkillListItem>,
     pub catalog: Vec<SkillListItem>,
+    #[serde(default)]
+    pub management: SkillManagementProjection,
     pub health_details: HashMap<SkillId, SkillHealthItem>,
     pub loading: bool,
     pub error: Option<String>,
@@ -27,7 +29,24 @@ pub struct SkillCatalogState {
 pub struct SkillsCatalogSnapshot {
     pub catalog: Vec<SkillListItem>,
     pub installed: Vec<SkillListItem>,
+    #[serde(default)]
+    pub management: SkillManagementProjection,
     pub health_details: HashMap<SkillId, SkillHealthItem>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillManagementProjection {
+    pub standalone: Vec<SkillListItem>,
+    pub packs: Vec<SkillPackManagementRow>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillPackManagementRow {
+    pub pack: SkillPackInstallationItem,
+    pub children: Vec<SkillListItem>,
+    pub attachable: bool,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -50,6 +69,7 @@ pub struct ReconciledSkillsSnapshot {
 pub struct SkillsCatalogRefreshSuccessReduction {
     pub catalog: Vec<SkillListItem>,
     pub installed: Vec<SkillListItem>,
+    pub management: SkillManagementProjection,
     pub health_details: HashMap<SkillId, SkillHealthItem>,
     pub pending_actions: HashSet<SkillId>,
     pub selected_target: Option<SkillId>,
@@ -140,14 +160,87 @@ pub fn project_skills_snapshot(
     catalog: Vec<SkillListItem>,
     health_items: Vec<SkillHealthItem>,
 ) -> SkillsCatalogSnapshot {
-    let SkillsCatalogSplit { catalog, installed } = derive_skills_catalog_and_installed(catalog);
+    project_skills_list_snapshot(
+        SkillListResponse {
+            snapshot_version: 0,
+            generated_at: 0,
+            skills: catalog,
+            packs: Vec::new(),
+        },
+        health_items,
+    )
+}
+
+pub fn project_skills_list_snapshot(
+    list: SkillListResponse,
+    health_items: Vec<SkillHealthItem>,
+) -> SkillsCatalogSnapshot {
+    let SkillListResponse { skills, packs, .. } = list;
+    let SkillsCatalogSplit { catalog, installed } = derive_skills_catalog_and_installed(skills);
+    let management = project_skill_management(installed.as_slice(), packs);
     let health_details = skill_health::health_details_map(health_items);
 
     SkillsCatalogSnapshot {
         catalog,
         installed,
+        management,
         health_details,
     }
+}
+
+pub fn project_skill_management(
+    installed: &[SkillListItem],
+    mut packs: Vec<SkillPackInstallationItem>,
+) -> SkillManagementProjection {
+    let mut standalone = installed
+        .iter()
+        .filter(|skill| skill.pack.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    standalone.sort_by(skill_management_order);
+
+    packs.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut children_by_pack = HashMap::<_, Vec<_>>::new();
+    for skill in installed.iter().filter(|skill| skill.pack.is_some()) {
+        let membership = skill.pack.as_ref().expect("membership checked above");
+        children_by_pack
+            .entry(membership.pack_id.clone())
+            .or_default()
+            .push(skill.clone());
+    }
+
+    let packs = packs
+        .into_iter()
+        .map(|pack| {
+            let mut children = children_by_pack.remove(&pack.id).unwrap_or_default();
+            children.sort_by(|left, right| {
+                let left_membership = left.pack.as_ref().expect("packed child membership");
+                let right_membership = right.pack.as_ref().expect("packed child membership");
+                left_membership
+                    .member_key
+                    .cmp(&right_membership.member_key)
+                    .then_with(|| left.skill_id.cmp(&right.skill_id))
+            });
+            SkillPackManagementRow {
+                attachable: !children.is_empty(),
+                pack,
+                children,
+            }
+        })
+        .collect();
+
+    SkillManagementProjection { standalone, packs }
+}
+
+fn skill_management_order(left: &SkillListItem, right: &SkillListItem) -> std::cmp::Ordering {
+    left.source_kind
+        .cmp(&right.source_kind)
+        .then_with(|| left.slug.cmp(&right.slug))
+        .then_with(|| left.skill_id.cmp(&right.skill_id))
 }
 
 pub fn load_skills_snapshot<TTransport>(
@@ -168,7 +261,7 @@ where
             .skills
     };
 
-    Ok(project_skills_snapshot(list.skills, health_items))
+    Ok(project_skills_list_snapshot(list, health_items))
 }
 
 pub fn reconcile_skills_snapshot(
@@ -205,6 +298,7 @@ pub fn reduce_skills_catalog_refresh_success(
     SkillsCatalogRefreshSuccessReduction {
         catalog: snapshot.catalog,
         installed: snapshot.installed,
+        management: snapshot.management,
         health_details: snapshot.health_details,
         pending_actions,
         selected_target: reconciled.selected_target,
@@ -273,7 +367,9 @@ pub fn selected_skill_still_present(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{SkillHealthSummary, SkillInstallState, SkillPolicyState};
+    use pioneer_protocol::{
+        SkillHealthSummary, SkillInstallState, SkillPackId, SkillPackMembership, SkillPolicyState,
+    };
     use std::cell::RefCell;
 
     fn skill_id(slug: &str, source_kind: &str) -> SkillId {
@@ -287,6 +383,7 @@ mod tests {
     fn skill(slug: &str, source_kind: &str, installed: bool) -> SkillListItem {
         SkillListItem {
             skill_id: skill_id(slug, source_kind),
+            pack: None,
             owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),
@@ -316,6 +413,29 @@ mod tests {
             status: "active".to_owned(),
             status_reason: None,
         }
+    }
+
+    fn pack(character: char, name: &str) -> SkillPackInstallationItem {
+        SkillPackInstallationItem {
+            id: SkillPackId::new(character.to_string().repeat(21)).expect("test pack id"),
+            name: name.to_owned(),
+            source_kind: "user".to_owned(),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    fn packed_skill(
+        slug: &str,
+        pack: &SkillPackInstallationItem,
+        member_key: &str,
+    ) -> SkillListItem {
+        let mut skill = skill(slug, "user", true);
+        skill.pack = Some(SkillPackMembership {
+            pack_id: pack.id.clone(),
+            member_key: member_key.to_owned(),
+        });
+        skill
     }
 
     fn health(slug: &str, source_kind: &str) -> SkillHealthItem {
@@ -391,6 +511,90 @@ mod tests {
     }
 
     #[test]
+    fn management_projection_groups_current_children_and_preserves_empty_parents() {
+        let populated = pack('P', "Research");
+        let empty = pack('Z', "Empty");
+        let standalone = skill("standalone", "user", true);
+        let mut first = packed_skill("browser", &populated, "z-browser");
+        first.skill_id = SkillId::new("B".repeat(21)).expect("skill id");
+        let mut second = packed_skill("reviewer", &populated, "a-reviewer");
+        second.skill_id = SkillId::new("R".repeat(21)).expect("skill id");
+
+        let projection = project_skill_management(
+            &[first, standalone.clone(), second],
+            vec![populated.clone(), empty.clone()],
+        );
+
+        assert_eq!(projection.standalone, vec![standalone]);
+        assert_eq!(projection.packs.len(), 2);
+        assert_eq!(
+            projection
+                .packs
+                .iter()
+                .map(|row| row.pack.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Empty", "Research"]
+        );
+        let empty_row = projection
+            .packs
+            .iter()
+            .find(|row| row.pack.id == empty.id)
+            .expect("empty pack row");
+        assert!(empty_row.children.is_empty());
+        assert!(!empty_row.attachable);
+
+        let populated_row = projection
+            .packs
+            .iter()
+            .find(|row| row.pack.id == populated.id)
+            .expect("populated pack row");
+        assert!(populated_row.attachable);
+        assert_eq!(
+            populated_row
+                .children
+                .iter()
+                .map(|skill| { skill.pack.as_ref().expect("membership").member_key.as_str() })
+                .collect::<Vec<_>>(),
+            vec!["a-reviewer", "z-browser"]
+        );
+        assert_eq!(populated_row.pack.name, "Research");
+    }
+
+    #[test]
+    fn management_projection_orders_equal_member_keys_by_skill_id() {
+        let parent = pack('P', "Research");
+        let mut second = packed_skill("same", &parent, "member");
+        second.skill_id = SkillId::new("B".repeat(21)).expect("skill id");
+        let mut first = packed_skill("same", &parent, "member");
+        first.skill_id = SkillId::new("A".repeat(21)).expect("skill id");
+
+        let projection = project_skill_management(&[second, first], vec![parent]);
+
+        assert_eq!(
+            projection.packs[0]
+                .children
+                .iter()
+                .map(|skill| skill.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AAAAAAAAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBBBBBBBB"]
+        );
+    }
+
+    #[test]
+    fn old_snapshot_payload_defaults_management_projection() {
+        let value = serde_json::json!({
+            "catalog": [],
+            "installed": [],
+            "health_details": {}
+        });
+
+        let snapshot: SkillsCatalogSnapshot =
+            serde_json::from_value(value).expect("old snapshot payload");
+
+        assert_eq!(snapshot.management, SkillManagementProjection::default());
+    }
+
+    #[test]
     fn pending_and_selected_target_helpers_use_canonical_keys() {
         let mut pending = HashSet::new();
         let alpha_id = skill_id("alpha", "user");
@@ -409,13 +613,15 @@ mod tests {
 
     #[test]
     fn load_snapshot_orchestrates_list_then_health() {
-        let transport = FakeSkillSnapshotTransport::new(
+        let parent = pack('P', "Research");
+        let mut transport = FakeSkillSnapshotTransport::new(
             vec![
-                skill("alpha", "user", true),
+                packed_skill("alpha", &parent, "alpha"),
                 skill("beta", "registry", false),
             ],
             vec![health("alpha", "user")],
         );
+        transport.packs.push(parent);
 
         let snapshot = load_skills_snapshot(&transport, "workspace").expect("snapshot");
 
@@ -425,6 +631,8 @@ mod tests {
         );
         assert_eq!(snapshot.catalog.len(), 2);
         assert_eq!(snapshot.installed.len(), 1);
+        assert_eq!(snapshot.management.packs.len(), 1);
+        assert_eq!(snapshot.management.packs[0].children.len(), 1);
         assert!(
             snapshot
                 .health_details
@@ -525,6 +733,7 @@ mod tests {
 
     struct FakeSkillSnapshotTransport {
         skills: Vec<SkillListItem>,
+        packs: Vec<SkillPackInstallationItem>,
         health: Vec<SkillHealthItem>,
         requests: RefCell<Vec<String>>,
     }
@@ -533,6 +742,7 @@ mod tests {
         fn new(skills: Vec<SkillListItem>, health: Vec<SkillHealthItem>) -> Self {
             Self {
                 skills,
+                packs: Vec::new(),
                 health,
                 requests: RefCell::new(Vec::new()),
             }
@@ -548,6 +758,7 @@ mod tests {
                 snapshot_version: 1,
                 generated_at: 1,
                 skills: self.skills.clone(),
+                packs: self.packs.clone(),
             })
         }
 

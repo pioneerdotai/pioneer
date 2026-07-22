@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use pioneer_entity::skill_upload_session;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
     QueryFilter, QueryOrder, Set,
 };
 
-pub async fn upsert_skill_upload_session<C: ConnectionTrait>(
+pub async fn insert_skill_upload_session<C: ConnectionTrait>(
     db: &C,
     record: &crate::SkillUploadSessionRecord,
     created_at: DateTimeWithTimeZone,
@@ -32,31 +32,11 @@ pub async fn upsert_skill_upload_session<C: ConnectionTrait>(
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })
-    .on_conflict(
-        OnConflict::column(skill_upload_session::Column::UploadId)
-            .update_columns([
-                skill_upload_session::Column::WorkspaceId,
-                skill_upload_session::Column::ConnectionId,
-                skill_upload_session::Column::Status,
-                skill_upload_session::Column::FileName,
-                skill_upload_session::Column::ArchiveFormat,
-                skill_upload_session::Column::CompressedSizeBytes,
-                skill_upload_session::Column::ReceivedBytes,
-                skill_upload_session::Column::Sha256,
-                skill_upload_session::Column::PayloadPath,
-                skill_upload_session::Column::ExpiresAtUnix,
-                skill_upload_session::Column::FinalizedAtUnix,
-                skill_upload_session::Column::ConsumedAtUnix,
-                skill_upload_session::Column::AbortedAtUnix,
-                skill_upload_session::Column::UpdatedAt,
-            ])
-            .to_owned(),
-    )
     .exec(db)
     .await
     .with_context(|| {
         format!(
-            "failed to upsert skill upload session `{}`",
+            "failed to insert skill upload session `{}`",
             record.upload_id
         )
     })?;
@@ -130,34 +110,62 @@ pub async fn update_skill_upload_received_bytes<C: ConnectionTrait>(
     Ok(Some(updated))
 }
 
-pub async fn update_skill_upload_status<C: ConnectionTrait>(
+pub async fn transition_skill_upload_status<C: ConnectionTrait>(
     db: &C,
     upload_id: &str,
+    expected_statuses: &[&str],
     status: &str,
     finalized_at_unix: Option<i64>,
     consumed_at_unix: Option<i64>,
     aborted_at_unix: Option<i64>,
     updated_at: DateTimeWithTimeZone,
-) -> Result<Option<skill_upload_session::Model>> {
-    let Some(model) = find_skill_upload_session(db, upload_id).await? else {
-        return Ok(None);
-    };
-
-    let mut active = model.into_active_model();
-    active.status = Set(status.to_owned());
-    if finalized_at_unix.is_some() {
-        active.finalized_at_unix = Set(finalized_at_unix);
+) -> Result<bool> {
+    if expected_statuses.is_empty() {
+        anyhow::bail!("skill upload transition requires at least one expected status");
     }
-    if consumed_at_unix.is_some() {
-        active.consumed_at_unix = Set(consumed_at_unix);
+    let mut update = skill_upload_session::Entity::update_many()
+        .filter(skill_upload_session::Column::UploadId.eq(upload_id.to_owned()))
+        .filter(
+            skill_upload_session::Column::Status.is_in(
+                expected_statuses
+                    .iter()
+                    .map(|status| (*status).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .filter(skill_upload_session::Column::ConsumedAtUnix.is_null())
+        .filter(skill_upload_session::Column::AbortedAtUnix.is_null())
+        .col_expr(
+            skill_upload_session::Column::Status,
+            Expr::value(status.to_owned()),
+        )
+        .col_expr(
+            skill_upload_session::Column::UpdatedAt,
+            Expr::value(updated_at),
+        );
+    if let Some(finalized_at_unix) = finalized_at_unix {
+        update = update.col_expr(
+            skill_upload_session::Column::FinalizedAtUnix,
+            Expr::value(finalized_at_unix),
+        );
     }
-    if aborted_at_unix.is_some() {
-        active.aborted_at_unix = Set(aborted_at_unix);
+    if let Some(consumed_at_unix) = consumed_at_unix {
+        update = update.col_expr(
+            skill_upload_session::Column::ConsumedAtUnix,
+            Expr::value(consumed_at_unix),
+        );
     }
-    active.updated_at = Set(updated_at);
-    let updated = active
-        .update(db)
-        .await
-        .with_context(|| format!("failed to update status for upload `{upload_id}`"))?;
-    Ok(Some(updated))
+    if let Some(aborted_at_unix) = aborted_at_unix {
+        update = update.col_expr(
+            skill_upload_session::Column::AbortedAtUnix,
+            Expr::value(aborted_at_unix),
+        );
+    }
+    let result = update.exec(db).await.with_context(|| {
+        format!(
+            "failed to transition upload `{upload_id}` from [{}] to `{status}`",
+            expected_statuses.join(", ")
+        )
+    })?;
+    Ok(result.rows_affected == 1)
 }

@@ -18,6 +18,10 @@ use super::{
         ComposerModelSelection, ComposerModelSelectionState, default_composer_turn_mode,
     },
     permissions::default_composer_permission_mode,
+    skill_selection::{
+        ComposerSkillPickerProjection, ComposerSkillSelection, normalize_composer_skill_selections,
+        reduce_composer_skill_selection_toggle,
+    },
     turn_prepare::{
         apply_uploaded_composer_attachment_artifacts, mark_pending_composer_attachments_uploading,
         mark_uploading_composer_attachments_failed,
@@ -34,6 +38,8 @@ pub struct ComposerDomainState {
     pub attachments: Vec<ComposerAttachment>,
     #[serde(default)]
     pub capabilities: Vec<ComposerCapability>,
+    #[serde(default)]
+    pub skill_selections: Vec<ComposerSkillSelection>,
     #[serde(default = "default_composer_turn_mode")]
     pub selected_mode: ThreadMode,
     #[serde(default)]
@@ -56,6 +62,7 @@ impl Default for ComposerDomainState {
         Self {
             attachments: Vec::new(),
             capabilities: Vec::new(),
+            skill_selections: Vec::new(),
             selected_mode: default_composer_turn_mode(),
             mode_manually_selected: false,
             selected_provider: None,
@@ -121,6 +128,13 @@ pub enum ComposerDomainAction {
     },
     RemoveCapabilityAt {
         index: usize,
+    },
+    SetSkillSelections {
+        selections: Vec<ComposerSkillSelection>,
+    },
+    ToggleSkillSelection {
+        picker: ComposerSkillPickerProjection,
+        selection: ComposerSkillSelection,
     },
     SetModeFromUser {
         mode: ThreadMode,
@@ -222,6 +236,17 @@ pub fn reduce_composer_domain_state(
         ComposerDomainAction::RemoveCapabilityAt { index } => {
             remove_composer_capability_at(&mut next.capabilities, index);
         }
+        ComposerDomainAction::SetSkillSelections { selections } => {
+            next.skill_selections = normalize_composer_skill_selections(selections);
+        }
+        ComposerDomainAction::ToggleSkillSelection { picker, selection } => {
+            next.skill_selections = reduce_composer_skill_selection_toggle(
+                next.skill_selections.as_slice(),
+                &picker,
+                selection,
+            )
+            .selections;
+        }
         ComposerDomainAction::SetModeFromUser { mode } => {
             next.selected_mode = mode;
             next.mode_manually_selected = true;
@@ -292,14 +317,16 @@ pub fn reduce_composer_domain_state(
         ComposerDomainAction::ClearPayload => {
             next.attachments.clear();
             next.capabilities.clear();
+            next.skill_selections.clear();
         }
         ComposerDomainAction::Reset { defaults } => {
             next = defaults;
         }
     }
 
-    let payload_changed =
-        next.attachments != state.attachments || next.capabilities != state.capabilities;
+    let payload_changed = next.attachments != state.attachments
+        || next.capabilities != state.capabilities
+        || next.skill_selections != state.skill_selections;
     let model_selection_changed = next.selected_provider != state.selected_provider
         || next.selected_model != state.selected_model
         || next.selected_reasoning_effort != state.selected_reasoning_effort
@@ -346,7 +373,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::composer::capabilities::ComposerCapabilityKind;
-    use pioneer_protocol::{McpScopeKind, SkillId};
+    use pioneer_protocol::{McpScopeKind, SkillId, SkillPackId};
 
     fn mcp_capability() -> ComposerCapability {
         ComposerCapability {
@@ -375,8 +402,10 @@ mod tests {
 
     #[test]
     fn draft_round_trip_preserves_exact_skill_id_and_label_snapshot() {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
         let state = ComposerDomainState {
             capabilities: vec![skill_capability()],
+            skill_selections: vec![ComposerSkillSelection::SkillPack { pack_id }],
             ..ComposerDomainState::default()
         };
 
@@ -391,6 +420,43 @@ mod tests {
             ComposerCapabilityKind::Skill { ref skill_id, .. }
                 if skill_id.as_str() == "RRRRRRRRRRRRRRRRRRRRR"
         ));
+        assert_eq!(decoded.skill_selections, state.skill_selections);
+    }
+
+    #[test]
+    fn set_skill_selections_normalizes_full_and_partial_pack_intent() {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+        let child = ComposerSkillSelection::Skill {
+            skill_id: SkillId::new("C".repeat(21)).expect("skill id"),
+            pack_id: Some(pack_id.clone()),
+        };
+        let standalone = ComposerSkillSelection::Skill {
+            skill_id: SkillId::new("S".repeat(21)).expect("skill id"),
+            pack_id: None,
+        };
+        let full = ComposerSkillSelection::SkillPack { pack_id };
+
+        let transition = reduce_composer_domain_state(
+            &ComposerDomainState::default(),
+            ComposerDomainAction::SetSkillSelections {
+                selections: vec![child, standalone.clone(), full.clone()],
+            },
+        );
+
+        assert_eq!(transition.state.skill_selections, vec![standalone, full]);
+        assert!(transition.payload_changed);
+    }
+
+    #[test]
+    fn old_domain_state_payload_defaults_skill_selections() {
+        let value = serde_json::to_value(ComposerDomainState::default()).expect("state value");
+        let mut object = value.as_object().expect("state object").clone();
+        object.remove("skill_selections");
+
+        let decoded: ComposerDomainState =
+            serde_json::from_value(serde_json::Value::Object(object)).expect("old state payload");
+
+        assert!(decoded.skill_selections.is_empty());
     }
 
     #[test]
@@ -460,6 +526,9 @@ mod tests {
                 upload_state: super::super::attachments::ComposerAttachmentUploadState::Local,
             }],
             capabilities: vec![mcp_capability()],
+            skill_selections: vec![ComposerSkillSelection::SkillPack {
+                pack_id: SkillPackId::new("P".repeat(21)).expect("pack id"),
+            }],
             selected_provider: Some("openai".to_owned()),
             selected_model: Some("gpt-5".to_owned()),
             selected_reasoning_effort: Some("high".to_owned()),
@@ -479,6 +548,7 @@ mod tests {
         let cleared = reduce_composer_domain_state(&changed, ComposerDomainAction::ClearPayload);
         assert!(cleared.state.attachments.is_empty());
         assert!(cleared.state.capabilities.is_empty());
+        assert!(cleared.state.skill_selections.is_empty());
         assert_eq!(cleared.state.selected_model.as_deref(), Some("gpt-5.1"));
         assert_eq!(
             cleared.state.selected_permission_mode,

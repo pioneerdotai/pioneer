@@ -7,6 +7,13 @@
       "type": "integer",
       "format": "int64"
     },
+    "packs": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SkillPackInstallationItem"
+      }
+    },
     "skills": {
       "type": "array",
       "default": [],
@@ -142,6 +149,16 @@
             "null"
           ]
         },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "policy": {
           "$ref": "#/$defs/SkillPolicyState"
         },
@@ -185,6 +202,56 @@
         "policy",
         "health",
         "status"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackInstallationItem": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "source_kind",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "SkillPackMembership": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key"
       ]
     },
     "SkillPolicyState": {

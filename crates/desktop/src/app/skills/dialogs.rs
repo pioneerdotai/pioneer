@@ -1,11 +1,12 @@
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
-use pioneer_protocol::SkillId;
+use pioneer_protocol::{SkillId, SkillPackId};
 
 #[derive(Clone)]
 enum SkillSourcePickerTarget {
     Install,
     Update { skill_id: SkillId },
+    UpdatePack { pack_id: SkillPackId },
 }
 
 #[derive(Copy, Clone)]
@@ -29,6 +30,50 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         self.open_skill_source_picker(SkillSourcePickerTarget::Update { skill_id }, window, cx);
+    }
+
+    pub(super) fn open_skill_pack_update_dialog(
+        &mut self,
+        pack_id: SkillPackId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_skill_source_picker(SkillSourcePickerTarget::UpdatePack { pack_id }, window, cx);
+    }
+
+    pub(super) fn confirm_uninstall_skill_pack(
+        &mut self,
+        pack_id: SkillPackId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = t!("skills.dialog.uninstall_pack_title", name = name.as_str()).to_string();
+        let description = t!("skills.dialog.uninstall_pack_description").to_string();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            title.as_str(),
+            Some(description.as_str()),
+            &[
+                PromptButton::new(t!("skills.button.uninstall").to_string()),
+                PromptButton::cancel(t!("buttons.cancel").to_string()),
+            ],
+            cx,
+        );
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                if answer.await != Ok(0) {
+                    return;
+                }
+                let _ = this.update(&mut cx, |view, cx| {
+                    view.uninstall_skill_pack(pack_id, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn open_skill_source_picker(
@@ -101,6 +146,9 @@ impl PioneerDesktop {
             SkillSourcePickerTarget::Install => self.install_skill_from_path(source_path, cx),
             SkillSourcePickerTarget::Update { skill_id } => {
                 self.update_skill_from_path(skill_id, source_path, cx)
+            }
+            SkillSourcePickerTarget::UpdatePack { pack_id } => {
+                self.update_skill_pack_from_path(pack_id, source_path, cx)
             }
         }
     }

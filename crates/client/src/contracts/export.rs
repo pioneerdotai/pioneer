@@ -1565,6 +1565,41 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "composer_skill_chip.json",
+            crate::composer::skill_selection::ComposerSkillChip,
+            Domain::Composer,
+            Kind::PresentationDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "composer_skill_chip_kind.json",
+            crate::composer::skill_selection::ComposerSkillChipKind,
+            Domain::Composer,
+            Kind::PresentationDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "composer_skill_picker_projection.json",
+            crate::composer::skill_selection::ComposerSkillPickerProjection,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "composer_skill_selection.json",
+            crate::composer::skill_selection::ComposerSkillSelection,
+            Domain::Composer,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "composer_skill_selection_reduction.json",
+            crate::composer::skill_selection::ComposerSkillSelectionReduction,
+            Domain::Composer,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
             "remote_gateway_validation.json",
             crate::gateway::setup::RemoteGatewayValidation,
             Domain::Connection,
@@ -1600,11 +1635,25 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "selectable_packed_skill_capability.json",
+            crate::composer::skill_selection::SelectablePackedSkillCapability,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
             "selectable_skill_capability.json",
             crate::composer::capabilities::SelectableSkillCapability,
             Domain::Composer,
             Kind::SelectorDto,
             Stability::Stable
+        ),
+        contract_type!(
+            "selectable_skill_pack_capability.json",
+            crate::composer::skill_selection::SelectableSkillPackCapability,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Provisional
         ),
         contract_type!(
             "skill_audit_action.json",
@@ -1703,6 +1752,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Skills,
             Kind::PresentationDto,
             Stability::Stable
+        ),
+        contract_type!(
+            "skill_management_projection.json",
+            crate::skills::catalog::SkillManagementProjection,
+            Domain::Skills,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "skill_pack_management_row.json",
+            crate::skills::catalog::SkillPackManagementRow,
+            Domain::Skills,
+            Kind::SelectorDto,
+            Stability::Provisional
         ),
         contract_type!(
             "skill_security_card.json",

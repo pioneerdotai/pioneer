@@ -1067,13 +1067,21 @@ installed_count = "Gefunden:"
 title = "Keine installierten Fähigkeiten"
 description = "Installieren Sie neue Fähigkeiten und erweitern Sie die Möglichkeiten Ihrer Agenten."
 
+[skills.dialog]
+uninstall_pack_title = "%{name} deinstallieren?"
+uninstall_pack_description = "Entfernt dieses Skill-Paket und alle aktuell darin installierten Skills aus dem Arbeitsbereich."
+
 [skills.error]
 gateway_not_connected = "Gateway ist nicht verbunden."
 workspace_not_selected = "Kein aktiver Arbeitsbereich ausgewählt."
 load_failed = "Installierte Fähigkeiten konnten nicht geladen werden"
 path_required = "Pfad ist erforderlich."
 invalid_skill_target = "Ungültiges Fähigkeitsziel."
+invalid_pack_target = "Ungültiges Skill-Paket-Ziel."
 install_failed = "Fähigkeit konnte nicht installiert werden"
+install_pack_failed = "Skill-Paket konnte nicht installiert werden"
+update_pack_failed = "Skill-Paket konnte nicht aktualisiert werden"
+uninstall_pack_failed = "Skill-Paket konnte nicht deinstalliert werden"
 update_failed = "Fähigkeit konnte nicht aktualisiert werden"
 uninstall_failed = "Fähigkeit konnte nicht deinstalliert werden"
 policy_failed = "Fähigkeitsrichtlinie konnte nicht aktualisiert werden"
@@ -1082,6 +1090,9 @@ path_picker_failed = "Quellenauswahl konnte nicht geöffnet werden"
 [skills.card]
 version = "Version"
 fingerprint = "Fingerabdruck"
+skill_count_one = "%{count} Fähigkeit"
+skill_count_few = "%{count} Fähigkeiten"
+skill_count_many = "%{count} Fähigkeiten"
 
 [skills.status]
 active = "Aktiv"
@@ -1109,7 +1120,9 @@ implicit = "Implizit"
 [skills.upload]
 preparing = "Upload der Fähigkeit wird vorbereitet"
 installing = "Fähigkeit wird hochgeladen"
+installing_pack = "Skill-Paket wird hochgeladen"
 updating = "Aktualisierung wird hochgeladen"
+updating_pack = "Skill-Paket-Aktualisierung wird hochgeladen"
 cancelling = "Upload wird abgebrochen"
 
 [skills.diagnostics]

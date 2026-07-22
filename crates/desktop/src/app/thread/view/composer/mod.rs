@@ -35,7 +35,8 @@ impl PioneerDesktop {
                 .is_some_and(|conversation| conversation.can_submit_message()),
             text: composer_text.as_str(),
             has_attachments: !self.composer_attachments.is_empty(),
-            has_capabilities: !effective_capabilities.is_empty(),
+            has_capabilities: !effective_capabilities.is_empty()
+                || !self.composer_skill_selections.is_empty(),
         })
     }
 }

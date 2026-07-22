@@ -5476,28 +5476,61 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
     mut skill_lookup: impl FnMut(
         &pioneer_protocol::SkillId,
     ) -> Option<(Option<&'a str>, &'a str, &'a str)>,
+    pack_names: &HashMap<pioneer_protocol::SkillPackId, String>,
 ) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
     capabilities
         .iter()
         .map(|capability| {
             Ok(match &capability.kind {
-                pioneer_protocol::TurnCapabilityKind::Skill { skill_id } => {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id, pack_id } => {
                     let (owner, slug, source_kind) = skill_lookup(skill_id).ok_or_else(|| {
                     anyhow::anyhow!(
                         "missing immutable presentation snapshot for selected skill `{skill_id}`"
                     )
-                })?;
+                    })?;
                     let fallback_label = pioneer_skills::compact_skill_label(owner, slug);
+                    let pack = pack_id
+                        .as_ref()
+                        .map(|pack_id| {
+                            pack_names
+                                .get(pack_id)
+                                .map(|name| pioneer_protocol::TurnSkillPackPresentationSummary {
+                                    pack_id: pack_id.clone(),
+                                    label: name.clone(),
+                                })
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "missing immutable presentation snapshot for selected skill pack `{pack_id}`"
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    let label = if pack.is_some() {
+                        fallback_label
+                    } else {
+                        capability_label(capability.label.as_deref(), fallback_label.as_str())
+                    };
                     pioneer_protocol::UserMessageAttachment::Skill {
                         capability: pioneer_protocol::TurnSkillCapabilitySummary {
                             skill_id: skill_id.clone(),
-                            label: capability_label(
-                                capability.label.as_deref(),
-                                fallback_label.as_str(),
-                            ),
+                            label,
                             owner: owner.map(str::to_owned),
                             slug: slug.to_owned(),
                             source_kind: source_kind.to_owned(),
+                            pack,
+                        },
+                    }
+                }
+                pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
+                    let name = pack_names.get(pack_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing immutable presentation snapshot for selected skill pack `{pack_id}`"
+                        )
+                    })?;
+                    pioneer_protocol::UserMessageAttachment::SkillPack {
+                        capability: pioneer_protocol::TurnSkillPackCapabilitySummary {
+                            pack_id: pack_id.clone(),
+                            label: name.clone(),
                         },
                     }
                 }
@@ -5535,38 +5568,48 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
 pub(super) fn user_message_attachments_from_capabilities_and_catalog(
     capabilities: &[pioneer_protocol::TurnCapability],
     catalog: &pioneer_skills::SkillCatalogSnapshot,
+    pack_names: &HashMap<pioneer_protocol::SkillPackId, String>,
 ) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
-    user_message_attachments_from_capabilities_with_lookup(capabilities, |skill_id| {
-        catalog
-            .skills
-            .iter()
-            .find(|skill| &skill.identity.skill_id == skill_id)
-            .map(|skill| {
-                (
-                    skill.identity.owner.as_deref(),
-                    skill.identity.slug.as_str(),
-                    skill.identity.source_kind.as_db_value(),
-                )
-            })
-    })
+    user_message_attachments_from_capabilities_with_lookup(
+        capabilities,
+        |skill_id| {
+            catalog
+                .skills
+                .iter()
+                .find(|skill| &skill.identity.skill_id == skill_id)
+                .map(|skill| {
+                    (
+                        skill.identity.owner.as_deref(),
+                        skill.identity.slug.as_str(),
+                        skill.identity.source_kind.as_db_value(),
+                    )
+                })
+        },
+        pack_names,
+    )
 }
 
 pub(super) fn user_message_attachments_from_capabilities_and_bindings(
     capabilities: &[pioneer_protocol::TurnCapability],
     bindings: &[pioneer_protocol::TurnSkillBinding],
+    pack_names: &HashMap<pioneer_protocol::SkillPackId, String>,
 ) -> Result<Vec<pioneer_protocol::UserMessageAttachment>> {
-    user_message_attachments_from_capabilities_with_lookup(capabilities, |skill_id| {
-        bindings
-            .iter()
-            .find(|binding| &binding.skill_id == skill_id)
-            .map(|binding| {
-                (
-                    binding.skill_owner.as_deref(),
-                    binding.skill_slug.as_str(),
-                    binding.source_kind.as_str(),
-                )
-            })
-    })
+    user_message_attachments_from_capabilities_with_lookup(
+        capabilities,
+        |skill_id| {
+            bindings
+                .iter()
+                .find(|binding| &binding.skill_id == skill_id)
+                .map(|binding| {
+                    (
+                        binding.skill_owner.as_deref(),
+                        binding.skill_slug.as_str(),
+                        binding.source_kind.as_str(),
+                    )
+                })
+        },
+        pack_names,
+    )
 }
 
 fn capability_label(label: Option<&str>, fallback: &str) -> String {
@@ -5583,6 +5626,7 @@ mod user_message_attachment_tests {
     use pioneer_protocol::{
         SkillId, TurnCapability, TurnCapabilityKind, TurnSkillBinding, UserMessageAttachment,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn selected_skill_attachment_is_an_owned_binding_snapshot() {
@@ -5591,6 +5635,7 @@ mod user_message_attachment_tests {
             id: format!("skill:{skill_id}"),
             kind: TurnCapabilityKind::Skill {
                 skill_id: skill_id.clone(),
+                pack_id: None,
             },
             label: None,
         };
@@ -5607,6 +5652,7 @@ mod user_message_attachment_tests {
         let attachments = user_message_attachments_from_capabilities_and_bindings(
             std::slice::from_ref(&capability),
             bindings.as_slice(),
+            &HashMap::new(),
         )
         .expect("binding must snapshot");
         bindings[0].skill_owner = Some("owner-after".to_owned());
@@ -5621,6 +5667,7 @@ mod user_message_attachment_tests {
                     owner: Some("owner-before".to_owned()),
                     slug: "slug-before".to_owned(),
                     source_kind: "user".to_owned(),
+                    pack: None,
                 },
             }]
         );
@@ -5631,13 +5678,17 @@ mod user_message_attachment_tests {
         let skill_id = SkillId::new("BBBBBBBBBBBBBBBBBBBBB").expect("valid skill id");
         let capability = TurnCapability {
             id: format!("skill:{skill_id}"),
-            kind: TurnCapabilityKind::Skill { skill_id },
+            kind: TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            },
             label: None,
         };
 
         let error = user_message_attachments_from_capabilities_and_bindings(
             std::slice::from_ref(&capability),
             &[],
+            &HashMap::new(),
         )
         .expect_err("missing binding must fail closed");
 
@@ -5646,5 +5697,64 @@ mod user_message_attachment_tests {
                 .to_string()
                 .contains("missing immutable presentation snapshot")
         );
+    }
+
+    #[test]
+    fn pack_attachments_snapshot_authoritative_names_and_original_shape() {
+        let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+        let skill_id = SkillId::new("S".repeat(21)).expect("skill id");
+        let bindings = vec![TurnSkillBinding {
+            skill_id: skill_id.clone(),
+            skill_owner: Some("owner".to_owned()),
+            skill_slug: "member".to_owned(),
+            skill_version: None,
+            fingerprint: "fingerprint".to_owned(),
+            source_kind: "user".to_owned(),
+            resolved_reason: "explicit".to_owned(),
+        }];
+        let mut pack_names = HashMap::from([(pack_id.clone(), "Authoritative Pack".to_owned())]);
+
+        let partial = user_message_attachments_from_capabilities_and_bindings(
+            &[TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&skill_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: skill_id.clone(),
+                    pack_id: Some(pack_id.clone()),
+                },
+                label: Some("untrusted label".to_owned()),
+            }],
+            bindings.as_slice(),
+            &pack_names,
+        )
+        .expect("partial pack snapshot");
+        let full = user_message_attachments_from_capabilities_and_bindings(
+            &[TurnCapability {
+                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                kind: TurnCapabilityKind::SkillPack {
+                    pack_id: pack_id.clone(),
+                },
+                label: Some("untrusted pack label".to_owned()),
+            }],
+            bindings.as_slice(),
+            &pack_names,
+        )
+        .expect("full pack snapshot");
+
+        pack_names.insert(pack_id.clone(), "Renamed Pack".to_owned());
+        pack_names.remove(&pack_id);
+        assert!(matches!(
+            &partial[0],
+            UserMessageAttachment::Skill { capability }
+                if capability.label == "owner/member"
+                    && matches!(
+                        capability.pack.as_ref(),
+                        Some(pack) if pack.pack_id == pack_id && pack.label == "Authoritative Pack"
+                    )
+        ));
+        assert!(matches!(
+            &full[0],
+            UserMessageAttachment::SkillPack { capability }
+                if capability.pack_id == pack_id && capability.label == "Authoritative Pack"
+        ));
     }
 }

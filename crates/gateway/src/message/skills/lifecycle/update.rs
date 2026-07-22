@@ -162,7 +162,25 @@ impl MessageProcessor {
                 return;
             }
         };
-        let _guard = self.acquire_skills_write_lock().await;
+        let upload_guard = self
+            .acquire_skill_upload_lock(materialized.upload.upload_id.as_str())
+            .await;
+        let write_guard = self.acquire_skills_write_lock().await;
+        if let Err(error) = self
+            .revalidate_finalized_upload_locked(
+                connection_id,
+                workspace_id.as_str(),
+                materialized.upload.upload_id.as_str(),
+                &request_id,
+            )
+            .await
+        {
+            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            drop(write_guard);
+            drop(upload_guard);
+            self.send_error(connection_id, error).await;
+            return;
+        }
         if let Err(error) = self
             .ensure_skills_lock_v2_locked(
                 location.lock_path.as_path(),
@@ -353,77 +371,51 @@ impl MessageProcessor {
             fingerprint: Some(update_result.definition.identity.fingerprint.clone()),
             ..SkillInstallationPatch::default()
         };
-        match self
+        let audit_records = skill_audit_records(update_result.audit_events.as_slice());
+        let persisted = self
             .crud_store
-            .update_skill_installation(&params.skill_id, &patch, now)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                if let Err(error) = pioneer_skills::rollback_prepared_skill_commit(
-                    &update_result,
-                    location.lock_path.as_path(),
-                ) {
-                    warn!(
-                        skill_id = %params.skill_id,
-                        error = %format!("{error:#}"),
-                        "failed to roll back updated skill after database error"
-                    );
-                }
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-                self.send_error(
-                    connection_id,
-                    skills_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "failed to persist updated skill installation",
-                        json!({"skill_id": params.skill_id}),
-                    ),
-                )
-                .await;
-                return;
+            .update_skill_lifecycle(
+                &params.skill_id,
+                &patch,
+                audit_records.as_slice(),
+                materialized.upload.upload_id.as_str(),
+                now,
+            )
+            .await;
+        if !matches!(persisted, Ok(true)) {
+            if let Err(error) = pioneer_skills::rollback_prepared_skill_commit(
+                &update_result,
+                location.lock_path.as_path(),
+            ) {
+                warn!(
+                    skill_id = %params.skill_id,
+                    error = %format!("{error:#}"),
+                    "failed to roll back updated skill after lifecycle transaction error"
+                );
             }
+            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            let error = match persisted {
+                Ok(false) => anyhow::anyhow!(
+                    "upload `{}` changed state before skill update publication",
+                    materialized.upload.upload_id
+                ),
+                Err(error) => error,
+                Ok(true) => unreachable!(),
+            };
+            self.send_error(
+                connection_id,
+                skills_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    SKILLS_ERROR_INTERNAL,
+                    "failed to persist updated skill and consume upload",
+                    json!({"error": format!("{error:#}")}),
+                ),
+            )
+            .await;
+            return;
         }
         pioneer_skills::finalize_prepared_skill_commit(&update_result);
-        let audit_records = skill_audit_records(update_result.audit_events.as_slice());
-        if let Err(error) = self
-            .crud_store
-            .insert_skill_audit_event_records(audit_records.as_slice())
-            .await
-        {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to persist skill audit events",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = self
-            .mark_upload_consumed(materialized.upload.upload_id.as_str(), now)
-            .await
-        {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to mark skill upload consumed",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
-        }
         self.cleanup_upload_artifacts(&materialized.upload, materialized.cleanup_root.as_path());
         let updated_owner = update_result.definition.identity.owner;
         let updated_slug = update_result.definition.identity.slug;

@@ -756,6 +756,8 @@ mod tests {
         assert!(binding_schema.contains("skill_id"));
         assert!(binding_schema.contains("skill_owner"));
         assert!(binding_schema.contains("^[A-Za-z0-9]{21}$"));
+        assert!(!binding_schema.contains("pack_id"));
+        assert!(!binding_schema.contains("packId"));
     }
 
     #[test]

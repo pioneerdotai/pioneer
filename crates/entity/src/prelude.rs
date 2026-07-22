@@ -27,6 +27,7 @@ pub use super::recovery_job::Entity as RecoveryJob;
 pub use super::skill_audit_event::Entity as SkillAuditEvent;
 pub use super::skill_dependency_snapshot::Entity as SkillDependencySnapshot;
 pub use super::skill_installation::Entity as SkillInstallation;
+pub use super::skill_pack_installation::Entity as SkillPackInstallation;
 pub use super::skill_upload_session::Entity as SkillUploadSession;
 pub use super::skill_workspace_policy::Entity as SkillWorkspacePolicy;
 pub use super::task::Entity as Task;

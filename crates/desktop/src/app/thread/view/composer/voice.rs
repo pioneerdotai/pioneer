@@ -287,6 +287,8 @@ impl PioneerDesktop {
         };
         let composer_attachments = self.composer_attachments.clone();
         let composer_capabilities = self.effective_composer_capabilities();
+        let composer_skill_selections = self.composer_skill_selections.clone();
+        let composer_skill_picker = self.composer_skill_picker_projection("");
         let endpoint_kind = self
             .gateway
             .runtime
@@ -303,6 +305,8 @@ impl PioneerDesktop {
             endpoint_kind,
             attachments: composer_attachments,
             capabilities: composer_capabilities,
+            skill_selections: composer_skill_selections,
+            skill_picker: composer_skill_picker,
             selected_model,
             selected_provider,
             turn_model_provider,

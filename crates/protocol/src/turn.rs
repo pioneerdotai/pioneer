@@ -1,5 +1,6 @@
 use crate::{
-    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, SkillId, TaskTurnItem, ThreadMode,
+    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, SkillId, SkillPackId, TaskTurnItem,
+    ThreadMode,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1336,13 +1337,17 @@ impl<'de> Deserialize<'de> for TurnCapability {
         D: serde::Deserializer<'de>,
     {
         let wire = TurnCapabilityWire::deserialize(deserializer)?;
-        if let TurnCapabilityKind::Skill { skill_id } = &wire.kind {
-            let expected = skill_capability_key(skill_id);
-            if wire.id != expected {
-                return Err(serde::de::Error::custom(format!(
-                    "skill capability id must be {expected}"
-                )));
-            }
+        let expected = match &wire.kind {
+            TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_capability_key(skill_id)),
+            TurnCapabilityKind::SkillPack { pack_id } => Some(skill_pack_capability_key(pack_id)),
+            TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => None,
+        };
+        if let Some(expected) = expected
+            && wire.id != expected
+        {
+            return Err(serde::de::Error::custom(format!(
+                "capability id must be {expected}"
+            )));
         }
         Ok(Self {
             id: wire.id,
@@ -1357,12 +1362,23 @@ pub fn skill_capability_key(skill_id: &SkillId) -> String {
     format!("skill:{skill_id}")
 }
 
+/// Builds the canonical internal key for a selected skill pack capability.
+pub fn skill_pack_capability_key(pack_id: &SkillPackId) -> String {
+    format!("skill_pack:{pack_id}")
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnCapabilityKind {
     Skill {
         #[serde(rename = "skillId")]
         skill_id: SkillId,
+        #[serde(rename = "packId", default, skip_serializing_if = "Option::is_none")]
+        pack_id: Option<SkillPackId>,
+    },
+    SkillPack {
+        #[serde(rename = "packId")]
+        pack_id: SkillPackId,
     },
     McpServer {
         name: String,
@@ -3318,6 +3334,9 @@ pub enum UserMessageAttachment {
     Skill {
         capability: TurnSkillCapabilitySummary,
     },
+    SkillPack {
+        capability: TurnSkillPackCapabilitySummary,
+    },
     McpServer {
         capability: TurnMcpServerCapabilitySummary,
     },
@@ -3337,6 +3356,24 @@ pub struct TurnSkillCapabilitySummary {
     pub slug: String,
     #[serde(rename = "sourceKind")]
     pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<TurnSkillPackPresentationSummary>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSkillPackCapabilitySummary {
+    #[serde(rename = "packId")]
+    pub pack_id: SkillPackId,
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSkillPackPresentationSummary {
+    #[serde(rename = "packId")]
+    pub pack_id: SkillPackId,
+    pub label: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -5379,6 +5416,7 @@ mod tests {
                 label: Some("imagegen".to_owned()),
                 kind: TurnCapabilityKind::Skill {
                     skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
+                    pack_id: None,
                 },
             }
         );
@@ -5438,12 +5476,90 @@ mod tests {
             "skill capability key must be derived from the exact skill id"
         );
 
+        let old_standalone: TurnCapability = serde_json::from_value(json!({
+            "id": "skill:mvg02zVNGWuw5z5C4nYDo",
+            "kind": {
+                "type": "skill",
+                "skillId": "mvg02zVNGWuw5z5C4nYDo"
+            }
+        }))
+        .expect("legacy skill capability without packId should decode");
+        assert_eq!(
+            old_standalone.kind,
+            TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            }
+        );
+
         let capability_schema = serde_json::to_value(schemars::schema_for!(TurnCapabilityKind))
             .expect("capability schema should encode");
         let capability_schema = capability_schema.to_string();
         assert!(capability_schema.contains("skillId"));
         assert!(capability_schema.contains("^[A-Za-z0-9]{21}$"));
         assert!(!capability_schema.contains("sourceKind\":{\"type\":\"string\"}"));
+    }
+
+    #[test]
+    fn skill_pack_capability_requires_canonical_key_and_preserves_child_context() {
+        let pack_id: SkillPackId = "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid pack id");
+        assert_eq!(
+            skill_pack_capability_key(&pack_id),
+            "skill_pack:mvg02zVNGWuw5z5C4nYDo"
+        );
+
+        let full_pack: TurnCapability = serde_json::from_value(json!({
+            "id": "skill_pack:mvg02zVNGWuw5z5C4nYDo",
+            "kind": {
+                "type": "skillPack",
+                "packId": "mvg02zVNGWuw5z5C4nYDo"
+            }
+        }))
+        .expect("full pack capability should decode");
+        assert_eq!(
+            full_pack.kind,
+            TurnCapabilityKind::SkillPack {
+                pack_id: pack_id.clone(),
+            }
+        );
+
+        let packed_child: TurnCapability = serde_json::from_value(json!({
+            "id": "skill:mvg02zVNGWuw5z5C4nYDo",
+            "kind": {
+                "type": "skill",
+                "skillId": "mvg02zVNGWuw5z5C4nYDo",
+                "packId": "mvg02zVNGWuw5z5C4nYDo"
+            }
+        }))
+        .expect("packed child capability should decode");
+        assert_eq!(packed_child.id, "skill:mvg02zVNGWuw5z5C4nYDo");
+        assert_eq!(
+            packed_child.kind,
+            TurnCapabilityKind::Skill {
+                skill_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid skill id"),
+                pack_id: Some(pack_id),
+            }
+        );
+
+        let mismatched_key = serde_json::from_value::<TurnCapability>(json!({
+            "id": "skill:mvg02zVNGWuw5z5C4nYDo",
+            "kind": {
+                "type": "skillPack",
+                "packId": "mvg02zVNGWuw5z5C4nYDo"
+            }
+        }));
+        assert!(mismatched_key.is_err());
+
+        let missing_pack_id = serde_json::from_value::<TurnCapabilityKind>(json!({
+            "type": "skillPack"
+        }));
+        assert!(missing_pack_id.is_err());
+
+        let invalid_pack_id = serde_json::from_value::<TurnCapabilityKind>(json!({
+            "type": "skillPack",
+            "packId": "too-short"
+        }));
+        assert!(invalid_pack_id.is_err());
     }
 
     #[test]
@@ -5514,6 +5630,16 @@ mod tests {
                     owner: Some("pioneer".to_owned()),
                     slug: "docs".to_owned(),
                     source_kind: "user".to_owned(),
+                    pack: Some(TurnSkillPackPresentationSummary {
+                        pack_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid pack id"),
+                        label: "writer-pack".to_owned(),
+                    }),
+                },
+            },
+            UserMessageAttachment::SkillPack {
+                capability: TurnSkillPackCapabilitySummary {
+                    pack_id: "mvg02zVNGWuw5z5C4nYDo".parse().expect("valid pack id"),
+                    label: "writer-pack".to_owned(),
                 },
             },
             UserMessageAttachment::McpServer {
@@ -5543,8 +5669,13 @@ mod tests {
 
         let encoded = serde_json::to_value(&item).expect("user message should encode");
         assert_eq!(encoded["attachments"][0]["type"], json!("skill"));
-        assert_eq!(encoded["attachments"][1]["type"], json!("mcpServer"));
-        assert_eq!(encoded["attachments"][2]["type"], json!("mcpTool"));
+        assert_eq!(
+            encoded["attachments"][0]["capability"]["pack"]["label"],
+            json!("writer-pack")
+        );
+        assert_eq!(encoded["attachments"][1]["type"], json!("skillPack"));
+        assert_eq!(encoded["attachments"][2]["type"], json!("mcpServer"));
+        assert_eq!(encoded["attachments"][3]["type"], json!("mcpTool"));
         let mut keys = encoded
             .as_object()
             .expect("encoded user message should be an object")
@@ -5580,6 +5711,21 @@ mod tests {
         assert!(summary_schema.contains("skillId"));
         assert!(summary_schema.contains("owner"));
         assert!(!summary_schema.contains("\"id\""));
+
+        let old_attachment: UserMessageAttachment = serde_json::from_value(json!({
+            "type": "skill",
+            "capability": {
+                "skillId": "mvg02zVNGWuw5z5C4nYDo",
+                "label": "docs",
+                "slug": "docs",
+                "sourceKind": "user"
+            }
+        }))
+        .expect("historical standalone skill attachment without pack should decode");
+        let UserMessageAttachment::Skill { capability } = old_attachment else {
+            panic!("expected skill attachment");
+        };
+        assert_eq!(capability.pack, None);
     }
 
     #[test]

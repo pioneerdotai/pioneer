@@ -943,7 +943,10 @@ fn resolve_turn_capability_input(
         }
 
         let canonical_key = match &capability.kind {
-            TurnCapabilityKind::Skill { skill_id } => {
+            TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            } => {
                 let expected_id = format!("skill:{skill_id}");
                 if capability.id != expected_id {
                     normalized.rejected.push(rejected_capability(
@@ -954,6 +957,17 @@ fn resolve_turn_capability_input(
                     continue;
                 }
                 expected_id
+            }
+            TurnCapabilityKind::Skill {
+                pack_id: Some(_), ..
+            }
+            | TurnCapabilityKind::SkillPack { .. } => {
+                normalized.rejected.push(rejected_capability(
+                    capability,
+                    TurnCapabilityRejectedReason::InvalidInput,
+                    "Skill pack metadata reached the agent runtime boundary.",
+                ));
+                continue;
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 let name = name.trim();
@@ -1005,11 +1019,20 @@ fn resolve_turn_capability_input(
         }
 
         match &capability.kind {
-            TurnCapabilityKind::Skill { skill_id } => {
+            TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            } => {
                 normalized.skill_refs.push(SkillExplicitRef {
                     skill_id: skill_id.clone(),
                     label: capability.label.clone(),
                 });
+            }
+            TurnCapabilityKind::Skill {
+                pack_id: Some(_), ..
+            }
+            | TurnCapabilityKind::SkillPack { .. } => {
+                unreachable!("pack metadata was rejected before runtime normalization")
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 normalized.mcp_server_refs.push(AgentMcpServerRef {
@@ -1045,6 +1068,7 @@ fn normalize_turn_capabilities(capabilities: &[TurnCapability]) -> TurnCapabilit
 fn skill_capability_kind(reference: &SkillExplicitRef) -> TurnCapabilityKind {
     TurnCapabilityKind::Skill {
         skill_id: reference.skill_id.clone(),
+        pack_id: None,
     }
 }
 
@@ -1244,7 +1268,8 @@ fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     }
 
     match &rejected.kind {
-        TurnCapabilityKind::Skill { skill_id } => skill_id.to_string(),
+        TurnCapabilityKind::Skill { skill_id, .. } => skill_id.to_string(),
+        TurnCapabilityKind::SkillPack { pack_id } => pack_id.to_string(),
         TurnCapabilityKind::McpServer { name, .. } => name.clone(),
         TurnCapabilityKind::McpTool {
             server_name,
@@ -5924,7 +5949,10 @@ mod tests {
         TurnCapability {
             id: format!("skill:{skill_id}"),
             label: Some(label.to_owned()),
-            kind: TurnCapabilityKind::Skill { skill_id },
+            kind: TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            },
         }
     }
 
@@ -6042,6 +6070,36 @@ mod tests {
     }
 
     #[test]
+    fn normalize_turn_capabilities_rejects_pack_metadata_at_runtime_boundary() {
+        let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+        let skill_id = test_skill_id("packed");
+        let normalized = normalize_turn_capabilities(&[
+            TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&skill_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: Some(pack_id.clone()),
+                },
+                label: None,
+            },
+            TurnCapability {
+                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                kind: TurnCapabilityKind::SkillPack { pack_id },
+                label: None,
+            },
+        ]);
+
+        assert!(normalized.skill_refs.is_empty());
+        assert_eq!(normalized.rejected.len(), 2);
+        assert!(
+            normalized
+                .rejected
+                .iter()
+                .all(|rejected| rejected.reason == TurnCapabilityRejectedReason::InvalidInput)
+        );
+    }
+
+    #[test]
     fn normalize_turn_capabilities_splits_skill_server_and_tool_refs() {
         let normalized = normalize_turn_capabilities(&[
             skill_capability("docs", "docs"),
@@ -6107,7 +6165,8 @@ mod tests {
         assert_eq!(
             summary.accepted[0].kind,
             TurnCapabilityKind::Skill {
-                skill_id: test_skill_id("docs")
+                skill_id: test_skill_id("docs"),
+                pack_id: None,
             }
         );
     }

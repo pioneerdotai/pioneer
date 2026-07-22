@@ -10,6 +10,7 @@ use crate::{
         user_message_attachments_from_composer_capabilities,
     },
     composer::permissions as composer_permissions,
+    composer::skill_selection::{ComposerSkillPickerProjection, ComposerSkillSelection},
     gateway::types::GatewayEndpointKind,
     platform::{ClientFileSystem, ClientPath},
     turns::start as turn_start,
@@ -17,9 +18,11 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
     AgentExecutionBackend, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef,
-    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, TurnPermissionMode, UserInput,
-    UserMessageAttachment, VoiceTurnContext,
+    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, TurnCapabilityKind, TurnPermissionMode,
+    TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary,
+    UserInput, UserMessageAttachment, VoiceTurnContext,
 };
+use std::collections::HashSet;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -38,6 +41,10 @@ pub struct PrepareComposerTurnRequest {
     pub text: String,
     pub attachments: Vec<ComposerAttachment>,
     pub capabilities: Vec<ComposerCapability>,
+    #[serde(default)]
+    pub skill_selections: Vec<ComposerSkillSelection>,
+    #[serde(default)]
+    pub skill_picker: ComposerSkillPickerProjection,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -60,6 +67,10 @@ pub struct PrepareVoiceComposerSnapshotRequest {
     pub endpoint_kind: Option<GatewayEndpointKind>,
     pub attachments: Vec<ComposerAttachment>,
     pub capabilities: Vec<ComposerCapability>,
+    #[serde(default)]
+    pub skill_selections: Vec<ComposerSkillSelection>,
+    #[serde(default)]
+    pub skill_picker: ComposerSkillPickerProjection,
     pub selected_model: Option<String>,
     pub selected_provider: Option<String>,
     pub turn_model_provider: Option<String>,
@@ -211,11 +222,13 @@ where
         });
     }
 
-    Ok(build_prepared_composer_turn(
+    build_prepared_composer_turn_with_skill_selections(
         request.text,
         prepared_attachments,
         request.capabilities,
-    ))
+        request.skill_selections.as_slice(),
+        &request.skill_picker,
+    )
 }
 
 pub fn prepare_voice_composer_snapshot<TTransport, TFileSystem>(
@@ -238,6 +251,8 @@ where
             text: String::new(),
             attachments: request.attachments,
             capabilities: request.capabilities,
+            skill_selections: request.skill_selections,
+            skill_picker: request.skill_picker,
         },
     )?;
 
@@ -388,6 +403,208 @@ pub fn build_prepared_composer_turn(
         user_attachments,
         attachments: prepared_attachments,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedComposerSkillSelections {
+    pub capabilities: Vec<TurnCapability>,
+    pub user_attachments: Vec<UserMessageAttachment>,
+}
+
+pub fn prepare_composer_skill_selections(
+    selections: &[ComposerSkillSelection],
+    picker: &ComposerSkillPickerProjection,
+) -> Result<PreparedComposerSkillSelections> {
+    let mut seen_selection_keys = HashSet::new();
+    let mut seen_skill_ids = HashSet::new();
+    let full_pack_ids = selections
+        .iter()
+        .filter_map(|selection| match selection {
+            ComposerSkillSelection::SkillPack { pack_id } => Some(pack_id.clone()),
+            ComposerSkillSelection::Skill { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for selection in selections {
+        if !seen_selection_keys.insert(selection.key()) {
+            return Err(anyhow!(
+                "duplicate Composer skill selection `{}`",
+                selection.key()
+            ));
+        }
+        if let ComposerSkillSelection::Skill {
+            pack_id: Some(pack_id),
+            ..
+        } = selection
+            && full_pack_ids.contains(pack_id)
+        {
+            return Err(anyhow!(
+                "skill pack `{pack_id}` cannot be selected together with one of its children"
+            ));
+        }
+    }
+
+    let mut capabilities = Vec::with_capacity(selections.len());
+    let mut user_attachments = Vec::with_capacity(selections.len());
+    for selection in selections {
+        match selection {
+            ComposerSkillSelection::SkillPack { pack_id } => {
+                let pack = picker
+                    .packs
+                    .iter()
+                    .find(|pack| &pack.pack_id == pack_id)
+                    .filter(|pack| pack.selectable && !pack.children.is_empty())
+                    .ok_or_else(|| anyhow!("skill pack `{pack_id}` is not selectable"))?;
+                capabilities.push(TurnCapability {
+                    id: pioneer_protocol::skill_pack_capability_key(pack_id),
+                    kind: TurnCapabilityKind::SkillPack {
+                        pack_id: pack_id.clone(),
+                    },
+                    label: non_empty_label(pack.label.as_str()),
+                });
+                user_attachments.push(UserMessageAttachment::SkillPack {
+                    capability: TurnSkillPackCapabilitySummary {
+                        pack_id: pack_id.clone(),
+                        label: pack.label.clone(),
+                    },
+                });
+            }
+            ComposerSkillSelection::Skill { skill_id, pack_id } => {
+                if !seen_skill_ids.insert(skill_id.clone()) {
+                    return Err(anyhow!("skill `{skill_id}` is selected more than once"));
+                }
+
+                let (skill, pack) = match pack_id {
+                    Some(pack_id) => {
+                        let pack = picker
+                            .packs
+                            .iter()
+                            .find(|pack| &pack.pack_id == pack_id)
+                            .ok_or_else(|| anyhow!("skill pack `{pack_id}` is not available"))?;
+                        let child = pack
+                            .children
+                            .iter()
+                            .find(|child| &child.skill.skill_id == skill_id)
+                            .filter(|child| child.skill.selectable)
+                            .ok_or_else(|| {
+                                anyhow!("skill `{skill_id}` is not selectable in pack `{pack_id}`")
+                            })?;
+                        (
+                            &child.skill,
+                            Some(TurnSkillPackPresentationSummary {
+                                pack_id: pack_id.clone(),
+                                label: pack.label.clone(),
+                            }),
+                        )
+                    }
+                    None => {
+                        let skill = picker
+                            .standalone
+                            .iter()
+                            .find(|skill| &skill.skill_id == skill_id)
+                            .filter(|skill| skill.selectable)
+                            .ok_or_else(|| {
+                                anyhow!("standalone skill `{skill_id}` is not selectable")
+                            })?;
+                        (skill, None)
+                    }
+                };
+
+                capabilities.push(TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(skill_id),
+                    kind: TurnCapabilityKind::Skill {
+                        skill_id: skill_id.clone(),
+                        pack_id: pack_id.clone(),
+                    },
+                    label: non_empty_label(skill.label.as_str()),
+                });
+                user_attachments.push(UserMessageAttachment::Skill {
+                    capability: TurnSkillCapabilitySummary {
+                        skill_id: skill_id.clone(),
+                        label: skill.label.clone(),
+                        owner: skill.owner.clone(),
+                        slug: skill.slug.clone(),
+                        source_kind: skill.source_kind.clone(),
+                        pack,
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(PreparedComposerSkillSelections {
+        capabilities,
+        user_attachments,
+    })
+}
+
+pub fn build_prepared_composer_turn_with_skill_selections(
+    text: String,
+    prepared_attachments: Vec<PreparedComposerAttachment>,
+    capabilities: Vec<ComposerCapability>,
+    skill_selections: &[ComposerSkillSelection],
+    skill_picker: &ComposerSkillPickerProjection,
+) -> Result<PreparedComposerTurn> {
+    let skill_preparation = prepare_composer_skill_selections(skill_selections, skill_picker)?;
+    let mut prepared = build_prepared_composer_turn(text, prepared_attachments, capabilities);
+
+    let mut capability_ids = prepared
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.clone())
+        .collect::<HashSet<_>>();
+    for capability in &skill_preparation.capabilities {
+        if !capability_ids.insert(capability.id.clone()) {
+            return Err(anyhow!(
+                "Composer capability `{}` is selected more than once",
+                capability.id
+            ));
+        }
+    }
+
+    let legacy_skill_ids = prepared
+        .capabilities
+        .iter()
+        .filter_map(|capability| match &capability.kind {
+            TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_id),
+            TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::McpServer { .. }
+            | TurnCapabilityKind::McpTool { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    for full_pack_id in skill_selections
+        .iter()
+        .filter_map(|selection| match selection {
+            ComposerSkillSelection::SkillPack { pack_id } => Some(pack_id),
+            ComposerSkillSelection::Skill { .. } => None,
+        })
+    {
+        let pack = skill_picker
+            .packs
+            .iter()
+            .find(|pack| &pack.pack_id == full_pack_id)
+            .expect("validated skill pack selection");
+        if let Some(child) = pack
+            .children
+            .iter()
+            .find(|child| legacy_skill_ids.contains(&child.skill.skill_id))
+        {
+            return Err(anyhow!(
+                "skill pack `{full_pack_id}` cannot be selected with child `{}`",
+                child.skill.skill_id
+            ));
+        }
+    }
+
+    prepared.capabilities.extend(skill_preparation.capabilities);
+    prepared
+        .user_attachments
+        .extend(skill_preparation.user_attachments);
+    Ok(prepared)
+}
+
+fn non_empty_label(label: &str) -> Option<String> {
+    (!label.trim().is_empty()).then(|| label.to_owned())
 }
 
 pub fn reduce_prepared_composer_turn_submit_success(
@@ -748,7 +965,12 @@ pub fn attachment_name_from_reference(reference: &str) -> String {
 mod tests {
     use super::*;
     use crate::composer::attachments::{ComposerAttachmentKind, ComposerAttachmentUploadState};
-    use crate::composer::capabilities::ComposerCapabilityKind;
+    use crate::composer::capabilities::{
+        ComposerCapabilityKind, SelectableSkillCapability, SkillCapabilityUnavailableReason,
+    };
+    use crate::composer::skill_selection::{
+        SelectablePackedSkillCapability, SelectableSkillPackCapability,
+    };
     use crate::platform::{ClientFileMetadata, ClientFileSystem, ClientPath};
     use crate::{ClientError, ClientResult};
     use pioneer_protocol::{
@@ -756,7 +978,7 @@ mod tests {
         ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadCapabilities,
         ArtifactUploadChunkAckNotification, ArtifactUploadFinishParams,
         ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
-        SkillId,
+        SkillId, SkillPackId,
     };
     use std::sync::Mutex;
 
@@ -798,6 +1020,172 @@ mod tests {
                 max_concurrent_downloads: 2,
             },
         }
+    }
+
+    fn skill_picker() -> ComposerSkillPickerProjection {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+        ComposerSkillPickerProjection {
+            standalone: vec![selectable_skill('S', "standalone")],
+            packs: vec![SelectableSkillPackCapability {
+                key: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                pack_id: pack_id.clone(),
+                label: "writer-pack".to_owned(),
+                children: vec![SelectablePackedSkillCapability {
+                    pack_id,
+                    member_key: "writer".to_owned(),
+                    skill: selectable_skill('C', "writer"),
+                }],
+                selectable: true,
+            }],
+        }
+    }
+
+    fn selectable_skill(character: char, slug: &str) -> SelectableSkillCapability {
+        let skill_id = SkillId::new(character.to_string().repeat(21)).expect("skill id");
+        SelectableSkillCapability {
+            key: pioneer_protocol::skill_capability_key(&skill_id),
+            skill_id,
+            label: slug.to_owned(),
+            display_name: slug.to_owned(),
+            description: String::new(),
+            owner: Some("pioneer".to_owned()),
+            slug: slug.to_owned(),
+            source_kind: "user".to_owned(),
+            selectable: true,
+            unavailable_reason: None::<SkillCapabilityUnavailableReason>,
+        }
+    }
+
+    #[test]
+    fn skill_selection_preparation_preserves_full_partial_and_standalone_intent() {
+        let picker = skill_picker();
+        let pack_id = picker.packs[0].pack_id.clone();
+        let child_id = picker.packs[0].children[0].skill.skill_id.clone();
+        let standalone_id = picker.standalone[0].skill_id.clone();
+
+        let full = prepare_composer_skill_selections(
+            &[ComposerSkillSelection::SkillPack {
+                pack_id: pack_id.clone(),
+            }],
+            &picker,
+        )
+        .expect("full pack preparation");
+        assert!(matches!(
+            full.capabilities.as_slice(),
+            [TurnCapability {
+                kind: TurnCapabilityKind::SkillPack { pack_id: actual },
+                ..
+            }] if actual == &pack_id
+        ));
+        assert!(matches!(
+            full.user_attachments.as_slice(),
+            [UserMessageAttachment::SkillPack { capability }]
+                if capability.pack_id == pack_id && capability.label == "writer-pack"
+        ));
+
+        let partial = prepare_composer_skill_selections(
+            &[ComposerSkillSelection::Skill {
+                skill_id: child_id.clone(),
+                pack_id: Some(pack_id.clone()),
+            }],
+            &picker,
+        )
+        .expect("packed child preparation");
+        assert!(matches!(
+            partial.capabilities.as_slice(),
+            [TurnCapability {
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: actual_skill,
+                    pack_id: Some(actual_pack),
+                },
+                ..
+            }] if actual_skill == &child_id && actual_pack == &pack_id
+        ));
+        assert!(matches!(
+            partial.user_attachments.as_slice(),
+            [UserMessageAttachment::Skill { capability }]
+                if capability.skill_id == child_id
+                    && capability.pack.as_ref().is_some_and(|pack| pack.pack_id == pack_id)
+        ));
+
+        let standalone = prepare_composer_skill_selections(
+            &[ComposerSkillSelection::Skill {
+                skill_id: standalone_id.clone(),
+                pack_id: None,
+            }],
+            &picker,
+        )
+        .expect("standalone preparation");
+        assert!(matches!(
+            standalone.capabilities.as_slice(),
+            [TurnCapability {
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: actual,
+                    pack_id: None,
+                },
+                ..
+            }] if actual == &standalone_id
+        ));
+        assert!(matches!(
+            standalone.user_attachments.as_slice(),
+            [UserMessageAttachment::Skill { capability }] if capability.pack.is_none()
+        ));
+    }
+
+    #[test]
+    fn skill_selection_preparation_rejects_mixed_parent_and_child() {
+        let picker = skill_picker();
+        let pack_id = picker.packs[0].pack_id.clone();
+        let child_id = picker.packs[0].children[0].skill.skill_id.clone();
+        let result = prepare_composer_skill_selections(
+            &[
+                ComposerSkillSelection::SkillPack {
+                    pack_id: pack_id.clone(),
+                },
+                ComposerSkillSelection::Skill {
+                    skill_id: child_id,
+                    pack_id: Some(pack_id),
+                },
+            ],
+            &picker,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn text_and_voice_share_exact_skill_selection_capabilities() {
+        let picker = skill_picker();
+        let selections = vec![
+            ComposerSkillSelection::SkillPack {
+                pack_id: picker.packs[0].pack_id.clone(),
+            },
+            ComposerSkillSelection::Skill {
+                skill_id: picker.standalone[0].skill_id.clone(),
+                pack_id: None,
+            },
+        ];
+        let text = build_prepared_composer_turn_with_skill_selections(
+            "hello".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            selections.as_slice(),
+            &picker,
+        )
+        .expect("text preparation");
+        let voice_prepared = build_prepared_composer_turn_with_skill_selections(
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            selections.as_slice(),
+            &picker,
+        )
+        .expect("voice preparation");
+        let voice =
+            build_prepared_voice_composer_snapshot(voice_snapshot_context(), voice_prepared)
+                .expect("voice snapshot");
+
+        assert_eq!(voice.context.capabilities, text.capabilities);
+        assert_eq!(text.user_attachments.len(), 2);
     }
 
     fn voice_snapshot_context() -> PreparedVoiceComposerSnapshotContext {
@@ -1142,7 +1530,10 @@ mod tests {
         );
         assert!(matches!(
             snapshot.context.capabilities[0].kind,
-            pioneer_protocol::TurnCapabilityKind::Skill { skill_id: ref actual }
+            pioneer_protocol::TurnCapabilityKind::Skill {
+                skill_id: ref actual,
+                ..
+            }
                 if actual == &skill_id
         ));
         assert!(matches!(
@@ -1214,6 +1605,8 @@ mod tests {
                     ComposerAttachmentUploadState::Local,
                 )],
                 capabilities: Vec::new(),
+                skill_selections: Vec::new(),
+                skill_picker: ComposerSkillPickerProjection::default(),
                 selected_model: Some("gpt-5".to_owned()),
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
@@ -1481,6 +1874,8 @@ mod tests {
                     ComposerAttachmentUploadState::Uploading,
                 )],
                 capabilities: Vec::new(),
+                skill_selections: Vec::new(),
+                skill_picker: ComposerSkillPickerProjection::default(),
             },
         )
         .expect("prepare composer turn");

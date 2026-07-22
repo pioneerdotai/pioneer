@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillPackInstallationItem",
+  "type": "object",
+  "properties": {
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "id": {
+      "$ref": "#/$defs/SkillPackId"
+    },
+    "name": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "source_kind",
+    "created_at",
+    "updated_at"
+  ],
+  "$defs": {
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

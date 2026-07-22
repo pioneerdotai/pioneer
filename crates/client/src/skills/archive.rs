@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::{Compression, GzBuilder};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -12,6 +13,12 @@ pub struct SkillUploadArchive {
     pub bytes: Vec<u8>,
     pub sha256: String,
     pub uncompressed_size_bytes: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SkillUploadSourceKind {
+    Skill,
+    Pack,
 }
 
 #[derive(Debug)]
@@ -26,18 +33,98 @@ struct ArchiveEntry {
 pub fn build_skill_upload_archive(source_path: &Path) -> Result<SkillUploadArchive> {
     let source_root = fs::canonicalize(source_path)
         .with_context(|| format!("failed to resolve `{}`", source_path.display()))?;
-    let root_metadata = fs::symlink_metadata(source_root.as_path())
-        .with_context(|| format!("failed to read metadata for `{}`", source_root.display()))?;
-    if !root_metadata.file_type().is_dir() {
-        bail!("selected skill source must be a directory");
-    }
+    require_directory(source_root.as_path(), "selected skill source")?;
     if !source_root.join("SKILL.md").is_file() {
         bail!("selected skill directory is missing root SKILL.md");
     }
 
     let root_name = archive_root_name(source_root.as_path())?;
+    build_upload_archive(source_root.as_path(), root_name)
+}
+
+pub fn build_skill_pack_upload_archive(source_path: &Path) -> Result<SkillUploadArchive> {
+    let source_root = fs::canonicalize(source_path)
+        .with_context(|| format!("failed to resolve `{}`", source_path.display()))?;
+    require_directory(source_root.as_path(), "selected skill pack source")?;
+    validate_skill_pack_shape(source_root.as_path())?;
+
+    let root_name = archive_root_name_strict(source_root.as_path())?;
+    build_upload_archive(source_root.as_path(), root_name)
+}
+
+pub fn classify_skill_upload_source(source_path: &Path) -> Result<SkillUploadSourceKind> {
+    let source_root = fs::canonicalize(source_path)
+        .with_context(|| format!("failed to resolve `{}`", source_path.display()))?;
+    require_directory(source_root.as_path(), "selected skill source")?;
+
+    if source_root.join("SKILL.md").is_file() {
+        return Ok(SkillUploadSourceKind::Skill);
+    }
+
+    validate_skill_pack_shape(source_root.as_path())?;
+    Ok(SkillUploadSourceKind::Pack)
+}
+
+fn require_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("{label} must be a directory");
+    }
+    Ok(())
+}
+
+fn validate_skill_pack_shape(source_root: &Path) -> Result<()> {
+    if source_root.join("SKILL.md").exists() {
+        bail!("selected skill pack root must not contain SKILL.md");
+    }
+
+    let mut children = fs::read_dir(source_root)
+        .with_context(|| format!("failed to read directory `{}`", source_root.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!(
+                "failed to read directory entry in `{}`",
+                source_root.display()
+            )
+        })?;
+    children.sort_by_key(|entry| entry.file_name());
+
+    let mut member_count = 0usize;
+    for child in children {
+        let member_name = skill_pack_member_name(child.file_name())?;
+        let path = child.path();
+        let metadata = fs::symlink_metadata(path.as_path())
+            .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            bail!("skill pack root cannot include symlink `{member_name}`");
+        }
+        if !file_type.is_dir() {
+            bail!("skill pack root cannot include regular file `{member_name}`");
+        }
+        if !path.join("SKILL.md").is_file() {
+            bail!("skill pack member `{member_name}` is missing direct SKILL.md");
+        }
+        member_count += 1;
+    }
+
+    if member_count == 0 {
+        bail!("selected skill pack must contain at least one skill directory");
+    }
+
+    Ok(())
+}
+
+fn skill_pack_member_name(file_name: OsString) -> Result<String> {
+    file_name
+        .into_string()
+        .map_err(|_| anyhow!("skill pack member name is not valid UTF-8"))
+}
+
+fn build_upload_archive(source_root: &Path, root_name: String) -> Result<SkillUploadArchive> {
     let mut entries = Vec::new();
-    collect_archive_entries(source_root.as_path(), source_root.as_path(), &mut entries)?;
+    collect_archive_entries(source_root, source_root, &mut entries)?;
     entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
     let uncompressed_size_bytes =
@@ -155,6 +242,14 @@ fn archive_root_name(source_root: &Path) -> Result<String> {
     } else {
         Ok(sanitized)
     }
+}
+
+fn archive_root_name_strict(source_root: &Path) -> Result<String> {
+    source_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("skill pack root name is not valid UTF-8"))
 }
 
 fn normalize_relative_path(path: &Path) -> Result<String> {
@@ -293,6 +388,147 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn classify_skill_upload_source_distinguishes_valid_roots_and_rejects_mixed_root() {
+        let skill = temp_case("classified-skill");
+        write_file(skill.join("SKILL.md").as_path(), "# Skill\n");
+
+        let pack = temp_case("classified-pack");
+        write_file(pack.join("browser/SKILL.md").as_path(), "# Browser\n");
+        write_file(pack.join("reviewer/SKILL.md").as_path(), "# Reviewer\n");
+
+        let mixed = temp_case("classified-mixed");
+        write_file(mixed.join("browser/SKILL.md").as_path(), "# Browser\n");
+        write_file(mixed.join("README.md").as_path(), "not a pack\n");
+
+        assert_eq!(
+            classify_skill_upload_source(skill.as_path()).expect("classify skill"),
+            SkillUploadSourceKind::Skill
+        );
+        assert_eq!(
+            classify_skill_upload_source(pack.as_path()).expect("classify pack"),
+            SkillUploadSourceKind::Pack
+        );
+        let error = classify_skill_upload_source(mixed.as_path())
+            .expect_err("mixed root should fail")
+            .to_string();
+        assert!(error.contains("regular file `README.md`"));
+
+        let _ = fs::remove_dir_all(skill);
+        let _ = fs::remove_dir_all(pack);
+        let _ = fs::remove_dir_all(mixed);
+    }
+
+    #[test]
+    fn build_skill_pack_upload_archive_preserves_one_root_and_sorted_members() {
+        let root = temp_case("Research Pack (v1)");
+        write_file(root.join("reviewer/SKILL.md").as_path(), "# Reviewer\n");
+        write_file(
+            root.join("browser/references/search.md").as_path(),
+            "search\n",
+        );
+        write_file(root.join("browser/SKILL.md").as_path(), "# Browser\n");
+
+        let first = build_skill_pack_upload_archive(root.as_path()).expect("build pack archive");
+        let second = build_skill_pack_upload_archive(root.as_path()).expect("rebuild pack archive");
+        let root_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 pack root name")
+            .to_owned();
+
+        assert_eq!(
+            archive_root_name_strict(root.as_path()).expect("strict archive root name"),
+            root_name
+        );
+
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(
+            archive_paths_in_order(first.bytes.as_slice()),
+            vec![
+                root_name.clone(),
+                format!("{root_name}/browser"),
+                format!("{root_name}/browser/SKILL.md"),
+                format!("{root_name}/browser/references"),
+                format!("{root_name}/browser/references/search.md"),
+                format!("{root_name}/reviewer"),
+                format!("{root_name}/reviewer/SKILL.md"),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_skill_pack_upload_archive_rejects_empty_or_mixed_root() {
+        let empty = temp_case("empty-pack");
+        let error = build_skill_pack_upload_archive(empty.as_path())
+            .expect_err("empty pack should fail")
+            .to_string();
+        assert!(error.contains("at least one skill directory"));
+
+        let root_skill = temp_case("pack-root-skill-md");
+        write_file(root_skill.join("SKILL.md").as_path(), "# Not a pack\n");
+        let error = build_skill_pack_upload_archive(root_skill.as_path())
+            .expect_err("root SKILL.md should fail")
+            .to_string();
+        assert!(error.contains("must not contain SKILL.md"));
+
+        let mixed = temp_case("mixed-pack");
+        write_file(mixed.join("browser/SKILL.md").as_path(), "# Browser\n");
+        write_file(mixed.join("README.md").as_path(), "read me\n");
+        let error = build_skill_pack_upload_archive(mixed.as_path())
+            .expect_err("root regular file should fail")
+            .to_string();
+        assert!(error.contains("regular file `README.md`"));
+
+        let _ = fs::remove_dir_all(empty);
+        let _ = fs::remove_dir_all(root_skill);
+        let _ = fs::remove_dir_all(mixed);
+    }
+
+    #[test]
+    fn build_skill_pack_upload_archive_rejects_member_without_direct_skill_md() {
+        let root = temp_case("missing-member-skill-md");
+        write_file(
+            root.join("browser/nested/SKILL.md").as_path(),
+            "# Too deep\n",
+        );
+
+        let error = build_skill_pack_upload_archive(root.as_path())
+            .expect_err("member without direct SKILL.md should fail")
+            .to_string();
+        assert!(error.contains("member `browser`"));
+        assert!(error.contains("direct SKILL.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_skill_pack_upload_archive_rejects_non_utf8_member_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = skill_pack_member_name(OsString::from_vec(vec![b'm', 0x80]))
+            .expect_err("non-UTF-8 member should fail")
+            .to_string();
+        assert!(error.contains("member name is not valid UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_skill_pack_upload_archive_rejects_non_utf8_root_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from(OsString::from_vec(vec![b'p', 0x80]));
+
+        let error = archive_root_name_strict(root.as_path())
+            .expect_err("non-UTF-8 root should fail")
+            .to_string();
+        assert!(error.contains("root name is not valid UTF-8"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_skill_upload_archive_rejects_symlinks() {
@@ -347,6 +583,24 @@ mod tests {
 
     fn archive_paths(bytes: &[u8]) -> std::collections::HashSet<String> {
         archive_modes(bytes).into_keys().collect()
+    }
+
+    fn archive_paths_in_order(bytes: &[u8]) -> Vec<String> {
+        let decoder = GzDecoder::new(bytes);
+        let mut archive = Archive::new(decoder);
+        archive
+            .entries()
+            .expect("read archive")
+            .map(|entry| {
+                entry
+                    .expect("read entry")
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_owned()
+            })
+            .collect()
     }
 
     fn archive_modes(bytes: &[u8]) -> std::collections::HashMap<String, u32> {

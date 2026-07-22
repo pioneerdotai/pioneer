@@ -11,6 +11,7 @@ mod gateway;
 mod pending_requests;
 #[cfg(feature = "schema")]
 pub mod schema;
+mod skills;
 mod threads;
 mod timeline;
 mod workspaces;
@@ -117,6 +118,11 @@ use pioneer_protocol::{
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use serde::{Deserialize, Serialize};
+use skills::{
+    ClientComposerSkillChipsRequest, ClientComposerSkillPackPickerRequest,
+    ClientComposerSkillSelectionToggleRequest, composer_skill_chips, composer_skill_pack_picker,
+    composer_skill_selection_toggle,
+};
 use std::{
     any::Any,
     ffi::{CStr, CString, c_char},
@@ -885,6 +891,36 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn composer_skill_pack_picker(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::skill_selection::ComposerSkillPickerProjection, String>
+    {
+        let request = serde_json::from_str::<ClientComposerSkillPackPickerRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill pack picker request: {error}"))?;
+        composer_skill_pack_picker(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn composer_skill_selection_toggle(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::skill_selection::ComposerSkillSelectionReduction, String>
+    {
+        let request = serde_json::from_str::<ClientComposerSkillSelectionToggleRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill selection toggle request: {error}"))?;
+        Ok(composer_skill_selection_toggle(request))
+    }
+
+    fn composer_skill_chips(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::skill_selection::ComposerSkillChip>, String> {
+        let request = serde_json::from_str::<ClientComposerSkillChipsRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill chips request: {error}"))?;
+        Ok(composer_skill_chips(request))
+    }
+
     fn composer_capabilities_update(
         &self,
         input_json: &str,
@@ -1590,6 +1626,18 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_composer_mcp_picker_rows,
     composer_mcp_picker_rows
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_pack_picker,
+    composer_skill_pack_picker
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_selection_toggle,
+    composer_skill_selection_toggle
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_chips,
+    composer_skill_chips
 );
 ffi_client_json_method!(
     pioneer_client_ffi_composer_capabilities_update,

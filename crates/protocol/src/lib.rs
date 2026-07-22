@@ -74,7 +74,10 @@ pub use cli_runtime::{
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
     sanitize_runtime_diagnostic_lines,
 };
-pub use id::{SKILL_ID_LEN, SkillId, SkillIdError, generate_id};
+pub use id::{
+    SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
+    generate_id,
+};
 pub use jsonrpc::{
     INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
@@ -152,13 +155,16 @@ pub use settings::{
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
     SkillHealthItem, SkillHealthSummary, SkillHealthTarget, SkillInstallState,
-    SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem,
-    SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
+    SkillLifecycleAuditSummary, SkillLifecycleRemovedSkill, SkillLifecycleResultSkill,
+    SkillLifecycleSource, SkillListItem, SkillListParams, SkillListResponse, SkillPackChangedItem,
+    SkillPackInstallationItem, SkillPackMembership, SkillPolicyState, SkillSecurityFinding,
     SkillTrustGateStatus, SkillValidationDiagnostic, SkillWorkspacePolicy,
     SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams,
-    SkillsInstallResponse, SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
-    SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
-    SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
+    SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
+    SkillsPackUpdateResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
+    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
+    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
@@ -289,7 +295,8 @@ pub use turn::{
     TurnResumeResponse, TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot,
     TurnSecurityCapabilityKind, TurnSecurityDegradation, TurnSecurityEnforcementStatus,
     TurnSecurityExecutionBackendKind, TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance,
-    TurnSecuritySnapshotSource, TurnShellPolicy, TurnSkillCapabilitySummary, TurnStartParams,
+    TurnSecuritySnapshotSource, TurnShellPolicy, TurnSkillCapabilitySummary,
+    TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary, TurnStartParams,
     TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
     TurnTmpMode, TurnTmpPolicy, TurnToolLoopBudgetExceededNotification, UserInput,
     UserMessageAttachment, WebFetchLink, WebSearchResultItem,
@@ -297,6 +304,7 @@ pub use turn::{
     build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
     collect_execution_checkpoint_strict_obligations, normalize_metadata_reasoning_effort,
     reasoning_effort_comparison_key, resolve_turn_permission_profile, skill_capability_key,
+    skill_pack_capability_key,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,

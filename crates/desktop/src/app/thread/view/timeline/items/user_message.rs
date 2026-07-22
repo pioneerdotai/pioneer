@@ -277,3 +277,61 @@ fn attachment_capability_icon(
                 .text_color(cx.theme().foreground),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ParsedUserAttachmentKind, parse_user_attachments};
+    use pioneer_protocol::{
+        SkillId, SkillPackId, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
+        TurnSkillPackPresentationSummary, UserMessageAttachment,
+    };
+
+    #[test]
+    fn desktop_user_message_badges_use_snapshot_pack_labels() {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+        let parsed = parse_user_attachments(&[
+            UserMessageAttachment::SkillPack {
+                capability: TurnSkillPackCapabilitySummary {
+                    pack_id: pack_id.clone(),
+                    label: "Research Pack".to_owned(),
+                },
+            },
+            UserMessageAttachment::Skill {
+                capability: TurnSkillCapabilitySummary {
+                    skill_id: SkillId::new("S".repeat(21)).expect("skill id"),
+                    label: "Search".to_owned(),
+                    owner: None,
+                    slug: "search".to_owned(),
+                    source_kind: "user".to_owned(),
+                    pack: Some(TurnSkillPackPresentationSummary {
+                        pack_id,
+                        label: "Research Pack".to_owned(),
+                    }),
+                },
+            },
+            UserMessageAttachment::Skill {
+                capability: TurnSkillCapabilitySummary {
+                    skill_id: SkillId::new("D".repeat(21)).expect("skill id"),
+                    label: "Docs".to_owned(),
+                    owner: None,
+                    slug: "docs".to_owned(),
+                    source_kind: "user".to_owned(),
+                    pack: None,
+                },
+            },
+        ]);
+
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|attachment| attachment.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Research Pack", "Research Pack / Search", "Docs"]
+        );
+        assert!(
+            parsed
+                .iter()
+                .all(|attachment| attachment.kind == ParsedUserAttachmentKind::Skill)
+        );
+    }
+}

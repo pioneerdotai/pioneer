@@ -361,13 +361,26 @@ impl MessageProcessor {
         changes: Vec<SkillChangedItem>,
         created_at: i64,
     ) {
-        let notification = SkillsChangedNotification {
-            workspace_id: workspace_id.to_owned(),
-            snapshot_version: self.next_skills_snapshot_version(),
-            reason: reason.to_owned(),
+        self.notify_skill_projection_changed(workspace_id, reason, changes, Vec::new(), created_at)
+            .await;
+    }
+
+    pub(super) async fn notify_skill_projection_changed(
+        &self,
+        workspace_id: &str,
+        reason: &str,
+        changes: Vec<SkillChangedItem>,
+        pack_changes: Vec<SkillPackChangedItem>,
+        created_at: i64,
+    ) {
+        let notification = skill_projection_changed_notification(
+            workspace_id,
+            self.next_skills_snapshot_version(),
+            reason,
             changes,
+            pack_changes,
             created_at,
-        };
+        );
 
         self.send_notification_to_workspace_connections(
             workspace_id,
@@ -375,5 +388,131 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+    }
+}
+
+fn skill_projection_changed_notification(
+    workspace_id: &str,
+    snapshot_version: u64,
+    reason: &str,
+    changes: Vec<SkillChangedItem>,
+    pack_changes: Vec<SkillPackChangedItem>,
+    created_at: i64,
+) -> SkillsChangedNotification {
+    SkillsChangedNotification {
+        workspace_id: workspace_id.to_owned(),
+        snapshot_version,
+        reason: reason.to_owned(),
+        changes,
+        pack_changes: ordered_skill_pack_changes(pack_changes),
+        created_at,
+    }
+}
+
+fn ordered_skill_pack_changes(
+    mut pack_changes: Vec<SkillPackChangedItem>,
+) -> Vec<SkillPackChangedItem> {
+    pack_changes.sort_by(|left, right| left.pack_id.cmp(&right.pack_id));
+    pack_changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ordered_skill_pack_changes, skill_projection_changed_notification};
+    use pioneer_protocol::{SkillChangedItem, SkillId, SkillPackChangedItem, SkillPackId};
+
+    fn pack_id(character: char) -> SkillPackId {
+        SkillPackId::new(character.to_string().repeat(21)).expect("valid pack id")
+    }
+
+    fn skill_id(character: char) -> SkillId {
+        SkillId::new(character.to_string().repeat(21)).expect("valid skill id")
+    }
+
+    #[test]
+    fn skill_pack_changes_are_ordered_by_pack_id_without_losing_names() {
+        let changes = ordered_skill_pack_changes(vec![
+            SkillPackChangedItem {
+                pack_id: pack_id('Z'),
+                change_type: "uninstalled".to_owned(),
+                name_before: Some("Removed".to_owned()),
+                name_after: None,
+            },
+            SkillPackChangedItem {
+                pack_id: pack_id('A'),
+                change_type: "installed".to_owned(),
+                name_before: None,
+                name_after: Some("Installed".to_owned()),
+            },
+            SkillPackChangedItem {
+                pack_id: pack_id('M'),
+                change_type: "updated".to_owned(),
+                name_before: Some("Before".to_owned()),
+                name_after: Some("After".to_owned()),
+            },
+        ]);
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.pack_id.clone())
+                .collect::<Vec<_>>(),
+            vec![pack_id('A'), pack_id('M'), pack_id('Z')]
+        );
+        assert_eq!(changes[0].name_before, None);
+        assert_eq!(changes[0].name_after.as_deref(), Some("Installed"));
+        assert_eq!(changes[1].name_before.as_deref(), Some("Before"));
+        assert_eq!(changes[1].name_after.as_deref(), Some("After"));
+        assert_eq!(changes[2].name_before.as_deref(), Some("Removed"));
+        assert_eq!(changes[2].name_after, None);
+    }
+
+    #[test]
+    fn combined_projection_notification_preserves_preordered_children_and_orders_parents() {
+        let child_changes = vec![
+            SkillChangedItem {
+                skill_id: skill_id('A'),
+                owner: None,
+                slug: "alpha".to_owned(),
+                source_kind: "user".to_owned(),
+                change_type: "install".to_owned(),
+                fingerprint_before: None,
+                fingerprint_after: Some("alpha-after".to_owned()),
+            },
+            SkillChangedItem {
+                skill_id: skill_id('Z'),
+                owner: None,
+                slug: "zeta".to_owned(),
+                source_kind: "user".to_owned(),
+                change_type: "install".to_owned(),
+                fingerprint_before: None,
+                fingerprint_after: Some("zeta-after".to_owned()),
+            },
+        ];
+        let notification = skill_projection_changed_notification(
+            "workspace-one",
+            7,
+            "pack_installed",
+            child_changes.clone(),
+            vec![
+                SkillPackChangedItem {
+                    pack_id: pack_id('Z'),
+                    change_type: "installed".to_owned(),
+                    name_before: None,
+                    name_after: Some("Zeta".to_owned()),
+                },
+                SkillPackChangedItem {
+                    pack_id: pack_id('A'),
+                    change_type: "installed".to_owned(),
+                    name_before: None,
+                    name_after: Some("Alpha".to_owned()),
+                },
+            ],
+            9,
+        );
+
+        assert_eq!(notification.changes, child_changes);
+        assert_eq!(notification.pack_changes[0].pack_id, pack_id('A'));
+        assert_eq!(notification.pack_changes[1].pack_id, pack_id('Z'));
     }
 }

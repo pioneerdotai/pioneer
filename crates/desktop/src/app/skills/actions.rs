@@ -5,9 +5,14 @@ use crate::{
 use anyhow::Result;
 use gpui::{prelude::*, *};
 use pioneer_client::skills::{
-    actions as skill_actions, archive::build_skill_upload_archive, upload as skill_upload,
+    actions as skill_actions,
+    archive::{
+        SkillUploadArchive, SkillUploadSourceKind, build_skill_pack_upload_archive,
+        build_skill_upload_archive, classify_skill_upload_source,
+    },
+    upload as skill_upload,
 };
-use pioneer_protocol::SkillId;
+use pioneer_protocol::{SkillId, SkillPackId};
 use std::{
     path::PathBuf,
     sync::{
@@ -55,9 +60,171 @@ impl PioneerDesktop {
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
+            async move {
+                let classification_path = PathBuf::from(source_path.as_str());
+                let source_kind = cx
+                    .background_spawn(async move {
+                        classify_skill_upload_source(classification_path.as_path())
+                    })
+                    .await;
+                let (source_kind, result): (Option<SkillUploadSourceKind>, Result<()>) =
+                    match source_kind {
+                        Ok(source_kind) => {
+                            let archive_builder: fn(
+                                &std::path::Path,
+                            ) -> Result<SkillUploadArchive> = match source_kind {
+                                SkillUploadSourceKind::Skill => build_skill_upload_archive,
+                                SkillUploadSourceKind::Pack => build_skill_pack_upload_archive,
+                            };
+                            let progress_label = match source_kind {
+                                SkillUploadSourceKind::Skill => {
+                                    t!("skills.upload.installing").to_string()
+                                }
+                                SkillUploadSourceKind::Pack => {
+                                    t!("skills.upload.installing_pack").to_string()
+                                }
+                            };
+                            let upload_workspace_id = workspace_id.clone();
+                            let result = async {
+                                let upload_id = upload_selected_skill_directory(
+                                    this.clone(),
+                                    &mut cx,
+                                    ws_sender.clone(),
+                                    upload_workspace_id,
+                                    source_path,
+                                    progress_label,
+                                    cancel_token,
+                                    archive_builder,
+                                )
+                                .await?;
+
+                                cx.background_spawn(async move {
+                                    match source_kind {
+                                        SkillUploadSourceKind::Skill => ws_sender
+                                            .skills_install(
+                                                skill_actions::skills_install_uploaded_archive_params(
+                                                    workspace_id,
+                                                    upload_id,
+                                                ),
+                                            )
+                                            .map(|_| ()),
+                                        SkillUploadSourceKind::Pack => ws_sender
+                                            .skills_pack_install(
+                                                skill_actions::skills_pack_install_uploaded_archive_params(
+                                                    workspace_id,
+                                                    upload_id,
+                                                ),
+                                            )
+                                            .map(|_| ()),
+                                    }
+                                })
+                                .await?;
+                                Ok(())
+                            }
+                            .await;
+                            (Some(source_kind), result)
+                        }
+                        Err(error) => (None, Err(error)),
+                    };
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !skill_actions::skill_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
+                        return;
+                    }
+
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
+                        Err(error) => {
+                            let label = match source_kind {
+                                Some(SkillUploadSourceKind::Pack) => {
+                                    t!("skills.error.install_pack_failed")
+                                }
+                                _ => t!("skills.error.install_failed"),
+                            };
+                            let error = format!("{label}: {error:#}");
+                            warn!(source_kind = ?source_kind, error = %format!("{error:#}"), "failed to install skill source");
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
+                        }
+                    };
+                    match source_kind {
+                        Some(SkillUploadSourceKind::Pack) => {
+                            let reduction = skill_actions::reduce_skill_pack_action_finish(
+                                skill_actions::SkillPackActionFinishKind::Install,
+                                outcome,
+                            );
+                            view.apply_skill_pack_action_finish_reduction(reduction);
+                        }
+                        _ => {
+                            let reduction = skill_actions::reduce_skill_action_finish(
+                                skill_actions::SkillActionFinishKind::Install,
+                                outcome,
+                            );
+                            view.apply_skill_action_finish_reduction(reduction);
+                        }
+                    }
+
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn update_skill_pack_from_path(
+        &mut self,
+        pack_id: SkillPackId,
+        source_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .skills_management
+            .packs
+            .iter()
+            .any(|row| row.pack.id == pack_id)
+        {
+            self.skills_error = Some(t!("skills.error.invalid_pack_target").to_string());
+            return;
+        }
+        let Some(source_path) = skill_actions::normalize_skill_source_path(source_path.as_str())
+        else {
+            self.skills_error = Some(t!("skills.error.path_required").to_string());
+            return;
+        };
+        let scope = match skill_actions::plan_skill_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.skills_workspace_scope(),
+        ) {
+            skill_actions::SkillActionScopePlan::Send(scope) => scope,
+            skill_actions::SkillActionScopePlan::Unavailable(reason) => {
+                self.apply_skill_action_unavailable(reason);
+                return;
+            }
+        };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
+
+        self.skills_error = None;
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.skills_upload_cancel_token = Some(cancel_token.clone());
+        self.skills_upload_progress = Some(skill_upload::skill_upload_progress(
+            t!("skills.upload.preparing").to_string(),
+            0,
+            0,
+        ));
+        self.mark_skill_pack_pending(&pack_id, true);
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let pack_id_for_request = pack_id.clone();
             let upload_workspace_id = workspace_id.clone();
-            let upload_source_path = source_path.clone();
-            let upload_cancel_token = cancel_token.clone();
             async move {
                 let result: Result<()> = async {
                     let upload_id = upload_selected_skill_directory(
@@ -65,16 +232,18 @@ impl PioneerDesktop {
                         &mut cx,
                         ws_sender.clone(),
                         upload_workspace_id,
-                        upload_source_path,
-                        t!("skills.upload.installing").to_string(),
-                        upload_cancel_token,
+                        source_path,
+                        t!("skills.upload.updating_pack").to_string(),
+                        cancel_token,
+                        build_skill_pack_upload_archive,
                     )
                     .await?;
 
                     cx.background_spawn(async move {
-                        ws_sender.skills_install(
-                            skill_actions::skills_install_uploaded_archive_params(
+                        ws_sender.skills_pack_update(
+                            skill_actions::skills_pack_update_uploaded_archive_params(
                                 workspace_id,
+                                pack_id_for_request,
                                 upload_id,
                             ),
                         )
@@ -95,17 +264,94 @@ impl PioneerDesktop {
                     let outcome = match result {
                         Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
                         Err(error) => {
-                            let error = format!("{}: {error:#}", t!("skills.error.install_failed"));
-                            warn!(error = %format!("{error:#}"), "failed to install skill");
+                            let error =
+                                format!("{}: {error:#}", t!("skills.error.update_pack_failed"));
+                            warn!(pack_id = %pack_id, error = %format!("{error:#}"), "failed to update skill pack");
                             skill_actions::SkillActionFinishOutcome::Failure { error }
                         }
                     };
-                    let reduction = skill_actions::reduce_skill_action_finish(
-                        skill_actions::SkillActionFinishKind::Install,
+                    let reduction = skill_actions::reduce_skill_pack_action_finish(
+                        skill_actions::SkillPackActionFinishKind::Update(
+                            skill_actions::SkillPackActionTarget::new(pack_id.clone()),
+                        ),
                         outcome,
                     );
-                    view.apply_skill_action_finish_reduction(reduction);
+                    view.apply_skill_pack_action_finish_reduction(reduction);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
 
+    pub(super) fn uninstall_skill_pack(&mut self, pack_id: SkillPackId, cx: &mut Context<Self>) {
+        if !self
+            .skills_management
+            .packs
+            .iter()
+            .any(|row| row.pack.id == pack_id)
+        {
+            self.skills_error = Some(t!("skills.error.invalid_pack_target").to_string());
+            return;
+        }
+        let scope = match skill_actions::plan_skill_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.skills_workspace_scope(),
+        ) {
+            skill_actions::SkillActionScopePlan::Send(scope) => scope,
+            skill_actions::SkillActionScopePlan::Unavailable(reason) => {
+                self.apply_skill_action_unavailable(reason);
+                return;
+            }
+        };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
+
+        self.skills_error = None;
+        self.mark_skill_pack_pending(&pack_id, true);
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let pack_id_for_request = pack_id.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.skills_pack_uninstall(skill_actions::skills_pack_uninstall_params(
+                            workspace_id,
+                            pack_id_for_request,
+                        ))
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !skill_actions::skill_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
+                        return;
+                    }
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
+                        Err(error) => {
+                            let error = format!(
+                                "{}: {error:#}",
+                                t!("skills.error.uninstall_pack_failed")
+                            );
+                            warn!(pack_id = %pack_id, error = %format!("{error:#}"), "failed to uninstall skill pack");
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
+                        }
+                    };
+                    let reduction = skill_actions::reduce_skill_pack_action_finish(
+                        skill_actions::SkillPackActionFinishKind::Uninstall(
+                            skill_actions::SkillPackActionTarget::new(pack_id.clone()),
+                        ),
+                        outcome,
+                    );
+                    view.apply_skill_pack_action_finish_reduction(reduction);
                     cx.notify();
                 });
             }
@@ -177,6 +423,7 @@ impl PioneerDesktop {
                         upload_source_path,
                         t!("skills.upload.updating").to_string(),
                         upload_cancel_token,
+                        build_skill_upload_archive,
                     )
                     .await?;
 
@@ -356,6 +603,7 @@ impl PioneerDesktop {
             enabled,
             allow_implicit_invocation,
         );
+        self.reproject_skill_management();
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -409,6 +657,7 @@ impl PioneerDesktop {
                             prev_enabled,
                             prev_implicit,
                         );
+                        view.reproject_skill_management();
                     }
                     view.apply_skill_action_finish_reduction(reduction);
 
@@ -459,6 +708,26 @@ impl PioneerDesktop {
             self.queue_skills_refresh();
         }
     }
+
+    fn apply_skill_pack_action_finish_reduction(
+        &mut self,
+        reduction: skill_actions::SkillPackActionFinishReduction,
+    ) {
+        if let Some(loading) = reduction.loading {
+            self.skills_loading = loading;
+        }
+        if reduction.clear_upload_state {
+            self.skills_upload_progress = None;
+            self.skills_upload_cancel_token = None;
+        }
+        if let Some(pending) = reduction.pending {
+            self.mark_skill_pack_pending(&pending.target.pack_id, pending.pending);
+        }
+        self.skills_error = reduction.error;
+        if reduction.queue_refresh {
+            self.queue_skills_refresh();
+        }
+    }
 }
 
 async fn upload_selected_skill_directory(
@@ -469,10 +738,11 @@ async fn upload_selected_skill_directory(
     source_path: String,
     progress_label: String,
     cancel_token: Arc<AtomicBool>,
+    archive_builder: fn(&std::path::Path) -> Result<SkillUploadArchive>,
 ) -> Result<String> {
     let source_path = PathBuf::from(source_path);
     let archive = cx
-        .background_spawn(async move { build_skill_upload_archive(source_path.as_path()) })
+        .background_spawn(async move { archive_builder(source_path.as_path()) })
         .await?;
     let total_bytes = skill_upload::archive_compressed_size(&archive)?;
 

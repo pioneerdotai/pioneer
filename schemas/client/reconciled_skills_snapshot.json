@@ -236,6 +236,16 @@
             "null"
           ]
         },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "policy": {
           "$ref": "#/$defs/SkillPolicyState"
         },
@@ -279,6 +289,99 @@
         "policy",
         "health",
         "status"
+      ]
+    },
+    "SkillManagementProjection": {
+      "type": "object",
+      "properties": {
+        "packs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillPackManagementRow"
+          }
+        },
+        "standalone": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillListItem"
+          }
+        }
+      },
+      "required": [
+        "standalone",
+        "packs"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackInstallationItem": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "source_kind",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "SkillPackManagementRow": {
+      "type": "object",
+      "properties": {
+        "attachable": {
+          "type": "boolean"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillListItem"
+          }
+        },
+        "pack": {
+          "$ref": "#/$defs/SkillPackInstallationItem"
+        }
+      },
+      "required": [
+        "pack",
+        "children",
+        "attachable"
+      ]
+    },
+    "SkillPackMembership": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key"
       ]
     },
     "SkillPolicyState": {
@@ -391,6 +494,13 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/SkillListItem"
+          }
+        },
+        "management": {
+          "$ref": "#/$defs/SkillManagementProjection",
+          "default": {
+            "packs": [],
+            "standalone": []
           }
         }
       },

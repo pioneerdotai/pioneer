@@ -121,22 +121,26 @@ use crate::{
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SandboxBackendKind, SandboxBackendRequirement,
     SandboxMode, SandboxPolicy, SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem,
     SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillHealthTarget, SkillId,
-    SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource,
-    SkillListItem, SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
-    SkillTrustGateStatus, SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams,
-    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams,
-    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
-    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
-    SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadChunkAckNotification,
-    SkillsUploadChunkHeader, SkillsUploadFinishParams, SkillsUploadFinishResponse,
-    SkillsUploadStartParams, SkillsUploadStartResponse, Task, TaskAcceptParams, TaskAcceptResponse,
-    TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
-    TaskAgentContextPolicy, TaskAgentInput, TaskAgentInputAttachment, TaskAgentInputAttachmentKind,
-    TaskAgentInputReference, TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSecurityCap, TaskAgentSpec, TaskAgentSpecInput, TaskAgentToolPolicy,
-    TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode, TaskCancelParams, TaskCancelResponse,
-    TaskCancelScope, TaskCancelledNotification, TaskCompletedNotification, TaskCompletionBehavior,
+    SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleRemovedSkill,
+    SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem, SkillListParams,
+    SkillListResponse, SkillPackChangedItem, SkillPackId, SkillPackInstallationItem,
+    SkillPackMembership, SkillPolicyState, SkillSecurityFinding, SkillTrustGateStatus,
+    SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse,
+    SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
+    SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
+    SkillsPackUpdateResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
+    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
+    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
+    SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse, Task,
+    TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
+    TaskAgentContext, TaskAgentContextMode, TaskAgentContextPolicy, TaskAgentInput,
+    TaskAgentInputAttachment, TaskAgentInputAttachmentKind, TaskAgentInputReference,
+    TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSecurityCap,
+    TaskAgentSpec, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskArtifact,
+    TaskAttachmentMode, TaskCancelParams, TaskCancelResponse, TaskCancelScope,
+    TaskCancelledNotification, TaskCompletedNotification, TaskCompletionBehavior,
     TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse,
     TaskCreatedNotification, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
     TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,
@@ -213,8 +217,9 @@ use crate::{
     TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
     TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
     TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
-    TurnShellPolicy, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
-    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
+    TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
+    TurnSkillPackPresentationSummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
+    TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
     TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput,
     VoiceAudioEncoding, VoiceAudioFormat, VoiceChunkAckNotification, VoiceChunkFrameHeader,
     VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
@@ -1329,6 +1334,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             TurnSkillCapabilitySummary
         ),
         schema_doc!(
+            "turn_skill_pack_capability_summary.json",
+            TurnSkillPackCapabilitySummary
+        ),
+        schema_doc!(
+            "turn_skill_pack_presentation_summary.json",
+            TurnSkillPackPresentationSummary
+        ),
+        schema_doc!(
             "turn_mcp_server_capability_summary.json",
             TurnMcpServerCapabilitySummary
         ),
@@ -1688,8 +1701,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("skills_list_params.json", SkillListParams),
         schema_doc!("skill_id.json", SkillId),
+        schema_doc!("skill_pack_id.json", SkillPackId),
         schema_doc!("skills_list_response.json", SkillListResponse),
         schema_doc!("skills_list_item.json", SkillListItem),
+        schema_doc!(
+            "skill_pack_installation_item.json",
+            SkillPackInstallationItem
+        ),
+        schema_doc!("skill_pack_membership.json", SkillPackMembership),
         schema_doc!("skill_install_state.json", SkillInstallState),
         schema_doc!("skill_policy_state.json", SkillPolicyState),
         schema_doc!("skill_health_summary.json", SkillHealthSummary),
@@ -1704,6 +1723,25 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("skills_update_response.json", SkillsUpdateResponse),
         schema_doc!("skills_uninstall_params.json", SkillsUninstallParams),
         schema_doc!("skills_uninstall_response.json", SkillsUninstallResponse),
+        schema_doc!("skills_pack_install_params.json", SkillsPackInstallParams),
+        schema_doc!(
+            "skills_pack_install_response.json",
+            SkillsPackInstallResponse
+        ),
+        schema_doc!("skills_pack_update_params.json", SkillsPackUpdateParams),
+        schema_doc!("skills_pack_update_response.json", SkillsPackUpdateResponse),
+        schema_doc!(
+            "skills_pack_uninstall_params.json",
+            SkillsPackUninstallParams
+        ),
+        schema_doc!(
+            "skills_pack_uninstall_response.json",
+            SkillsPackUninstallResponse
+        ),
+        schema_doc!(
+            "skill_lifecycle_removed_skill.json",
+            SkillLifecycleRemovedSkill
+        ),
         schema_doc!("skill_lifecycle_source.json", SkillLifecycleSource),
         schema_doc!("skill_archive_format.json", SkillArchiveFormat),
         schema_doc!("skills_upload_start_params.json", SkillsUploadStartParams),
@@ -1750,6 +1788,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             SkillsChangedNotification
         ),
         schema_doc!("skill_changed_item.json", SkillChangedItem),
+        schema_doc!("skill_pack_changed_item.json", SkillPackChangedItem),
         schema_doc!("mcp_list_params.json", McpListParams),
         schema_doc!("mcp_list_response.json", McpListResponse),
         schema_doc!("mcp_list_item.json", McpListItem),

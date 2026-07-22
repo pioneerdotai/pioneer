@@ -473,6 +473,37 @@ impl MessageProcessor {
             .map(|row| (row.skill_id.clone(), row))
             .collect::<HashMap<_, _>>();
 
+        let pack_items = match self
+            .crud_store
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| SkillPackInstallationItem {
+                    id: row.pack_id,
+                    name: row.name,
+                    source_kind: row.source_kind,
+                    created_at: row.created_at_unix,
+                    updated_at: row.updated_at_unix,
+                })
+                .collect(),
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "failed to load skill pack installations",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
         let workspace_policies = match self
             .crud_store
             .list_workspace_skill_policies(workspace_id.as_str())
@@ -564,6 +595,14 @@ impl MessageProcessor {
 
                 SkillListItem {
                     skill_id: skill.identity.skill_id.clone(),
+                    pack: installation.and_then(|item| {
+                        item.pack_id.clone().zip(item.pack_member_key.clone()).map(
+                            |(pack_id, member_key)| SkillPackMembership {
+                                pack_id,
+                                member_key,
+                            },
+                        )
+                    }),
                     owner: skill.identity.owner.clone(),
                     slug: skill.identity.slug.clone(),
                     source_kind: skill.identity.source_kind.as_db_value().to_owned(),
@@ -614,6 +653,7 @@ impl MessageProcessor {
             snapshot_version: self.current_skills_snapshot_version(),
             generated_at: now_timestamp_secs(),
             skills: response_items,
+            packs: pack_items,
         };
 
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {

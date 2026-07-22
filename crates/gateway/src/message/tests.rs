@@ -47,8 +47,8 @@ use pioneer_crud::{
     AgentMemoryListFilter, CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus,
     CrudStore, MemoryActorRecord, NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection,
     NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-    SkillInstallationPatch, SkillInstallationRecord, ThreadAgentsDocSaveReason,
-    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
+    SkillInstallationPatch, SkillInstallationRecord, SkillPackInstallationRecord,
+    ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -93,6 +93,7 @@ use pioneer_protocol::{
     ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
     RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
     SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPackInstallResponse, SkillsPackUninstallResponse, SkillsPackUpdateResponse,
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
     SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
@@ -512,6 +513,325 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
     }
 }
 
+#[test]
+fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("skill pack normalization runtime")
+        .block_on(async {
+            let harness = setup_cli_runtime_security_harness().await;
+            let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+            let other_pack_id =
+                pioneer_protocol::SkillPackId::new("Q".repeat(21)).expect("other pack id");
+            let empty_pack_id =
+                pioneer_protocol::SkillPackId::new("E".repeat(21)).expect("empty pack id");
+            let foreign_pack_id =
+                pioneer_protocol::SkillPackId::new("F".repeat(21)).expect("foreign pack id");
+            for (id, name) in [
+                (other_pack_id.clone(), "other-pack"),
+                (empty_pack_id.clone(), "empty-pack"),
+            ] {
+                harness
+                    .crud_store
+                    .insert_skill_pack_installation(&SkillPackInstallationRecord {
+                        pack_id: id,
+                        name: name.to_owned(),
+                        scope_key: harness.workspace_id.clone(),
+                        source_kind: "user".to_owned(),
+                        created_at_unix: 1,
+                        updated_at_unix: 1,
+                    })
+                    .await
+                    .expect("insert pack");
+            }
+            harness
+                .crud_store
+                .insert_skill_pack_installation(&SkillPackInstallationRecord {
+                    pack_id: foreign_pack_id.clone(),
+                    name: "foreign-pack".to_owned(),
+                    scope_key: "workspace_foreign".to_owned(),
+                    source_kind: "user".to_owned(),
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                })
+                .await
+                .expect("insert foreign pack");
+
+            let first_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("first id");
+            let second_id = pioneer_protocol::SkillId::new("B".repeat(21)).expect("second id");
+            let standalone_id =
+                pioneer_protocol::SkillId::new("S".repeat(21)).expect("standalone id");
+            let packed_children = [(first_id.clone(), "zeta"), (second_id.clone(), "alpha")].map(
+                |(skill_id, member_key)| SkillInstallationRecord {
+                    skill_id: skill_id.clone(),
+                    owner: None,
+                    slug: skill_id.to_string(),
+                    version: None,
+                    source_kind: "user".to_owned(),
+                    scope_key: harness.workspace_id.clone(),
+                    source_ref: format!("test:{skill_id}"),
+                    install_path: format!("/tmp/{skill_id}"),
+                    trust_level: "community".to_owned(),
+                    fingerprint: format!("fingerprint:{skill_id}"),
+                    updated_at_unix: 1,
+                    pack_id: Some(pack_id.clone()),
+                    pack_member_key: Some(member_key.to_owned()),
+                },
+            );
+            harness
+                .crud_store
+                .insert_skill_pack_installation_with_children(
+                    &SkillPackInstallationRecord {
+                        pack_id: pack_id.clone(),
+                        name: "writer-pack".to_owned(),
+                        scope_key: harness.workspace_id.clone(),
+                        source_kind: "user".to_owned(),
+                        created_at_unix: 1,
+                        updated_at_unix: 1,
+                    },
+                    &packed_children,
+                )
+                .await
+                .expect("insert pack and children");
+            harness
+                .crud_store
+                .insert_skill_installation(
+                    &SkillInstallationRecord {
+                        skill_id: standalone_id.clone(),
+                        owner: None,
+                        slug: standalone_id.to_string(),
+                        version: None,
+                        source_kind: "user".to_owned(),
+                        scope_key: harness.workspace_id.clone(),
+                        source_ref: format!("test:{standalone_id}"),
+                        install_path: format!("/tmp/{standalone_id}"),
+                        trust_level: "community".to_owned(),
+                        fingerprint: format!("fingerprint:{standalone_id}"),
+                        updated_at_unix: 1,
+                        pack_id: None,
+                        pack_member_key: None,
+                    },
+                    1,
+                )
+                .await
+                .expect("insert standalone skill");
+
+            let full = TurnCapability {
+                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                kind: TurnCapabilityKind::SkillPack {
+                    pack_id: pack_id.clone(),
+                },
+                label: Some("client-pack-label".to_owned()),
+            };
+            let standalone = TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&standalone_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: standalone_id.clone(),
+                    pack_id: None,
+                },
+                label: Some("standalone".to_owned()),
+            };
+            let normalized = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[full.clone(), standalone],
+                )
+                .await
+                .expect("normalize full pack");
+            assert!(matches!(
+                normalized.presentation[0].kind,
+                TurnCapabilityKind::SkillPack { .. }
+            ));
+            let execution_ids = normalized
+                .execution
+                .iter()
+                .filter_map(|capability| match &capability.kind {
+                    TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                        assert!(pack_id.is_none());
+                        Some(skill_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                execution_ids,
+                vec![second_id.clone(), first_id.clone(), standalone_id]
+            );
+            assert_eq!(normalized.execution[0].label, None);
+            assert_eq!(normalized.execution[1].label, None);
+            assert_eq!(normalized.execution[2].label.as_deref(), Some("standalone"));
+            let child_failure = harness
+                .processor
+                .validate_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &normalized.execution[..2],
+                )
+                .await;
+            assert!(
+                child_failure.is_err(),
+                "one unavailable child must reject the complete expanded pack"
+            );
+
+            let duplicate_pack = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[full.clone(), full.clone()],
+                )
+                .await;
+            assert!(duplicate_pack.is_err());
+
+            let duplicate_child = TurnCapability {
+                id: pioneer_protocol::skill_capability_key(&first_id),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: first_id.clone(),
+                    pack_id: Some(pack_id.clone()),
+                },
+                label: None,
+            };
+            let duplicate_child_result = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[duplicate_child.clone(), duplicate_child],
+                )
+                .await;
+            assert!(duplicate_child_result.is_err());
+
+            let normalized_child = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[TurnCapability {
+                        id: pioneer_protocol::skill_capability_key(&first_id),
+                        kind: TurnCapabilityKind::Skill {
+                            skill_id: first_id.clone(),
+                            pack_id: None,
+                        },
+                        label: None,
+                    }],
+                )
+                .await
+                .expect("normalize legacy packed child");
+            assert!(matches!(
+                &normalized_child.presentation[0].kind,
+                TurnCapabilityKind::Skill {
+                    pack_id: Some(actual),
+                    ..
+                } if actual == &pack_id
+            ));
+            assert_eq!(normalized_child.execution[0].label, None);
+
+            let mismatch = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[TurnCapability {
+                        id: pioneer_protocol::skill_capability_key(&first_id),
+                        kind: TurnCapabilityKind::Skill {
+                            skill_id: first_id.clone(),
+                            pack_id: Some(other_pack_id),
+                        },
+                        label: None,
+                    }],
+                )
+                .await;
+            assert!(mismatch.is_err());
+
+            let mixed = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[
+                        full,
+                        TurnCapability {
+                            id: pioneer_protocol::skill_capability_key(&first_id),
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: first_id,
+                                pack_id: Some(pack_id.clone()),
+                            },
+                            label: None,
+                        },
+                    ],
+                )
+                .await;
+            assert!(mixed.is_err());
+
+            let empty = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[TurnCapability {
+                        id: pioneer_protocol::skill_pack_capability_key(&empty_pack_id),
+                        kind: TurnCapabilityKind::SkillPack {
+                            pack_id: empty_pack_id,
+                        },
+                        label: None,
+                    }],
+                )
+                .await;
+            assert!(empty.is_err());
+
+            let foreign = harness
+                .processor
+                .normalize_turn_skill_capabilities(
+                    harness.workspace_id.as_str(),
+                    &[TurnCapability {
+                        id: pioneer_protocol::skill_pack_capability_key(&foreign_pack_id),
+                        kind: TurnCapabilityKind::SkillPack {
+                            pack_id: foreign_pack_id,
+                        },
+                        label: None,
+                    }],
+                )
+                .await;
+            assert!(foreign.is_err());
+
+            let write_guard = harness.processor.acquire_skills_write_lock().await;
+            let queued_capabilities = vec![TurnCapability {
+                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                kind: TurnCapabilityKind::SkillPack {
+                    pack_id: pack_id.clone(),
+                },
+                label: None,
+            }];
+            let queued_normalization = harness.processor.normalize_turn_skill_capabilities(
+                harness.workspace_id.as_str(),
+                queued_capabilities.as_slice(),
+            );
+            tokio::pin!(queued_normalization);
+            assert!(
+                timeout(Duration::from_millis(50), queued_normalization.as_mut())
+                    .await
+                    .is_err(),
+                "turn capability normalization must wait for the shared skills write lock"
+            );
+            harness
+                .crud_store
+                .update_skill_pack_installation_name(
+                    harness.workspace_id.as_str(),
+                    &pack_id,
+                    "authoritative-pack-name",
+                    2,
+                )
+                .await
+                .expect("rename pack while normalization is queued");
+            drop(write_guard);
+            let normalized_after_lock = queued_normalization
+                .await
+                .expect("normalize pack after lifecycle lock release");
+            assert_eq!(
+                normalized_after_lock
+                    .pack_names
+                    .get(&pack_id)
+                    .map(String::as_str),
+                Some("authoritative-pack-name")
+            );
+        });
+}
+
 struct CliRuntimeSkillPreflightHarness {
     _temp: tempfile::TempDir,
     rx: mpsc::Receiver<Message>,
@@ -676,7 +996,10 @@ fn cli_runtime_skill_capability(slug: &str, source_kind: &str) -> JsonValue {
     let skill_id = cli_runtime_skill_test_id(slug, source_kind);
     serde_json::to_value(pioneer_protocol::TurnCapability {
         id: format!("skill:{skill_id}"),
-        kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
+        kind: pioneer_protocol::TurnCapabilityKind::Skill {
+            skill_id,
+            pack_id: None,
+        },
         label: Some(slug.to_owned()),
     })
     .unwrap()
@@ -708,6 +1031,8 @@ async fn seed_cli_runtime_skill_installation(
                 },
                 fingerprint: format!("cli-test-fingerprint-{skill_id}"),
                 updated_at_unix: 1,
+                pack_id: None,
+                pack_member_key: None,
             },
             1,
         )
@@ -4349,6 +4674,8 @@ async fn seed_test_skill_installation(
                 trust_level: "community".to_owned(),
                 fingerprint: format!("test-fingerprint-{skill_id_character}"),
                 updated_at_unix: 1,
+                pack_id: None,
+                pack_member_key: None,
             },
             1,
         )
@@ -4366,6 +4693,30 @@ async fn create_finalized_skill_upload(
     request_prefix: &str,
 ) -> String {
     let archive = build_test_skill_archive(source_path);
+    create_finalized_archive_upload(
+        processor,
+        rx,
+        connection_id,
+        workspace_id,
+        archive,
+        format!(
+            "{}.tar.gz",
+            source_path.file_name().unwrap().to_string_lossy()
+        ),
+        request_prefix,
+    )
+    .await
+}
+
+async fn create_finalized_archive_upload(
+    processor: &MessageProcessor,
+    rx: &mut mpsc::Receiver<Message>,
+    connection_id: u64,
+    workspace_id: &str,
+    archive: Vec<u8>,
+    file_name: String,
+    request_prefix: &str,
+) -> String {
     let sha256 = hex::encode(Sha256::digest(archive.as_slice()));
     let start_request_id = generate_test_request_id(request_prefix, "start");
     let start_request = json!({
@@ -4374,10 +4725,7 @@ async fn create_finalized_skill_upload(
         "method": "skills/upload/start",
         "params": {
             "workspace_id": workspace_id,
-            "file_name": format!(
-                "{}.tar.gz",
-                source_path.file_name().unwrap().to_string_lossy()
-            ),
+            "file_name": file_name,
             "archive_format": SkillArchiveFormat::TarGz,
             "compressed_size_bytes": archive.len(),
             "uncompressed_size_hint_bytes": archive.len(),
@@ -4433,6 +4781,58 @@ async fn create_finalized_skill_upload(
         serde_json::from_value(finish_response.result).expect("skills/upload/finish decode");
     assert_eq!(finish_payload.status, "finalized");
     finish_payload.upload_id
+}
+
+async fn install_test_skill_pack(
+    processor: &MessageProcessor,
+    rx: &mut mpsc::Receiver<Message>,
+    connection_id: u64,
+    workspace_id: &str,
+    request_id: &str,
+    upload_seed: &str,
+    pack_root: &std::path::Path,
+) -> SkillsPackInstallResponse {
+    let upload_id = create_finalized_archive_upload(
+        processor,
+        rx,
+        connection_id,
+        workspace_id,
+        build_test_directory_archive(pack_root),
+        format!("{upload_seed}.tar.gz"),
+        upload_seed,
+    )
+    .await;
+    let request = json!({
+        "jsonrpc": "2.0", "id": request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": upload_id}}
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let (response, _) =
+        recv_response_and_notification_by_id_method(rx, request_id, events::SKILLS_CHANGED).await;
+    serde_json::from_value(response.result).expect("pack install response")
+}
+
+fn build_test_directory_archive(source_path: &std::path::Path) -> Vec<u8> {
+    use flate2::{Compression, GzBuilder};
+    use tar::Builder;
+
+    let root_name = source_path
+        .file_name()
+        .expect("source path should have file name");
+    let encoder = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    builder
+        .append_dir_all(root_name, source_path)
+        .expect("append source directory");
+    builder
+        .into_inner()
+        .expect("finalize tar")
+        .finish()
+        .expect("finalize gzip")
 }
 
 fn build_test_skill_archive(source_path: &std::path::Path) -> Vec<u8> {
@@ -6298,6 +6698,11 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
     std::fs::create_dir_all(&workspace_root).expect("create workspace root");
     std::fs::create_dir_all(&registry_root).expect("create registry root");
     let weather_path = write_test_skill(&user_root, "weather", "", "weather body");
+    let full_member_path = write_test_skill(&user_root, "full-member", "", "full member body");
+    let full_member_two_path =
+        write_test_skill(&user_root, "full-member-two", "", "second full member body");
+    let partial_member_path =
+        write_test_skill(&user_root, "partial-member", "", "partial member body");
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -6313,6 +6718,80 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         "weather",
     )
     .await;
+    let full_pack_id = pioneer_protocol::SkillPackId::new("F".repeat(21)).expect("full pack id");
+    let partial_pack_id =
+        pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("partial pack id");
+    let full_member_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("full member id");
+    let partial_member_id =
+        pioneer_protocol::SkillId::new("B".repeat(21)).expect("partial member id");
+    let full_member_two_id =
+        pioneer_protocol::SkillId::new("C".repeat(21)).expect("second full member id");
+    for (pack_id, name, skill_id, slug, path, member_key) in [
+        (
+            full_pack_id.clone(),
+            "Full Research Pack",
+            full_member_id.clone(),
+            "full-member",
+            full_member_path.as_path(),
+            "full-member-key",
+        ),
+        (
+            partial_pack_id.clone(),
+            "Partial Research Pack",
+            partial_member_id.clone(),
+            "partial-member",
+            partial_member_path.as_path(),
+            "partial-member-key",
+        ),
+    ] {
+        let mut children = vec![SkillInstallationRecord {
+            skill_id,
+            owner: Some("tests".to_owned()),
+            slug: slug.to_owned(),
+            version: None,
+            source_kind: "user".to_owned(),
+            scope_key: workspace_id.clone(),
+            source_ref: format!("test:{slug}"),
+            install_path: path.display().to_string(),
+            trust_level: "community".to_owned(),
+            fingerprint: format!("fingerprint:{slug}"),
+            updated_at_unix: 1,
+            pack_id: Some(pack_id.clone()),
+            pack_member_key: Some(member_key.to_owned()),
+        }];
+        if pack_id == full_pack_id {
+            children.push(SkillInstallationRecord {
+                skill_id: full_member_two_id.clone(),
+                owner: Some("tests".to_owned()),
+                slug: "full-member-two".to_owned(),
+                version: None,
+                source_kind: "user".to_owned(),
+                scope_key: workspace_id.clone(),
+                source_ref: "test:full-member-two".to_owned(),
+                install_path: full_member_two_path.display().to_string(),
+                trust_level: "community".to_owned(),
+                fingerprint: "fingerprint:full-member-two".to_owned(),
+                updated_at_unix: 1,
+                pack_id: Some(full_pack_id.clone()),
+                pack_member_key: Some("full-member-two-key".to_owned()),
+            });
+        }
+        crud_store
+            .insert_skill_pack_installation_with_children(
+                &SkillPackInstallationRecord {
+                    pack_id: pack_id.clone(),
+                    name: name.to_owned(),
+                    scope_key: workspace_id.clone(),
+                    source_kind: "user".to_owned(),
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+                children.as_slice(),
+            )
+            .await
+            .expect("pack fixture should persist");
+    }
+    let crud_store_for_history = crud_store.clone();
     let capture_provider = Arc::new(CaptureSummaryProvider::new("capability answer"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -6357,6 +6836,20 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
                     "label": "tests/weather"
                 },
                 {
+                    "id": pioneer_protocol::skill_pack_capability_key(&full_pack_id),
+                    "kind": { "type": "skillPack", "packId": full_pack_id },
+                    "label": "untrusted full pack label"
+                },
+                {
+                    "id": pioneer_protocol::skill_capability_key(&partial_member_id),
+                    "kind": {
+                        "type": "skill",
+                        "skillId": partial_member_id,
+                        "packId": partial_pack_id
+                    },
+                    "label": "untrusted partial label"
+                },
+                {
                     "id": "mcp-server:workspace:resend",
                     "kind": { "type": "mcpServer", "name": "resend", "scopeKind": "workspace" },
                     "label": "resend"
@@ -6398,7 +6891,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
     let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
 
     assert_eq!(text, "use selected capabilities");
-    assert_eq!(attachments.len(), 3);
+    assert_eq!(attachments.len(), 5);
     assert!(matches!(
         &attachments[0],
         UserMessageAttachment::Skill { capability }
@@ -6410,6 +6903,24 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
     ));
     assert!(matches!(
         &attachments[1],
+        UserMessageAttachment::SkillPack { capability }
+            if capability.pack_id == full_pack_id
+                && capability.label == "Full Research Pack"
+    ));
+    assert!(matches!(
+        &attachments[2],
+        UserMessageAttachment::Skill { capability }
+            if capability.skill_id == partial_member_id
+                && capability.label == "tests/partial-member"
+                && matches!(
+                    capability.pack.as_ref(),
+                    Some(pack)
+                        if pack.pack_id == partial_pack_id
+                            && pack.label == "Partial Research Pack"
+                )
+    ));
+    assert!(matches!(
+        &attachments[3],
         UserMessageAttachment::McpServer { capability }
             if capability.id == "mcp-server:workspace:resend"
                 && capability.label == "resend"
@@ -6417,7 +6928,7 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
                 && capability.scope_kind == McpScopeKind::Workspace
     ));
     assert!(matches!(
-        &attachments[2],
+        &attachments[4],
         UserMessageAttachment::McpTool { capability }
             if capability.id == "mcp-tool:workspace:resend:send_email"
                 && capability.label == "resend / Send Email"
@@ -6425,6 +6936,30 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
                 && capability.raw_tool_name == "send_email"
                 && capability.scope_kind == McpScopeKind::Workspace
     ));
+
+    assert!(
+        crud_store_for_history
+            .delete_skill_pack_installation_with_children(workspace_id.as_str(), &full_pack_id,)
+            .await
+            .expect("delete full pack after send")
+    );
+    assert!(
+        crud_store_for_history
+            .update_skill_pack_installation_name(
+                workspace_id.as_str(),
+                &partial_pack_id,
+                "Renamed Partial Pack",
+                2,
+            )
+            .await
+            .expect("rename partial pack after send")
+    );
+    assert!(
+        crud_store_for_history
+            .delete_skill_pack_installation_with_children(workspace_id.as_str(), &partial_pack_id,)
+            .await
+            .expect("delete partial pack after rename")
+    );
 
     let timeline_request_id = generate_test_request_id("turncapmsg", "timeline");
     let timeline_request = json!({
@@ -6462,6 +6997,23 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         )),
         "semantic timeline user block must preserve skill chips"
     );
+    assert!(timeline_attachments.iter().any(|attachment| matches!(
+        attachment,
+        UserMessageAttachment::SkillPack { capability }
+            if capability.pack_id == full_pack_id
+                && capability.label == "Full Research Pack"
+    )));
+    assert!(timeline_attachments.iter().any(|attachment| matches!(
+        attachment,
+        UserMessageAttachment::Skill { capability }
+            if capability.skill_id == partial_member_id
+                && matches!(
+                    capability.pack.as_ref(),
+                    Some(pack)
+                        if pack.pack_id == partial_pack_id
+                            && pack.label == "Partial Research Pack"
+                )
+    )));
     assert!(
         timeline_attachments.iter().any(|attachment| matches!(
             attachment,
@@ -13378,6 +13930,7 @@ async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
                 kind: TurnCapabilityKind::Skill {
                     skill_id: pioneer_protocol::SkillId::new("DDDDDDDDDDDDDDDDDDDDD")
                         .expect("valid docs SkillId"),
+                    pack_id: None,
                 },
                 reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
             }],
@@ -13387,6 +13940,7 @@ async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
                 kind: TurnCapabilityKind::Skill {
                     skill_id: pioneer_protocol::SkillId::new("MMMMMMMMMMMMMMMMMMMMM")
                         .expect("valid missing SkillId"),
+                    pack_id: None,
                 },
                 reason: TurnCapabilityRejectedReason::NotFound,
                 message: "Skill `missing` is not installed or not available in this workspace."
@@ -31237,6 +31791,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
     let shared_path = write_test_skill(&user_root, "shared-skill", "", "user shared body");
     let user_path = write_test_skill(&user_root, "user-a", "", "user skill body");
     let registry_path = write_test_skill(&registry_root, "registry-c", "", "registry skill body");
+    let packed_path = write_test_skill(&user_root, "packed-member", "", "packed skill body");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -31273,6 +31828,61 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         "registry-c",
     )
     .await;
+    let populated_pack = SkillPackInstallationRecord {
+        pack_id: pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("valid pack id"),
+        name: "Alpha Pack".to_owned(),
+        scope_key: workspace_id.clone(),
+        source_kind: "user".to_owned(),
+        created_at_unix: 10,
+        updated_at_unix: 11,
+    };
+    let packed_skill_id =
+        pioneer_protocol::SkillId::new("M".repeat(21)).expect("valid packed skill id");
+    crud_store
+        .insert_skill_pack_installation_with_children(
+            &populated_pack,
+            &[SkillInstallationRecord {
+                skill_id: packed_skill_id.clone(),
+                owner: Some("tests".to_owned()),
+                slug: "packed-member".to_owned(),
+                version: None,
+                source_kind: "user".to_owned(),
+                scope_key: workspace_id.clone(),
+                source_ref: "test:user:packed-member".to_owned(),
+                install_path: packed_path.display().to_string(),
+                trust_level: "community".to_owned(),
+                fingerprint: "test-fingerprint-M".to_owned(),
+                updated_at_unix: 11,
+                pack_id: Some(populated_pack.pack_id.clone()),
+                pack_member_key: Some("member-one".to_owned()),
+            }],
+        )
+        .await
+        .expect("seed populated pack");
+    let empty_pack = SkillPackInstallationRecord {
+        pack_id: pioneer_protocol::SkillPackId::new("E".repeat(21)).expect("valid pack id"),
+        name: "Zulu Empty Pack".to_owned(),
+        scope_key: workspace_id.clone(),
+        source_kind: "registry".to_owned(),
+        created_at_unix: 12,
+        updated_at_unix: 13,
+    };
+    crud_store
+        .insert_skill_pack_installation(&empty_pack)
+        .await
+        .expect("seed empty pack");
+    crud_store
+        .insert_skill_pack_installation(&SkillPackInstallationRecord {
+            pack_id: pioneer_protocol::SkillPackId::new("O".repeat(21))
+                .expect("valid other-scope pack id"),
+            name: "Foreign Pack".to_owned(),
+            scope_key: "ws_000000000000009999".to_owned(),
+            source_kind: "user".to_owned(),
+            created_at_unix: 14,
+            updated_at_unix: 15,
+        })
+        .await
+        .expect("seed foreign pack");
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -31305,6 +31915,18 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         serde_json::from_value(response.result).expect("skills/list payload should decode");
     assert!(payload.snapshot_version > 0);
     assert!(payload.generated_at > 0);
+    assert_eq!(
+        payload
+            .packs
+            .iter()
+            .map(|pack| (pack.name.as_str(), pack.id.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Alpha Pack", populated_pack.pack_id.clone()),
+            ("Zulu Empty Pack", empty_pack.pack_id.clone()),
+        ],
+        "skills/list must return scoped parent rows ordered by name then ID, including empty packs"
+    );
     assert!(
         payload.skills.len() >= 6,
         "skills/list should include all discovered sources"
@@ -31362,6 +31984,21 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         .expect("user skill should be listed");
     assert!(user_skill.install.lifecycle_editable);
     assert!(user_skill.policy.allow_implicit_invocation_editable);
+    assert!(
+        user_skill.pack.is_none(),
+        "standalone membership must remain absent"
+    );
+    let packed_skill = payload
+        .skills
+        .iter()
+        .find(|skill| skill.skill_id == packed_skill_id)
+        .expect("packed skill should remain in the flat skill list");
+    let membership = packed_skill
+        .pack
+        .as_ref()
+        .expect("packed skill should expose membership");
+    assert_eq!(membership.pack_id, populated_pack.pack_id);
+    assert_eq!(membership.member_key, "member-one");
     assert!(
         payload
             .skills
@@ -31435,6 +32072,7 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
             id: format!("skill:{skill_id}"),
             kind: TurnCapabilityKind::Skill {
                 skill_id: skill_id.clone(),
+                pack_id: None,
             },
             label: Some("same-owner/same-label".to_owned()),
         };
@@ -31451,6 +32089,7 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         id: format!("skill:{unavailable_id}"),
         kind: TurnCapabilityKind::Skill {
             skill_id: unavailable_id,
+            pack_id: None,
         },
         label: Some("same-owner/same-label".to_owned()),
     };
@@ -31466,6 +32105,7 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         id: format!("skill:{missing_id}"),
         kind: TurnCapabilityKind::Skill {
             skill_id: missing_id,
+            pack_id: None,
         },
         label: Some("same-owner/same-label".to_owned()),
     };
@@ -31477,7 +32117,10 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
 
     let mismatched_key = TurnCapability {
         id: format!("skill:{second_id}"),
-        kind: TurnCapabilityKind::Skill { skill_id: first_id },
+        kind: TurnCapabilityKind::Skill {
+            skill_id: first_id,
+            pack_id: None,
+        },
         label: Some("same-owner/same-label".to_owned()),
     };
     let key_error = processor
@@ -31567,6 +32210,10 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         serde_json::from_value(changed_params).expect("skills/changed payload should decode");
     assert_eq!(changed_payload.reason, "policy_updated");
     assert_eq!(changed_payload.workspace_id, workspace_id);
+    assert!(
+        changed_payload.pack_changes.is_empty(),
+        "ordinary skill notifications must carry no pack changes"
+    );
     assert!(
         changed_payload
             .changes
@@ -31828,6 +32475,1884 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
     assert!(locked_skill.policy.allow_implicit_invocation);
     assert!(!locked_skill.policy.allow_implicit_invocation_editable);
     assert_eq!(locked_skill.status, "disabled");
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_pack_install_persists_children_atomically_and_emits_one_change() {
+    let base_dir = unique_temp_dir("skills_pack_install");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let pack_root = base_dir.join("Research Pack");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    for (member_key, slug, body) in [
+        ("zeta-member", "zeta-skill", "zeta body"),
+        ("alpha-member", "alpha-skill", "alpha body"),
+    ] {
+        let member_dir = pack_root.join(member_key);
+        std::fs::create_dir_all(member_dir.as_path()).expect("create pack member");
+        std::fs::write(
+            member_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {slug}\nslug: {slug}\ndescription: {slug} description\n---\n{body}"
+            ),
+        )
+        .expect("write pack member");
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+
+    let upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "research-pack.tar.gz".to_owned(),
+        "packinstall",
+    )
+    .await;
+    let request_id = "skillspackinstall0001";
+    processor.set_pack_install_failpoints(
+        request_id,
+        vec![("pack_collision", 0), ("child_collision", 0)],
+    );
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "skills/pack/install",
+        "params": {
+            "workspace_id": workspace_id,
+            "source": {"type": "uploaded_archive", "upload_id": upload_id},
+            "target_source_kind": "user"
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let (response, changed) =
+        recv_response_and_notification_by_id_method(&mut rx, request_id, events::SKILLS_CHANGED)
+            .await;
+    let payload: SkillsPackInstallResponse = serde_json::from_value(response.result)
+        .expect("skills/pack/install response should decode");
+    assert_eq!(payload.status, "installed");
+    assert_eq!(payload.pack.name, "Research Pack");
+    assert_eq!(
+        payload
+            .skills
+            .iter()
+            .map(|skill| skill.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha-skill", "zeta-skill"]
+    );
+    assert_ne!(payload.skills[0].skill_id, payload.skills[1].skill_id);
+    assert_eq!(payload.audit.events_written, 2);
+
+    let parent = crud_store_for_assert
+        .find_skill_pack_installation(workspace_id.as_str(), &payload.pack.id)
+        .await
+        .expect("read installed pack")
+        .expect("installed pack should exist");
+    assert_eq!(parent.name, "Research Pack");
+    let children = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &payload.pack.id)
+        .await
+        .expect("read pack children");
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.pack_member_key.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("alpha-member"), Some("zeta-member")]
+    );
+    for child in &children {
+        let path = std::path::Path::new(child.install_path.as_str());
+        assert!(path.join("SKILL.md").is_file());
+        assert!(path.ends_with(format!("{}/{}", child.skill_id, child.slug)));
+        assert!(!child.install_path.contains("Research Pack"));
+        assert!(
+            crud_store_for_assert
+                .find_workspace_skill_policy(workspace_id.as_str(), &child.skill_id)
+                .await
+                .expect("read child policy")
+                .is_some()
+        );
+        assert_eq!(
+            crud_store_for_assert
+                .list_skill_audit_event_records(&child.skill_id, 16)
+                .await
+                .expect("read child audit")
+                .len(),
+            1
+        );
+    }
+    let managed_root = std::path::Path::new(children[0].install_path.as_str())
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("child install path should be rooted at <root>/<skill_id>/<slug>");
+    let lock = pioneer_skills::read_skills_lock(&managed_root.join("skills-lock.toml"))
+        .expect("read pack child lock entries");
+    assert_eq!(
+        lock.entries
+            .iter()
+            .map(|entry| entry.skill_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        children
+            .iter()
+            .map(|child| child.skill_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    for child in &children {
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.skill_id == child.skill_id)
+            .expect("each installed pack child should have a lock entry");
+        assert_eq!(entry.slug, child.slug);
+        assert_eq!(entry.install_path, child.install_path);
+    }
+
+    let list_request_id = "packinstalllist000001";
+    let list_request = json!({
+        "jsonrpc": "2.0",
+        "id": list_request_id,
+        "method": "skills/list",
+        "params": {
+            "workspace_id": workspace_id,
+            "include_health": true,
+            "include_policy": true
+        }
+    });
+    processor
+        .process_request(connection_id, &list_request.to_string())
+        .await;
+    let list_response = recv_response_by_id(&mut rx, list_request_id).await;
+    let list_payload: SkillListResponse =
+        serde_json::from_value(list_response.result).expect("skills/list response should decode");
+    for child in &children {
+        let listed = list_payload
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == child.skill_id)
+            .expect("pack child should remain an ordinary flat skills/list item");
+        assert_eq!(listed.slug, child.slug);
+        assert!(matches!(
+            &listed.pack,
+            Some(pack)
+                if pack.pack_id == payload.pack.id
+                    && Some(pack.member_key.as_str()) == child.pack_member_key.as_deref()
+        ));
+    }
+    let upload = crud_store_for_assert
+        .find_skill_upload_session(upload_id.as_str())
+        .await
+        .expect("read consumed upload")
+        .expect("upload row should exist");
+    assert_eq!(upload.status, "consumed");
+    assert!(upload.consumed_at_unix.is_some());
+
+    let changed_payload: SkillsChangedNotification =
+        serde_json::from_value(changed.params.expect("skills/changed params should exist"))
+            .expect("skills/changed should decode");
+    assert_eq!(changed_payload.reason, "pack_installed");
+    assert_eq!(changed_payload.pack_changes.len(), 1);
+    assert_eq!(changed_payload.pack_changes[0].pack_id, payload.pack.id);
+    assert_eq!(
+        changed_payload.pack_changes[0].name_before, None,
+        "pack install has no previous name"
+    );
+    assert_eq!(
+        changed_payload.pack_changes[0].name_after.as_deref(),
+        Some("Research Pack")
+    );
+    assert_eq!(
+        changed_payload
+            .changes
+            .iter()
+            .map(|change| change.skill_id.clone())
+            .collect::<Vec<_>>(),
+        children
+            .iter()
+            .map(|child| child.skill_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_pack_install_consumes_one_upload_exactly_once() {
+    let base_dir = unique_temp_dir("skills_pack_install_race");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let pack_root = base_dir.join("Race Pack");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let member_dir = pack_root.join("member");
+    std::fs::create_dir_all(member_dir.as_path()).expect("create pack member");
+    std::fs::write(
+        member_dir.join("SKILL.md"),
+        "---\nname: member\nslug: member\ndescription: member\n---\nbody",
+    )
+    .expect("write pack member");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+    let upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "race-pack.tar.gz".to_owned(),
+        "packrace",
+    )
+    .await;
+    let first = json!({
+        "jsonrpc": "2.0", "id": "packraceinstall000001", "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": upload_id}}
+    })
+    .to_string();
+    let second = json!({
+        "jsonrpc": "2.0", "id": "packraceinstall000002", "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": upload_id}}
+    })
+    .to_string();
+    tokio::join!(
+        processor.process_request(connection_id, first.as_str()),
+        processor.process_request(connection_id, second.as_str())
+    );
+
+    let mut terminal_payloads = Vec::new();
+    let mut observed_payloads = Vec::new();
+    let mut notifications = 0usize;
+    while terminal_payloads.len() < 2 {
+        let text = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(Message::Text(text))) => text,
+            Ok(Some(other)) => panic!("expected text message, got {other:?}"),
+            Ok(None) => panic!("connection closed after payloads: {observed_payloads:#?}"),
+            Err(error) => panic!(
+                "timed out waiting for concurrent pack install terminal response: {error:?}; \
+                 observed payloads: {observed_payloads:#?}"
+            ),
+        };
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        observed_payloads.push(value.clone());
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            notifications += 1;
+        } else if matches!(
+            value.get("id").and_then(serde_json::Value::as_str),
+            Some("packraceinstall000001" | "packraceinstall000002")
+        ) {
+            terminal_payloads.push(value);
+        }
+    }
+    while let Ok(Some(message)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            notifications += 1;
+        }
+    }
+    assert_eq!(
+        terminal_payloads
+            .iter()
+            .filter(|payload| payload.get("result").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminal_payloads
+            .iter()
+            .filter(|payload| payload.get("error").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(notifications, 1);
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+            .expect("list installed packs")
+            .len(),
+        1
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(upload_id.as_str())
+            .await
+            .expect("read upload")
+            .expect("upload exists")
+            .status,
+        "consumed"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pack_install_upload_races_and_existing_terminal_states_never_publish_twice() {
+    let base_dir = unique_temp_dir("skills_pack_install_abort_race");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let pack_root = base_dir.join("Abort Race Pack");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let member_dir = pack_root.join("member");
+    std::fs::create_dir_all(member_dir.as_path()).expect("create pack member");
+    std::fs::write(
+        member_dir.join("SKILL.md"),
+        "---\nname: member\nslug: member\ndescription: member\n---\nbody",
+    )
+    .expect("write pack member");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+    let upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "abort-race-pack.tar.gz".to_owned(),
+        "packabortrace",
+    )
+    .await;
+    let install_request_id = generate_test_request_id("packabort", "install");
+    let abort_request_id = generate_test_request_id("packabort", "abort");
+    let install_request = json!({
+        "jsonrpc": "2.0", "id": install_request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": upload_id}}
+    })
+    .to_string();
+    let abort_request = json!({
+        "jsonrpc": "2.0", "id": abort_request_id, "method": "skills/upload/abort",
+        "params": {"workspace_id": workspace_id, "upload_id": upload_id}
+    })
+    .to_string();
+    tokio::join!(
+        processor.process_request(connection_id, install_request.as_str()),
+        processor.process_request(connection_id, abort_request.as_str())
+    );
+
+    let mut terminals = Vec::new();
+    let mut notifications = 0usize;
+    while terminals.len() < 2 {
+        let text = recv_text_timeout_context(
+            &mut rx,
+            Duration::from_secs(2),
+            "pack install and abort race response",
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            notifications += 1;
+        } else if matches!(
+            value.get("id").and_then(serde_json::Value::as_str),
+            Some(id) if id == install_request_id || id == abort_request_id
+        ) {
+            terminals.push(value);
+        }
+    }
+    while let Ok(Some(message)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            notifications += 1;
+        }
+    }
+
+    let install_succeeded = terminals.iter().any(|payload| {
+        payload.get("id").and_then(serde_json::Value::as_str) == Some(install_request_id.as_str())
+            && payload.get("result").is_some()
+    });
+    let abort_succeeded = terminals.iter().any(|payload| {
+        payload.get("id").and_then(serde_json::Value::as_str) == Some(abort_request_id.as_str())
+            && payload.get("result").is_some()
+    });
+    assert_ne!(install_succeeded, abort_succeeded);
+
+    let upload = crud_store_for_assert
+        .find_skill_upload_session(upload_id.as_str())
+        .await
+        .expect("read raced upload")
+        .expect("raced upload should remain addressable");
+    let packs = crud_store_for_assert
+        .list_skill_pack_installations(workspace_id.as_str())
+        .await
+        .expect("list raced packs");
+    if install_succeeded {
+        assert_eq!(upload.status, "consumed");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(notifications, 1);
+    } else {
+        assert_eq!(upload.status, "aborted");
+        assert!(packs.is_empty());
+        assert_eq!(notifications, 0);
+    }
+
+    let packs_before_mixed_race = packs.len();
+    let mixed_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "mixed-race-pack.tar.gz".to_owned(),
+        "packmixedrace",
+    )
+    .await;
+    let mixed_pack_request_id = generate_test_request_id("packmixed", "pack");
+    let ordinary_request_id = generate_test_request_id("packmixed", "skill");
+    let mixed_pack_request = json!({
+        "jsonrpc": "2.0", "id": mixed_pack_request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": mixed_upload_id}}
+    })
+    .to_string();
+    let ordinary_request = json!({
+        "jsonrpc": "2.0", "id": ordinary_request_id, "method": "skills/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": mixed_upload_id}}
+    })
+    .to_string();
+    tokio::join!(
+        processor.process_request(connection_id, mixed_pack_request.as_str()),
+        processor.process_request(connection_id, ordinary_request.as_str())
+    );
+
+    let mut mixed_terminals = Vec::new();
+    let mut mixed_notifications = 0usize;
+    while mixed_terminals.len() < 2 {
+        let text = recv_text_timeout_context(
+            &mut rx,
+            Duration::from_secs(2),
+            "pack and ordinary install shared-upload race response",
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            mixed_notifications += 1;
+        } else if matches!(
+            value.get("id").and_then(serde_json::Value::as_str),
+            Some(id) if id == mixed_pack_request_id || id == ordinary_request_id
+        ) {
+            mixed_terminals.push(value);
+        }
+    }
+    while let Ok(Some(message)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("decode payload");
+        if value.get("method").and_then(serde_json::Value::as_str) == Some(events::SKILLS_CHANGED) {
+            mixed_notifications += 1;
+        }
+    }
+    assert!(mixed_terminals.iter().any(|payload| {
+        payload.get("id").and_then(serde_json::Value::as_str) == Some(ordinary_request_id.as_str())
+            && payload.get("error").is_some()
+    }));
+    let mixed_pack_succeeded = mixed_terminals.iter().any(|payload| {
+        payload.get("id").and_then(serde_json::Value::as_str)
+            == Some(mixed_pack_request_id.as_str())
+            && payload.get("result").is_some()
+    });
+    let mixed_upload = crud_store_for_assert
+        .find_skill_upload_session(mixed_upload_id.as_str())
+        .await
+        .expect("read mixed raced upload")
+        .expect("mixed raced upload should remain addressable");
+    let packs_after_mixed_race = crud_store_for_assert
+        .list_skill_pack_installations(workspace_id.as_str())
+        .await
+        .expect("list packs after mixed race")
+        .len();
+    if mixed_pack_succeeded {
+        assert_eq!(mixed_upload.status, "consumed");
+        assert_eq!(packs_after_mixed_race, packs_before_mixed_race + 1);
+        assert_eq!(mixed_notifications, 1);
+    } else {
+        assert_eq!(mixed_upload.status, "aborted");
+        assert_eq!(packs_after_mixed_race, packs_before_mixed_race);
+        assert_eq!(mixed_notifications, 0);
+    }
+
+    let skills_before_terminal_uploads = crud_store_for_assert
+        .list_skill_installations()
+        .await
+        .expect("list skills before terminal upload attempts")
+        .len();
+    let managed_root = workspace_root.join(workspace_id.as_str()).join("user");
+    let managed_skill_ids = |root: &std::path::Path| {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return std::collections::HashSet::new();
+            }
+            Err(error) => panic!("read managed root: {error}"),
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let managed_ids_before_terminal_uploads = managed_skill_ids(managed_root.as_path());
+
+    for (terminal_status, aborted_at, upload_prefix, request_prefix) in [
+        ("aborted", Some(100), "packalreadyabort", "packtermabort"),
+        ("expired", None, "packalreadyexpire", "packtermexpire"),
+    ] {
+        let terminal_upload_id = create_finalized_archive_upload(
+            &processor,
+            &mut rx,
+            connection_id,
+            workspace_id.as_str(),
+            build_test_directory_archive(pack_root.as_path()),
+            format!("{terminal_status}-pack.tar.gz"),
+            upload_prefix,
+        )
+        .await;
+        assert!(
+            crud_store_for_assert
+                .transition_skill_upload_status(
+                    terminal_upload_id.as_str(),
+                    &["finalized"],
+                    terminal_status,
+                    None,
+                    None,
+                    aborted_at,
+                    100,
+                )
+                .await
+                .expect("terminal upload transition should succeed")
+                .is_some()
+        );
+
+        let terminal_request_id = generate_test_request_id(request_prefix, "install");
+        let terminal_request = json!({
+            "jsonrpc": "2.0", "id": terminal_request_id, "method": "skills/pack/install",
+            "params": {
+                "workspace_id": workspace_id,
+                "source": {"type": "uploaded_archive", "upload_id": terminal_upload_id}
+            }
+        });
+        processor
+            .process_request(connection_id, &terminal_request.to_string())
+            .await;
+        let _error = recv_error_by_id(&mut rx, terminal_request_id.as_str()).await;
+        assert_eq!(
+            crud_store_for_assert
+                .find_skill_upload_session(terminal_upload_id.as_str())
+                .await
+                .expect("read terminal upload")
+                .expect("terminal upload remains addressable")
+                .status,
+            terminal_status
+        );
+    }
+
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+            .expect("list packs after terminal upload attempts")
+            .len(),
+        packs_after_mixed_race
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_installations()
+            .await
+            .expect("list skills after terminal upload attempts")
+            .len(),
+        skills_before_terminal_uploads
+    );
+    assert_eq!(
+        managed_skill_ids(managed_root.as_path()),
+        managed_ids_before_terminal_uploads
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_expiry_waits_for_the_shared_lifecycle_guard() {
+    let base_dir = unique_temp_dir("skills_upload_expiry_guard");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let payload_path = base_dir.join("expired-upload.tar.gz");
+    std::fs::write(payload_path.as_path(), b"payload").expect("write upload payload");
+
+    let (tx, _rx) = mpsc::channel(8);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    );
+    let upload_id = "expiryguardupload0001";
+    crud_store_for_assert
+        .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+            upload_id: upload_id.to_owned(),
+            workspace_id,
+            connection_id,
+            status: "finalized".to_owned(),
+            file_name: "expired-upload.tar.gz".to_owned(),
+            archive_format: "tar_gz".to_owned(),
+            compressed_size_bytes: 7,
+            received_bytes: 7,
+            sha256: "a".repeat(64),
+            payload_path: payload_path.display().to_string(),
+            created_at_unix: 1,
+            expires_at_unix: 2,
+            finalized_at_unix: Some(1),
+            consumed_at_unix: None,
+            aborted_at_unix: None,
+        })
+        .await
+        .expect("expired upload fixture should persist");
+
+    let guard = processor.acquire_skill_upload_lock(upload_id).await;
+    let cleanup = processor.cleanup_stale_skill_uploads(3);
+    tokio::pin!(cleanup);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut cleanup)
+            .await
+            .is_err(),
+        "expiry must wait while a lifecycle operation owns the upload guard"
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(upload_id)
+            .await
+            .expect("read guarded upload")
+            .expect("guarded upload should exist")
+            .status,
+        "finalized"
+    );
+
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(2), &mut cleanup)
+        .await
+        .expect("expiry should finish after lifecycle guard release");
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(upload_id)
+            .await
+            .expect("read expired upload")
+            .expect("expired upload should remain addressable")
+            .status,
+        "expired"
+    );
+    assert!(!payload_path.exists());
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pack_install_commit_failure_rolls_back_all_published_children() {
+    let base_dir = unique_temp_dir("skills_pack_install_rollback");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let pack_root = base_dir.join("Rollback Pack");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    for member_key in ["alpha", "beta"] {
+        let member_dir = pack_root.join(member_key);
+        std::fs::create_dir_all(member_dir.as_path()).expect("create pack member");
+        std::fs::write(
+            member_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {member_key}\nslug: {member_key}\ndescription: {member_key}\n---\nbody"
+            ),
+        )
+        .expect("write pack member");
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+    let upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "rollback-pack.tar.gz".to_owned(),
+        "packrollback",
+    )
+    .await;
+    let request_id = "packrollbackinstall01";
+    processor.set_pack_install_failpoints(request_id, vec![("commit", 1)]);
+    let request = json!({
+        "jsonrpc": "2.0", "id": request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": upload_id}}
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let error = recv_error_by_id(&mut rx, request_id).await;
+    assert!(
+        serde_json::to_string(&error)
+            .expect("encode error")
+            .contains("injected pack install failure at commit[1]")
+    );
+    assert!(
+        crud_store_for_assert
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+            .expect("list packs")
+            .is_empty()
+    );
+    assert!(
+        crud_store_for_assert
+            .list_skill_installations()
+            .await
+            .expect("list skills")
+            .is_empty()
+    );
+    assert!(
+        crud_store_for_assert
+            .list_workspace_skill_policies(workspace_id.as_str())
+            .await
+            .expect("list policies")
+            .is_empty()
+    );
+    let upload = crud_store_for_assert
+        .find_skill_upload_session(upload_id.as_str())
+        .await
+        .expect("read upload")
+        .expect("upload exists");
+    assert_eq!(upload.status, "finalized");
+    assert!(upload.consumed_at_unix.is_none());
+    assert!(std::path::Path::new(upload.payload_path.as_str()).is_file());
+    let managed_root = workspace_root.join(workspace_id.as_str()).join("user");
+    let managed_dirs = std::fs::read_dir(managed_root.as_path())
+        .expect("read managed root")
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    assert!(
+        managed_dirs.is_empty(),
+        "rollback must remove published paths"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "failed pack install must not emit a success notification"
+    );
+
+    let persistence_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "persistence-pack.tar.gz".to_owned(),
+        "packpersist",
+    )
+    .await;
+    let persistence_request_id = "packpersistinstall001";
+    processor.set_pack_install_failpoints(persistence_request_id, vec![("persist", 0)]);
+    let persistence_request = json!({
+        "jsonrpc": "2.0", "id": persistence_request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": persistence_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &persistence_request.to_string())
+        .await;
+    let persistence_error = recv_error_by_id(&mut rx, persistence_request_id).await;
+    assert!(
+        serde_json::to_string(&persistence_error)
+            .expect("encode persistence error")
+            .contains("injected pack install failure at persist[0]")
+    );
+    assert!(
+        crud_store_for_assert
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+            .expect("list packs after persistence failure")
+            .is_empty()
+    );
+    assert!(
+        crud_store_for_assert
+            .list_skill_installations()
+            .await
+            .expect("list skills after persistence failure")
+            .is_empty()
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(persistence_upload_id.as_str())
+            .await
+            .expect("read persistence upload")
+            .expect("persistence upload exists")
+            .status,
+        "finalized"
+    );
+    assert!(
+        std::fs::read_dir(managed_root.as_path())
+            .expect("read managed root after persistence rollback")
+            .flatten()
+            .all(|entry| !entry.path().is_dir()),
+        "database failure rollback must remove every published path"
+    );
+
+    let compound_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "compound-pack.tar.gz".to_owned(),
+        "packcompound",
+    )
+    .await;
+    let compound_request_id = "packcompoundinstall01";
+    processor
+        .set_pack_install_failpoints(compound_request_id, vec![("commit", 1), ("rollback", 0)]);
+    let compound_request = json!({
+        "jsonrpc": "2.0", "id": compound_request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": compound_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &compound_request.to_string())
+        .await;
+    let compound_error = recv_error_by_id(&mut rx, compound_request_id).await;
+    let compound_error_json =
+        serde_json::to_string(&compound_error).expect("encode compound error");
+    assert!(compound_error_json.contains("rollback also failed"));
+    assert!(compound_error_json.contains("injected pack install failure at rollback[0]"));
+    assert!(
+        crud_store_for_assert
+            .list_skill_pack_installations(workspace_id.as_str())
+            .await
+            .expect("list packs after compound failure")
+            .is_empty()
+    );
+    assert!(
+        crud_store_for_assert
+            .list_skill_installations()
+            .await
+            .expect("list skills after compound failure")
+            .is_empty()
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(compound_upload_id.as_str())
+            .await
+            .expect("read compound upload")
+            .expect("compound upload exists")
+            .status,
+        "finalized"
+    );
+    assert!(
+        std::fs::read_dir(managed_root.as_path())
+            .expect("read managed root after compound rollback")
+            .flatten()
+            .any(|entry| entry.path().is_dir()),
+        "compound rollback failure must not claim the filesystem was fully restored"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_pack_update_preserves_retained_identity_policy_and_rolls_back_failures() {
+    let base_dir = unique_temp_dir("skills_pack_update");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let write_member = |pack_root: &std::path::Path, member_key: &str, slug: &str, body: &str| {
+        let member_dir = pack_root.join(member_key);
+        std::fs::create_dir_all(member_dir.as_path()).expect("create pack member");
+        std::fs::write(
+            member_dir.join("SKILL.md"),
+            format!("---\nname: {slug}\nslug: {slug}\ndescription: {slug}\n---\n{body}"),
+        )
+        .expect("write pack member");
+    };
+    let original_root = base_dir.join("Original Pack");
+    write_member(&original_root, "alpha", "alpha-v1", "alpha v1");
+    write_member(&original_root, "removed", "removed", "removed body");
+    write_member(&original_root, "rename-old", "renamed", "same metadata");
+
+    let (tx, mut rx) = mpsc::channel(96);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+
+    let install_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(original_root.as_path()),
+        "original-pack.tar.gz".to_owned(),
+        "packupdateinstall",
+    )
+    .await;
+    let install_request_id = "packupdateinstall0001";
+    let install_request = json!({
+        "jsonrpc": "2.0", "id": install_request_id, "method": "skills/pack/install",
+        "params": {"workspace_id": workspace_id, "source": {"type": "uploaded_archive", "upload_id": install_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &install_request.to_string())
+        .await;
+    let (install_response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        install_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let installed: SkillsPackInstallResponse = serde_json::from_value(install_response.result)
+        .expect("pack install response should decode");
+    let original_children = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+        .await
+        .expect("read original children");
+    let original_by_key = original_children
+        .iter()
+        .map(|child| {
+            (
+                child.pack_member_key.clone().expect("original member key"),
+                child.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let alpha_id = original_by_key["alpha"].skill_id.clone();
+    let removed_id = original_by_key["removed"].skill_id.clone();
+    let renamed_old_id = original_by_key["rename-old"].skill_id.clone();
+    let mut alpha_policy = crud_store_for_assert
+        .find_workspace_skill_policy(workspace_id.as_str(), &alpha_id)
+        .await
+        .expect("read alpha policy")
+        .expect("alpha policy exists");
+    alpha_policy.enabled = Some(false);
+    alpha_policy.allow_implicit_invocation = Some(true);
+    crud_store_for_assert
+        .upsert_workspace_skill_policy(&alpha_policy, 20)
+        .await
+        .expect("customize retained policy");
+
+    let updated_root = base_dir.join("Renamed Pack");
+    write_member(&updated_root, "alpha", "alpha-v2", "alpha v2");
+    write_member(&updated_root, "added", "added", "added body");
+    write_member(&updated_root, "rename-new", "renamed", "same metadata");
+    let update_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(updated_root.as_path()),
+        "renamed-pack.tar.gz".to_owned(),
+        "packupdateapply",
+    )
+    .await;
+    let update_request_id = "packupdateapply000010";
+    processor.set_pack_update_failpoints(update_request_id, vec![("collision", 0)]);
+    let update_request = json!({
+        "jsonrpc": "2.0", "id": update_request_id, "method": "skills/pack/update",
+        "params": {"workspace_id": workspace_id, "pack_id": installed.pack.id, "source": {"type": "uploaded_archive", "upload_id": update_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &update_request.to_string())
+        .await;
+    let (update_response, update_changed) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        update_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let updated: SkillsPackUpdateResponse =
+        serde_json::from_value(update_response.result).expect("pack update response should decode");
+    assert_eq!(updated.status, "updated");
+    assert_eq!(updated.pack.id, installed.pack.id);
+    assert_eq!(updated.pack.name, "Renamed Pack");
+    assert_eq!(updated.audit.events_written, 5);
+    assert_eq!(
+        updated
+            .skills
+            .iter()
+            .map(|skill| skill.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["added", "alpha-v2", "renamed"]
+    );
+
+    let current_children = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+        .await
+        .expect("read updated children");
+    let current_by_key = current_children
+        .iter()
+        .map(|child| {
+            (
+                child.pack_member_key.clone().expect("current member key"),
+                child.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(current_by_key["alpha"].skill_id, alpha_id);
+    assert!(
+        ![&alpha_id, &removed_id, &renamed_old_id].contains(&&current_by_key["added"].skill_id),
+        "a newly added pack member must receive a new SkillId"
+    );
+    assert_ne!(current_by_key["rename-new"].skill_id, renamed_old_id);
+    assert!(!current_by_key.contains_key("removed"));
+    assert!(!current_by_key.contains_key("rename-old"));
+    let retained_policy = crud_store_for_assert
+        .find_workspace_skill_policy(workspace_id.as_str(), &alpha_id)
+        .await
+        .expect("read retained policy")
+        .expect("retained policy exists");
+    assert_eq!(retained_policy.enabled, Some(false));
+    assert_eq!(retained_policy.allow_implicit_invocation, Some(true));
+    let added_policy = crud_store_for_assert
+        .find_workspace_skill_policy(workspace_id.as_str(), &current_by_key["added"].skill_id)
+        .await
+        .expect("read added policy")
+        .expect("added policy exists");
+    assert_eq!(added_policy.enabled, Some(true));
+    assert_eq!(added_policy.allow_implicit_invocation, Some(false));
+    for removed_id in [&removed_id, &renamed_old_id] {
+        assert!(
+            crud_store_for_assert
+                .find_workspace_skill_policy(workspace_id.as_str(), removed_id)
+                .await
+                .expect("read removed policy")
+                .is_none()
+        );
+        assert!(
+            !std::path::Path::new(
+                &original_children
+                    .iter()
+                    .find(|child| &child.skill_id == removed_id)
+                    .expect("removed child snapshot")
+                    .install_path
+            )
+            .exists()
+        );
+    }
+    let changed: SkillsChangedNotification = serde_json::from_value(
+        update_changed
+            .params
+            .expect("pack update notification params"),
+    )
+    .expect("pack update notification should decode");
+    assert_eq!(changed.pack_changes.len(), 1);
+    assert_eq!(
+        changed.pack_changes[0].name_before.as_deref(),
+        Some("Original Pack")
+    );
+    assert_eq!(
+        changed.pack_changes[0].name_after.as_deref(),
+        Some("Renamed Pack")
+    );
+    assert_eq!(
+        changed
+            .changes
+            .iter()
+            .map(|change| change.change_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["install", "update", "uninstall", "install", "uninstall"]
+    );
+
+    let stable_parent = crud_store_for_assert
+        .find_skill_pack_installation(workspace_id.as_str(), &installed.pack.id)
+        .await
+        .expect("read stable parent")
+        .expect("stable parent exists");
+    let stable_children = current_children.clone();
+    let alpha_path = std::path::PathBuf::from(current_by_key["alpha"].install_path.as_str());
+    let alpha_before_failure = std::fs::read_to_string(alpha_path.join("SKILL.md"))
+        .expect("read alpha before failed update");
+
+    let stale_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(updated_root.as_path()),
+        "stale-pack.tar.gz".to_owned(),
+        "packupdatestale",
+    )
+    .await;
+    let stale_request_id = "packupdatestale000010";
+    processor.set_pack_update_failpoints(stale_request_id, vec![("stale", 0)]);
+    let stale_request = json!({
+        "jsonrpc": "2.0", "id": stale_request_id, "method": "skills/pack/update",
+        "params": {"workspace_id": workspace_id, "pack_id": installed.pack.id, "source": {"type": "uploaded_archive", "upload_id": stale_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &stale_request.to_string())
+        .await;
+    let _stale_error = recv_error_by_id(&mut rx, stale_request_id).await;
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(stale_upload_id.as_str())
+            .await
+            .expect("read stale upload")
+            .expect("stale upload exists")
+            .status,
+        "finalized"
+    );
+
+    let failed_root = base_dir.join("Failed Pack");
+    write_member(&failed_root, "alpha", "alpha-v3", "alpha v3");
+    write_member(&failed_root, "added", "added-v2", "added v2");
+    write_member(&failed_root, "rename-new", "renamed-v2", "renamed v2");
+    let failed_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(failed_root.as_path()),
+        "failed-pack.tar.gz".to_owned(),
+        "packupdatefailed",
+    )
+    .await;
+    let failed_request_id = "packupdatefailed00010";
+    processor.set_pack_update_failpoints(failed_request_id, vec![("commit", 1)]);
+    let failed_request = json!({
+        "jsonrpc": "2.0", "id": failed_request_id, "method": "skills/pack/update",
+        "params": {"workspace_id": workspace_id, "pack_id": installed.pack.id, "source": {"type": "uploaded_archive", "upload_id": failed_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &failed_request.to_string())
+        .await;
+    let failed_error = recv_error_by_id(&mut rx, failed_request_id).await;
+    assert!(
+        serde_json::to_string(&failed_error)
+            .expect("encode failed update")
+            .contains("injected pack update failure at commit[1]")
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_pack_installation(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read parent after failed update")
+            .as_ref(),
+        Some(&stable_parent)
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read children after failed update"),
+        stable_children
+    );
+    assert_eq!(
+        std::fs::read_to_string(alpha_path.join("SKILL.md"))
+            .expect("read alpha after failed update"),
+        alpha_before_failure
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(failed_upload_id.as_str())
+            .await
+            .expect("read failed update upload")
+            .expect("failed update upload exists")
+            .status,
+        "finalized"
+    );
+
+    let compound_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(failed_root.as_path()),
+        "compound-update-pack.tar.gz".to_owned(),
+        "packupdatecompound",
+    )
+    .await;
+    let compound_request_id = "packupdatecompound010";
+    processor.set_pack_update_failpoints(
+        compound_request_id,
+        vec![("commit", 1), ("rollback_commits", 0)],
+    );
+    let compound_request = json!({
+        "jsonrpc": "2.0", "id": compound_request_id, "method": "skills/pack/update",
+        "params": {"workspace_id": workspace_id, "pack_id": installed.pack.id, "source": {"type": "uploaded_archive", "upload_id": compound_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &compound_request.to_string())
+        .await;
+    let compound_error = recv_error_by_id(&mut rx, compound_request_id).await;
+    let compound_error_json =
+        serde_json::to_string(&compound_error).expect("encode compound update error");
+    assert!(compound_error_json.contains("rollback also failed"));
+    assert!(compound_error_json.contains("injected pack update failure at rollback_commits[0]"));
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_pack_installation(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read parent after compound update failure")
+            .as_ref(),
+        Some(&stable_parent)
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read children after compound update failure"),
+        stable_children
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_upload_session(compound_upload_id.as_str())
+            .await
+            .expect("read compound update upload")
+            .expect("compound update upload exists")
+            .status,
+        "finalized"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_pack_uninstall_is_ordered_atomic_and_supports_empty_parents() {
+    let base_dir = unique_temp_dir("skills_pack_uninstall");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let write_pack = |root: &std::path::Path, name: &str| {
+        let pack_root = root.join(name);
+        for (member_key, slug) in [("zeta", "zeta"), ("alpha", "alpha")] {
+            let member = pack_root.join(member_key);
+            std::fs::create_dir_all(member.as_path()).expect("create pack member");
+            std::fs::write(
+                member.join("SKILL.md"),
+                format!("---\nname: {slug}\nslug: {slug}\ndescription: {slug}\n---\n{slug} body"),
+            )
+            .expect("write pack member");
+        }
+        pack_root
+    };
+
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    ));
+
+    let first_root = write_pack(base_dir.as_path(), "Uninstall Pack");
+    let first = install_test_skill_pack(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        "packuninstallsetup010",
+        "packuninstallsetup",
+        first_root.as_path(),
+    )
+    .await;
+    let first_children = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &first.pack.id)
+        .await
+        .expect("list first pack children");
+    let first_paths = first_children
+        .iter()
+        .map(|child| std::path::PathBuf::from(child.install_path.as_str()))
+        .collect::<Vec<_>>();
+
+    let failed_request_id = "packuninstallfailed01";
+    processor.set_pack_uninstall_failpoints(failed_request_id, vec![("persist", 0)]);
+    let failed_request = json!({
+        "jsonrpc": "2.0", "id": failed_request_id, "method": "skills/pack/uninstall",
+        "params": {"workspace_id": workspace_id, "pack_id": first.pack.id}
+    });
+    processor
+        .process_request(connection_id, &failed_request.to_string())
+        .await;
+    let failed_error = recv_error_by_id(&mut rx, failed_request_id).await;
+    assert!(
+        serde_json::to_string(&failed_error)
+            .expect("encode failed uninstall")
+            .contains("injected pack uninstall failure at persist[0]")
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .list_skill_installations_for_pack(workspace_id.as_str(), &first.pack.id)
+            .await
+            .expect("children restored after failed uninstall"),
+        first_children
+    );
+    assert!(first_paths.iter().all(|path| path.is_dir()));
+
+    let uninstall_request_id = "packuninstallsuccess1";
+    let uninstall_request = json!({
+        "jsonrpc": "2.0", "id": uninstall_request_id, "method": "skills/pack/uninstall",
+        "params": {"workspace_id": workspace_id, "pack_id": first.pack.id}
+    });
+    let write_guard = processor.acquire_skills_write_lock().await;
+    let queued_processor = processor.clone();
+    let queued_request = uninstall_request.to_string();
+    let queued_uninstall = tokio::spawn(async move {
+        queued_processor
+            .process_request(connection_id, queued_request.as_str())
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "pack uninstall must wait for the shared skills write lock before publishing"
+    );
+    crud_store_for_assert
+        .update_skill_pack_installation_name(
+            workspace_id.as_str(),
+            &first.pack.id,
+            "Authoritative Uninstall Pack",
+            50,
+        )
+        .await
+        .expect("rename pack while uninstall is queued");
+    drop(write_guard);
+    queued_uninstall.await.expect("queued pack uninstall task");
+    let (uninstall_response, uninstall_changed) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        uninstall_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let uninstalled: SkillsPackUninstallResponse =
+        serde_json::from_value(uninstall_response.result).expect("pack uninstall response");
+    assert_eq!(uninstalled.status, "uninstalled");
+    assert_eq!(uninstalled.pack.id, first.pack.id);
+    assert_eq!(uninstalled.pack.name, "Authoritative Uninstall Pack");
+    assert_eq!(uninstalled.audit.events_written, 2);
+    assert_eq!(
+        uninstalled
+            .removed_skills
+            .iter()
+            .map(|skill| skill.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "zeta"]
+    );
+    assert!(first_paths.iter().all(|path| !path.exists()));
+    assert!(
+        crud_store_for_assert
+            .find_skill_pack_installation(workspace_id.as_str(), &first.pack.id)
+            .await
+            .expect("query removed pack")
+            .is_none()
+    );
+    for child in &first_children {
+        assert!(
+            crud_store_for_assert
+                .find_workspace_skill_policy(workspace_id.as_str(), &child.skill_id)
+                .await
+                .expect("query removed child policy")
+                .is_none()
+        );
+    }
+    let changed: SkillsChangedNotification = serde_json::from_value(
+        uninstall_changed
+            .params
+            .expect("pack uninstall notification params"),
+    )
+    .expect("decode pack uninstall notification");
+    assert_eq!(changed.pack_changes.len(), 1);
+    assert_eq!(changed.pack_changes[0].change_type, "uninstalled");
+    assert_eq!(
+        changed.pack_changes[0].name_before.as_deref(),
+        Some("Authoritative Uninstall Pack")
+    );
+    assert_eq!(changed.pack_changes[0].name_after, None);
+    assert_eq!(changed.changes.len(), 2);
+
+    let empty_parent = SkillPackInstallationRecord {
+        pack_id: pioneer_protocol::SkillPackId::new("E".repeat(21)).expect("empty pack id"),
+        name: "Empty Pack".to_owned(),
+        scope_key: workspace_id.clone(),
+        source_kind: "user".to_owned(),
+        created_at_unix: 10,
+        updated_at_unix: 10,
+    };
+    crud_store_for_assert
+        .insert_skill_pack_installation(&empty_parent)
+        .await
+        .expect("insert empty pack");
+    let empty_request_id = "packuninstallempty001";
+    let empty_request = json!({
+        "jsonrpc": "2.0", "id": empty_request_id, "method": "skills/pack/uninstall",
+        "params": {"workspace_id": workspace_id, "pack_id": empty_parent.pack_id}
+    });
+    processor
+        .process_request(connection_id, &empty_request.to_string())
+        .await;
+    let (empty_response, empty_changed) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        empty_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let empty: SkillsPackUninstallResponse =
+        serde_json::from_value(empty_response.result).expect("empty pack uninstall response");
+    assert!(empty.removed_skills.is_empty());
+    assert_eq!(empty.audit.events_written, 0);
+    let empty_changed: SkillsChangedNotification = serde_json::from_value(
+        empty_changed
+            .params
+            .expect("empty pack notification params"),
+    )
+    .expect("decode empty pack notification");
+    assert!(empty_changed.changes.is_empty());
+    assert_eq!(empty_changed.pack_changes.len(), 1);
+
+    let compound_root = write_pack(base_dir.as_path(), "Compound Uninstall Pack");
+    let compound = install_test_skill_pack(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        "pkuncompoundsetup0010",
+        "pkuncompound",
+        compound_root.as_path(),
+    )
+    .await;
+    let compound_paths = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &compound.pack.id)
+        .await
+        .expect("read compound pack children")
+        .into_iter()
+        .map(|child| std::path::PathBuf::from(child.install_path))
+        .collect::<Vec<_>>();
+    let compound_request_id = "pkuncompoundremove010";
+    processor
+        .set_pack_uninstall_failpoints(compound_request_id, vec![("persist", 0), ("rollback", 0)]);
+    let compound_request = json!({
+        "jsonrpc": "2.0", "id": compound_request_id, "method": "skills/pack/uninstall",
+        "params": {"workspace_id": workspace_id, "pack_id": compound.pack.id}
+    });
+    processor
+        .process_request(connection_id, &compound_request.to_string())
+        .await;
+    let compound_error = recv_error_by_id(&mut rx, compound_request_id).await;
+    let compound_error_json =
+        serde_json::to_string(&compound_error).expect("encode compound uninstall error");
+    assert!(compound_error_json.contains("rollback also failed"));
+    assert!(compound_error_json.contains("injected pack uninstall failure at rollback[0]"));
+    assert!(
+        crud_store_for_assert
+            .find_skill_pack_installation(workspace_id.as_str(), &compound.pack.id)
+            .await
+            .expect("query pack after compound failure")
+            .is_some()
+    );
+    assert!(
+        compound_paths.iter().any(|path| !path.exists()),
+        "rollback failure must not claim that staged packages were restored"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packed_skill_individual_update_and_uninstall_preserve_parent_contract() {
+    let base_dir = unique_temp_dir("packed_skill_individual_lifecycle");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create skill root");
+    }
+    let pack_root = base_dir.join("Individual Pack");
+    let member_root = pack_root.join("member-key");
+    std::fs::create_dir_all(member_root.as_path()).expect("create initial member");
+    std::fs::write(
+        member_root.join("SKILL.md"),
+        "---\nname: member-v1\nslug: member-v1\ndescription: member v1\n---\nmember v1",
+    )
+    .expect("write initial member");
+
+    let (tx, mut rx) = mpsc::channel(96);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+
+    let installed = install_test_skill_pack(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        "packedindividualset10",
+        "packedindividual",
+        pack_root.as_path(),
+    )
+    .await;
+    let original = crud_store_for_assert
+        .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+        .await
+        .expect("read installed child")
+        .into_iter()
+        .next()
+        .expect("installed child exists");
+    let original_id = original.skill_id.clone();
+    let original_membership = (original.pack_id.clone(), original.pack_member_key.clone());
+    let policy_request_id = "packedchildpolicy0010";
+    let policy_request = json!({
+        "jsonrpc": "2.0", "id": policy_request_id, "method": "skills/policy/set",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_id": original_id,
+            "enabled": false,
+            "allow_implicit_invocation": true
+        }
+    });
+    processor
+        .process_request(connection_id, &policy_request.to_string())
+        .await;
+    let policy_response = recv_response_by_id(&mut rx, policy_request_id).await;
+    let policy: SkillsPolicySetResponse =
+        serde_json::from_value(policy_response.result).expect("packed child policy response");
+    assert_eq!(policy.policy.skill_id, original_id);
+    let _policy_changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
+    let custom_policy = crud_store_for_assert
+        .find_workspace_skill_policy(workspace_id.as_str(), &original_id)
+        .await
+        .expect("read customized policy")
+        .expect("customized policy exists");
+    let after_policy = crud_store_for_assert
+        .find_skill_installation(&original_id)
+        .await
+        .expect("read packed child after policy update")
+        .expect("packed child remains after policy update");
+    assert_eq!(
+        (after_policy.pack_id, after_policy.pack_member_key),
+        original_membership.clone()
+    );
+    crud_store_for_assert
+        .update_skill_pack_installation_name(
+            workspace_id.as_str(),
+            &installed.pack.id,
+            installed.pack.name.as_str(),
+            1,
+        )
+        .await
+        .expect("lower parent timestamp for touch assertion");
+
+    let update_source = base_dir.join("individual-update-source");
+    std::fs::create_dir_all(update_source.as_path()).expect("create update source");
+    std::fs::write(
+        update_source.join("SKILL.md"),
+        "---\nname: member-v2\nslug: member-v2\ndescription: member v2\n---\nmember v2",
+    )
+    .expect("write update source");
+    let update_upload_id = create_finalized_skill_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        update_source.as_path(),
+        "packedchildupdate",
+    )
+    .await;
+    let update_request_id = "packedchildupdate0010";
+    let update_request = json!({
+        "jsonrpc": "2.0", "id": update_request_id, "method": "skills/update",
+        "params": {"workspace_id": workspace_id, "skill_id": original_id, "source": {"type": "uploaded_archive", "upload_id": update_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &update_request.to_string())
+        .await;
+    let (update_response, update_changed) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        update_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let updated: SkillsUpdateResponse =
+        serde_json::from_value(update_response.result).expect("individual update response");
+    assert_eq!(updated.skill.skill_id, original_id);
+    let update_changed: SkillsChangedNotification = serde_json::from_value(
+        update_changed
+            .params
+            .expect("individual update notification params"),
+    )
+    .expect("decode individual update notification");
+    assert!(update_changed.pack_changes.is_empty());
+    let updated_row = crud_store_for_assert
+        .find_skill_installation(&original_id)
+        .await
+        .expect("read updated packed child")
+        .expect("updated packed child exists");
+    assert_eq!(
+        (
+            updated_row.pack_id.clone(),
+            updated_row.pack_member_key.clone()
+        ),
+        original_membership
+    );
+    assert_eq!(updated_row.slug, "member-v2");
+    assert_eq!(
+        crud_store_for_assert
+            .find_workspace_skill_policy(workspace_id.as_str(), &original_id)
+            .await
+            .expect("read preserved policy")
+            .expect("preserved policy exists"),
+        custom_policy
+    );
+    assert_eq!(
+        crud_store_for_assert
+            .find_skill_pack_installation(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read parent after child update")
+            .expect("parent remains after child update")
+            .updated_at_unix,
+        1
+    );
+
+    let uninstall_request_id = "packedchildremove0010";
+    let uninstall_request = json!({
+        "jsonrpc": "2.0", "id": uninstall_request_id, "method": "skills/uninstall",
+        "params": {"workspace_id": workspace_id, "skill_id": original_id}
+    });
+    processor
+        .process_request(connection_id, &uninstall_request.to_string())
+        .await;
+    let (uninstall_response, uninstall_changed) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        uninstall_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let uninstalled: SkillsUninstallResponse =
+        serde_json::from_value(uninstall_response.result).expect("individual uninstall response");
+    assert_eq!(uninstalled.skill_id, original_id);
+    assert_eq!(uninstalled.audit.events_written, 1);
+    let empty_parent = crud_store_for_assert
+        .find_skill_pack_installation(workspace_id.as_str(), &installed.pack.id)
+        .await
+        .expect("read parent after last child removal")
+        .expect("empty parent must remain");
+    assert!(empty_parent.updated_at_unix > 1);
+    assert!(
+        crud_store_for_assert
+            .list_skill_installations_for_pack(workspace_id.as_str(), &installed.pack.id)
+            .await
+            .expect("read empty pack children")
+            .is_empty()
+    );
+    let changed: SkillsChangedNotification = serde_json::from_value(
+        uninstall_changed
+            .params
+            .expect("individual uninstall notification params"),
+    )
+    .expect("decode individual uninstall notification");
+    assert_eq!(changed.pack_changes.len(), 1);
+    assert_eq!(changed.pack_changes[0].change_type, "updated");
+    assert_eq!(
+        changed.pack_changes[0].name_before,
+        changed.pack_changes[0].name_after
+    );
+
+    std::fs::write(
+        member_root.join("SKILL.md"),
+        "---\nname: member-v3\nslug: member-v3\ndescription: member v3\n---\nmember v3",
+    )
+    .expect("write re-added member");
+    let readd_upload_id = create_finalized_archive_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_id.as_str(),
+        build_test_directory_archive(pack_root.as_path()),
+        "individual-pack-readd.tar.gz".to_owned(),
+        "packedchildreadd",
+    )
+    .await;
+    let readd_request_id = "packedchildreadd00100";
+    let readd_request = json!({
+        "jsonrpc": "2.0", "id": readd_request_id, "method": "skills/pack/update",
+        "params": {"workspace_id": workspace_id, "pack_id": installed.pack.id, "source": {"type": "uploaded_archive", "upload_id": readd_upload_id}}
+    });
+    processor
+        .process_request(connection_id, &readd_request.to_string())
+        .await;
+    let (readd_response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        readd_request_id,
+        events::SKILLS_CHANGED,
+    )
+    .await;
+    let readded: SkillsPackUpdateResponse =
+        serde_json::from_value(readd_response.result).expect("pack re-add response");
+    assert_eq!(readded.skills.len(), 1);
+    assert_ne!(readded.skills[0].skill_id, original_id);
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -37244,11 +39769,29 @@ async fn recv_response_and_notification_by_id_method(
 ) -> (JsonRpcResponse, JsonRpcNotification) {
     let mut response = None;
     let mut notification = None;
+    let mut observed = Vec::new();
 
     for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
+        let message = match timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => panic!(
+                "websocket channel closed while waiting for response `{request_id}` and notification `{method}`; observed={observed:?}"
+            ),
+            Err(error) => panic!(
+                "timed out waiting for response `{request_id}` and notification `{method}`: {error:?}; response_seen={}; notification_seen={}; observed={observed:?}",
+                response.is_some(),
+                notification.is_some(),
+            ),
+        };
+        let payload = match message {
+            Message::Text(payload) => payload.to_string(),
+            other => panic!(
+                "expected text while waiting for response `{request_id}` and notification `{method}`, got {other:?}"
+            ),
+        };
         let value: serde_json::Value =
             serde_json::from_str(&payload).expect("json-rpc payload should decode");
+        observed.push(payload);
 
         if response.is_none()
             && value.get("id").and_then(serde_json::Value::as_str) == Some(request_id)

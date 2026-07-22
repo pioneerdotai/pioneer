@@ -4,8 +4,8 @@ use crate::dependencies::{
     DependencyCheckInput, DependencyCheckResult, evaluate_skill_dependencies,
 };
 use crate::provenance::{
-    SkillLockEntry, find_lock_entry, read_skills_lock, remove_lock_entry, upsert_lock_entry,
-    write_skills_lock_atomic,
+    SkillLockEntry, SkillsLock, find_lock_entry, read_skills_lock, remove_lock_entry,
+    upsert_lock_entry, write_skills_lock_atomic,
 };
 use crate::security::{SkillSecurityPolicy, ensure_install_path_contained, scan_skill_directory};
 use anyhow::{Context, Result, bail};
@@ -134,6 +134,38 @@ pub struct UninstallSkillResult {
     pub removed_path: Option<PathBuf>,
     pub removed_lock_entry: Option<SkillLockEntry>,
     pub audit_events: Vec<SkillAuditEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReversibleSkillRemovalTarget {
+    pub skill_id: SkillId,
+    pub slug: String,
+    pub managed_install_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StageReversibleSkillRemovalsRequest {
+    pub targets: Vec<ReversibleSkillRemovalTarget>,
+    pub install_root: PathBuf,
+    pub lock_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReversibleSkillRemoval {
+    pub skill_id: SkillId,
+    pub original_path: Option<PathBuf>,
+    pub was_present_on_disk: bool,
+    pub removed_lock_entry: Option<SkillLockEntry>,
+    staged_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReversibleSkillRemovalBatch {
+    pub removals: Vec<ReversibleSkillRemoval>,
+    install_root: PathBuf,
+    lock_path: PathBuf,
+    staging_session_dir: PathBuf,
+    previous_lock: SkillsLock,
 }
 
 pub fn install_skill(request: InstallSkillRequest) -> Result<InstallSkillResult> {
@@ -296,6 +328,327 @@ pub fn rollback_prepared_skill_commit(result: &InstallSkillResult, lock_path: &P
         remove_lock_entry(&mut lock, &result.definition.identity.skill_id);
     }
     write_skills_lock_atomic(lock_path, &lock)
+}
+
+pub fn stage_reversible_skill_removals(
+    mut request: StageReversibleSkillRemovalsRequest,
+) -> Result<ReversibleSkillRemovalBatch> {
+    request
+        .targets
+        .sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+    if request
+        .targets
+        .windows(2)
+        .any(|pair| pair[0].skill_id == pair[1].skill_id)
+    {
+        bail!("reversible removal targets must have unique SkillId values");
+    }
+
+    for target in &request.targets {
+        if let Some(path) = target.managed_install_path.as_ref() {
+            let containment =
+                ensure_install_path_contained(request.install_root.as_path(), path.as_path());
+            if containment.has_blocking_findings() {
+                bail!(
+                    "reversible removal blocked by containment policy for skill `{}`",
+                    target.skill_id
+                );
+            }
+        }
+    }
+    for (index, left) in request.targets.iter().enumerate() {
+        let Some(left_path) = left.managed_install_path.as_ref() else {
+            continue;
+        };
+        for right in request.targets.iter().skip(index + 1) {
+            let Some(right_path) = right.managed_install_path.as_ref() else {
+                continue;
+            };
+            if left_path == right_path
+                || left_path.starts_with(right_path)
+                || right_path.starts_with(left_path)
+            {
+                bail!("reversible removal paths must be distinct and non-overlapping");
+            }
+        }
+    }
+    for target in &request.targets {
+        let Some(path) = target.managed_install_path.as_ref() else {
+            continue;
+        };
+        let expected = canonical_skill_install_path(
+            request.install_root.as_path(),
+            &target.skill_id,
+            target.slug.as_str(),
+        )?;
+        if path != &expected {
+            bail!(
+                "reversible removal path `{}` is not the canonical path `{}` for skill `{}`",
+                path.display(),
+                expected.display(),
+                target.skill_id
+            );
+        }
+    }
+
+    let previous_lock = read_skills_lock(request.lock_path.as_path())?;
+    let staging_root = request.install_root.join(".staging");
+    fs::create_dir_all(staging_root.as_path())
+        .with_context(|| format!("failed to create staging root `{}`", staging_root.display()))?;
+    let staging_session_dir = staging_root.join(format!("removal-{}", unique_suffix()));
+    fs::create_dir_all(staging_session_dir.as_path()).with_context(|| {
+        format!(
+            "failed to create removal staging directory `{}`",
+            staging_session_dir.display()
+        )
+    })?;
+
+    let mut removals: Vec<ReversibleSkillRemoval> = Vec::with_capacity(request.targets.len());
+    for (index, target) in request.targets.into_iter().enumerate() {
+        let original_path = target.managed_install_path;
+        let was_present_on_disk = original_path.as_ref().is_some_and(|path| path.exists());
+        let staged_path =
+            was_present_on_disk.then(|| staging_session_dir.join(target.skill_id.as_str()));
+        if let (Some(original_path), Some(staged_path)) = (&original_path, &staged_path) {
+            let stage_result = ensure_reversible_removal_path_contained(
+                request.install_root.as_path(),
+                staged_path.as_path(),
+                "staging",
+            )
+            .and_then(|()| removal_failpoint("stage_move", index))
+            .and_then(|()| {
+                fs::rename(original_path.as_path(), staged_path.as_path()).with_context(|| {
+                    format!(
+                        "failed to stage removal of skill `{}` from `{}`",
+                        target.skill_id,
+                        original_path.display()
+                    )
+                })
+            });
+            if let Err(error) = stage_result {
+                let rollback_errors =
+                    restore_staged_removal_paths(&removals, request.install_root.as_path());
+                if rollback_errors.is_empty() {
+                    let _ = remove_empty_staging_session(staging_session_dir.as_path());
+                }
+                return Err(with_rollback_errors(error, rollback_errors));
+            }
+        }
+        let removed_lock_entry = find_lock_entry(&previous_lock, &target.skill_id).cloned();
+        removals.push(ReversibleSkillRemoval {
+            skill_id: target.skill_id,
+            original_path,
+            was_present_on_disk,
+            removed_lock_entry,
+            staged_path,
+        });
+    }
+
+    let mut updated_lock = previous_lock.clone();
+    for removal in &removals {
+        remove_lock_entry(&mut updated_lock, &removal.skill_id);
+    }
+    if let Err(error) = removal_failpoint("lock_write", 0).and_then(|()| {
+        write_skills_lock_atomic(request.lock_path.as_path(), &updated_lock)
+            .context("failed to write lock after staging reversible removals")
+    }) {
+        let rollback_errors =
+            restore_staged_removal_paths(&removals, request.install_root.as_path());
+        if rollback_errors.is_empty() {
+            let _ = remove_empty_staging_session(staging_session_dir.as_path());
+        }
+        return Err(with_rollback_errors(error, rollback_errors));
+    }
+
+    Ok(ReversibleSkillRemovalBatch {
+        removals,
+        install_root: request.install_root,
+        lock_path: request.lock_path,
+        staging_session_dir,
+        previous_lock,
+    })
+}
+
+pub fn rollback_reversible_skill_removals(batch: &ReversibleSkillRemovalBatch) -> Result<()> {
+    let mut errors = restore_staged_removal_paths(&batch.removals, batch.install_root.as_path());
+    if let Err(error) = removal_failpoint("rollback_lock", 0).and_then(|()| {
+        write_skills_lock_atomic(batch.lock_path.as_path(), &batch.previous_lock)
+            .context("failed to restore skills lock after reversible removals")
+    }) {
+        errors.push(error);
+    }
+    if let Err(error) = remove_empty_staging_session(batch.staging_session_dir.as_path()) {
+        errors.push(error);
+    }
+    finish_collected_errors("failed to roll back reversible skill removals", errors)
+}
+
+pub fn finalize_reversible_skill_removals(batch: &ReversibleSkillRemovalBatch) -> Result<()> {
+    let mut errors = Vec::new();
+    for (index, removal) in batch.removals.iter().enumerate() {
+        let Some(staged_path) = removal.staged_path.as_ref() else {
+            continue;
+        };
+        let finalize_result = ensure_reversible_removal_path_contained(
+            batch.install_root.as_path(),
+            staged_path.as_path(),
+            "staged removal",
+        )
+        .and_then(|()| removal_failpoint("finalize_remove", index))
+        .and_then(|()| {
+            remove_path_if_present(staged_path.as_path())
+                .with_context(|| format!("failed to finalize removal of `{}`", removal.skill_id))
+                .map(|_| ())
+        });
+        if let Err(error) = finalize_result {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = remove_empty_staging_session(batch.staging_session_dir.as_path()) {
+        errors.push(error);
+    }
+    finish_collected_errors("failed to finalize reversible skill removals", errors)
+}
+
+fn restore_staged_removal_paths(
+    removals: &[ReversibleSkillRemoval],
+    install_root: &Path,
+) -> Vec<anyhow::Error> {
+    let mut errors = Vec::new();
+    for (index, removal) in removals.iter().enumerate().rev() {
+        let (Some(original_path), Some(staged_path)) =
+            (removal.original_path.as_ref(), removal.staged_path.as_ref())
+        else {
+            continue;
+        };
+        if !staged_path.exists() {
+            if !original_path.exists() {
+                errors.push(anyhow::anyhow!(
+                    "neither staged nor original path exists for skill `{}`",
+                    removal.skill_id
+                ));
+            }
+            continue;
+        }
+        if original_path.exists() {
+            errors.push(anyhow::anyhow!(
+                "cannot restore skill `{}` because `{}` already exists",
+                removal.skill_id,
+                original_path.display()
+            ));
+            continue;
+        }
+        let restore_result = ensure_reversible_removal_path_contained(
+            install_root,
+            staged_path.as_path(),
+            "staged removal",
+        )
+        .and_then(|()| {
+            ensure_reversible_removal_path_contained(
+                install_root,
+                original_path.as_path(),
+                "original removal",
+            )
+        })
+        .and_then(|()| removal_failpoint("rollback_move", index))
+        .and_then(|()| {
+            fs::rename(staged_path.as_path(), original_path.as_path()).with_context(|| {
+                format!(
+                    "failed to restore skill `{}` to `{}`",
+                    removal.skill_id,
+                    original_path.display()
+                )
+            })
+        });
+        if let Err(error) = restore_result {
+            errors.push(error);
+        }
+    }
+    errors
+}
+
+fn ensure_reversible_removal_path_contained(
+    install_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    let containment = ensure_install_path_contained(install_root, path);
+    if containment.has_blocking_findings() {
+        bail!(
+            "{label} path `{}` is outside managed install root",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_empty_staging_session(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove staging directory `{}`", path.display())),
+    }
+}
+
+fn with_rollback_errors(
+    primary: anyhow::Error,
+    rollback_errors: Vec<anyhow::Error>,
+) -> anyhow::Error {
+    if rollback_errors.is_empty() {
+        return primary;
+    }
+    anyhow::anyhow!(
+        "{primary:#}; rollback also failed: {}",
+        rollback_errors
+            .iter()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn finish_collected_errors(context: &str, errors: Vec<anyhow::Error>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{context}: {}",
+        errors
+            .iter()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+#[cfg(not(test))]
+fn removal_failpoint(_name: &str, _index: usize) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOVAL_FAILPOINTS: std::cell::RefCell<Vec<(&'static str, usize)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn removal_failpoint(name: &str, index: usize) -> Result<()> {
+    REMOVAL_FAILPOINTS.with(|failpoints| {
+        if failpoints
+            .borrow()
+            .iter()
+            .any(|(candidate, candidate_index)| *candidate == name && *candidate_index == index)
+        {
+            bail!("injected reversible removal failure at {name}[{index}]");
+        }
+        Ok(())
+    })
 }
 
 pub fn prepare_materialized_skill(
@@ -838,9 +1191,12 @@ fn unique_suffix() -> String {
 mod tests {
     use super::{
         CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest,
-        PrepareMaterializedSkillRequest, PreviousSkillInstallation, SkillInstallerPolicy,
-        UninstallSkillRequest, UpdateSkillRequest, commit_prepared_skill, install_skill,
-        prepare_materialized_skill, rollback_prepared_skill_commit, uninstall_skill, update_skill,
+        PrepareMaterializedSkillRequest, PreviousSkillInstallation, REMOVAL_FAILPOINTS,
+        ReversibleSkillRemovalTarget, SkillInstallerPolicy, StageReversibleSkillRemovalsRequest,
+        UninstallSkillRequest, UpdateSkillRequest, commit_prepared_skill,
+        finalize_reversible_skill_removals, install_skill, prepare_materialized_skill,
+        rollback_prepared_skill_commit, rollback_reversible_skill_removals,
+        stage_reversible_skill_removals, uninstall_skill, update_skill,
     };
     use crate::contract::SkillSourceKind;
     use crate::provenance::{find_lock_entry, read_skills_lock};
@@ -883,6 +1239,19 @@ mod tests {
 
     fn id(value: &str) -> SkillId {
         SkillId::new(value).unwrap()
+    }
+
+    struct RemovalFailpointGuard;
+
+    impl Drop for RemovalFailpointGuard {
+        fn drop(&mut self) {
+            REMOVAL_FAILPOINTS.with(|failpoints| failpoints.borrow_mut().clear());
+        }
+    }
+
+    fn removal_failpoints(points: Vec<(&'static str, usize)>) -> RemovalFailpointGuard {
+        REMOVAL_FAILPOINTS.with(|failpoints| *failpoints.borrow_mut() = points);
+        RemovalFailpointGuard
     }
 
     #[test]
@@ -1378,5 +1747,388 @@ Body"#,
         assert!(find_lock_entry(&lock, &skill_id).is_none());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reversible_batch_removal_stages_in_order_and_restores_paths_and_lock() {
+        let root = temp_case("reversible-removal-rollback");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let first = install_for_removal(
+            root.as_path(),
+            install_root.as_path(),
+            lock_path.as_path(),
+            "AAAAAAAAAAAAAAAAAAAAA",
+            "First Skill",
+        );
+        let second = install_for_removal(
+            root.as_path(),
+            install_root.as_path(),
+            lock_path.as_path(),
+            "BBBBBBBBBBBBBBBBBBBBB",
+            "Second Skill",
+        );
+
+        let batch = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![
+                ReversibleSkillRemovalTarget {
+                    skill_id: second.definition.identity.skill_id.clone(),
+                    slug: second.definition.identity.slug.clone(),
+                    managed_install_path: Some(second.install_path.clone()),
+                },
+                ReversibleSkillRemovalTarget {
+                    skill_id: first.definition.identity.skill_id.clone(),
+                    slug: first.definition.identity.slug.clone(),
+                    managed_install_path: Some(first.install_path.clone()),
+                },
+            ],
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+        })
+        .expect("stage removals");
+
+        assert_eq!(batch.removals[0].skill_id.as_str(), "AAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(batch.removals[1].skill_id.as_str(), "BBBBBBBBBBBBBBBBBBBBB");
+        assert!(!first.install_path.exists());
+        assert!(!second.install_path.exists());
+        let staged_lock = read_skills_lock(lock_path.as_path()).expect("read staged lock");
+        assert!(find_lock_entry(&staged_lock, &first.definition.identity.skill_id).is_none());
+        assert!(find_lock_entry(&staged_lock, &second.definition.identity.skill_id).is_none());
+
+        rollback_reversible_skill_removals(&batch).expect("roll back removals");
+
+        assert!(first.install_path.exists());
+        assert!(second.install_path.exists());
+        let restored_lock = read_skills_lock(lock_path.as_path()).expect("read restored lock");
+        assert!(find_lock_entry(&restored_lock, &first.definition.identity.skill_id).is_some());
+        assert!(find_lock_entry(&restored_lock, &second.definition.identity.skill_id).is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reversible_batch_removal_finalize_deletes_only_staged_paths() {
+        let root = temp_case("reversible-removal-finalize");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let installed = install_for_removal(
+            root.as_path(),
+            install_root.as_path(),
+            lock_path.as_path(),
+            "CCCCCCCCCCCCCCCCCCCCC",
+            "Removed Skill",
+        );
+        let unrelated = install_root.join("unrelated.txt");
+        fs::write(unrelated.as_path(), b"keep").expect("write unrelated file");
+        let batch = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: installed.definition.identity.skill_id.clone(),
+                slug: installed.definition.identity.slug.clone(),
+                managed_install_path: Some(installed.install_path.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+        })
+        .expect("stage removal");
+
+        finalize_reversible_skill_removals(&batch).expect("finalize removal");
+
+        assert!(!installed.install_path.exists());
+        assert!(unrelated.exists());
+        assert!(batch.removals.iter().all(|removal| {
+            removal
+                .staged_path
+                .as_ref()
+                .is_none_or(|path| !path.exists())
+        }));
+        assert!(
+            find_lock_entry(
+                &read_skills_lock(lock_path.as_path()).expect("read final lock"),
+                &installed.definition.identity.skill_id,
+            )
+            .is_none()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reversible_batch_removal_missing_optional_path_preserves_uninstall_semantics() {
+        let root = temp_case("reversible-removal-missing");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let installed = install_for_removal(
+            root.as_path(),
+            install_root.as_path(),
+            lock_path.as_path(),
+            "DDDDDDDDDDDDDDDDDDDDD",
+            "Missing Skill",
+        );
+        fs::remove_dir_all(installed.install_path.as_path()).expect("remove managed path first");
+
+        let batch = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: installed.definition.identity.skill_id.clone(),
+                slug: installed.definition.identity.slug.clone(),
+                managed_install_path: Some(installed.install_path.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+        })
+        .expect("stage missing path");
+
+        assert!(!batch.removals[0].was_present_on_disk);
+        assert!(batch.removals[0].staged_path.is_none());
+        rollback_reversible_skill_removals(&batch).expect("restore lock for missing path");
+        assert!(
+            find_lock_entry(
+                &read_skills_lock(lock_path.as_path()).expect("read restored lock"),
+                &installed.definition.identity.skill_id,
+            )
+            .is_some()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reversible_batch_removal_rejects_outside_noncanonical_and_overlapping_paths_before_moves() {
+        let root = temp_case("reversible-removal-containment");
+        let install_root = root.join("install");
+        fs::create_dir_all(install_root.as_path()).expect("create install root");
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.as_path()).expect("create outside path");
+        let error = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: id("EEEEEEEEEEEEEEEEEEEEE"),
+                slug: "outside".to_owned(),
+                managed_install_path: Some(outside.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: install_root.join("skills-lock.toml"),
+        })
+        .expect_err("outside path should fail")
+        .to_string();
+        assert!(error.contains("containment"));
+        assert!(outside.exists());
+
+        let wrong_canonical_path = install_root
+            .join("EEEEEEEEEEEEEEEEEEEEE")
+            .join("wrong-slug");
+        fs::create_dir_all(wrong_canonical_path.as_path())
+            .expect("create noncanonical managed path");
+        let error = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: id("EEEEEEEEEEEEEEEEEEEEE"),
+                slug: "expected-slug".to_owned(),
+                managed_install_path: Some(wrong_canonical_path.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: install_root.join("skills-lock.toml"),
+        })
+        .expect_err("noncanonical managed path should fail")
+        .to_string();
+        assert!(error.contains("is not the canonical path"));
+        assert!(wrong_canonical_path.exists());
+
+        let parent = install_root.join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(child.as_path()).expect("create overlapping paths");
+        let error = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![
+                ReversibleSkillRemovalTarget {
+                    skill_id: id("FFFFFFFFFFFFFFFFFFFFF"),
+                    slug: "parent".to_owned(),
+                    managed_install_path: Some(parent.clone()),
+                },
+                ReversibleSkillRemovalTarget {
+                    skill_id: id("GGGGGGGGGGGGGGGGGGGGG"),
+                    slug: "child".to_owned(),
+                    managed_install_path: Some(child),
+                },
+            ],
+            install_root,
+            lock_path: root.join("lock.toml"),
+        })
+        .expect_err("overlapping paths should fail")
+        .to_string();
+        assert!(error.contains("non-overlapping"));
+        assert!(parent.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reversible_batch_removal_move_and_lock_faults_restore_prior_state() {
+        for (case_name, failpoints) in [
+            ("move", vec![("stage_move", 1)]),
+            ("lock", vec![("lock_write", 0)]),
+        ] {
+            let root = temp_case(case_name);
+            let install_root = root.join("install");
+            let lock_path = install_root.join("skills-lock.toml");
+            let first = install_for_removal(
+                root.as_path(),
+                install_root.as_path(),
+                lock_path.as_path(),
+                "HHHHHHHHHHHHHHHHHHHHH",
+                "First Fault Skill",
+            );
+            let second = install_for_removal(
+                root.as_path(),
+                install_root.as_path(),
+                lock_path.as_path(),
+                "IIIIIIIIIIIIIIIIIIIII",
+                "Second Fault Skill",
+            );
+            let _guard = removal_failpoints(failpoints);
+
+            let error = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+                targets: vec![
+                    ReversibleSkillRemovalTarget {
+                        skill_id: first.definition.identity.skill_id.clone(),
+                        slug: first.definition.identity.slug.clone(),
+                        managed_install_path: Some(first.install_path.clone()),
+                    },
+                    ReversibleSkillRemovalTarget {
+                        skill_id: second.definition.identity.skill_id.clone(),
+                        slug: second.definition.identity.slug.clone(),
+                        managed_install_path: Some(second.install_path.clone()),
+                    },
+                ],
+                install_root: install_root.clone(),
+                lock_path: lock_path.clone(),
+            })
+            .expect_err("injected stage failure should fail")
+            .to_string();
+
+            assert!(error.contains("injected reversible removal failure"));
+            assert!(first.install_path.exists());
+            assert!(second.install_path.exists());
+            let lock = read_skills_lock(lock_path.as_path()).expect("read unchanged lock");
+            assert!(find_lock_entry(&lock, &first.definition.identity.skill_id).is_some());
+            assert!(find_lock_entry(&lock, &second.definition.identity.skill_id).is_some());
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn reversible_batch_removal_surfaces_rollback_finalize_and_compound_failures() {
+        let root = temp_case("reversible-removal-fallible-cleanup");
+        let install_root = root.join("install");
+        let lock_path = install_root.join("skills-lock.toml");
+        let installed = install_for_removal(
+            root.as_path(),
+            install_root.as_path(),
+            lock_path.as_path(),
+            "JJJJJJJJJJJJJJJJJJJJJ",
+            "Fallible Skill",
+        );
+        let batch = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: installed.definition.identity.skill_id.clone(),
+                slug: installed.definition.identity.slug.clone(),
+                managed_install_path: Some(installed.install_path.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+        })
+        .expect("stage removal");
+        {
+            let _guard = removal_failpoints(vec![("rollback_move", 0)]);
+            let error = rollback_reversible_skill_removals(&batch)
+                .expect_err("rollback fault should surface")
+                .to_string();
+            assert!(error.contains("rollback_move"));
+        }
+        rollback_reversible_skill_removals(&batch).expect("retry rollback");
+        assert!(installed.install_path.exists());
+
+        let finalize_batch = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![ReversibleSkillRemovalTarget {
+                skill_id: installed.definition.identity.skill_id.clone(),
+                slug: installed.definition.identity.slug.clone(),
+                managed_install_path: Some(installed.install_path.clone()),
+            }],
+            install_root: install_root.clone(),
+            lock_path: lock_path.clone(),
+        })
+        .expect("stage finalize removal");
+        {
+            let _guard = removal_failpoints(vec![("finalize_remove", 0)]);
+            let error = finalize_reversible_skill_removals(&finalize_batch)
+                .expect_err("finalize fault should surface")
+                .to_string();
+            assert!(error.contains("finalize_remove"));
+        }
+        finalize_reversible_skill_removals(&finalize_batch).expect("retry finalize");
+
+        let _ = fs::remove_dir_all(root);
+
+        let compound_root = temp_case("reversible-removal-compound");
+        let compound_install = compound_root.join("install");
+        let compound_lock = compound_install.join("skills-lock.toml");
+        let first = install_for_removal(
+            compound_root.as_path(),
+            compound_install.as_path(),
+            compound_lock.as_path(),
+            "KKKKKKKKKKKKKKKKKKKKK",
+            "Compound First",
+        );
+        let second = install_for_removal(
+            compound_root.as_path(),
+            compound_install.as_path(),
+            compound_lock.as_path(),
+            "LLLLLLLLLLLLLLLLLLLLL",
+            "Compound Second",
+        );
+        let _guard = removal_failpoints(vec![("stage_move", 1), ("rollback_move", 0)]);
+        let error = stage_reversible_skill_removals(StageReversibleSkillRemovalsRequest {
+            targets: vec![
+                ReversibleSkillRemovalTarget {
+                    skill_id: first.definition.identity.skill_id.clone(),
+                    slug: first.definition.identity.slug.clone(),
+                    managed_install_path: Some(first.install_path.clone()),
+                },
+                ReversibleSkillRemovalTarget {
+                    skill_id: second.definition.identity.skill_id.clone(),
+                    slug: second.definition.identity.slug.clone(),
+                    managed_install_path: Some(second.install_path.clone()),
+                },
+            ],
+            install_root: compound_install,
+            lock_path: compound_lock,
+        })
+        .expect_err("stage and rollback failures should be combined")
+        .to_string();
+        assert!(error.contains("stage_move"));
+        assert!(error.contains("rollback also failed"));
+        assert!(error.contains("rollback_move"));
+        assert!(!first.install_path.exists());
+        assert!(second.install_path.exists());
+        let _ = fs::remove_dir_all(compound_root);
+    }
+
+    fn install_for_removal(
+        case_root: &std::path::Path,
+        install_root: &std::path::Path,
+        lock_path: &std::path::Path,
+        skill_id: &str,
+        name: &str,
+    ) -> super::InstallSkillResult {
+        let source = case_root.join(format!("source-{skill_id}"));
+        write_skill(source.as_path(), name, "removal test");
+        install_skill(InstallSkillRequest {
+            skill_id: id(skill_id),
+            source_kind: SkillSourceKind::User,
+            source_ref: format!("upload:{skill_id}"),
+            source_path: source,
+            install_root: install_root.to_path_buf(),
+            lock_path: lock_path.to_path_buf(),
+            now_unix: 1,
+            policy: SkillInstallerPolicy::default(),
+        })
+        .expect("install removal fixture")
     }
 }

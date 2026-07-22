@@ -224,6 +224,22 @@ impl PioneerDesktop {
         self.reduce_composer_domain(ComposerDomainAction::RemoveCapabilityAt { index });
     }
 
+    pub(super) fn remove_composer_skill_selection(
+        &mut self,
+        selection: pioneer_client::composer::skill_selection::ComposerSkillSelection,
+    ) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
+        let selections = self
+            .composer_skill_selections
+            .iter()
+            .filter(|existing| *existing != &selection)
+            .cloned()
+            .collect();
+        self.reduce_composer_domain(ComposerDomainAction::SetSkillSelections { selections });
+    }
+
     pub(super) fn add_composer_capabilities(
         &mut self,
         capabilities: impl IntoIterator<Item = ComposerCapability>,
@@ -276,10 +292,12 @@ impl PioneerDesktop {
         let composer_attachments = self.composer_attachments.clone();
         let submission =
             self.composer_submission_plan(composer_text.as_str(), !composer_attachments.is_empty());
-        if !submission.has_composer_payload {
+        if !submission.has_composer_payload && self.composer_skill_selections.is_empty() {
             return;
         }
         let composer_capabilities = submission.capabilities;
+        let composer_skill_selections = self.composer_skill_selections.clone();
+        let composer_skill_picker = self.composer_skill_picker_projection("");
         self.reduce_composer_domain(ComposerDomainAction::SetCapabilities {
             capabilities: composer_capabilities.clone(),
         });
@@ -312,6 +330,8 @@ impl PioneerDesktop {
                 let composer_text_for_prepare = composer_text.clone();
                 let composer_attachments_for_prepare = composer_attachments.clone();
                 let composer_capabilities_for_prepare = composer_capabilities.clone();
+                let composer_skill_selections_for_prepare = composer_skill_selections.clone();
+                let composer_skill_picker_for_prepare = composer_skill_picker.clone();
                 let workspace_id_for_prepare = workspace_id.clone();
 
                 async move {
@@ -325,6 +345,8 @@ impl PioneerDesktop {
                                 text: composer_text_for_prepare,
                                 attachments: composer_attachments_for_prepare,
                                 capabilities: composer_capabilities_for_prepare,
+                                skill_selections: composer_skill_selections_for_prepare,
+                                skill_picker: composer_skill_picker_for_prepare,
                             })
                         })
                         .await;

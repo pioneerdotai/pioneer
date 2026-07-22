@@ -212,6 +212,12 @@
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
     },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "TextElement": {
       "type": "object",
       "properties": {
@@ -292,6 +298,16 @@
         {
           "type": "object",
           "properties": {
+            "packId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "skillId": {
               "$ref": "#/$defs/SkillId"
             },
@@ -303,6 +319,22 @@
           "required": [
             "type",
             "skillId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "packId": {
+              "$ref": "#/$defs/SkillPackId"
+            },
+            "type": {
+              "type": "string",
+              "const": "skillPack"
+            }
+          },
+          "required": [
+            "type",
+            "packId"
           ]
         },
         {

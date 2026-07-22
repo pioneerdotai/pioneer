@@ -908,13 +908,21 @@ installed_count = "Found:"
 title = "No installed skills"
 description = "Install new skills and expand your agents' capabilities."
 
+[skills.dialog]
+uninstall_pack_title = "Uninstall %{name}?"
+uninstall_pack_description = "Removes this skill pack and all of its currently installed skills from the workspace."
+
 [skills.error]
 gateway_not_connected = "Gateway is not connected."
 workspace_not_selected = "No active workspace selected."
 load_failed = "Failed to load installed skills"
 path_required = "Path is required."
 invalid_skill_target = "Invalid skill target."
+invalid_pack_target = "Invalid skill pack target."
 install_failed = "Failed to install skill"
+install_pack_failed = "Failed to install skill pack"
+update_pack_failed = "Failed to update skill pack"
+uninstall_pack_failed = "Failed to uninstall skill pack"
 update_failed = "Failed to update skill"
 uninstall_failed = "Failed to uninstall skill"
 policy_failed = "Failed to update skill policy"
@@ -923,6 +931,9 @@ path_picker_failed = "Failed to open source picker"
 [skills.card]
 version = "Version"
 fingerprint = "Fingerprint"
+skill_count_one = "%{count} skill"
+skill_count_few = "%{count} skills"
+skill_count_many = "%{count} skills"
 
 [skills.button]
 install = "Install"
@@ -934,7 +945,9 @@ implicit = "Implicit"
 [skills.upload]
 preparing = "Preparing skill upload"
 installing = "Uploading skill"
+installing_pack = "Uploading skill pack"
 updating = "Uploading update"
+updating_pack = "Uploading skill pack update"
 cancelling = "Cancelling upload"
 
 [skills.diagnostics]

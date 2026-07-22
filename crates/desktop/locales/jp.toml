@@ -1067,13 +1067,21 @@ installed_count = "検出:"
 title = "インストール済みスキルはありません"
 description = "新しいスキルをインストールして、エージェントの機能を拡張しましょう。"
 
+[skills.dialog]
+uninstall_pack_title = "%{name} をアンインストールしますか？"
+uninstall_pack_description = "このスキルパックと、現在含まれているインストール済みスキルをワークスペースから削除します。"
+
 [skills.error]
 gateway_not_connected = "ゲートウェイに接続されていません。"
 workspace_not_selected = "アクティブなワークスペースが選択されていません。"
 load_failed = "インストール済みスキルを読み込めませんでした"
 path_required = "パスは必須です。"
 invalid_skill_target = "スキルの対象が無効です。"
+invalid_pack_target = "スキルパックの対象が無効です。"
 install_failed = "スキルをインストールできませんでした"
+install_pack_failed = "スキルパックをインストールできませんでした"
+update_pack_failed = "スキルパックを更新できませんでした"
+uninstall_pack_failed = "スキルパックをアンインストールできませんでした"
 update_failed = "スキルを更新できませんでした"
 uninstall_failed = "スキルをアンインストールできませんでした"
 policy_failed = "スキルポリシーを更新できませんでした"
@@ -1082,6 +1090,9 @@ path_picker_failed = "ソース選択を開けませんでした"
 [skills.card]
 version = "バージョン"
 fingerprint = "フィンガープリント"
+skill_count_one = "%{count} スキル"
+skill_count_few = "%{count} スキル"
+skill_count_many = "%{count} スキル"
 
 [skills.status]
 active = "有効"
@@ -1109,7 +1120,9 @@ implicit = "暗黙"
 [skills.upload]
 preparing = "スキルのアップロードを準備しています"
 installing = "スキルをアップロードしています"
+installing_pack = "スキルパックをアップロードしています"
 updating = "更新をアップロードしています"
+updating_pack = "スキルパックの更新をアップロードしています"
 cancelling = "アップロードをキャンセルしています"
 
 [skills.diagnostics]

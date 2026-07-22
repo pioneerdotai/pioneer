@@ -14,7 +14,8 @@ use pioneer_protocol::{
     MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
-    SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
+    SkillsInstallParams, SkillsPackInstallParams, SkillsPackUninstallParams,
+    SkillsPackUpdateParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
     TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
@@ -1767,6 +1768,75 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::SKILLS_INSTALL
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::SKILLS_PACK_INSTALL => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<SkillsPackInstallParams>(params_value) {
+                        Ok(params) => {
+                            self.skills_pack_install(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::SKILLS_PACK_INSTALL
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::SKILLS_PACK_UPDATE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<SkillsPackUpdateParams>(params_value) {
+                        Ok(params) => {
+                            self.skills_pack_update(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::SKILLS_PACK_UPDATE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::SKILLS_PACK_UNINSTALL => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<SkillsPackUninstallParams>(params_value) {
+                        Ok(params) => {
+                            self.skills_pack_uninstall(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::SKILLS_PACK_UNINSTALL
                                     ),
                                 ),
                             )

@@ -17,14 +17,23 @@ use pioneer_client::composer::capabilities::{
     McpCapabilityUnavailableReason, SelectableMcpCapability, SelectableSkillCapability,
     SkillCapabilityUnavailableReason,
 };
+use pioneer_client::composer::skill_selection::{
+    ComposerSkillPickerProjection, ComposerSkillSelection, SelectablePackedSkillCapability,
+    SelectableSkillPackCapability, normalize_composer_skill_selections,
+    project_composer_skill_picker, reduce_composer_skill_selection_toggle,
+};
+use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::mcp::{details as mcp_details, list as mcp_list};
-use pioneer_client::skills::catalog as skill_catalog;
+use pioneer_client::skills::catalog::{self as skill_catalog, SkillManagementProjection};
+use pioneer_protocol::SkillPackId;
 use std::collections::HashSet;
 
 struct CapabilityPickerState {
     search: Entity<InputState>,
     selected: HashSet<String>,
-    skill_rows: Vec<SelectableSkillCapability>,
+    skill_management: SkillManagementProjection,
+    skill_selections: Vec<ComposerSkillSelection>,
+    expanded_skill_pack_ids: HashSet<SkillPackId>,
     skill_loading: bool,
     skill_error: Option<String>,
     mcp_server_rows: Vec<SelectableMcpCapability>,
@@ -42,7 +51,9 @@ impl CapabilityPickerState {
         Self {
             search: cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.into())),
             selected: HashSet::new(),
-            skill_rows: Vec::new(),
+            skill_management: SkillManagementProjection::default(),
+            skill_selections: Vec::new(),
+            expanded_skill_pack_ids: HashSet::new(),
             skill_loading: false,
             skill_error: None,
             mcp_server_rows: Vec::new(),
@@ -68,8 +79,24 @@ impl CapabilityPickerState {
         self.search.read(cx).value().to_string()
     }
 
-    fn toggle_selected(&mut self, key: &str, cx: &mut Context<Self>) {
-        composer_capabilities::toggle_selected_capability_key(&mut self.selected, key);
+    fn toggle_skill_selection(
+        &mut self,
+        picker: &ComposerSkillPickerProjection,
+        selection: ComposerSkillSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.skill_selections = reduce_desktop_skill_picker_selection(
+            self.skill_selections.as_slice(),
+            picker,
+            selection,
+        );
+        cx.notify();
+    }
+
+    fn toggle_skill_pack_expanded(&mut self, pack_id: SkillPackId, cx: &mut Context<Self>) {
+        if !self.expanded_skill_pack_ids.remove(&pack_id) {
+            self.expanded_skill_pack_ids.insert(pack_id);
+        }
         cx.notify();
     }
 
@@ -94,14 +121,14 @@ impl CapabilityPickerState {
 
     fn finish_loading_skills(
         &mut self,
-        rows: Vec<SelectableSkillCapability>,
+        management: SkillManagementProjection,
         cx: &mut Context<Self>,
     ) {
-        composer_capabilities::replace_skill_capability_rows(
-            &mut self.skill_rows,
-            &mut self.selected,
-            rows,
-        );
+        self.expanded_skill_pack_ids
+            .retain(|pack_id| management.packs.iter().any(|row| &row.pack.id == pack_id));
+        self.skill_management = management;
+        self.skill_selections =
+            normalize_composer_skill_selections(self.skill_selections.iter().cloned());
         self.skill_loading = false;
         self.skill_error = None;
         cx.notify();
@@ -205,6 +232,14 @@ impl CapabilityPickerState {
     }
 }
 
+fn reduce_desktop_skill_picker_selection(
+    current: &[ComposerSkillSelection],
+    picker: &ComposerSkillPickerProjection,
+    selection: ComposerSkillSelection,
+) -> Vec<ComposerSkillSelection> {
+    reduce_composer_skill_selection_toggle(current, picker, selection).selections
+}
+
 impl PioneerDesktop {
     pub(super) fn open_composer_skills_picker(
         &mut self,
@@ -212,29 +247,29 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let desktop_entity = cx.entity().clone();
-        let rows = self.selectable_skill_capabilities("");
+        let management = self.skills_management.clone();
+        let initial_selections = self.composer_skill_selections.clone();
         let picker_state = cx.new(|cx| {
             let mut state = CapabilityPickerState::new(
                 window,
                 cx,
                 t!("chat.composer.capability_picker.search_skills").to_string(),
             );
-            state.skill_rows = rows;
+            state.skill_management = management;
+            state.skill_selections = initial_selections;
             state
         });
         self.load_composer_skill_picker_rows(picker_state.clone(), cx);
 
         window.open_dialog(cx, move |dialog, window, cx| {
             picker_state.update(cx, |state, cx| state.focus_search_once(window, cx));
-            let (rows, selected, loading, error) = {
+            let (picker, selections, expanded_pack_ids, loading, error) = {
                 let state = picker_state.read(cx);
                 let query = state.query(cx);
                 (
-                    composer_capabilities::filter_selectable_skill_capability_rows(
-                        state.skill_rows.as_slice(),
-                        query.as_str(),
-                    ),
-                    state.selected.clone(),
+                    project_composer_skill_picker(&state.skill_management, query.as_str()),
+                    state.skill_selections.clone(),
+                    state.expanded_skill_pack_ids.clone(),
                     state.skill_loading,
                     state.skill_error.clone(),
                 )
@@ -257,8 +292,9 @@ impl PioneerDesktop {
                     let desktop_entity = desktop_entity.clone();
                     let picker_state = picker_state.clone();
                     move |_, _, _, cx| {
-                        let capabilities =
-                            selected_skill_composer_capabilities(&picker_state.read(cx));
+                        let selections = normalize_composer_skill_selections(
+                            picker_state.read(cx).skill_selections.iter().cloned(),
+                        );
 
                         vec![
                             default_outline_button("composer-skills-cancel")
@@ -268,15 +304,19 @@ impl PioneerDesktop {
                                 .into_any_element(),
                             default_primary_button("composer-skills-save")
                                 .label(t!("buttons.add").to_string())
-                                .disabled(capabilities.is_empty())
+                                .disabled(selections.is_empty())
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
                                     move |_, window, cx| {
-                                        if capabilities.is_empty() {
+                                        if selections.is_empty() {
                                             return;
                                         }
                                         let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.add_composer_capabilities(capabilities.clone());
+                                            view.reduce_composer_domain(
+                                                ComposerDomainAction::SetSkillSelections {
+                                                    selections: selections.clone(),
+                                                },
+                                            );
                                             cx.notify();
                                         });
                                         window.close_dialog(cx);
@@ -293,8 +333,9 @@ impl PioneerDesktop {
                         .py_4()
                         .child(render_picker_filter_form(&picker_state.read(cx).search))
                         .child(render_skill_rows(
-                            rows,
-                            selected,
+                            picker,
+                            selections,
+                            expanded_pack_ids,
                             loading,
                             error,
                             picker_state.clone(),
@@ -453,14 +494,11 @@ impl PioneerDesktop {
         });
     }
 
-    pub(super) fn selectable_skill_capabilities(
+    pub(crate) fn composer_skill_picker_projection(
         &self,
         query: &str,
-    ) -> Vec<SelectableSkillCapability> {
-        composer_capabilities::filter_installed_skill_capability_rows(
-            self.installed_skills.as_slice(),
-            query,
-        )
+    ) -> ComposerSkillPickerProjection {
+        project_composer_skill_picker(&self.skills_management, query)
     }
 
     pub(super) fn selectable_mcp_server_capabilities(
@@ -505,11 +543,13 @@ impl PioneerDesktop {
                 let _ = cx.update(|cx| {
                     picker_state.update(cx, |state, cx| match result {
                         Ok(response) => {
-                            let reduction =
-                                composer_capabilities::reduce_composer_skill_picker_rows_response(
-                                    response, "",
-                                );
-                            state.finish_loading_skills(reduction.rows, cx);
+                            let split =
+                                skill_catalog::derive_skills_catalog_and_installed(response.skills);
+                            let management = skill_catalog::project_skill_management(
+                                split.installed.as_slice(),
+                                response.packs,
+                            );
+                            state.finish_loading_skills(management, cx);
                         }
                         Err(error) => {
                             state.fail_loading_skills(
@@ -716,14 +756,15 @@ fn render_picker_filter_form(search: &Entity<InputState>) -> AnyElement {
 }
 
 fn render_skill_rows(
-    rows: Vec<SelectableSkillCapability>,
-    selected: HashSet<String>,
+    picker: ComposerSkillPickerProjection,
+    selections: Vec<ComposerSkillSelection>,
+    expanded_pack_ids: HashSet<SkillPackId>,
     loading: bool,
     error: Option<String>,
     picker_state: Entity<CapabilityPickerState>,
     cx: &mut App,
 ) -> AnyElement {
-    if rows.is_empty() {
+    if picker.standalone.is_empty() && picker.packs.is_empty() {
         if loading {
             return empty_picker_state(
                 t!("chat.composer.capability_picker.loading_skills").to_string(),
@@ -751,79 +792,242 @@ fn render_skill_rows(
         list = list.child(picker_error_banner(error, cx));
     }
 
+    let picker_for_rows = picker.clone();
+    let mut rows = picker
+        .standalone
+        .into_iter()
+        .map(|row| {
+            render_standalone_skill_picker_row(
+                row,
+                &selections,
+                picker_for_rows.clone(),
+                picker_state.clone(),
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.extend(picker.packs.into_iter().flat_map(|pack| {
+        let is_expanded = expanded_pack_ids.contains(&pack.pack_id);
+        let mut pack_rows = vec![render_skill_pack_picker_row(
+            pack.clone(),
+            &selections,
+            is_expanded,
+            picker_for_rows.clone(),
+            picker_state.clone(),
+            cx,
+        )];
+        if is_expanded {
+            pack_rows.extend(pack.children.into_iter().map(|child| {
+                render_packed_skill_picker_row(
+                    child,
+                    &selections,
+                    picker_for_rows.clone(),
+                    picker_state.clone(),
+                    cx,
+                )
+            }));
+        }
+        pack_rows
+    }));
+
     let row_count = rows.len();
     list.children(rows.into_iter().enumerate().map(|(row_index, row)| {
-        let is_selected = selected.contains(row.key.as_str());
-        let key = row.key.clone();
-        let key_id = stable_picker_row_id(key.as_str());
-        let is_selectable = row.selectable;
-        let key_for_row = key.clone();
-        let key_for_toggle = key.clone();
-        let picker_state_for_row = picker_state.clone();
-        let picker_state_for_toggle = picker_state.clone();
-        let disabled_reason =
-            skill_capability_unavailable_reason_label(row.unavailable_reason.as_ref());
-        let row_element = h_flex()
-            .id(("composer-skill-picker-row", key_id))
-            .w_full()
-            .items_center()
-            .gap_3()
-            .rounded_md()
-            .border_1()
-            .border_color(if is_selected {
-                cx.theme().blue
-            } else {
-                cx.theme().border
-            })
-            .bg(cx.theme().background)
-            .p_2()
-            .when(is_selectable, |this| {
-                this.cursor_pointer().on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    picker_state_for_row.update(cx, |state, cx| {
-                        state.toggle_selected(key_for_row.as_str(), cx);
-                    });
-                })
-            })
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(div().text_sm().font_medium().child(row.label))
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .line_height(relative(1.45))
-                            .child(if row.description.trim().is_empty() {
-                                row.slug
-                            } else {
-                                row.description
-                            }),
-                    )
-                    .when_some(disabled_reason, |this, reason| {
-                        this.child(div().text_xs().text_color(cx.theme().danger).child(reason))
-                    }),
-            )
-            .child(render_picker_select_control(
-                ("composer-skill-picker-toggle", key_id),
-                is_selected,
-                !row.selectable,
-                move |_, _, cx| {
-                    picker_state_for_toggle.update(cx, |state, cx| {
-                        state.toggle_selected(key_for_toggle.as_str(), cx);
-                    });
-                },
-                cx,
-            ));
-
         div()
             .w_full()
             .when(row_index + 1 < row_count, |this| this.pb_2())
-            .child(row_element)
+            .child(row)
     }))
     .into_any_element()
+}
+
+fn render_standalone_skill_picker_row(
+    row: SelectableSkillCapability,
+    selections: &[ComposerSkillSelection],
+    picker: ComposerSkillPickerProjection,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    let selection = ComposerSkillSelection::Skill {
+        skill_id: row.skill_id.clone(),
+        pack_id: None,
+    };
+    render_skill_picker_leaf_row(row, selection, selections, picker, picker_state, cx)
+}
+
+fn render_packed_skill_picker_row(
+    child: SelectablePackedSkillCapability,
+    selections: &[ComposerSkillSelection],
+    picker: ComposerSkillPickerProjection,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    let selection = ComposerSkillSelection::Skill {
+        skill_id: child.skill.skill_id.clone(),
+        pack_id: Some(child.pack_id),
+    };
+    render_skill_picker_leaf_row(child.skill, selection, selections, picker, picker_state, cx)
+}
+
+fn render_skill_picker_leaf_row(
+    row: SelectableSkillCapability,
+    selection: ComposerSkillSelection,
+    selections: &[ComposerSkillSelection],
+    picker: ComposerSkillPickerProjection,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    let is_selected = selections.contains(&selection);
+    let key_id = stable_picker_row_id(selection.key().as_str());
+    let disabled_reason =
+        skill_capability_unavailable_reason_label(row.unavailable_reason.as_ref());
+    let selection_for_row = selection.clone();
+    let selection_for_toggle = selection;
+    let picker_for_row = picker.clone();
+    let picker_state_for_row = picker_state.clone();
+    let picker_state_for_toggle = picker_state.clone();
+
+    h_flex()
+        .id(("composer-skill-picker-row", key_id))
+        .w_full()
+        .items_center()
+        .gap_3()
+        .rounded_md()
+        .border_1()
+        .border_color(if is_selected {
+            cx.theme().blue
+        } else {
+            cx.theme().border
+        })
+        .bg(cx.theme().background)
+        .p_2()
+        .when(row.selectable, |this| {
+            this.cursor_pointer().on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                picker_state_for_row.update(cx, |state, cx| {
+                    state.toggle_skill_selection(&picker_for_row, selection_for_row.clone(), cx);
+                });
+            })
+        })
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_sm().font_medium().child(row.label))
+                .child(
+                    div()
+                        .text_xs()
+                        .opacity(0.6)
+                        .line_height(relative(1.45))
+                        .child(if row.description.trim().is_empty() {
+                            row.slug
+                        } else {
+                            row.description
+                        }),
+                )
+                .when_some(disabled_reason, |this, reason| {
+                    this.child(div().text_xs().text_color(cx.theme().danger).child(reason))
+                }),
+        )
+        .child(render_picker_select_control(
+            ("composer-skill-picker-toggle", key_id),
+            is_selected,
+            !row.selectable,
+            move |_, _, cx| {
+                picker_state_for_toggle.update(cx, |state, cx| {
+                    state.toggle_skill_selection(&picker, selection_for_toggle.clone(), cx);
+                });
+            },
+            cx,
+        ))
+        .into_any_element()
+}
+
+fn render_skill_pack_picker_row(
+    pack: SelectableSkillPackCapability,
+    selections: &[ComposerSkillSelection],
+    expanded: bool,
+    picker: ComposerSkillPickerProjection,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    let selection = ComposerSkillSelection::SkillPack {
+        pack_id: pack.pack_id.clone(),
+    };
+    let is_selected = selections.contains(&selection);
+    let key_id = stable_picker_row_id(pack.key.as_str());
+    let pack_id = pack.pack_id.clone();
+    let selection_for_row = selection.clone();
+    let selection_for_toggle = selection;
+    let picker_for_row = picker.clone();
+    let picker_state_for_row = picker_state.clone();
+    let picker_state_for_toggle = picker_state.clone();
+    let picker_state_for_expand = picker_state.clone();
+
+    h_flex()
+        .id(("composer-skill-pack-picker-row", key_id))
+        .w_full()
+        .items_center()
+        .gap_3()
+        .rounded_md()
+        .border_1()
+        .border_color(if is_selected {
+            cx.theme().blue
+        } else {
+            cx.theme().border
+        })
+        .bg(cx.theme().background)
+        .p_2()
+        .when(pack.selectable, |this| {
+            this.cursor_pointer().on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                picker_state_for_row.update(cx, |state, cx| {
+                    state.toggle_skill_selection(&picker_for_row, selection_for_row.clone(), cx);
+                });
+            })
+        })
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_sm().font_medium().child(pack.label))
+                .child(
+                    div()
+                        .text_xs()
+                        .opacity(0.6)
+                        .child(pack.children.len().to_string()),
+                ),
+        )
+        .child(render_picker_select_control(
+            ("composer-skill-pack-picker-toggle", key_id),
+            is_selected,
+            !pack.selectable,
+            move |_, _, cx| {
+                picker_state_for_toggle.update(cx, |state, cx| {
+                    state.toggle_skill_selection(&picker, selection_for_toggle.clone(), cx);
+                });
+            },
+            cx,
+        ))
+        .child(
+            Button::new(("composer-skill-pack-expand", key_id))
+                .small()
+                .compact()
+                .ghost()
+                .icon(if expanded {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    picker_state_for_expand.update(cx, |state, cx| {
+                        state.toggle_skill_pack_expanded(pack_id.clone(), cx);
+                    });
+                }),
+        )
+        .into_any_element()
 }
 
 fn render_picker_select_control(
@@ -1317,17 +1521,106 @@ fn mcp_capability_row_description(row: &SelectableMcpCapability) -> String {
     row.description.clone()
 }
 
-fn selected_skill_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
-    composer_capabilities::selected_skill_composer_capabilities_from_rows(
-        state.skill_rows.as_slice(),
-        &state.selected,
-    )
-}
-
 fn selected_mcp_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
     composer_capabilities::selected_mcp_composer_capabilities_from_rows(
         state.mcp_server_rows.as_slice(),
         state.mcp_tool_rows.as_slice(),
         &state.selected,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::SkillId;
+
+    fn skill_id(character: char) -> SkillId {
+        SkillId::new(character.to_string().repeat(21)).expect("skill id")
+    }
+
+    fn pack_id(character: char) -> SkillPackId {
+        SkillPackId::new(character.to_string().repeat(21)).expect("pack id")
+    }
+
+    fn selectable_skill(character: char) -> SelectableSkillCapability {
+        let skill_id = skill_id(character);
+        SelectableSkillCapability {
+            key: pioneer_protocol::skill_capability_key(&skill_id),
+            skill_id,
+            label: character.to_string(),
+            display_name: character.to_string(),
+            description: String::new(),
+            owner: None,
+            slug: character.to_string(),
+            source_kind: "user".to_owned(),
+            selectable: true,
+            unavailable_reason: None,
+        }
+    }
+
+    fn picker() -> ComposerSkillPickerProjection {
+        let pack_id = pack_id('P');
+        ComposerSkillPickerProjection {
+            standalone: vec![selectable_skill('S')],
+            packs: vec![SelectableSkillPackCapability {
+                key: format!("skill_pack:{pack_id}"),
+                pack_id: pack_id.clone(),
+                label: "Pack".to_owned(),
+                children: vec![SelectablePackedSkillCapability {
+                    pack_id,
+                    member_key: "child".to_owned(),
+                    skill: selectable_skill('C'),
+                }],
+                selectable: true,
+            }],
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_picker_uses_shared_full_to_partial_transition_with_stable_ids() {
+        let picker = picker();
+        let full = ComposerSkillSelection::SkillPack {
+            pack_id: pack_id('P'),
+        };
+        let child = ComposerSkillSelection::Skill {
+            skill_id: skill_id('C'),
+            pack_id: Some(pack_id('P')),
+        };
+
+        let selected = reduce_desktop_skill_picker_selection(&[], &picker, full);
+        let partial = reduce_desktop_skill_picker_selection(&selected, &picker, child.clone());
+
+        assert_eq!(partial, vec![child]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_picker_keeps_manual_all_children_partial() {
+        let mut picker = picker();
+        let pack_id = pack_id('P');
+        picker.packs[0]
+            .children
+            .push(SelectablePackedSkillCapability {
+                pack_id: pack_id.clone(),
+                member_key: "second".to_owned(),
+                skill: selectable_skill('D'),
+            });
+        let first = ComposerSkillSelection::Skill {
+            skill_id: skill_id('C'),
+            pack_id: Some(pack_id.clone()),
+        };
+        let second = ComposerSkillSelection::Skill {
+            skill_id: skill_id('D'),
+            pack_id: Some(pack_id),
+        };
+
+        let selected = reduce_desktop_skill_picker_selection(&[], &picker, first);
+        let selected = reduce_desktop_skill_picker_selection(&selected, &picker, second);
+
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .all(|selection| matches!(selection, ComposerSkillSelection::Skill { .. }))
+        );
+    }
 }

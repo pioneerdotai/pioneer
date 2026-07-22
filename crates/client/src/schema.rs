@@ -907,12 +907,40 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::skills::catalog::ReconciledSkillsSnapshot
         ),
         schema_doc!(
+            "composer_skill_chip.json",
+            crate::composer::skill_selection::ComposerSkillChip
+        ),
+        schema_doc!(
+            "composer_skill_chip_kind.json",
+            crate::composer::skill_selection::ComposerSkillChipKind
+        ),
+        schema_doc!(
+            "composer_skill_picker_projection.json",
+            crate::composer::skill_selection::ComposerSkillPickerProjection
+        ),
+        schema_doc!(
+            "composer_skill_selection.json",
+            crate::composer::skill_selection::ComposerSkillSelection
+        ),
+        schema_doc!(
+            "composer_skill_selection_reduction.json",
+            crate::composer::skill_selection::ComposerSkillSelectionReduction
+        ),
+        schema_doc!(
             "selectable_mcp_capability.json",
             crate::composer::capabilities::SelectableMcpCapability
         ),
         schema_doc!(
+            "selectable_packed_skill_capability.json",
+            crate::composer::skill_selection::SelectablePackedSkillCapability
+        ),
+        schema_doc!(
             "selectable_skill_capability.json",
             crate::composer::capabilities::SelectableSkillCapability
+        ),
+        schema_doc!(
+            "selectable_skill_pack_capability.json",
+            crate::composer::skill_selection::SelectableSkillPackCapability
         ),
         schema_doc!(
             "skill_audit_action.json",
@@ -969,6 +997,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "skill_json_value_preview.json",
             crate::skills::presentation::SkillJsonValuePreview
+        ),
+        schema_doc!(
+            "skill_management_projection.json",
+            crate::skills::catalog::SkillManagementProjection
+        ),
+        schema_doc!(
+            "skill_pack_management_row.json",
+            crate::skills::catalog::SkillPackManagementRow
         ),
         schema_doc!(
             "skill_security_card.json",
@@ -1196,6 +1232,30 @@ mod tests {
             assert_eq!(
                 left_bytes, right_bytes,
                 "{file_name} changed between exports"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_pack_composer_contracts_are_registered() {
+        let file_names = client_schema_documents()
+            .into_iter()
+            .map(|document| document.file_name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "composer_skill_chip.json",
+            "composer_skill_picker_projection.json",
+            "composer_skill_selection.json",
+            "composer_skill_selection_reduction.json",
+            "selectable_packed_skill_capability.json",
+            "selectable_skill_pack_capability.json",
+            "skill_management_projection.json",
+            "skill_pack_management_row.json",
+        ] {
+            assert!(
+                file_names.contains(&expected),
+                "missing skill pack contract {expected}"
             );
         }
     }

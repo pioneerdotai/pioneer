@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsPackUninstallResponse",
+  "type": "object",
+  "properties": {
+    "audit": {
+      "$ref": "#/$defs/SkillLifecycleAuditSummary"
+    },
+    "pack": {
+      "$ref": "#/$defs/SkillPackInstallationItem"
+    },
+    "removed_skills": {
+      "description": "Ordered by pack member key, then SkillId.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillLifecycleRemovedSkill"
+      }
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "pack",
+    "removed_skills",
+    "audit"
+  ],
+  "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillLifecycleAuditSummary": {
+      "type": "object",
+      "properties": {
+        "events_written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "events_written"
+      ]
+    },
+    "SkillLifecycleRemovedSkill": {
+      "type": "object",
+      "properties": {
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "removed_install_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackInstallationItem": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "source_kind",
+        "created_at",
+        "updated_at"
+      ]
+    }
+  }
+}

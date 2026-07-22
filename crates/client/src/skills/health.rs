@@ -55,6 +55,7 @@ mod tests {
     fn skill(slug: &str, source_kind: &str) -> SkillListItem {
         SkillListItem {
             skill_id: test_id(slug, source_kind),
+            pack: None,
             owner: None,
             slug: slug.to_owned(),
             source_kind: source_kind.to_owned(),

@@ -1016,6 +1016,7 @@ mod tests {
                 kind: TurnCapabilityKind::Skill {
                     skill_id: SkillId::new("VVVVVVVVVVVVVVVVVVVVV")
                         .expect("valid voice fixture SkillId"),
+                    pack_id: None,
                 },
                 label: Some("Demo".to_owned()),
             }],

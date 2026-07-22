@@ -28,7 +28,7 @@ fn generate_install_skill_id(upload_id: &str) -> Result<SkillId> {
 }
 
 impl MessageProcessor {
-    async fn allocate_install_skill_id(
+    pub(super) async fn allocate_install_skill_id(
         &self,
         upload_id: &str,
         context: &SkillsRuntimeContext,
@@ -211,7 +211,25 @@ impl MessageProcessor {
             return;
         };
         let now = now_timestamp_secs();
-        let _guard = self.acquire_skills_write_lock().await;
+        let upload_guard = self
+            .acquire_skill_upload_lock(materialized.upload.upload_id.as_str())
+            .await;
+        let write_guard = self.acquire_skills_write_lock().await;
+        if let Err(error) = self
+            .revalidate_finalized_upload_locked(
+                connection_id,
+                workspace_id.as_str(),
+                materialized.upload.upload_id.as_str(),
+                &request_id,
+            )
+            .await
+        {
+            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            drop(write_guard);
+            drop(upload_guard);
+            self.send_error(connection_id, error).await;
+            return;
+        }
         if let Err(error) = self
             .ensure_skills_lock_v2_locked(
                 location.lock_path.as_path(),
@@ -318,6 +336,8 @@ impl MessageProcessor {
                 .to_owned(),
             fingerprint: install_result.definition.identity.fingerprint.clone(),
             updated_at_unix: now,
+            pack_id: None,
+            pack_member_key: None,
         };
         let policy_record = WorkspaceSkillPolicyRecord {
             id: pioneer_protocol::generate_id(21),
@@ -326,20 +346,35 @@ impl MessageProcessor {
             enabled: Some(true),
             allow_implicit_invocation: Some(false),
         };
-        if let Err(error) = self
+        let audit_records = skill_audit_records(install_result.audit_events.as_slice());
+        let persisted = self
             .crud_store
-            .insert_skill_installation_with_policy(&installation_record, &policy_record, now)
-            .await
-        {
+            .install_skill_lifecycle(
+                &installation_record,
+                &policy_record,
+                audit_records.as_slice(),
+                materialized.upload.upload_id.as_str(),
+                now,
+            )
+            .await;
+        if !matches!(persisted, Ok(true)) {
             rollback_committed_install(&install_result, &location);
             let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+            let error = match persisted {
+                Ok(false) => anyhow::anyhow!(
+                    "upload `{}` changed state before skill publication",
+                    materialized.upload.upload_id
+                ),
+                Err(error) => error,
+                Ok(true) => unreachable!(),
+            };
             self.send_error(
                 connection_id,
                 skills_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     SKILLS_ERROR_INTERNAL,
-                    "failed to persist skill installation and default policy",
+                    "failed to persist skill installation and consume upload",
                     json!({"error": format!("{error:#}")}),
                 ),
             )
@@ -348,45 +383,6 @@ impl MessageProcessor {
         }
 
         pioneer_skills::finalize_prepared_skill_commit(&install_result);
-
-        let audit_records = skill_audit_records(install_result.audit_events.as_slice());
-        if let Err(error) = self
-            .crud_store
-            .insert_skill_audit_event_records(audit_records.as_slice())
-            .await
-        {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to persist skill audit events",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = self
-            .mark_upload_consumed(materialized.upload.upload_id.as_str(), now)
-            .await
-        {
-            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
-            self.send_error(
-                connection_id,
-                skills_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_INTERNAL,
-                    "failed to mark skill upload consumed",
-                    json!({"error": format!("{error:#}")}),
-                ),
-            )
-            .await;
-            return;
-        }
         self.cleanup_upload_artifacts(&materialized.upload, materialized.cleanup_root.as_path());
 
         let payload = SkillsInstallResponse {

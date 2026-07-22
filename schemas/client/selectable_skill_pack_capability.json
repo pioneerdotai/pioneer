@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SelectableSkillPackCapability",
+  "type": "object",
+  "properties": {
+    "children": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SelectablePackedSkillCapability"
+      }
+    },
+    "key": {
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "pack_id": {
+      "$ref": "#/$defs/SkillPackId"
+    },
+    "selectable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "key",
+    "pack_id",
+    "label",
+    "children",
+    "selectable"
+  ],
+  "$defs": {
+    "SelectablePackedSkillCapability": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "skill": {
+          "$ref": "#/$defs/SelectableSkillCapability"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key",
+        "skill"
+      ]
+    },
+    "SelectableSkillCapability": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillCapabilityUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "skill_id",
+        "label",
+        "display_name",
+        "description",
+        "slug",
+        "source_kind",
+        "selectable"
+      ]
+    },
+    "SkillCapabilityUnavailableReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "DisabledByPolicy"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Inactive": {
+              "type": "object",
+              "properties": {
+                "status_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Inactive"
+          ]
+        }
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

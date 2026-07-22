@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tar::Archive;
 
@@ -26,6 +26,32 @@ pub(super) struct MaterializedSkillSource {
     pub source_dir: PathBuf,
     pub cleanup_root: PathBuf,
     pub upload: SkillUploadSessionRecord,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SkillPackMemberSource {
+    pub pack_member_key: String,
+    pub source_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ValidatedSkillPackRoot {
+    pub pack_name: String,
+    pub members: Vec<SkillPackMemberSource>,
+}
+
+fn normalize_materialized_skill_frontmatter(source_dir: &Path) -> Result<()> {
+    let skill_file = source_dir.join("SKILL.md");
+    let raw = fs::read_to_string(skill_file.as_path())
+        .with_context(|| format!("failed to read `{}`", skill_file.display()))?;
+    let Some(normalized) =
+        pioneer_skills::normalize_skill_markdown_plain_description(raw.as_str())?
+    else {
+        return Ok(());
+    };
+    fs::write(skill_file.as_path(), normalized)
+        .with_context(|| format!("failed to normalize `{}`", skill_file.display()))?;
+    Ok(())
 }
 
 impl MessageProcessor {
@@ -145,13 +171,15 @@ impl MessageProcessor {
         let upload_id = pioneer_protocol::generate_id(21);
         let now = now_timestamp_secs();
         let expires_at = now.saturating_add(i64::try_from(context.upload_ttl_secs).unwrap_or(3600));
-        let upload_dir = context
+        let workspace_upload_dir = context
             .upload_root
-            .join(sanitize_workspace_id_component(workspace_id.as_str()))
-            .join(upload_id.as_str());
+            .join(sanitize_workspace_id_component(workspace_id.as_str()));
+        let upload_dir = workspace_upload_dir.join(upload_id.as_str());
         let payload_path = upload_dir.join("payload.tar.gz");
 
-        if let Err(error) = fs::create_dir_all(upload_dir.as_path()) {
+        if let Err(error) = fs::create_dir_all(workspace_upload_dir.as_path())
+            .and_then(|()| fs::create_dir(upload_dir.as_path()))
+        {
             self.send_error(
                 connection_id,
                 skills_error(
@@ -184,7 +212,7 @@ impl MessageProcessor {
             aborted_at_unix: None,
         };
 
-        if let Err(error) = self.crud_store.upsert_skill_upload_session(&record).await {
+        if let Err(error) = self.crud_store.insert_skill_upload_session(&record).await {
             let _ = fs::remove_dir_all(upload_dir.as_path());
             self.send_error(
                 connection_id,
@@ -299,18 +327,24 @@ impl MessageProcessor {
         match sha256_file(PathBuf::from(upload.payload_path.as_str()).as_path()) {
             Ok(actual) if actual == upload.sha256 => {}
             Ok(actual) => {
-                let _ = remove_upload_payload(&upload);
-                let _ = self
+                if self
                     .crud_store
-                    .update_skill_upload_status(
+                    .transition_skill_upload_status(
                         upload.upload_id.as_str(),
+                        &[UPLOAD_STATUS_RECEIVING],
                         UPLOAD_STATUS_ABORTED,
                         None,
                         None,
                         Some(now),
                         now,
                     )
-                    .await;
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let _ = remove_upload_payload(&upload);
+                }
                 self.send_error(
                     connection_id,
                     skills_error(
@@ -342,8 +376,9 @@ impl MessageProcessor {
 
         let updated = match self
             .crud_store
-            .update_skill_upload_status(
+            .transition_skill_upload_status(
                 upload.upload_id.as_str(),
+                &[UPLOAD_STATUS_RECEIVING],
                 UPLOAD_STATUS_FINALIZED,
                 Some(now),
                 None,
@@ -354,7 +389,17 @@ impl MessageProcessor {
         {
             Ok(Some(row)) => row,
             Ok(None) => {
-                self.send_upload_not_found(connection_id, request_id).await;
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_UPLOAD_INVALID_REQUEST,
+                        "upload changed state before it could be finalized",
+                        json!({"upload_id": upload.upload_id}),
+                    ),
+                )
+                .await;
                 return;
             }
             Err(error) => {
@@ -425,11 +470,11 @@ impl MessageProcessor {
             return;
         }
 
-        let _ = remove_upload_payload(&upload);
         let updated = match self
             .crud_store
-            .update_skill_upload_status(
+            .transition_skill_upload_status(
                 upload.upload_id.as_str(),
+                &[UPLOAD_STATUS_RECEIVING, UPLOAD_STATUS_FINALIZED],
                 UPLOAD_STATUS_ABORTED,
                 None,
                 None,
@@ -440,7 +485,17 @@ impl MessageProcessor {
         {
             Ok(Some(row)) => row,
             Ok(None) => {
-                self.send_upload_not_found(connection_id, request_id).await;
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_UPLOAD_INVALID_REQUEST,
+                        "upload is already in a terminal state",
+                        json!({"upload_id": upload.upload_id, "status": upload.status}),
+                    ),
+                )
+                .await;
                 return;
             }
             Err(error) => {
@@ -463,6 +518,7 @@ impl MessageProcessor {
             upload_id: updated.upload_id,
             status: updated.status,
         };
+        let _ = remove_upload_payload(&upload);
         self.send_result(connection_id, request_id, &payload, "skills/upload/abort")
             .await;
     }
@@ -653,6 +709,69 @@ impl MessageProcessor {
         context: &SkillsRuntimeContext,
         request_id: &RequestId,
     ) -> Result<MaterializedSkillSource, JsonRpcErrorResponse> {
+        let materialized = self
+            .materialize_uploaded_archive_source(
+                connection_id,
+                workspace_id,
+                upload_id,
+                context,
+                request_id,
+            )
+            .await?;
+        match validate_single_skill_root(materialized.source_dir.clone()).and_then(|source_dir| {
+            normalize_materialized_skill_frontmatter(source_dir.as_path())?;
+            Ok(source_dir)
+        }) {
+            Ok(source_dir) => Ok(MaterializedSkillSource {
+                source_dir,
+                ..materialized
+            }),
+            Err(error) => {
+                self.abort_invalid_materialized_upload(&materialized).await;
+                Err(invalid_materialized_archive_error(request_id, error))
+            }
+        }
+    }
+
+    pub(super) async fn materialize_uploaded_skill_pack_source(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        upload_id: &str,
+        context: &SkillsRuntimeContext,
+        request_id: &RequestId,
+    ) -> Result<(MaterializedSkillSource, ValidatedSkillPackRoot), JsonRpcErrorResponse> {
+        let materialized = self
+            .materialize_uploaded_archive_source(
+                connection_id,
+                workspace_id,
+                upload_id,
+                context,
+                request_id,
+            )
+            .await?;
+        match validate_skill_pack_root(materialized.source_dir.clone()).and_then(|validated| {
+            for member in &validated.members {
+                normalize_materialized_skill_frontmatter(member.source_dir.as_path())?;
+            }
+            Ok(validated)
+        }) {
+            Ok(validated) => Ok((materialized, validated)),
+            Err(error) => {
+                self.abort_invalid_materialized_upload(&materialized).await;
+                Err(invalid_materialized_archive_error(request_id, error))
+            }
+        }
+    }
+
+    async fn materialize_uploaded_archive_source(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        upload_id: &str,
+        context: &SkillsRuntimeContext,
+        request_id: &RequestId,
+    ) -> Result<MaterializedSkillSource, JsonRpcErrorResponse> {
         let now = now_timestamp_secs();
         let upload = self
             .find_upload_for_connection(upload_id)
@@ -692,7 +811,7 @@ impl MessageProcessor {
             )
         })?;
 
-        let source_dir = match extract_skill_archive(
+        let source_dir = match extract_archive_secure(
             PathBuf::from(upload.payload_path.as_str()).as_path(),
             cleanup_root.as_path(),
             context.max_upload_uncompressed_bytes,
@@ -701,25 +820,13 @@ impl MessageProcessor {
         ) {
             Ok(source_dir) => source_dir,
             Err(error) => {
-                let _ = remove_upload_payload(&upload);
-                let _ = self
-                    .crud_store
-                    .update_skill_upload_status(
-                        upload.upload_id.as_str(),
-                        UPLOAD_STATUS_ABORTED,
-                        None,
-                        None,
-                        Some(now),
-                        now,
-                    )
-                    .await;
-                return Err(skills_error(
-                    Some(request_id.clone()),
-                    INVALID_REQUEST_CODE,
-                    SKILLS_ERROR_UPLOAD_INVALID_ARCHIVE,
-                    "failed to materialize uploaded skill archive",
-                    json!({"error": format!("{error:#}")}),
-                ));
+                let materialized = MaterializedSkillSource {
+                    source_dir: cleanup_root.clone(),
+                    cleanup_root,
+                    upload,
+                };
+                self.abort_invalid_materialized_upload(&materialized).await;
+                return Err(invalid_materialized_archive_error(request_id, error));
             }
         };
 
@@ -730,10 +837,79 @@ impl MessageProcessor {
         })
     }
 
+    async fn abort_invalid_materialized_upload(&self, materialized: &MaterializedSkillSource) {
+        let _guard = self
+            .acquire_skill_upload_lock(materialized.upload.upload_id.as_str())
+            .await;
+        let now = now_timestamp_secs();
+        match self
+            .crud_store
+            .transition_skill_upload_status(
+                materialized.upload.upload_id.as_str(),
+                &[UPLOAD_STATUS_FINALIZED],
+                UPLOAD_STATUS_ABORTED,
+                None,
+                None,
+                Some(now),
+                now,
+            )
+            .await
+        {
+            Ok(Some(_)) => {
+                let _ = remove_upload_payload(&materialized.upload);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    upload_id = materialized.upload.upload_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to abort invalid materialized skill upload"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(materialized.cleanup_root.as_path());
+    }
+
+    pub(super) async fn revalidate_finalized_upload_locked(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        upload_id: &str,
+        request_id: &RequestId,
+    ) -> Result<SkillUploadSessionRecord, JsonRpcErrorResponse> {
+        let now = now_timestamp_secs();
+        let upload = self
+            .find_upload_for_connection(upload_id)
+            .await
+            .ok_or_else(|| {
+                skills_error(
+                    Some(request_id.clone()),
+                    INVALID_PARAMS_CODE,
+                    SKILLS_ERROR_UPLOAD_NOT_FOUND,
+                    "upload was not found",
+                    json!({"upload_id": upload_id}),
+                )
+            })?;
+        validate_upload_owner(&upload, workspace_id, connection_id, now)
+            .map_err(|error| error.with_request_id(request_id.clone()))?;
+        if upload.status != UPLOAD_STATUS_FINALIZED || upload.consumed_at_unix.is_some() {
+            return Err(skills_error(
+                Some(request_id.clone()),
+                INVALID_REQUEST_CODE,
+                SKILLS_ERROR_UPLOAD_INVALID_REQUEST,
+                "upload is no longer finalized and unconsumed",
+                json!({"upload_id": upload_id, "status": upload.status}),
+            ));
+        }
+        Ok(upload)
+    }
+
     pub(super) async fn mark_upload_consumed(&self, upload_id: &str, now: i64) -> Result<()> {
-        self.crud_store
-            .update_skill_upload_status(
+        let updated = self
+            .crud_store
+            .transition_skill_upload_status(
                 upload_id,
+                &[UPLOAD_STATUS_FINALIZED],
                 UPLOAD_STATUS_CONSUMED,
                 None,
                 Some(now),
@@ -741,6 +917,9 @@ impl MessageProcessor {
                 now,
             )
             .await?;
+        if updated.is_none() {
+            bail!("upload `{upload_id}` is no longer finalized and unconsumed");
+        }
         Ok(())
     }
 
@@ -759,11 +938,11 @@ impl MessageProcessor {
         now: i64,
         upload: &SkillUploadSessionRecord,
     ) {
-        let _ = remove_upload_payload(upload);
-        if let Err(error) = self
+        match self
             .crud_store
-            .update_skill_upload_status(
+            .transition_skill_upload_status(
                 upload_id,
+                &[UPLOAD_STATUS_RECEIVING, UPLOAD_STATUS_FINALIZED],
                 UPLOAD_STATUS_ABORTED,
                 None,
                 None,
@@ -772,11 +951,17 @@ impl MessageProcessor {
             )
             .await
         {
-            warn!(
-                upload_id,
-                error = %format!("{error:#}"),
-                "failed to mark invalid skill upload aborted"
-            );
+            Ok(Some(_)) => {
+                let _ = remove_upload_payload(upload);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    upload_id,
+                    error = %format!("{error:#}"),
+                    "failed to mark invalid skill upload aborted"
+                );
+            }
         }
     }
 
@@ -796,17 +981,33 @@ impl MessageProcessor {
             let _guard = self
                 .acquire_skill_upload_lock(upload.upload_id.as_str())
                 .await;
-            let _ = remove_upload_payload(&upload);
-            if upload.expires_at_unix <= now
+            let current = match self
+                .crud_store
+                .find_skill_upload_session(upload.upload_id.as_str())
+                .await
+            {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        upload_id = upload.upload_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to re-read stale skill upload"
+                    );
+                    continue;
+                }
+            };
+            if current.expires_at_unix <= now
                 && matches!(
-                    upload.status.as_str(),
+                    current.status.as_str(),
                     UPLOAD_STATUS_RECEIVING | UPLOAD_STATUS_FINALIZED
                 )
             {
-                if let Err(error) = self
+                match self
                     .crud_store
-                    .update_skill_upload_status(
-                        upload.upload_id.as_str(),
+                    .transition_skill_upload_status(
+                        current.upload_id.as_str(),
+                        &[UPLOAD_STATUS_RECEIVING, UPLOAD_STATUS_FINALIZED],
                         UPLOAD_STATUS_EXPIRED,
                         None,
                         None,
@@ -815,12 +1016,23 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    warn!(
-                        upload_id = upload.upload_id.as_str(),
-                        error = %format!("{error:#}"),
-                        "failed to mark skill upload expired"
-                    );
+                    Ok(Some(_)) => {
+                        let _ = remove_upload_payload(&current);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            upload_id = current.upload_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to mark skill upload expired"
+                        );
+                    }
                 }
+            } else if matches!(
+                current.status.as_str(),
+                UPLOAD_STATUS_ABORTED | UPLOAD_STATUS_CONSUMED | UPLOAD_STATUS_EXPIRED
+            ) {
+                let _ = remove_upload_payload(&current);
             }
         }
 
@@ -1003,6 +1215,19 @@ impl MessageProcessor {
             );
         }
     }
+}
+
+fn invalid_materialized_archive_error(
+    request_id: &RequestId,
+    error: anyhow::Error,
+) -> JsonRpcErrorResponse {
+    skills_error(
+        Some(request_id.clone()),
+        INVALID_REQUEST_CODE,
+        SKILLS_ERROR_UPLOAD_INVALID_ARCHIVE,
+        "failed to materialize uploaded skill archive",
+        json!({"error": format!("{error:#}")}),
+    )
 }
 
 struct UploadValidationError {
@@ -1210,7 +1435,7 @@ fn directory_modified_at_or_before(path: &std::path::Path, stale_before: i64) ->
     i64::try_from(age.as_secs()).unwrap_or(i64::MAX) <= stale_before
 }
 
-fn extract_skill_archive(
+pub(super) fn extract_archive_secure(
     archive_path: &std::path::Path,
     cleanup_root: &std::path::Path,
     max_uncompressed_bytes: usize,
@@ -1221,7 +1446,7 @@ fn extract_skill_archive(
         .with_context(|| format!("failed to open skill archive `{}`", archive_path.display()))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
-    let mut root_name: Option<String> = None;
+    let mut root_name: Option<std::ffi::OsString> = None;
     let mut seen_paths = HashSet::new();
     let mut total_uncompressed = 0usize;
     let mut entry_count = 0usize;
@@ -1247,7 +1472,7 @@ fn extract_skill_archive(
         let Some(first_component) = normalized.components().next() else {
             continue;
         };
-        let root_component = first_component.as_os_str().to_string_lossy().to_string();
+        let root_component = first_component.as_os_str().to_os_string();
         match root_name.as_ref() {
             Some(existing) if existing != &root_component => {
                 bail!("archive contains multiple top-level roots");
@@ -1256,9 +1481,8 @@ fn extract_skill_archive(
             _ => {}
         }
 
-        let path_key = normalized.display().to_string();
-        if !seen_paths.insert(path_key.clone()) {
-            bail!("archive contains duplicate path `{path_key}`");
+        if !seen_paths.insert(normalized.clone()) {
+            bail!("archive contains duplicate path `{}`", normalized.display());
         }
 
         let entry_type = entry.header().entry_type();
@@ -1279,13 +1503,19 @@ fn extract_skill_archive(
         }
 
         if !entry_type.is_file() {
-            bail!("archive contains unsupported entry `{path_key}`");
+            bail!(
+                "archive contains unsupported entry `{}`",
+                normalized.display()
+            );
         }
 
         let file_size =
             usize::try_from(entry.header().size().unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
         if file_size > max_file_bytes {
-            bail!("archive file `{path_key}` exceeds per-file limit");
+            bail!(
+                "archive file `{}` exceeds per-file limit",
+                normalized.display()
+            );
         }
         total_uncompressed = total_uncompressed.saturating_add(file_size);
         if total_uncompressed > max_uncompressed_bytes {
@@ -1317,10 +1547,65 @@ fn extract_skill_archive(
     let root = root_name.ok_or_else(|| anyhow!("archive is empty"))?;
     let source_dir = cleanup_root.join(root);
     ensure_materialized_path_contained(cleanup_root.as_path(), source_dir.as_path())?;
+    Ok(source_dir)
+}
+
+pub(super) fn validate_single_skill_root(source_dir: PathBuf) -> Result<PathBuf> {
     if !source_dir.join("SKILL.md").is_file() {
         bail!("archive root is missing SKILL.md");
     }
     Ok(source_dir)
+}
+
+pub(super) fn validate_skill_pack_root(source_dir: PathBuf) -> Result<ValidatedSkillPackRoot> {
+    if !source_dir.is_dir() {
+        bail!("pack root must be a directory");
+    }
+    let pack_name = exact_utf8_component(
+        source_dir
+            .file_name()
+            .ok_or_else(|| anyhow!("pack root must have a name"))?,
+        "pack root",
+    )?;
+
+    let mut members = Vec::new();
+    for entry in fs::read_dir(source_dir.as_path())
+        .with_context(|| format!("failed to read pack root `{}`", source_dir.display()))?
+    {
+        let entry = entry.context("failed to read pack root entry")?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect `{}`", entry.path().display()))?;
+        if !file_type.is_dir() {
+            bail!(
+                "pack root may contain only immediate child directories; found `{}`",
+                entry.path().display()
+            );
+        }
+        let member_name = entry.file_name();
+        let pack_member_key = exact_utf8_component(member_name.as_os_str(), "pack member")?;
+        let member_dir = entry.path();
+        if !member_dir.join("SKILL.md").is_file() {
+            bail!("pack member `{pack_member_key}` is missing direct SKILL.md");
+        }
+        members.push(SkillPackMemberSource {
+            pack_member_key,
+            source_dir: member_dir,
+        });
+    }
+
+    if members.is_empty() {
+        bail!("pack root must contain at least one immediate child directory");
+    }
+    members.sort_by(|left, right| left.pack_member_key.cmp(&right.pack_member_key));
+
+    Ok(ValidatedSkillPackRoot { pack_name, members })
+}
+
+fn exact_utf8_component(name: &std::ffi::OsStr, label: &str) -> Result<String> {
+    name.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{label} name must be valid UTF-8"))
 }
 
 fn ensure_materialized_path_contained(
@@ -1436,13 +1721,14 @@ mod tests {
             ],
         );
 
-        let source_dir = extract_skill_archive(
+        let source_dir = extract_archive_secure(
             archive.as_path(),
             case.materialized.as_path(),
             1024,
             8,
             1024,
         )
+        .and_then(validate_single_skill_root)
         .expect("valid archive should extract");
 
         assert_eq!(
@@ -1453,23 +1739,31 @@ mod tests {
     }
 
     #[test]
-    fn extract_skill_archive_rejects_missing_root_skill_md() {
+    fn secure_extraction_accepts_pack_shape_but_single_skill_validation_rejects_it() {
         let case = TempCase::new("missing-skill-md");
         let archive = case.path.join("skill.tar.gz");
         write_archive(
             archive.as_path(),
-            &[TestEntry::file("invalid-skill/README.md", b"readme")],
+            &[
+                TestEntry::file("pack/first/SKILL.md", b"---\nname: first\n---\n"),
+                TestEntry::file("pack/second/SKILL.md", b"---\nname: second\n---\n"),
+            ],
         );
 
-        let error = extract_skill_archive(
+        let source_dir = extract_archive_secure(
             archive.as_path(),
             case.materialized.as_path(),
             1024,
             8,
             1024,
         )
-        .expect_err("missing SKILL.md should fail")
-        .to_string();
+        .expect("safe pack-shaped archive should extract");
+        assert!(source_dir.join("first/SKILL.md").is_file());
+        assert!(source_dir.join("second/SKILL.md").is_file());
+
+        let error = validate_single_skill_root(source_dir)
+            .expect_err("single-skill validation must reject a pack-shaped archive")
+            .to_string();
 
         assert!(error.contains("SKILL.md"));
     }
@@ -1486,7 +1780,7 @@ mod tests {
             ],
         );
 
-        let error = extract_skill_archive(
+        let error = extract_archive_secure(
             archive.as_path(),
             case.materialized.as_path(),
             1024,
@@ -1511,7 +1805,7 @@ mod tests {
             ],
         );
 
-        let error = extract_skill_archive(
+        let error = extract_archive_secure(
             archive.as_path(),
             case.materialized.as_path(),
             1024,
@@ -1544,7 +1838,7 @@ mod tests {
                 ],
             );
 
-            let error = extract_skill_archive(
+            let error = extract_archive_secure(
                 archive.as_path(),
                 case.materialized.as_path(),
                 1024,
@@ -1570,7 +1864,7 @@ mod tests {
             ],
         );
 
-        let error = extract_skill_archive(
+        let error = extract_archive_secure(
             archive.as_path(),
             case.materialized.as_path(),
             1024,
@@ -1594,7 +1888,7 @@ mod tests {
                 b"---\nname: skill\n---\nthis file is too large",
             )],
         );
-        let oversized_error = extract_skill_archive(
+        let oversized_error = extract_archive_secure(
             oversized_archive.as_path(),
             oversized.materialized.as_path(),
             1024,
@@ -1615,7 +1909,7 @@ mod tests {
                 TestEntry::file("skill/b.txt", b"b"),
             ],
         );
-        let too_many_error = extract_skill_archive(
+        let too_many_error = extract_archive_secure(
             too_many_archive.as_path(),
             too_many.materialized.as_path(),
             1024,
@@ -1625,6 +1919,241 @@ mod tests {
         .expect_err("entry limit should fail")
         .to_string();
         assert!(too_many_error.contains("entries"));
+    }
+
+    #[test]
+    fn secure_extraction_rejects_empty_and_multiple_roots() {
+        let empty = TempCase::new("empty-archive");
+        let empty_archive = empty.path.join("skill.tar.gz");
+        write_archive(empty_archive.as_path(), &[]);
+        let empty_error = extract_archive_secure(
+            empty_archive.as_path(),
+            empty.materialized.as_path(),
+            1024,
+            8,
+            1024,
+        )
+        .expect_err("empty archive should fail")
+        .to_string();
+        assert!(empty_error.contains("empty"));
+
+        let multiple = TempCase::new("multiple-roots");
+        let multiple_archive = multiple.path.join("skill.tar.gz");
+        write_archive(
+            multiple_archive.as_path(),
+            &[
+                TestEntry::file("first/SKILL.md", b"first"),
+                TestEntry::file("second/SKILL.md", b"second"),
+            ],
+        );
+        let multiple_error = extract_archive_secure(
+            multiple_archive.as_path(),
+            multiple.materialized.as_path(),
+            1024,
+            8,
+            1024,
+        )
+        .expect_err("multiple roots should fail")
+        .to_string();
+        assert!(multiple_error.contains("multiple top-level roots"));
+    }
+
+    #[test]
+    fn pack_shape_preserves_exact_names_orders_members_and_ignores_nested_directories() {
+        let case = TempCase::new("pack-shape-valid");
+        let root = case.materialized.join("Exact Pack Name");
+        fs::create_dir_all(root.join("z-member/assets/nested")).expect("create z member");
+        fs::create_dir_all(root.join("a-member")).expect("create a member");
+        fs::write(root.join("z-member/SKILL.md"), b"z").expect("write z skill");
+        fs::write(root.join("a-member/SKILL.md"), b"a").expect("write a skill");
+        fs::write(root.join("z-member/assets/nested/SKILL.md"), b"nested")
+            .expect("write nested asset");
+
+        let validated = validate_skill_pack_root(root).expect("valid pack shape");
+
+        assert_eq!(validated.pack_name, "Exact Pack Name");
+        assert_eq!(
+            validated
+                .members
+                .iter()
+                .map(|member| member.pack_member_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-member", "z-member"]
+        );
+    }
+
+    #[test]
+    fn pack_shape_accepts_one_member() {
+        let case = TempCase::new("pack-shape-one");
+        let root = case.materialized.join("pack");
+        fs::create_dir_all(root.join("only")).expect("create member");
+        fs::write(root.join("only/SKILL.md"), b"skill").expect("write skill");
+
+        let validated = validate_skill_pack_root(root).expect("valid one-member pack");
+
+        assert_eq!(validated.members.len(), 1);
+        assert_eq!(validated.members[0].pack_member_key, "only");
+    }
+
+    #[test]
+    fn materialized_preflight_normalizes_plain_description_without_touching_other_content() {
+        let case = TempCase::new("normalize-description");
+        let skill_dir = case.materialized.join("aso-router");
+        fs::create_dir_all(skill_dir.as_path()).expect("create skill directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            b"---\nname: aso-router\ndescription: Routes requests. Triggers: /aso\nmetadata:\n  version: 1.0.0\n---\nInstructions\n",
+        )
+        .expect("write malformed skill");
+
+        normalize_materialized_skill_frontmatter(skill_dir.as_path())
+            .expect("materialized preflight should normalize description");
+
+        let normalized = fs::read_to_string(skill_dir.join("SKILL.md"))
+            .expect("read normalized materialized skill");
+        assert!(normalized.contains("description: >-\n  Routes requests. Triggers: /aso\n"));
+        assert!(normalized.ends_with("---\nInstructions\n"));
+        normalize_materialized_skill_frontmatter(skill_dir.as_path())
+            .expect("normalization should be idempotent");
+        assert_eq!(
+            fs::read_to_string(skill_dir.join("SKILL.md"))
+                .expect("read normalized materialized skill again"),
+            normalized
+        );
+    }
+
+    #[test]
+    fn pack_shape_rejects_non_directory_empty_root_files_and_missing_member_skill() {
+        let non_directory = TempCase::new("pack-root-file");
+        let root_file = non_directory.materialized.join("pack");
+        fs::write(root_file.as_path(), b"not a directory").expect("write root file");
+        assert!(
+            validate_skill_pack_root(root_file)
+                .expect_err("file root should fail")
+                .to_string()
+                .contains("must be a directory")
+        );
+
+        let empty = TempCase::new("pack-root-empty");
+        let empty_root = empty.materialized.join("pack");
+        fs::create_dir_all(empty_root.as_path()).expect("create empty root");
+        assert!(
+            validate_skill_pack_root(empty_root)
+                .expect_err("empty root should fail")
+                .to_string()
+                .contains("at least one")
+        );
+
+        for file_name in ["SKILL.md", "README.md", "LICENSE", ".DS_Store"] {
+            let case = TempCase::new(file_name);
+            let root = case.materialized.join("pack");
+            fs::create_dir_all(root.join("member")).expect("create member");
+            fs::write(root.join("member/SKILL.md"), b"skill").expect("write member skill");
+            fs::write(root.join(file_name), b"root file").expect("write root file");
+            let error = validate_skill_pack_root(root)
+                .expect_err("root regular file should fail")
+                .to_string();
+            assert!(error.contains("only immediate child directories"));
+        }
+
+        let missing = TempCase::new("pack-member-missing-skill");
+        let missing_root = missing.materialized.join("pack");
+        fs::create_dir_all(missing_root.join("member/nested")).expect("create nested member");
+        fs::write(missing_root.join("member/nested/SKILL.md"), b"nested")
+            .expect("write nested skill");
+        let error = validate_skill_pack_root(missing_root)
+            .expect_err("member without direct SKILL.md should fail")
+            .to_string();
+        assert!(error.contains("member") && error.contains("direct SKILL.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_shape_rejects_non_utf8_root_and_member_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_vec(vec![b'n', 0xff]);
+        let root_error = exact_utf8_component(invalid.as_os_str(), "pack root")
+            .expect_err("non-UTF-8 root should fail")
+            .to_string();
+        let member_error = exact_utf8_component(invalid.as_os_str(), "pack member")
+            .expect_err("non-UTF-8 member should fail")
+            .to_string();
+
+        assert!(root_error.contains("pack root name must be valid UTF-8"));
+        assert!(member_error.contains("pack member name must be valid UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_archive_names_are_rejected_without_lossy_persistence() {
+        let invalid_root = TempCase::new("non-utf8-root-archive");
+        let invalid_root_archive = invalid_root.path.join("pack.tar.gz");
+        write_raw_archive(
+            invalid_root_archive.as_path(),
+            &[(b"\xff/member/SKILL.md", b"skill")],
+        );
+        let root_result = extract_archive_secure(
+            invalid_root_archive.as_path(),
+            invalid_root.materialized.as_path(),
+            1024,
+            8,
+            1024,
+        );
+        if let Ok(invalid_root_source) = root_result {
+            let root_error = validate_skill_pack_root(invalid_root_source)
+                .expect_err("pack endpoint should reject a non-UTF-8 root")
+                .to_string();
+            assert!(root_error.contains("pack root name must be valid UTF-8"));
+        }
+        assert!(!invalid_root.materialized.join("\u{fffd}").exists());
+
+        let invalid_member = TempCase::new("non-utf8-member-archive");
+        let invalid_member_archive = invalid_member.path.join("pack.tar.gz");
+        write_raw_archive(
+            invalid_member_archive.as_path(),
+            &[(b"pack/\xff/SKILL.md", b"skill")],
+        );
+        let member_result = extract_archive_secure(
+            invalid_member_archive.as_path(),
+            invalid_member.materialized.as_path(),
+            1024,
+            8,
+            1024,
+        );
+        if let Ok(invalid_member_source) = member_result {
+            let member_error = validate_skill_pack_root(invalid_member_source)
+                .expect_err("pack endpoint should reject a non-UTF-8 member")
+                .to_string();
+            assert!(member_error.contains("pack member name must be valid UTF-8"));
+        }
+        assert!(!invalid_member.materialized.join("pack/\u{fffd}").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_does_not_collapse_distinct_roots_through_lossy_text() {
+        let case = TempCase::new("lossy-root-collision");
+        let archive = case.path.join("pack.tar.gz");
+        write_raw_archive(
+            archive.as_path(),
+            &[
+                (b"\xef\xbf\xbd/SKILL.md", b"skill"),
+                (b"\xff/ignored.txt", b"ignored"),
+            ],
+        );
+
+        let error = extract_archive_secure(
+            archive.as_path(),
+            case.materialized.as_path(),
+            1024,
+            8,
+            1024,
+        )
+        .expect_err("byte-distinct top-level roots must remain distinct")
+        .to_string();
+
+        assert!(error.contains("multiple top-level roots"));
     }
 
     fn upload_frame(header: &SkillsUploadChunkHeader, chunk: &[u8]) -> Vec<u8> {
@@ -1733,6 +2262,34 @@ mod tests {
             .expect("finish gzip");
     }
 
+    #[cfg(unix)]
+    fn write_raw_archive(path: &std::path::Path, entries: &[(&[u8], &[u8])]) {
+        let file = fs::File::create(path).expect("create archive");
+        let encoder = GzBuilder::new()
+            .mtime(0)
+            .write(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        for (entry_path, contents) in entries {
+            let mut header = Header::new_gnu();
+            set_test_header_path_bytes(&mut header, entry_path);
+            header.set_entry_type(EntryType::Regular);
+            header.set_size(u64::try_from(contents.len()).expect("content len"));
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append(&header, Cursor::new(*contents))
+                .expect("append raw-path file");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip");
+    }
+
     fn append_test_entry<W: io::Write>(builder: &mut Builder<W>, entry: &TestEntry) {
         let mut header = Header::new_gnu();
         set_test_header_path(&mut header, entry.path);
@@ -1800,5 +2357,13 @@ mod tests {
         let bytes = header.as_mut_bytes();
         bytes[0..100].fill(0);
         bytes[0..raw.len()].copy_from_slice(raw);
+    }
+
+    #[cfg(unix)]
+    fn set_test_header_path_bytes(header: &mut Header, path: &[u8]) {
+        assert!(path.len() <= 100, "test path must fit tar name field");
+        let bytes = header.as_mut_bytes();
+        bytes[0..100].fill(0);
+        bytes[0..path.len()].copy_from_slice(path);
     }
 }

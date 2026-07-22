@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillLifecycleRemovedSkill",
+  "type": "object",
+  "properties": {
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "removed_install_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
+    },
+    "slug": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "skill_id",
+    "slug",
+    "source_kind"
+  ],
+  "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

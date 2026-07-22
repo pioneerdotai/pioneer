@@ -30,6 +30,7 @@ mod m20260715_000002_turn_mcp_projection;
 mod m20260716_000001_turn_cli_runtime_instruction;
 mod m20260720_000001_cli_runtime_execution_segment;
 mod m20260720_000002_stable_skill_id;
+mod m20260721_000001_skill_pack_installation;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -61,6 +62,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260716_000001_turn_cli_runtime_instruction::Migration),
             Box::new(m20260720_000001_cli_runtime_execution_segment::Migration),
             Box::new(m20260720_000002_stable_skill_id::Migration),
+            Box::new(m20260721_000001_skill_pack_installation::Migration),
         ]
     }
 }

@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsPackInstallResponse",
+  "type": "object",
+  "properties": {
+    "audit": {
+      "$ref": "#/$defs/SkillLifecycleAuditSummary"
+    },
+    "pack": {
+      "$ref": "#/$defs/SkillPackInstallationItem"
+    },
+    "skills": {
+      "description": "Ordered by pack member key, then SkillId.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillLifecycleResultSkill"
+      }
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "pack",
+    "skills",
+    "audit"
+  ],
+  "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillLifecycleAuditSummary": {
+      "type": "object",
+      "properties": {
+        "events_written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "events_written"
+      ]
+    },
+    "SkillLifecycleResultSkill": {
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "install_path": {
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "fingerprint",
+        "trust_level",
+        "install_path"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackInstallationItem": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "source_kind",
+        "created_at",
+        "updated_at"
+      ]
+    }
+  }
+}

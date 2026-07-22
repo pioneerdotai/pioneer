@@ -1426,12 +1426,15 @@ fn migrate_capability_snapshot(
                     slug.as_str(),
                     source_kind.as_str(),
                 );
-                pioneer_protocol::TurnCapabilityKind::Skill { skill_id }
+                pioneer_protocol::TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: None,
+                }
             } else {
                 serde_json::from_value(capability.kind)?
             };
             let id = match &kind {
-                pioneer_protocol::TurnCapabilityKind::Skill { skill_id } => {
+                pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
                     pioneer_protocol::skill_capability_key(skill_id)
                 }
                 _ => capability.id,
@@ -1673,6 +1676,7 @@ fn migrate_turn_item_value(
                     owner,
                     slug,
                     source_kind: legacy.source_kind,
+                    pack: None,
                 };
                 let object = attachment
                     .as_object_mut()
@@ -1778,8 +1782,11 @@ mod tests {
     }
 
     async fn apply_pre_stable_migrations(db: &DatabaseConnection) {
-        let migration_count = Migrator::migrations().len();
-        Migrator::up(db, Some((migration_count - 1) as u32))
+        let migration_count = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20260720_000002_stable_skill_id")
+            .expect("Stable SkillId migration should be registered");
+        Migrator::up(db, Some(migration_count as u32))
             .await
             .expect("pre-Stable-SkillId migrations should apply");
     }
@@ -2426,6 +2433,8 @@ mod tests {
             trust_level: "community".to_owned(),
             fingerprint: "foreground-fingerprint".to_owned(),
             updated_at_unix: 0,
+            pack_id: None,
+            pack_member_key: None,
         };
         tokio::time::timeout(
             Duration::from_secs(5),

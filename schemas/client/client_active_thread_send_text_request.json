@@ -59,6 +59,20 @@
       ],
       "default": null
     },
+    "skill_picker": {
+      "$ref": "#/$defs/ComposerSkillPickerProjection",
+      "default": {
+        "packs": [],
+        "standalone": []
+      }
+    },
+    "skill_selections": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ComposerSkillSelection"
+      }
+    },
     "text": {
       "type": "string"
     },
@@ -431,6 +445,73 @@
         }
       ]
     },
+    "ComposerSkillPickerProjection": {
+      "type": "object",
+      "properties": {
+        "packs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SelectableSkillPackCapability"
+          }
+        },
+        "standalone": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SelectableSkillCapability"
+          }
+        }
+      },
+      "required": [
+        "standalone",
+        "packs"
+      ]
+    },
+    "ComposerSkillSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "pack_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        }
+      ]
+    },
     "McpScopeKind": {
       "type": "string",
       "enum": [
@@ -438,7 +519,147 @@
         "user"
       ]
     },
+    "SelectablePackedSkillCapability": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "skill": {
+          "$ref": "#/$defs/SelectableSkillCapability"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key",
+        "skill"
+      ]
+    },
+    "SelectableSkillCapability": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillCapabilityUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "skill_id",
+        "label",
+        "display_name",
+        "description",
+        "slug",
+        "source_kind",
+        "selectable"
+      ]
+    },
+    "SelectableSkillPackCapability": {
+      "type": "object",
+      "properties": {
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SelectablePackedSkillCapability"
+          }
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "selectable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "pack_id",
+        "label",
+        "children",
+        "selectable"
+      ]
+    },
+    "SkillCapabilityUnavailableReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "DisabledByPolicy"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Inactive": {
+              "type": "object",
+              "properties": {
+                "status_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Inactive"
+          ]
+        }
+      ]
+    },
     "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
       "type": "string",
       "maxLength": 21,
       "minLength": 21,

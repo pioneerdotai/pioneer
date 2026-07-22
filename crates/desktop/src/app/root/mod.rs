@@ -43,13 +43,14 @@ pub(super) use pioneer_client::{
     composer::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},
         draft::ComposerDraftLifecycleState,
+        skill_selection::ComposerSkillSelection,
         turn_prepare::PrepareVoiceComposerSnapshotRequest,
     },
     gateway::runtime::GatewaySetupAction,
     providers::list::ProviderListState,
     providers::presentation::ProviderModelDisplayKey,
     providers::selectors::ProviderFilter,
-    skills::upload::SkillUploadProgress,
+    skills::{catalog::SkillManagementProjection, upload::SkillUploadProgress},
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     tasks::review::TaskReviewActionState,
     threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
@@ -57,8 +58,8 @@ pub(super) use pioneer_client::{
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    SkillHealthItem, SkillId, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder,
-    ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
+    SkillHealthItem, SkillId, SkillListItem, SkillPackId, Thread, ThreadAgentsDocSummary,
+    ThreadFolder, ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -317,6 +318,7 @@ pub struct PioneerDesktop {
     pub(super) composer_state: Entity<InputState>,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
     pub(super) composer_capabilities: Vec<ComposerCapability>,
+    pub(super) composer_skill_selections: Vec<ComposerSkillSelection>,
     pub(super) composer_upload_in_progress: bool,
     pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
@@ -357,6 +359,9 @@ pub struct PioneerDesktop {
     pub(super) mcp_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
     pub(super) installed_skills: Vec<SkillListItem>,
     pub(super) skills_catalog: Vec<SkillListItem>,
+    pub(super) skills_management: SkillManagementProjection,
+    pub(super) skills_expanded_pack_ids: HashSet<SkillPackId>,
+    pub(super) skills_pending_pack_actions: HashSet<SkillPackId>,
     pub(super) skills_health_details: HashMap<SkillId, SkillHealthItem>,
     pub(super) skills_loading: bool,
     pub(super) skills_error: Option<String>,

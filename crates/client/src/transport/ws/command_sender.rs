@@ -39,7 +39,9 @@ use pioneer_protocol::{
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, SkillListParams, SkillListResponse, SkillsHealthParams,
-    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams,
+    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams,
+    SkillsPackInstallResponse, SkillsPackUninstallParams, SkillsPackUninstallResponse,
+    SkillsPackUpdateParams, SkillsPackUpdateResponse, SkillsPolicyListParams,
     SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
     SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
     SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadFinishParams,
@@ -1372,6 +1374,66 @@ where
     )
 }
 
+pub fn skills_pack_install<TTransport>(
+    transport: &TTransport,
+    params: SkillsPackInstallParams,
+) -> Result<SkillsPackInstallResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::SKILLS_PACK_INSTALL,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::SKILLS_PACK_INSTALL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn skills_pack_update<TTransport>(
+    transport: &TTransport,
+    params: SkillsPackUpdateParams,
+) -> Result<SkillsPackUpdateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::SKILLS_PACK_UPDATE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::SKILLS_PACK_UPDATE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn skills_pack_uninstall<TTransport>(
+    transport: &TTransport,
+    params: SkillsPackUninstallParams,
+) -> Result<SkillsPackUninstallResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::SKILLS_PACK_UNINSTALL,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::SKILLS_PACK_UNINSTALL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn skills_upload_start<TTransport>(
     transport: &TTransport,
     params: SkillsUploadStartParams,
@@ -2247,8 +2309,8 @@ mod tests {
     use crate::rpc::{JsonRpcResponseSender, WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE};
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
-        SkillHealthTarget, SkillId, SkillLifecycleSource, TaskCancelScope, TurnCapability,
-        VoiceAudioEncoding, VoiceSessionStartContext, VoiceTurnContext, Workspace,
+        SkillHealthTarget, SkillId, SkillLifecycleSource, SkillPackId, TaskCancelScope,
+        TurnCapability, VoiceAudioEncoding, VoiceSessionStartContext, VoiceTurnContext, Workspace,
     };
     use serde_json::json;
 
@@ -2333,6 +2395,66 @@ mod tests {
         }
     }
 
+    struct ExactSkillPackTransport;
+
+    impl JsonRpcRequestTransport for ExactSkillPackTransport {
+        fn send_json_rpc_request(
+            &self,
+            _request_id: String,
+            payload: String,
+            response_tx: JsonRpcResponseSender,
+        ) -> std::result::Result<(), String> {
+            let request: JsonRpcRequest =
+                serde_json::from_str(payload.as_str()).expect("request payload");
+            let params = request.params.expect("pack lifecycle params");
+            assert_eq!(params["workspace_id"], json!("workspace"));
+            let pack = json!({
+                "id": "PPPPPPPPPPPPPPPPPPPPP",
+                "name": "Research",
+                "source_kind": "user",
+                "created_at": 1,
+                "updated_at": 2
+            });
+            let result = match request.method.as_str() {
+                methods::SKILLS_PACK_INSTALL => {
+                    assert_eq!(params["source"]["type"], json!("uploaded_archive"));
+                    assert_eq!(params["source"]["upload_id"], json!("upload-install"));
+                    assert_eq!(params["target_source_kind"], json!("user"));
+                    json!({
+                        "status": "installed",
+                        "pack": pack,
+                        "skills": [],
+                        "audit": { "events_written": 0 }
+                    })
+                }
+                methods::SKILLS_PACK_UPDATE => {
+                    assert_eq!(params["pack_id"], json!("PPPPPPPPPPPPPPPPPPPPP"));
+                    assert_eq!(params["source"]["type"], json!("uploaded_archive"));
+                    assert_eq!(params["source"]["upload_id"], json!("upload-update"));
+                    json!({
+                        "status": "updated",
+                        "pack": pack,
+                        "skills": [],
+                        "audit": { "events_written": 0 }
+                    })
+                }
+                methods::SKILLS_PACK_UNINSTALL => {
+                    assert_eq!(params["pack_id"], json!("PPPPPPPPPPPPPPPPPPPPP"));
+                    json!({
+                        "status": "uninstalled",
+                        "pack": pack,
+                        "removed_skills": [],
+                        "audit": { "events_written": 0 }
+                    })
+                }
+                method => panic!("unexpected method {method}"),
+            };
+
+            response_tx.send(Ok(result)).expect("response send");
+            Ok(())
+        }
+    }
+
     fn workspace_json() -> serde_json::Value {
         json!({
             "id": "ws_1",
@@ -2392,6 +2514,47 @@ mod tests {
                 updated_at: 2,
             }]
         );
+    }
+
+    #[test]
+    fn ws_command_sender_uses_exact_skill_pack_lifecycle_methods() {
+        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
+        let install = skills_pack_install(
+            &ExactSkillPackTransport,
+            SkillsPackInstallParams {
+                workspace_id: "workspace".to_owned(),
+                source: SkillLifecycleSource::UploadedArchive {
+                    upload_id: "upload-install".to_owned(),
+                },
+                target_source_kind: "user".to_owned(),
+            },
+        )
+        .expect("pack install");
+        assert_eq!(install.status, "installed");
+
+        let update = skills_pack_update(
+            &ExactSkillPackTransport,
+            SkillsPackUpdateParams {
+                workspace_id: "workspace".to_owned(),
+                pack_id: pack_id.clone(),
+                source: SkillLifecycleSource::UploadedArchive {
+                    upload_id: "upload-update".to_owned(),
+                },
+            },
+        )
+        .expect("pack update");
+        assert_eq!(update.pack.id, pack_id);
+
+        let uninstall = skills_pack_uninstall(
+            &ExactSkillPackTransport,
+            SkillsPackUninstallParams {
+                workspace_id: "workspace".to_owned(),
+                pack_id,
+            },
+        )
+        .expect("pack uninstall");
+        assert_eq!(uninstall.status, "uninstalled");
+        assert!(uninstall.removed_skills.is_empty());
     }
 
     #[test]
@@ -2663,7 +2826,10 @@ mod tests {
                 input: Vec::new(),
                 capabilities: vec![TurnCapability {
                     id: pioneer_protocol::skill_capability_key(&skill_id),
-                    kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
+                    kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                        skill_id,
+                        pack_id: None,
+                    },
                     label: Some("owner/slug".to_owned()),
                 }],
                 model: None,
@@ -2752,7 +2918,10 @@ mod tests {
         let mut context = voice_turn_context();
         context.capabilities = vec![TurnCapability {
             id: pioneer_protocol::skill_capability_key(&skill_id),
-            kind: pioneer_protocol::TurnCapabilityKind::Skill { skill_id },
+            kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                skill_id,
+                pack_id: None,
+            },
             label: Some("owner/slug".to_owned()),
         }];
         let error = voice_session_finalize(

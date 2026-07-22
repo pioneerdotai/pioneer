@@ -1067,13 +1067,21 @@ installed_count = "Trouvées :"
 title = "Aucune compétence installée"
 description = "Installez de nouvelles compétences et étendez les capacités des agents."
 
+[skills.dialog]
+uninstall_pack_title = "Désinstaller %{name} ?"
+uninstall_pack_description = "Supprime ce pack de compétences et toutes les compétences actuellement installées qu'il contient de l'espace de travail."
+
 [skills.error]
 gateway_not_connected = "La passerelle n'est pas connectée."
 workspace_not_selected = "Aucun espace de travail actif sélectionné."
 load_failed = "Impossible de charger les compétences installées"
 path_required = "Le chemin est requis."
 invalid_skill_target = "Cible de compétence invalide."
+invalid_pack_target = "Cible de pack de compétences invalide."
 install_failed = "Impossible d'installer la compétence"
+install_pack_failed = "Impossible d'installer le pack de compétences"
+update_pack_failed = "Impossible de mettre à jour le pack de compétences"
+uninstall_pack_failed = "Impossible de désinstaller le pack de compétences"
 update_failed = "Impossible de mettre à jour la compétence"
 uninstall_failed = "Impossible de désinstaller la compétence"
 policy_failed = "Impossible de mettre à jour la politique de compétence"
@@ -1082,6 +1090,9 @@ path_picker_failed = "Impossible d'ouvrir le sélecteur de source"
 [skills.card]
 version = "Version"
 fingerprint = "Empreinte"
+skill_count_one = "%{count} compétence"
+skill_count_few = "%{count} compétences"
+skill_count_many = "%{count} compétences"
 
 [skills.status]
 active = "Active"
@@ -1109,7 +1120,9 @@ implicit = "Implicite"
 [skills.upload]
 preparing = "Préparation de l'envoi de la compétence"
 installing = "Envoi de la compétence"
+installing_pack = "Envoi du pack de compétences"
 updating = "Envoi de la mise à jour"
+updating_pack = "Envoi de la mise à jour du pack de compétences"
 cancelling = "Annulation de l'envoi"
 
 [skills.diagnostics]

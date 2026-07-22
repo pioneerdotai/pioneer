@@ -8,6 +8,7 @@ use pioneer_client::{
         attachments::ComposerAttachment,
         capabilities::{ComposerCapability, plan_composer_submission},
         model_selection as composer_model_selection,
+        skill_selection::{ComposerSkillPickerProjection, ComposerSkillSelection},
         turn_prepare::{
             ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
             PrepareVoiceComposerSnapshotRequest, PreparedComposerTurnSubmitContext,
@@ -144,6 +145,10 @@ pub struct ClientActiveThreadSendTextRequest {
     #[serde(default)]
     pub capabilities: Vec<ComposerCapability>,
     #[serde(default)]
+    pub skill_selections: Vec<ComposerSkillSelection>,
+    #[serde(default)]
+    pub skill_picker: ComposerSkillPickerProjection,
+    #[serde(default)]
     pub expanded_keys: Vec<String>,
 }
 
@@ -180,6 +185,10 @@ pub struct ClientPrepareVoiceComposerSnapshotRequest {
     pub attachments: Vec<ComposerAttachment>,
     #[serde(default)]
     pub capabilities: Vec<ComposerCapability>,
+    #[serde(default)]
+    pub skill_selections: Vec<ComposerSkillSelection>,
+    #[serde(default)]
+    pub skill_picker: ComposerSkillPickerProjection,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -510,6 +519,8 @@ impl ClientFfiActiveThreadState {
             permission_mode,
             attachments,
             capabilities,
+            skill_selections,
+            skill_picker,
             expanded_keys,
         } = request;
 
@@ -541,7 +552,7 @@ impl ClientFfiActiveThreadState {
                 selected_mode,
                 text.as_str(),
                 !attachments.is_empty(),
-                !capabilities.is_empty(),
+                !capabilities.is_empty() || !skill_selections.is_empty(),
             )?
         };
         let execution_target = resolve_selected_execution_target(
@@ -556,7 +567,7 @@ impl ClientFfiActiveThreadState {
             !attachments.is_empty(),
             capabilities.as_slice(),
         );
-        if !submission.has_composer_payload {
+        if !submission.has_composer_payload && skill_selections.is_empty() {
             return Err(anyhow::anyhow!(
                 "message content is required before starting turn"
             ));
@@ -573,6 +584,8 @@ impl ClientFfiActiveThreadState {
                 text,
                 attachments,
                 capabilities,
+                skill_selections,
+                skill_picker,
             },
         )?;
         let turn_model_provider = if cli_runtime_selected {
@@ -679,6 +692,8 @@ impl ClientFfiActiveThreadState {
             permission_mode,
             attachments,
             capabilities,
+            skill_selections,
+            skill_picker,
         } = request;
 
         let thread_id = thread_session::require_thread_id(thread_id, "starting voice")
@@ -744,6 +759,8 @@ impl ClientFfiActiveThreadState {
                 endpoint_kind,
                 attachments,
                 capabilities,
+                skill_selections,
+                skill_picker,
                 selected_model: Some(selection.selected_model),
                 selected_provider: Some(selection.selected_provider),
                 turn_model_provider,
@@ -2081,6 +2098,45 @@ mod tests {
         .expect("request decodes");
 
         assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
+    }
+
+    #[test]
+    fn text_and_voice_requests_round_trip_pack_skill_selections() {
+        let selection = json!({
+            "kind": "skill_pack",
+            "pack_id": "PPPPPPPPPPPPPPPPPPPPP"
+        });
+        let picker = json!({
+            "standalone": [],
+            "packs": [{
+                "key": "skill_pack:PPPPPPPPPPPPPPPPPPPPP",
+                "pack_id": "PPPPPPPPPPPPPPPPPPPPP",
+                "label": "writer-pack",
+                "children": [],
+                "selectable": false
+            }]
+        });
+
+        let text: ClientActiveThreadSendTextRequest = serde_json::from_value(json!({
+            "text": "hello",
+            "permission_mode": "supervised",
+            "skill_selections": [selection.clone()],
+            "skill_picker": picker.clone()
+        }))
+        .expect("text request");
+        let voice: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
+            "permission_mode": "supervised",
+            "skill_selections": [selection],
+            "skill_picker": picker
+        }))
+        .expect("voice request");
+
+        assert_eq!(text.skill_selections, voice.skill_selections);
+        assert_eq!(text.skill_picker, voice.skill_picker);
+        assert!(matches!(
+            text.skill_selections.as_slice(),
+            [ComposerSkillSelection::SkillPack { .. }]
+        ));
     }
 
     #[test]

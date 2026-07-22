@@ -416,7 +416,10 @@ fn skill_capability(slug: &str) -> TurnCapability {
     let skill_id = test_skill_id_for_path(std::path::Path::new(slug));
     TurnCapability {
         id: format!("skill:{skill_id}"),
-        kind: TurnCapabilityKind::Skill { skill_id },
+        kind: TurnCapabilityKind::Skill {
+            skill_id,
+            pack_id: None,
+        },
         label: Some(slug.to_owned()),
     }
 }

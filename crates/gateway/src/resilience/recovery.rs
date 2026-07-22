@@ -2942,8 +2942,8 @@ mod tests {
     use pioneer_crud::{
         ClaimedRecoveryActivation, CrudStore, NewCliRuntimeTurnBinding,
         NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot,
-        RecoveryJobRecord, SkillInstallationRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
-        TurnExecutionWindowStatsRecord,
+        RecoveryJobRecord, SkillInstallationRecord, SkillPackInstallationRecord, TimeoutCandidate,
+        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
     };
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
@@ -3346,6 +3346,7 @@ mod tests {
             id: format!("skill:{writer_skill_id}"),
             kind: TurnCapabilityKind::Skill {
                 skill_id: writer_skill_id,
+                pack_id: None,
             },
             label: Some("Writer".to_owned()),
         }];
@@ -3453,9 +3454,19 @@ mod tests {
         .expect("recovery skill package should exist");
         let writer_skill_id =
             pioneer_protocol::SkillId::new("WWWWWWWWWWWWWWWWWWWWW").expect("valid writer SkillId");
+        let pack_id =
+            pioneer_protocol::SkillPackId::new("PPPPPPPPPPPPPPPPPPPPP").expect("valid pack id");
         crud_store
-            .insert_skill_installation(
-                &SkillInstallationRecord {
+            .insert_skill_pack_installation_with_children(
+                &SkillPackInstallationRecord {
+                    pack_id: pack_id.clone(),
+                    name: "Recovery Pack".to_owned(),
+                    scope_key: workspace_id.to_owned(),
+                    source_kind: "user".to_owned(),
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+                &[SkillInstallationRecord {
                     skill_id: writer_skill_id.clone(),
                     owner: Some("tests".to_owned()),
                     slug: "writer".to_owned(),
@@ -3467,12 +3478,71 @@ mod tests {
                     trust_level: "verified".to_owned(),
                     fingerprint: "recovery-writer-fingerprint".to_owned(),
                     updated_at_unix: 1,
-                },
-                1,
+                    pack_id: Some(pack_id.clone()),
+                    pack_member_key: Some("writer".to_owned()),
+                }],
             )
             .await
             .expect("recovery skill installation should persist");
         persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        let stored_snapshot = crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .expect("runtime snapshot should query")
+            .expect("runtime snapshot should exist");
+        assert!(!stored_snapshot.capabilities_json.contains("packId"));
+        assert!(!stored_snapshot.capabilities_json.contains("skillPack"));
+
+        assert!(
+            crud_store
+                .update_skill_pack_installation_name(
+                    workspace_id,
+                    &pack_id,
+                    "Renamed Recovery Pack",
+                    2,
+                )
+                .await
+                .expect("pack rename should succeed")
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Writer\nslug: writer\ndescription: Updated recovery writer skill\n---\nWrite with current content.",
+        )
+        .expect("updated recovery skill package should exist");
+        assert!(
+            crud_store
+                .delete_skill_pack_installation_with_children(workspace_id, &pack_id)
+                .await
+                .expect("pack removal should succeed")
+        );
+        crud_store
+            .insert_skill_installation(
+                &SkillInstallationRecord {
+                    skill_id: writer_skill_id.clone(),
+                    owner: Some("tests".to_owned()),
+                    slug: "writer".to_owned(),
+                    version: None,
+                    source_kind: "user".to_owned(),
+                    scope_key: workspace_id.to_owned(),
+                    source_ref: "test:recovery:writer-current".to_owned(),
+                    install_path: skill_dir.display().to_string(),
+                    trust_level: "verified".to_owned(),
+                    fingerprint: "recovery-writer-current-fingerprint".to_owned(),
+                    updated_at_unix: 3,
+                    pack_id: None,
+                    pack_member_key: None,
+                },
+                3,
+            )
+            .await
+            .expect("retained SkillId should remain available independently of deleted parent");
+        assert!(
+            crud_store
+                .find_skill_pack_installation(workspace_id, &pack_id)
+                .await
+                .expect("deleted parent lookup")
+                .is_none()
+        );
 
         let restored = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_000)
@@ -3498,17 +3568,24 @@ mod tests {
         );
         assert!(matches!(
             &restored.capabilities[0].kind,
-            TurnCapabilityKind::Skill { skill_id } if skill_id == &restored_skill_id
+            TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &restored_skill_id
         ));
         assert_eq!(
             restored.capabilities[0].id,
             format!("skill:{restored_skill_id}")
         );
-        assert!(restored.skill_catalog.skills.iter().any(|skill| {
-            skill.identity.skill_id == restored_skill_id
-                && skill.identity.owner.as_deref() == Some("tests")
-                && skill.identity.slug == "writer"
-        }));
+        let restored_skill = restored
+            .skill_catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.skill_id == restored_skill_id)
+            .expect("frozen SkillId should resolve without its former parent");
+        assert_eq!(restored_skill.identity.owner.as_deref(), Some("tests"));
+        assert_eq!(restored_skill.identity.slug, "writer");
+        assert_eq!(
+            restored_skill.instructions.body.trim(),
+            "Write with current content."
+        );
         assert_eq!(restored.resolved_artifacts.len(), 1);
         assert_eq!(
             restored
@@ -3526,6 +3603,30 @@ mod tests {
         assert_eq!(
             security_snapshot.sandbox.mode,
             TurnSandboxMode::WorkspaceWrite
+        );
+        assert!(
+            crud_store
+                .delete_skill_installation(&restored_skill_id)
+                .await
+                .expect("selected skill removal should succeed")
+        );
+        let restored_missing = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_001)
+            .await
+            .expect("missing-skill recovery request should load")
+            .into_available()
+            .expect("runtime snapshot remains the authoritative identity set");
+        assert!(matches!(
+            &restored_missing.capabilities[0].kind,
+            TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &restored_skill_id
+        ));
+        assert!(
+            restored_missing
+                .skill_catalog
+                .skills
+                .iter()
+                .all(|skill| skill.identity.skill_id != restored_skill_id),
+            "removed frozen child must remain missing instead of being replaced"
         );
         let _ = std::fs::remove_dir_all(skill_dir);
     }

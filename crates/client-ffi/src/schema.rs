@@ -192,6 +192,18 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::ClientComposerSkillToggleResult
         ),
         schema_doc!(
+            "client_composer_skill_pack_picker_request.json",
+            crate::skills::ClientComposerSkillPackPickerRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_selection_toggle_request.json",
+            crate::skills::ClientComposerSkillSelectionToggleRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_chips_request.json",
+            crate::skills::ClientComposerSkillChipsRequest
+        ),
+        schema_doc!(
             "client_gateway_connect_request.json",
             crate::contracts::ClientGatewayConnectRequest
         ),
@@ -550,4 +562,26 @@ pub fn write_client_ffi_schemas(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_pack_ffi_contracts_are_registered_and_serializable() {
+        let documents = client_ffi_schema_documents();
+
+        for expected in [
+            "client_composer_skill_chips_request.json",
+            "client_composer_skill_pack_picker_request.json",
+            "client_composer_skill_selection_toggle_request.json",
+        ] {
+            let document = documents
+                .iter()
+                .find(|document| document.file_name == expected)
+                .unwrap_or_else(|| panic!("missing skill pack FFI contract {expected}"));
+            serde_json::to_string(&document.schema).expect("schema serializes");
+        }
+    }
 }

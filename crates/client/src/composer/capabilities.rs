@@ -595,6 +595,7 @@ impl ComposerCapability {
             kind: match &self.kind {
                 ComposerCapabilityKind::Skill { skill_id, .. } => TurnCapabilityKind::Skill {
                     skill_id: skill_id.clone(),
+                    pack_id: None,
                 },
                 ComposerCapabilityKind::McpServer { name, scope_kind } => {
                     TurnCapabilityKind::McpServer {
@@ -630,6 +631,7 @@ impl ComposerCapability {
                     owner: owner.clone(),
                     slug: slug.clone(),
                     source_kind: source_kind.clone(),
+                    pack: None,
                 },
             },
             ComposerCapabilityKind::McpServer { name, scope_kind } => {
@@ -1456,6 +1458,7 @@ mod tests {
     fn skill_item(slug: &str) -> SkillListItem {
         SkillListItem {
             skill_id: skill_id(slug),
+            pack: None,
             owner: None,
             slug: slug.to_owned(),
             source_kind: "user".to_owned(),
@@ -1951,6 +1954,7 @@ mod tests {
             turn_capability.kind,
             TurnCapabilityKind::Skill {
                 skill_id: expected_skill_id,
+                pack_id: None,
             }
         );
     }
@@ -2209,6 +2213,7 @@ mod tests {
                 snapshot_version: 1,
                 generated_at: 1,
                 skills: vec![uninstalled, tasks, browser, installed],
+                packs: Vec::new(),
             },
             "",
         );
