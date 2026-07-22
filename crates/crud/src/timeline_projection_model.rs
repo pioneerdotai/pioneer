@@ -80,11 +80,15 @@ pub fn approval_block_id(turn_id: &str, request_id: &str) -> String {
     format!("turn:{turn_id}:approval:{request_id}")
 }
 
+pub fn terminal_state_block_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:terminal-state")
+}
+
 pub(crate) fn turn_work_presentation(turn: &turn::Model, has_final: bool) -> &'static str {
     if has_final {
         "collapsed_after_final"
     } else if turn_is_terminal(turn) {
-        "expanded_terminal_no_final"
+        "collapsed_after_final"
     } else {
         "expanded_live"
     }
@@ -128,6 +132,15 @@ pub(crate) fn turn_is_terminal(turn: &turn::Model) -> bool {
         turn.status.as_str(),
         "completed" | "failed" | "interrupted" | "blocked"
     )
+}
+
+pub(crate) fn terminal_turn_state(turn: &turn::Model) -> Option<&'static str> {
+    match turn.status.as_str() {
+        "failed" => Some("failed"),
+        "interrupted" => Some("interrupted"),
+        "blocked" => Some("blocked"),
+        _ => None,
+    }
 }
 
 pub(crate) fn terminal_completed_at(turn: &turn::Model) -> Option<DateTimeWithTimeZone> {

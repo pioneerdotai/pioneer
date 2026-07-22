@@ -5,7 +5,8 @@ use pioneer_crud::{
     SEMANTIC_TIMELINE_PROJECTION_KEY, SEMANTIC_TIMELINE_PROJECTION_VERSION,
     ThreadTimelineBlockRecord, TurnItemProjectionClassification, TurnWorkItemProjectionRecord,
     TurnWorkProjectionRecord, WORK_ITEM_STATUS_RUNNING, WorkItemClassification, assistant_block_id,
-    classify_turn_item_row, user_block_id, work_block_id, work_item_projection_id,
+    classify_turn_item_row, terminal_state_block_id, user_block_id, work_block_id,
+    work_item_projection_id,
 };
 use pioneer_entity::{
     cli_runtime_pending_request, thread, turn, turn_event, turn_input, turn_item,
@@ -120,7 +121,7 @@ fn turn_work_presentation(turn: &turn::Model, has_final: bool) -> &'static str {
     if has_final {
         "collapsed_after_final"
     } else if turn_is_terminal(turn) {
-        "expanded_terminal_no_final"
+        "collapsed_after_final"
     } else {
         "expanded_live"
     }
@@ -164,6 +165,15 @@ fn turn_is_terminal(turn: &turn::Model) -> bool {
         turn.status.as_str(),
         "completed" | "failed" | "interrupted" | "blocked"
     )
+}
+
+fn terminal_turn_state(turn: &turn::Model) -> Option<&'static str> {
+    match turn.status.as_str() {
+        "failed" => Some("failed"),
+        "interrupted" => Some("interrupted"),
+        "blocked" => Some("blocked"),
+        _ => None,
+    }
 }
 
 fn terminal_completed_at(turn: &turn::Model) -> Option<DateTimeWithTimeZone> {
@@ -740,6 +750,36 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
         )
         .await?;
         stats.timeline_blocks_upserted = stats.timeline_blocks_upserted.saturating_add(1);
+    }
+
+    let terminal_block_id = terminal_state_block_id(turn_model.id.as_str());
+    if let Some(state) = terminal_turn_state(turn_model) {
+        timeline_repository::upsert_thread_timeline_block(
+            db,
+            ThreadTimelineBlockRecord {
+                block_id: terminal_block_id,
+                workspace_id: thread_model.workspace_id.clone(),
+                thread_id: thread_model.id.clone(),
+                turn_id: Some(turn_model.id.clone()),
+                block_kind: timeline_repository::BLOCK_KIND_SYSTEM.to_owned(),
+                sort_key: turn_block_sort_key(turn_model, 300, "terminal-state"),
+                source_kind: Some("turn_terminal_state".to_owned()),
+                source_key: Some(turn_model.id.clone()),
+                started_at: Some(turn_model.updated_at),
+                completed_at: Some(turn_model.updated_at),
+                metadata_json: json!({
+                    "state": state,
+                    "message": turn_model.error,
+                })
+                .to_string(),
+                created_at: turn_model.updated_at,
+                updated_at: turn_model.updated_at,
+            },
+        )
+        .await?;
+        stats.timeline_blocks_upserted = stats.timeline_blocks_upserted.saturating_add(1);
+    } else {
+        timeline_repository::delete_thread_timeline_block(db, terminal_block_id.as_str()).await?;
     }
 
     Ok(stats)

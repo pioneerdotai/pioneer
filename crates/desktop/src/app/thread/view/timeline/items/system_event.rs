@@ -24,6 +24,9 @@ fn system_event_icon(level: &SystemEventLevel) -> IconName {
 fn system_event_message_text(message: &SystemEventMessage) -> String {
     match message {
         SystemEventMessage::Raw(message) => message.clone(),
+        SystemEventMessage::TurnCancelled => t!("timeline.system.turn_cancelled").to_string(),
+        SystemEventMessage::TurnFailed => t!("timeline.system.turn_failed").to_string(),
+        SystemEventMessage::TurnBlocked => t!("timeline.system.turn_blocked").to_string(),
         SystemEventMessage::Timeout { recovery_started } => {
             if *recovery_started {
                 t!("timeline.system.timeout_with_recovery").to_string()

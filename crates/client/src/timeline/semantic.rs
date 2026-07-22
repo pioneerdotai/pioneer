@@ -528,10 +528,7 @@ pub fn turn_work_range_from_page(page: TurnWorkPageResponse) -> TurnWorkRangeCac
 }
 
 pub fn protocol_default_work_expanded(work: &TurnWorkBlock) -> bool {
-    matches!(
-        work.presentation,
-        TurnWorkPresentation::ExpandedLive | TurnWorkPresentation::ExpandedTerminalNoFinal
-    )
+    work.presentation == TurnWorkPresentation::ExpandedLive
 }
 
 pub fn resolve_work_expanded(work: &TurnWorkBlock, expansion: &TimelineExpansionState) -> bool {
@@ -970,14 +967,16 @@ pub fn apply_conversation_event_to_semantic_timeline(
             now_unix_ms,
         ),
         ConversationEvent::LocalTurnStartRejected {
-            thread_id, turn_id, ..
-        } => apply_turn_state_to_semantic_timeline(
+            thread_id,
+            turn_id,
+            error,
+            ..
+        } => apply_local_turn_start_rejected_to_semantic_timeline(
             state,
             workspace_id,
             thread_id,
             turn_id,
-            TurnWorkState::Failed,
-            Some(now_unix_ms),
+            error,
             now_unix_ms,
         ),
         ConversationEvent::TurnCompleted { thread_id, turn } => {
@@ -1131,7 +1130,7 @@ fn apply_turn_state_to_semantic_timeline(
     let presentation = if turn_has_assistant_block(thread, turn_id) {
         TurnWorkPresentation::CollapsedAfterFinal
     } else if completed_at_unix_ms.is_some() {
-        TurnWorkPresentation::ExpandedTerminalNoFinal
+        TurnWorkPresentation::CollapsedAfterFinal
     } else {
         TurnWorkPresentation::ExpandedLive
     };
@@ -1145,6 +1144,28 @@ fn apply_turn_state_to_semantic_timeline(
         completed_at_unix_ms,
         now_unix_ms,
     );
+    if completed_at_unix_ms.is_some()
+        && matches!(
+            work_state,
+            TurnWorkState::Failed | TurnWorkState::Interrupted | TurnWorkState::Blocked
+        )
+    {
+        upsert_terminal_state_block(
+            thread,
+            workspace_id,
+            thread_id,
+            turn_id,
+            work_state,
+            None,
+            now_unix_ms,
+        );
+    } else {
+        thread
+            .top_level
+            .blocks_by_id
+            .remove(terminal_state_block_id(turn_id).as_str());
+        sort_top_level_blocks(&mut thread.top_level);
+    }
     before != *thread
 }
 
@@ -1157,7 +1178,7 @@ fn apply_terminal_turn_to_semantic_timeline(
     now_unix_ms: i64,
 ) -> bool {
     let work_state = turn_status_to_work_state(turn.status).unwrap_or(fallback_state);
-    apply_turn_state_to_semantic_timeline(
+    let changed = apply_turn_state_to_semantic_timeline(
         state,
         workspace_id,
         thread_id,
@@ -1165,7 +1186,57 @@ fn apply_terminal_turn_to_semantic_timeline(
         work_state,
         Some(now_unix_ms),
         now_unix_ms,
-    )
+    );
+    if !matches!(
+        work_state,
+        TurnWorkState::Failed | TurnWorkState::Interrupted | TurnWorkState::Blocked
+    ) {
+        return changed;
+    }
+
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    upsert_terminal_state_block(
+        thread,
+        workspace_id,
+        thread_id,
+        turn.id.as_str(),
+        work_state,
+        turn.error.clone(),
+        now_unix_ms,
+    );
+    changed || before != *thread
+}
+
+fn apply_local_turn_start_rejected_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    error: &str,
+    now_unix_ms: i64,
+) -> bool {
+    let changed = apply_turn_state_to_semantic_timeline(
+        state,
+        workspace_id,
+        thread_id,
+        turn_id,
+        TurnWorkState::Failed,
+        Some(now_unix_ms),
+        now_unix_ms,
+    );
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    upsert_terminal_state_block(
+        thread,
+        workspace_id,
+        thread_id,
+        turn_id,
+        TurnWorkState::Failed,
+        Some(error.to_owned()),
+        now_unix_ms,
+    );
+    changed || before != *thread
 }
 
 fn apply_item_started_to_semantic_timeline(
@@ -1836,6 +1907,10 @@ fn assistant_block_id(turn_id: &str, item_id: &str) -> String {
     format!("turn:{turn_id}:assistant:{item_id}")
 }
 
+fn terminal_state_block_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:terminal-state")
+}
+
 fn work_item_projection_id(turn_id: &str, item_id: &str) -> String {
     format!("turn:{turn_id}:work:{item_id}")
 }
@@ -1972,6 +2047,36 @@ fn upsert_assistant_message_block(
             status,
             markdown: markdown.clone(),
         },
+    };
+    upsert_top_level_block(thread, block);
+}
+
+fn upsert_terminal_state_block(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    state: TurnWorkState,
+    message: Option<String>,
+    now_unix_ms: i64,
+) {
+    let block_id = terminal_state_block_id(turn_id);
+    let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let block = TimelineBlock {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        block_id,
+        turn_id: Some(turn_id.to_owned()),
+        sort_key: existing
+            .map(|block| block.sort_key.clone())
+            .unwrap_or_else(|| {
+                turn_block_sort_key(thread, turn_id, 300, "terminal-state", now_unix_ms)
+            }),
+        started_at_unix_ms: existing
+            .and_then(|block| block.started_at_unix_ms)
+            .or(Some(now_unix_ms)),
+        updated_at_unix_ms: Some(now_unix_ms),
+        kind: TimelineBlockKind::TurnState { state, message },
     };
     upsert_top_level_block(thread, block);
 }
@@ -3136,6 +3241,74 @@ mod tests {
                 .any(|hint| matches!(hint, SemanticTimelineRequestHint::TurnWorkInitial { turn_id, .. } if turn_id == "turn_a")),
             "expanded live work should request a bounded initial work page, not synthesize all items"
         );
+    }
+
+    #[test]
+    fn terminal_without_final_collapses_work_and_adds_outcome_block() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![
+                user_block("thread_a", "block_user", "001", "turn_a"),
+                turn_work_block("thread_a", "block_work", "002"),
+            ]),
+            TopLevelPageMergeMode::Reset
+        ));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnFailed {
+                thread_id: "thread_a".to_owned(),
+                turn: Turn {
+                    id: "turn_a".to_owned(),
+                    status: TurnStatus::Failed,
+                    turn_kind: pioneer_protocol::TurnKind::Conversation,
+                    origin: pioneer_protocol::TurnOrigin::User,
+                    error: Some("provider disconnected".to_owned()),
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::compile_turn_permission_profile(
+                        pioneer_protocol::TurnPermissionMode::FullAccess,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                },
+            },
+            10,
+        ));
+
+        let flattened =
+            flatten_semantic_timeline(&state, "thread_a").expect("flattened rows should exist");
+        let work_row = flattened
+            .rows
+            .iter()
+            .find(|row| matches!(row.kind, SemanticTimelineRowKind::WorkHeader { .. }))
+            .expect("terminal work header should remain visible");
+        assert!(matches!(
+            &work_row.kind,
+            SemanticTimelineRowKind::WorkHeader {
+                expanded: false,
+                work,
+                ..
+            } if work.presentation == TurnWorkPresentation::CollapsedAfterFinal
+                && work.state == TurnWorkState::Failed
+        ));
+        let terminal_row = flattened
+            .rows
+            .iter()
+            .find(|row| matches!(row.kind, SemanticTimelineRowKind::TurnState { .. }))
+            .expect("terminal outcome block should be visible");
+        assert!(matches!(
+            &terminal_row.kind,
+            SemanticTimelineRowKind::TurnState { block }
+                if matches!(
+                    &block.kind,
+                    TimelineBlockKind::TurnState {
+                        state: TurnWorkState::Failed,
+                        message: Some(message),
+                    } if message == "provider disconnected"
+                )
+        ));
+        assert!(flattened.request_hints.is_empty());
     }
 
     #[test]

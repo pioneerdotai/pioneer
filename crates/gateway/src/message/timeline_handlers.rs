@@ -878,10 +878,7 @@ impl MessageProcessor {
                 message: None,
             },
             BLOCK_KIND_APPROVAL => self.approval_timeline_block_kind(&row).await?,
-            BLOCK_KIND_SYSTEM => TimelineBlockKind::TurnState {
-                state: TurnWorkState::Running,
-                message: None,
-            },
+            BLOCK_KIND_SYSTEM => terminal_turn_state_timeline_block_kind(&row)?,
             other => {
                 return Err(anyhow!(
                     "unsupported thread timeline block kind `{other}` for block `{}`",
@@ -1259,6 +1256,30 @@ fn parse_turn_work_presentation(value: &str) -> TurnWorkPresentation {
     }
 }
 
+fn terminal_turn_state_timeline_block_kind(
+    row: &thread_timeline_block::Model,
+) -> Result<TimelineBlockKind> {
+    terminal_turn_state_timeline_block_kind_from_metadata(row.metadata_json.as_str())
+}
+
+fn terminal_turn_state_timeline_block_kind_from_metadata(
+    metadata_json: &str,
+) -> Result<TimelineBlockKind> {
+    let metadata = parse_optional_metadata(metadata_json)?;
+    let state = metadata
+        .as_ref()
+        .and_then(|value| value.get("state"))
+        .and_then(JsonValue::as_str)
+        .map(parse_turn_work_state)
+        .unwrap_or(TurnWorkState::Running);
+    let message = metadata
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    Ok(TimelineBlockKind::TurnState { state, message })
+}
+
 fn parse_turn_work_state(value: &str) -> TurnWorkState {
     match value {
         "starting" => TurnWorkState::Starting,
@@ -1401,5 +1422,24 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
         JsonValue::Null => Ok(None),
         JsonValue::Object(map) if map.is_empty() => Ok(None),
         _ => Ok(Some(parsed)),
+    }
+}
+
+#[cfg(test)]
+mod timeline_handler_unit_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_system_row_metadata_preserves_state_and_message() {
+        assert_eq!(
+            terminal_turn_state_timeline_block_kind_from_metadata(
+                r#"{"state":"interrupted","message":"stopped by user"}"#,
+            )
+            .unwrap(),
+            TimelineBlockKind::TurnState {
+                state: TurnWorkState::Interrupted,
+                message: Some("stopped by user".to_owned()),
+            }
+        );
     }
 }

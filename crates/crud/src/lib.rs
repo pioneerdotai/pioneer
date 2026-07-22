@@ -355,7 +355,7 @@ pub use crate::repositories::thread_timeline_projection::{
     SEMANTIC_TIMELINE_PROJECTION_KEY, SEMANTIC_TIMELINE_PROJECTION_VERSION,
     ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord, TurnWorkProjectionRecord,
     WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE, count_thread_timeline_blocks,
-    count_turn_work_items, delete_thread_timeline_blocks_for_thread,
+    count_turn_work_items, delete_thread_timeline_block, delete_thread_timeline_blocks_for_thread,
     delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
     delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
     find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
@@ -391,7 +391,8 @@ pub use crate::timeline_projection::{
     classify_turn_item_with_db_status,
 };
 pub use crate::timeline_projection_model::{
-    approval_block_id, assistant_block_id, user_block_id, work_block_id, work_item_projection_id,
+    approval_block_id, assistant_block_id, terminal_state_block_id, user_block_id, work_block_id,
+    work_item_projection_id,
 };
 use crate::turn_item_terminal::{
     TurnItemTerminalState, terminalize_turn_item_payload, tool_call_status,

@@ -12,8 +12,8 @@ use crate::{
     },
 };
 use pioneer_protocol::{
-    AgentMessagePhase, TimelineBlock, TimelineBlockKind, TurnItem, TurnItemType, TurnWorkBlock,
-    TurnWorkItem, TurnWorkItemStatus, TurnWorkPresentation, TurnWorkState,
+    AgentMessagePhase, SystemEventLevel, TimelineBlock, TimelineBlockKind, TurnItem, TurnItemType,
+    TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkPresentation, TurnWorkState,
 };
 use std::collections::HashMap;
 
@@ -195,7 +195,7 @@ fn push_work_header(
     work: &TurnWorkBlock,
     expanded: bool,
 ) {
-    if work.presentation != TurnWorkPresentation::CollapsedAfterFinal || work.work_count == 0 {
+    if work.presentation == TurnWorkPresentation::ExpandedLive || work.work_count == 0 {
         return;
     }
     let toggle_key = semantic_turn_work_toggle_key(work.turn_id.as_str());
@@ -241,32 +241,85 @@ fn push_work_item(
 }
 
 fn push_turn_state(
-    projection: &ConversationViewState,
+    projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
 ) {
     let TimelineBlockKind::TurnState { state, message } = &block.kind else {
         return;
     };
-    if !matches!(
-        state,
-        TurnWorkState::Starting | TurnWorkState::Running | TurnWorkState::Stalled
-    ) {
-        return;
-    }
     let Some(turn_id) = block.turn_id.as_deref() else {
         return;
     };
-    rows.push(TimelineRow {
-        key: format!("semantic-turn-state::{turn_id}::{}", block.block_id),
-        kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
-            projection,
-            turn_id,
-            block.started_at_unix_ms.or(block.updated_at_unix_ms),
-            Some(*state),
-            message.clone(),
+    if matches!(
+        state,
+        TurnWorkState::Starting | TurnWorkState::Running | TurnWorkState::Stalled
+    ) {
+        rows.push(TimelineRow {
+            key: format!("semantic-turn-state::{turn_id}::{}", block.block_id),
+            kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
+                projection,
+                turn_id,
+                block.started_at_unix_ms.or(block.updated_at_unix_ms),
+                Some(*state),
+                message.clone(),
+            )),
+        });
+        return;
+    }
+
+    let Some((level, code, fallback_message)) = terminal_turn_state_event(*state) else {
+        return;
+    };
+    let message = message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(fallback_message)
+        .to_owned();
+    let details = Some(serde_json::json!({ "error_message": message }));
+    let item_id = format!("{}:event", block.block_id);
+    let item = TurnItem::SystemEvent {
+        id: item_id.clone(),
+        level,
+        message: message.clone(),
+        code: Some(code.to_owned()),
+        details: details.clone(),
+    };
+    push_item_row(
+        projection,
+        rows,
+        ItemRowInput {
+            entry_id: block.block_id.clone(),
+            item_id,
+            turn_id: turn_id.to_owned(),
+            item_type: "system_event".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: block.started_at_unix_ms.or(block.updated_at_unix_ms),
+            updated_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
+            completed_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
+            partial_text: message.clone(),
+            final_text: Some(message),
+            partial_markdown: None,
+            final_markdown: None,
+            item,
+            opaque_meta: details,
+        },
+    );
+}
+
+fn terminal_turn_state_event(
+    state: TurnWorkState,
+) -> Option<(SystemEventLevel, &'static str, &'static str)> {
+    match state {
+        TurnWorkState::Failed => Some((SystemEventLevel::Error, "turn_failed", "Turn failed")),
+        TurnWorkState::Interrupted => Some((
+            SystemEventLevel::Warning,
+            "turn_cancelled",
+            "Turn cancelled",
         )),
-    });
+        TurnWorkState::Blocked => Some((SystemEventLevel::Warning, "turn_blocked", "Turn blocked")),
+        _ => None,
+    }
 }
 
 fn running_turn_display_for_projection(
@@ -468,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn work_header_toggle_is_emitted_only_for_collapsed_after_final() {
+    fn work_header_toggle_is_emitted_for_collapsed_work() {
         let model = render_semantic_timeline_rows(
             &[semantic_row(SemanticTimelineRowKind::WorkHeader {
                 block: work_block(TurnWorkPresentation::CollapsedAfterFinal, 70_000),
@@ -510,6 +563,36 @@ mod tests {
     }
 
     #[test]
+    fn every_unsuccessful_terminal_state_has_a_system_event() {
+        for (state, expected_level, expected_code, expected_message) in [
+            (
+                TurnWorkState::Failed,
+                SystemEventLevel::Error,
+                "turn_failed",
+                "Turn failed",
+            ),
+            (
+                TurnWorkState::Interrupted,
+                SystemEventLevel::Warning,
+                "turn_cancelled",
+                "Turn cancelled",
+            ),
+            (
+                TurnWorkState::Blocked,
+                SystemEventLevel::Warning,
+                "turn_blocked",
+                "Turn blocked",
+            ),
+        ] {
+            assert_eq!(
+                terminal_turn_state_event(state),
+                Some((expected_level, expected_code, expected_message))
+            );
+        }
+        assert_eq!(terminal_turn_state_event(TurnWorkState::Completed), None);
+    }
+
+    #[test]
     fn turn_state_rows_preserve_running_indicator_while_stalled() {
         for state in [
             TurnWorkState::Starting,
@@ -539,6 +622,29 @@ mod tests {
             ConversationViewState::default(),
         );
         assert!(terminal_model.rows.is_empty());
+
+        let failed_model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::TurnState {
+                block: turn_state_block(TurnWorkState::Failed),
+            })],
+            ConversationViewState::default(),
+        );
+        assert!(matches!(
+            &failed_model.rows[0],
+            TimelineRow {
+                kind: TimelineRowKind::Item { timeline_index: 0 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &failed_model.projection.items[0].item,
+            TurnItem::SystemEvent {
+                level: SystemEventLevel::Error,
+                message,
+                code: Some(code),
+                ..
+            } if message == "Turn failed" && code == "turn_failed"
+        ));
     }
 
     #[test]

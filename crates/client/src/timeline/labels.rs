@@ -1109,6 +1109,9 @@ pub struct SystemEventPresentation {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum SystemEventMessage {
     Raw(String),
+    TurnCancelled,
+    TurnFailed,
+    TurnBlocked,
     Timeout { recovery_started: bool },
     RecoveryOpened,
     RecoveryAttached,
@@ -1488,6 +1491,18 @@ pub fn system_event_presentation(
     details: Option<&JsonValue>,
 ) -> SystemEventPresentation {
     match code {
+        Some("turn_cancelled") if message == "Turn cancelled" => SystemEventPresentation {
+            message: SystemEventMessage::TurnCancelled,
+            label: system_event_label(level),
+        },
+        Some("turn_failed") if message == "Turn failed" => SystemEventPresentation {
+            message: SystemEventMessage::TurnFailed,
+            label: system_event_label(level),
+        },
+        Some("turn_blocked") if message == "Turn blocked" => SystemEventPresentation {
+            message: SystemEventMessage::TurnBlocked,
+            label: system_event_label(level),
+        },
         Some("item_timeout_detected") => {
             let recovery_started = detail_has_string(details, "recovery_job_id");
             SystemEventPresentation {

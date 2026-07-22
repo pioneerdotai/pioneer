@@ -18,8 +18,9 @@ use crate::repositories::{thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row};
 use crate::timeline_projection_model::{
     ItemEventOrder, approval_block_id, assistant_block_id, classification_metadata_json,
-    elapsed_ms, terminal_completed_at, turn_block_sort_key, turn_work_presentation,
-    turn_work_state, user_block_id, work_block_id, work_item_order_key, work_item_projection_id,
+    elapsed_ms, terminal_completed_at, terminal_state_block_id, terminal_turn_state,
+    turn_block_sort_key, turn_work_presentation, turn_work_state, user_block_id, work_block_id,
+    work_item_order_key, work_item_projection_id,
 };
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
@@ -169,6 +170,12 @@ async fn project_turn_started<C: ConnectionTrait>(
         );
     };
 
+    timeline_repository::delete_thread_timeline_block(
+        db,
+        terminal_state_block_id(turn_model.id.as_str()).as_str(),
+    )
+    .await?;
+
     if !payload.input.is_empty() {
         timeline_repository::upsert_thread_timeline_block(
             db,
@@ -201,6 +208,43 @@ async fn project_turn_started<C: ConnectionTrait>(
         &turn_model,
         event.sequence,
         event.created_at,
+    )
+    .await
+}
+
+async fn project_terminal_turn_state<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &thread_entity::Model,
+    turn_model: &turn_entity::Model,
+    projected_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    let block_id = terminal_state_block_id(turn_model.id.as_str());
+    let Some(state) = terminal_turn_state(turn_model) else {
+        timeline_repository::delete_thread_timeline_block(db, block_id.as_str()).await?;
+        return Ok(());
+    };
+
+    timeline_repository::upsert_thread_timeline_block(
+        db,
+        ThreadTimelineBlockRecord {
+            block_id,
+            workspace_id: thread_model.workspace_id.clone(),
+            thread_id: thread_model.id.clone(),
+            turn_id: Some(turn_model.id.clone()),
+            block_kind: timeline_repository::BLOCK_KIND_SYSTEM.to_owned(),
+            sort_key: turn_block_sort_key(turn_model, 300, "terminal-state"),
+            source_kind: Some("turn_terminal_state".to_owned()),
+            source_key: Some(turn_model.id.clone()),
+            started_at: Some(projected_at),
+            completed_at: Some(projected_at),
+            metadata_json: json!({
+                "state": state,
+                "message": turn_model.error,
+            })
+            .to_string(),
+            created_at: projected_at,
+            updated_at: projected_at,
+        },
     )
     .await
 }
@@ -368,7 +412,8 @@ async fn project_terminal_turn_event<C: ConnectionTrait>(
         event.sequence,
         event.created_at,
     )
-    .await
+    .await?;
+    project_terminal_turn_state(db, &thread_model, &turn_model, event.created_at).await
 }
 
 async fn project_turn_item_row<C: ConnectionTrait>(

@@ -11,7 +11,7 @@ use sea_orm::{
 };
 
 pub const SEMANTIC_TIMELINE_PROJECTION_KEY: &str = "semantic_timeline";
-pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 3;
+pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 4;
 
 pub const PROJECTION_META_STATUS_PENDING: &str = "pending";
 pub const PROJECTION_META_STATUS_BACKFILLING: &str = "backfilling";
