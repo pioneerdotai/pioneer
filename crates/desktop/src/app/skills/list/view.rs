@@ -752,8 +752,8 @@ impl PioneerDesktop {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopSkillManagementRow, project_desktop_skill_management_rows,
-        skill_pack_context_actions_enabled,
+        DesktopSkillManagementRow, SkillCountForm, project_desktop_skill_management_rows,
+        skill_count_form, skill_pack_context_actions_enabled,
     };
     use pioneer_client::skills::catalog::{SkillManagementProjection, SkillPackManagementRow};
     use pioneer_protocol::{
