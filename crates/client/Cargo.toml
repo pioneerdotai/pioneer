@@ -27,6 +27,7 @@ schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+shell-words.workspace = true
 tar.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

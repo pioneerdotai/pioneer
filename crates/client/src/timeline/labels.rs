@@ -237,10 +237,30 @@ pub fn stable_user_message_attachment_chip_id(item_id: &str, chip_index: usize) 
 }
 
 pub fn command_from_arguments(arguments: &JsonValue) -> Option<String> {
+    let command = command_parts_from_arguments(arguments).join(" ");
+    (!command.trim().is_empty()).then_some(command)
+}
+
+pub fn command_execution_display_command(
+    command: &[String],
+    arguments: &JsonValue,
+) -> Option<String> {
+    let argument_command;
+    let parts = if command.iter().any(|part| !part.trim().is_empty()) {
+        command
+    } else {
+        argument_command = command_parts_from_arguments(arguments);
+        argument_command.as_slice()
+    };
+
+    display_command_parts(parts)
+}
+
+fn command_parts_from_arguments(arguments: &JsonValue) -> Vec<String> {
     if let Some(cmd) = arguments.get("cmd").and_then(JsonValue::as_str)
         && !cmd.trim().is_empty()
     {
-        return Some(cmd.to_owned());
+        return vec![cmd.to_owned()];
     }
 
     arguments
@@ -250,10 +270,48 @@ pub fn command_from_arguments(arguments: &JsonValue) -> Option<String> {
             parts
                 .iter()
                 .filter_map(JsonValue::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
+                .map(str::to_owned)
+                .collect()
         })
-        .filter(|cmd| !cmd.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn display_command_parts(parts: &[String]) -> Option<String> {
+    let raw = match parts {
+        [] => return None,
+        [raw] => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            if let Ok(parsed) = shell_words::split(trimmed)
+                && let Some(script) = shell_launcher_script(parsed.as_slice())
+            {
+                script.to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        _ => shell_launcher_script(parts)
+            .map(str::to_owned)
+            .unwrap_or_else(|| parts.join(" ")),
+    };
+
+    let display = raw.replace('\r', " ").replace('\n', " ");
+    let display = display.trim();
+    (!display.is_empty()).then(|| display.to_owned())
+}
+
+fn shell_launcher_script(parts: &[String]) -> Option<&str> {
+    if parts.len() < 3 || !matches!(parts[1].as_str(), "-c" | "-lc") {
+        return None;
+    }
+
+    let executable = Path::new(parts[0].as_str())
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    matches!(executable, "sh" | "bash" | "zsh").then_some(parts[2].as_str())
 }
 
 pub fn shell_output_from_display(display: &ToolDisplayPayload) -> Option<&str> {
@@ -307,13 +365,9 @@ pub fn command_execution_terminal_text(
         return normalize_for_terminal(fallback_text);
     };
 
-    let command_line = if command.is_empty() {
-        command_from_arguments(arguments)
-            .map(|cmd| format!("$ {cmd}"))
-            .unwrap_or_default()
-    } else {
-        format!("$ {}", command.join(" "))
-    };
+    let command_line = command_execution_display_command(command, arguments)
+        .map(|command| format!("$ {command}"))
+        .unwrap_or_default();
 
     let command_output = shell_output_from_display(display)
         .or_else(|| shell_output_from_storage(storage))
@@ -1743,6 +1797,47 @@ mod tests {
         assert_eq!(
             command_from_arguments(&json!({ "command": ["cargo", "check"] })).as_deref(),
             Some("cargo check")
+        );
+        assert_eq!(
+            command_execution_display_command(
+                &[r#"/bin/zsh -lc "rg -n \"needle\" crates/client""#.to_owned()],
+                &json!({}),
+            )
+            .as_deref(),
+            Some(r#"rg -n "needle" crates/client"#)
+        );
+        assert_eq!(
+            command_execution_display_command(
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "find \"$root\" -type f".to_owned(),
+                ],
+                &json!({}),
+            )
+            .as_deref(),
+            Some("find \"$root\" -type f")
+        );
+        assert_eq!(
+            command_execution_display_command(
+                &[
+                    "find".to_owned(),
+                    "/tmp".to_owned(),
+                    "-name".to_owned(),
+                    "*.rs".to_owned(),
+                ],
+                &json!({}),
+            )
+            .as_deref(),
+            Some("find /tmp -name *.rs")
+        );
+        assert_eq!(
+            command_execution_display_command(
+                &[],
+                &json!({ "cmd": "bash -lc 'cargo test\ncargo check'" }),
+            )
+            .as_deref(),
+            Some("cargo test cargo check")
         );
         assert_eq!(normalize_for_terminal("a\nb"), "a\r\nb");
         assert_eq!(

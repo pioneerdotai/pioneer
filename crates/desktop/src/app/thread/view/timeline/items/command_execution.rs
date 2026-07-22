@@ -9,7 +9,9 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
-use pioneer_client::timeline::labels::command_execution_terminal_text;
+use pioneer_client::timeline::labels::{
+    command_execution_display_command, command_execution_terminal_text,
+};
 use pioneer_protocol::TurnItem;
 use std::{
     hash::{Hash, Hasher},
@@ -104,6 +106,17 @@ impl PioneerDesktop {
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let command_label = match item {
+            TurnItem::CommandExecution {
+                arguments,
+                command,
+                tool_name,
+                ..
+            } => command_execution_display_command(command, arguments)
+                .unwrap_or_else(|| tool_name.clone()),
+            _ => t!("timeline.command.running").to_string(),
+        };
+
         let terminal_text =
             command_execution_terminal_text(item, Self::timeline_entry_text(item_view), |output| {
                 Self::truncate_for_card(output, 24_000)
@@ -145,8 +158,32 @@ impl PioneerDesktop {
         let mut toggle_id_hasher = std::collections::hash_map::DefaultHasher::new();
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
+        let is_running = item_view.status == TimelineEntryStatus::Running;
+        let command_row = || {
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .when(is_running, |this| {
+                    this.child(Spinner::new().icon(IconName::Loader))
+                })
+                .when(!is_running, |this| {
+                    this.child(Icon::new(PioneerIconName::Terminal).size_4().opacity(0.8))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .line_height(relative(1.45))
+                        .child(command_label.clone()),
+                )
+                .into_any_element()
+        };
 
-        let content = if item_view.status == TimelineEntryStatus::Running {
+        let content = if is_running {
             Collapsible::new()
                 .gap_2()
                 .open(open)
@@ -165,13 +202,7 @@ impl PioneerDesktop {
                                 .gap_3()
                                 .text_sm()
                                 .font_semibold()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(Spinner::new().icon(IconName::Loader))
-                                        .child(t!("timeline.command.running").to_string()),
-                                )
+                                .child(command_row())
                                 .child(
                                     h_flex()
                                         .items_center()
@@ -217,27 +248,7 @@ impl PioneerDesktop {
                                 .justify_between()
                                 .gap_3()
                                 .text_sm()
-                                .child(
-                                    h_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Icon::new(PioneerIconName::Terminal)
-                                                .size_4()
-                                                .opacity(0.8),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .child(
-                                                    t!("timeline.command.completed").to_string(),
-                                                ),
-                                        ),
-                                )
+                                .child(command_row())
                                 .child(
                                     h_flex()
                                         .flex_none()
