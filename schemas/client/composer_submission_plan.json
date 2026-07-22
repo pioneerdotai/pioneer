@@ -182,12 +182,6 @@
         "user"
       ]
     },
-    "SkillId": {
-      "type": "string",
-      "maxLength": 21,
-      "minLength": 21,
-      "pattern": "^[A-Za-z0-9]{21}$"
-    },
     "RemovedComposerCapability": {
       "type": "object",
       "properties": {
@@ -203,6 +197,12 @@
         "capability",
         "reason"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     }
   }
 }

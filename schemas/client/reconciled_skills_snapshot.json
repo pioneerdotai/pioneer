@@ -380,8 +380,11 @@
         },
         "health_details": {
           "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/SkillHealthItem"
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9]{21}$": {
+              "$ref": "#/$defs/SkillHealthItem"
+            }
           }
         },
         "installed": {

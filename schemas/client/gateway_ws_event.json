@@ -2681,6 +2681,17 @@
         }
       }
     },
+    "GatewayThreadEpisodicVectorLocalModelStatus": {
+      "type": "string",
+      "enum": [
+        "not_selected",
+        "unknown",
+        "missing",
+        "downloading",
+        "installed",
+        "failed"
+      ]
+    },
     "GatewayThreadEpisodicVectorRefillStatus": {
       "type": "string",
       "enum": [
@@ -2695,8 +2706,34 @@
     "GatewayThreadEpisodicVectorRefillStatusChangedNotification": {
       "type": "object",
       "properties": {
+        "downloaded_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "local_model_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorLocalModelStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus"
+        },
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "workspace_id": {
           "type": "string"

@@ -3,6 +3,14 @@
   "title": "GatewayThreadEpisodicVectorSearchSettings",
   "type": "object",
   "properties": {
+    "downloaded_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "embedding_dimension": {
       "type": [
         "integer",
@@ -55,6 +63,14 @@
     "refill_status": {
       "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
       "default": "disabled"
+    },
+    "total_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
     },
     "use_search_instructions": {
       "type": "boolean",

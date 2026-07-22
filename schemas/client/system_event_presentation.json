@@ -104,6 +104,9 @@
         {
           "type": "string",
           "enum": [
+            "TurnCancelled",
+            "TurnFailed",
+            "TurnBlocked",
             "RecoveryOpened",
             "RecoveryAttached",
             "RetryScheduled",
