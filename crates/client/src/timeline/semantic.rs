@@ -1127,7 +1127,8 @@ fn apply_turn_state_to_semantic_timeline(
 ) -> bool {
     let thread = state.thread_mut(thread_id.to_owned());
     let before = thread.clone();
-    let presentation = if turn_has_assistant_block(thread, turn_id) {
+    let has_final = turn_has_assistant_block(thread, turn_id);
+    let presentation = if has_final {
         TurnWorkPresentation::CollapsedAfterFinal
     } else if completed_at_unix_ms.is_some() {
         TurnWorkPresentation::CollapsedAfterFinal
@@ -1145,6 +1146,7 @@ fn apply_turn_state_to_semantic_timeline(
         now_unix_ms,
     );
     if completed_at_unix_ms.is_some()
+        && !has_final
         && matches!(
             work_state,
             TurnWorkState::Failed | TurnWorkState::Interrupted | TurnWorkState::Blocked
@@ -1160,11 +1162,7 @@ fn apply_turn_state_to_semantic_timeline(
             now_unix_ms,
         );
     } else {
-        thread
-            .top_level
-            .blocks_by_id
-            .remove(terminal_state_block_id(turn_id).as_str());
-        sort_top_level_blocks(&mut thread.top_level);
+        remove_terminal_state_block(thread, turn_id);
     }
     before != *thread
 }
@@ -1195,6 +1193,9 @@ fn apply_terminal_turn_to_semantic_timeline(
     }
 
     let thread = state.thread_mut(thread_id.to_owned());
+    if turn_has_assistant_block(thread, turn.id.as_str()) {
+        return changed;
+    }
     let before = thread.clone();
     upsert_terminal_state_block(
         thread,
@@ -1281,6 +1282,7 @@ fn apply_item_started_to_semantic_timeline(
                 TurnWorkItemStatus::Running,
                 now_unix_ms,
             );
+            remove_terminal_state_block(thread, turn_id);
             upsert_turn_work_summary(
                 thread,
                 workspace_id,
@@ -1442,6 +1444,7 @@ fn apply_item_completed_to_semantic_timeline(
                 TurnWorkItemStatus::Completed,
                 now_unix_ms,
             );
+            remove_terminal_state_block(thread, turn_id);
             upsert_turn_work_summary(
                 thread,
                 workspace_id,
@@ -2079,6 +2082,17 @@ fn upsert_terminal_state_block(
         kind: TimelineBlockKind::TurnState { state, message },
     };
     upsert_top_level_block(thread, block);
+}
+
+fn remove_terminal_state_block(thread: &mut ThreadSemanticTimelineState, turn_id: &str) {
+    if thread
+        .top_level
+        .blocks_by_id
+        .remove(terminal_state_block_id(turn_id).as_str())
+        .is_some()
+    {
+        sort_top_level_blocks(&mut thread.top_level);
+    }
 }
 
 fn upsert_turn_work_item(
@@ -3309,6 +3323,63 @@ mod tests {
                 )
         ));
         assert!(flattened.request_hints.is_empty());
+    }
+
+    #[test]
+    fn terminal_with_final_keeps_answer_without_outcome_block() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![
+                user_block("thread_a", "block_user", "001", "turn_a"),
+                turn_work_block("thread_a", "block_work", "002"),
+                assistant_block("thread_a", "block_assistant", "003", "turn_a", None),
+            ]),
+            TopLevelPageMergeMode::Reset
+        ));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnFailed {
+                thread_id: "thread_a".to_owned(),
+                turn: Turn {
+                    id: "turn_a".to_owned(),
+                    status: TurnStatus::Failed,
+                    turn_kind: pioneer_protocol::TurnKind::Conversation,
+                    origin: pioneer_protocol::TurnOrigin::User,
+                    error: Some("failed after final".to_owned()),
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::compile_turn_permission_profile(
+                        pioneer_protocol::TurnPermissionMode::FullAccess,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                },
+            },
+            10,
+        ));
+
+        let flattened =
+            flatten_semantic_timeline(&state, "thread_a").expect("flattened rows should exist");
+        assert!(
+            flattened
+                .rows
+                .iter()
+                .any(|row| matches!(row.kind, SemanticTimelineRowKind::AssistantMessage { .. }))
+        );
+        assert!(
+            !flattened
+                .rows
+                .iter()
+                .any(|row| matches!(row.kind, SemanticTimelineRowKind::TurnState { .. }))
+        );
+        assert!(flattened.rows.iter().any(|row| matches!(
+            &row.kind,
+            SemanticTimelineRowKind::WorkHeader { work, expanded, .. }
+                if !expanded
+                    && work.presentation == TurnWorkPresentation::CollapsedAfterFinal
+                    && work.state == TurnWorkState::Failed
+        )));
     }
 
     #[test]

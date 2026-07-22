@@ -219,6 +219,17 @@ async fn project_terminal_turn_state<C: ConnectionTrait>(
     projected_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     let block_id = terminal_state_block_id(turn_model.id.as_str());
+    let has_final = timeline_repository::count_thread_timeline_blocks_for_turn_kind(
+        db,
+        turn_model.id.as_str(),
+        timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE,
+    )
+    .await?
+        > 0;
+    if has_final {
+        timeline_repository::delete_thread_timeline_block(db, block_id.as_str()).await?;
+        return Ok(());
+    }
     let Some(state) = terminal_turn_state(turn_model) else {
         timeline_repository::delete_thread_timeline_block(db, block_id.as_str()).await?;
         return Ok(());
@@ -464,6 +475,11 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                 },
             )
             .await?;
+            timeline_repository::delete_thread_timeline_block(
+                db,
+                terminal_state_block_id(turn_model.id.as_str()).as_str(),
+            )
+            .await?;
         }
         ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
             let source_order =
@@ -558,6 +574,11 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                     created_at: item_model.created_at,
                     updated_at: refreshed_at,
                 },
+            )
+            .await?;
+            timeline_repository::delete_thread_timeline_block(
+                db,
+                terminal_state_block_id(turn_model.id.as_str()).as_str(),
             )
             .await?;
         }

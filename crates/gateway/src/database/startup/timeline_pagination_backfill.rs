@@ -753,7 +753,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     }
 
     let terminal_block_id = terminal_state_block_id(turn_model.id.as_str());
-    if let Some(state) = terminal_turn_state(turn_model) {
+    if let Some(state) = terminal_turn_state(turn_model).filter(|_| !has_final) {
         timeline_repository::upsert_thread_timeline_block(
             db,
             ThreadTimelineBlockRecord {
