@@ -147,33 +147,56 @@ impl PioneerDesktop {
         let toggle_id = toggle_id_hasher.finish();
 
         let content = if item_view.status == TimelineEntryStatus::Running {
-            v_flex()
-                .w_full()
-                .gap_3()
-                .child(terminal_block)
+            Collapsible::new()
+                .gap_2()
+                .open(open)
                 .child(
-                    h_flex()
+                    div()
+                        .id(("command-execution-toggle", toggle_id))
                         .w_full()
+                        .flex()
                         .items_center()
-                        .justify_between()
-                        .text_sm()
-                        .font_semibold()
+                        .hover(|this| this.opacity(0.8))
                         .child(
                             h_flex()
+                                .w_full()
                                 .items_center()
-                                .gap_2()
-                                .child(Spinner::new().icon(IconName::Loader))
-                                .child(t!("timeline.command.running").to_string()),
+                                .justify_between()
+                                .gap_3()
+                                .text_sm()
+                                .font_semibold()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Spinner::new().icon(IconName::Loader))
+                                        .child(t!("timeline.command.running").to_string()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when_some(running_elapsed_label, |this, elapsed| {
+                                            this.child(elapsed)
+                                        })
+                                        .child(
+                                            Icon::new(if open {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size_4(),
+                                        ),
+                                ),
                         )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .when_some(running_elapsed_label, |this, elapsed| {
-                                    this.child(elapsed)
-                                }),
-                        ),
+                        .on_click({
+                            let entry_id = entry_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            })
+                        }),
                 )
+                .content(terminal_block)
                 .into_any_element()
         } else {
             Collapsible::new()

@@ -61,6 +61,7 @@ impl PioneerDesktop {
         } else {
             changed_files_label(file_count)
         };
+        let is_running = item_view.status == TimelineEntryStatus::Running;
 
         let summary_row = || {
             h_flex()
@@ -68,7 +69,12 @@ impl PioneerDesktop {
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(Icon::new(IconName::File).size_4().opacity(0.8))
+                .when(is_running, |this| {
+                    this.child(Spinner::new().icon(IconName::Loader))
+                })
+                .when(!is_running, |this| {
+                    this.child(Icon::new(IconName::File).size_4().opacity(0.8))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -100,44 +106,57 @@ impl PioneerDesktop {
         let status = final_file_change_status(item_view.status, success, exit_code);
         let final_status = file_change_status_label(status.kind);
         let is_successful = status.successful;
+        let details =
+            self.file_change_details(changed_files.as_slice(), exit_code, output.as_deref(), cx);
 
-        let content = if item_view.status == TimelineEntryStatus::Running {
-            v_flex()
-                .w_full()
-                .gap_3()
-                .child(summary_row())
+        let content = if is_running {
+            Collapsible::new()
+                .gap_2()
+                .open(open)
                 .child(
-                    h_flex()
+                    div()
+                        .id(("file-change-toggle", toggle_id))
                         .w_full()
+                        .flex()
                         .items_center()
-                        .justify_between()
-                        .text_sm()
-                        .font_semibold()
+                        .hover(|this| this.opacity(0.9))
                         .child(
                             h_flex()
+                                .w_full()
                                 .items_center()
-                                .gap_2()
-                                .child(Spinner::new().icon(IconName::Loader))
-                                .child(t!("timeline.file_change.running").to_string()),
+                                .justify_between()
+                                .gap_3()
+                                .child(summary_row())
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(t!("timeline.file_change.running").to_string())
+                                        .when_some(running_elapsed_label, |this, elapsed| {
+                                            this.child(elapsed)
+                                        })
+                                        .child(
+                                            Icon::new(if open {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size_4(),
+                                        ),
+                                ),
                         )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .when_some(running_elapsed_label, |this, elapsed| {
-                                    this.child(elapsed)
-                                }),
-                        ),
+                        .on_click({
+                            let entry_id = entry_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            })
+                        }),
                 )
+                .content(details)
                 .into_any_element()
         } else {
-            let details = self.file_change_details(
-                changed_files.as_slice(),
-                exit_code,
-                output.as_deref(),
-                cx,
-            );
-
             Collapsible::new()
                 .gap_2()
                 .open(open)

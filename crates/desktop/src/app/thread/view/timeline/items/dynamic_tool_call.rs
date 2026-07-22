@@ -116,45 +116,62 @@ impl PioneerDesktop {
         let status = final_dynamic_tool_status(item_view.status, success);
         let final_status = dynamic_tool_status_label(status.kind);
         let is_successful = status.successful;
+        let details = self.dynamic_tool_details(
+            arguments.as_deref(),
+            display_text.as_deref(),
+            mcp_metadata.as_ref(),
+            task_wait_review.as_ref(),
+            cx,
+        );
 
         let content = if is_running {
-            v_flex()
-                .w_full()
-                .gap_3()
-                .child(tool_row())
+            Collapsible::new()
+                .gap_2()
+                .open(open)
                 .child(
-                    h_flex()
+                    div()
+                        .id(("dynamic-tool-toggle", toggle_id))
                         .w_full()
+                        .flex()
                         .items_center()
-                        .justify_between()
-                        .text_sm()
-                        .font_semibold()
+                        .hover(|this| this.opacity(0.9))
                         .child(
                             h_flex()
+                                .w_full()
                                 .items_center()
-                                .gap_2()
-                                .child(Spinner::new().icon(IconName::Loader))
-                                .child(t!("timeline.tool.running").to_string()),
+                                .justify_between()
+                                .gap_3()
+                                .child(tool_row())
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(t!("timeline.tool.running").to_string())
+                                        .when_some(running_elapsed_label, |this, elapsed| {
+                                            this.child(elapsed)
+                                        })
+                                        .child(
+                                            Icon::new(if open {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size_4(),
+                                        ),
+                                ),
                         )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .when_some(running_elapsed_label, |this, elapsed| {
-                                    this.child(elapsed)
-                                }),
-                        ),
+                        .on_click({
+                            let entry_id = entry_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            })
+                        }),
                 )
+                .content(details)
                 .into_any_element()
         } else {
-            let details = self.dynamic_tool_details(
-                arguments.as_deref(),
-                display_text.as_deref(),
-                mcp_metadata.as_ref(),
-                task_wait_review.as_ref(),
-                cx,
-            );
-
             Collapsible::new()
                 .gap_2()
                 .open(open)

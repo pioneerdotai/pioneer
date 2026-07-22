@@ -58,34 +58,78 @@ impl PioneerDesktop {
         let toggle_id = toggle_id_hasher.finish();
 
         let content = if item_view.status == TimelineEntryStatus::Running {
-            let status_row = h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .text_sm()
-                .font_semibold()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Spinner::new().icon(IconName::Loader))
-                        .child(t!("timeline.reasoning.running").to_string()),
-                )
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .when_some(running_elapsed_label, |this, elapsed| this.child(elapsed)),
-                );
-
             if has_body {
-                v_flex()
-                    .gap_4()
-                    .child(body_element)
-                    .child(status_row)
+                Collapsible::new()
+                    .gap_2()
+                    .open(open)
+                    .child(
+                        div()
+                            .id(("reasoning-toggle", toggle_id))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .hover(|this| this.opacity(0.8))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Spinner::new().icon(IconName::Loader))
+                                            .child(t!("timeline.reasoning.running").to_string()),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .when_some(running_elapsed_label, |this, elapsed| {
+                                                this.child(elapsed)
+                                            })
+                                            .child(
+                                                Icon::new(if open {
+                                                    IconName::ChevronUp
+                                                } else {
+                                                    IconName::ChevronDown
+                                                })
+                                                .size_4(),
+                                            ),
+                                    ),
+                            )
+                            .on_click({
+                                let entry_id = entry_id.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                                })
+                            }),
+                    )
+                    .content(body_element)
                     .into_any_element()
             } else {
-                v_flex().gap_4().child(status_row).into_any_element()
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .text_sm()
+                    .font_semibold()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Spinner::new().icon(IconName::Loader))
+                            .child(t!("timeline.reasoning.running").to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when_some(running_elapsed_label, |this, elapsed| this.child(elapsed)),
+                    )
+                    .into_any_element()
             }
         } else if has_body {
             Collapsible::new()

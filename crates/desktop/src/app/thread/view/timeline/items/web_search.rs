@@ -43,13 +43,19 @@ impl PioneerDesktop {
                 Vec::new(),
             ),
         };
+        let is_running = item_view.status == TimelineEntryStatus::Running;
 
         let query_with_icon = || {
             h_flex()
                 .w_full()
                 .items_center()
                 .gap_2()
-                .child(Icon::new(IconName::Search).size_4().opacity(0.8))
+                .when(is_running, |this| {
+                    this.child(Spinner::new().icon(IconName::Loader))
+                })
+                .when(!is_running, |this| {
+                    this.child(Icon::new(IconName::Search).size_4().opacity(0.8))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -78,64 +84,82 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let content = if item_view.status == TimelineEntryStatus::Running {
+        let result_rows = if results.is_empty() {
             v_flex()
                 .w_full()
-                .gap_3()
-                .child(query_with_icon())
+                .gap_2()
+                .pt_1()
                 .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
+                    div()
                         .text_sm()
-                        .font_semibold()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(Spinner::new().icon(IconName::Loader))
-                                .child(t!("timeline.web_search.running").to_string()),
-                        )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .when_some(running_elapsed_label, |this, elapsed| {
-                                    this.child(elapsed)
-                                }),
-                        ),
+                        .opacity(0.75)
+                        .child(t!("timeline.web_search.no_results").to_string()),
                 )
                 .into_any_element()
         } else {
-            let result_rows = if results.is_empty() {
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .pt_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .opacity(0.75)
-                            .child(t!("timeline.web_search.no_results").to_string()),
-                    )
-                    .into_any_element()
-            } else {
-                let mut list = v_flex()
-                    .w_full()
-                    .gap_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_1();
+            let mut list = v_flex()
+                .w_full()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().border)
+                .p_1();
 
-                for (index, result) in results.iter().enumerate() {
-                    list = list.child(self.web_search_result_row(result, toggle_id, index, cx));
-                }
+            for (index, result) in results.iter().enumerate() {
+                list = list.child(self.web_search_result_row(result, toggle_id, index, cx));
+            }
 
-                v_flex().w_full().pt_1().child(list).into_any_element()
-            };
+            v_flex().w_full().pt_1().child(list).into_any_element()
+        };
 
+        let content = if is_running {
+            Collapsible::new()
+                .gap_2()
+                .open(open)
+                .child(
+                    div()
+                        .id(("web-search-toggle", toggle_id))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .hover(|this| this.opacity(0.9))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(query_with_icon())
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(t!("timeline.web_search.running").to_string())
+                                        .when_some(running_elapsed_label, |this, elapsed| {
+                                            this.child(elapsed)
+                                        })
+                                        .child(
+                                            Icon::new(if open {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size_4(),
+                                        ),
+                                ),
+                        )
+                        .on_click({
+                            let entry_id = entry_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            })
+                        }),
+                )
+                .content(result_rows)
+                .into_any_element()
+        } else {
             Collapsible::new()
                 .gap_2()
                 .open(open)
