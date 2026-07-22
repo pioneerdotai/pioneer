@@ -850,7 +850,7 @@ checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1765,12 +1765,12 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.3"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fb99565819980999fb7b4a1796046a5c949e6d4ff132cf5fadf5a641e20d776"
+checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
 dependencies = [
  "clap_builder",
- "clap_derive 4.6.3",
+ "clap_derive 4.6.4",
 ]
 
 [[package]]
@@ -1800,14 +1800,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.3"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32f2392eae7f16557a3d727ef3a12e57b2b2ca6f98566a5f4fb41ffe305df077"
+checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2689,7 +2689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a1b2f1087c32a26a8c6c7d89eb80b50c33d8466e2431ea2a8345c969cded18"
 dependencies = [
  "anyhow",
- "clap 4.6.3",
+ "clap 4.6.4",
  "futures",
  "keyring-core",
  "log",
@@ -5941,9 +5941,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.188"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22053b6a34f84abc97f9129e61334f40174659a1b9bd18c970b83db6a9a6348b"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -6065,7 +6065,7 @@ checksum = "77060ebe535362c3da75682cd17b0431017b6e7c5661e714fc69a7ad017d1301"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -7933,9 +7933,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pest"
-version = "2.8.7"
+version = "2.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47627dd7305c6a2d6c8c6bcd24c5a4c17dbbf425f4f9c5313e724b38fc9782e9"
+checksum = "7df728be843c7070fab6ab7c328c4e9e9d78e23bf749c0669c86ee7ebfa050a2"
 dependencies = [
  "memchr",
  "ucd-trie",
@@ -7943,9 +7943,9 @@ dependencies = [
 
 [[package]]
 name = "pest_derive"
-version = "2.8.7"
+version = "2.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b4254325ecad416ab689e27ba51da03ba01a9632bc6e108f5fe7c3c4ad29d58"
+checksum = "9e2dd6fc3b26b3462ee188aac870f5a41d398f1cd5e2408d16531bd71c9591fd"
 dependencies = [
  "pest",
  "pest_generator",
@@ -7953,9 +7953,9 @@ dependencies = [
 
 [[package]]
 name = "pest_generator"
-version = "2.8.7"
+version = "2.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c4c0e91ead7a8f7acecbca6f003fc2e8282b1dbe2dd9c9d2f16aba42995e0a7"
+checksum = "6a7a9205cfb6f596a9e8b689c0a15f9ceb7a1aafae7aaf788150ac65b29975b6"
 dependencies = [
  "pest",
  "pest_meta",
@@ -7966,9 +7966,9 @@ dependencies = [
 
 [[package]]
 name = "pest_meta"
-version = "2.8.7"
+version = "2.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9744bc48116fee06334924bb5f2bad41eed5e89bd26e29b0b799f9a3f82c210"
+checksum = "85abd351c0de1e8384fc791a0737111a350394937e92b956b743dac12429f57c"
 dependencies = [
  "pest",
 ]
@@ -8156,7 +8156,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8181,7 +8181,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -8196,7 +8196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8222,7 +8222,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -8246,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -8264,7 +8264,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -8278,7 +8278,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8302,7 +8302,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "pioneer-client",
@@ -8316,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "config",
@@ -8327,7 +8327,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8348,7 +8348,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8389,7 +8389,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -8397,7 +8397,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8457,7 +8457,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -8472,7 +8472,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -8485,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8507,7 +8507,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8530,7 +8530,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -8543,7 +8543,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -8554,7 +8554,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8572,7 +8572,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "hex",
  "nanoid",
@@ -8584,7 +8584,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8607,7 +8607,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -8617,7 +8617,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -8635,7 +8635,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8657,7 +8657,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8678,7 +8678,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8709,7 +8709,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -9634,7 +9634,7 @@ checksum = "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -10536,7 +10536,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ec4b7c39c90efa92b8bb0b91ac7159684b9fa0d6371ce39bfab0a9793ce7394"
 dependencies = [
  "chrono",
- "clap 4.6.3",
+ "clap 4.6.4",
  "dotenvy",
  "glob",
  "indoc",
@@ -10572,7 +10572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef3576c5301b67ea7d2ce4515858d700066e51911c7d228a439c00ff258695c8"
 dependencies = [
  "async-trait",
- "clap 4.6.3",
+ "clap 4.6.4",
  "dotenvy",
  "sea-orm",
  "sea-orm-cli",
@@ -10909,7 +10909,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -10989,7 +10989,7 @@ checksum = "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -11824,9 +11824,9 @@ dependencies = [
 
 [[package]]
 name = "sse-stream"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39f24a9b78c40b90817bbcd1821c74ddfd74916aadd29403d001532a9195532d"
+checksum = "c123f296ade4ec4b8b0f6162116e6629f5146922ca5ab40ca9d3c2e73ab4761e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -12185,9 +12185,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.2"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a207d6d6a2b7fc470b80443726053f18a2481b7e1eee970597051596567987a3"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12582,7 +12582,7 @@ checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -12830,9 +12830,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -14209,8 +14209,8 @@ dependencies = [
 
 [[package]]
 name = "webclaw-core"
-version = "0.6.15"
-source = "git+https://github.com/0xMassi/webclaw#caa4e8ea49c25208aa0b0c11fb503874f2f52398"
+version = "0.6.16"
+source = "git+https://github.com/0xMassi/webclaw#50a17d27e504e558372528a4e6530ff09aee3537"
 dependencies = [
  "ego-tree 0.10.0",
  "once_cell",
