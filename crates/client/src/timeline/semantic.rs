@@ -2821,6 +2821,93 @@ mod tests {
     }
 
     #[test]
+    fn newest_work_batches_accumulate_without_replacing_stable_rows() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![turn_work_block("thread_a", "block_work", "001")]),
+            TopLevelPageMergeMode::Reset
+        ));
+
+        let first_batch = (0..50)
+            .map(|index| work_item(&format!("work_{index:03}"), &format!("{index:03}")))
+            .collect();
+        let mut first_page = work_page(first_batch);
+        first_page.page.before_cursor = Some(TimelineCursor {
+            value: "oldest-loaded".to_owned(),
+        });
+        first_page.page.after_cursor = Some(TimelineCursor {
+            value: "first-newest".to_owned(),
+        });
+        first_page.page.has_more_before = true;
+        assert!(apply_turn_work_page(
+            &mut state,
+            first_page,
+            WorkPageMergeMode::MergeAfter
+        ));
+        let first_row_ids = flatten_semantic_timeline(&state, "thread_a")
+            .expect("flattened rows should exist")
+            .rows
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+
+        let second_batch = (50..100)
+            .map(|index| work_item(&format!("work_{index:03}"), &format!("{index:03}")))
+            .collect();
+        let mut second_page = work_page(second_batch);
+        second_page.page.before_cursor = Some(TimelineCursor {
+            value: "newest-window-start".to_owned(),
+        });
+        second_page.page.after_cursor = Some(TimelineCursor {
+            value: "latest-newest".to_owned(),
+        });
+        assert!(apply_turn_work_page(
+            &mut state,
+            second_page,
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let thread = state.thread("thread_a").expect("thread cache should exist");
+        let range = thread
+            .work_range("turn_a")
+            .expect("work range should exist");
+        assert_eq!(range.ordered_item_ids.len(), 100);
+        assert_eq!(
+            range.ordered_item_ids.first().map(String::as_str),
+            Some("work_000")
+        );
+        assert_eq!(
+            range.ordered_item_ids.last().map(String::as_str),
+            Some("work_099")
+        );
+        assert_eq!(
+            range
+                .loaded_range
+                .before_cursor
+                .as_ref()
+                .map(|cursor| cursor.value.as_str()),
+            Some("oldest-loaded")
+        );
+        assert_eq!(
+            range
+                .loaded_range
+                .after_cursor
+                .as_ref()
+                .map(|cursor| cursor.value.as_str()),
+            Some("latest-newest")
+        );
+
+        let all_row_ids = flatten_semantic_timeline(&state, "thread_a")
+            .expect("flattened rows should exist")
+            .rows
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert!(all_row_ids.starts_with(first_row_ids.as_slice()));
+    }
+
+    #[test]
     fn collapse_does_not_evict_cached_work_range() {
         let mut state = SemanticTimelineState::default();
         assert!(apply_turn_work_page(

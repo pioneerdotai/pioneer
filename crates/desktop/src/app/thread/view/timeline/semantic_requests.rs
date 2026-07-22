@@ -261,18 +261,7 @@ impl PioneerDesktop {
                                 })
                             }
                             SemanticTimelineRequestAction::TurnWorkPage { key, params } => {
-                                let merge_mode = match key {
-                                    SemanticTimelineRequestKey::TurnWorkInitial { .. } => {
-                                        WorkPageMergeMode::Reset
-                                    }
-                                    SemanticTimelineRequestKey::TurnWorkBefore { .. } => {
-                                        WorkPageMergeMode::MergeBefore
-                                    }
-                                    SemanticTimelineRequestKey::TurnWorkAfter { .. } => {
-                                        WorkPageMergeMode::MergeAfter
-                                    }
-                                    _ => WorkPageMergeMode::Merge,
-                                };
+                                let merge_mode = turn_work_page_merge_mode(&key);
                                 ws_sender.turn_work_page(params).map(|page| {
                                     SemanticTimelinePageResult::TurnWork { page, merge_mode }
                                 })
@@ -428,6 +417,18 @@ fn semantic_request_action_key(
     }
 }
 
+fn turn_work_page_merge_mode(key: &SemanticTimelineRequestKey) -> WorkPageMergeMode {
+    match key {
+        SemanticTimelineRequestKey::TurnWorkBefore { .. } => WorkPageMergeMode::MergeBefore,
+        SemanticTimelineRequestKey::TurnWorkAfter { .. } => WorkPageMergeMode::MergeAfter,
+        // Initial and live newest-page requests share a key so they are deduplicated. Merging is
+        // equivalent to reset for an empty range; on refresh it preserves the oldest loaded
+        // cursor and extends the range toward its newest boundary.
+        SemanticTimelineRequestKey::TurnWorkInitial { .. } => WorkPageMergeMode::MergeAfter,
+        _ => WorkPageMergeMode::Merge,
+    }
+}
+
 fn semantic_action_allowed_by_scroll(
     action: &SemanticTimelineRequestAction,
     allow_thread_before: bool,
@@ -455,5 +456,21 @@ fn semantic_action_requires_scroll_intent(action: &SemanticTimelineRequestAction
         SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
             !matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_turn_work_page_merges_with_loaded_range() {
+        assert_eq!(
+            turn_work_page_merge_mode(&SemanticTimelineRequestKey::TurnWorkInitial {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+            }),
+            WorkPageMergeMode::MergeAfter
+        );
     }
 }

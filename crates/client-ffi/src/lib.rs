@@ -1284,11 +1284,13 @@ fn thread_timeline_page_merge_mode(anchor: &TimelinePageAnchor) -> TopLevelPageM
 
 fn turn_work_page_merge_mode(anchor: &TimelinePageAnchor) -> WorkPageMergeMode {
     match anchor {
-        TimelinePageAnchor::Before { .. } => WorkPageMergeMode::MergeBefore,
-        TimelinePageAnchor::After { .. } => WorkPageMergeMode::MergeAfter,
-        TimelinePageAnchor::Newest
-        | TimelinePageAnchor::Oldest
-        | TimelinePageAnchor::Around { .. } => WorkPageMergeMode::Reset,
+        TimelinePageAnchor::Newest | TimelinePageAnchor::After { .. } => {
+            WorkPageMergeMode::MergeAfter
+        }
+        TimelinePageAnchor::Oldest | TimelinePageAnchor::Before { .. } => {
+            WorkPageMergeMode::MergeBefore
+        }
+        TimelinePageAnchor::Around { .. } => WorkPageMergeMode::Reset,
     }
 }
 
@@ -1962,6 +1964,26 @@ mod tests {
         let value: serde_json::Value = decode_response(response.as_str());
 
         assert_eq!(value["value"], 1);
+    }
+
+    #[test]
+    fn turn_work_boundary_anchors_preserve_loaded_native_ranges() {
+        assert_eq!(
+            turn_work_page_merge_mode(&TimelinePageAnchor::Newest),
+            WorkPageMergeMode::MergeAfter
+        );
+        assert_eq!(
+            turn_work_page_merge_mode(&TimelinePageAnchor::Oldest),
+            WorkPageMergeMode::MergeBefore
+        );
+        assert_eq!(
+            turn_work_page_merge_mode(&TimelinePageAnchor::Around {
+                cursor: pioneer_protocol::TimelineCursor {
+                    value: "cursor".to_owned(),
+                },
+            }),
+            WorkPageMergeMode::Reset
+        );
     }
 
     #[test]
