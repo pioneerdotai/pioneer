@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use pioneer_protocol::{ThreadStatus, TurnItemAttemptStatus};
+use pioneer_protocol::{ThreadStatus, TurnItemAttemptStatus, TurnKind};
 use sea_orm::ConnectionTrait;
 use std::future::Future;
 use std::pin::Pin;
@@ -196,16 +196,41 @@ impl TurnProjector {
     ) -> Result<()> {
         let thread_created_at = unix_to_datetime(payload.thread.created_at);
         let thread_updated_at = unix_to_datetime(payload.thread.updated_at);
+        let is_task_run_occurrence = payload.turn.turn_kind == TurnKind::TaskRun;
 
-        thread::upsert_thread(db, &payload.thread, thread_created_at, thread_updated_at).await?;
-        policy::upsert_thread_sandbox_policy(
-            db,
-            payload.thread.id.as_str(),
-            payload.sandbox_mode,
-            thread_created_at,
-            thread_updated_at,
-        )
-        .await?;
+        if is_task_run_occurrence {
+            // A task-run occurrence is only a parent-timeline projection. The
+            // parent thread and its foreground policy already exist, and a
+            // stale task payload must not overwrite metadata or foreground
+            // state written by a concurrent conversation turn.
+            if thread::find_thread_by_id(db, payload.thread.id.as_str())
+                .await?
+                .is_none()
+            {
+                let mut parent = payload.thread.clone();
+                parent.status = ThreadStatus::Idle;
+                thread::upsert_thread(db, &parent, thread_created_at, thread_updated_at).await?;
+                policy::upsert_thread_sandbox_policy(
+                    db,
+                    parent.id.as_str(),
+                    payload.sandbox_mode,
+                    thread_created_at,
+                    thread_updated_at,
+                )
+                .await?;
+            }
+        } else {
+            thread::upsert_thread(db, &payload.thread, thread_created_at, thread_updated_at)
+                .await?;
+            policy::upsert_thread_sandbox_policy(
+                db,
+                payload.thread.id.as_str(),
+                payload.sandbox_mode,
+                thread_created_at,
+                thread_updated_at,
+            )
+            .await?;
+        }
 
         let existing_turn = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?;
         let turn_status = turn_status_to_db(payload.turn.status).to_owned();
@@ -241,6 +266,15 @@ impl TurnProjector {
                 payload.turn.id.as_str(),
                 payload.turn.status,
                 turn_error,
+                thread_updated_at,
+            )
+            .await?;
+        }
+
+        if is_task_run_occurrence {
+            self.project_thread_foreground_status(
+                db,
+                payload.thread.id.as_str(),
                 thread_updated_at,
             )
             .await?;
@@ -287,9 +321,24 @@ impl TurnProjector {
             .await?;
         }
 
-        thread::update_thread_status(db, thread_id, ThreadStatus::Idle, updated_at).await?;
+        self.project_thread_foreground_status(db, thread_id, updated_at)
+            .await?;
 
         Ok(())
+    }
+
+    async fn project_thread_foreground_status<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        thread_id: &str,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<()> {
+        let status = if turn::has_in_progress_conversation_turn(db, thread_id).await? {
+            ThreadStatus::Active
+        } else {
+            ThreadStatus::Idle
+        };
+        thread::update_thread_status(db, thread_id, status, updated_at).await
     }
 
     async fn close_running_attempts_for_terminal_turn<C: ConnectionTrait + Sync>(

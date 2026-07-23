@@ -103,6 +103,7 @@ pub async fn update_thread_status<C: ConnectionTrait>(
         return Ok(());
     };
 
+    let updated_at = model.updated_at.max(updated_at);
     let mut active_model: thread::ActiveModel = model.into();
     active_model.status = Set(thread_status_to_db(status).to_owned());
     active_model.updated_at = Set(updated_at);

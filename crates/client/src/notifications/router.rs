@@ -24,7 +24,8 @@ use pioneer_protocol::{
     TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
+    TurnFailedNotification, TurnKind, TurnStartedNotification,
+    TurnToolLoopBudgetExceededNotification,
 };
 
 pub use crate::mcp::notifications::{
@@ -186,22 +187,23 @@ pub fn reduce_turn_started_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
+    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
         workspace_id,
         turn_id,
-        promote_thread_from_draft: true,
+        promote_thread_from_draft: owns_foreground,
         queue_thread_list_refresh: true,
-        thread_status: Some(ThreadStatus::Active),
+        thread_status: owns_foreground.then_some(ThreadStatus::Active),
         conversation_event: ConversationEvent::TurnStarted {
             thread_id,
             turn: notification.turn,
         },
         tick_conversation: false,
-        reset_thread_resume: true,
+        reset_thread_resume: owns_foreground,
         refresh_thread_artifacts: false,
-        sync_composer_model_selection: true,
+        sync_composer_model_selection: owns_foreground,
         pending_requests: None,
     }
 }
@@ -212,6 +214,7 @@ pub fn reduce_turn_completed_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
+    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
@@ -219,13 +222,13 @@ pub fn reduce_turn_completed_notification(
         turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
-        thread_status: Some(ThreadStatus::Idle),
+        thread_status: owns_foreground.then_some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnCompleted {
             thread_id: thread_id.clone(),
             turn: notification.turn,
         },
-        tick_conversation: true,
-        reset_thread_resume: true,
+        tick_conversation: owns_foreground,
+        reset_thread_resume: owns_foreground,
         refresh_thread_artifacts: true,
         sync_composer_model_selection: false,
         pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
@@ -242,6 +245,7 @@ pub fn reduce_turn_failed_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
+    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
@@ -249,13 +253,13 @@ pub fn reduce_turn_failed_notification(
         turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
-        thread_status: Some(ThreadStatus::Idle),
+        thread_status: owns_foreground.then_some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnFailed {
             thread_id: thread_id.clone(),
             turn: notification.turn,
         },
         tick_conversation: false,
-        reset_thread_resume: true,
+        reset_thread_resume: owns_foreground,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
         pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
@@ -272,6 +276,7 @@ pub fn reduce_turn_blocked_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
+    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
@@ -279,14 +284,14 @@ pub fn reduce_turn_blocked_notification(
         turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
-        thread_status: Some(ThreadStatus::Idle),
+        thread_status: owns_foreground.then_some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnBlocked {
             thread_id: thread_id.clone(),
             turn: notification.turn,
             resume: notification.resume,
         },
         tick_conversation: false,
-        reset_thread_resume: true,
+        reset_thread_resume: owns_foreground,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
         pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
@@ -1193,6 +1198,45 @@ mod tests {
             failed.conversation_event,
             ConversationEvent::TurnFailed { .. }
         ));
+    }
+
+    #[test]
+    fn task_run_lifecycle_reductions_do_not_mutate_foreground_state() {
+        let mut task_turn = turn("run_a", TurnStatus::InProgress);
+        task_turn.turn_kind = TurnKind::TaskRun;
+
+        let started = reduce_turn_started_notification(TurnStartedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "thr_a".to_owned(),
+            turn: task_turn.clone(),
+        });
+        assert!(!started.promote_thread_from_draft);
+        assert_eq!(started.thread_status, None);
+        assert!(!started.reset_thread_resume);
+        assert!(!started.sync_composer_model_selection);
+        assert!(started.pending_requests.is_none());
+
+        task_turn.status = TurnStatus::Completed;
+        let completed = reduce_turn_completed_notification(TurnCompletedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "thr_a".to_owned(),
+            turn: task_turn.clone(),
+        });
+        assert_eq!(completed.thread_status, None);
+        assert!(!completed.tick_conversation);
+        assert!(!completed.reset_thread_resume);
+        assert!(completed.refresh_thread_artifacts);
+        assert!(completed.pending_requests.is_some());
+
+        task_turn.status = TurnStatus::Failed;
+        let failed = reduce_turn_failed_notification(TurnFailedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "thr_a".to_owned(),
+            turn: task_turn,
+        });
+        assert_eq!(failed.thread_status, None);
+        assert!(!failed.reset_thread_resume);
+        assert!(failed.pending_requests.is_some());
     }
 
     #[test]

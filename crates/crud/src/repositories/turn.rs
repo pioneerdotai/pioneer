@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_status_history};
 use pioneer_protocol::{
-    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnStatus, UserInput, generate_id,
+    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnKind, TurnStatus, UserInput, generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
@@ -63,6 +63,20 @@ pub async fn find_turn_by_thread_and_id<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn by thread and id")
+}
+
+pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<bool> {
+    let count = turn::Entity::find()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)))
+        .filter(turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::Conversation)))
+        .count(db)
+        .await
+        .context("failed to count in-progress conversation turns")?;
+    Ok(count > 0)
 }
 
 pub async fn upsert_turn<C: ConnectionTrait>(

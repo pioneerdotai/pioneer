@@ -25,11 +25,11 @@ use pioneer_protocol::{
     TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
     TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskThreadLineage, TaskTree,
     TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement, TimelineOutputPolicy,
-    ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
-    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
-    UserInput, generate_id,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement, ThreadStatus,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
+    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind,
+    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -68,9 +68,9 @@ use crate::convention::{
     task_status_from_db, task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
     task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_origin_from_db,
-    turn_permission_mode_from_db, turn_permission_profile_source_from_db, turn_status_from_db,
-    turn_status_to_db,
+    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db,
+    turn_origin_from_db, turn_permission_mode_from_db, turn_permission_profile_source_from_db,
+    turn_status_from_db, turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -8361,6 +8361,55 @@ impl CrudStore {
         }
 
         Ok(completed)
+    }
+
+    pub async fn reconcile_thread_foreground_statuses(
+        &self,
+        event_timestamp_secs: i64,
+    ) -> Result<u64> {
+        let active_conversation_thread_ids = pioneer_entity::turn::Entity::find()
+            .filter(
+                pioneer_entity::turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)),
+            )
+            .filter(
+                pioneer_entity::turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::Conversation)),
+            )
+            .all(&self.connection)
+            .await
+            .context("failed to query in-progress conversation turns for status repair")?
+            .into_iter()
+            .map(|turn| turn.thread_id)
+            .collect::<HashSet<_>>();
+        let threads = pioneer_entity::thread::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("failed to query threads for foreground status repair")?;
+        let updated_at = unix_to_datetime(event_timestamp_secs);
+        let mut repaired = 0u64;
+
+        for thread_model in threads {
+            let desired = if active_conversation_thread_ids.contains(thread_model.id.as_str()) {
+                ThreadStatus::Active
+            } else {
+                ThreadStatus::Idle
+            };
+            let Some(current) = thread_status_from_db(thread_model.status.as_str()) else {
+                continue;
+            };
+            if current == desired {
+                continue;
+            }
+            repositories::thread::update_thread_status(
+                &self.connection,
+                thread_model.id.as_str(),
+                desired,
+                updated_at,
+            )
+            .await?;
+            repaired = repaired.saturating_add(1);
+        }
+
+        Ok(repaired)
     }
 
     pub async fn get_turn_inputs(&self, turn_id: &str) -> Result<Vec<UserInput>> {
@@ -24822,20 +24871,27 @@ mod tests {
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000001".to_owned(),
             name: None,
-            preview: String::new(),
+            preview: "human conversation".to_owned(),
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
             reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
-            status: ThreadStatus::Active,
+            status: ThreadStatus::Idle,
             origin_kind: ThreadOriginKind::User,
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
             turns: Vec::new(),
         };
+        store
+            .upsert_thread_model(&thread)
+            .await
+            .expect("parent thread should exist before task occurrence");
+        let mut stale_task_thread = thread.clone();
+        stale_task_thread.preview = "stale task payload".to_owned();
+        stale_task_thread.status = ThreadStatus::Active;
         let turn = Turn {
             id: "run_0000000000000000001".to_owned(),
             status: TurnStatus::InProgress,
@@ -24847,7 +24903,7 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(&stale_task_thread, SandboxMode::FullAccess, &turn, &[])
             .await
             .expect("task run occurrence turn start should persist");
 
@@ -24867,6 +24923,15 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id == thread.id)
             .expect("thread should exist");
+        assert_eq!(
+            listed_thread.status,
+            ThreadStatus::Idle,
+            "task occurrence must not make the parent foreground active"
+        );
+        assert_eq!(
+            listed_thread.preview, thread.preview,
+            "stale task payload must not overwrite concurrent parent metadata"
+        );
         let snapshot_turn = listed_thread
             .turns
             .iter()
@@ -24874,6 +24939,131 @@ mod tests {
             .expect("task run occurrence turn should appear in owner thread");
         assert_eq!(snapshot_turn.turn_kind, TurnKind::TaskRun);
         assert_eq!(snapshot_turn.origin, TurnOrigin::ScheduledTask);
+
+        let foreground_turn = Turn {
+            id: "turn_0000000000000000002".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        let mut active_thread = thread.clone();
+        active_thread.updated_at = timestamp + 1;
+        active_thread.status = ThreadStatus::Active;
+        store
+            .materialize_turn_start(
+                &active_thread,
+                SandboxMode::FullAccess,
+                &foreground_turn,
+                &[],
+            )
+            .await
+            .expect("foreground conversation should start");
+
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..turn
+                    },
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("task occurrence should complete");
+        assert_eq!(
+            store
+                .get_thread_model(thread.id.as_str())
+                .await
+                .expect("parent should load")
+                .expect("parent should exist")
+                .status,
+            ThreadStatus::Active,
+            "task completion must not idle a concurrent conversation"
+        );
+
+        let mut stale_idle_parent = store
+            .get_thread_model(thread.id.as_str())
+            .await
+            .expect("parent should load")
+            .expect("parent should exist");
+        stale_idle_parent.status = ThreadStatus::Idle;
+        store
+            .upsert_thread_model(&stale_idle_parent)
+            .await
+            .expect("stale idle parent should persist");
+        assert_eq!(
+            store
+                .reconcile_thread_foreground_statuses(timestamp + 2)
+                .await
+                .expect("foreground status repair should succeed"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_thread_model(thread.id.as_str())
+                .await
+                .expect("parent should load")
+                .expect("parent should exist")
+                .status,
+            ThreadStatus::Active
+        );
+
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..foreground_turn
+                    },
+                },
+                timestamp + 3,
+            )
+            .await
+            .expect("foreground conversation should complete");
+        assert_eq!(
+            store
+                .get_thread_model(thread.id.as_str())
+                .await
+                .expect("parent should load")
+                .expect("parent should exist")
+                .status,
+            ThreadStatus::Idle
+        );
+
+        let mut stale_active_parent = store
+            .get_thread_model(thread.id.as_str())
+            .await
+            .expect("parent should load")
+            .expect("parent should exist");
+        stale_active_parent.status = ThreadStatus::Active;
+        store
+            .upsert_thread_model(&stale_active_parent)
+            .await
+            .expect("legacy task-owned active status should persist");
+        assert_eq!(
+            store
+                .reconcile_thread_foreground_statuses(timestamp + 4)
+                .await
+                .expect("legacy foreground status repair should succeed"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_thread_model(thread.id.as_str())
+                .await
+                .expect("parent should load")
+                .expect("parent should exist")
+                .status,
+            ThreadStatus::Idle
+        );
     }
 
     #[tokio::test]

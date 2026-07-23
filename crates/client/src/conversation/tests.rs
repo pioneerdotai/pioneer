@@ -13,11 +13,11 @@ use pioneer_protocol::{
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, TurnPermissionActionKind, TurnPermissionAuditDecision,
-    TurnPermissionAuditEvent, TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey,
-    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
-    TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary,
-    TurnStatus, UserInput, UserMessageAttachment,
+    TurnItemTimeoutReason, TurnItemType, TurnKind, TurnOrigin, TurnPermissionActionKind,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnPermissionDecisionReason, TurnPermissionMode,
+    TurnPermissionProfileSource, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
+    TurnSkillPackPresentationSummary, TurnStatus, UserInput, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -99,6 +99,63 @@ fn thread_snapshot_hydration_locks_composer_for_running_turn() {
         Some(TURN_ID)
     );
     assert_eq!(conversation.projection().phase_label, "running");
+}
+
+#[test]
+fn task_run_occurrence_does_not_claim_foreground_on_notification_or_reload() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let task_turn_id = "run_0000000000000000001";
+    let task_turn = Turn {
+        id: task_turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::TaskRun,
+        origin: TurnOrigin::DetachedTask,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: task_turn.clone(),
+    });
+
+    assert!(conversation.can_submit_message());
+    assert_eq!(conversation.in_flight_turn_id(), None);
+    assert!(!conversation.projection().composer_locked);
+
+    let foreground_turn_id = "turn_000000000000000002";
+    let foreground_turn = turn_snapshot(foreground_turn_id, TurnStatus::InProgress, None);
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: foreground_turn.clone(),
+    });
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            status: TurnStatus::Completed,
+            ..task_turn.clone()
+        },
+    });
+
+    assert_eq!(
+        conversation.in_flight_turn_id(),
+        Some(foreground_turn_id),
+        "task completion must not complete the concurrent foreground turn"
+    );
+    assert!(conversation.projection().composer_locked);
+
+    let mut reloaded = Conversation::new(THREAD_ID);
+    let mut snapshot = thread_snapshot_with_turn(foreground_turn);
+    snapshot.turns.push(task_turn);
+    reloaded.sync_thread_snapshot(&snapshot);
+
+    assert_eq!(
+        reloaded.in_flight_turn_id(),
+        Some(foreground_turn_id),
+        "reload must select the latest conversation turn, not the task occurrence"
+    );
+    assert!(reloaded.projection().composer_locked);
 }
 
 #[test]

@@ -14,6 +14,8 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
     let created_default_workspace = ensure_default_workspace_exists(connection).await?;
     let repaired_completed_turn_rows =
         repair_turns_completed_after_final_agent_message(connection).await?;
+    let repaired_thread_foreground_status_rows =
+        repair_thread_foreground_statuses(connection).await?;
     let repaired_terminal_execution_window_rows =
         repair_terminal_turn_execution_windows(connection).await?;
     let (deleted_terminal_llm_context_rows, deleted_expired_llm_context_rows) =
@@ -23,6 +25,7 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
     info!(
         created_default_workspace,
         repaired_completed_turn_rows,
+        repaired_thread_foreground_status_rows,
         repaired_terminal_execution_window_rows,
         deleted_terminal_llm_context_rows,
         deleted_expired_llm_context_rows,
@@ -30,6 +33,14 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
         "gateway bootstrap completed"
     );
     Ok(())
+}
+
+async fn repair_thread_foreground_statuses(connection: &DatabaseConnection) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection.clone());
+    store
+        .reconcile_thread_foreground_statuses(chrono::Utc::now().fixed_offset().timestamp())
+        .await
+        .context("failed to reconcile thread foreground statuses during bootstrap")
 }
 
 async fn cleanup_turn_llm_context(connection: &DatabaseConnection) -> Result<(u64, u64)> {

@@ -1,5 +1,5 @@
 use super::*;
-use pioneer_protocol::{Thread, TurnStatus};
+use pioneer_protocol::{Thread, TurnKind, TurnStatus};
 
 impl Conversation {
     pub fn new(thread_id: impl Into<String>) -> Self {
@@ -113,7 +113,9 @@ impl Conversation {
                     .apply_local_turn_cancel_rejected(error.as_str());
             }
             ConversationEvent::TurnStarted { turn, .. } => {
-                self.pending_completion_turn_id = None;
+                if turn.turn_kind == TurnKind::Conversation {
+                    self.pending_completion_turn_id = None;
+                }
                 self.projector.apply_turn_started(&turn, ts_unix_ms);
             }
             ConversationEvent::TurnCompleted { turn, .. } => {
@@ -131,13 +133,17 @@ impl Conversation {
                 }
             }
             ConversationEvent::TurnFailed { turn, .. } => {
-                self.pending_completion_turn_id = None;
+                if turn.turn_kind == TurnKind::Conversation {
+                    self.pending_completion_turn_id = None;
+                }
                 if !self.state_machine.is_blocked_turn(turn.id.as_str()) {
                     self.projector.apply_turn_failed(&turn, ts_unix_ms);
                 }
             }
             ConversationEvent::TurnBlocked { turn, resume, .. } => {
-                self.pending_completion_turn_id = None;
+                if turn.turn_kind == TurnKind::Conversation {
+                    self.pending_completion_turn_id = None;
+                }
                 self.projector
                     .apply_turn_blocked(&turn, resume.as_ref(), ts_unix_ms);
             }
@@ -474,7 +480,12 @@ impl Conversation {
             return;
         }
 
-        let Some(turn) = thread.turns.last() else {
+        let Some(turn) = thread
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.turn_kind == TurnKind::Conversation)
+        else {
             return;
         };
 

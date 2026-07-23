@@ -1,5 +1,5 @@
 use super::events::ConversationEvent;
-use pioneer_protocol::TurnStatus;
+use pioneer_protocol::{TurnKind, TurnStatus};
 
 pub const DEFAULT_TURN_FAILED_ERROR: &str = "Turn failed";
 
@@ -161,7 +161,9 @@ impl TurnStateMachine {
                     };
                 }
             }
-            ConversationEvent::TurnStarted { turn, .. } => {
+            ConversationEvent::TurnStarted { turn, .. }
+                if turn.turn_kind == TurnKind::Conversation =>
+            {
                 if self.matches_turn(turn.id.as_str()) || self.can_start_new_turn() {
                     self.state = TurnFlowState::Running {
                         turn_id: turn.id.clone(),
@@ -187,7 +189,9 @@ impl TurnStateMachine {
                     };
                 }
             }
-            ConversationEvent::TurnCompleted { turn, .. } => {
+            ConversationEvent::TurnCompleted { turn, .. }
+                if turn.turn_kind == TurnKind::Conversation =>
+            {
                 if matches!(
                     &self.state,
                     TurnFlowState::Completed {
@@ -221,7 +225,9 @@ impl TurnStateMachine {
                     };
                 }
             }
-            ConversationEvent::TurnFailed { turn, .. } => {
+            ConversationEvent::TurnFailed { turn, .. }
+                if turn.turn_kind == TurnKind::Conversation =>
+            {
                 if matches!(
                     &self.state,
                     TurnFlowState::Blocked {
@@ -249,7 +255,9 @@ impl TurnStateMachine {
                     }
                 }
             }
-            ConversationEvent::TurnBlocked { turn, .. } => {
+            ConversationEvent::TurnBlocked { turn, .. }
+                if turn.turn_kind == TurnKind::Conversation =>
+            {
                 if self.matches_turn(turn.id.as_str()) || self.in_flight_turn_id().is_none() {
                     self.state = TurnFlowState::Blocked {
                         turn_id: turn.id.clone(),
@@ -324,11 +332,18 @@ impl TurnStateMachine {
                     };
                 }
             }
-            ConversationEvent::TurnPermissionAudit { .. } => {}
+            ConversationEvent::TurnStarted { .. }
+            | ConversationEvent::TurnCompleted { .. }
+            | ConversationEvent::TurnFailed { .. }
+            | ConversationEvent::TurnBlocked { .. }
+            | ConversationEvent::TurnPermissionAudit { .. } => {}
         }
     }
 
     pub fn sync_snapshot_turn(&mut self, turn: &pioneer_protocol::Turn) {
+        if turn.turn_kind != TurnKind::Conversation {
+            return;
+        }
         self.state = match turn.status {
             TurnStatus::InProgress => TurnFlowState::Running {
                 turn_id: turn.id.clone(),

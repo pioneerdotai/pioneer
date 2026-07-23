@@ -15,9 +15,9 @@ use pioneer_protocol::{
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
     TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTrigger,
     TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-    ThreadStatus, ToolPermissionPolicySnapshot, Turn, TurnBlockedNotification,
-    TurnCompletedNotification, TurnExecutionSecuritySnapshot, TurnFailedNotification, TurnKind,
-    TurnOrigin, TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStartParams,
+    ToolPermissionPolicySnapshot, Turn, TurnBlockedNotification, TurnCompletedNotification,
+    TurnExecutionSecuritySnapshot, TurnFailedNotification, TurnKind, TurnOrigin,
+    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStartParams,
     TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
@@ -2571,7 +2571,6 @@ async fn ensure_task_run_occurrence_turn(
     };
     let now = now_timestamp_secs();
     parent_thread.updated_at = now;
-    parent_thread.status = ThreadStatus::Active;
     parent_thread.turns.clear();
     let occurrence_turn = Turn {
         id: run.id.clone(),

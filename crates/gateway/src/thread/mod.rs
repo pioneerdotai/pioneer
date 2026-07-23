@@ -3,8 +3,8 @@ use pioneer_config::AppConfig;
 use pioneer_protocol::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStartedNotification,
-    ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, Turn, TurnStartParams,
-    TurnStartResponse, TurnStartedNotification, TurnStatus,
+    ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, Turn, TurnKind,
+    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
@@ -161,7 +161,7 @@ impl ThreadManager {
     /// turn rather than starting a new thread session.
     pub async fn system_thread_restore_persisted(
         &self,
-        thread: Thread,
+        mut thread: Thread,
         sandbox_mode: Option<SandboxMode>,
     ) -> Result<()> {
         let thread_id = thread.id.clone();
@@ -185,17 +185,11 @@ impl ThreadManager {
                     entry.thread.turns.push(turn);
                 }
             }
-            if entry
-                .thread
-                .turns
-                .iter()
-                .any(|turn| turn.status == TurnStatus::InProgress)
-            {
-                entry.thread.status = ThreadStatus::Active;
-            }
+            entry.thread.status = foreground_thread_status(&entry.thread);
             return Ok(());
         }
 
+        thread.status = foreground_thread_status(&thread);
         state.threads.insert(
             thread_id,
             ThreadEntry {
@@ -526,11 +520,7 @@ impl ThreadManager {
             bail!("connection `{connection_id}` is not subscribed to thread `{thread_id}`");
         }
 
-        let has_running_turn = entry
-            .thread
-            .turns
-            .iter()
-            .any(|turn| turn.status == TurnStatus::InProgress);
+        let has_running_turn = entry.thread.turns.iter().any(turn_owns_foreground);
 
         if has_running_turn {
             bail!("thread `{thread_id}` already has a running turn");
@@ -761,7 +751,7 @@ impl ThreadManager {
             return false;
         };
 
-        if !entry.connection_ids.is_empty() || has_in_progress_turn(&entry.thread) {
+        if !entry.connection_ids.is_empty() || has_in_progress_conversation_turn(&entry.thread) {
             return false;
         }
 
@@ -783,7 +773,8 @@ impl ThreadManager {
             let should_remove = match state.threads.get_mut(&thread_id) {
                 Some(entry) => {
                     entry.connection_ids.remove(&connection_id);
-                    entry.connection_ids.is_empty() && !has_in_progress_turn(&entry.thread)
+                    entry.connection_ids.is_empty()
+                        && !has_in_progress_conversation_turn(&entry.thread)
                 }
                 None => false,
             };
@@ -832,7 +823,7 @@ impl ThreadManager {
         }
 
         let should_remove_thread = state.threads.get(thread_id).is_some_and(|entry| {
-            entry.connection_ids.is_empty() && !has_in_progress_turn(&entry.thread)
+            entry.connection_ids.is_empty() && !has_in_progress_conversation_turn(&entry.thread)
         });
 
         let closed_notification = if should_remove_thread {
@@ -864,11 +855,20 @@ impl ThreadManager {
     }
 }
 
-fn has_in_progress_turn(thread: &Thread) -> bool {
-    thread
-        .turns
-        .iter()
-        .any(|turn| turn.status == TurnStatus::InProgress)
+fn turn_owns_foreground(turn: &Turn) -> bool {
+    turn.turn_kind == TurnKind::Conversation && turn.status == TurnStatus::InProgress
+}
+
+fn has_in_progress_conversation_turn(thread: &Thread) -> bool {
+    thread.turns.iter().any(turn_owns_foreground)
+}
+
+fn foreground_thread_status(thread: &Thread) -> ThreadStatus {
+    if has_in_progress_conversation_turn(thread) {
+        ThreadStatus::Active
+    } else {
+        ThreadStatus::Idle
+    }
 }
 
 fn thread_visible_to_connection(entry: &ThreadEntry, connection_id: Option<ConnectionId>) -> bool {
@@ -953,8 +953,9 @@ mod tests {
     use pioneer_protocol::{
         PermissionBehavior, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStartParams, ThreadStatus, ThreadUnsubscribeStatus, ToolPermissionPolicySnapshot,
-        TurnPermissionMode, TurnPermissionProfileSelection, TurnPermissionProfileSource,
-        TurnReasoningSelection, TurnStartParams, TurnStatus, UserInput,
+        TurnKind, TurnOrigin, TurnPermissionMode, TurnPermissionProfileSelection,
+        TurnPermissionProfileSource, TurnReasoningSelection, TurnStartParams, TurnStatus,
+        UserInput,
     };
 
     fn start_params(thread_id: &str) -> ThreadStartParams {
@@ -1175,6 +1176,94 @@ mod tests {
             .await
             .expect("restored turn should remain addressable");
         assert_eq!(turn.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn persisted_task_run_occurrence_does_not_block_new_conversation_turn() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let workspace_id = "ws_000000000000000001";
+        let thread_id = "thr_000000000000000122";
+        let task_turn_id = "run_0000000000000000122";
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: Some("restored detached task".to_owned()),
+            preview: "background work".to_owned(),
+            mode: ThreadMode::Agent,
+            model: "o4-mini".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_010,
+            // Legacy projections marked the parent active for this task turn.
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: vec![pioneer_protocol::Turn {
+                id: task_turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::TaskRun,
+                origin: TurnOrigin::DetachedTask,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            }],
+        };
+
+        manager
+            .system_thread_restore_persisted(thread, None)
+            .await
+            .expect("persisted task occurrence should restore");
+        assert_eq!(
+            manager
+                .thread_get(thread_id)
+                .await
+                .expect("restored parent should exist")
+                .status,
+            ThreadStatus::Idle
+        );
+
+        manager
+            .thread_start(10, workspace_id.to_owned(), start_params(thread_id))
+            .await
+            .expect("user should subscribe to restored parent");
+        let foreground = manager
+            .turn_start(
+                10,
+                TurnStartParams {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: "turn_000000000000000122".to_owned(),
+                    input: vec![UserInput::Text {
+                        text: "continue chatting".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: None,
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+            )
+            .await
+            .expect("detached task occurrence must not block a conversation turn");
+
+        assert_eq!(foreground.response.turn.turn_kind, TurnKind::Conversation);
+        assert_eq!(foreground.response.turn.status, TurnStatus::InProgress);
+        assert_eq!(
+            manager
+                .turn_get(thread_id, task_turn_id)
+                .await
+                .expect("task occurrence should remain independently in progress")
+                .1
+                .status,
+            TurnStatus::InProgress
+        );
     }
 
     #[tokio::test]
