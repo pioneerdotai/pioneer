@@ -3457,6 +3457,11 @@ async fn task_turn_item_from_response_with_run(
         root_task_id: task.root_task_id.clone(),
         title: task.title.clone(),
         status: task.status,
+        attachment: task
+            .lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment)
+            .unwrap_or(TaskAttachmentMode::Detached),
         trigger_kind: trigger
             .map(TaskTrigger::kind)
             .unwrap_or(TaskTriggerKind::Manual),
@@ -4106,6 +4111,7 @@ mod tests {
             root_task_id: None,
             title: "Daily Weather Forecast".to_owned(),
             status: TaskStatus::Scheduled,
+            attachment: TaskAttachmentMode::Detached,
             trigger_kind: TaskTriggerKind::Cron,
             executor_kind: TaskExecutorKind::Agent,
             child_thread_id: None,

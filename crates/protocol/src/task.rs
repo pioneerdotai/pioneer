@@ -434,9 +434,10 @@ pub enum TaskOwnerKind {
     System,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAttachmentMode {
+    #[default]
     Attached,
     Detached,
 }
@@ -2775,6 +2776,8 @@ pub struct TaskTurnItem {
     pub root_task_id: Option<String>,
     pub title: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub attachment: TaskAttachmentMode,
     pub trigger_kind: TaskTriggerKind,
     pub executor_kind: TaskExecutorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2897,6 +2900,7 @@ mod tests {
             root_task_id: Some("task_root".to_owned()),
             title: "Check weather".to_owned(),
             status: TaskStatus::Scheduled,
+            attachment: super::TaskAttachmentMode::Detached,
             trigger_kind: TaskTriggerKind::ScheduledAt,
             executor_kind: TaskExecutorKind::Agent,
             child_thread_id: None,
@@ -2914,6 +2918,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&item).expect("item should encode");
         assert_eq!(encoded["taskId"], json!("task_1"));
+        assert_eq!(encoded["attachment"], json!("detached"));
         assert_eq!(encoded["triggerKind"], json!("scheduled_at"));
 
         let decoded: TaskTurnItem = serde_json::from_value(encoded).expect("item should decode");

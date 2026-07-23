@@ -15,12 +15,13 @@ use crate::repositories::cli_runtime_binding::{
 };
 use crate::repositories::thread_timeline_projection as timeline_repository;
 use crate::repositories::{thread, turn};
-use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row};
+use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row_for_turn};
 use crate::timeline_projection_model::{
     ItemEventOrder, approval_block_id, assistant_block_id, classification_metadata_json,
-    elapsed_ms, terminal_completed_at, terminal_state_block_id, terminal_turn_state,
-    turn_block_sort_key, turn_work_presentation, turn_work_state, user_block_id, work_block_id,
-    work_item_order_key, work_item_projection_id,
+    detached_task_run_block_id, elapsed_ms, terminal_completed_at, terminal_state_block_id,
+    terminal_turn_state, timeline_event_block_sort_key, turn_block_sort_key,
+    turn_work_presentation, turn_work_state, user_block_id, work_block_id, work_item_order_key,
+    work_item_projection_id,
 };
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
@@ -202,6 +203,16 @@ async fn project_turn_started<C: ConnectionTrait>(
         .await?;
     }
 
+    if detached_task_run_origin_hint(&turn_model) {
+        timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            work_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        return Ok(());
+    }
+
     refresh_turn_work_summary(
         db,
         &thread_model,
@@ -219,6 +230,10 @@ async fn project_terminal_turn_state<C: ConnectionTrait>(
     projected_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     let block_id = terminal_state_block_id(turn_model.id.as_str());
+    if turn_has_detached_task_run_block(db, turn_model.id.as_str()).await? {
+        timeline_repository::delete_thread_timeline_block(db, block_id.as_str()).await?;
+        return Ok(());
+    }
     let has_final = timeline_repository::count_thread_timeline_blocks_for_turn_kind(
         db,
         turn_model.id.as_str(),
@@ -300,7 +315,7 @@ async fn project_turn_item_event<C: ConnectionTrait>(
     };
 
     let refresh_work_summary = !matches!(
-        classify_turn_item_row(&item_model).placement,
+        classify_turn_item_row_for_turn(&item_model, &turn_model).placement,
         ProjectionPlacement::TopLevelUserMessage
     );
 
@@ -347,7 +362,7 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
     };
 
     let refresh_work_summary = !matches!(
-        classify_turn_item_row(&item_model).placement,
+        classify_turn_item_row_for_turn(&item_model, &turn_model).placement,
         ProjectionPlacement::TopLevelUserMessage
     );
 
@@ -434,10 +449,20 @@ async fn project_turn_item_row<C: ConnectionTrait>(
     item_model: &turn_item_entity::Model,
     event: &AppendedTurnEvent,
 ) -> Result<()> {
-    let classification = classify_turn_item_row(item_model);
+    let classification = classify_turn_item_row_for_turn(item_model, turn_model);
 
     match classification.placement {
         ProjectionPlacement::TopLevelUserMessage => {}
+        ProjectionPlacement::TopLevelDetachedTaskRun => {
+            project_detached_task_run_block(
+                db,
+                thread_model,
+                turn_model,
+                item_model,
+                event.created_at,
+            )
+            .await?;
+        }
         ProjectionPlacement::TopLevelAssistantMessage => {
             let source_order =
                 resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
@@ -459,7 +484,18 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                    sort_key: turn_block_sort_key(&turn_model, 200, order_key.as_str()),
+                    sort_key: if turn_has_detached_task_run_block(db, turn_model.id.as_str())
+                        .await?
+                    {
+                        timeline_event_block_sort_key(
+                            item_model.created_at,
+                            turn_model.id.as_str(),
+                            200,
+                            order_key.as_str(),
+                        )
+                    } else {
+                        turn_block_sort_key(turn_model, 200, order_key.as_str())
+                    },
                     source_kind: Some("turn_item".to_owned()),
                     source_key: Some(item_model.item_id.clone()),
                     started_at: Some(item_model.created_at),
@@ -530,10 +566,14 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
     source_sequence: i64,
     refreshed_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    let classification = classify_turn_item_row(item_model);
+    let classification = classify_turn_item_row_for_turn(item_model, turn_model);
 
     match classification.placement {
         ProjectionPlacement::TopLevelUserMessage => {}
+        ProjectionPlacement::TopLevelDetachedTaskRun => {
+            project_detached_task_run_block(db, thread_model, turn_model, item_model, refreshed_at)
+                .await?;
+        }
         ProjectionPlacement::TopLevelAssistantMessage => {
             let source_order = resolve_snapshot_item_source_order(
                 db,
@@ -560,7 +600,18 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                    sort_key: turn_block_sort_key(&turn_model, 200, order_key.as_str()),
+                    sort_key: if turn_has_detached_task_run_block(db, turn_model.id.as_str())
+                        .await?
+                    {
+                        timeline_event_block_sort_key(
+                            item_model.created_at,
+                            turn_model.id.as_str(),
+                            200,
+                            order_key.as_str(),
+                        )
+                    } else {
+                        turn_block_sort_key(turn_model, 200, order_key.as_str())
+                    },
                     source_kind: Some("turn_item".to_owned()),
                     source_key: Some(item_model.item_id.clone()),
                     started_at: Some(item_model.created_at),
@@ -628,6 +679,80 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
     }
 
     Ok(())
+}
+
+async fn project_detached_task_run_block<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &thread_entity::Model,
+    turn_model: &turn_entity::Model,
+    item_model: &turn_item_entity::Model,
+    projected_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    timeline_repository::delete_turn_work_item_projection_for_item(
+        db,
+        turn_model.id.as_str(),
+        item_model.item_id.as_str(),
+    )
+    .await?;
+    timeline_repository::delete_thread_timeline_block(
+        db,
+        assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
+    )
+    .await?;
+    timeline_repository::upsert_thread_timeline_block(
+        db,
+        ThreadTimelineBlockRecord {
+            block_id: detached_task_run_block_id(
+                turn_model.id.as_str(),
+                item_model.item_id.as_str(),
+            ),
+            workspace_id: thread_model.workspace_id.clone(),
+            thread_id: thread_model.id.clone(),
+            turn_id: Some(turn_model.id.clone()),
+            block_kind: timeline_repository::BLOCK_KIND_DETACHED_TASK_RUN.to_owned(),
+            sort_key: turn_block_sort_key(
+                turn_model,
+                100,
+                format!("detached-task-run:{}", item_model.item_id).as_str(),
+            ),
+            source_kind: Some("turn_item".to_owned()),
+            source_key: Some(item_model.item_id.clone()),
+            started_at: Some(item_model.created_at),
+            completed_at: None,
+            metadata_json: json!({
+                "turnId": turn_model.id,
+                "itemId": item_model.item_id,
+                "attachment": "detached",
+            })
+            .to_string(),
+            created_at: item_model.created_at,
+            updated_at: projected_at,
+        },
+    )
+    .await
+}
+
+async fn turn_has_detached_task_run_block<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<bool> {
+    Ok(
+        timeline_repository::count_thread_timeline_blocks_for_turn_kind(
+            db,
+            turn_id,
+            timeline_repository::BLOCK_KIND_DETACHED_TASK_RUN,
+        )
+        .await?
+            > 0,
+    )
+}
+
+fn detached_task_run_origin_hint(turn_model: &turn_entity::Model) -> bool {
+    turn_model.turn_kind == "task_run"
+        && matches!(
+            turn_model.origin.as_str(),
+            "scheduled_task" | "detached_task"
+        )
 }
 
 async fn resolve_item_source_order<C: ConnectionTrait>(
@@ -707,7 +832,9 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     )
     .await?
         > 0;
-    let needs_work_block = work_count > 0 || !has_final;
+    let has_detached_task_run =
+        turn_has_detached_task_run_block(db, turn_model.id.as_str()).await?;
+    let needs_work_block = work_count > 0 || (!has_final && !has_detached_task_run);
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;

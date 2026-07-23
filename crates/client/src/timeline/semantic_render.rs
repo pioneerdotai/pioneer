@@ -12,8 +12,9 @@ use crate::{
     },
 };
 use pioneer_protocol::{
-    AgentMessagePhase, SystemEventLevel, TimelineBlock, TimelineBlockKind, TurnItem, TurnItemType,
-    TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkPresentation, TurnWorkState,
+    AgentMessagePhase, SystemEventLevel, TaskStatus, TimelineBlock, TimelineBlockKind, TurnItem,
+    TurnItemType, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkPresentation,
+    TurnWorkState,
 };
 use std::collections::HashMap;
 
@@ -88,6 +89,9 @@ fn push_semantic_row(
             ..
         } => push_work_header(rows, block, work, *expanded),
         SemanticTimelineRowKind::WorkItem { item } => push_work_item(projection, rows, item),
+        SemanticTimelineRowKind::DetachedTaskRun { block } => {
+            push_detached_task_run(projection, rows, block);
+        }
         SemanticTimelineRowKind::AssistantMessage { block } => {
             push_assistant_block(projection, rows, block);
         }
@@ -236,6 +240,45 @@ fn push_work_item(
                 .flatten(),
             item: item.item.clone(),
             opaque_meta: item.metadata.clone(),
+        },
+    );
+}
+
+fn push_detached_task_run(
+    projection: &mut ConversationViewState,
+    rows: &mut Vec<TimelineRow>,
+    block: &TimelineBlock,
+) {
+    let TimelineBlockKind::DetachedTaskRun { task } = &block.kind else {
+        return;
+    };
+    let turn_id = block.turn_id.as_deref().unwrap_or(block.block_id.as_str());
+    let status = task_timeline_entry_status(task.status);
+    let terminal = task.status.is_terminal();
+    push_item_row(
+        projection,
+        rows,
+        ItemRowInput {
+            entry_id: block.block_id.clone(),
+            item_id: task.id.clone(),
+            turn_id: turn_id.to_owned(),
+            item_type: "task".to_owned(),
+            status,
+            started_at_unix_ms: block.started_at_unix_ms.or(Some(task.created_at)),
+            updated_at_unix_ms: block.updated_at_unix_ms.or(Some(task.updated_at)),
+            completed_at_unix_ms: terminal
+                .then(|| block.updated_at_unix_ms.or(Some(task.updated_at)))
+                .flatten(),
+            partial_text: task.title.clone(),
+            final_text: terminal.then(|| task.title.clone()),
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::Task { item: task.clone() },
+            opaque_meta: Some(serde_json::json!({
+                "attachment": "detached",
+                "taskId": task.task_id,
+                "runId": task.run_id,
+            })),
         },
     );
 }
@@ -418,6 +461,7 @@ fn semantic_row_turn_id(row: &SemanticTimelineRow) -> Option<&str> {
         SemanticTimelineRowKind::WorkHeader { work, .. } => Some(work.turn_id.as_str()),
         SemanticTimelineRowKind::WorkItem { item } => Some(item.turn_id.as_str()),
         SemanticTimelineRowKind::UserBlock { block }
+        | SemanticTimelineRowKind::DetachedTaskRun { block }
         | SemanticTimelineRowKind::AssistantMessage { block }
         | SemanticTimelineRowKind::PendingRequest { block }
         | SemanticTimelineRowKind::TurnState { block } => block.turn_id.as_deref(),
@@ -435,6 +479,21 @@ fn work_item_status(status: TurnWorkItemStatus) -> TimelineEntryStatus {
         TurnWorkItemStatus::Blocked => TimelineEntryStatus::Blocked,
         TurnWorkItemStatus::Failed => TimelineEntryStatus::Failed,
         TurnWorkItemStatus::Cancelled => TimelineEntryStatus::Cancelled,
+    }
+}
+
+fn task_timeline_entry_status(status: TaskStatus) -> TimelineEntryStatus {
+    match status {
+        TaskStatus::Completed => TimelineEntryStatus::Completed,
+        TaskStatus::Blocked => TimelineEntryStatus::Blocked,
+        TaskStatus::Failed => TimelineEntryStatus::Failed,
+        TaskStatus::Cancelled => TimelineEntryStatus::Cancelled,
+        TaskStatus::Draft
+        | TaskStatus::Scheduled
+        | TaskStatus::Queued
+        | TaskStatus::Running
+        | TaskStatus::Waiting
+        | TaskStatus::WaitingReview => TimelineEntryStatus::Running,
     }
 }
 
@@ -493,7 +552,8 @@ mod tests {
     use super::*;
     use crate::conversation::ConversationViewState;
     use pioneer_protocol::{
-        MarkdownDocument, TimelineCursor, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
+        MarkdownDocument, TaskAttachmentMode, TaskExecutorKind, TaskTriggerKind, TaskTurnItem,
+        TimelineCursor, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
         TurnPermissionProfileSource, TurnStatus,
     };
 
@@ -518,6 +578,42 @@ mod tests {
             Some(markdown.clone())
         );
         assert_eq!(model.projection.items[0].final_markdown, Some(markdown));
+    }
+
+    #[test]
+    fn detached_task_run_renders_as_a_standalone_task_card() {
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::DetachedTaskRun {
+                block: detached_task_run_block(TaskStatus::Running),
+            })],
+            ConversationViewState::default(),
+        );
+
+        assert_eq!(model.rows.len(), 1);
+        assert!(matches!(
+            &model.rows[0],
+            TimelineRow {
+                kind: TimelineRowKind::Item { timeline_index: 0 },
+                ..
+            }
+        ));
+        assert_eq!(model.projection.items.len(), 1);
+        assert_eq!(
+            model.projection.items[0].status,
+            TimelineEntryStatus::Running
+        );
+        assert!(matches!(
+            &model.projection.items[0].item,
+            TurnItem::Task { item }
+                if item.attachment == TaskAttachmentMode::Detached
+                    && item.progress_preview.as_deref() == Some("Collecting sources")
+        ));
+        assert!(
+            model
+                .rows
+                .iter()
+                .all(|row| !matches!(row.kind, TimelineRowKind::TurnWorkToggle(_)))
+        );
     }
 
     #[test]
@@ -748,6 +844,43 @@ mod tests {
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
                 markdown,
+            },
+        }
+    }
+
+    fn detached_task_run_block(status: TaskStatus) -> TimelineBlock {
+        TimelineBlock {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            block_id: "block_detached_task".to_owned(),
+            turn_id: Some("task_turn_a".to_owned()),
+            sort_key: "002".to_owned(),
+            started_at_unix_ms: Some(2),
+            updated_at_unix_ms: Some(3),
+            kind: TimelineBlockKind::DetachedTaskRun {
+                task: TaskTurnItem {
+                    id: "task_anchor_a".to_owned(),
+                    task_id: "task_a".to_owned(),
+                    run_id: Some("run_a".to_owned()),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: "Background analysis".to_owned(),
+                    status,
+                    attachment: TaskAttachmentMode::Detached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: Some("child_a".to_owned()),
+                    child_turn_id: Some("child_turn_a".to_owned()),
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: Some("Collecting sources".to_owned()),
+                    result_preview: None,
+                    error_preview: None,
+                    created_at: 2,
+                    updated_at: 3,
+                },
             },
         }
     }

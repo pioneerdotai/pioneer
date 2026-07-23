@@ -1,11 +1,12 @@
 use super::*;
 use pioneer_crud::{
     ProjectionPlacement, ProjectionVisibility, approval_block_id, assistant_block_id,
-    classify_turn_item_with_db_status, user_block_id, work_block_id, work_item_projection_id,
+    classify_turn_item_with_db_status, detached_task_run_block_id, user_block_id, work_block_id,
+    work_item_projection_id,
 };
 use pioneer_protocol::{
-    ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
-    TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
+    TaskAttachmentMode, ThreadTimelineBlocksChangedNotification, TimelineChangeReason, TurnKind,
+    TurnOrigin, TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
 };
 
 impl MessageProcessor {
@@ -19,25 +20,42 @@ impl MessageProcessor {
     ) {
         let classification = classify_turn_item_with_db_status(item, db_status);
         let item_id = item.item_id();
+        let detached_task_run = self.is_detached_task_run_turn(thread_id, turn_id).await;
         let mut changed_block_ids = Vec::new();
+        let mut removed_block_ids = Vec::new();
         let mut changed_work_item_ids = Vec::new();
         let mut removed_work_item_ids = Vec::new();
         let mut notify_work_state = false;
 
         match classification.placement {
+            ProjectionPlacement::TopLevelDetachedTaskRun => {
+                changed_block_ids.push(detached_task_run_block_id(turn_id, item_id));
+                removed_block_ids.push(work_block_id(turn_id));
+                removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
+            }
             ProjectionPlacement::TopLevelAssistantMessage => {
-                notify_work_state = true;
-                changed_block_ids.push(work_block_id(turn_id));
+                notify_work_state = !detached_task_run;
+                if detached_task_run {
+                    removed_block_ids.push(work_block_id(turn_id));
+                } else {
+                    changed_block_ids.push(work_block_id(turn_id));
+                }
                 changed_block_ids.push(assistant_block_id(turn_id, item_id));
                 removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
             }
             ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
-                notify_work_state = true;
-                changed_block_ids.push(work_block_id(turn_id));
-                if classification.visibility == ProjectionVisibility::Visible {
-                    changed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
-                } else {
+                if detached_task_run && matches!(item, TurnItem::Task { .. }) {
+                    changed_block_ids.push(detached_task_run_block_id(turn_id, item_id));
+                    removed_block_ids.push(work_block_id(turn_id));
                     removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
+                } else {
+                    notify_work_state = true;
+                    changed_block_ids.push(work_block_id(turn_id));
+                    if classification.visibility == ProjectionVisibility::Visible {
+                        changed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
+                    } else {
+                        removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
+                    }
                 }
             }
             ProjectionPlacement::TopLevelUserMessage => {
@@ -49,7 +67,7 @@ impl MessageProcessor {
             workspace_id,
             thread_id,
             changed_block_ids,
-            Vec::new(),
+            removed_block_ids,
         )
         .await;
         if !changed_work_item_ids.is_empty() || !removed_work_item_ids.is_empty() {
@@ -74,6 +92,16 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
+        if self.is_detached_task_run_turn(thread_id, turn_id).await {
+            self.notify_semantic_timeline_blocks_changed(
+                workspace_id,
+                thread_id,
+                Vec::new(),
+                vec![work_block_id(turn_id)],
+            )
+            .await;
+            return;
+        }
         self.notify_semantic_timeline_blocks_changed(
             workspace_id,
             thread_id,
@@ -83,6 +111,32 @@ impl MessageProcessor {
         .await;
         self.notify_semantic_turn_work_state_changed(workspace_id, thread_id, turn_id)
             .await;
+    }
+
+    async fn is_detached_task_run_turn(&self, thread_id: &str, turn_id: &str) -> bool {
+        let Ok(Some((_, turn))) = self.crud_store.get_turn(thread_id, turn_id).await else {
+            return false;
+        };
+        if turn.turn_kind != TurnKind::TaskRun {
+            return false;
+        }
+
+        if let Ok(items) = self
+            .crud_store
+            .list_turn_items_by_type(turn_id, "task")
+            .await
+            && let Some(attachment) = items.iter().find_map(|item| match item {
+                TurnItem::Task { item } => Some(item.attachment),
+                _ => None,
+            })
+        {
+            return attachment == TaskAttachmentMode::Detached;
+        }
+
+        matches!(
+            turn.origin,
+            TurnOrigin::ScheduledTask | TurnOrigin::DetachedTask
+        )
     }
 
     pub(super) async fn notify_semantic_timeline_work_item_id_changed(

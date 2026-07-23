@@ -6,10 +6,10 @@
 
 use crate::conversation::ConversationEvent;
 use pioneer_protocol::{
-    AgentMessagePhase, ItemDeltaStream, MarkdownDocument, SystemEventLevel,
+    AgentMessagePhase, ItemDeltaStream, MarkdownDocument, SystemEventLevel, TaskAttachmentMode,
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
-    TurnItem, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TurnItem, TurnKind, TurnOrigin, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
     TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
     TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
     TurnWorkStateChangedNotification, UserMessageAttachment,
@@ -59,6 +59,9 @@ pub enum SemanticTimelineRowKind {
     },
     WorkItem {
         item: TurnWorkItem,
+    },
+    DetachedTaskRun {
+        block: TimelineBlock,
     },
     AssistantMessage {
         block: TimelineBlock,
@@ -452,6 +455,9 @@ pub struct ThreadSemanticTimelineState {
     pub top_level: TopLevelTimelineCache,
     pub work_ranges_by_turn: HashMap<TurnId, TurnWorkRangeCache>,
     pub expansion: TimelineExpansionState,
+    #[serde(skip)]
+    #[cfg_attr(any(feature = "schema", test), schemars(skip))]
+    detached_task_run_turn_ids: HashSet<TurnId>,
 }
 
 impl ThreadSemanticTimelineState {
@@ -614,6 +620,14 @@ pub fn flatten_thread_semantic_timeline(
                     );
                 }
             }
+            TimelineBlockKind::DetachedTaskRun { .. } => rows.push(SemanticTimelineRow {
+                id: SemanticTimelineRowId::TopLevelBlock {
+                    block_id: block.block_id.clone(),
+                },
+                kind: SemanticTimelineRowKind::DetachedTaskRun {
+                    block: block.clone(),
+                },
+            }),
             TimelineBlockKind::AssistantMessage { .. } => rows.push(SemanticTimelineRow {
                 id: SemanticTimelineRowId::TopLevelBlock {
                     block_id: block.block_id.clone(),
@@ -855,8 +869,28 @@ pub fn apply_thread_timeline_page(
     merge_mode: TopLevelPageMergeMode,
 ) -> bool {
     let thread_id = page.thread_id.clone();
+    let detached_turn_ids = page
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { .. })
+                .then(|| block.turn_id.clone())
+                .flatten()
+        })
+        .collect::<HashSet<_>>();
     let thread = state.thread_mut(thread_id);
-    apply_top_level_page(&mut thread.top_level, page, merge_mode)
+    let before = thread.clone();
+    if merge_mode == TopLevelPageMergeMode::Reset {
+        thread.detached_task_run_turn_ids.clear();
+    }
+    thread
+        .detached_task_run_turn_ids
+        .extend(detached_turn_ids.iter().cloned());
+    apply_top_level_page(&mut thread.top_level, page, merge_mode);
+    for turn_id in detached_turn_ids {
+        remove_detached_task_run_work_state(thread, turn_id.as_str());
+    }
+    before != *thread
 }
 
 pub fn apply_top_level_page(
@@ -980,10 +1014,6 @@ pub fn apply_conversation_event_to_semantic_timeline(
         ),
         ConversationEvent::LocalTurnStartAccepted {
             thread_id, turn_id, ..
-        }
-        | ConversationEvent::TurnStarted {
-            thread_id,
-            turn: Turn { id: turn_id, .. },
         } => apply_turn_state_to_semantic_timeline(
             state,
             workspace_id,
@@ -993,6 +1023,15 @@ pub fn apply_conversation_event_to_semantic_timeline(
             None,
             now_unix_ms,
         ),
+        ConversationEvent::TurnStarted { thread_id, turn } => {
+            apply_started_turn_to_semantic_timeline(
+                state,
+                workspace_id,
+                thread_id,
+                turn,
+                now_unix_ms,
+            )
+        }
         ConversationEvent::LocalTurnStartRejected {
             thread_id,
             turn_id,
@@ -1007,7 +1046,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
             now_unix_ms,
         ),
         ConversationEvent::TurnCompleted { thread_id, turn } => {
-            apply_terminal_turn_to_semantic_timeline(
+            apply_terminal_or_detached_turn_to_semantic_timeline(
                 state,
                 workspace_id,
                 thread_id,
@@ -1017,7 +1056,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
             )
         }
         ConversationEvent::TurnFailed { thread_id, turn } => {
-            apply_terminal_turn_to_semantic_timeline(
+            apply_terminal_or_detached_turn_to_semantic_timeline(
                 state,
                 workspace_id,
                 thread_id,
@@ -1028,7 +1067,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
         }
         ConversationEvent::TurnBlocked {
             thread_id, turn, ..
-        } => apply_terminal_turn_to_semantic_timeline(
+        } => apply_terminal_or_detached_turn_to_semantic_timeline(
             state,
             workspace_id,
             thread_id,
@@ -1141,6 +1180,58 @@ fn apply_local_turn_start_requested_to_semantic_timeline(
         now_unix_ms,
     );
     before != *thread
+}
+
+fn apply_started_turn_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn: &Turn,
+    now_unix_ms: i64,
+) -> bool {
+    if !turn_is_detached_task_run(turn) {
+        return apply_turn_state_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn.id.as_str(),
+            TurnWorkState::Running,
+            None,
+            now_unix_ms,
+        );
+    }
+
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    thread.detached_task_run_turn_ids.insert(turn.id.clone());
+    remove_detached_task_run_work_state(thread, turn.id.as_str());
+    before != *thread
+}
+
+fn apply_terminal_or_detached_turn_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn: &Turn,
+    fallback_state: TurnWorkState,
+    now_unix_ms: i64,
+) -> bool {
+    if turn_is_detached_task_run(turn) {
+        let thread = state.thread_mut(thread_id.to_owned());
+        let before = thread.clone();
+        thread.detached_task_run_turn_ids.insert(turn.id.clone());
+        remove_detached_task_run_work_state(thread, turn.id.as_str());
+        return before != *thread;
+    }
+
+    apply_terminal_turn_to_semantic_timeline(
+        state,
+        workspace_id,
+        thread_id,
+        turn,
+        fallback_state,
+        now_unix_ms,
+    )
 }
 
 fn apply_turn_state_to_semantic_timeline(
@@ -1277,7 +1368,8 @@ fn apply_item_started_to_semantic_timeline(
 ) -> bool {
     let thread = state.thread_mut(thread_id.to_owned());
     let before = thread.clone();
-    match live_item_placement(item) {
+    reconcile_task_attachment_marker(thread, turn_id, item);
+    match live_item_placement(thread, turn_id, item) {
         LiveItemPlacement::TopLevelUser => {
             let TurnItem::UserMessage {
                 id,
@@ -1310,16 +1402,32 @@ fn apply_item_started_to_semantic_timeline(
                 now_unix_ms,
             );
             remove_terminal_state_block(thread, turn_id);
-            upsert_turn_work_summary(
+            if thread_has_detached_task_run(thread, turn_id) {
+                remove_detached_task_run_work_state(thread, turn_id);
+            } else {
+                upsert_turn_work_summary(
+                    thread,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    TurnWorkState::Running,
+                    TurnWorkPresentation::CollapsedAfterFinal,
+                    None,
+                    now_unix_ms,
+                );
+            }
+        }
+        LiveItemPlacement::DetachedTaskRun => {
+            remove_turn_work_item(thread, turn_id, item.item_id());
+            upsert_detached_task_run_block(
                 thread,
                 workspace_id,
                 thread_id,
                 turn_id,
-                TurnWorkState::Running,
-                TurnWorkPresentation::CollapsedAfterFinal,
-                None,
+                item,
                 now_unix_ms,
             );
+            remove_detached_task_run_work_state(thread, turn_id);
         }
         LiveItemPlacement::TurnWork => {
             upsert_turn_work_item(
@@ -1440,7 +1548,8 @@ fn apply_item_completed_to_semantic_timeline(
 ) -> bool {
     let thread = state.thread_mut(thread_id.to_owned());
     let before = thread.clone();
-    match live_item_placement(item) {
+    reconcile_task_attachment_marker(thread, turn_id, item);
+    match live_item_placement(thread, turn_id, item) {
         LiveItemPlacement::TopLevelUser => {
             if let TurnItem::UserMessage {
                 id,
@@ -1472,16 +1581,32 @@ fn apply_item_completed_to_semantic_timeline(
                 now_unix_ms,
             );
             remove_terminal_state_block(thread, turn_id);
-            upsert_turn_work_summary(
+            if thread_has_detached_task_run(thread, turn_id) {
+                remove_detached_task_run_work_state(thread, turn_id);
+            } else {
+                upsert_turn_work_summary(
+                    thread,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    TurnWorkState::Running,
+                    TurnWorkPresentation::CollapsedAfterFinal,
+                    None,
+                    now_unix_ms,
+                );
+            }
+        }
+        LiveItemPlacement::DetachedTaskRun => {
+            remove_turn_work_item(thread, turn_id, item.item_id());
+            upsert_detached_task_run_block(
                 thread,
                 workspace_id,
                 thread_id,
                 turn_id,
-                TurnWorkState::Running,
-                TurnWorkPresentation::CollapsedAfterFinal,
-                None,
+                item,
                 now_unix_ms,
             );
+            remove_detached_task_run_work_state(thread, turn_id);
         }
         LiveItemPlacement::TurnWork => {
             upsert_turn_work_item(
@@ -1936,14 +2061,25 @@ fn semantic_timeline_cache_patch_from_diff(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveItemPlacement {
     TopLevelUser,
+    DetachedTaskRun,
     TurnWork,
     TopLevelAssistant,
     Hidden,
 }
 
-fn live_item_placement(item: &TurnItem) -> LiveItemPlacement {
+fn live_item_placement(
+    thread: &ThreadSemanticTimelineState,
+    turn_id: &str,
+    item: &TurnItem,
+) -> LiveItemPlacement {
     match item {
         TurnItem::UserMessage { .. } => LiveItemPlacement::TopLevelUser,
+        TurnItem::Task { item }
+            if item.attachment == TaskAttachmentMode::Detached
+                && thread_has_detached_task_run(thread, turn_id) =>
+        {
+            LiveItemPlacement::DetachedTaskRun
+        }
         TurnItem::AgentMessage { phase, .. } if matches!(phase, AgentMessagePhase::FinalAnswer) => {
             LiveItemPlacement::TopLevelAssistant
         }
@@ -2040,6 +2176,10 @@ fn work_block_id(turn_id: &str) -> String {
     format!("turn:{turn_id}:work")
 }
 
+fn detached_task_run_block_id(turn_id: &str, item_id: &str) -> String {
+    format!("turn:{turn_id}:detached-task-run:{item_id}")
+}
+
 fn assistant_block_id(turn_id: &str, item_id: &str) -> String {
     format!("turn:{turn_id}:assistant:{item_id}")
 }
@@ -2078,6 +2218,15 @@ fn turn_block_sort_key(
         rank,
         suffix
     )
+}
+
+fn timeline_event_block_sort_key(
+    turn_id: &str,
+    rank: u16,
+    suffix: &str,
+    now_unix_ms: i64,
+) -> String {
+    format!("{:020}:{turn_id}:{rank:03}:{suffix}", now_unix_ms.max(0))
 }
 
 fn work_item_order_key(
@@ -2166,13 +2315,12 @@ fn upsert_assistant_message_block(
         sort_key: existing
             .map(|block| block.sort_key.clone())
             .unwrap_or_else(|| {
-                turn_block_sort_key(
-                    thread,
-                    turn_id,
-                    200,
-                    work_item_order_key(thread.work_range(turn_id), id, now_unix_ms).as_str(),
-                    now_unix_ms,
-                )
+                let order_key = work_item_order_key(thread.work_range(turn_id), id, now_unix_ms);
+                if thread_has_detached_task_run(thread, turn_id) {
+                    timeline_event_block_sort_key(turn_id, 200, order_key.as_str(), now_unix_ms)
+                } else {
+                    turn_block_sort_key(thread, turn_id, 200, order_key.as_str(), now_unix_ms)
+                }
             }),
         started_at_unix_ms: existing
             .and_then(|block| block.started_at_unix_ms)
@@ -2186,6 +2334,91 @@ fn upsert_assistant_message_block(
         },
     };
     upsert_top_level_block(thread, block);
+}
+
+fn upsert_detached_task_run_block(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: &TurnItem,
+    now_unix_ms: i64,
+) {
+    let TurnItem::Task { item: task } = item else {
+        return;
+    };
+    thread.detached_task_run_turn_ids.insert(turn_id.to_owned());
+    let block_id = detached_task_run_block_id(turn_id, task.id.as_str());
+    let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let block = TimelineBlock {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        block_id,
+        turn_id: Some(turn_id.to_owned()),
+        sort_key: existing
+            .map(|block| block.sort_key.clone())
+            .unwrap_or_else(|| {
+                turn_block_sort_key(
+                    thread,
+                    turn_id,
+                    100,
+                    format!("detached-task-run:{}", task.id).as_str(),
+                    now_unix_ms,
+                )
+            }),
+        started_at_unix_ms: existing
+            .and_then(|block| block.started_at_unix_ms)
+            .or(Some(now_unix_ms)),
+        updated_at_unix_ms: Some(now_unix_ms),
+        kind: TimelineBlockKind::DetachedTaskRun { task: task.clone() },
+    };
+    upsert_top_level_block(thread, block);
+}
+
+fn remove_detached_task_run_work_state(thread: &mut ThreadSemanticTimelineState, turn_id: &str) {
+    thread.work_ranges_by_turn.remove(turn_id);
+    thread
+        .top_level
+        .blocks_by_id
+        .remove(work_block_id(turn_id).as_str());
+    thread
+        .top_level
+        .blocks_by_id
+        .remove(terminal_state_block_id(turn_id).as_str());
+    thread
+        .top_level
+        .ordered_block_ids
+        .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
+    thread.expansion.clear_turn_work_override(turn_id);
+    sort_top_level_blocks(&mut thread.top_level);
+}
+
+fn reconcile_task_attachment_marker(
+    thread: &mut ThreadSemanticTimelineState,
+    turn_id: &str,
+    item: &TurnItem,
+) {
+    if let TurnItem::Task { item } = item
+        && item.attachment == TaskAttachmentMode::Attached
+    {
+        thread.detached_task_run_turn_ids.remove(turn_id);
+    }
+}
+
+fn thread_has_detached_task_run(thread: &ThreadSemanticTimelineState, turn_id: &str) -> bool {
+    thread.detached_task_run_turn_ids.contains(turn_id)
+        || thread.top_level.blocks_by_id.values().any(|block| {
+            block.turn_id.as_deref() == Some(turn_id)
+                && matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { .. })
+        })
+}
+
+fn turn_is_detached_task_run(turn: &Turn) -> bool {
+    turn.turn_kind == TurnKind::TaskRun
+        && matches!(
+            &turn.origin,
+            TurnOrigin::ScheduledTask | TurnOrigin::DetachedTask
+        )
 }
 
 fn upsert_terminal_state_block(
@@ -2613,6 +2846,7 @@ fn turn_span(flattened: &SemanticTimelineRows, turn_id: &str) -> Option<(usize, 
             SemanticTimelineRowKind::WorkHeader { work, .. } => work.turn_id == turn_id,
             SemanticTimelineRowKind::WorkItem { item } => item.turn_id == turn_id,
             SemanticTimelineRowKind::UserBlock { block }
+            | SemanticTimelineRowKind::DetachedTaskRun { block }
             | SemanticTimelineRowKind::AssistantMessage { block }
             | SemanticTimelineRowKind::PendingRequest { block }
             | SemanticTimelineRowKind::TurnState { block } => {
@@ -2828,7 +3062,8 @@ fn merge_work_loaded_range(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        SystemEventLevel, TimelineBlockKind, TurnItem, TurnItemType, TurnWorkItemStatus,
+        SystemEventLevel, TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind,
+        TaskTurnItem, TimelineBlockKind, TurnItem, TurnItemType, TurnWorkItemStatus,
         TurnWorkPresentation, TurnWorkState,
     };
 
@@ -2849,6 +3084,147 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.ordered_block_ids, vec!["block_b"]);
+    }
+
+    #[test]
+    fn detached_task_card_stays_at_start_position_and_result_uses_delivery_position() {
+        let mut state = SemanticTimelineState::default();
+        let task_turn = detached_task_turn("task_turn");
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnStarted {
+                thread_id: "thread_a".to_owned(),
+                turn: task_turn,
+            },
+            1_000,
+        ));
+
+        let running_task = task_turn_item(TaskAttachmentMode::Detached, TaskStatus::Running);
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: running_task.clone(),
+            },
+            1_000,
+        ));
+        let initial_sort_key = state
+            .thread("thread_a")
+            .and_then(|thread| {
+                thread
+                    .top_level
+                    .block("turn:task_turn:detached-task-run:task_anchor")
+            })
+            .map(|block| block.sort_key.clone())
+            .expect("detached task card should exist");
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "user_turn".to_owned(),
+                pending_request_id: "pending_user".to_owned(),
+                user_text: "A later parent message".to_owned(),
+                attachments: Vec::new(),
+            },
+            2_000,
+        ));
+
+        let completed_task = task_turn_item(TaskAttachmentMode::Detached, TaskStatus::Completed);
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemUpdated {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: completed_task,
+            },
+            3_000,
+        ));
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemCompleted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "task_result".to_owned(),
+                    text: "Background analysis is ready".to_owned(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            4_000,
+        ));
+
+        let thread = state.thread("thread_a").expect("thread state should exist");
+        let task_block = thread
+            .top_level
+            .block("turn:task_turn:detached-task-run:task_anchor")
+            .expect("detached task card should remain");
+        assert_eq!(task_block.sort_key, initial_sort_key);
+        assert!(matches!(
+            &task_block.kind,
+            TimelineBlockKind::DetachedTaskRun { task }
+                if task.status == TaskStatus::Completed
+        ));
+        assert!(
+            thread.top_level.block("turn:task_turn:work").is_none(),
+            "detached task work must not appear in the Worked group"
+        );
+
+        let ordered_ids = thread
+            .top_level
+            .ordered_blocks()
+            .map(|block| block.block_id.as_str())
+            .collect::<Vec<_>>();
+        let task_index = ordered_ids
+            .iter()
+            .position(|id| *id == "turn:task_turn:detached-task-run:task_anchor")
+            .unwrap();
+        let user_index = ordered_ids
+            .iter()
+            .position(|id| *id == "turn:user_turn:user")
+            .unwrap();
+        let result_index = ordered_ids
+            .iter()
+            .position(|id| *id == "turn:task_turn:assistant:task_result")
+            .unwrap();
+        assert!(task_index < user_index);
+        assert!(user_index < result_index);
+    }
+
+    #[test]
+    fn attached_task_remains_inside_turn_work() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "conversation_turn".to_owned(),
+                item: task_turn_item(TaskAttachmentMode::Attached, TaskStatus::Running),
+            },
+            1_000,
+        ));
+
+        let thread = state.thread("thread_a").expect("thread state should exist");
+        assert!(
+            thread
+                .top_level
+                .ordered_blocks()
+                .all(|block| !matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { .. }))
+        );
+        assert!(thread.work_range("conversation_turn").is_some_and(|range| {
+            range
+                .items_by_id
+                .contains_key("turn:conversation_turn:work:task_anchor")
+        }));
     }
 
     #[test]
@@ -4264,6 +4640,49 @@ mod tests {
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
                 markdown,
+            },
+        }
+    }
+
+    fn detached_task_turn(turn_id: &str) -> Turn {
+        Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::compile_turn_permission_profile(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+                pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+        }
+    }
+
+    fn task_turn_item(attachment: TaskAttachmentMode, status: TaskStatus) -> TurnItem {
+        TurnItem::Task {
+            item: TaskTurnItem {
+                id: "task_anchor".to_owned(),
+                task_id: "task_a".to_owned(),
+                run_id: Some("run_a".to_owned()),
+                parent_task_id: None,
+                root_task_id: None,
+                title: "Background analysis".to_owned(),
+                status,
+                attachment,
+                trigger_kind: TaskTriggerKind::Immediate,
+                executor_kind: TaskExecutorKind::Agent,
+                child_thread_id: Some("child_a".to_owned()),
+                child_turn_id: Some("child_turn_a".to_owned()),
+                agent_role: None,
+                depth: 0,
+                max_depth: 3,
+                next_fire_at: None,
+                progress_preview: Some("Collecting sources".to_owned()),
+                result_preview: None,
+                error_preview: None,
+                created_at: 1,
+                updated_at: 2,
             },
         }
     }

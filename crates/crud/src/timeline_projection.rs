@@ -1,5 +1,7 @@
-use pioneer_entity::turn_item;
-use pioneer_protocol::{AgentMessagePhase, SystemEventLevel, ToolCallStatus, TurnItem};
+use pioneer_entity::{turn, turn_item};
+use pioneer_protocol::{
+    AgentMessagePhase, SystemEventLevel, TaskAttachmentMode, ToolCallStatus, TurnItem,
+};
 use serde_json::Value as JsonValue;
 
 use crate::repositories::thread_timeline_projection::{
@@ -29,6 +31,7 @@ impl ProjectionVisibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionPlacement {
     TopLevelUserMessage,
+    TopLevelDetachedTaskRun,
     TurnWork,
     TopLevelAssistantMessage,
     Hidden,
@@ -38,6 +41,7 @@ impl ProjectionPlacement {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TopLevelUserMessage => "top_level_user_message",
+            Self::TopLevelDetachedTaskRun => "top_level_detached_task_run",
             Self::TurnWork => "turn_work",
             Self::TopLevelAssistantMessage => "top_level_assistant_message",
             Self::Hidden => "hidden",
@@ -256,6 +260,28 @@ pub fn classify_turn_item_row(row: &turn_item::Model) -> TurnItemProjectionClass
             audit_reason: Some(format!("unknown turn item type `{}`", row.item_type)),
         },
     }
+}
+
+pub fn classify_turn_item_row_for_turn(
+    row: &turn_item::Model,
+    turn: &turn::Model,
+) -> TurnItemProjectionClassification {
+    let mut classification = classify_turn_item_row(row);
+    if turn.turn_kind == "task_run"
+        && classification.classification == WorkItemClassification::Task
+        && task_attachment_from_row(row) == Some(TaskAttachmentMode::Detached)
+    {
+        classification.placement = ProjectionPlacement::TopLevelDetachedTaskRun;
+    }
+    classification
+}
+
+fn task_attachment_from_row(row: &turn_item::Model) -> Option<TaskAttachmentMode> {
+    let TurnItem::Task { item } = serde_json::from_str::<TurnItem>(row.payload.as_str()).ok()?
+    else {
+        return None;
+    };
+    Some(item.attachment)
 }
 
 fn parse_turn_item_payload(row: &turn_item::Model) -> std::result::Result<JsonValue, String> {
@@ -704,8 +730,11 @@ fn turn_item_type_label(item: &TurnItem) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use pioneer_entity::turn_item;
-    use pioneer_protocol::{AgentMessagePhase, SystemEventLevel, TurnItem};
+    use pioneer_entity::{turn, turn_item};
+    use pioneer_protocol::{
+        AgentMessagePhase, SystemEventLevel, TaskAttachmentMode, TaskExecutorKind, TaskStatus,
+        TaskTriggerKind, TaskTurnItem, TurnItem,
+    };
     use serde_json::json;
 
     use super::*;
@@ -736,6 +765,60 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn turn_row(turn_kind: &str) -> turn::Model {
+        let now = chrono::Utc::now().into();
+        turn::Model {
+            id: "turn_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            status: "in_progress".to_owned(),
+            error: None,
+            prompt_manifest_json: "{}".to_owned(),
+            prompt_compiler_version: None,
+            prompt_profile: None,
+            prompt_fingerprint_stable: None,
+            prompt_fingerprint_dynamic: None,
+            prompt_fingerprint_full: None,
+            created_at: now,
+            updated_at: now,
+            turn_kind: turn_kind.to_owned(),
+            origin: "detached_task".to_owned(),
+            reasoning_effort: None,
+            permission_profile_mode: None,
+            permission_profile_source: None,
+            permission_profile_snapshot_json: None,
+            execution_security_snapshot_version: None,
+            execution_security_snapshot_json: None,
+        }
+    }
+
+    fn task_item(attachment: TaskAttachmentMode) -> TurnItem {
+        TurnItem::Task {
+            item: TaskTurnItem {
+                id: "item_1".to_owned(),
+                task_id: "task_1".to_owned(),
+                run_id: Some("run_1".to_owned()),
+                parent_task_id: None,
+                root_task_id: None,
+                title: "Background analysis".to_owned(),
+                status: TaskStatus::Running,
+                attachment,
+                trigger_kind: TaskTriggerKind::Immediate,
+                executor_kind: TaskExecutorKind::Agent,
+                child_thread_id: Some("child_1".to_owned()),
+                child_turn_id: Some("child_turn_1".to_owned()),
+                agent_role: None,
+                depth: 0,
+                max_depth: 3,
+                next_fire_at: None,
+                progress_preview: Some("Collecting sources".to_owned()),
+                result_preview: None,
+                error_preview: None,
+                created_at: 1,
+                updated_at: 2,
+            },
         }
     }
 
@@ -791,6 +874,29 @@ mod tests {
         assert_eq!(
             classified.classification,
             WorkItemClassification::InternalTokenUsage
+        );
+    }
+
+    #[test]
+    fn only_detached_task_run_anchors_project_as_top_level_cards() {
+        let detached_payload =
+            serde_json::to_string(&task_item(TaskAttachmentMode::Detached)).unwrap();
+        let detached = turn_item_row("task", Some("completed"), detached_payload.as_str());
+        assert_eq!(
+            classify_turn_item_row_for_turn(&detached, &turn_row("task_run")).placement,
+            ProjectionPlacement::TopLevelDetachedTaskRun
+        );
+
+        let attached_payload =
+            serde_json::to_string(&task_item(TaskAttachmentMode::Attached)).unwrap();
+        let attached = turn_item_row("task", Some("completed"), attached_payload.as_str());
+        assert_eq!(
+            classify_turn_item_row_for_turn(&attached, &turn_row("task_run")).placement,
+            ProjectionPlacement::TurnWork
+        );
+        assert_eq!(
+            classify_turn_item_row_for_turn(&detached, &turn_row("conversation")).placement,
+            ProjectionPlacement::TurnWork
         );
     }
 

@@ -348,22 +348,22 @@ pub use crate::repositories::thread_agents_doc::{
     ThreadAgentsDocScopeContext, ThreadAgentsDocStatus, ThreadAgentsDocSummaryRecord,
 };
 pub use crate::repositories::thread_timeline_projection::{
-    BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM,
-    BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE, PROJECTION_META_STATUS_BACKFILLING,
-    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING,
-    ProjectionMetaConfigRecord, ProjectionMetaRecord, ProjectionPageAnchor,
-    SEMANTIC_TIMELINE_PROJECTION_KEY, SEMANTIC_TIMELINE_PROJECTION_VERSION,
-    ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord, TurnWorkProjectionRecord,
-    WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE, count_thread_timeline_blocks,
-    count_turn_work_items, delete_thread_timeline_block, delete_thread_timeline_blocks_for_thread,
-    delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
-    delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
-    find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
-    find_turn_work_projection, list_projection_meta_by_key_prefix,
-    list_thread_timeline_blocks_page, list_turn_work_item_projections_by_ids,
-    list_turn_work_items_page, update_projection_meta_status, upsert_projection_meta,
-    upsert_projection_meta_with_config, upsert_thread_timeline_block,
-    upsert_turn_work_item_projection, upsert_turn_work_projection,
+    BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
+    BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
+    PROJECTION_META_STATUS_BACKFILLING, PROJECTION_META_STATUS_COMPLETE,
+    PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING, ProjectionMetaConfigRecord,
+    ProjectionMetaRecord, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_KEY,
+    SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
+    TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
+    count_thread_timeline_blocks, count_turn_work_items, delete_thread_timeline_block,
+    delete_thread_timeline_blocks_for_thread, delete_thread_timeline_blocks_for_turn,
+    delete_turn_work_items_for_turn, delete_turn_work_projection, find_projection_meta,
+    find_thread_timeline_block_by_sort_key, find_turn_work_item_projection,
+    find_turn_work_item_projection_by_order_key, find_turn_work_projection,
+    list_projection_meta_by_key_prefix, list_thread_timeline_blocks_page,
+    list_turn_work_item_projections_by_ids, list_turn_work_items_page,
+    update_projection_meta_status, upsert_projection_meta, upsert_projection_meta_with_config,
+    upsert_thread_timeline_block, upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
 pub use crate::repositories::turn_mcp_projection::{
     TurnMcpProjectionPersistenceError, TurnMcpProjectionReplaceOutcome,
@@ -390,11 +390,11 @@ pub use crate::timeline_projection::{
     ProjectionPlacement, ProjectionVisibility, TurnItemProjectionClassification,
     WORK_ITEM_STATUS_CANCELLED, WORK_ITEM_STATUS_COMPLETED, WORK_ITEM_STATUS_FAILED,
     WORK_ITEM_STATUS_RUNNING, WorkItemClassification, classify_turn_item_row,
-    classify_turn_item_with_db_status,
+    classify_turn_item_row_for_turn, classify_turn_item_with_db_status,
 };
 pub use crate::timeline_projection_model::{
-    approval_block_id, assistant_block_id, terminal_state_block_id, user_block_id, work_block_id,
-    work_item_projection_id,
+    approval_block_id, assistant_block_id, detached_task_run_block_id, terminal_state_block_id,
+    user_block_id, work_block_id, work_item_projection_id,
 };
 use crate::turn_item_terminal::{
     TurnItemTerminalState, terminalize_turn_item_payload, tool_call_status,

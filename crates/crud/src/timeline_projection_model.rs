@@ -60,12 +60,31 @@ pub(crate) fn turn_block_sort_key(turn: &turn::Model, rank: u16, suffix: &str) -
     )
 }
 
+pub(crate) fn timeline_event_block_sort_key(
+    occurred_at: DateTimeWithTimeZone,
+    turn_id: &str,
+    rank: u16,
+    suffix: &str,
+) -> String {
+    format!(
+        "{:020}:{}:{:03}:{}",
+        datetime_millis(occurred_at).max(0),
+        turn_id,
+        rank,
+        suffix
+    )
+}
+
 pub fn user_block_id(turn_id: &str) -> String {
     format!("turn:{turn_id}:user")
 }
 
 pub fn work_block_id(turn_id: &str) -> String {
     format!("turn:{turn_id}:work")
+}
+
+pub fn detached_task_run_block_id(turn_id: &str, item_id: &str) -> String {
+    format!("turn:{turn_id}:detached-task-run:{item_id}")
 }
 
 pub fn assistant_block_id(turn_id: &str, item_id: &str) -> String {

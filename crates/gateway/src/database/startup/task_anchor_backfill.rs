@@ -13,7 +13,7 @@ use sea_orm::{
 use tracing::{info, warn};
 
 const TASK_ANCHOR_BACKFILL_KEY: &str = "task_anchor_payload_backfill";
-const TASK_ANCHOR_BACKFILL_VERSION: i64 = 1;
+const TASK_ANCHOR_BACKFILL_VERSION: i64 = 2;
 const TASK_ANCHOR_BACKFILL_BATCH_SIZE: u64 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

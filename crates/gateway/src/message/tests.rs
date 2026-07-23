@@ -44,11 +44,12 @@ use pioneer_cli_agent_runtime::event::{
 use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructionTransport;
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
-    AgentMemoryListFilter, CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus,
-    CrudStore, MemoryActorRecord, NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection,
-    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-    SkillInstallationPatch, SkillInstallationRecord, SkillPackInstallationRecord,
-    ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, global_agent_memory_scope_key,
+    AgentMemoryListFilter, BLOCK_KIND_DETACHED_TASK_RUN, BLOCK_KIND_TURN_WORK,
+    CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus, CrudStore, MemoryActorRecord,
+    NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection, NewCliRuntimePendingRequest,
+    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, SkillInstallationPatch,
+    SkillInstallationRecord, SkillPackInstallationRecord, ThreadAgentsDocSaveReason,
+    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -12017,8 +12018,26 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
             } if item.id == crate::task_tools::task_run_anchor_id(run.id.as_str())
                 && item.task_id == response.task.id
                 && item.run_id.as_deref() == Some(run.id.as_str())
+                && item.attachment == TaskAttachmentMode::Detached
         )),
         "occurrence turn should persist a parent-visible task anchor for desktop reload"
+    );
+    let projected_blocks = thread_timeline_block::Entity::find()
+        .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id))
+        .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
+        .all(&crud_store.database_connection())
+        .await
+        .expect("occurrence timeline blocks should load");
+    assert!(projected_blocks.iter().any(|block| {
+        block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN
+            && block.source_key.as_deref()
+                == Some(crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str())
+    }));
+    assert!(
+        projected_blocks
+            .iter()
+            .all(|block| block.block_kind != BLOCK_KIND_TURN_WORK),
+        "detached task occurrence must not create a Worked group"
     );
     let progress_target = processor
         .task_progress_parent_target_for_test(
@@ -14658,6 +14677,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
                 root_task_id: None,
                 title: "Summarize proposal".to_owned(),
                 status: TaskStatus::Completed,
+                attachment: TaskAttachmentMode::Attached,
                 trigger_kind: TaskTriggerKind::Immediate,
                 executor_kind: TaskExecutorKind::Agent,
                 child_thread_id: None,

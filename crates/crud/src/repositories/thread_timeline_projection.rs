@@ -11,7 +11,7 @@ use sea_orm::{
 };
 
 pub const SEMANTIC_TIMELINE_PROJECTION_KEY: &str = "semantic_timeline";
-pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 4;
+pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 5;
 
 pub const PROJECTION_META_STATUS_PENDING: &str = "pending";
 pub const PROJECTION_META_STATUS_BACKFILLING: &str = "backfilling";
@@ -20,6 +20,7 @@ pub const PROJECTION_META_STATUS_FAILED: &str = "failed";
 
 pub const BLOCK_KIND_USER_MESSAGE: &str = "user_message";
 pub const BLOCK_KIND_TURN_WORK: &str = "turn_work";
+pub const BLOCK_KIND_DETACHED_TASK_RUN: &str = "detached_task_run";
 pub const BLOCK_KIND_ASSISTANT_MESSAGE: &str = "assistant_message";
 pub const BLOCK_KIND_RUNNING: &str = "running";
 pub const BLOCK_KIND_APPROVAL: &str = "approval";

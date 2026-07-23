@@ -1,6 +1,6 @@
 use crate::{
-    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, MarkdownDocument, TurnItem,
-    TurnItemType, UserInput, UserMessageAttachment,
+    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, MarkdownDocument, TaskTurnItem,
+    TurnItem, TurnItemType, UserInput, UserMessageAttachment,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,8 @@ pub enum TimelineBlockKind {
     },
     #[serde(rename_all = "camelCase")]
     TurnWork { work: TurnWorkBlock },
+    #[serde(rename_all = "camelCase")]
+    DetachedTaskRun { task: TaskTurnItem },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
         item_id: String,

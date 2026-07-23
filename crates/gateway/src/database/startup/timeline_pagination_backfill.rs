@@ -5,8 +5,8 @@ use pioneer_crud::{
     SEMANTIC_TIMELINE_PROJECTION_KEY, SEMANTIC_TIMELINE_PROJECTION_VERSION,
     ThreadTimelineBlockRecord, TurnItemProjectionClassification, TurnWorkItemProjectionRecord,
     TurnWorkProjectionRecord, WORK_ITEM_STATUS_RUNNING, WorkItemClassification, assistant_block_id,
-    classify_turn_item_row, terminal_state_block_id, user_block_id, work_block_id,
-    work_item_projection_id,
+    classify_turn_item_row_for_turn, detached_task_run_block_id, terminal_state_block_id,
+    user_block_id, work_block_id, work_item_projection_id,
 };
 use pioneer_entity::{
     cli_runtime_pending_request, thread, turn, turn_event, turn_input, turn_item,
@@ -58,6 +58,13 @@ struct AssistantBlockCandidate {
     order_key: String,
     started_at: DateTimeWithTimeZone,
     completed_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone)]
+struct DetachedTaskRunBlockCandidate {
+    item_id: String,
+    started_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +119,21 @@ fn turn_block_sort_key(turn: &turn::Model, rank: u16, suffix: &str) -> String {
         "{:020}:{}:{:03}:{}",
         datetime_millis(turn.created_at).max(0),
         turn.id,
+        rank,
+        suffix
+    )
+}
+
+fn timeline_event_block_sort_key(
+    occurred_at: DateTimeWithTimeZone,
+    turn_id: &str,
+    rank: u16,
+    suffix: &str,
+) -> String {
+    format!(
+        "{:020}:{}:{:03}:{}",
+        datetime_millis(occurred_at).max(0),
+        turn_id,
         rank,
         suffix
     )
@@ -514,6 +536,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     let mut last_work_item_order_key: Option<String> = None;
     let mut running_item_id: Option<String> = None;
     let mut assistant_blocks = Vec::new();
+    let mut detached_task_run_blocks = Vec::new();
     let mut has_running_item = false;
     let mut has_stale_running_item = false;
     let projection_now = now_datetime();
@@ -528,7 +551,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
         }
 
         for item_model in &items {
-            let classification = classify_turn_item_row(item_model);
+            let classification = classify_turn_item_row_for_turn(item_model, turn_model);
             if classification.classification == WorkItemClassification::InvalidPayload {
                 stats.invalid_items = stats.invalid_items.saturating_add(1);
             }
@@ -538,6 +561,13 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
 
             match classification.placement {
                 ProjectionPlacement::TopLevelUserMessage => {}
+                ProjectionPlacement::TopLevelDetachedTaskRun => {
+                    detached_task_run_blocks.push(DetachedTaskRunBlockCandidate {
+                        item_id: item_model.item_id.clone(),
+                        started_at: item_model.created_at,
+                        updated_at: item_model.updated_at,
+                    });
+                }
                 ProjectionPlacement::TopLevelAssistantMessage => {
                     assistant_blocks.push(AssistantBlockCandidate {
                         item_id: item_model.item_id.clone(),
@@ -645,8 +675,9 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     }
 
     let has_final = !assistant_blocks.is_empty();
+    let has_detached_task_run = !detached_task_run_blocks.is_empty();
     let work_count = visible_work_count.saturating_add(hidden_work_count);
-    let needs_work_block = work_count > 0 || !has_final;
+    let needs_work_block = work_count > 0 || (!has_final && !has_detached_task_run);
 
     if needs_work_block {
         let pending_request_count = count_pending_cli_runtime_requests(
@@ -724,6 +755,41 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
         stats.timeline_blocks_upserted = stats.timeline_blocks_upserted.saturating_add(1);
     }
 
+    for task_run in detached_task_run_blocks {
+        timeline_repository::upsert_thread_timeline_block(
+            db,
+            ThreadTimelineBlockRecord {
+                block_id: detached_task_run_block_id(
+                    turn_model.id.as_str(),
+                    task_run.item_id.as_str(),
+                ),
+                workspace_id: thread_model.workspace_id.clone(),
+                thread_id: thread_model.id.clone(),
+                turn_id: Some(turn_model.id.clone()),
+                block_kind: timeline_repository::BLOCK_KIND_DETACHED_TASK_RUN.to_owned(),
+                sort_key: turn_block_sort_key(
+                    turn_model,
+                    100,
+                    format!("detached-task-run:{}", task_run.item_id).as_str(),
+                ),
+                source_kind: Some("turn_item".to_owned()),
+                source_key: Some(task_run.item_id.clone()),
+                started_at: Some(task_run.started_at),
+                completed_at: None,
+                metadata_json: json!({
+                    "turnId": turn_model.id,
+                    "itemId": task_run.item_id,
+                    "attachment": "detached",
+                })
+                .to_string(),
+                created_at: task_run.started_at,
+                updated_at: task_run.updated_at,
+            },
+        )
+        .await?;
+        stats.timeline_blocks_upserted = stats.timeline_blocks_upserted.saturating_add(1);
+    }
+
     for assistant in assistant_blocks {
         timeline_repository::upsert_thread_timeline_block(
             db,
@@ -733,7 +799,16 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                 thread_id: thread_model.id.clone(),
                 turn_id: Some(turn_model.id.clone()),
                 block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                sort_key: turn_block_sort_key(turn_model, 200, assistant.order_key.as_str()),
+                sort_key: if has_detached_task_run {
+                    timeline_event_block_sort_key(
+                        assistant.started_at,
+                        turn_model.id.as_str(),
+                        200,
+                        assistant.order_key.as_str(),
+                    )
+                } else {
+                    turn_block_sort_key(turn_model, 200, assistant.order_key.as_str())
+                },
                 source_kind: Some("turn_item".to_owned()),
                 source_key: Some(assistant.item_id.clone()),
                 started_at: Some(assistant.started_at),
@@ -753,7 +828,9 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     }
 
     let terminal_block_id = terminal_state_block_id(turn_model.id.as_str());
-    if let Some(state) = terminal_turn_state(turn_model).filter(|_| !has_final) {
+    if let Some(state) =
+        terminal_turn_state(turn_model).filter(|_| !has_final && !has_detached_task_run)
+    {
         timeline_repository::upsert_thread_timeline_block(
             db,
             ThreadTimelineBlockRecord {

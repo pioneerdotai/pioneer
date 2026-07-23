@@ -6,10 +6,10 @@ use super::timeline_cursor::{
 use super::*;
 use anyhow::{Context, Result, anyhow};
 use pioneer_crud::{
-    BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM,
-    BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE, CliRuntimePendingRequestListFilter,
-    ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION, WORK_VISIBILITY_VISIBLE,
-    approval_block_id,
+    BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
+    BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
+    CliRuntimePendingRequestListFilter, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION,
+    WORK_VISIBILITY_VISIBLE, approval_block_id,
 };
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
@@ -1116,6 +1116,9 @@ impl MessageProcessor {
         let kind = match row.block_kind.as_str() {
             BLOCK_KIND_USER_MESSAGE => self.user_message_timeline_block_kind(&row).await?,
             BLOCK_KIND_TURN_WORK => self.turn_work_timeline_block_kind(&row).await?,
+            BLOCK_KIND_DETACHED_TASK_RUN => {
+                self.detached_task_run_timeline_block_kind(&row).await?
+            }
             BLOCK_KIND_ASSISTANT_MESSAGE => {
                 self.assistant_message_timeline_block_kind(&row).await?
             }
@@ -1290,6 +1293,33 @@ impl MessageProcessor {
             status: TurnWorkItemStatus::Completed,
             markdown,
         })
+    }
+
+    async fn detached_task_run_timeline_block_kind(
+        &self,
+        row: &thread_timeline_block::Model,
+    ) -> Result<TimelineBlockKind> {
+        let turn_id = row
+            .turn_id
+            .as_deref()
+            .context("detached task run timeline block is missing turn_id")?;
+        let item_id = row
+            .source_key
+            .as_deref()
+            .context("detached task run timeline block is missing source_key")?;
+        let Some(item) = self.crud_store.get_turn_item(turn_id, item_id).await? else {
+            return Err(anyhow!(
+                "detached task run item `{item_id}` for turn `{turn_id}` was not found"
+            ));
+        };
+        let TurnItem::Task { item: task } = item else {
+            return Err(anyhow!(
+                "timeline block `{}` points to non-task item `{item_id}`",
+                row.block_id
+            ));
+        };
+
+        Ok(TimelineBlockKind::DetachedTaskRun { task })
     }
 
     async fn turn_work_items_from_rows(
