@@ -3817,13 +3817,13 @@ dependencies = [
 
 [[package]]
 name = "foreign-types-macros"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a5c6c585bc94aaf2c7b51dd4c2ba22680844aba4c687be581871a6f518c5742"
+checksum = "ea5190182e6915eb873ddbc16e23b711b6eb1f9c00a0d0a3a91b5f6228475225"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -8156,7 +8156,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8181,7 +8181,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -8196,7 +8196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8222,7 +8222,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -8246,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -8264,7 +8264,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -8278,7 +8278,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8302,7 +8302,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "pioneer-client",
@@ -8316,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "config",
@@ -8327,7 +8327,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8348,7 +8348,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8389,7 +8389,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "sea-orm",
  "serde",
@@ -8397,7 +8397,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8457,7 +8457,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -8472,7 +8472,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -8485,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8507,7 +8507,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8530,7 +8530,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -8543,7 +8543,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -8554,7 +8554,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8572,7 +8572,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "hex",
  "nanoid",
@@ -8584,7 +8584,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8607,7 +8607,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -8617,7 +8617,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -8635,7 +8635,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8657,7 +8657,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8678,7 +8678,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8709,7 +8709,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.33.0"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -9204,9 +9204,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]
@@ -14052,9 +14052,9 @@ dependencies = [
 
 [[package]]
 name = "wayland-backend"
-version = "0.3.15"
+version = "0.3.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d"
+checksum = "016ccf01d1c58b6f8999612813e17c9b2390f7d70671428869913310f83f54b8"
 dependencies = [
  "cc",
  "downcast-rs 1.2.1",
@@ -14066,9 +14066,9 @@ dependencies = [
 
 [[package]]
 name = "wayland-client"
-version = "0.31.14"
+version = "0.31.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645c7c96bb74690c3189b5c9cb4ca1627062bb23693a4fad9d8c3de958260144"
+checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
 dependencies = [
  "bitflags 2.13.1",
  "rustix 1.1.4",
@@ -14139,20 +14139,20 @@ dependencies = [
 
 [[package]]
 name = "wayland-scanner"
-version = "0.31.10"
+version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
+checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
 dependencies = [
  "proc-macro2",
- "quick-xml 0.39.4",
+ "quick-xml 0.41.0",
  "quote",
 ]
 
 [[package]]
 name = "wayland-server"
-version = "0.31.13"
+version = "0.31.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc1846eb04c49182e04f4a099e2a830a2b745610bbc1d61246e206f29c7000a0"
+checksum = "0dde9c29be0f723a573977de51ee455bf3dfa03652730a74f9dd3b337e374d75"
 dependencies = [
  "bitflags 2.13.1",
  "downcast-rs 1.2.1",
