@@ -1588,11 +1588,13 @@ fn classify_memvid_error(error: MemvidError) -> ThreadEpisodicMemvidError {
         MemvidError::Lock(_)
         | MemvidError::Locked(_)
         | MemvidError::CheckpointFailed { .. }
-        | MemvidError::Io { .. } => ThreadEpisodicMemvidError::retryable(error.to_string()),
+        | MemvidError::Io { .. }
+        | MemvidError::InvalidSketchTrack { .. } => {
+            ThreadEpisodicMemvidError::retryable(error.to_string())
+        }
         MemvidError::InvalidHeader { .. }
         | MemvidError::InvalidToc { .. }
         | MemvidError::InvalidTimeIndex { .. }
-        | MemvidError::InvalidSketchTrack { .. }
         | MemvidError::InvalidLogicMesh { .. }
         | MemvidError::LogicMeshNotEnabled
         | MemvidError::LexNotEnabled
@@ -2101,6 +2103,19 @@ mod tests {
     fn rejects_non_file_storage_uri() {
         let error = path_from_storage_uri("s3://bucket/capsule.mv2").expect_err("must reject");
         assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+    }
+
+    #[test]
+    fn invalid_sketch_track_is_retryable() {
+        let error = classify_memvid_error(MemvidError::InvalidSketchTrack {
+            reason: "Invalid sketch track magic".into(),
+        });
+
+        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::Retryable);
+        assert_eq!(
+            error.message,
+            "Sketch track is invalid: Invalid sketch track magic"
+        );
     }
 
     #[test]

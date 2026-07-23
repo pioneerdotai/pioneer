@@ -54,6 +54,8 @@ const REFILL_RECOVERY_SCAN_LIMIT: u64 = 100_000;
 const REFILL_LOCK_FILE_NAME: &str = ".thread_episodic_workspace_capsule_refill.lock";
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
 const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
+const LEGACY_INVALID_SKETCH_TRACK_ERROR: &str =
+    "Sketch track is invalid: Invalid sketch track magic";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
@@ -1262,12 +1264,15 @@ async fn recover_misclassified_retryable_jobs(
     let mut recovered = 0usize;
     for job in jobs {
         let last_error = job.last_error.as_deref().unwrap_or_default();
+        let legacy_invalid_sketch_track = job.attempt_count < config.max_attempts
+            && last_error == LEGACY_INVALID_SKETCH_TRACK_ERROR;
         let exhausted_before_bounded_input_support = job.attempt_count == config.max_attempts
             && last_error.contains("missing field `data`")
             && !last_error.contains(CHUNKED_EMBEDDING_INPUT_ERROR_MARKER);
-        let retryable = (job.attempt_count < config.max_attempts
+        let legacy_provider_failure = (job.attempt_count < config.max_attempts
             || exhausted_before_bounded_input_support)
             && provider_embedding_error_message_is_retryable(last_error);
+        let retryable = legacy_invalid_sketch_track || legacy_provider_failure;
         if !retryable {
             continue;
         }
@@ -3324,6 +3329,119 @@ mod tests {
             )
             .await
             .expect("resumed marker should be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_restart_recovers_legacy_invalid_sketch_track() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_legacy_sketch";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_legacy_sketch_a",
+            "item_vector_refill_legacy_sketch_a",
+            "completed frame must survive legacy sketch recovery",
+        )
+        .await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_legacy_sketch_b",
+            "item_vector_refill_legacy_sketch_b",
+            "legacy sketch failure should resume without rebuild",
+        )
+        .await;
+
+        let legacy_provider = Arc::new(ScriptedThreadEpisodicEmbeddingProvider::new(vec![
+            Ok(vec![0.1, 0.2, 0.3]),
+            Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    "openai",
+                    "text-embedding-3-small",
+                    LEGACY_INVALID_SKETCH_TRACK_ERROR,
+                ),
+            ),
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            legacy_provider.as_ref(),
+        )
+        .expect("test provider target");
+
+        refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            legacy_provider,
+            immediate_retry_config(5),
+        )
+        .await
+        .expect_err("legacy sketch classification should leave a failed marker");
+
+        let retained_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("items should list before recovery")
+            .into_iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::Active)
+            .expect("one item should already be indexed");
+        let retained_item_id = retained_item.id;
+        let retained_frame_uri = retained_item
+            .frame_uri
+            .expect("completed item should retain its frame URI");
+
+        let resume_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let summary = refill_once_with_test_executor_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            resume_provider.clone(),
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("legacy sketch failure should resume");
+
+        assert!(summary.resumed);
+        assert_eq!(summary.legacy_retryable_jobs_requeued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(summary.capsule_files_deleted, 0);
+        assert_eq!(summary.capsule_rows_deleted, 0);
+        assert_eq!(summary.item_rows_deleted, 0);
+        assert_eq!(summary.index_jobs_deleted, 0);
+        assert_eq!(resume_provider.calls(), 1);
+
+        let retained_item = crud_store
+            .find_thread_episodic_item(retained_item_id.as_str())
+            .await
+            .expect("retained item lookup should succeed")
+            .expect("retained item should still exist");
+        assert_eq!(
+            retained_item.frame_uri.as_deref(),
+            Some(retained_frame_uri.as_str())
+        );
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list after recovery");
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ThreadEpisodicIndexJobStatus::Completed)
+        );
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target
+            )
+            .await
+            .expect("recovered marker should be current")
         );
     }
 
