@@ -35,6 +35,7 @@ use pioneer_client::{
             apply_conversation_event_to_semantic_timeline_with_patch,
             apply_semantic_timeline_live_update_with_patch,
             apply_thread_timeline_page as apply_semantic_thread_timeline_page,
+            apply_turn_work_items_get_response as apply_semantic_turn_work_items_get_response,
             apply_turn_work_page as apply_semantic_turn_work_page, expand_turn_work,
             flatten_semantic_timeline, remove_thread_semantic_timeline,
         },
@@ -53,7 +54,7 @@ use pioneer_client::{
 use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AgentExecutionBackend, GatewayNotification, RuntimeSummary, Thread, ThreadGetParams,
-    ThreadMode, ThreadTimelinePageResponse, TurnWorkPageResponse,
+    ThreadMode, ThreadTimelinePageResponse, TurnWorkItemsGetResponse, TurnWorkPageResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -483,6 +484,21 @@ impl ClientFfiActiveThreadState {
             &mut inner.semantic_timelines,
             page,
             merge_mode,
+        ))
+    }
+
+    pub fn apply_turn_work_items_get_response(
+        &self,
+        response: TurnWorkItemsGetResponse,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+
+        Ok(apply_semantic_turn_work_items_get_response(
+            &mut inner.semantic_timelines,
+            response,
         ))
     }
 

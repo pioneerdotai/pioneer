@@ -188,6 +188,10 @@ pub struct TurnWorkItem {
     pub item_id: String,
     pub turn_id: String,
     pub order_key: String,
+    #[serde(default)]
+    pub source_sequence: i64,
+    #[serde(default)]
+    pub source_updated_at_unix_micros: i64,
     pub item_type: TurnItemType,
     pub status: TurnWorkItemStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,10 +221,39 @@ pub struct TurnWorkPageResponse {
     pub thread_id: String,
     pub turn_id: String,
     pub projection_version: i64,
+    #[serde(default)]
+    pub source_high_watermark: i64,
+    #[serde(default)]
+    pub projection_updated_at_unix_micros: i64,
     pub work: TurnWorkBlock,
     #[serde(default)]
     pub items: Vec<TurnWorkItem>,
     pub page: TimelinePageInfo,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnWorkItemsGetParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub work_item_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnWorkItemsGetResponse {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub projection_version: i64,
+    #[serde(default)]
+    pub source_high_watermark: i64,
+    #[serde(default)]
+    pub projection_updated_at_unix_micros: i64,
+    #[serde(default)]
+    pub items: Vec<TurnWorkItem>,
+    #[serde(default)]
+    pub removed_work_item_ids: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -271,6 +304,10 @@ pub struct TurnWorkStateChangedNotification {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default)]
+    pub source_high_watermark: i64,
+    #[serde(default)]
+    pub projection_updated_at_unix_micros: i64,
     pub work: TurnWorkBlock,
     pub reason: TimelineChangeReason,
 }

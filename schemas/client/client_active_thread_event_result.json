@@ -4833,6 +4833,16 @@
         "orderKey": {
           "type": "string"
         },
+        "sourceSequence": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceUpdatedAtUnixMicros": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
         "startedAtUnixMs": {
           "type": [
             "integer",

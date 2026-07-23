@@ -240,8 +240,9 @@ pub use timeline::{
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
     TimelinePageInfo, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkPageParams, TurnWorkPageResponse,
-    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification,
+    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
+    TurnWorkStateChangedNotification,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,

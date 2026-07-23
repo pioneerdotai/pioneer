@@ -503,6 +503,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::turn_work_page(self, params)
     }
 
+    pub fn turn_work_items_get(
+        &self,
+        params: TurnWorkItemsGetParams,
+    ) -> Result<TurnWorkItemsGetResponse> {
+        client_ws_commands::turn_work_items_get(self, params)
+    }
+
     pub fn task_accept(&self, params: TaskAcceptParams) -> Result<TaskAcceptResponse> {
         client_ws_commands::task_accept(self, params)
     }

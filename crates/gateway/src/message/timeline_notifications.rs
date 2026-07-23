@@ -36,6 +36,8 @@ impl MessageProcessor {
                 changed_block_ids.push(work_block_id(turn_id));
                 if classification.visibility == ProjectionVisibility::Visible {
                     changed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
+                } else {
+                    removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
                 }
             }
             ProjectionPlacement::TopLevelUserMessage => {
@@ -284,6 +286,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        let source_high_watermark = projection.source_high_watermark;
+        let projection_updated_at_unix_micros = projection.updated_at.timestamp_micros();
         let work = match self.turn_work_block_from_projection(projection).await {
             Ok(work) => work,
             Err(error) => {
@@ -301,6 +305,8 @@ impl MessageProcessor {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
+            source_high_watermark,
+            projection_updated_at_unix_micros,
             work,
             reason: TimelineChangeReason::LiveEvent,
         };

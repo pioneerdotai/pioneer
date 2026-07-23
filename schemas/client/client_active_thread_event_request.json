@@ -11675,8 +11675,18 @@
     "TurnWorkStateChangedNotification": {
       "type": "object",
       "properties": {
+        "projectionUpdatedAtUnixMicros": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
         "reason": {
           "$ref": "#/$defs/TimelineChangeReason"
+        },
+        "sourceHighWatermark": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
         },
         "threadId": {
           "type": "string"

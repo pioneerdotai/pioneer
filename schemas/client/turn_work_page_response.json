@@ -13,9 +13,19 @@
     "page": {
       "$ref": "#/$defs/TimelinePageInfo"
     },
+    "projectionUpdatedAtUnixMicros": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
     "projectionVersion": {
       "type": "integer",
       "format": "int64"
+    },
+    "sourceHighWatermark": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
     },
     "threadId": {
       "type": "string"
@@ -2863,6 +2873,16 @@
         "metadata": true,
         "orderKey": {
           "type": "string"
+        },
+        "sourceSequence": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceUpdatedAtUnixMicros": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
         },
         "startedAtUnixMs": {
           "type": [

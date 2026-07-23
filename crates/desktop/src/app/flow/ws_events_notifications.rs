@@ -424,6 +424,7 @@ impl PioneerDesktop {
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
         let mut refetch_thread_id = None;
         let mut refetch_work_candidate = None;
+        let mut reconcile_work_items = None;
         match &update {
             pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
                 if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
@@ -435,6 +436,11 @@ impl PioneerDesktop {
             {
                 refetch_work_candidate =
                     Some((notification.thread_id.clone(), notification.turn_id.clone()));
+                reconcile_work_items = Some((
+                    notification.thread_id.clone(),
+                    notification.turn_id.clone(),
+                    notification.changed_work_item_ids.clone(),
+                ));
             }
             pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification)
                 if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
@@ -455,6 +461,11 @@ impl PioneerDesktop {
 
         if let Some(thread_id) = refetch_thread_id {
             self.request_semantic_thread_newest_page(thread_id, cx);
+        }
+        if let Some((thread_id, turn_id, work_item_ids)) = reconcile_work_items
+            && self.should_refetch_semantic_turn_work(thread_id.as_str(), turn_id.as_str())
+        {
+            self.request_semantic_turn_work_items(thread_id, turn_id, work_item_ids, cx);
         }
         if let Some((thread_id, turn_id)) = refetch_work_candidate
             && self.should_refetch_semantic_turn_work(thread_id.as_str(), turn_id.as_str())

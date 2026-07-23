@@ -26396,6 +26396,62 @@ async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
             .any(|item| item.status == pioneer_protocol::TurnWorkItemStatus::Running),
         "newest work page should preserve running command state"
     );
+    assert!(newest_page.source_high_watermark > 0);
+    assert!(newest_page.projection_updated_at_unix_micros > 0);
+    assert!(
+        newest_page
+            .items
+            .iter()
+            .all(|item| { item.source_sequence > 0 && item.source_updated_at_unix_micros > 0 }),
+        "work items should expose durable freshness revisions"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_work_items_get_returns_exact_visible_rows_and_reports_missing_ids() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let thread_id = harness.sandbox_thread_id.clone();
+    let turn_id = harness.sandbox_turn_id.clone();
+    let page = request_semantic_turn_work_page(
+        &mut harness,
+        "work-items-source",
+        thread_id,
+        turn_id,
+        json!({ "kind": "oldest" }),
+        5,
+    )
+    .await;
+    let requested_work_item_id = page.items[0].work_item_id.clone();
+    let request_id = generate_test_request_id("semantic", "work-items-get");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/work/items/get",
+        "params": {
+            "threadId": harness.sandbox_thread_id,
+            "turnId": harness.sandbox_turn_id,
+            "workItemIds": [requested_work_item_id, "missing_work_item"]
+        }
+    });
+
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let response: pioneer_protocol::TurnWorkItemsGetResponse =
+        serde_json::from_value(response.result).expect("turn/work/items/get should decode");
+
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.items[0].work_item_id, requested_work_item_id);
+    assert!(response.items[0].source_sequence > 0);
+    assert!(response.items[0].source_updated_at_unix_micros > 0);
+    assert_eq!(
+        response.removed_work_item_ids,
+        vec!["missing_work_item".to_owned()]
+    );
+    assert_eq!(response.source_high_watermark, page.source_high_watermark);
+    assert!(response.projection_updated_at_unix_micros > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

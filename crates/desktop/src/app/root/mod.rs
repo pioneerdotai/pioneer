@@ -54,7 +54,9 @@ pub(super) use pioneer_client::{
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     tasks::review::TaskReviewActionState,
     threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
-    timeline::semantic::{SemanticTimelineRequestKey, SemanticTimelineState},
+    timeline::semantic::{
+        SemanticTimelineRequestAction, SemanticTimelineRequestKey, SemanticTimelineState,
+    },
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
@@ -385,6 +387,8 @@ pub struct PioneerDesktop {
     pub(super) semantic_timelines: SemanticTimelineState,
     pub(super) semantic_timeline_revision: u64,
     pub(super) semantic_timeline_in_flight: HashSet<SemanticTimelineRequestKey>,
+    pub(super) semantic_timeline_pending:
+        HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     pub(super) task_review_actions: TaskReviewActionState,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) show_thread_artifacts_sidebar: bool,

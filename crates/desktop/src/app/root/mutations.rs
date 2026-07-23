@@ -336,6 +336,8 @@ impl PioneerDesktop {
         }
         self.semantic_timeline_in_flight
             .retain(|key| !semantic_request_key_matches_thread(key, thread_id));
+        self.semantic_timeline_pending
+            .retain(|key, _| !semantic_request_key_matches_thread(key, thread_id));
         if let Some(workspace_id) = workspace_id {
             self.pending_requests.apply(
                 pioneer_client::cli_runtime::approvals::reduce_pending_request_thread_closed_cleanup(
@@ -365,6 +367,7 @@ impl PioneerDesktop {
         self.semantic_timelines = Default::default();
         self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
         self.semantic_timeline_in_flight.clear();
+        self.semantic_timeline_pending.clear();
         let mut composer_defaults = self.composer_domain_state();
         composer_defaults.attachments.clear();
         composer_defaults.capabilities.clear();
@@ -497,6 +500,10 @@ fn semantic_request_key_matches_thread(key: &SemanticTimelineRequestKey, thread_
             ..
         }
         | SemanticTimelineRequestKey::TurnWorkAfter {
+            thread_id: request_thread_id,
+            ..
+        }
+        | SemanticTimelineRequestKey::TurnWorkItems {
             thread_id: request_thread_id,
             ..
         } => request_thread_id == thread_id,

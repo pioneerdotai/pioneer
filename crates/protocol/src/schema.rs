@@ -6,8 +6,9 @@ use crate::timeline::{
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
     TimelinePageInfo, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkPageParams, TurnWorkPageResponse,
-    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification,
+    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
+    TurnWorkStateChangedNotification,
 };
 
 use crate::artifact::{
@@ -1373,6 +1374,11 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_work_item_status.json", TurnWorkItemStatus),
         schema_doc!("turn_work_page_params.json", TurnWorkPageParams),
         schema_doc!("turn_work_page_response.json", TurnWorkPageResponse),
+        schema_doc!("turn_work_items_get_params.json", TurnWorkItemsGetParams),
+        schema_doc!(
+            "turn_work_items_get_response.json",
+            TurnWorkItemsGetResponse
+        ),
         schema_doc!(
             "turn_work_items_changed_notification.json",
             TurnWorkItemsChangedNotification

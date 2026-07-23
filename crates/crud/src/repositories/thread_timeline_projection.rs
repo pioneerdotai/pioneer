@@ -465,6 +465,36 @@ pub async fn find_turn_work_item_projection<C: ConnectionTrait>(
         .with_context(|| format!("failed to query turn work item projection `{work_item_id}`"))
 }
 
+pub async fn list_turn_work_item_projections_by_ids<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    work_item_ids: &[String],
+    visibility: Option<&str>,
+) -> Result<Vec<turn_work_item_projection::Model>> {
+    if work_item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = turn_work_item_projection::Entity::find()
+        .filter(turn_work_item_projection::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_work_item_projection::Column::WorkItemId.is_in(work_item_ids.iter().cloned()));
+    if let Some(visibility) = visibility {
+        query =
+            query.filter(turn_work_item_projection::Column::Visibility.eq(visibility.to_owned()));
+    }
+
+    query
+        .order_by_asc(turn_work_item_projection::Column::OrderKey)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query {} work item projections for turn `{turn_id}`",
+                work_item_ids.len()
+            )
+        })
+}
+
 pub async fn find_turn_work_item_projection_by_order_key<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

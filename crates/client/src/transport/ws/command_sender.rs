@@ -58,13 +58,13 @@ use pioneer_protocol::{
     ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams,
     TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams, TurnItemsResponse,
     TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
-    TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat,
-    VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
-    VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse,
-    VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
-    validate_voice_streaming_audio_format,
+    TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams,
+    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse, validate_voice_streaming_audio_format,
 };
 use std::time::Duration;
 
@@ -542,6 +542,32 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::TURN_WORK_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_work_items_get<TTransport>(
+    transport: &TTransport,
+    params: TurnWorkItemsGetParams,
+) -> Result<TurnWorkItemsGetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_WORK_ITEMS_GET,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_WORK_ITEMS_GET,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_WORK_ITEMS_GET,
         &params,
         RPC_REQUEST_TIMEOUT,
     )

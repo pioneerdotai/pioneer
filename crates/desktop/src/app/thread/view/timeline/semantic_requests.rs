@@ -7,8 +7,8 @@ use pioneer_client::timeline::semantic::{
     TopLevelPageMergeMode, WorkPageMergeMode,
 };
 use pioneer_protocol::{
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor, TurnWorkPageParams,
-    TurnWorkPageResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 use std::collections::HashMap;
 use tracing::warn;
@@ -23,6 +23,9 @@ enum SemanticTimelinePageResult {
     TurnWork {
         page: TurnWorkPageResponse,
         merge_mode: WorkPageMergeMode,
+    },
+    TurnWorkItems {
+        response: TurnWorkItemsGetResponse,
     },
 }
 
@@ -68,6 +71,75 @@ impl PioneerDesktop {
             },
             cx,
         );
+    }
+
+    pub(crate) fn request_semantic_turn_work_items(
+        &mut self,
+        thread_id: String,
+        turn_id: String,
+        mut work_item_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        work_item_ids.sort();
+        work_item_ids.dedup();
+        if work_item_ids.is_empty() {
+            return;
+        }
+
+        self.execute_semantic_timeline_action(
+            SemanticTimelineRequestAction::TurnWorkItemsGet {
+                key: SemanticTimelineRequestKey::TurnWorkItems {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                params: TurnWorkItemsGetParams {
+                    thread_id,
+                    turn_id,
+                    work_item_ids,
+                },
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn reconcile_semantic_timeline_after_reconnect(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
+        self.request_semantic_thread_newest_page(thread_id.clone(), cx);
+
+        let turn_reconciliations =
+            self.semantic_timelines
+                .thread(thread_id.as_str())
+                .map(|thread| {
+                    thread
+                        .work_ranges_by_turn
+                        .iter()
+                        .map(|(turn_id, range)| {
+                            let expanded =
+                                thread.cached_turn_work_block(turn_id.as_str()).is_some_and(
+                                    |work| semantic::resolve_work_expanded(work, &thread.expansion),
+                                );
+                            let mut work_item_ids = range
+                                .stale_work_item_ids()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>();
+                            work_item_ids.extend(range.running_work_item_ids());
+                            work_item_ids.sort();
+                            work_item_ids.dedup();
+                            (turn_id.clone(), expanded, work_item_ids)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+        for (turn_id, expanded, work_item_ids) in turn_reconciliations {
+            if expanded {
+                self.request_semantic_turn_work_newest_page(thread_id.clone(), turn_id.clone(), cx);
+            }
+            self.request_semantic_turn_work_items(thread_id.clone(), turn_id, work_item_ids, cx);
+        }
     }
 
     pub(super) fn request_semantic_timeline_prefetch_for_visible_rows(
@@ -198,20 +270,41 @@ impl PioneerDesktop {
             cx.notify();
         }
 
-        if !is_expanded && self.should_request_initial_turn_work_page(thread_id.as_str(), turn_id) {
-            self.execute_semantic_timeline_action(
-                SemanticTimelineRequestAction::TurnWorkPage {
-                    key: SemanticTimelineRequestKey::TurnWorkInitial {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.to_owned(),
+        if !is_expanded {
+            if self.should_request_initial_turn_work_page(thread_id.as_str(), turn_id) {
+                self.execute_semantic_timeline_action(
+                    SemanticTimelineRequestAction::TurnWorkPage {
+                        key: SemanticTimelineRequestKey::TurnWorkInitial {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.to_owned(),
+                        },
+                        params: TurnWorkPageParams {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.to_owned(),
+                            anchor: TimelinePageAnchor::Newest,
+                            limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
+                        },
                     },
-                    params: TurnWorkPageParams {
-                        thread_id,
-                        turn_id: turn_id.to_owned(),
-                        anchor: TimelinePageAnchor::Newest,
-                        limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
-                    },
-                },
+                    cx,
+                );
+            }
+
+            let stale_work_item_ids = self
+                .semantic_timelines
+                .thread(thread_id.as_str())
+                .and_then(|thread| thread.work_range(turn_id))
+                .map(|range| {
+                    range
+                        .stale_work_item_ids()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.request_semantic_turn_work_items(
+                thread_id,
+                turn_id.to_owned(),
+                stale_work_item_ids,
                 cx,
             );
         }
@@ -229,10 +322,14 @@ impl PioneerDesktop {
             return;
         };
 
-        let key = semantic_request_action_key(&action).clone();
-        if !self.semantic_timeline_in_flight.insert(key.clone()) {
+        let key = semantic::semantic_timeline_request_key(&action).clone();
+        let Some(action) = semantic::enqueue_semantic_timeline_request(
+            &mut self.semantic_timeline_in_flight,
+            &mut self.semantic_timeline_pending,
+            action,
+        ) else {
             return;
-        }
+        };
         self.mark_semantic_timeline_request_loading(&key);
         cx.notify();
 
@@ -266,16 +363,25 @@ impl PioneerDesktop {
                                     SemanticTimelinePageResult::TurnWork { page, merge_mode }
                                 })
                             }
+                            SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } => {
+                                ws_sender.turn_work_items_get(params).map(|response| {
+                                    SemanticTimelinePageResult::TurnWorkItems { response }
+                                })
+                            }
                         }
                     })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    view.semantic_timeline_in_flight.remove(&key);
                     if view.gateway.ws_connection_id != Some(connection_id) {
                         cx.notify();
                         return;
                     }
+                    let pending_action = semantic::finish_semantic_timeline_request(
+                        &mut view.semantic_timeline_in_flight,
+                        &mut view.semantic_timeline_pending,
+                        &key,
+                    );
 
                     match result {
                         Ok(SemanticTimelinePageResult::Thread { page, merge_mode }) => {
@@ -300,6 +406,16 @@ impl PioneerDesktop {
                                     view.semantic_timeline_revision.saturating_add(1);
                             }
                         }
+                        Ok(SemanticTimelinePageResult::TurnWorkItems { response }) => {
+                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            if semantic::apply_turn_work_items_get_response(
+                                &mut view.semantic_timelines,
+                                response,
+                            ) {
+                                view.semantic_timeline_revision =
+                                    view.semantic_timeline_revision.saturating_add(1);
+                            }
+                        }
                         Err(error) => {
                             warn!(
                                 request_key = ?key,
@@ -308,6 +424,9 @@ impl PioneerDesktop {
                             );
                             view.mark_semantic_timeline_request_failed(&key, format!("{error:#}"));
                         }
+                    }
+                    if let Some(pending_action) = pending_action {
+                        view.execute_semantic_timeline_action(pending_action, cx);
                     }
                     cx.notify();
                 });
@@ -332,6 +451,9 @@ impl PioneerDesktop {
                 thread_id, turn_id, ..
             }
             | SemanticTimelineRequestKey::TurnWorkAfter {
+                thread_id, turn_id, ..
+            }
+            | SemanticTimelineRequestKey::TurnWorkItems {
                 thread_id, turn_id, ..
             } => {
                 self.semantic_timelines
@@ -361,6 +483,9 @@ impl PioneerDesktop {
                 thread_id, turn_id, ..
             }
             | SemanticTimelineRequestKey::TurnWorkAfter {
+                thread_id, turn_id, ..
+            }
+            | SemanticTimelineRequestKey::TurnWorkItems {
                 thread_id, turn_id, ..
             } => {
                 self.semantic_timelines
@@ -408,15 +533,6 @@ impl PioneerDesktop {
     }
 }
 
-fn semantic_request_action_key(
-    action: &SemanticTimelineRequestAction,
-) -> &SemanticTimelineRequestKey {
-    match action {
-        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. }
-        | SemanticTimelineRequestAction::TurnWorkPage { key, .. } => key,
-    }
-}
-
 fn turn_work_page_merge_mode(key: &SemanticTimelineRequestKey) -> WorkPageMergeMode {
     match key {
         SemanticTimelineRequestKey::TurnWorkBefore { .. } => WorkPageMergeMode::MergeBefore,
@@ -445,6 +561,7 @@ fn semantic_action_allowed_by_scroll(
         SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
             matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. }) || allow_work_prefetch
         }
+        SemanticTimelineRequestAction::TurnWorkItemsGet { .. } => true,
     }
 }
 
@@ -456,6 +573,7 @@ fn semantic_action_requires_scroll_intent(action: &SemanticTimelineRequestAction
         SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
             !matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. })
         }
+        SemanticTimelineRequestAction::TurnWorkItemsGet { .. } => false,
     }
 }
 

@@ -145,6 +145,8 @@ fn large_semantic_timeline_uses_stable_blocks_and_paged_work() {
             thread_id: THREAD_ID.to_owned(),
             turn_id: TURN_ID.to_owned(),
             projection_version: 1,
+            source_high_watermark: 100,
+            projection_updated_at_unix_micros: 100,
             work: turn_work(
                 TurnWorkPresentation::CollapsedAfterFinal,
                 TOTAL_WORK_ITEM_COUNT
@@ -256,6 +258,8 @@ fn work_item(index: usize) -> TurnWorkItem {
         item_id: format!("reasoning_{index:04}"),
         turn_id: TURN_ID.to_owned(),
         order_key: format!("{index:08}"),
+        source_sequence: index as i64,
+        source_updated_at_unix_micros: index as i64,
         item_type: TurnItemType::Reasoning,
         status: TurnWorkItemStatus::Completed,
         started_at_unix_ms: Some(1_001 + index as i64),

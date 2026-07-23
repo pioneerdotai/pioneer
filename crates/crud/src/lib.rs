@@ -360,8 +360,9 @@ pub use crate::repositories::thread_timeline_projection::{
     delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
     find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
     find_turn_work_projection, list_projection_meta_by_key_prefix,
-    list_thread_timeline_blocks_page, list_turn_work_items_page, update_projection_meta_status,
-    upsert_projection_meta, upsert_projection_meta_with_config, upsert_thread_timeline_block,
+    list_thread_timeline_blocks_page, list_turn_work_item_projections_by_ids,
+    list_turn_work_items_page, update_projection_meta_status, upsert_projection_meta,
+    upsert_projection_meta_with_config, upsert_thread_timeline_block,
     upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
 pub use crate::repositories::turn_mcp_projection::{
@@ -8515,6 +8516,29 @@ impl CrudStore {
         Ok(Some(parsed))
     }
 
+    pub async fn get_turn_items_by_ids(
+        &self,
+        turn_id: &str,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, pioneer_protocol::TurnItem>> {
+        let models = turn::list_turn_items_by_ids(&self.connection, turn_id, item_ids).await?;
+        models
+            .into_iter()
+            .map(|model| {
+                let item_id = model.item_id;
+                let item = serde_json::from_str::<pioneer_protocol::TurnItem>(
+                    model.payload.as_str(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to decode turn_item payload for turn `{turn_id}` item `{item_id}`"
+                    )
+                })?;
+                Ok((item_id, item))
+            })
+            .collect()
+    }
+
     pub async fn list_turn_items_by_type(
         &self,
         turn_id: &str,
@@ -11438,6 +11462,16 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         work_item_id: &str,
     ) -> Result<Option<pioneer_entity::turn_work_item_projection::Model>> {
         find_turn_work_item_projection(&self.connection, work_item_id).await
+    }
+
+    pub async fn list_turn_work_item_projections_by_ids(
+        &self,
+        turn_id: &str,
+        work_item_ids: &[String],
+        visibility: Option<&str>,
+    ) -> Result<Vec<pioneer_entity::turn_work_item_projection::Model>> {
+        list_turn_work_item_projections_by_ids(&self.connection, turn_id, work_item_ids, visibility)
+            .await
     }
 
     pub async fn find_turn_work_item_projection_by_order_key(

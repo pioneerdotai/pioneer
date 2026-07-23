@@ -112,8 +112,9 @@ use pioneer_protocol::{
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
     ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
-    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnWorkPageParams,
-    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
@@ -134,7 +135,7 @@ use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
     ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
 };
-use timeline::{thread_timeline_page, turn_work_page};
+use timeline::{thread_timeline_page, turn_work_items_get, turn_work_page};
 use workspaces::{
     WorkspaceCreateRequest, WorkspaceCreateResult, WorkspaceRenameRequest, WorkspaceRenameResult,
     WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
@@ -1132,6 +1133,28 @@ impl ClientFfiRuntime {
         Ok(page)
     }
 
+    fn turn_work_items_get(
+        &self,
+        input_json: &str,
+    ) -> Result<TurnWorkItemsGetResponse, ClientFfiError> {
+        let params =
+            serde_json::from_str::<TurnWorkItemsGetParams>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid turn work items params: {error}"),
+                    timeline::TIMELINE_ERROR_VALIDATION,
+                )
+            })?;
+
+        let response = turn_work_items_get(&self.client_runtime.ws_command_sender(), params)?;
+        self.active_thread
+            .apply_turn_work_items_get_response(response.clone())
+            .map_err(|error| {
+                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
+            })?;
+
+        Ok(response)
+    }
+
     fn agents_doc_get(&self, input_json: &str) -> Result<ThreadAgentsDocGetResponse, String> {
         let request = serde_json::from_str::<ThreadAgentsDocGetParams>(input_json)
             .map_err(|error| format!("invalid agents doc get request: {error}"))?;
@@ -1695,6 +1718,7 @@ ffi_client_json_typed_method!(
     thread_timeline_page
 );
 ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_page, turn_work_page);
+ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_items_get, turn_work_items_get);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_get, agents_doc_get);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_save, agents_doc_save);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_archive, agents_doc_archive);

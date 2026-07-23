@@ -4,7 +4,8 @@ use pioneer_client::{
     transport::ws::{command_sender as ws_commands, worker},
 };
 use pioneer_protocol::{
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 
 pub const TIMELINE_ERROR_CANCELLED: &str = "pioneer_timeline_cancelled";
@@ -24,6 +25,13 @@ pub fn turn_work_page(
     params: TurnWorkPageParams,
 ) -> Result<TurnWorkPageResponse, ClientFfiError> {
     ws_commands::turn_work_page(transport, params).map_err(map_timeline_page_error)
+}
+
+pub fn turn_work_items_get(
+    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
+    params: TurnWorkItemsGetParams,
+) -> Result<TurnWorkItemsGetResponse, ClientFfiError> {
+    ws_commands::turn_work_items_get(transport, params).map_err(map_timeline_page_error)
 }
 
 fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {

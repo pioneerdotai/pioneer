@@ -515,6 +515,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::TurnWorkPageResponse
         ),
         schema_doc!(
+            "turn_work_items_get_params.json",
+            pioneer_protocol::TurnWorkItemsGetParams
+        ),
+        schema_doc!(
+            "turn_work_items_get_response.json",
+            pioneer_protocol::TurnWorkItemsGetResponse
+        ),
+        schema_doc!(
             "turn_work_presentation.json",
             pioneer_protocol::TurnWorkPresentation
         ),

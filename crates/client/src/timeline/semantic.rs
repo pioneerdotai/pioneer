@@ -10,9 +10,11 @@ use pioneer_protocol::{
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
     TurnItem, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkPageParams, TurnWorkPageResponse,
-    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification, UserMessageAttachment,
+    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
+    TurnWorkStateChangedNotification, UserMessageAttachment,
 };
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_TOP_LEVEL_PAGE_LIMIT: u32 = 12;
@@ -154,6 +156,10 @@ pub enum SemanticTimelineRequestKey {
         turn_id: TurnId,
         cursor: String,
     },
+    TurnWorkItems {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -166,6 +172,10 @@ pub enum SemanticTimelineRequestAction {
     TurnWorkPage {
         key: SemanticTimelineRequestKey,
         params: TurnWorkPageParams,
+    },
+    TurnWorkItemsGet {
+        key: SemanticTimelineRequestKey,
+        params: TurnWorkItemsGetParams,
     },
 }
 
@@ -334,6 +344,8 @@ pub struct TurnWorkRangeCache {
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub work: Option<TurnWorkBlock>,
+    pub source_high_watermark: i64,
+    pub projection_updated_at_unix_micros: i64,
     pub items_by_id: HashMap<TurnWorkItemId, TurnWorkItem>,
     pub ordered_item_ids: Vec<TurnWorkItemId>,
     pub stale_work_item_ids: HashSet<TurnWorkItemId>,
@@ -368,6 +380,17 @@ impl TurnWorkRangeCache {
 
     pub fn take_stale_work_item_ids(&mut self) -> Vec<TurnWorkItemId> {
         let mut ids = self.stale_work_item_ids.drain().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub fn running_work_item_ids(&self) -> Vec<TurnWorkItemId> {
+        let mut ids = self
+            .items_by_id
+            .values()
+            .filter(|item| item.status == TurnWorkItemStatus::Running)
+            .map(|item| item.work_item_id.clone())
+            .collect::<Vec<_>>();
         ids.sort();
         ids
     }
@@ -507,6 +530,8 @@ pub fn top_level_cache_from_page(page: ThreadTimelinePageResponse) -> TopLevelTi
 }
 
 pub fn turn_work_range_from_page(page: TurnWorkPageResponse) -> TurnWorkRangeCache {
+    let source_high_watermark = page.source_high_watermark;
+    let projection_updated_at_unix_micros = page.projection_updated_at_unix_micros;
     let mut items_by_id = HashMap::with_capacity(page.items.len());
     let mut ordered_item_ids = Vec::with_capacity(page.items.len());
     for item in page.items {
@@ -517,6 +542,8 @@ pub fn turn_work_range_from_page(page: TurnWorkPageResponse) -> TurnWorkRangeCac
         thread_id: page.thread_id,
         turn_id: page.turn_id,
         work: Some(page.work),
+        source_high_watermark,
+        projection_updated_at_unix_micros,
         items_by_id,
         ordered_item_ids,
         stale_work_item_ids: HashSet::new(),
@@ -1577,6 +1604,16 @@ pub fn apply_work_range_page(
 ) -> bool {
     let before = range.clone();
     let was_empty = range.ordered_item_ids.is_empty();
+    let incoming_projection_revision = (
+        page.source_high_watermark,
+        page.projection_updated_at_unix_micros,
+    );
+    let cached_projection_revision = (
+        range.source_high_watermark,
+        range.projection_updated_at_unix_micros,
+    );
+    let page_can_advance_newest_boundary =
+        incoming_projection_revision >= cached_projection_revision;
     let live_running_items = if merge_mode == WorkPageMergeMode::Reset {
         live_running_work_items(range)
     } else {
@@ -1591,22 +1628,104 @@ pub fn apply_work_range_page(
 
     range.thread_id = page.thread_id;
     range.turn_id = page.turn_id;
-    range.work = Some(page.work);
+    if page_can_advance_newest_boundary {
+        range.work = Some(page.work);
+        range.source_high_watermark = page.source_high_watermark;
+        range.projection_updated_at_unix_micros = page.projection_updated_at_unix_micros;
+    }
     for item in page.items {
-        remove_existing_work_items_for_item_id(
-            range,
-            item.item_id.as_str(),
-            item.work_item_id.as_str(),
-        );
-        range.stale_work_item_ids.remove(item.work_item_id.as_str());
-        range.items_by_id.insert(item.work_item_id.clone(), item);
+        merge_turn_work_item(range, item);
     }
     restore_missing_live_running_work_items(range, live_running_items);
     sort_work_items(range);
-    merge_work_loaded_range(range, &page.page, merge_mode, was_empty);
+    merge_work_loaded_range(
+        range,
+        &page.page,
+        merge_mode,
+        was_empty,
+        page_can_advance_newest_boundary,
+    );
     range.request_status = TimelineRequestStatus::Ready;
 
     before != *range
+}
+
+pub fn apply_turn_work_items_get_response(
+    state: &mut SemanticTimelineState,
+    response: TurnWorkItemsGetResponse,
+) -> bool {
+    let thread = state.thread_mut(response.thread_id.clone());
+    let range = thread.work_range_mut(response.turn_id.clone());
+    apply_work_items_get_response(range, response)
+}
+
+pub fn apply_work_items_get_response(
+    range: &mut TurnWorkRangeCache,
+    response: TurnWorkItemsGetResponse,
+) -> bool {
+    let before = range.clone();
+    range.thread_id = response.thread_id;
+    range.turn_id = response.turn_id;
+    let response_revision = (
+        response.source_high_watermark,
+        response.projection_updated_at_unix_micros,
+    );
+    let cached_revision = (
+        range.source_high_watermark,
+        range.projection_updated_at_unix_micros,
+    );
+
+    for item in response.items {
+        merge_turn_work_item(range, item);
+    }
+    if response_revision >= cached_revision {
+        for work_item_id in response.removed_work_item_ids {
+            range.items_by_id.remove(work_item_id.as_str());
+            range.stale_work_item_ids.remove(work_item_id.as_str());
+        }
+        range.source_high_watermark = response.source_high_watermark;
+        range.projection_updated_at_unix_micros = response.projection_updated_at_unix_micros;
+    }
+    range
+        .ordered_item_ids
+        .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
+    sort_work_items(range);
+    range.request_status = TimelineRequestStatus::Ready;
+
+    before != *range
+}
+
+fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) {
+    if let Some(existing) = range.items_by_id.get(item.work_item_id.as_str())
+        && !incoming_work_item_is_newer(existing, &item)
+    {
+        range.stale_work_item_ids.remove(item.work_item_id.as_str());
+        return;
+    }
+
+    remove_existing_work_items_for_item_id(
+        range,
+        item.item_id.as_str(),
+        item.work_item_id.as_str(),
+    );
+    range.stale_work_item_ids.remove(item.work_item_id.as_str());
+    range.items_by_id.insert(item.work_item_id.clone(), item);
+}
+
+fn incoming_work_item_is_newer(existing: &TurnWorkItem, incoming: &TurnWorkItem) -> bool {
+    if is_terminal_turn_work_item_status(existing.status)
+        && incoming.status == TurnWorkItemStatus::Running
+    {
+        return false;
+    }
+
+    match incoming.source_sequence.cmp(&existing.source_sequence) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => {
+            incoming.source_updated_at_unix_micros >= existing.source_updated_at_unix_micros
+        }
+    }
 }
 
 fn live_running_work_items(range: &TurnWorkRangeCache) -> Vec<TurnWorkItem> {
@@ -1692,8 +1811,23 @@ pub fn apply_turn_work_state_changed(
     let before = thread.clone();
     let turn_id = notification.turn_id;
     let work = notification.work;
+    let incoming_revision = (
+        notification.source_high_watermark,
+        notification.projection_updated_at_unix_micros,
+    );
 
-    thread.work_range_mut(turn_id.as_str()).work = Some(work.clone());
+    let range = thread.work_range_mut(turn_id.as_str());
+    if incoming_revision
+        < (
+            range.source_high_watermark,
+            range.projection_updated_at_unix_micros,
+        )
+    {
+        return false;
+    }
+    range.work = Some(work.clone());
+    range.source_high_watermark = notification.source_high_watermark;
+    range.projection_updated_at_unix_micros = notification.projection_updated_at_unix_micros;
     for block in thread.top_level.blocks_by_id.values_mut() {
         if let TimelineBlockKind::TurnWork { work: block_work } = &mut block.kind
             && block_work.turn_id == turn_id
@@ -2116,6 +2250,16 @@ fn upsert_turn_work_item(
         .items_by_id
         .get(work_item_id.as_str())
         .and_then(|item| item.started_at_unix_ms);
+    let existing_source_sequence = range
+        .items_by_id
+        .get(work_item_id.as_str())
+        .map(|item| item.source_sequence)
+        .unwrap_or_default();
+    let existing_source_updated_at_unix_micros = range
+        .items_by_id
+        .get(work_item_id.as_str())
+        .map(|item| item.source_updated_at_unix_micros)
+        .unwrap_or_default();
     range.items_by_id.insert(
         work_item_id.clone(),
         TurnWorkItem {
@@ -2123,6 +2267,9 @@ fn upsert_turn_work_item(
             item_id,
             turn_id: turn_id.to_owned(),
             order_key,
+            source_sequence: existing_source_sequence,
+            source_updated_at_unix_micros: existing_source_updated_at_unix_micros
+                .max(now_unix_ms.saturating_mul(1_000)),
             item_type,
             status,
             started_at_unix_ms: existing_started_at.or(Some(now_unix_ms)),
@@ -2337,12 +2484,77 @@ fn push_request_action(
 ) {
     let key = match &action {
         SemanticTimelineRequestAction::ThreadTimelinePage { key, .. }
-        | SemanticTimelineRequestAction::TurnWorkPage { key, .. } => key,
+        | SemanticTimelineRequestAction::TurnWorkPage { key, .. }
+        | SemanticTimelineRequestAction::TurnWorkItemsGet { key, .. } => key,
     };
     if in_flight.contains(key) || !planned.insert(key.clone()) {
         return;
     }
     actions.push(action);
+}
+
+pub fn coalesce_semantic_timeline_request_action(
+    existing: &mut SemanticTimelineRequestAction,
+    incoming: SemanticTimelineRequestAction,
+) {
+    if let (
+        SemanticTimelineRequestAction::TurnWorkItemsGet {
+            params: existing_params,
+            ..
+        },
+        SemanticTimelineRequestAction::TurnWorkItemsGet {
+            params: incoming_params,
+            ..
+        },
+    ) = (&mut *existing, &incoming)
+    {
+        existing_params
+            .work_item_ids
+            .extend(incoming_params.work_item_ids.iter().cloned());
+        existing_params.work_item_ids.sort();
+        existing_params.work_item_ids.dedup();
+        return;
+    }
+
+    *existing = incoming;
+}
+
+pub fn semantic_timeline_request_key(
+    action: &SemanticTimelineRequestAction,
+) -> &SemanticTimelineRequestKey {
+    match action {
+        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. }
+        | SemanticTimelineRequestAction::TurnWorkPage { key, .. }
+        | SemanticTimelineRequestAction::TurnWorkItemsGet { key, .. } => key,
+    }
+}
+
+pub fn enqueue_semantic_timeline_request(
+    in_flight: &mut HashSet<SemanticTimelineRequestKey>,
+    pending: &mut HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
+    action: SemanticTimelineRequestAction,
+) -> Option<SemanticTimelineRequestAction> {
+    let key = semantic_timeline_request_key(&action).clone();
+    if in_flight.insert(key.clone()) {
+        return Some(action);
+    }
+
+    pending
+        .entry(key)
+        .and_modify(|queued| {
+            coalesce_semantic_timeline_request_action(queued, action.clone());
+        })
+        .or_insert(action);
+    None
+}
+
+pub fn finish_semantic_timeline_request(
+    in_flight: &mut HashSet<SemanticTimelineRequestKey>,
+    pending: &mut HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
+    key: &SemanticTimelineRequestKey,
+) -> Option<SemanticTimelineRequestAction> {
+    in_flight.remove(key);
+    pending.remove(key)
 }
 
 fn turn_span_is_visible(
@@ -2570,6 +2782,7 @@ fn merge_work_loaded_range(
     page: &TimelinePageInfo,
     merge_mode: WorkPageMergeMode,
     was_empty: bool,
+    page_can_advance_newest_boundary: bool,
 ) {
     if was_empty || merge_mode == WorkPageMergeMode::Reset {
         range.loaded_range = page.into();
@@ -2599,8 +2812,10 @@ fn merge_work_loaded_range(
             }
         }
         WorkPageMergeMode::MergeAfter => {
-            range.loaded_range.after_cursor = page.after_cursor.clone();
-            range.loaded_range.has_more_after = page.has_more_after;
+            if page_can_advance_newest_boundary {
+                range.loaded_range.after_cursor = page.after_cursor.clone();
+                range.loaded_range.has_more_after = page.has_more_after;
+            }
             if range.loaded_range.before_cursor.is_none() {
                 range.loaded_range.before_cursor = page.before_cursor.clone();
                 range.loaded_range.has_more_before = page.has_more_before;
@@ -3091,6 +3306,206 @@ mod tests {
     }
 
     #[test]
+    fn late_running_page_cannot_regress_terminal_work_item() {
+        let mut state = SemanticTimelineState::default();
+        let mut completed = work_item("work_a", "001");
+        completed.status = TurnWorkItemStatus::Completed;
+        completed.source_sequence = 12;
+        completed.source_updated_at_unix_micros = 12;
+        let mut completed_page = work_page(vec![completed.clone()]);
+        completed_page.source_high_watermark = 12;
+        completed_page.projection_updated_at_unix_micros = 12;
+        assert!(apply_turn_work_page(
+            &mut state,
+            completed_page,
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut stale_running = completed;
+        stale_running.status = TurnWorkItemStatus::Running;
+        stale_running.source_sequence = 11;
+        stale_running.source_updated_at_unix_micros = 11;
+        let mut stale_page = work_page(vec![stale_running]);
+        stale_page.source_high_watermark = 11;
+        stale_page.projection_updated_at_unix_micros = 11;
+        assert!(!apply_turn_work_page(
+            &mut state,
+            stale_page,
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let item = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .and_then(|range| range.item("work_a"))
+            .expect("work item should remain cached");
+        assert_eq!(item.status, TurnWorkItemStatus::Completed);
+        assert_eq!(item.source_sequence, 12);
+    }
+
+    #[test]
+    fn terminal_work_item_never_regresses_to_running_even_with_newer_transport_revision() {
+        let mut state = SemanticTimelineState::default();
+        let mut completed = work_item("work_a", "001");
+        completed.status = TurnWorkItemStatus::Completed;
+        completed.source_sequence = 12;
+        completed.source_updated_at_unix_micros = 12;
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(vec![completed.clone()]),
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut running = completed;
+        running.status = TurnWorkItemStatus::Running;
+        running.source_sequence = 13;
+        running.source_updated_at_unix_micros = 13;
+        let mut response = work_items_response("thread_a", "turn_a", 13, vec![running]);
+        response.projection_updated_at_unix_micros = 13;
+        assert!(apply_turn_work_items_get_response(&mut state, response));
+
+        let item = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .and_then(|range| range.item("work_a"))
+            .expect("work item should remain cached");
+        assert_eq!(item.status, TurnWorkItemStatus::Completed);
+        assert_eq!(item.source_sequence, 12);
+    }
+
+    #[test]
+    fn targeted_reconciliation_updates_item_outside_newest_window_without_replacing_range() {
+        let mut state = SemanticTimelineState::default();
+        let items = (0..100)
+            .map(|index| work_item(&format!("work_{index:03}"), &format!("{index:03}")))
+            .collect();
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(items),
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut updated = work_item("work_000", "000");
+        updated.status = TurnWorkItemStatus::Failed;
+        updated.source_sequence = 20;
+        updated.source_updated_at_unix_micros = 20;
+        assert!(apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 20, vec![updated])
+        ));
+
+        let range = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .expect("work range should exist");
+        assert_eq!(range.ordered_item_ids.len(), 100);
+        assert_eq!(
+            range.item("work_000").map(|item| item.status),
+            Some(TurnWorkItemStatus::Failed)
+        );
+        assert_eq!(
+            range.ordered_item_ids.last().map(String::as_str),
+            Some("work_099")
+        );
+    }
+
+    #[test]
+    fn targeted_reconciliation_is_scoped_to_its_thread() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(vec![work_item("work_a", "001")]),
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut thread_b_item = work_item("work_b", "001");
+        thread_b_item.turn_id = "turn_b".to_owned();
+        let response = work_items_response("thread_b", "turn_b", 2, vec![thread_b_item]);
+        assert!(apply_turn_work_items_get_response(&mut state, response));
+
+        assert!(
+            state
+                .thread("thread_a")
+                .and_then(|thread| thread.work_range("turn_a"))
+                .is_some_and(|range| range.item("work_a").is_some())
+        );
+        assert!(
+            state
+                .thread("thread_b")
+                .and_then(|thread| thread.work_range("turn_b"))
+                .is_some_and(|range| range.item("work_b").is_some())
+        );
+    }
+
+    #[test]
+    fn repeated_targeted_requests_coalesce_changed_ids() {
+        let key = SemanticTimelineRequestKey::TurnWorkItems {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+        };
+        let mut pending = SemanticTimelineRequestAction::TurnWorkItemsGet {
+            key: key.clone(),
+            params: TurnWorkItemsGetParams {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                work_item_ids: vec!["work_a".to_owned()],
+            },
+        };
+        coalesce_semantic_timeline_request_action(
+            &mut pending,
+            SemanticTimelineRequestAction::TurnWorkItemsGet {
+                key,
+                params: TurnWorkItemsGetParams {
+                    thread_id: "thread_a".to_owned(),
+                    turn_id: "turn_a".to_owned(),
+                    work_item_ids: vec!["work_b".to_owned(), "work_a".to_owned()],
+                },
+            },
+        );
+
+        let SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } = pending else {
+            panic!("coalesced action should remain a targeted work request");
+        };
+        assert_eq!(params.work_item_ids, vec!["work_a", "work_b"]);
+    }
+
+    #[test]
+    fn invalidation_during_in_flight_request_schedules_trailing_reconciliation() {
+        let key = SemanticTimelineRequestKey::TurnWorkItems {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+        };
+        let action = |work_item_id: &str| SemanticTimelineRequestAction::TurnWorkItemsGet {
+            key: key.clone(),
+            params: TurnWorkItemsGetParams {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                work_item_ids: vec![work_item_id.to_owned()],
+            },
+        };
+        let mut in_flight = HashSet::new();
+        let mut pending = HashMap::new();
+
+        assert!(
+            enqueue_semantic_timeline_request(&mut in_flight, &mut pending, action("work_a"))
+                .is_some()
+        );
+        assert!(
+            enqueue_semantic_timeline_request(&mut in_flight, &mut pending, action("work_b"))
+                .is_none()
+        );
+
+        let trailing = finish_semantic_timeline_request(&mut in_flight, &mut pending, &key)
+            .expect("in-flight invalidation should leave a trailing request");
+        let SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } = trailing else {
+            panic!("trailing request should preserve its action kind");
+        };
+        assert_eq!(params.work_item_ids, vec!["work_b"]);
+        assert!(!in_flight.contains(&key));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn collapse_does_not_evict_cached_work_range() {
         let mut state = SemanticTimelineState::default();
         assert!(apply_turn_work_page(
@@ -3175,6 +3590,8 @@ mod tests {
                 workspace_id: "workspace_a".to_owned(),
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
+                source_high_watermark: 2,
+                projection_updated_at_unix_micros: 2,
                 work: updated_work,
                 reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
             }
@@ -3861,6 +4278,8 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             turn_id: "turn_a".to_owned(),
             projection_version: 1,
+            source_high_watermark: 1,
+            projection_updated_at_unix_micros: 1,
             work,
             items,
             page: TimelinePageInfo {
@@ -3873,6 +4292,24 @@ mod tests {
                 has_more_before: false,
                 has_more_after: false,
             },
+        }
+    }
+
+    fn work_items_response(
+        thread_id: &str,
+        turn_id: &str,
+        source_high_watermark: i64,
+        items: Vec<TurnWorkItem>,
+    ) -> TurnWorkItemsGetResponse {
+        TurnWorkItemsGetResponse {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            projection_version: 1,
+            source_high_watermark,
+            projection_updated_at_unix_micros: source_high_watermark,
+            items,
+            removed_work_item_ids: Vec::new(),
         }
     }
 
@@ -3902,6 +4339,8 @@ mod tests {
             item_id: format!("item_{work_item_id}"),
             turn_id: "turn_a".to_owned(),
             order_key: order_key.to_owned(),
+            source_sequence: 1,
+            source_updated_at_unix_micros: 1,
             item_type: TurnItemType::CommandExecution,
             status: TurnWorkItemStatus::Completed,
             started_at_unix_ms: None,
@@ -3934,6 +4373,8 @@ mod tests {
             item_id: format!("item_{work_item_id}"),
             turn_id: "turn_a".to_owned(),
             order_key: order_key.to_owned(),
+            source_sequence: 1,
+            source_updated_at_unix_micros: 1,
             item_type: TurnItemType::SystemEvent,
             status: TurnWorkItemStatus::Completed,
             started_at_unix_ms: None,

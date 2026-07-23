@@ -164,6 +164,7 @@ impl PioneerDesktop {
             semantic_timelines: SemanticTimelineState::default(),
             semantic_timeline_revision: 0,
             semantic_timeline_in_flight: HashSet::new(),
+            semantic_timeline_pending: HashMap::new(),
             task_review_actions: TaskReviewActionState::default(),
             thread_artifacts: ThreadArtifactsState::default(),
             show_thread_artifacts_sidebar: false,

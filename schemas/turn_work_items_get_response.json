@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "TurnWorkPageResponse",
+  "title": "TurnWorkItemsGetResponse",
   "type": "object",
   "properties": {
     "items": {
@@ -10,9 +10,6 @@
         "$ref": "#/$defs/TurnWorkItem"
       }
     },
-    "page": {
-      "$ref": "#/$defs/TimelinePageInfo"
-    },
     "projectionUpdatedAtUnixMicros": {
       "type": "integer",
       "format": "int64",
@@ -21,6 +18,13 @@
     "projectionVersion": {
       "type": "integer",
       "format": "int64"
+    },
+    "removedWorkItemIds": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
     },
     "sourceHighWatermark": {
       "type": "integer",
@@ -33,9 +37,6 @@
     "turnId": {
       "type": "string"
     },
-    "work": {
-      "$ref": "#/$defs/TurnWorkBlock"
-    },
     "workspaceId": {
       "type": "string"
     }
@@ -44,9 +45,7 @@
     "workspaceId",
     "threadId",
     "turnId",
-    "projectionVersion",
-    "work",
-    "page"
+    "projectionVersion"
   ],
   "$defs": {
     "AgentMessagePhase": {
@@ -880,17 +879,6 @@
         "dependency"
       ]
     },
-    "TimelineCursor": {
-      "type": "object",
-      "properties": {
-        "value": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "value"
-      ]
-    },
     "TimelineOutputPolicy": {
       "oneOf": [
         {
@@ -953,41 +941,6 @@
             "mode"
           ]
         }
-      ]
-    },
-    "TimelinePageInfo": {
-      "type": "object",
-      "properties": {
-        "afterCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "beforeCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "hasMoreAfter": {
-          "type": "boolean"
-        },
-        "hasMoreBefore": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "hasMoreBefore",
-        "hasMoreAfter"
       ]
     },
     "ToolCallStatus": {
@@ -2752,105 +2705,6 @@
         "label"
       ]
     },
-    "TurnWorkBlock": {
-      "type": "object",
-      "properties": {
-        "afterCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "beforeCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "completedAtUnixMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "elapsedMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "firstWorkItemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "hasMoreAfter": {
-          "type": "boolean"
-        },
-        "hasMoreBefore": {
-          "type": "boolean"
-        },
-        "hiddenWorkCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "lastWorkItemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "presentation": {
-          "$ref": "#/$defs/TurnWorkPresentation"
-        },
-        "startedAtUnixMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "state": {
-          "$ref": "#/$defs/TurnWorkState"
-        },
-        "turnId": {
-          "type": "string"
-        },
-        "visibleWorkCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "workCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "turnId",
-        "presentation",
-        "state",
-        "workCount",
-        "visibleWorkCount",
-        "hiddenWorkCount",
-        "hasMoreBefore",
-        "hasMoreAfter"
-      ]
-    },
     "TurnWorkItem": {
       "type": "object",
       "properties": {
@@ -2919,27 +2773,6 @@
         "blocked",
         "failed",
         "cancelled"
-      ]
-    },
-    "TurnWorkPresentation": {
-      "type": "string",
-      "enum": [
-        "expanded_live",
-        "collapsed_after_final",
-        "expanded_terminal_no_final"
-      ]
-    },
-    "TurnWorkState": {
-      "type": "string",
-      "enum": [
-        "starting",
-        "running",
-        "waiting_for_approval",
-        "stalled",
-        "completed",
-        "blocked",
-        "failed",
-        "interrupted"
       ]
     },
     "UserMessageAttachment": {

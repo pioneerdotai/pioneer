@@ -22,8 +22,8 @@ use pioneer_protocol::{
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
     ThreadTimelinePageParams, TurnCancelParams, TurnPermissionRequestRespondParams,
-    TurnResumeParams, TurnWorkPageParams, VoiceSessionCancelParams, VoiceSessionFinalizeParams,
-    VoiceSessionStartParams, VoiceStatusParams,
+    TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
+    VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
 };
 
 fn vector_provider_key_name(
@@ -809,6 +809,29 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_WORK_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_WORK_ITEMS_GET => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnWorkItemsGetParams>(params_value) {
+                        Ok(params) => {
+                            self.turn_work_items_get(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_WORK_ITEMS_GET
                                     ),
                                 ),
                             )

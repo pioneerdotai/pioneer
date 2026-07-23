@@ -16,9 +16,12 @@ use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
     TaskThreadLineage, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock,
     TimelineBlockKind, TimelinePageInfo, TurnItem, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput,
-    UserMessageAttachment,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    TurnWorkPresentation, TurnWorkState, UserInput, UserMessageAttachment,
 };
+
+const TURN_WORK_ITEMS_GET_MAX_IDS: usize = 200;
+const TURN_WORK_SNAPSHOT_MAX_ATTEMPTS: usize = 4;
 
 struct ThreadTimelineRowsPage {
     rows: Vec<thread_timeline_block::Model>,
@@ -30,6 +33,18 @@ struct TurnWorkRowsPage {
     rows: Vec<turn_work_item_projection::Model>,
     has_more_before: bool,
     has_more_after: bool,
+}
+
+struct TurnWorkPageSnapshot {
+    projection: turn_work_projection::Model,
+    rows_page: TurnWorkRowsPage,
+    items: Vec<TurnWorkItem>,
+}
+
+struct TurnWorkItemsSnapshot {
+    projection: turn_work_projection::Model,
+    items: Vec<TurnWorkItem>,
+    removed_work_item_ids: Vec<String>,
 }
 
 impl MessageProcessor {
@@ -331,11 +346,11 @@ impl MessageProcessor {
             }
         };
 
-        let rows_page = match self
-            .load_turn_work_rows(params.turn_id.as_str(), anchor, limit)
+        let snapshot = match self
+            .load_consistent_turn_work_page_snapshot(work_projection, anchor, limit)
             .await
         {
-            Ok(page) => page,
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -351,9 +366,9 @@ impl MessageProcessor {
         };
 
         let page_info = match turn_work_page_info(
-            rows_page.rows.as_slice(),
-            rows_page.has_more_before,
-            rows_page.has_more_after,
+            snapshot.rows_page.rows.as_slice(),
+            snapshot.rows_page.has_more_before,
+            snapshot.rows_page.has_more_after,
         ) {
             Ok(page_info) => page_info,
             Err(error) => {
@@ -370,24 +385,13 @@ impl MessageProcessor {
             }
         };
 
-        let items = match self.turn_work_items_from_rows(rows_page.rows).await {
-            Ok(items) => items,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to materialize turn work items: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let workspace_id = work_projection.workspace_id.clone();
-        let work = match self.turn_work_block_from_projection(work_projection).await {
+        let workspace_id = snapshot.projection.workspace_id.clone();
+        let source_high_watermark = snapshot.projection.source_high_watermark;
+        let projection_updated_at_unix_micros = snapshot.projection.updated_at.timestamp_micros();
+        let work = match self
+            .turn_work_block_from_projection(snapshot.projection)
+            .await
+        {
             Ok(work) => work,
             Err(error) => {
                 self.send_error(
@@ -412,8 +416,10 @@ impl MessageProcessor {
             thread_id: params.thread_id,
             turn_id: params.turn_id,
             projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+            source_high_watermark,
+            projection_updated_at_unix_micros,
             work,
-            items,
+            items: snapshot.items,
             page: page_info,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -437,6 +443,151 @@ impl MessageProcessor {
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send turn/work/page response"
+            );
+        }
+    }
+
+    pub(super) async fn turn_work_items_get(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: TurnWorkItemsGetParams,
+    ) {
+        if params.thread_id.trim().is_empty()
+            || params.turn_id.trim().is_empty()
+            || params.work_item_ids.is_empty()
+            || params
+                .work_item_ids
+                .iter()
+                .any(|work_item_id| work_item_id.trim().is_empty())
+            || params.work_item_ids.len() > TURN_WORK_ITEMS_GET_MAX_IDS
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `thread_id`, `turn_id`, and 1..={TURN_WORK_ITEMS_GET_MAX_IDS} non-empty `work_item_ids` are required",
+                        methods::TURN_WORK_ITEMS_GET
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let mut work_item_ids = params.work_item_ids;
+        work_item_ids.sort();
+        work_item_ids.dedup();
+
+        let work_projection = match self
+            .crud_store
+            .get_turn_work_projection(params.turn_id.as_str())
+            .await
+        {
+            Ok(Some(projection)) if projection.thread_id == params.thread_id => projection,
+            Ok(Some(_)) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: turn `{}` does not belong to thread `{}`",
+                            methods::TURN_WORK_ITEMS_GET,
+                            params.turn_id,
+                            params.thread_id
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "turn work projection for turn `{}` was not found",
+                            params.turn_id
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load turn work projection: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let snapshot = match self
+            .load_consistent_turn_work_items_snapshot(work_projection, work_item_ids)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load turn work items: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let workspace_id = snapshot.projection.workspace_id.clone();
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+
+        let response_payload = TurnWorkItemsGetResponse {
+            workspace_id,
+            thread_id: params.thread_id,
+            turn_id: params.turn_id,
+            projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+            source_high_watermark: snapshot.projection.source_high_watermark,
+            projection_updated_at_unix_micros: snapshot.projection.updated_at.timestamp_micros(),
+            items: snapshot.items,
+            removed_work_item_ids: snapshot.removed_work_item_ids,
+        };
+        let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send turn/work/items/get response"
             );
         }
     }
@@ -587,6 +738,101 @@ impl MessageProcessor {
             has_more_before,
             has_more_after,
         })
+    }
+
+    async fn load_consistent_turn_work_page_snapshot(
+        &self,
+        mut projection: turn_work_projection::Model,
+        anchor: ResolvedTimelineAnchor,
+        limit: u64,
+    ) -> Result<TurnWorkPageSnapshot> {
+        for _ in 0..TURN_WORK_SNAPSHOT_MAX_ATTEMPTS {
+            let rows_page = self
+                .load_turn_work_rows(projection.turn_id.as_str(), anchor.clone(), limit)
+                .await?;
+            let items = self
+                .turn_work_items_from_rows(rows_page.rows.as_slice())
+                .await?;
+            let Some(current_projection) = self
+                .crud_store
+                .get_turn_work_projection(projection.turn_id.as_str())
+                .await?
+            else {
+                return Err(anyhow!(
+                    "turn work projection for turn `{}` disappeared while reading its page",
+                    projection.turn_id
+                ));
+            };
+
+            if turn_work_projection_revision(&projection)
+                == turn_work_projection_revision(&current_projection)
+            {
+                return Ok(TurnWorkPageSnapshot {
+                    projection: current_projection,
+                    rows_page,
+                    items,
+                });
+            }
+            projection = current_projection;
+        }
+
+        Err(anyhow!(
+            "turn work projection for turn `{}` kept changing while reading its page",
+            projection.turn_id
+        ))
+    }
+
+    async fn load_consistent_turn_work_items_snapshot(
+        &self,
+        mut projection: turn_work_projection::Model,
+        work_item_ids: Vec<String>,
+    ) -> Result<TurnWorkItemsSnapshot> {
+        for _ in 0..TURN_WORK_SNAPSHOT_MAX_ATTEMPTS {
+            let rows = self
+                .crud_store
+                .list_turn_work_item_projections_by_ids(
+                    projection.turn_id.as_str(),
+                    work_item_ids.as_slice(),
+                    Some(WORK_VISIBILITY_VISIBLE),
+                )
+                .await?;
+            let items = self.turn_work_items_from_rows(rows.as_slice()).await?;
+            let Some(current_projection) = self
+                .crud_store
+                .get_turn_work_projection(projection.turn_id.as_str())
+                .await?
+            else {
+                return Err(anyhow!(
+                    "turn work projection for turn `{}` disappeared while reading its items",
+                    projection.turn_id
+                ));
+            };
+
+            if turn_work_projection_revision(&projection)
+                == turn_work_projection_revision(&current_projection)
+            {
+                let returned_ids = rows
+                    .iter()
+                    .map(|row| row.work_item_id.as_str())
+                    .collect::<HashSet<_>>();
+                let removed_work_item_ids = work_item_ids
+                    .iter()
+                    .filter(|work_item_id| !returned_ids.contains(work_item_id.as_str()))
+                    .cloned()
+                    .collect();
+                return Ok(TurnWorkItemsSnapshot {
+                    projection: current_projection,
+                    items,
+                    removed_work_item_ids,
+                });
+            }
+            projection = current_projection;
+        }
+
+        Err(anyhow!(
+            "turn work projection for turn `{}` kept changing while reading its items",
+            projection.turn_id
+        ))
     }
 
     async fn load_turn_work_rows(
@@ -1048,37 +1294,47 @@ impl MessageProcessor {
 
     async fn turn_work_items_from_rows(
         &self,
-        rows: Vec<turn_work_item_projection::Model>,
+        rows: &[turn_work_item_projection::Model],
     ) -> Result<Vec<TurnWorkItem>> {
+        let item_ids = rows
+            .iter()
+            .map(|row| row.item_id.clone())
+            .collect::<Vec<_>>();
+        let mut items_by_id = self
+            .crud_store
+            .get_turn_items_by_ids(
+                rows.first()
+                    .map(|row| row.turn_id.as_str())
+                    .unwrap_or_default(),
+                item_ids.as_slice(),
+            )
+            .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            items.push(self.turn_work_item_from_row(row).await?);
+            let Some(mut item) = items_by_id.remove(row.item_id.as_str()) else {
+                return Err(anyhow!(
+                    "turn item `{}` for work row `{}` was not found",
+                    row.item_id,
+                    row.work_item_id
+                ));
+            };
+            Self::normalize_item_markdown(&mut item);
+            items.push(Self::turn_work_item_from_row(row, item)?);
         }
         Ok(items)
     }
 
-    async fn turn_work_item_from_row(
-        &self,
-        row: turn_work_item_projection::Model,
+    fn turn_work_item_from_row(
+        row: &turn_work_item_projection::Model,
+        item: TurnItem,
     ) -> Result<TurnWorkItem> {
-        let Some(mut item) = self
-            .crud_store
-            .get_turn_item(row.turn_id.as_str(), row.item_id.as_str())
-            .await?
-        else {
-            return Err(anyhow!(
-                "turn item `{}` for work row `{}` was not found",
-                row.item_id,
-                row.work_item_id
-            ));
-        };
-        Self::normalize_item_markdown(&mut item);
-
         Ok(TurnWorkItem {
-            work_item_id: row.work_item_id,
-            item_id: row.item_id,
-            turn_id: row.turn_id,
-            order_key: row.order_key,
+            work_item_id: row.work_item_id.clone(),
+            item_id: row.item_id.clone(),
+            turn_id: row.turn_id.clone(),
+            order_key: row.order_key.clone(),
+            source_sequence: row.source_sequence,
+            source_updated_at_unix_micros: row.updated_at.timestamp_micros(),
             item_type: item.item_type(),
             status: parse_turn_work_item_status(row.status.as_str()),
             started_at_unix_ms: row.started_at.map(|value| value.timestamp_millis()),
@@ -1186,6 +1442,13 @@ fn turn_work_page_info(
         has_more_before,
         has_more_after,
     })
+}
+
+fn turn_work_projection_revision(projection: &turn_work_projection::Model) -> (i64, i64) {
+    (
+        projection.source_high_watermark,
+        projection.updated_at.timestamp_micros(),
+    )
 }
 
 fn user_message_text_and_attachments(input: &[UserInput]) -> (String, Vec<UserMessageAttachment>) {

@@ -24,6 +24,7 @@ pub mod methods {
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ITEMS: &str = "turn/items";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
+    pub const TURN_WORK_ITEMS_GET: &str = "turn/work/items/get";
     pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
     pub const VOICE_STATUS: &str = "voice/status";
     pub const VOICE_SESSION_START: &str = "voice/session/start";
