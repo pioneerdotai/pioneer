@@ -73,6 +73,7 @@ pub fn default_lifecycle_policy(
 
 pub fn default_delivery_policy(
     trigger_kind: TaskTriggerKind,
+    attachment: TaskAttachmentMode,
     owner_kind: TaskOwnerKind,
     owner_id: Option<&str>,
     created_by_thread_id: Option<&str>,
@@ -83,8 +84,10 @@ pub fn default_delivery_policy(
         trigger_kind,
         TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
     );
+    let is_immediate_detached =
+        trigger_kind == TaskTriggerKind::Immediate && attachment == TaskAttachmentMode::Detached;
     TaskDeliveryPolicy {
-        mode: if is_scheduled && has_thread_target {
+        mode: if (is_scheduled || is_immediate_detached) && has_thread_target {
             TaskDeliveryMode::OwnerThread
         } else {
             TaskDeliveryMode::None

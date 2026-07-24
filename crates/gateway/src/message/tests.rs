@@ -12067,6 +12067,277 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_millis(250),
+            text: r#"<task_result>{"summary":"immediate background result","data":{"rawText":"immediate background result\nfull detail"}}</task_result>"#.to_owned(),
+        }),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let parent_thread_id = "thr_parent_immediate_detached";
+    let creation_turn_id = "turn_parent_immediate_detached";
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        creation_turn_id,
+        "Immediate background child result",
+        3,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = None;
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("immediate detached task_create should succeed");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate detached task should create a run");
+    assert_eq!(
+        response
+            .task
+            .delivery_policy
+            .as_ref()
+            .map(|policy| policy.mode),
+        Some(TaskDeliveryMode::OwnerThread),
+        "immediate detached thread work should inherit scheduled-style owner delivery"
+    );
+    assert!(
+        !response.task.status.is_terminal(),
+        "delayed immediate child should still be running when task_create returns"
+    );
+
+    let mut running_occurrence_turn = None;
+    for _ in 0..100 {
+        running_occurrence_turn = crud_store
+            .get_turn(parent_thread_id, run.id.as_str())
+            .await
+            .expect("running occurrence turn lookup should succeed")
+            .map(|(_, turn)| turn);
+        if running_occurrence_turn.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let running_occurrence_turn =
+        running_occurrence_turn.expect("running occurrence turn should appear asynchronously");
+    assert_eq!(running_occurrence_turn.status, TurnStatus::InProgress);
+    assert_eq!(running_occurrence_turn.origin, TurnOrigin::DetachedTask);
+    let mut running_blocks = Vec::new();
+    for _ in 0..100 {
+        running_blocks = thread_timeline_block::Entity::find()
+            .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id))
+            .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
+            .all(&crud_store.database_connection())
+            .await
+            .expect("running occurrence timeline blocks should load");
+        if running_blocks
+            .iter()
+            .any(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let running_card = running_blocks
+        .iter()
+        .find(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN)
+        .expect("standalone detached card should be visible while the child is running");
+    let running_card_id = running_card.block_id.clone();
+    let running_card_sort_key = running_card.sort_key.clone();
+
+    let created_at = super::now_timestamp_secs();
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: Turn {
+                    id: creation_turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::Conversation,
+                    origin: TurnOrigin::User,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+            },
+            created_at,
+        )
+        .await
+        .expect("parent turn should complete without joining detached work");
+
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            response.task.id.as_str(),
+            TaskStatus::Completed,
+        )
+        .await,
+        TaskStatus::Completed
+    );
+    let task_response = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task query should succeed")
+        .expect("task should exist");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    assert_eq!(lineage.parent_thread_id, parent_thread_id);
+    assert_eq!(lineage.created_by_turn_id.as_deref(), Some(run.id.as_str()));
+
+    let (_, occurrence_turn) = crud_store
+        .get_turn(parent_thread_id, run.id.as_str())
+        .await
+        .expect("occurrence turn lookup should succeed")
+        .expect("occurrence turn should exist");
+    assert_eq!(occurrence_turn.turn_kind, TurnKind::TaskRun);
+    assert_eq!(occurrence_turn.origin, TurnOrigin::DetachedTask);
+    assert_eq!(occurrence_turn.status, TurnStatus::Completed);
+
+    let occurrence_items = crud_store
+        .get_turn_item_events(parent_thread_id, run.id.as_str())
+        .await
+        .expect("occurrence turn items should load")
+        .expect("occurrence turn item stream should exist");
+    assert!(
+        occurrence_items.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::Task { item },
+                ..
+            } if item.id == crate::task_tools::task_run_anchor_id(run.id.as_str())
+                && item.task_id == response.task.id
+                && item.run_id.as_deref() == Some(run.id.as_str())
+                && item.attachment == TaskAttachmentMode::Detached
+                && item.trigger_kind == TaskTriggerKind::Immediate
+        )),
+        "immediate detached occurrence should persist the same standalone Task card as scheduled work"
+    );
+    let projected_blocks = thread_timeline_block::Entity::find()
+        .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id))
+        .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
+        .all(&crud_store.database_connection())
+        .await
+        .expect("occurrence timeline blocks should load");
+    assert!(projected_blocks.iter().any(|block| {
+        block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN
+            && block.source_key.as_deref()
+                == Some(crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str())
+    }));
+    let completed_card = projected_blocks
+        .iter()
+        .find(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN)
+        .expect("completed detached card should remain in the timeline");
+    assert_eq!(completed_card.block_id, running_card_id);
+    assert_eq!(
+        completed_card.sort_key, running_card_sort_key,
+        "Task status updates must not move the standalone card"
+    );
+    assert!(
+        projected_blocks
+            .iter()
+            .all(|block| block.block_kind != BLOCK_KIND_TURN_WORK),
+        "immediate detached occurrence must not create a Worked group"
+    );
+
+    let parent = crud_store
+        .get_thread_model(parent_thread_id)
+        .await
+        .expect("parent thread should load")
+        .expect("parent thread should exist");
+    assert_eq!(
+        parent.status,
+        ThreadStatus::Idle,
+        "completed parent must stay idle while detached result delivery is pending"
+    );
+
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+        .await
+        .expect("immediate detached delivery worker should run");
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(2), 10)
+        .await
+        .expect("repeated delivery polling should remain idempotent");
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(response.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("deliveries should read");
+    assert_eq!(deliveries.deliveries.len(), 1);
+    assert_eq!(
+        deliveries.deliveries[0].status,
+        TaskDeliveryStatus::Delivered
+    );
+    assert_eq!(
+        deliveries.deliveries[0].delivered_turn_id.as_deref(),
+        Some(run.id.as_str()),
+        "result should be appended to the Task occurrence turn"
+    );
+
+    let delivered_items = crud_store
+        .get_turn_item_events(parent_thread_id, run.id.as_str())
+        .await
+        .expect("delivered occurrence items should load")
+        .expect("delivered occurrence stream should exist");
+    let delivered_agent_messages = delivered_items
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::AgentMessage { text, .. },
+                    ..
+                } if text.contains("immediate background result")
+            )
+        })
+        .count();
+    assert_eq!(
+        delivered_agent_messages, 1,
+        "background result must be delivered to the parent exactly once"
+    );
+
+    assert_eq!(
+        task_response
+            .task
+            .lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment),
+        Some(TaskAttachmentMode::Detached)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = mpsc::channel(8);

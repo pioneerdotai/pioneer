@@ -3751,6 +3751,128 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
 }
 
 #[tokio::test]
+async fn immediate_detached_thread_task_defaults_to_owner_thread_delivery() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.owner_kind = TaskOwnerKind::Thread;
+    params.owner_id = Some("thr_background_owner".to_owned());
+    params.created_by_thread_id = Some("thr_background_owner".to_owned());
+    params.created_by_turn_id = Some("turn_background_creator".to_owned());
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("immediate detached task should create and run");
+
+    assert_eq!(
+        response
+            .task
+            .delivery_policy
+            .as_ref()
+            .map(|policy| policy.mode),
+        Some(TaskDeliveryMode::OwnerThread)
+    );
+    assert_eq!(
+        response
+            .task
+            .lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment),
+        Some(TaskAttachmentMode::Detached)
+    );
+    assert!(
+        response.run.is_some(),
+        "immediate background task should create a run during admission"
+    );
+
+    let deliveries = runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: "ws_tasks".to_owned(),
+            task_id: Some(response.task.id),
+            run_id: None,
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("deliveries should read");
+    assert_eq!(deliveries.deliveries.len(), 1);
+    let delivery = &deliveries.deliveries[0];
+    assert_eq!(delivery.mode, TaskDeliveryMode::OwnerThread);
+    assert_eq!(delivery.status, TaskDeliveryStatus::Pending);
+    assert_eq!(
+        delivery.target_thread_id.as_deref(),
+        Some("thr_background_owner")
+    );
+    assert_eq!(
+        delivery
+            .result_snapshot
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("completed run 1")
+    );
+}
+
+#[tokio::test]
+async fn immediate_attached_thread_task_keeps_no_delivery_default() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.owner_kind = TaskOwnerKind::Thread;
+    params.owner_id = Some("thr_attached_owner".to_owned());
+    params.created_by_thread_id = Some("thr_attached_owner".to_owned());
+    params.created_by_turn_id = Some("turn_attached_creator".to_owned());
+
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("immediate attached task should create and run");
+
+    assert_eq!(
+        response
+            .task
+            .lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment),
+        Some(TaskAttachmentMode::Attached)
+    );
+    assert_eq!(
+        response
+            .task
+            .delivery_policy
+            .as_ref()
+            .map(|policy| policy.mode),
+        Some(TaskDeliveryMode::None),
+        "attached subagent result remains owned by the joining parent turn"
+    );
+    let deliveries = runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: "ws_tasks".to_owned(),
+            task_id: Some(response.task.id),
+            run_id: None,
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("deliveries should read");
+    assert!(deliveries.deliveries.is_empty());
+}
+
+#[tokio::test]
 async fn cancel_task_cancels_pending_deliveries() {
     let runtime = runtime().await;
     runtime

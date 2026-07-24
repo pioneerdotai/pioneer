@@ -9,16 +9,16 @@ use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
     TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
     TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
-    TaskCreateParams, TaskCreateResponse, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
-    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
-    TaskOwnerKind, TaskPauseParams, TaskRescheduleParams, TaskResult, TaskResultCandidateStatus,
-    TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy, TaskReviseParams,
-    TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind, TaskStatus,
-    TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
-    TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
-    constants::events,
+    TaskCompletionBehavior, TaskCreateParams, TaskCreateResponse, TaskDeliveryMode,
+    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
+    TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
+    TaskManualActor, TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams,
+    TaskRescheduleParams, TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind,
+    TaskResumeParams, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunStatus, TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem,
+    TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus,
+    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -981,6 +981,9 @@ impl TaskToolHandler {
             ));
         }
         let trigger_kind = trigger.spec.kind();
+        let lifecycle_policy =
+            task_create_lifecycle_policy(input.background, trigger_kind, input.lifecycle_policy)?;
+        let delivery_policy = task_create_delivery_policy(input.background, input.delivery_policy)?;
         let instructions = normalize_task_instructions(input.instructions, trigger_kind)?;
         let output_instructions =
             normalize_task_output_instructions(input.output_instructions, trigger_kind)?;
@@ -1021,8 +1024,8 @@ impl TaskToolHandler {
             priority: input.priority.unwrap_or_default(),
             trigger,
             agent_spec,
-            lifecycle_policy: input.lifecycle_policy,
-            delivery_policy: input.delivery_policy,
+            lifecycle_policy,
+            delivery_policy,
             retry_policy: input.retry_policy,
             timeout_policy: input.timeout_policy,
             concurrency_policy: input.concurrency_policy,
@@ -1264,6 +1267,9 @@ struct TaskCreateToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
     trigger: Option<TaskTriggerToolInput>,
+    #[serde(default)]
+    /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn, delivers its result to the parent thread, and must not be joined with task_wait.
+    background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
     executor_kind: Option<TaskToolExecutorKind>,
@@ -1302,10 +1308,10 @@ struct TaskCreateToolInput {
     /// Optional scheduling priority. Higher values are preferred by the task service.
     priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Advanced lifecycle policy. Omit for attached subagent work.
+    /// Advanced lifecycle policy. Omit for normal attached work and when background=true. background=true already selects Detached + KeepRunning + CompleteOnTerminalRun.
     lifecycle_policy: Option<TaskLifecyclePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work.
+    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work and for background=true, which defaults to owner_thread delivery with the result included.
     delivery_policy: Option<TaskDeliveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Advanced retry policy. Omit to use the task service default.
@@ -1326,6 +1332,52 @@ struct TaskCreateToolInput {
     )]
     /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
     idempotency_key: Option<String>,
+}
+
+fn task_create_lifecycle_policy(
+    background: bool,
+    trigger_kind: TaskTriggerKind,
+    lifecycle_policy: Option<TaskLifecyclePolicy>,
+) -> Result<Option<TaskLifecyclePolicy>, ToolError> {
+    if !background {
+        return Ok(lifecycle_policy);
+    }
+    if trigger_kind != TaskTriggerKind::Immediate {
+        return Err(ToolError::invalid_arguments(
+            "`background=true` is only valid for an immediate Task; omit it for scheduled, interval, and cron Tasks because those are already detached",
+        ));
+    }
+    let expected = TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    };
+    match lifecycle_policy {
+        None => Ok(Some(expected)),
+        Some(policy) if policy == expected => Ok(Some(policy)),
+        Some(_) => Err(ToolError::invalid_arguments(
+            "`background=true` already selects Detached + KeepRunning + CompleteOnTerminalRun; omit lifecyclePolicy or make it exactly equivalent",
+        )),
+    }
+}
+
+fn task_create_delivery_policy(
+    background: bool,
+    delivery_policy: Option<TaskDeliveryPolicy>,
+) -> Result<Option<TaskDeliveryPolicy>, ToolError> {
+    if !background {
+        return Ok(delivery_policy);
+    }
+    match delivery_policy {
+        None => Ok(None),
+        Some(policy) if policy.mode == TaskDeliveryMode::OwnerThread && policy.include_result => {
+            Ok(Some(policy))
+        }
+        Some(_) => Err(ToolError::invalid_arguments(
+            "`background=true` delivers the completed result to the parent thread; omit deliveryPolicy or use owner_thread with includeResult=true",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1931,7 +1983,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For immediate subagents omit trigger. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the parent thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -2699,16 +2751,7 @@ fn json_u32(value: &JsonValue, key: &str) -> u32 {
 }
 
 fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem) -> JsonValue {
-    let attachment = response
-        .task
-        .lifecycle_policy
-        .as_ref()
-        .map(|policy| match policy.attachment {
-            TaskAttachmentMode::Attached => "attached",
-            TaskAttachmentMode::Detached => "detached",
-        })
-        .unwrap_or("detached");
-
+    let attachment = task_create_response_attachment(response);
     let waitable = task_create_response_waitable(response);
 
     json!({
@@ -2718,7 +2761,13 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
         "waitRecommendation": task_create_wait_recommendation(response, waitable),
         "status": task_status_label(response.task.status),
         "title": response.task.title,
-        "attachment": attachment,
+        "attachment": match attachment {
+            TaskAttachmentMode::Attached => "attached",
+            TaskAttachmentMode::Detached => "detached",
+        },
+        "deliveryMode": response.task.delivery_policy.as_ref().map(|policy| {
+            task_delivery_mode_label(policy.mode)
+        }),
         "trigger": task_trigger_model_output(&response.trigger),
         "triggerKind": trigger_kind_label(response.trigger.kind()),
         "nextFireAt": response.trigger.next_fire_at,
@@ -2883,6 +2932,8 @@ fn task_create_validation_hints(
     waitable: bool,
 ) -> Vec<&'static str> {
     let mut hints = Vec::new();
+    let immediate_detached = response.trigger.kind() == TaskTriggerKind::Immediate
+        && task_create_response_attachment(response) == TaskAttachmentMode::Detached;
     if matches!(
         response.trigger.kind(),
         TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
@@ -2894,18 +2945,31 @@ fn task_create_validation_hints(
     if waitable {
         hints.push("active_attached_task_should_be_joined_before_final_answer");
     }
+    if immediate_detached {
+        hints.push("immediate_detached_task_runs_in_background");
+        hints.push("do_not_call_task_wait_for_detached_task");
+        if response
+            .task
+            .delivery_policy
+            .as_ref()
+            .is_some_and(|policy| policy.mode == TaskDeliveryMode::OwnerThread)
+        {
+            hints.push("result_will_be_delivered_to_owner_thread");
+        }
+    }
     hints
 }
 
 fn task_create_response_waitable(response: &TaskCreateResponse) -> bool {
-    response
-        .run
-        .as_ref()
-        .is_some_and(|run| !run.status.is_terminal())
-        || matches!(
-            response.task.status,
-            TaskStatus::Queued | TaskStatus::Running | TaskStatus::Waiting
-        )
+    task_create_response_attachment(response) == TaskAttachmentMode::Attached
+        && (response
+            .run
+            .as_ref()
+            .is_some_and(|run| !run.status.is_terminal())
+            || matches!(
+                response.task.status,
+                TaskStatus::Queued | TaskStatus::Running | TaskStatus::Waiting
+            ))
 }
 
 fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool) -> &'static str {
@@ -2916,7 +2980,31 @@ fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool
         TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron => {
             "do_not_call_task_wait_confirm_schedule"
         }
+        TaskTriggerKind::Immediate
+            if task_create_response_attachment(response) == TaskAttachmentMode::Detached =>
+        {
+            "do_not_call_task_wait_background_result_delivers_to_parent"
+        }
         _ => "do_not_call_task_wait_unless_an_active_run_exists",
+    }
+}
+
+fn task_create_response_attachment(response: &TaskCreateResponse) -> TaskAttachmentMode {
+    response
+        .task
+        .lifecycle_policy
+        .as_ref()
+        .map(|policy| policy.attachment)
+        .unwrap_or(TaskAttachmentMode::Detached)
+}
+
+fn task_delivery_mode_label(mode: TaskDeliveryMode) -> &'static str {
+    match mode {
+        TaskDeliveryMode::None => "none",
+        TaskDeliveryMode::OwnerThread => "owner_thread",
+        TaskDeliveryMode::Thread => "thread",
+        TaskDeliveryMode::UserNotification => "user_notification",
+        TaskDeliveryMode::Webhook => "webhook",
     }
 }
 
@@ -4212,6 +4300,155 @@ mod tests {
     }
 
     #[test]
+    fn immediate_detached_task_create_output_is_background_and_not_waitable() {
+        let mut task = sample_task(TaskStatus::Running);
+        task.owner_kind = TaskOwnerKind::Thread;
+        task.owner_id = Some("thread_12345678901234".to_owned());
+        task.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+        task.delivery_policy = Some(TaskDeliveryPolicy {
+            mode: TaskDeliveryMode::OwnerThread,
+            thread_id: None,
+            webhook_url: None,
+            include_result: true,
+            format: pioneer_protocol::TaskDeliveryFormat::Summary,
+        });
+        let response = TaskCreateResponse {
+            task,
+            trigger: TaskTrigger {
+                id: "trigger_1234567890123".to_owned(),
+                task_id: "task_1234567890123456".to_owned(),
+                status: pioneer_protocol::TaskTriggerStatus::Exhausted,
+                spec: TaskTriggerSpec::Immediate,
+                next_fire_at: None,
+                last_fire_at: Some(100),
+                created_at: 100,
+                updated_at: 100,
+            },
+            run: Some(sample_run(TaskRunStatus::Running)),
+            agent_spec: None,
+        };
+        let mut anchor = sample_task_turn_item();
+        anchor.status = TaskStatus::Running;
+        anchor.trigger_kind = TaskTriggerKind::Immediate;
+        anchor.run_id = response.run.as_ref().map(|run| run.id.clone());
+
+        let output = task_create_tool_output(&response, &anchor);
+
+        assert_eq!(output["attachment"], "detached");
+        assert_eq!(output["deliveryMode"], "owner_thread");
+        assert_eq!(output["waitable"], JsonValue::Bool(false));
+        assert_eq!(
+            output["waitRecommendation"],
+            "do_not_call_task_wait_background_result_delivers_to_parent"
+        );
+        let hints = output["validationHints"]
+            .as_array()
+            .expect("validation hints should be an array");
+        for expected in [
+            "immediate_detached_task_runs_in_background",
+            "do_not_call_task_wait_for_detached_task",
+            "result_will_be_delivered_to_owner_thread",
+        ] {
+            assert!(
+                hints.iter().any(|hint| hint == expected),
+                "missing background hint `{expected}` in {hints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_attached_task_create_output_remains_waitable() {
+        let mut task = sample_task(TaskStatus::Running);
+        task.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Attached,
+            on_parent_cancel: TaskParentTerminalAction::Cancel,
+            on_parent_failure: TaskParentTerminalAction::Cancel,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+        task.delivery_policy = Some(TaskDeliveryPolicy {
+            mode: TaskDeliveryMode::None,
+            thread_id: None,
+            webhook_url: None,
+            include_result: true,
+            format: pioneer_protocol::TaskDeliveryFormat::Summary,
+        });
+        let response = TaskCreateResponse {
+            task,
+            trigger: TaskTrigger {
+                id: "trigger_1234567890123".to_owned(),
+                task_id: "task_1234567890123456".to_owned(),
+                status: pioneer_protocol::TaskTriggerStatus::Exhausted,
+                spec: TaskTriggerSpec::Immediate,
+                next_fire_at: None,
+                last_fire_at: Some(100),
+                created_at: 100,
+                updated_at: 100,
+            },
+            run: Some(sample_run(TaskRunStatus::Running)),
+            agent_spec: None,
+        };
+
+        let output = task_create_tool_output(&response, &sample_task_turn_item());
+
+        assert_eq!(output["attachment"], "attached");
+        assert_eq!(output["deliveryMode"], "none");
+        assert_eq!(output["waitable"], JsonValue::Bool(true));
+        assert_eq!(
+            output["waitRecommendation"],
+            "call_task_wait_for_active_attached_work_before_final_answer"
+        );
+    }
+
+    #[test]
+    fn background_input_compiles_to_canonical_immediate_detached_lifecycle() {
+        let policy = task_create_lifecycle_policy(true, TaskTriggerKind::Immediate, None)
+            .expect("background lifecycle should normalize")
+            .expect("background lifecycle should be explicit");
+
+        assert_eq!(policy.attachment, TaskAttachmentMode::Detached);
+        assert_eq!(
+            policy.on_parent_cancel,
+            TaskParentTerminalAction::KeepRunning
+        );
+        assert_eq!(
+            policy.on_parent_failure,
+            TaskParentTerminalAction::KeepRunning
+        );
+        assert_eq!(
+            policy.completion,
+            TaskCompletionBehavior::CompleteOnTerminalRun
+        );
+        assert!(
+            task_create_lifecycle_policy(true, TaskTriggerKind::Cron, None).is_err(),
+            "scheduled Tasks are already detached and must not combine with background=true"
+        );
+        assert!(
+            task_create_delivery_policy(true, None)
+                .expect("background delivery should use the service default")
+                .is_none()
+        );
+        assert!(
+            task_create_delivery_policy(
+                true,
+                Some(TaskDeliveryPolicy {
+                    mode: TaskDeliveryMode::None,
+                    thread_id: None,
+                    webhook_url: None,
+                    include_result: true,
+                    format: pioneer_protocol::TaskDeliveryFormat::Summary,
+                }),
+            )
+            .is_err(),
+            "background=true must not silently discard parent result delivery"
+        );
+    }
+
+    #[test]
     fn task_trigger_detail_output_keeps_model_facing_shape() {
         let trigger = sample_cron_trigger(Some(1_000));
 
@@ -4378,6 +4615,8 @@ mod tests {
         let create_schema = task_create_schema().to_string();
         for expected in [
             "Do not pass runtime-owned fields",
+            "background=true",
+            "delivers its result to the parent thread",
             "self-contained for future runs",
             "currently available tools/skills/MCP/built-ins",
             "Final result format and delivery contract",

@@ -1527,6 +1527,7 @@ impl TaskService {
         let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
             default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
         });
+        let attachment = lifecycle_policy.attachment;
         let agent_review_policy =
             self.effective_agent_review_policy_for_create(&params, trigger_kind, &lifecycle_policy);
         let task = Task {
@@ -1547,6 +1548,7 @@ impl TaskService {
             delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
                 default_delivery_policy(
                     trigger_kind,
+                    attachment,
                     params.owner_kind,
                     params.owner_id.as_deref(),
                     params.created_by_thread_id.as_deref(),
