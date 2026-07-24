@@ -5,11 +5,12 @@ use async_trait::async_trait;
 use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    ExecutionCheckpointPayload, ItemCompletedNotification, ItemStartedNotification,
-    PermissionBehavior, SandboxMode, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass,
-    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    AgentExecutionBackend, ExecutionCheckpointPayload, ItemCompletedNotification,
+    ItemStartedNotification, PermissionBehavior, SandboxMode, TASK_COMPOSER_WORK_VERSION, Task,
+    TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec, TaskAgentToolPolicy,
+    TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind,
+    TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
@@ -110,6 +111,9 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Started => {}
             outcome => return Ok(outcome),
         }
+        // The occurrence turn is the durable security parent for this run, so it
+        // carries the Task's maximum cap. The composer selection is applied to
+        // the actual hidden child below and may safely narrow that cap.
         let occurrence_permission_profile =
             effective_task_child_permission_profile(&agent_spec, None)?;
         let parent = ensure_task_run_occurrence_context(
@@ -236,16 +240,50 @@ impl TaskAgentExecutor {
         };
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
-        let effective_model = effective_agent_model(agent_spec)?;
-        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None)?;
+        let mut composer_launch =
+            rebound_composer_work_launch(task, child_thread_id.as_str(), child_turn_id.as_str())?;
+        if let Some(launch) = composer_launch.as_ref() {
+            validate_internal_api_composer_launch(launch)?;
+        }
+        let normalized_composer_capabilities = if let Some(launch) = composer_launch.as_mut() {
+            let normalized = processor
+                .normalize_turn_skill_capabilities(
+                    context.workspace_id.as_str(),
+                    launch.capabilities.as_slice(),
+                )
+                .await
+                .map_err(|message| anyhow!(message))
+                .context("failed to normalize composer work capabilities")?;
+            launch.capabilities = normalized.execution.clone();
+            Some(normalized)
+        } else {
+            None
+        };
+        let effective_model = effective_task_child_model(task, agent_spec)?;
+        let child_mode = composer_launch
+            .as_ref()
+            .and_then(|launch| launch.mode)
+            .unwrap_or(ThreadMode::Agent);
+        let launch_permission_profile =
+            composer_launch_permission_profile(composer_launch.as_ref());
+        let child_permission_profile = effective_task_child_permission_profile(
+            agent_spec,
+            launch_permission_profile.as_ref(),
+        )?;
+        let reasoning_effort = composer_launch_reasoning_effort(composer_launch.as_ref());
+        let sandbox_mode = composer_launch
+            .as_ref()
+            .and_then(|launch| launch.sandbox_policy.as_ref())
+            .map(|policy| policy.mode)
+            .unwrap_or(SandboxMode::FullAccess);
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
             workspace_id: context.workspace_id.clone(),
             name: thread_name_from_task(task),
             model: Some(effective_model.model.clone()),
             model_provider: Some(effective_model.model_provider.clone()),
-            sandbox: Some(SandboxMode::FullAccess),
-            mode: Some(ThreadMode::Agent),
+            sandbox: Some(sandbox_mode),
+            mode: Some(child_mode),
             origin_kind: Some(ThreadOriginKind::TaskRun),
             sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
             agent_nickname: agent_spec.agent_nickname.clone(),
@@ -257,33 +295,44 @@ impl TaskAgentExecutor {
             .await
             .context("failed to create hidden task thread")?;
 
-        let prompt = materialize_child_task_prompt(
-            processor,
-            task_response,
-            run,
-            agent_spec,
-            parent,
-            None,
-            &child_permission_profile,
-        )
-        .await?;
-        let child_input = materialize_child_task_input(prompt, agent_spec);
+        let child_input = if let Some(launch) = composer_launch.as_ref() {
+            launch.input.clone()
+        } else {
+            let prompt = materialize_child_task_prompt(
+                processor,
+                task_response,
+                run,
+                agent_spec,
+                parent,
+                None,
+                &child_permission_profile,
+            )
+            .await?;
+            materialize_child_task_input(prompt, agent_spec)
+        };
+        let turn_params = composer_launch.unwrap_or_else(|| TurnStartParams {
+            thread_id: child_thread_id.clone(),
+            turn_id: child_turn_id.clone(),
+            input: child_input.clone(),
+            capabilities: Vec::new(),
+            model: Some(effective_model.model.clone()),
+            model_provider: Some(effective_model.model_provider.clone()),
+            sandbox_policy: None,
+            mode: Some(child_mode),
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+        });
         let turn_outcome = processor
             .thread_manager
             .system_turn_start_with_permission_profile(
                 TurnStartParams {
-                    thread_id: child_thread_id.clone(),
-                    turn_id: child_turn_id.clone(),
                     input: child_input,
-                    capabilities: Vec::new(),
                     model: Some(effective_model.model),
                     model_provider: Some(effective_model.model_provider),
-                    sandbox_policy: None,
-                    mode: Some(ThreadMode::Agent),
-                    execution_backend: None,
-                    reasoning: None,
-                    permission_profile: None,
-                    cli_runtime_options: None,
+                    mode: Some(child_mode),
+                    ..turn_params
                 },
                 child_permission_profile,
             )
@@ -350,11 +399,12 @@ impl TaskAgentExecutor {
         if let Err(error) = message_future(
             processor
                 .crud_store
-                .materialize_turn_start_with_permission_audit(
+                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
                     &turn_outcome.materialization.thread,
                     turn_outcome.materialization.sandbox_mode,
                     &turn_outcome.materialization.turn,
                     &turn_outcome.materialization.input,
+                    reasoning_effort.as_deref(),
                     profile_selected_audit,
                 ),
         )
@@ -419,6 +469,24 @@ impl TaskAgentExecutor {
             .await
             .map_err(|message| anyhow!(message))
             .context("failed to validate hidden task skill capabilities")?;
+        if let Some(normalized) = normalized_composer_capabilities.as_ref() {
+            let capability_attachments =
+                super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
+                    normalized.presentation.as_slice(),
+                    &skill_catalog,
+                    &normalized.pack_names,
+                )
+                .context("failed to snapshot composer work capability presentation")?;
+            processor
+                .emit_user_message_item_lifecycle(
+                    task.workspace_id.as_str(),
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
+                    turn_outcome.materialization.input.as_slice(),
+                    capability_attachments.as_slice(),
+                )
+                .await;
+        }
         let resolved_artifacts = processor
             .resolve_provider_artifact_inputs(
                 task.workspace_id.as_str(),
@@ -442,11 +510,11 @@ impl TaskAgentExecutor {
                 child_thread_id.as_str(),
                 task.workspace_id.as_str(),
                 child_turn_id.as_str(),
-                ThreadMode::Agent,
+                child_mode,
                 &hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
-                None,
+                reasoning_effort.as_deref(),
                 &workspace_skill_policies,
                 turn_outcome.materialization.input.as_slice(),
                 turn_outcome.materialization.capabilities.as_slice(),
@@ -469,10 +537,10 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+            .start_turn_with_hook_context_reasoning_permission_profile_and_security_snapshot(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
-                ThreadMode::Agent,
+                child_mode,
                 hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
@@ -483,6 +551,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 Vec::new(),
+                reasoning_effort.as_deref(),
                 runtime_permission_profile,
                 child_security_snapshot,
             )
@@ -2405,6 +2474,122 @@ struct EffectiveAgentModel {
     model_provider: String,
 }
 
+fn composer_work_launch(task: &Task) -> Result<Option<&TurnStartParams>> {
+    let Some(composer_work) = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+    else {
+        return Ok(None);
+    };
+    if composer_work.version != TASK_COMPOSER_WORK_VERSION {
+        bail!(
+            "unsupported composer work payload version {}; expected {}",
+            composer_work.version,
+            TASK_COMPOSER_WORK_VERSION
+        );
+    }
+    Ok(Some(&composer_work.launch))
+}
+
+fn rebound_composer_work_launch(
+    task: &Task,
+    child_thread_id: &str,
+    child_turn_id: &str,
+) -> Result<Option<TurnStartParams>> {
+    let Some(composer_work) = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+    else {
+        return Ok(None);
+    };
+    if composer_work.version != TASK_COMPOSER_WORK_VERSION {
+        bail!(
+            "unsupported composer work payload version {}; expected {}",
+            composer_work.version,
+            TASK_COMPOSER_WORK_VERSION
+        );
+    }
+    Ok(Some(
+        composer_work.rebound_launch(child_thread_id, child_turn_id),
+    ))
+}
+
+fn validate_internal_api_composer_launch(launch: &TurnStartParams) -> Result<()> {
+    match launch.execution_backend.as_ref() {
+        None | Some(AgentExecutionBackend::ApiProvider { .. }) => Ok(()),
+        Some(AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id,
+            runtime_kind,
+        }) => bail!(
+            "composer work selected {:?} CLI runtime `{}`; native Task continuation is not implemented",
+            runtime_kind,
+            runtime_id
+        ),
+        Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+            bail!("composer work selected unsupported ACP runtime `{runtime_id}`")
+        }
+    }
+}
+
+fn composer_launch_permission_profile(
+    launch: Option<&TurnStartParams>,
+) -> Option<TurnPermissionProfileSnapshot> {
+    launch.map(|launch| {
+        pioneer_protocol::resolve_turn_permission_profile(launch.permission_profile.as_ref())
+    })
+}
+
+fn composer_launch_reasoning_effort(launch: Option<&TurnStartParams>) -> Option<String> {
+    launch
+        .and_then(|launch| launch.reasoning.as_ref())
+        .map(|reasoning| reasoning.effort.trim())
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned)
+}
+
+fn effective_task_child_model(
+    task: &Task,
+    agent_spec: &TaskAgentSpec,
+) -> Result<EffectiveAgentModel> {
+    let launch = composer_work_launch(task)?;
+    let model = launch
+        .and_then(|launch| launch.model.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            agent_spec
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| anyhow!("task agent spec `{}` is missing `model`", agent_spec.id))?;
+    let model_provider = launch
+        .and_then(|launch| launch.model_provider.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            agent_spec
+                .model_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "task agent spec `{}` is missing `model_provider`",
+                agent_spec.id
+            )
+        })?;
+
+    Ok(EffectiveAgentModel {
+        model: model.to_owned(),
+        model_provider: model_provider.to_owned(),
+    })
+}
+
 async fn resolve_parent_context(
     processor: &Arc<MessageProcessor>,
     task: &Task,
@@ -2449,7 +2634,7 @@ async fn ensure_task_run_occurrence_context(
     let Some(origin) = task_run_occurrence_origin(task_response, run) else {
         return Ok(parent);
     };
-    let effective_model = effective_agent_model(agent_spec)?;
+    let effective_model = effective_task_child_model(&task_response.task, agent_spec)?;
     let occurrence_security_snapshot = resolve_task_child_execution_security_snapshot(
         processor,
         task_response.task.workspace_id.as_str(),

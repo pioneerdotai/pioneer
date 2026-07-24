@@ -18757,6 +18757,7 @@ mod tests {
                     "city".to_owned(),
                     TaskValue::String("Berlin".to_owned()),
                 )]))),
+                composer_work: None,
             }),
             result: None,
             error: None,

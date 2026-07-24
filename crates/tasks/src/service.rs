@@ -21,8 +21,8 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
 use pioneer_crud::{AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore};
 use pioneer_protocol::{
-    ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, Task, TaskAcceptParams,
-    TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
+    ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
+    TaskAcceptParams, TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
     TaskAgentReviewPolicy, TaskAgentSpec, TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode,
     TaskCancelParams, TaskCancelResponse, TaskCancelScope, TaskConcurrencyConflictPolicy,
     TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams, TaskDeliveriesResponse,
@@ -3677,6 +3677,11 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
     }
     required_trimmed(&params.title, "title")?;
     required_trimmed(&params.goal, "goal")?;
+    let has_composer_work = params
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+        .is_some();
     if params.executor_kind == TaskExecutorKind::Agent {
         let agent_spec = params
             .agent_spec
@@ -3706,13 +3711,71 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
         if agent_spec.security_cap.is_none() {
             bail!("agent executor requires agent_spec.security_cap");
         }
-        validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
+        if !has_composer_work {
+            validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
+        }
     }
     if params.owner_kind == TaskOwnerKind::Thread && params.owner_id.is_none() {
         bail!("thread-owned task requires owner_id");
     }
     if let Some(policy) = params.delivery_policy.as_ref() {
         validate_delivery_policy(policy)?;
+    }
+    validate_composer_work_create_params(params)?;
+    Ok(())
+}
+
+fn validate_composer_work_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
+    let Some(composer_work) = params
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+    else {
+        return Ok(());
+    };
+    if composer_work.version != TASK_COMPOSER_WORK_VERSION {
+        bail!(
+            "unsupported composer work payload version {}; expected {}",
+            composer_work.version,
+            TASK_COMPOSER_WORK_VERSION
+        );
+    }
+    if params.executor_kind != TaskExecutorKind::Agent {
+        bail!("composer work requires the agent executor");
+    }
+    let attachment = params
+        .lifecycle_policy
+        .clone()
+        .unwrap_or_else(|| {
+            default_lifecycle_policy(
+                params.trigger.spec.kind(),
+                params.created_by_turn_id.is_some(),
+            )
+        })
+        .attachment;
+    if attachment != TaskAttachmentMode::Detached {
+        bail!("composer work requires detached task lifecycle");
+    }
+    if composer_work.launch.thread_id.trim().is_empty() {
+        bail!("composer work launch requires thread_id");
+    }
+    if composer_work.launch.turn_id.trim().is_empty() {
+        bail!("composer work launch requires turn_id");
+    }
+    let parent_thread_id = params
+        .created_by_thread_id
+        .as_deref()
+        .or_else(|| {
+            (params.owner_kind == TaskOwnerKind::Thread)
+                .then_some(params.owner_id.as_deref())
+                .flatten()
+        })
+        .ok_or_else(|| anyhow!("composer work requires a parent thread"))?;
+    if composer_work.launch.thread_id != parent_thread_id {
+        bail!(
+            "composer work launch thread `{}` does not match parent thread `{parent_thread_id}`",
+            composer_work.launch.thread_id
+        );
     }
     Ok(())
 }

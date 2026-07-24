@@ -9,6 +9,10 @@
         "null"
       ]
     },
+    "attachment": {
+      "$ref": "#/$defs/TaskAttachmentMode",
+      "default": "attached"
+    },
     "childThreadId": {
       "type": [
         "string",
@@ -112,6 +116,13 @@
     "updatedAt"
   ],
   "$defs": {
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
     "TaskExecutorKind": {
       "type": "string",
       "enum": [

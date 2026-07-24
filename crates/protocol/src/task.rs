@@ -1,4 +1,4 @@
-use crate::constants::events;
+use crate::{TurnStartParams, constants::events};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -698,13 +698,44 @@ pub struct TaskWriteLockConflict {
     pub scope_path: String,
 }
 
+pub const TASK_COMPOSER_WORK_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskComposerWork {
+    pub version: u32,
+    pub launch: TurnStartParams,
+}
+
+impl TaskComposerWork {
+    pub fn v1(launch: TurnStartParams) -> Self {
+        Self {
+            version: TASK_COMPOSER_WORK_VERSION,
+            launch,
+        }
+    }
+
+    pub fn rebound_launch(
+        &self,
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> TurnStartParams {
+        let mut launch = self.launch.clone();
+        launch.thread_id = thread_id.into();
+        launch.turn_id = turn_id.into();
+        launch
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskMetadata {
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TaskValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_work: Option<TaskComposerWork>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2839,6 +2870,74 @@ mod tests {
             serde_json::to_value(TaskTriggerKind::Interval).expect("kind should encode"),
             json!("interval")
         );
+    }
+
+    #[test]
+    fn composer_work_round_trips_exact_launch_and_rebinds_only_execution_ids() {
+        let launch = crate::TurnStartParams {
+            thread_id: "thr_parent".to_owned(),
+            turn_id: "turn_planned".to_owned(),
+            input: vec![
+                crate::UserInput::Text {
+                    text: "Inspect this exact request".to_owned(),
+                    text_elements: Vec::new(),
+                },
+                crate::UserInput::Image {
+                    url: "https://example.test/reference.png".to_owned(),
+                },
+            ],
+            capabilities: vec![crate::TurnCapability {
+                id: "mcp:workspace:docs".to_owned(),
+                kind: crate::TurnCapabilityKind::McpServer {
+                    name: "docs".to_owned(),
+                    scope_kind: crate::McpScopeKind::Workspace,
+                },
+                label: Some("Docs".to_owned()),
+            }],
+            model: Some("gpt-5.4".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            sandbox_policy: None,
+            mode: Some(crate::ThreadMode::Agent),
+            execution_backend: Some(crate::AgentExecutionBackend::ApiProvider {
+                provider: "openai".to_owned(),
+            }),
+            reasoning: Some(crate::TurnReasoningSelection {
+                effort: "high".to_owned(),
+            }),
+            permission_profile: Some(crate::TurnPermissionProfileSelection {
+                mode: crate::TurnPermissionMode::AutoAcceptEdits,
+            }),
+            cli_runtime_options: None,
+        };
+        let metadata = super::TaskMetadata {
+            labels: vec!["composer".to_owned()],
+            data: None,
+            composer_work: Some(super::TaskComposerWork::v1(launch.clone())),
+        };
+
+        let encoded = serde_json::to_value(&metadata).expect("metadata should encode");
+        assert_eq!(encoded["composerWork"]["version"], json!(1));
+        assert_eq!(
+            encoded["composerWork"]["launch"]["turn_id"],
+            json!("turn_planned")
+        );
+        let decoded: super::TaskMetadata =
+            serde_json::from_value(encoded).expect("metadata should decode");
+        assert_eq!(decoded, metadata);
+
+        let rebound = decoded
+            .composer_work
+            .expect("composer work should exist")
+            .rebound_launch("thr_child", "turn_child");
+        assert_eq!(rebound.thread_id, "thr_child");
+        assert_eq!(rebound.turn_id, "turn_child");
+        assert_eq!(rebound.input, launch.input);
+        assert_eq!(rebound.capabilities, launch.capabilities);
+        assert_eq!(rebound.model, launch.model);
+        assert_eq!(rebound.model_provider, launch.model_provider);
+        assert_eq!(rebound.execution_backend, launch.execution_backend);
+        assert_eq!(rebound.reasoning, launch.reasoning);
+        assert_eq!(rebound.permission_profile, launch.permission_profile);
     }
 
     #[test]

@@ -700,6 +700,176 @@ async fn parent_accept_context_for_candidate(
     )
 }
 
+fn composer_work_create_params(
+    trigger: TaskTriggerSpec,
+    parent_thread_id: &str,
+    payload_version: u32,
+) -> TaskCreateParams {
+    let mut params = create_params(trigger);
+    params.owner_kind = TaskOwnerKind::Thread;
+    params.owner_id = Some(parent_thread_id.to_owned());
+    params.created_by_thread_id = Some(parent_thread_id.to_owned());
+    params.created_by_turn_id = Some(format!("turn_{parent_thread_id}"));
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(3));
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.metadata = Some(pioneer_protocol::TaskMetadata {
+        labels: vec!["composer-work".to_owned()],
+        data: None,
+        composer_work: Some(pioneer_protocol::TaskComposerWork {
+            version: payload_version,
+            launch: pioneer_protocol::TurnStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                turn_id: format!("planned_{parent_thread_id}"),
+                input: vec![pioneer_protocol::UserInput::Text {
+                    text: "run the exact composer request".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox_policy: None,
+                mode: Some(pioneer_protocol::ThreadMode::Agent),
+                execution_backend: Some(pioneer_protocol::AgentExecutionBackend::ApiProvider {
+                    provider: "openai".to_owned(),
+                }),
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+        }),
+    });
+    params
+}
+
+#[tokio::test]
+async fn composer_work_rejects_unsupported_payload_version_before_commit() {
+    let runtime = runtime().await;
+    let parent_thread_id = "thr_composer_version";
+    let params = composer_work_create_params(
+        TaskTriggerSpec::Immediate,
+        parent_thread_id,
+        pioneer_protocol::TASK_COMPOSER_WORK_VERSION + 1,
+    );
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("unsupported composer payload must fail safely");
+    assert!(
+        format!("{error:#}").contains("unsupported composer work payload version"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        runtime
+            .service()
+            .store()
+            .list_tasks(pioneer_protocol::TaskListParams {
+                workspace_id: "ws_tasks".to_owned(),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .expect("tasks should list")
+            .is_empty(),
+        "invalid composer work must not create an ordinary Task fallback"
+    );
+}
+
+#[tokio::test]
+async fn composer_work_accepts_scheduled_interval_and_cron_detached_tasks() {
+    let runtime = runtime().await;
+    let cases = [
+        (
+            "scheduled",
+            TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            },
+        ),
+        (
+            "interval",
+            TaskTriggerSpec::Interval {
+                interval_seconds: 600,
+                interval_anchor_at: Some(4_000_000_000),
+                catch_up_policy: None,
+            },
+        ),
+        (
+            "cron",
+            TaskTriggerSpec::Cron {
+                cron_expr: "0 7 * * *".to_owned(),
+                timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: None,
+            },
+        ),
+    ];
+
+    for (name, trigger) in cases {
+        let parent_thread_id = format!("thr_composer_{name}");
+        let response = runtime
+            .service()
+            .create_task(
+                TaskCreateContext::default(),
+                composer_work_create_params(
+                    trigger,
+                    parent_thread_id.as_str(),
+                    pioneer_protocol::TASK_COMPOSER_WORK_VERSION,
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name} composer work should create: {error:#}"));
+
+        assert_eq!(response.task.status, TaskStatus::Scheduled);
+        assert_eq!(
+            response
+                .task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .map(|work| work.launch.thread_id.as_str()),
+            Some(parent_thread_id.as_str())
+        );
+        assert!(
+            response.run.is_none(),
+            "{name} Task should wait for its trigger"
+        );
+    }
+}
+
+#[tokio::test]
+async fn composer_work_rejects_attached_subagent_lifecycle() {
+    let runtime = runtime().await;
+    let mut params = composer_work_create_params(
+        TaskTriggerSpec::Immediate,
+        "thr_composer_attached",
+        pioneer_protocol::TASK_COMPOSER_WORK_VERSION,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Attached,
+        on_parent_cancel: TaskParentTerminalAction::Cancel,
+        on_parent_failure: TaskParentTerminalAction::Cancel,
+        completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("attached subagent work must keep the existing Task prompt path");
+    assert!(
+        format!("{error:#}").contains("requires detached task lifecycle"),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[tokio::test]
 async fn review_event_advisory_keeps_candidate_pending() {
     let runtime = runtime_with_review_config().await;

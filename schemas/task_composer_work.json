@@ -1,36 +1,21 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "TaskMetadata",
+  "title": "TaskComposerWork",
   "type": "object",
   "properties": {
-    "composerWork": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TaskComposerWork"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "launch": {
+      "$ref": "#/$defs/TurnStartParams"
     },
-    "data": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TaskValue"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "labels": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "type": "string"
-      }
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
     }
   },
+  "required": [
+    "version",
+    "launch"
+  ],
   "$defs": {
     "AgentExecutionBackend": {
       "oneOf": [
@@ -149,143 +134,6 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
-    },
-    "TaskComposerWork": {
-      "type": "object",
-      "properties": {
-        "launch": {
-          "$ref": "#/$defs/TurnStartParams"
-        },
-        "version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "version",
-        "launch"
-      ]
-    },
-    "TaskValue": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "null"
-            }
-          },
-          "required": [
-            "kind"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "bool"
-            },
-            "value": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "integer"
-            },
-            "value": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "number"
-            },
-            "value": {
-              "type": "number",
-              "format": "double"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "string"
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "list"
-            },
-            "value": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/TaskValue"
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "object"
-            },
-            "value": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/$defs/TaskValue"
-              }
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ]
-        }
-      ]
     },
     "TextElement": {
       "type": "object",

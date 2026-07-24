@@ -1324,7 +1324,7 @@ impl AgentManager {
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+        self.start_turn_with_hook_context_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -1341,6 +1341,49 @@ impl AgentManager {
             None,
             permission_profile,
             execution_security_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context_reasoning_permission_profile_and_security_snapshot(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        skill_catalog: SkillCatalogSnapshot,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        reasoning_effort: Option<&str>,
+        permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
+    ) -> Result<(), AgentStartError> {
+        let reasoning = reasoning_config_from_effort(reasoning_effort)?;
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            skill_catalog,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            None,
+            reasoning,
+            permission_profile,
+            Some(execution_security_snapshot),
         )
         .await
     }

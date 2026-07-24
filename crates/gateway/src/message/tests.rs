@@ -12338,6 +12338,253 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
+    let base_dir = unique_temp_dir("composer_work_exact_launch");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("create system skill root");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace skill root");
+    std::fs::create_dir_all(&registry_root).expect("create registry skill root");
+    let skill_path = write_test_skill(
+        &user_root,
+        "composer-launch",
+        "",
+        "COMPOSER LAUNCH SKILL BODY",
+    );
+
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("thread-default-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let skill_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'L',
+        workspace_id.as_str(),
+        "user",
+        skill_path.as_path(),
+        Some("tests"),
+        "composer-launch",
+    )
+    .await;
+    let provider = Arc::new(PreflightCaptureProvider::new(
+        r#"<task_result>{"summary":"composer payload complete","data":{"rawText":"composer payload complete"}}</task_result>"#,
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    ));
+    processor.bind_task_bridge().await;
+
+    let parent_thread_id = "thr_composer_work_exact";
+    let parent_turn_id = "turn_composer_work_parent";
+    let planned_turn_id = "turn_composer_work_planned";
+    let artifact =
+        ingest_user_test_artifact(&processor, workspace_id.as_str(), "launch-context.txt").await;
+    let exact_input = vec![
+        UserInput::Text {
+            text: "Use the exact composer request".to_owned(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            version_id: artifact.version_id.clone(),
+        },
+    ];
+    let exact_capabilities = vec![TurnCapability {
+        id: pioneer_protocol::skill_capability_key(&skill_id),
+        kind: TurnCapabilityKind::Skill {
+            skill_id: skill_id.clone(),
+            pack_id: None,
+        },
+        label: Some("tests/composer-launch".to_owned()),
+    }];
+    let exact_launch = pioneer_protocol::TurnStartParams {
+        thread_id: parent_thread_id.to_owned(),
+        turn_id: planned_turn_id.to_owned(),
+        input: exact_input.clone(),
+        capabilities: exact_capabilities.clone(),
+        model: Some("composer-selected-model".to_owned()),
+        model_provider: Some("openai".to_owned()),
+        sandbox_policy: Some(pioneer_protocol::SandboxPolicy::from_mode(
+            SandboxMode::FullAccess,
+        )),
+        mode: Some(ThreadMode::Agent),
+        execution_backend: Some(AgentExecutionBackend::ApiProvider {
+            provider: "openai".to_owned(),
+        }),
+        reasoning: Some(pioneer_protocol::TurnReasoningSelection {
+            effort: "high".to_owned(),
+        }),
+        permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
+            mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        }),
+        cli_runtime_options: None,
+    };
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "Task prompt must not replace composer input",
+        3,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = None;
+    params.metadata = Some(pioneer_protocol::TaskMetadata {
+        labels: vec!["composer-work".to_owned()],
+        data: None,
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch.clone())),
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("composer work should be accepted");
+    let run = response.run.as_ref().expect("immediate run should exist");
+    let terminal_status = wait_for_task_status(
+        crud_store.clone(),
+        response.task.id.as_str(),
+        TaskStatus::Completed,
+    )
+    .await;
+    if terminal_status != TaskStatus::Completed {
+        let failed = crud_store
+            .get_task(response.task.id.as_str())
+            .await
+            .expect("failed composer work task should reload")
+            .expect("failed composer work task should exist");
+        panic!(
+            "composer work task did not complete: status={terminal_status:?}, task_error={:?}, runs={:?}",
+            failed.task.error, failed.runs
+        );
+    }
+
+    let persisted = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task reload should succeed")
+        .expect("task should persist");
+    assert_eq!(
+        persisted
+            .task
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref())
+            .map(|work| &work.launch),
+        Some(&exact_launch),
+        "database round-trip must preserve the canonical composer launch"
+    );
+
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    let child_thread = crud_store
+        .get_thread_model(lineage.child_thread_id.as_str())
+        .await
+        .expect("child thread should load")
+        .expect("child thread should exist");
+    assert_eq!(child_thread.model, "composer-selected-model");
+    assert_eq!(child_thread.model_provider, "openai");
+    assert_eq!(child_thread.mode, ThreadMode::Agent);
+    assert_eq!(child_thread.reasoning_effort.as_deref(), Some("high"));
+
+    let (_, child_turn) = crud_store
+        .get_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("child turn should load")
+        .expect("child turn should exist");
+    assert_eq!(
+        child_turn.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        "composer permission selection must be intersected into the Task child"
+    );
+
+    let child_turn_id = lineage.child_turn_id.as_str();
+    let child_items = crud_store
+        .get_turn_item_events(lineage.child_thread_id.as_str(), child_turn_id)
+        .await
+        .expect("child items should load")
+        .expect("child item stream should exist");
+    assert!(child_items.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::ItemCompleted {
+            item: TurnItem::UserMessage {
+                text,
+                attachments,
+                ..
+            },
+            ..
+        } if text == "Use the exact composer request"
+            && attachments.iter().any(|attachment| matches!(
+                attachment,
+                UserMessageAttachment::Artifact { artifact: resolved }
+                    if resolved.artifact_id == artifact.artifact_id
+            ))
+            && attachments.iter().any(|attachment| matches!(
+                attachment,
+                UserMessageAttachment::Skill { capability }
+                    if capability.skill_id == skill_id
+            ))
+    )));
+
+    let requests = provider.snapshot_requests();
+    let main_request = requests
+        .iter()
+        .find(|request| !is_turn_preflight_request(request))
+        .expect("child main provider request should be captured");
+    assert_eq!(main_request.model, "composer-selected-model");
+    assert_eq!(
+        main_request.reasoning,
+        Some(pioneer_provider::ReasoningConfig::Effort(
+            pioneer_provider::ReasoningEffort::High
+        ))
+    );
+    let user_message = main_request
+        .messages
+        .last()
+        .expect("main request should include composer user input");
+    assert_eq!(user_message.content, "Use the exact composer request");
+    assert!(matches!(
+        user_message.content_parts.as_slice(),
+        [pioneer_provider::MessageContentPart::File { file }]
+            if file.name.as_deref() == Some("launch-context.txt")
+    ));
+    let compiled_prompt = main_request
+        .compiled_prompt
+        .as_ref()
+        .expect("child main request should carry a compiled prompt");
+    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
+    assert!(compiled_prompt.full_system_text.contains("composer-launch"));
+    assert!(compiled_prompt.full_system_text.contains(&format!(
+        "Exact skill reference for read_skill: `skill:{skill_id}`"
+    )));
+    assert!(
+        !compiled_prompt
+            .full_system_text
+            .contains("COMPOSER LAUNCH SKILL BODY"),
+        "selected skills use the same compact read_skill contract as a parent turn"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = mpsc::channel(8);

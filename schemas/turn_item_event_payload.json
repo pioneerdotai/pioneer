@@ -1717,6 +1717,13 @@
         "error"
       ]
     },
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
     "TaskExecutorKind": {
       "type": "string",
       "enum": [
@@ -2992,6 +2999,10 @@
                 "string",
                 "null"
               ]
+            },
+            "attachment": {
+              "$ref": "#/$defs/TaskAttachmentMode",
+              "default": "attached"
             },
             "childThreadId": {
               "type": [
