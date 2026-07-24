@@ -41,8 +41,10 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use hooks::AgentToolBundleArtifactStore;
-pub use hooks::{AgentPostTurnHookDispatchPolicy, AgentTurnHookRuntimeContext};
+pub use hooks::{
+    AgentPostTurnHookDispatchPolicy, AgentTurnHookRuntimeContext, AgentTurnPostTurnDispatchMode,
+};
+use hooks::{AgentToolBundleArtifactStore, DeferredTaskPostTurnDispatchStore};
 use manager_recovery::apply_recovery_adjustments;
 pub use pioneer_memory::hooks::{
     AgentEpisodicRecallProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
@@ -1072,6 +1074,7 @@ pub struct AgentManager {
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
+    deferred_task_post_turn_dispatches: Arc<DeferredTaskPostTurnDispatchStore>,
     permission_approval_broker: Arc<RwLock<Arc<dyn PermissionApprovalBroker>>>,
 }
 
@@ -1110,6 +1113,9 @@ impl AgentManager {
             hook_runtime: RwLock::new(None),
             tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
+            deferred_task_post_turn_dispatches: Arc::new(
+                DeferredTaskPostTurnDispatchStore::default(),
+            ),
             permission_approval_broker: Arc::new(RwLock::new(Arc::new(
                 StaticPermissionApprovalBroker::default(),
             ))),
@@ -1192,6 +1198,18 @@ impl AgentManager {
         *self.post_turn_hook_dispatch_policy.write().await = policy;
     }
 
+    pub async fn accept_deferred_task_result_post_turn(&self, thread_id: &str, turn_id: &str) {
+        self.deferred_task_post_turn_dispatches
+            .accept(thread_id, turn_id)
+            .await;
+    }
+
+    pub async fn discard_deferred_task_result_post_turn(&self, thread_id: &str, turn_id: &str) {
+        self.deferred_task_post_turn_dispatches
+            .discard(thread_id, turn_id)
+            .await;
+    }
+
     pub async fn has_memory_provider(&self) -> bool {
         self.memory_provider.read().await.is_some()
     }
@@ -1245,6 +1263,7 @@ impl AgentManager {
             tool_bundle_artifacts,
             self.permission_approval_broker.clone(),
             *self.post_turn_hook_dispatch_policy.read().await,
+            self.deferred_task_post_turn_dispatches.clone(),
             command_tx.clone(),
             command_rx,
             event_hub.clone(),

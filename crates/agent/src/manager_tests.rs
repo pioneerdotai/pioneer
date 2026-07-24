@@ -25,7 +25,9 @@ use pioneer_hooks::{
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
     TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
-use pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set;
+use pioneer_memory::hooks::{
+    MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, memory_turn_policy_from_hook_policy_set,
+};
 use pioneer_memory::{MemoryModeRecallParams, MemoryRecallMode};
 use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, McpScopeKind,
@@ -869,8 +871,10 @@ struct RecordedHookCall {
     payload: HookInputPayload,
     workspace_id: Option<String>,
     thread_id: Option<String>,
+    conversation_thread_id: Option<String>,
     turn_id: Option<String>,
     task_id: Option<String>,
+    accepted_task_result_post_turn: bool,
     mode: Option<HookContextMode>,
     actor_kind: Option<HookActorKind>,
     policy_set: HookPolicySet,
@@ -923,6 +927,11 @@ impl HookHandler for RecordingHookHandler {
                     .thread_id
                     .as_ref()
                     .map(|id| id.as_str().to_owned()),
+                conversation_thread_id: request
+                    .context
+                    .conversation_thread_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
                 turn_id: request
                     .context
                     .turn_id
@@ -933,6 +942,12 @@ impl HookHandler for RecordingHookHandler {
                     .task_id
                     .as_ref()
                     .map(|id| id.as_str().to_owned()),
+                accepted_task_result_post_turn: request.context.feature_flags.iter().any(
+                    |(flag, enabled)| {
+                        *enabled
+                            && flag.as_str() == MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG
+                    },
+                ),
                 mode: request.context.mode.clone(),
                 actor_kind: request
                     .context
@@ -4709,6 +4724,92 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
         panic!("post-turn hook should receive typed post-turn payload");
     };
     assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_detached_task_result_dispatches_post_turn_once_with_parent_scope() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    manager
+        .ensure_thread("thr_detached_result_hook", "ws_detached_result_hook")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, "thr_detached_result_hook").await;
+
+    manager
+        .start_test_turn_with_default_profile_hook_context(
+            "thr_detached_result_hook",
+            "turn_detached_result_hook",
+            ThreadMode::Agent,
+            AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
+                "task-detached-result",
+                "thread-visible-parent",
+            ),
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "Run this accepted background task.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("detached task result turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+    sleep(Duration::from_millis(25)).await;
+    assert!(
+        snapshot_hook_calls(&calls).is_empty(),
+        "post-turn must wait until the Task result candidate is accepted"
+    );
+
+    manager
+        .accept_deferred_task_result_post_turn(
+            "thr_detached_result_hook",
+            "turn_detached_result_hook",
+        )
+        .await;
+    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    assert_eq!(
+        call.conversation_thread_id.as_deref(),
+        Some("thread-visible-parent")
+    );
+    assert!(call.accepted_task_result_post_turn);
+    assert_eq!(call.thread_id.as_deref(), Some("thr_detached_result_hook"));
+    assert_eq!(call.turn_id.as_deref(), Some("turn_detached_result_hook"));
+    assert_eq!(call.task_id.as_deref(), Some("task-detached-result"));
+
+    manager
+        .accept_deferred_task_result_post_turn(
+            "thr_detached_result_hook",
+            "turn_detached_result_hook",
+        )
+        .await;
+    sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        snapshot_hook_calls(&calls)
+            .iter()
+            .filter(|call| call.phase == HookPhase::TurnPostTurn)
+            .count(),
+        1,
+        "replayed acceptance must not dispatch the extractor twice"
+    );
     assert_eq!(provider.snapshot_requests().len(), 1);
 }
 

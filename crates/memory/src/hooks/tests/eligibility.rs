@@ -11,6 +11,7 @@ fn eligible_input() -> MemoryPostTurnEligibilityInput {
         has_domain_events: false,
         source_context_kind: MemorySourceContextKind::DirectUserConversation,
         task_runtime_owned: false,
+        accepted_task_result: false,
         system_runtime_owned: false,
     }
 }
@@ -336,6 +337,48 @@ fn post_turn_eligibility_resolver_classifies_system_context_as_system_owned() {
         MemoryPostTurnEligibilityGate::evaluate(&input),
         MemoryPostTurnEligibilityDecision::Skipped(
             MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource
+        )
+    );
+}
+
+#[test]
+fn post_turn_eligibility_allows_only_accepted_task_results_with_parent_scope() {
+    let mut accepted = resolver_request(
+        Some("background request"),
+        Some("accepted final result"),
+        Vec::new(),
+        Vec::new(),
+    );
+    accepted.context.task_id =
+        Some(pioneer_hooks::HookTaskId::new("task-accepted").expect("valid task id"));
+    accepted.context.mode = Some(pioneer_hooks::HookContextMode::Task);
+    accepted.context.conversation_thread_id =
+        Some(pioneer_hooks::HookThreadId::new("thread-parent").expect("valid parent id"));
+    accepted.context.feature_flags.insert(
+        pioneer_hooks::HookFeatureFlag::new(MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG)
+            .expect("valid feature flag"),
+        true,
+    );
+
+    let accepted_input = resolver_input(&accepted);
+    assert!(accepted_input.task_runtime_owned);
+    assert!(accepted_input.accepted_task_result);
+    assert_eq!(
+        accepted_input.source_context_kind,
+        MemorySourceContextKind::TaskRuntime
+    );
+    assert_eq!(
+        MemoryPostTurnEligibilityGate::evaluate(&accepted_input),
+        MemoryPostTurnEligibilityDecision::Eligible
+    );
+
+    accepted.context.conversation_thread_id = None;
+    let missing_parent_scope = resolver_input(&accepted);
+    assert!(!missing_parent_scope.accepted_task_result);
+    assert_eq!(
+        MemoryPostTurnEligibilityGate::evaluate(&missing_parent_scope),
+        MemoryPostTurnEligibilityDecision::Skipped(
+            MemoryPostTurnEligibilitySkipReason::TaskRuntimeOwnedSource
         )
     );
 }

@@ -633,6 +633,7 @@ struct TestMemoryWriteProvider {
     manifest_calls: Arc<Mutex<usize>>,
     write_calls: Arc<Mutex<usize>>,
     write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
+    write_contexts: Arc<Mutex<Vec<MemoryTurnContext>>>,
     response: Option<MemorySemanticWriteResponse>,
 }
 
@@ -654,6 +655,13 @@ impl TestMemoryWriteProvider {
             .expect("write params lock poisoned")
             .clone()
     }
+
+    fn write_contexts(&self) -> Vec<MemoryTurnContext> {
+        self.write_contexts
+            .lock()
+            .expect("write contexts lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -672,10 +680,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
 
     async fn write_semantic_memory(
         &self,
-        _context: MemoryTurnContext,
+        context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
     ) -> Result<MemorySemanticWriteResponse, String> {
         *self.write_calls.lock().expect("write call lock poisoned") += 1;
+        self.write_contexts
+            .lock()
+            .expect("write contexts lock poisoned")
+            .push(context);
         self.write_params
             .lock()
             .expect("write params lock poisoned")

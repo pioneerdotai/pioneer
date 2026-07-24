@@ -508,6 +508,7 @@ impl TaskAgentExecutor {
             processor,
             task,
             parent,
+            child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
             thread_outcome.started_notification.thread.model.as_str(),
@@ -1044,6 +1045,7 @@ impl TaskAgentExecutor {
             processor,
             task,
             &parent,
+            child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
             thread_outcome.started_notification.thread.model.as_str(),
@@ -1413,6 +1415,7 @@ impl TaskAgentExecutor {
             processor,
             task,
             &parent,
+            child_runtime.task_run_turn.kind,
             child_thread_id,
             child_turn_id,
             thread_outcome.started_notification.thread.model.as_str(),
@@ -2168,6 +2171,7 @@ impl TaskAgentExecutor {
             processor,
             task,
             &parent,
+            task_run_turn.kind,
             task_run_turn.thread_id.as_str(),
             task_run_turn.turn_id.as_str(),
             thread_outcome.started_notification.thread.model.as_str(),
@@ -2685,12 +2689,20 @@ fn task_attachment(task: &Task) -> TaskAttachmentMode {
 fn task_hook_runtime_context(
     task: &Task,
     parent: &TaskParentRuntimeContext,
+    task_run_turn_kind: TaskRunTurnKind,
 ) -> AgentTurnHookRuntimeContext {
     if task_attachment(task) == TaskAttachmentMode::Detached {
-        AgentTurnHookRuntimeContext::task_in_conversation(
-            task.id.clone(),
-            parent.parent_thread_id.clone(),
-        )
+        if task_run_turn_kind == TaskRunTurnKind::Review {
+            AgentTurnHookRuntimeContext::task_in_conversation(
+                task.id.clone(),
+                parent.parent_thread_id.clone(),
+            )
+        } else {
+            AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
+                task.id.clone(),
+                parent.parent_thread_id.clone(),
+            )
+        }
     } else {
         AgentTurnHookRuntimeContext::task(task.id.clone())
     }
@@ -2701,6 +2713,7 @@ async fn load_task_execution_conversation_scope(
     processor: &Arc<MessageProcessor>,
     task: &Task,
     parent: &TaskParentRuntimeContext,
+    task_run_turn_kind: TaskRunTurnKind,
     execution_thread_id: &str,
     execution_turn_id: &str,
     fallback_model: &str,
@@ -2709,7 +2722,7 @@ async fn load_task_execution_conversation_scope(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
 )> {
-    let expected_hook_context = task_hook_runtime_context(task, parent);
+    let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
     if let Some(snapshot) = processor
         .crud_store
         .get_turn_runtime_snapshot(execution_turn_id)
@@ -5434,16 +5447,40 @@ mod tests {
             root_thread_id: "thread-parent".to_owned(),
         };
 
-        let detached =
-            task_hook_runtime_context(&task_with_attachment(TaskAttachmentMode::Detached), &parent);
+        let detached = task_hook_runtime_context(
+            &task_with_attachment(TaskAttachmentMode::Detached),
+            &parent,
+            TaskRunTurnKind::Initial,
+        );
         assert_eq!(
             detached.conversation_thread_id.as_deref(),
             Some("thread-parent")
         );
+        assert_eq!(
+            detached.post_turn_dispatch_mode,
+            pioneer_agent::AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance
+        );
 
-        let attached =
-            task_hook_runtime_context(&task_with_attachment(TaskAttachmentMode::Attached), &parent);
+        let attached = task_hook_runtime_context(
+            &task_with_attachment(TaskAttachmentMode::Attached),
+            &parent,
+            TaskRunTurnKind::Initial,
+        );
         assert_eq!(attached.conversation_thread_id, None);
+        assert_eq!(
+            attached.post_turn_dispatch_mode,
+            pioneer_agent::AgentTurnPostTurnDispatchMode::Immediate
+        );
+
+        let reviewer = task_hook_runtime_context(
+            &task_with_attachment(TaskAttachmentMode::Detached),
+            &parent,
+            TaskRunTurnKind::Review,
+        );
+        assert_eq!(
+            reviewer.post_turn_dispatch_mode,
+            pioneer_agent::AgentTurnPostTurnDispatchMode::Immediate
+        );
     }
 
     #[tokio::test]

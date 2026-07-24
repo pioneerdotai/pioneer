@@ -7,8 +7,8 @@ use super::{
 use crate::chat;
 use crate::hooks::{
     AgentPostTurnHookDispatchPolicy, AgentToolBundleArtifactStore, AgentTurnHookContext,
-    AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary, EffectiveTurnPolicySet,
-    EffectiveTurnPromptContextSet, run_agent_turn_post_turn_hook_phase,
+    AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary, DeferredTaskPostTurnDispatchStore,
+    EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
 };
 use futures_util::FutureExt;
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
@@ -201,6 +201,7 @@ pub(super) async fn run_agent_loop(
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>>,
     post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
+    deferred_task_post_turn_dispatches: Arc<DeferredTaskPostTurnDispatchStore>,
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
@@ -367,11 +368,13 @@ pub(super) async fn run_agent_loop(
                             },
                         )
                         .await;
-                        maybe_spawn_post_turn_hook_dispatch(
+                        maybe_dispatch_post_turn_hook(
                             hook_runtime.clone(),
                             post_turn_hook_dispatch_policy,
+                            deferred_task_post_turn_dispatches.as_ref(),
                             post_turn_dispatch,
-                        );
+                        )
+                        .await;
                     }
                     Ok(TurnTaskSuccess::NeedsContinuation(continuation)) => {
                         debug!(
@@ -643,11 +646,13 @@ pub(super) async fn run_agent_loop(
                                 error_for_dispatch,
                             )
                         });
-                        maybe_spawn_post_turn_hook_dispatch(
+                        maybe_dispatch_post_turn_hook(
                             hook_runtime.clone(),
                             post_turn_hook_dispatch_policy,
+                            deferred_task_post_turn_dispatches.as_ref(),
                             failure_dispatch,
-                        );
+                        )
+                        .await;
                     }
                     Err(TurnTaskFailure::Blocked(reason)) => {
                         last_turn_observation = Some((
@@ -680,11 +685,13 @@ pub(super) async fn run_agent_loop(
                                 reason_for_dispatch,
                             )
                         });
-                        maybe_spawn_post_turn_hook_dispatch(
+                        maybe_dispatch_post_turn_hook(
                             hook_runtime.clone(),
                             post_turn_hook_dispatch_policy,
+                            deferred_task_post_turn_dispatches.as_ref(),
                             blocked_dispatch,
-                        );
+                        )
+                        .await;
                     }
                     Err(TurnTaskFailure::ProviderFailure {
                         item_id,
@@ -722,11 +729,13 @@ pub(super) async fn run_agent_loop(
                                 failure_message,
                             )
                         });
-                        maybe_spawn_post_turn_hook_dispatch(
+                        maybe_dispatch_post_turn_hook(
                             hook_runtime.clone(),
                             post_turn_hook_dispatch_policy,
+                            deferred_task_post_turn_dispatches.as_ref(),
                             failure_dispatch,
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -860,11 +869,13 @@ pub(super) async fn run_agent_loop(
                     TurnPostTurnStatus::Interrupted,
                     reason_for_dispatch,
                 );
-                maybe_spawn_post_turn_hook_dispatch(
+                maybe_dispatch_post_turn_hook(
                     hook_runtime.clone(),
                     post_turn_hook_dispatch_policy,
+                    deferred_task_post_turn_dispatches.as_ref(),
                     interrupted_dispatch,
-                );
+                )
+                .await;
             }
             AgentCommand::ObserveTurn { turn_id, ack } => {
                 let observation = if active_turn_id.as_deref() == Some(turn_id.as_str()) {
@@ -1369,9 +1380,10 @@ async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurab
     }
 }
 
-fn maybe_spawn_post_turn_hook_dispatch(
+async fn maybe_dispatch_post_turn_hook(
     hook_runtime: Option<Arc<HookRuntime>>,
     policy: AgentPostTurnHookDispatchPolicy,
+    deferred_task_post_turn_dispatches: &DeferredTaskPostTurnDispatchStore,
     dispatch: Option<AgentTurnPostTurnHookDispatch>,
 ) {
     let Some(dispatch) = dispatch else {
@@ -1381,9 +1393,9 @@ fn maybe_spawn_post_turn_hook_dispatch(
         return;
     }
 
-    tokio::spawn(turn_flow_future(async move {
-        run_agent_turn_post_turn_hook_phase(hook_runtime.as_ref(), dispatch).await;
-    }));
+    deferred_task_post_turn_dispatches
+        .defer(hook_runtime, dispatch)
+        .await;
 }
 
 fn synthesize_post_turn_failure_dispatch(

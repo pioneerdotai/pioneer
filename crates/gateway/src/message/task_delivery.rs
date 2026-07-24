@@ -301,6 +301,9 @@ impl MessageProcessor {
         self.crud_store
             .materialize_item_completed(completed.clone(), now)
             .await?;
+        // Delivery projects an already-produced result into the target conversation. Index the
+        // committed projection directly; do not run another turn or post-turn memory extractor.
+        self.ingest_committed_thread_item(&completed).await;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
         self.notify_semantic_timeline_item_changed(

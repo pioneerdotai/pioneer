@@ -27,6 +27,7 @@ pub(super) struct MemoryPostTurnEligibilityInput {
     pub(super) has_domain_events: bool,
     pub(super) source_context_kind: MemorySourceContextKind,
     pub(super) task_runtime_owned: bool,
+    pub(super) accepted_task_result: bool,
     pub(super) system_runtime_owned: bool,
 }
 
@@ -154,9 +155,9 @@ impl MemoryPostTurnEligibilityGate {
                 MemoryPostTurnEligibilitySkipReason::NoTranscript,
             );
         }
-        if input.task_runtime_owned
-            || input.source_context_kind == MemorySourceContextKind::TaskRuntime
-        {
+        let task_runtime_source = input.task_runtime_owned
+            || input.source_context_kind == MemorySourceContextKind::TaskRuntime;
+        if task_runtime_source && !input.accepted_task_result {
             return MemoryPostTurnEligibilityDecision::Skipped(
                 MemoryPostTurnEligibilitySkipReason::TaskRuntimeOwnedSource,
             );
@@ -173,7 +174,9 @@ impl MemoryPostTurnEligibilityGate {
                 MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
             );
         }
-        if input.source_context_kind != MemorySourceContextKind::DirectUserConversation {
+        if !task_runtime_source
+            && input.source_context_kind != MemorySourceContextKind::DirectUserConversation
+        {
             return MemoryPostTurnEligibilityDecision::Skipped(
                 MemoryPostTurnEligibilitySkipReason::NoDirectUserSource,
             );
@@ -201,6 +204,15 @@ pub(super) fn memory_post_turn_eligibility_input_from_request(
     let has_tool_events = !input.tool_events.is_empty();
     let has_domain_events = !input.domain_events.is_empty();
     let task_runtime_owned = post_turn_request_is_task_owned(request, input);
+    let accepted_task_result = task_runtime_owned
+        && request
+            .context
+            .conversation_thread_id
+            .as_ref()
+            .is_some_and(|thread_id| !thread_id.as_str().trim().is_empty())
+        && request.context.feature_flags.iter().any(|(flag, enabled)| {
+            *enabled && flag.as_str() == MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG
+        });
     let system_runtime_owned = post_turn_request_is_system_owned(request);
     let source_context_kind = post_turn_source_context_kind(
         has_user_text,
@@ -221,6 +233,7 @@ pub(super) fn memory_post_turn_eligibility_input_from_request(
         has_domain_events,
         source_context_kind,
         task_runtime_owned,
+        accepted_task_result,
         system_runtime_owned,
     }
 }

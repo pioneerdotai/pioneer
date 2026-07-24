@@ -905,7 +905,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn ingest_committed_thread_item(
+    pub(super) async fn ingest_committed_thread_item(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) {

@@ -65,7 +65,10 @@ use pioneer_hooks::{
     TurnPreCompactionSummaryStrategy, TurnPreCompactionTrigger,
 };
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
-use pioneer_memory::hooks::{AgentMemoryProvider, MemoryRecallRequest, MemoryTurnContext};
+use pioneer_memory::hooks::{
+    AgentMemoryProvider, MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryRecallRequest,
+    MemoryTurnContext,
+};
 use pioneer_protocol::{
     AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, CLIAgentRuntimeKind,
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
@@ -3055,6 +3058,41 @@ struct Phase13RecordingHookHandler {
     behavior: Phase13HookBehavior,
 }
 
+struct TaskPostTurnRecordingHookHandler {
+    hook_id: HookId,
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl HookHandler for TaskPostTurnRecordingHookHandler {
+    fn id(&self) -> HookId {
+        self.hook_id.clone()
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("test.task_post_turn").expect("valid hook kind")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPostTurn]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        HookCapabilities::new([])
+    }
+
+    async fn execute(
+        &self,
+        request: HookHandlerRequest,
+    ) -> pioneer_hooks::HookResult<HookHandlerResponse> {
+        self.calls
+            .lock()
+            .expect("Task post-turn hook calls lock")
+            .push(request);
+        Ok(HookHandlerResponse::default())
+    }
+}
+
 #[async_trait::async_trait]
 impl HookHandler for Phase13RecordingHookHandler {
     fn id(&self) -> HookId {
@@ -3167,6 +3205,39 @@ fn phase_13_hook_runtime_with_fallback(
             ..HookRuntimeOptions::default()
         },
     ))
+}
+
+fn task_post_turn_recording_hook_runtime(
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+) -> Arc<HookRuntime> {
+    let handlers = Arc::new(HookRegistry::new());
+    let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+    let hook_id = HookId::new("test.task_post_turn_recorder").expect("valid hook id");
+    handlers
+        .register_handler(Arc::new(TaskPostTurnRecordingHookHandler {
+            hook_id: hook_id.clone(),
+            calls,
+        }))
+        .expect("Task post-turn hook registers");
+    subscriptions
+        .register_subscription(
+            handlers.as_ref(),
+            HookSubscription::new(
+                HookSubscriptionId::new("test.task_post_turn_subscription")
+                    .expect("valid subscription id"),
+                hook_id,
+                HookPhase::TurnPostTurn,
+            )
+            .with_execution_policy(HookExecutionPolicy {
+                await_policy: HookAwaitPolicy::Blocking,
+                timeout_ms: None,
+                max_parallelism: None,
+            })
+            .with_failure_policy(HookFailurePolicy::BestEffort),
+        )
+        .expect("Task post-turn hook subscription registers");
+
+    Arc::new(HookRuntime::new(handlers, subscriptions))
 }
 
 async fn install_test_hook_runtime(processor: &Arc<MessageProcessor>, runtime: Arc<HookRuntime>) {
@@ -12201,7 +12272,14 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         test_context_budget(),
         test_tool_loop_config(),
     ));
+    let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(post_turn_calls.clone()),
+    )
+    .await;
     processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
 
     let parent_thread_id = "thr_parent_immediate_detached";
     let creation_turn_id = "turn_parent_immediate_detached";
@@ -12319,6 +12397,68 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(lineage.parent_thread_id, parent_thread_id);
     assert_eq!(lineage.created_by_turn_id.as_deref(), Some(run.id.as_str()));
 
+    let mut accepted_post_turn_calls = Vec::new();
+    for _ in 0..100 {
+        accepted_post_turn_calls = post_turn_calls
+            .lock()
+            .expect("Task post-turn hook calls lock")
+            .clone();
+        if !accepted_post_turn_calls.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        accepted_post_turn_calls.len(),
+        1,
+        "the accepted final detached Task result must dispatch post-turn exactly once"
+    );
+    let accepted_post_turn = &accepted_post_turn_calls[0];
+    assert_eq!(accepted_post_turn.phase, HookPhase::TurnPostTurn);
+    assert_eq!(
+        accepted_post_turn
+            .context
+            .thread_id
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some(lineage.child_thread_id.as_str()),
+        "extractor provenance must remain on the hidden child"
+    );
+    assert_eq!(
+        accepted_post_turn
+            .context
+            .turn_id
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some(lineage.child_turn_id.as_str())
+    );
+    assert_eq!(
+        accepted_post_turn
+            .context
+            .conversation_thread_id
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some(parent_thread_id),
+        "memory extraction must use the parent as effective conversation scope"
+    );
+    assert_eq!(
+        accepted_post_turn
+            .context
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some(response.task.id.as_str())
+    );
+    assert!(
+        accepted_post_turn
+            .context
+            .feature_flags
+            .iter()
+            .any(|(flag, enabled)| {
+                *enabled && flag.as_str() == MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG
+            })
+    );
+
     let (_, occurrence_turn) = crud_store
         .get_turn(parent_thread_id, run.id.as_str())
         .await
@@ -12385,6 +12525,10 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         "completed parent must stay idle while detached result delivery is pending"
     );
 
+    let delivery_ingestor = Arc::new(RecordingThreadEpisodicIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
+        .await;
     processor
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
         .await
@@ -12437,6 +12581,35 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(
         delivered_agent_messages, 1,
         "background result must be delivered to the parent exactly once"
+    );
+    let ingestion_calls = delivery_ingestor.calls.lock().await;
+    assert_eq!(
+        ingestion_calls.len(),
+        1,
+        "repeated delivery polling must index the parent result exactly once"
+    );
+    let delivered_call = &ingestion_calls[0];
+    assert_eq!(delivered_call.workspace_id, workspace_id);
+    assert_eq!(delivered_call.thread_id, parent_thread_id);
+    assert_eq!(delivered_call.turn_id, run.id);
+    assert_eq!(delivered_call.item_type, TurnItemType::AgentMessage);
+    assert_eq!(
+        delivered_call.source_context,
+        pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
+    );
+    assert!(matches!(
+        &delivered_call.item,
+        TurnItem::AgentMessage { text, .. }
+            if text.contains("immediate background result")
+    ));
+    sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        post_turn_calls
+            .lock()
+            .expect("Task post-turn hook calls lock")
+            .len(),
+        1,
+        "delivery may episodically index the parent projection but must not run post-turn again"
     );
 
     assert_eq!(
@@ -13713,6 +13886,10 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .await
         .expect("task run turn should persist");
 
+    let delivery_ingestor = Arc::new(RecordingThreadEpisodicIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
+        .await;
     processor
         .process_due_task_deliveries(4_000_000_000, 10)
         .await
@@ -13782,6 +13959,23 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
             } if text == "delivered scheduled result\nfull detail"
         )
     }));
+    let ingestion_calls = delivery_ingestor.calls.lock().await;
+    assert_eq!(ingestion_calls.len(), 1);
+    let delivered_call = &ingestion_calls[0];
+    assert_eq!(delivered_call.workspace_id, workspace_id);
+    assert_eq!(delivered_call.thread_id, owner_thread_id);
+    assert_eq!(delivered_call.turn_id, run.id);
+    assert_eq!(delivered_call.item_type, TurnItemType::AgentMessage);
+    assert_eq!(
+        delivered_call.source_context,
+        pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
+    );
+    assert!(matches!(
+        &delivered_call.item,
+        TurnItem::AgentMessage { text, .. }
+            if text == "delivered scheduled result\nfull detail"
+    ));
+    drop(ingestion_calls);
     let owner_thread = crud_store
         .get_thread_model(owner_thread_id)
         .await

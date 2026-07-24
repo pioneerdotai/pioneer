@@ -1,7 +1,7 @@
 use pioneer_hooks::{
     HookActor, HookActorId, HookActorKind, HookAgentId, HookContext, HookContextMode,
-    HookContribution, HookContributionHash, HookContributionId, HookDiagnostic, HookId,
-    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
+    HookContribution, HookContributionHash, HookContributionId, HookDiagnostic, HookFeatureFlag,
+    HookId, HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
     HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits, HookPromptSectionSet,
     HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError, HookSectionId,
     HookSubscriptionId, HookTaskId, HookThreadId, HookToolBundleId, HookToolBundleSet,
@@ -12,12 +12,15 @@ use pioneer_hooks::{
     TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
     TurnPreToolMaterializationHookInput,
 };
-use pioneer_memory::hooks::MemoryToolBundleArtifactStore;
+use pioneer_memory::hooks::{
+    MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, MemoryToolBundleArtifactStore,
+};
 use pioneer_tools::ToolExtensionBundle;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
@@ -25,6 +28,22 @@ const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
 const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.thread_context";
+const DEFERRED_TASK_POST_TURN_MARKER_LIMIT: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnPostTurnDispatchMode {
+    #[default]
+    Immediate,
+    AwaitTaskResultAcceptance,
+    AcceptedTaskResult,
+}
+
+impl AgentTurnPostTurnDispatchMode {
+    fn is_immediate(&self) -> bool {
+        *self == Self::Immediate
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnHookRuntimeContext {
@@ -38,6 +57,11 @@ pub struct AgentTurnHookRuntimeContext {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_thread_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentTurnPostTurnDispatchMode::is_immediate"
+    )]
+    pub post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode,
 }
 
 impl Default for AgentTurnHookRuntimeContext {
@@ -49,6 +73,7 @@ impl Default for AgentTurnHookRuntimeContext {
             task_id: None,
             agent_id: None,
             conversation_thread_id: None,
+            post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode::Immediate,
         }
     }
 }
@@ -63,6 +88,7 @@ impl AgentTurnHookRuntimeContext {
             task_id: Some(task_id),
             agent_id: None,
             conversation_thread_id: None,
+            post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode::Immediate,
         }
     }
 
@@ -73,6 +99,16 @@ impl AgentTurnHookRuntimeContext {
         Self {
             conversation_thread_id: Some(conversation_thread_id.into()),
             ..Self::task(task_id)
+        }
+    }
+
+    pub fn accepted_result_candidate_in_conversation(
+        task_id: impl Into<String>,
+        conversation_thread_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            post_turn_dispatch_mode: AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance,
+            ..Self::task_in_conversation(task_id, conversation_thread_id)
         }
     }
 
@@ -278,6 +314,148 @@ impl AgentTurnPostTurnHookDispatch {
     pub(super) fn status(&self) -> TurnPostTurnStatus {
         self.summary.status()
     }
+
+    fn deferred_task_result_key(&self) -> Option<(String, String)> {
+        (self.summary.status() == TurnPostTurnStatus::Succeeded
+            && self.context.runtime_context.post_turn_dispatch_mode
+                == AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance)
+            .then(|| (self.context.thread_id.clone(), self.context.turn_id.clone()))
+    }
+
+    fn mark_task_result_accepted(&mut self) {
+        self.context.runtime_context.post_turn_dispatch_mode =
+            AgentTurnPostTurnDispatchMode::AcceptedTaskResult;
+    }
+}
+
+struct DeferredTaskPostTurnDispatch {
+    runtime: Option<Arc<HookRuntime>>,
+    dispatch: AgentTurnPostTurnHookDispatch,
+}
+
+enum DeferredTaskPostTurnState {
+    Waiting(DeferredTaskPostTurnDispatch),
+    AcceptedBeforeDispatch,
+    Resolved,
+}
+
+#[derive(Default)]
+pub(super) struct DeferredTaskPostTurnDispatchStore {
+    states: AsyncMutex<HashMap<(String, String), DeferredTaskPostTurnState>>,
+}
+
+impl DeferredTaskPostTurnDispatchStore {
+    pub(super) async fn defer(
+        &self,
+        runtime: Option<Arc<HookRuntime>>,
+        dispatch: AgentTurnPostTurnHookDispatch,
+    ) {
+        let Some(key) = dispatch.deferred_task_result_key() else {
+            spawn_agent_turn_post_turn_hook(runtime, dispatch);
+            return;
+        };
+        let pending = DeferredTaskPostTurnDispatch { runtime, dispatch };
+        let ready = {
+            use std::collections::hash_map::Entry;
+
+            let mut states = self.states.lock().await;
+            let ready = match states.entry(key.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(DeferredTaskPostTurnState::Waiting(pending));
+                    None
+                }
+                Entry::Occupied(mut entry) => match entry.get() {
+                    DeferredTaskPostTurnState::AcceptedBeforeDispatch => {
+                        entry.insert(DeferredTaskPostTurnState::Resolved);
+                        Some(pending)
+                    }
+                    DeferredTaskPostTurnState::Waiting(_) | DeferredTaskPostTurnState::Resolved => {
+                        None
+                    }
+                },
+            };
+            prune_deferred_task_post_turn_markers(&mut states, &key);
+            ready
+        };
+        if let Some(ready) = ready {
+            dispatch_accepted_task_result_post_turn(ready);
+        }
+    }
+
+    pub(super) async fn accept(&self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let ready = {
+            use std::collections::hash_map::Entry;
+
+            let mut states = self.states.lock().await;
+            let ready = match states.entry(key.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(DeferredTaskPostTurnState::AcceptedBeforeDispatch);
+                    None
+                }
+                Entry::Occupied(mut entry) => match entry.get() {
+                    DeferredTaskPostTurnState::Waiting(_) => {
+                        let prior = entry.insert(DeferredTaskPostTurnState::Resolved);
+                        let DeferredTaskPostTurnState::Waiting(pending) = prior else {
+                            unreachable!("waiting state checked before replacement");
+                        };
+                        Some(pending)
+                    }
+                    DeferredTaskPostTurnState::AcceptedBeforeDispatch
+                    | DeferredTaskPostTurnState::Resolved => None,
+                },
+            };
+            prune_deferred_task_post_turn_markers(&mut states, &key);
+            ready
+        };
+        if let Some(ready) = ready {
+            dispatch_accepted_task_result_post_turn(ready);
+        }
+    }
+
+    pub(super) async fn discard(&self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let mut states = self.states.lock().await;
+        states.insert(key.clone(), DeferredTaskPostTurnState::Resolved);
+        prune_deferred_task_post_turn_markers(&mut states, &key);
+    }
+}
+
+fn prune_deferred_task_post_turn_markers(
+    states: &mut HashMap<(String, String), DeferredTaskPostTurnState>,
+    protected_key: &(String, String),
+) {
+    let excess = states
+        .len()
+        .saturating_sub(DEFERRED_TASK_POST_TURN_MARKER_LIMIT);
+    if excess == 0 {
+        return;
+    }
+    let removable = states
+        .iter()
+        .filter_map(|(key, state)| {
+            (key != protected_key && !matches!(state, DeferredTaskPostTurnState::Waiting(_)))
+                .then(|| key.clone())
+        })
+        .take(excess)
+        .collect::<Vec<_>>();
+    for key in removable {
+        states.remove(&key);
+    }
+}
+
+fn dispatch_accepted_task_result_post_turn(mut pending: DeferredTaskPostTurnDispatch) {
+    pending.dispatch.mark_task_result_accepted();
+    spawn_agent_turn_post_turn_hook(pending.runtime, pending.dispatch);
+}
+
+fn spawn_agent_turn_post_turn_hook(
+    runtime: Option<Arc<HookRuntime>>,
+    dispatch: AgentTurnPostTurnHookDispatch,
+) {
+    tokio::spawn(async move {
+        run_agent_turn_post_turn_hook_phase(runtime.as_ref(), dispatch).await;
+    });
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1353,6 +1531,15 @@ fn build_phase_request_with_input(
         .as_ref()
         .map(|id| HookAgentId::new(id.clone()))
         .transpose()?;
+    let mut feature_flags = BTreeMap::new();
+    if context.runtime_context.post_turn_dispatch_mode
+        == AgentTurnPostTurnDispatchMode::AcceptedTaskResult
+    {
+        feature_flags.insert(
+            HookFeatureFlag::new(MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG)?,
+            true,
+        );
+    }
     let request = HookPhaseRequest::new(
         phase,
         HookContext {
@@ -1373,6 +1560,7 @@ fn build_phase_request_with_input(
                 id: actor_id,
             }),
             now_unix: Some(current_unix_timestamp()),
+            feature_flags,
             ..HookContext::default()
         },
         input,
@@ -2115,6 +2303,10 @@ mod tests {
         .expect("legacy hook context should deserialize");
         assert_eq!(legacy.conversation_thread_id, None);
         assert_eq!(
+            legacy.post_turn_dispatch_mode,
+            AgentTurnPostTurnDispatchMode::Immediate
+        );
+        assert_eq!(
             legacy.effective_conversation_thread_id("thread-child"),
             "thread-child"
         );
@@ -2126,6 +2318,18 @@ mod tests {
         assert_eq!(
             restored.conversation_thread_id.as_deref(),
             Some("thread-parent")
+        );
+
+        let deferred = AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
+            "task-1",
+            "thread-parent",
+        );
+        let json = serde_json::to_string(&deferred).expect("deferred context should serialize");
+        let restored: AgentTurnHookRuntimeContext =
+            serde_json::from_str(json.as_str()).expect("deferred context should deserialize");
+        assert_eq!(
+            restored.post_turn_dispatch_mode,
+            AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance
         );
     }
 
@@ -2242,5 +2446,80 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_acceptance_before_deferred_dispatch_releases_post_turn_once() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(TestPostTurnBackgroundHook {
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    HookSubscriptionId::new("sub.accepted_task_result")
+                        .expect("valid subscription id"),
+                    HookId::new("test.post_turn_background").expect("valid hook id"),
+                    HookPhase::TurnPostTurn,
+                )
+                .with_execution_policy(HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::Blocking,
+                    timeout_ms: Some(1_000),
+                    max_parallelism: None,
+                })
+                .with_failure_policy(HookFailurePolicy::BestEffort),
+            )
+            .expect("subscription registers");
+        let runtime = Arc::new(HookRuntime::new(handlers, subscriptions));
+        let store = DeferredTaskPostTurnDispatchStore::default();
+
+        store.accept("thread-child", "turn-child").await;
+        store.accept("thread-child", "turn-child").await;
+        let dispatch = AgentTurnPostTurnHookDispatch::new(
+            AgentTurnHookContext::with_runtime_context(
+                "workspace",
+                "thread-child",
+                "turn-child",
+                AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
+                    "task-1",
+                    "thread-parent",
+                ),
+            ),
+            EffectiveTurnPolicySet::empty(),
+            EffectiveTurnPromptContextSet::empty(),
+            AgentTurnPostTurnSummary::succeeded_with_model(
+                Some("model".to_owned()),
+                Some("provider".to_owned()),
+                "user".to_owned(),
+                "assistant".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        store.defer(Some(runtime), dispatch).await;
+
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate durable acceptance events must preserve the pending release marker"
+        );
+        store.accept("thread-child", "turn-child").await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "acceptance replay after dispatch must remain idempotent"
+        );
     }
 }

@@ -1093,6 +1093,93 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
 }
 
 #[tokio::test]
+async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_provenance() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider.clone()),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Investigate this in the background.",
+        "The accepted background investigation is complete.",
+    );
+    request.context.thread_id =
+        Some(pioneer_hooks::HookThreadId::new("thread-task-child").expect("valid child thread"));
+    request.context.turn_id =
+        Some(pioneer_hooks::HookTurnId::new("turn-task-child").expect("valid child turn"));
+    request.context.conversation_thread_id = Some(
+        pioneer_hooks::HookThreadId::new("thread-visible-parent").expect("valid parent thread"),
+    );
+    request.context.task_id =
+        Some(pioneer_hooks::HookTaskId::new("task-background").expect("valid task id"));
+    request.context.mode = Some(pioneer_hooks::HookContextMode::Task);
+    request.context.feature_flags.insert(
+        pioneer_hooks::HookFeatureFlag::new(MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG)
+            .expect("valid accepted Task result flag"),
+        true,
+    );
+
+    let response = hook
+        .execute(request)
+        .await
+        .expect("accepted detached Task result should run the extractor");
+
+    assert!(response.contributions.is_empty());
+    assert_eq!(extractor_provider.call_count(), 1);
+    assert_eq!(write_provider.write_call_count(), 1);
+    let extractor_context = extractor_provider
+        .contexts()
+        .into_iter()
+        .next()
+        .expect("extractor context should be recorded");
+    assert_eq!(extractor_context.thread_id, "thread-task-child");
+    assert_eq!(extractor_context.turn_id, "turn-task-child");
+
+    let write_context = write_provider
+        .write_contexts()
+        .into_iter()
+        .next()
+        .expect("write context should be recorded");
+    assert_eq!(write_context.thread_id, "thread-task-child");
+    assert_eq!(
+        write_context.conversation_thread_id.as_deref(),
+        Some("thread-visible-parent")
+    );
+    assert_eq!(
+        write_context.effective_conversation_thread_id(),
+        "thread-visible-parent"
+    );
+    assert_eq!(write_context.turn_id, "turn-task-child");
+    assert_eq!(write_context.task_id.as_deref(), Some("task-background"));
+
+    let params = write_provider
+        .write_params()
+        .into_iter()
+        .next()
+        .expect("write params should be recorded");
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::TaskRuntime)
+    );
+    let provenance = params
+        .provenance
+        .expect("child provenance should be retained");
+    assert_eq!(
+        provenance.source_thread_id.as_deref(),
+        Some("thread-task-child")
+    );
+    assert_eq!(
+        provenance.source_turn_id.as_deref(),
+        Some("turn-task-child")
+    );
+}
+
+#[tokio::test]
 async fn post_turn_extractor_uses_configured_model_override() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
