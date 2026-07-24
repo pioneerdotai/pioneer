@@ -21,6 +21,7 @@ pub(crate) const CLI_RUNTIME_TURN_STATUS_BLOCKED: &str = "blocked";
 pub(crate) struct CLIAgentRuntimeTurnBindingStartRequest {
     pub workspace_id: String,
     pub thread_id: String,
+    pub continuation_thread_id: String,
     pub turn_id: String,
     pub runtime_id: String,
     pub runtime_kind: String,
@@ -45,9 +46,11 @@ impl CLIAgentRuntimeTurnBindingStartRequest {
         input_mapping: &T,
         created_at: DateTimeWithTimeZone,
     ) -> Result<Self> {
+        let thread_id = thread_id.into();
         Ok(Self {
             workspace_id: workspace_id.into(),
-            thread_id: thread_id.into(),
+            continuation_thread_id: thread_id.clone(),
+            thread_id,
             turn_id: turn_id.into(),
             runtime_id: runtime_id.into(),
             runtime_kind: runtime_kind.into(),
@@ -94,6 +97,7 @@ pub(crate) async fn persist_cli_runtime_turn_binding_before_native_start(
             NewCliRuntimeTurnBinding {
                 turn_id: request.turn_id,
                 thread_id: request.thread_id,
+                continuation_thread_id: request.continuation_thread_id,
                 workspace_id: request.workspace_id,
                 runtime_id: request.runtime_id,
                 runtime_kind: request.runtime_kind,
@@ -209,6 +213,10 @@ fn validate_start_request(request: &CLIAgentRuntimeTurnBindingStartRequest) -> R
     for (label, value) in [
         ("workspace_id", request.workspace_id.as_str()),
         ("thread_id", request.thread_id.as_str()),
+        (
+            "continuation_thread_id",
+            request.continuation_thread_id.as_str(),
+        ),
         ("turn_id", request.turn_id.as_str()),
         ("runtime_id", request.runtime_id.as_str()),
         ("runtime_kind", request.runtime_kind.as_str()),
@@ -246,14 +254,19 @@ fn validate_existing_turn_binding(
     existing: &CliRuntimeTurnBindingRecord,
     request: &CLIAgentRuntimeTurnBindingStartRequest,
 ) -> Result<()> {
-    if existing.workspace_id != request.workspace_id || existing.thread_id != request.thread_id {
+    if existing.workspace_id != request.workspace_id
+        || existing.thread_id != request.thread_id
+        || existing.continuation_thread_id != request.continuation_thread_id
+    {
         bail!(
-            "turn `{}` is bound to workspace/thread `{}/{}` not `{}/{}`",
+            "turn `{}` is bound to workspace/thread/continuation `{}/{}/{}` not `{}/{}/{}`",
             request.turn_id,
             existing.workspace_id,
             existing.thread_id,
+            existing.continuation_thread_id,
             request.workspace_id,
-            request.thread_id
+            request.thread_id,
+            request.continuation_thread_id
         );
     }
     if existing.runtime_id != request.runtime_id || existing.runtime_kind != request.runtime_kind {

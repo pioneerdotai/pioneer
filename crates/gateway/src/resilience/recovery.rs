@@ -3651,6 +3651,7 @@ mod tests {
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.to_owned(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),

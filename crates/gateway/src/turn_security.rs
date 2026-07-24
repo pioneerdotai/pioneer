@@ -181,6 +181,32 @@ pub(crate) fn resolve_task_child_execution_security(
     child_turn_id: impl Into<String>,
     created_at_unix_ms: i64,
 ) -> Result<TurnExecutionSecuritySnapshot> {
+    resolve_task_child_execution_security_for_backend(
+        workspace_id,
+        parent_turn_id,
+        parent_snapshot,
+        task_cap,
+        child_permission_profile,
+        TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: effective_model_provider.into(),
+        },
+        child_thread_id,
+        child_turn_id,
+        created_at_unix_ms,
+    )
+}
+
+pub(crate) fn resolve_task_child_execution_security_for_backend(
+    workspace_id: &str,
+    parent_turn_id: &str,
+    parent_snapshot: &TurnExecutionSecuritySnapshot,
+    task_cap: &TaskAgentSecurityCap,
+    child_permission_profile: TurnPermissionProfileSnapshot,
+    execution_backend: TurnSecurityResolverExecutionBackend,
+    child_thread_id: impl Into<String>,
+    child_turn_id: impl Into<String>,
+    created_at_unix_ms: i64,
+) -> Result<TurnExecutionSecuritySnapshot> {
     validate_task_security_cap_within_parent(parent_snapshot, task_cap)?;
 
     let cap_profile =
@@ -259,9 +285,7 @@ pub(crate) fn resolve_task_child_execution_security(
         app_read_roots: Vec::new(),
         composer_permission_selection: None,
         resolved_permission_profile: snapshot.permission_profile.clone(),
-        execution_backend: TurnSecurityResolverExecutionBackend::NativeApiProvider {
-            provider: effective_model_provider.into(),
-        },
+        execution_backend,
         parent_cap: snapshot.parent_cap.clone(),
         managed_policy: TurnSecurityManagedPolicyInput::default(),
         created_at_unix_ms,

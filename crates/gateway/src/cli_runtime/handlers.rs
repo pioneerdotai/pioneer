@@ -2893,7 +2893,12 @@ impl MessageProcessor {
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
         let bindings = match self
             .crud_store
-            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                continuation_thread_id: Some(key.thread_id.clone()),
+                ..Default::default()
+            })
             .await
         {
             Ok(bindings) => bindings,
@@ -2947,7 +2952,7 @@ impl MessageProcessor {
         {
             Ok(Some(owner)) => {
                 if owner.binding.workspace_id != key.workspace_id
-                    || owner.binding.thread_id != key.thread_id
+                    || owner.binding.continuation_thread_id != key.thread_id
                     || owner.binding.native_thread_id != native_thread_id
                     || !owner.attempt.status.is_active()
                 {
@@ -3438,7 +3443,7 @@ impl MessageProcessor {
                 runtime_id: key.runtime_id.clone(),
                 runtime_kind: turn_binding.runtime_kind,
                 workspace_id: key.workspace_id.clone(),
-                thread_id: key.thread_id.clone(),
+                thread_id: turn_binding.thread_id.clone(),
                 turn_id: Some(turn_binding.turn_id),
                 native_thread_id: request.native_thread_id,
                 native_turn_id: request.native_turn_id,
@@ -4014,7 +4019,7 @@ impl MessageProcessor {
         }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
-            thread_id: key.thread_id.clone(),
+            thread_id: turn_binding.thread_id.clone(),
             turn_id: turn_binding.turn_id.clone(),
             recovery: recovery.clone(),
         };
@@ -4747,7 +4752,7 @@ impl MessageProcessor {
         let key = CLIAgentRuntimeSessionKey::new(
             binding.workspace_id.clone(),
             binding.runtime_id.clone(),
-            binding.thread_id.clone(),
+            binding.continuation_thread_id.clone(),
         )?;
         let Some(handle) = manager.existing_session(&key).await else {
             return Ok(false);
@@ -5374,7 +5379,7 @@ impl MessageProcessor {
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
                         "codex",
-                        key.thread_id.as_str(),
+                        turn_binding.thread_id.as_str(),
                         Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
@@ -5472,7 +5477,7 @@ impl MessageProcessor {
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
                         "codex",
-                        key.thread_id.as_str(),
+                        turn_binding.thread_id.as_str(),
                         Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
@@ -5570,7 +5575,7 @@ impl MessageProcessor {
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
                         "codex",
-                        key.thread_id.as_str(),
+                        turn_binding.thread_id.as_str(),
                         Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
@@ -5693,7 +5698,12 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                continuation_thread_id: Some(key.thread_id.clone()),
+                ..Default::default()
+            })
             .await
         {
             Ok(bindings) => bindings.into_iter().any(|binding| {
@@ -5726,7 +5736,7 @@ impl MessageProcessor {
     ) -> bool {
         if binding.workspace_id != key.workspace_id
             || binding.runtime_id != key.runtime_id
-            || binding.thread_id != key.thread_id
+            || binding.continuation_thread_id != key.thread_id
         {
             warn!(
                 workspace_id = key.workspace_id.as_str(),
@@ -5919,7 +5929,7 @@ impl MessageProcessor {
             Ok(Some(owner)) => {
                 let binding = owner.binding;
                 if binding.workspace_id != key.workspace_id
-                    || binding.thread_id != key.thread_id
+                    || binding.continuation_thread_id != key.thread_id
                     || binding.native_thread_id != native_thread_id
                     || !owner.attempt.status.is_active()
                     || owner.segment.as_ref().is_some_and(|segment| {
@@ -5936,7 +5946,12 @@ impl MessageProcessor {
             }
             Ok(None) => match self
                 .crud_store
-                .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+                .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                    workspace_id: Some(key.workspace_id.clone()),
+                    runtime_id: Some(key.runtime_id.clone()),
+                    continuation_thread_id: Some(key.thread_id.clone()),
+                    ..Default::default()
+                })
                 .await
             {
                 Ok(bindings) => bindings.into_iter().find(|binding| {
@@ -6029,7 +6044,7 @@ impl MessageProcessor {
             .retain(|key, cached_binding| {
                 key.workspace_id != binding.workspace_id
                     || key.runtime_id != binding.runtime_id
-                    || key.thread_id != binding.thread_id
+                    || key.thread_id != binding.continuation_thread_id
                     || cached_binding.turn_id != binding.turn_id
             });
     }
@@ -6047,7 +6062,12 @@ impl MessageProcessor {
         };
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                continuation_thread_id: Some(key.thread_id.clone()),
+                ..Default::default()
+            })
             .await
         {
             Ok(bindings) => bindings.into_iter().rev().find(|binding| {
@@ -6285,6 +6305,7 @@ impl MessageProcessor {
             .await;
         self.interrupt_and_close_cli_runtime_binding(&binding, reason)
             .await;
+        self.release_cli_runtime_session_turn_lease(turn_id).await;
     }
 
     pub(crate) async fn ensure_cli_runtime_turn_interrupted_cleanup(
@@ -6315,6 +6336,8 @@ impl MessageProcessor {
         self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
             .await;
         self.interrupt_and_close_cli_runtime_binding(binding, reason)
+            .await;
+        self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
             .await;
     }
 
@@ -6448,7 +6471,7 @@ impl MessageProcessor {
                 && let Ok(key) = CLIAgentRuntimeSessionKey::new(
                     binding.workspace_id.clone(),
                     binding.runtime_id.clone(),
-                    binding.thread_id.clone(),
+                    binding.continuation_thread_id.clone(),
                 )
                 && let Some(handle) = manager.existing_session(&key).await
                 && let Err(error) = handle
@@ -6511,6 +6534,8 @@ impl MessageProcessor {
                 reason,
             )
             .await;
+            self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
+                .await;
         }
     }
 
@@ -6735,7 +6760,7 @@ impl MessageProcessor {
         let key = match CLIAgentRuntimeSessionKey::new(
             binding.workspace_id.as_str(),
             binding.runtime_id.as_str(),
-            binding.thread_id.as_str(),
+            binding.continuation_thread_id.as_str(),
         ) {
             Ok(key) => key,
             Err(error) => {
@@ -7147,7 +7172,12 @@ impl MessageProcessor {
     ) -> bool {
         match self
             .crud_store
-            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                continuation_thread_id: Some(key.thread_id.clone()),
+                ..Default::default()
+            })
             .await
         {
             Ok(bindings) => bindings.into_iter().any(|binding| {
@@ -7206,10 +7236,19 @@ impl MessageProcessor {
                 request.request_id
             );
         };
+        let continuation_thread_id = if let Some(turn_id) = request.turn_id.as_deref() {
+            self.crud_store
+                .get_cli_runtime_turn_binding(turn_id)
+                .await?
+                .map(|binding| binding.continuation_thread_id)
+                .unwrap_or_else(|| request.thread_id.clone())
+        } else {
+            request.thread_id.clone()
+        };
         let key = CLIAgentRuntimeSessionKey::new(
             request.workspace_id.as_str(),
             request.runtime_id.as_str(),
-            request.thread_id.as_str(),
+            continuation_thread_id,
         )?;
         let Some(handle) = manager.existing_session(&key).await else {
             anyhow::bail!(

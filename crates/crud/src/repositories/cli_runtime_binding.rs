@@ -151,6 +151,7 @@ pub struct NewCliRuntimeThreadBinding {
 pub struct CliRuntimeTurnBindingRecord {
     pub turn_id: String,
     pub thread_id: String,
+    pub continuation_thread_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
     pub runtime_kind: String,
@@ -186,6 +187,7 @@ pub struct CliRuntimeTurnMcpMetadata {
 pub struct NewCliRuntimeTurnBinding {
     pub turn_id: String,
     pub thread_id: String,
+    pub continuation_thread_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
     pub runtime_kind: String,
@@ -361,6 +363,7 @@ pub struct CliRuntimeTurnBindingListFilter {
     pub runtime_id: Option<String>,
     pub runtime_kind: Option<String>,
     pub thread_id: Option<String>,
+    pub continuation_thread_id: Option<String>,
     pub statuses: Vec<String>,
     pub limit: Option<u64>,
 }
@@ -799,6 +802,7 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
             OnConflict::column(turn_cli_runtime_binding::Column::TurnId)
                 .update_columns([
                     turn_cli_runtime_binding::Column::ThreadId,
+                    turn_cli_runtime_binding::Column::ContinuationThreadId,
                     turn_cli_runtime_binding::Column::WorkspaceId,
                     turn_cli_runtime_binding::Column::RuntimeId,
                     turn_cli_runtime_binding::Column::RuntimeKind,
@@ -992,6 +996,11 @@ pub async fn list_turn_bindings<C: ConnectionTrait>(
     }
     if let Some(thread_id) = filter.thread_id {
         query = query.filter(turn_cli_runtime_binding::Column::ThreadId.eq(thread_id));
+    }
+    if let Some(continuation_thread_id) = filter.continuation_thread_id {
+        query = query.filter(
+            turn_cli_runtime_binding::Column::ContinuationThreadId.eq(continuation_thread_id),
+        );
     }
     if !filter.statuses.is_empty() {
         query = query.filter(turn_cli_runtime_binding::Column::Status.is_in(filter.statuses));
@@ -1665,6 +1674,7 @@ fn active_turn_binding_from_new(
     turn_cli_runtime_binding::ActiveModel {
         turn_id: Set(binding.turn_id),
         thread_id: Set(binding.thread_id),
+        continuation_thread_id: Set(binding.continuation_thread_id),
         workspace_id: Set(binding.workspace_id),
         runtime_id: Set(binding.runtime_id),
         runtime_kind: Set(binding.runtime_kind),
@@ -1903,6 +1913,7 @@ fn turn_binding_record_from_model(
     Ok(CliRuntimeTurnBindingRecord {
         turn_id: model.turn_id,
         thread_id: model.thread_id,
+        continuation_thread_id: model.continuation_thread_id,
         workspace_id: model.workspace_id,
         runtime_id: model.runtime_id,
         runtime_kind: model.runtime_kind,

@@ -2075,6 +2075,7 @@ impl CrudStore {
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
                     thread_id: binding.thread_id,
+                    continuation_thread_id: binding.continuation_thread_id,
                     workspace_id: binding.workspace_id,
                     runtime_id: binding.runtime_id,
                     runtime_kind: binding.runtime_kind,
@@ -2196,6 +2197,7 @@ impl CrudStore {
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
                     thread_id: binding.thread_id,
+                    continuation_thread_id: binding.continuation_thread_id,
                     workspace_id: binding.workspace_id,
                     runtime_id: binding.runtime_id,
                     runtime_kind: binding.runtime_kind,
@@ -2277,6 +2279,7 @@ impl CrudStore {
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
                     thread_id: binding.thread_id,
+                    continuation_thread_id: binding.continuation_thread_id,
                     workspace_id: binding.workspace_id,
                     runtime_id: binding.runtime_id,
                     runtime_kind: binding.runtime_kind,
@@ -16519,6 +16522,7 @@ mod tests {
         let turn_binding = NewCliRuntimeTurnBinding {
             turn_id: "turn_cli_bind".to_owned(),
             thread_id: "thread_cli_bind".to_owned(),
+            continuation_thread_id: "thread_cli_bind".to_owned(),
             workspace_id: "ws_cli_bind".to_owned(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -16592,6 +16596,7 @@ mod tests {
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: "turn_cli_running".to_owned(),
                 thread_id: "thread_cli_bind".to_owned(),
+                continuation_thread_id: "thread_cli_bind".to_owned(),
                 workspace_id: "ws_cli_bind".to_owned(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -16634,6 +16639,7 @@ mod tests {
                 NewCliRuntimeTurnBinding {
                     turn_id: turn_id.to_owned(),
                     thread_id: "thread_cli_segments".to_owned(),
+                    continuation_thread_id: "thread_cli_segments".to_owned(),
                     workspace_id: "ws_cli_segments".to_owned(),
                     runtime_id: "codex".to_owned(),
                     runtime_kind: "codex".to_owned(),
@@ -17286,6 +17292,7 @@ mod tests {
                 .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                     turn_id: turn_id.to_owned(),
                     thread_id: thread_id.to_owned(),
+                    continuation_thread_id: thread_id.to_owned(),
                     workspace_id: workspace_id.to_owned(),
                     runtime_id: "codex".to_owned(),
                     runtime_kind: "codex".to_owned(),
@@ -23494,6 +23501,7 @@ mod tests {
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: "turn_projection_activation".to_owned(),
                 thread_id: "thread_projection_activation".to_owned(),
+                continuation_thread_id: "thread_projection_activation".to_owned(),
                 workspace_id: "workspace_projection_activation".to_owned(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),

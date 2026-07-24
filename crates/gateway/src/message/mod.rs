@@ -363,6 +363,16 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
     cli_runtime_turn_binding_cache:
         Arc<Mutex<HashMap<CLIRuntimeNativeTurnKey, pioneer_crud::CliRuntimeTurnBindingRecord>>>,
+    cli_runtime_session_turn_mutexes: Arc<
+        Mutex<
+            HashMap<
+                crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+                Arc<tokio::sync::Mutex<()>>,
+            >,
+        >,
+    >,
+    cli_runtime_session_turn_leases:
+        Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
@@ -664,6 +674,8 @@ impl MessageProcessor {
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_session_turn_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_session_turn_leases: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_command_heartbeats,
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
@@ -2416,6 +2428,8 @@ impl MessageProcessor {
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_session_turn_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_session_turn_leases: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker::new(
                 MessageProcessorResilienceConfig::default()
                     .cli_runtime_command_heartbeat

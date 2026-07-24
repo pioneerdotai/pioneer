@@ -294,6 +294,7 @@ mod tests {
             workspace_id: "workspace".to_owned(),
             runtime_id: "codex".to_owned(),
             thread_id: "thread".to_owned(),
+            continuation_thread_id: "thread".to_owned(),
             runtime_kind: "codex".to_owned(),
             native_thread_id: "native-thread".to_owned(),
             native_turn_id: Some("native-turn".to_owned()),

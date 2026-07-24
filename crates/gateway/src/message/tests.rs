@@ -204,6 +204,7 @@ struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    next_native_turn_id: TokioMutex<Option<String>>,
     responses: TokioMutex<Vec<(JsonValue, JsonValue)>>,
     response_errors: TokioMutex<Vec<(JsonValue, i64, String, Option<JsonValue>)>>,
     interrupts: TokioMutex<Vec<(Option<String>, Option<String>)>>,
@@ -233,6 +234,10 @@ impl RecordingCliRuntimeSession {
         if let Some(event_log) = self.event_log.lock().await.clone() {
             event_log.lock().await.push(event.to_owned());
         }
+    }
+
+    async fn set_next_native_turn_id(&self, native_turn_id: impl Into<String>) {
+        *self.next_native_turn_id.lock().await = Some(native_turn_id.into());
     }
 }
 
@@ -298,12 +303,18 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeTurnStartSnapshot> {
         self.turn_starts.lock().await.push(params.clone());
+        let native_turn_id = self
+            .next_native_turn_id
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| "native_turn_default".to_owned());
         Ok(CLIAgentRuntimeTurnStartSnapshot {
             native_thread_id: params.native_thread_id,
-            native_turn_id: "native_turn_default".to_owned(),
+            native_turn_id: native_turn_id.clone(),
             raw: json!({
                 "turn": {
-                    "id": "native_turn_default"
+                    "id": native_turn_id
                 }
             }),
         })
@@ -4643,6 +4654,146 @@ fn test_task_create_params(
     }
 }
 
+fn detached_cli_task_create_params(
+    workspace_id: &str,
+    parent_thread_id: &str,
+    parent_turn_id: &str,
+    runtime_id: &str,
+    runtime_kind: CLIAgentRuntimeKind,
+    model: &str,
+    input: &str,
+) -> TaskCreateParams {
+    let mut params =
+        test_task_create_params(workspace_id, parent_thread_id, parent_turn_id, input, 3);
+    let full_access_profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+        pioneer_protocol::TurnPermissionMode::FullAccess,
+        pioneer_protocol::TurnPermissionProfileSource::Composer,
+    );
+    let model_provider = format!("cli_runtime:{runtime_id}");
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("test agent spec should exist");
+    agent_spec.model = Some(model.to_owned());
+    agent_spec.model_provider = Some(model_provider.clone());
+    agent_spec.permission_cap = Some(pioneer_protocol::task_permission_cap_from_snapshot(
+        &full_access_profile,
+    ));
+    agent_spec
+        .security_cap
+        .as_mut()
+        .expect("test security cap should exist")
+        .max_permission_profile =
+        pioneer_protocol::task_permission_cap_from_snapshot(&full_access_profile);
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::OwnerThread,
+        thread_id: None,
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    params.metadata = Some(pioneer_protocol::TaskMetadata {
+        labels: vec!["native-cli-runtime".to_owned()],
+        data: None,
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
+            pioneer_protocol::TurnStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                turn_id: format!("planned_{runtime_id}"),
+                input: vec![UserInput::Text {
+                    text: input.to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider),
+                sandbox_policy: Some(pioneer_protocol::SandboxPolicy::from_mode(
+                    SandboxMode::FullAccess,
+                )),
+                mode: Some(ThreadMode::Agent),
+                execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
+                    runtime_id: runtime_id.to_owned(),
+                    runtime_kind,
+                }),
+                reasoning: None,
+                permission_profile: Some(
+                    pioneer_protocol::TurnPermissionProfileSelection::full_access(),
+                ),
+                cli_runtime_options: Some(pioneer_protocol::TurnCLIRuntimeOptions {
+                    sandbox: None,
+                    effort: None,
+                    personality: Some(format!("{runtime_id}-task-personality")),
+                    summary: Some(format!("{runtime_id}-task-summary")),
+                    steer_if_active: None,
+                }),
+            },
+        )),
+    });
+    params
+}
+
+async fn complete_recorded_cli_task_turn(
+    processor: &Arc<MessageProcessor>,
+    manager: &Arc<CLIAgentRuntimeManager>,
+    workspace_id: &str,
+    runtime_id: &str,
+    parent_thread_id: &str,
+    native_thread_id: &str,
+    native_turn_id: &str,
+    result_text: &str,
+) {
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, parent_thread_id)
+        .expect("native Task session key should build");
+    let handle = manager
+        .existing_session(&key)
+        .await
+        .expect("native Task session should remain active");
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                native_item_id: format!("item_{native_turn_id}"),
+                item_kind: "agentMessage".to_owned(),
+                text: Some(result_text.to_owned()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+}
+
 async fn create_task_for_test(
     processor: &Arc<MessageProcessor>,
     params: TaskCreateParams,
@@ -4733,6 +4884,93 @@ async fn ensure_task_create_parent_turn_for_test(
     }
 
     Ok(())
+}
+
+async fn seed_completed_task_parent_with_history(
+    processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
+    parent_thread_id: &str,
+    parent_turn_id: &str,
+    history: &str,
+) {
+    let created_at = super::now_timestamp_secs();
+    processor
+        .crud_store
+        .materialize_turn_start(
+            &Thread {
+                workspace_id: workspace_id.to_owned(),
+                id: parent_thread_id.to_owned(),
+                name: Some("Native Task parent".to_owned()),
+                preview: history.to_owned(),
+                mode: ThreadMode::Agent,
+                model: "test-model".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at,
+                updated_at: created_at,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                turns: Vec::new(),
+            },
+            SandboxMode::FullAccess,
+            &Turn {
+                id: parent_turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::FullAccess,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                ),
+            },
+            &[UserInput::Text {
+                text: history.to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("native Task parent start should persist");
+    processor
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: Turn {
+                    id: parent_turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::Conversation,
+                    origin: TurnOrigin::User,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                        pioneer_protocol::TurnPermissionMode::FullAccess,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                },
+            },
+            created_at,
+        )
+        .await
+        .expect("native Task parent completion should persist");
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_security_snapshot(
+                parent_turn_id,
+                &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/tmp/pioneer-message-tests",
+                    created_at.saturating_mul(1_000),
+                ),
+            )
+            .await
+            .expect("native Task parent security snapshot should persist")
+    );
 }
 
 fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
@@ -13210,6 +13448,493 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     let _ = std::fs::remove_dir_all(base_dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers() {
+    for (runtime_id, runtime_kind, model) in [
+        ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
+        ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
+    ] {
+        let session_manager = Arc::new(SessionManager::new());
+        let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let processor = Arc::new(
+            MessageProcessor::new(
+                thread_manager,
+                test_provider(),
+                session_manager,
+                workspace_manager,
+                crud_store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_context_budget(),
+                test_tool_loop_config(),
+            )
+            .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+        );
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+
+        let parent_thread_id = format!("thr_native_task_{runtime_id}");
+        let parent_turn_id = format!("turn_native_parent_{runtime_id}");
+        let history_marker = format!("PARENT NATIVE HISTORY {runtime_id}");
+        seed_completed_task_parent_with_history(
+            &processor,
+            workspace_id.as_str(),
+            parent_thread_id.as_str(),
+            parent_turn_id.as_str(),
+            history_marker.as_str(),
+        )
+        .await;
+        let input_marker = format!("execute native detached work with {runtime_id}");
+        let params = detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id.as_str(),
+            parent_turn_id.as_str(),
+            runtime_id,
+            runtime_kind,
+            model,
+            input_marker.as_str(),
+        );
+        let native_turn_id = format!("native_task_turn_{runtime_id}");
+        cli_session
+            .set_next_native_turn_id(native_turn_id.clone())
+            .await;
+        let response = create_task_for_test(&processor, params)
+            .await
+            .expect("native detached Task should be accepted");
+        let run = response
+            .run
+            .clone()
+            .expect("immediate native Task should create a run");
+        let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        assert_eq!(
+            starts.len(),
+            1,
+            "{runtime_id} Task must dispatch exactly one native turn"
+        );
+        let native_start = &starts[0];
+        assert_eq!(native_start.model.as_deref(), Some(model));
+        assert_eq!(native_start.effort, None);
+        assert_eq!(
+            native_start.personality.as_deref(),
+            Some(format!("{runtime_id}-task-personality").as_str())
+        );
+        assert_eq!(
+            native_start.summary.as_deref(),
+            Some(format!("{runtime_id}-task-summary").as_str())
+        );
+        assert!(
+            native_start
+                .input
+                .to_string()
+                .contains(input_marker.as_str()),
+            "{runtime_id} must receive the exact composer input"
+        );
+        assert!(
+            native_start
+                .input
+                .to_string()
+                .contains(history_marker.as_str()),
+            "{runtime_id} must receive the parent conversation context"
+        );
+
+        let binding = crud_store
+            .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task turn binding should load")
+            .expect("native Task turn binding should exist");
+        assert_eq!(binding.thread_id, lineage.child_thread_id);
+        assert_eq!(binding.continuation_thread_id, parent_thread_id);
+        assert_eq!(binding.runtime_id, runtime_id);
+        let parent_binding = crud_store
+            .get_cli_runtime_thread_binding(parent_thread_id.as_str())
+            .await
+            .expect("parent continuation binding should load")
+            .expect("parent continuation binding should exist");
+        assert_eq!(
+            parent_binding.native_thread_id,
+            native_start.native_thread_id
+        );
+        assert!(
+            crud_store
+                .get_cli_runtime_thread_binding(lineage.child_thread_id.as_str())
+                .await
+                .expect("child continuation lookup should succeed")
+                .is_none(),
+            "the hidden child must not own a second native conversation"
+        );
+        let security = crud_store
+            .get_turn_execution_security_snapshot(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task security snapshot should load")
+            .expect("native Task security snapshot should exist")
+            .snapshot;
+        assert_eq!(
+            security
+                .parent_cap
+                .as_ref()
+                .map(|cap| cap.parent_turn_id.as_str()),
+            Some(run.id.as_str()),
+            "the child security snapshot must inherit through the durable Task occurrence anchor"
+        );
+        assert_eq!(
+            security.backend.execution_backend,
+            match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
+                }
+                CLIAgentRuntimeKind::Claude => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+                }
+            }
+        );
+
+        let result = format!(
+            r#"<task_result>{{"summary":"{runtime_id} native result","data":{{"runtime":"{runtime_id}"}}}}</task_result>"#
+        );
+        complete_recorded_cli_task_turn(
+            &processor,
+            &cli_manager,
+            workspace_id.as_str(),
+            runtime_id,
+            parent_thread_id.as_str(),
+            native_start.native_thread_id.as_str(),
+            native_turn_id.as_str(),
+            result.as_str(),
+        )
+        .await;
+        assert_eq!(
+            wait_for_task_status(
+                crud_store.clone(),
+                response.task.id.as_str(),
+                TaskStatus::Completed,
+            )
+            .await,
+            TaskStatus::Completed,
+            "{runtime_id} native Task should reconcile through the normal Task result path"
+        );
+        processor
+            .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+            .await
+            .expect("native Task delivery worker should run");
+        let occurrence_items = crud_store
+            .get_turn_item_events(parent_thread_id.as_str(), run.id.as_str())
+            .await
+            .expect("native Task occurrence items should load")
+            .expect("native Task occurrence turn should exist");
+        assert!(occurrence_items.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::AgentMessage { text, .. },
+                    ..
+                } if text.contains(format!("{runtime_id} native result").as_str())
+            )
+        }));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let parent_thread_id = "thr_native_task_fifo";
+    let parent_turn_id = "turn_native_parent_fifo";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "FIFO PARENT HISTORY",
+    )
+    .await;
+
+    cli_session
+        .set_next_native_turn_id("native_fifo_turn_1")
+        .await;
+    let first = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id,
+            parent_turn_id,
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            "first FIFO task",
+        ),
+    )
+    .await
+    .expect("first FIFO Task should start");
+    let first_run = first.run.clone().expect("first FIFO run should exist");
+    let first_lineage =
+        wait_for_child_lineage_for_run(crud_store.clone(), first_run.id.as_str()).await;
+    let first_starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+    assert_eq!(first_starts.len(), 1);
+    let native_thread_id = first_starts[0].native_thread_id.clone();
+
+    cli_session
+        .set_next_native_turn_id("native_fifo_turn_2")
+        .await;
+    let second_processor = processor.clone();
+    let second_workspace_id = workspace_id.clone();
+    let second = tokio::spawn(async move {
+        create_task_for_test(
+            &second_processor,
+            detached_cli_task_create_params(
+                second_workspace_id.as_str(),
+                parent_thread_id,
+                parent_turn_id,
+                "codex",
+                CLIAgentRuntimeKind::Codex,
+                "gpt-5",
+                "second FIFO task",
+            ),
+        )
+        .await
+    });
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        cli_session.turn_starts.lock().await.len(),
+        1,
+        "the second Task must not overlap the active native continuation"
+    );
+
+    complete_recorded_cli_task_turn(
+        &processor,
+        &cli_manager,
+        workspace_id.as_str(),
+        "codex",
+        parent_thread_id,
+        native_thread_id.as_str(),
+        "native_fifo_turn_1",
+        r#"<task_result>{"summary":"first FIFO result","data":{"order":1}}</task_result>"#,
+    )
+    .await;
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            first.task.id.as_str(),
+            TaskStatus::Completed,
+        )
+        .await,
+        TaskStatus::Completed
+    );
+
+    let second = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .expect("second FIFO Task creation should unblock")
+        .expect("second FIFO Task creation task should not panic")
+        .expect("second FIFO Task should start");
+    let second_run = second.run.clone().expect("second FIFO run should exist");
+    let second_lineage =
+        wait_for_child_lineage_for_run(crud_store.clone(), second_run.id.as_str()).await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 2).await;
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts[1].native_thread_id, native_thread_id,
+        "both Tasks must continue the same parent-owned native conversation"
+    );
+    assert_eq!(
+        cli_session.thread_starts.lock().await.len(),
+        1,
+        "FIFO continuation must create only one native thread"
+    );
+    assert!(
+        !cli_session.thread_resumes.lock().await.is_empty(),
+        "the second Task must resume the durable native thread"
+    );
+    for lineage in [&first_lineage, &second_lineage] {
+        let binding = crud_store
+            .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
+            .await
+            .expect("FIFO turn binding should load")
+            .expect("FIFO turn binding should exist");
+        assert_eq!(binding.thread_id, lineage.child_thread_id);
+        assert_eq!(binding.continuation_thread_id, parent_thread_id);
+    }
+
+    complete_recorded_cli_task_turn(
+        &processor,
+        &cli_manager,
+        workspace_id.as_str(),
+        "codex",
+        parent_thread_id,
+        native_thread_id.as_str(),
+        "native_fifo_turn_2",
+        r#"<task_result>{"summary":"second FIFO result","data":{"order":2}}</task_result>"#,
+    )
+    .await;
+    assert_eq!(
+        wait_for_task_status(crud_store, second.task.id.as_str(), TaskStatus::Completed,).await,
+        TaskStatus::Completed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let parent_thread_id = "thr_native_task_cancel";
+    let parent_turn_id = "turn_native_parent_cancel";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "CANCEL PARENT HISTORY",
+    )
+    .await;
+    cli_session
+        .set_next_native_turn_id("native_cancel_turn_1")
+        .await;
+    let first = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id,
+            parent_turn_id,
+            "claude",
+            CLIAgentRuntimeKind::Claude,
+            "claude-sonnet",
+            "cancel this native Task",
+        ),
+    )
+    .await
+    .expect("cancellable native Task should start");
+    let first_run = first.run.clone().expect("cancellable run should exist");
+    let first_lineage =
+        wait_for_child_lineage_for_run(crud_store.clone(), first_run.id.as_str()).await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+    assert_eq!(starts.len(), 1);
+    let native_thread_id = starts[0].native_thread_id.clone();
+
+    cancel_task_for_test(
+        &processor,
+        pioneer_protocol::TaskCancelParams {
+            task_id: first.task.id.clone(),
+            reason: Some("cancel native Task test".to_owned()),
+            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+        },
+    )
+    .await
+    .expect("native Task cancellation should succeed");
+    assert!(
+        cli_session
+            .interrupts
+            .lock()
+            .await
+            .iter()
+            .any(|(thread_id, turn_id)| {
+                thread_id.as_deref() == Some(native_thread_id.as_str())
+                    && turn_id.as_deref() == Some("native_cancel_turn_1")
+            }),
+        "Task cancellation must reach the native Claude turn"
+    );
+    let first_binding = crud_store
+        .get_cli_runtime_turn_binding(first_lineage.child_turn_id.as_str())
+        .await
+        .expect("cancelled native binding should load")
+        .expect("cancelled native binding should exist");
+    assert_eq!(
+        first_binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            first_run.id.as_str(),
+            TaskRunStatus::Cancelled,
+        )
+        .await,
+        TaskRunStatus::Cancelled
+    );
+
+    cli_session
+        .set_next_native_turn_id("native_cancel_turn_2")
+        .await;
+    let second = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id,
+            parent_turn_id,
+            "claude",
+            CLIAgentRuntimeKind::Claude,
+            "claude-sonnet",
+            "run after cancellation",
+        ),
+    )
+    .await
+    .expect("continuation should accept a Task after cancellation");
+    let second_run = second.run.clone().expect("second run should exist");
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 2).await;
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts[1].native_thread_id, native_thread_id,
+        "the durable parent continuation must survive process/session cancellation"
+    );
+    complete_recorded_cli_task_turn(
+        &processor,
+        &cli_manager,
+        workspace_id.as_str(),
+        "claude",
+        parent_thread_id,
+        native_thread_id.as_str(),
+        "native_cancel_turn_2",
+        r#"<task_result>{"summary":"after cancellation","data":{"ok":true}}</task_result>"#,
+    )
+    .await;
+    assert_eq!(
+        wait_for_task_status(crud_store, second.task.id.as_str(), TaskStatus::Completed,).await,
+        TaskStatus::Completed
+    );
+    let _ = second_run;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
     let provider = Arc::new(PromptParityCaptureProvider::default());
@@ -19983,6 +20708,7 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_cli_busy".to_owned(),
             thread_id: "thread_cli_busy".to_owned(),
+            continuation_thread_id: "thread_cli_busy".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20205,6 +20931,7 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20304,6 +21031,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_cli_stale".to_owned(),
             thread_id: "thread_cli_stale".to_owned(),
+            continuation_thread_id: "thread_cli_stale".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20416,6 +21144,7 @@ async fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_ter
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20587,6 +21316,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20709,6 +21439,7 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -20941,6 +21672,7 @@ async fn cli_runtime_legacy_storage_failure_routes_claude_through_native_recover
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id,
             runtime_id: "claude".to_owned(),
             runtime_kind: "claude".to_owned(),
@@ -21028,6 +21760,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -21177,6 +21910,7 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -21542,6 +22276,7 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -21711,6 +22446,7 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -21782,7 +22518,7 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
 #[tokio::test]
 async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_window() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false,
+        false, false, false,
     ))
     .await;
 }
@@ -21790,7 +22526,7 @@ async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_win
 #[tokio::test]
 async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        true, false,
+        true, false, false,
     ))
     .await;
 }
@@ -21798,7 +22534,15 @@ async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
 #[tokio::test]
 async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, true,
+        false, true, false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn detached_native_child_recovery_uses_parent_continuation_and_child_projection() {
+    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
+        false, false, true,
     ))
     .await;
 }
@@ -21806,6 +22550,7 @@ async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
 async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     reconcile_from_runtime_observation: bool,
     fail_after_confirmation: bool,
+    detached_child_owner: bool,
 ) {
     let (tx, _rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -21830,6 +22575,11 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
     let thread_id = "thread_cli_interrupted_recovery";
+    let continuation_thread_id = if detached_child_owner {
+        "thread_cli_interrupted_recovery_parent"
+    } else {
+        thread_id
+    };
     let turn_id = "turn_cli_interrupted_recovery";
     let native_thread_id = "native_thread_cli_interrupted_recovery";
     let initial_native_turn_id = "native_turn_cli_interrupted_recovery_1";
@@ -21921,6 +22671,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: continuation_thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -21967,7 +22718,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             })
             .await
     );
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", continuation_thread_id)
         .expect("session key should build");
 
     if reconcile_from_runtime_observation {
@@ -22110,6 +22861,20 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("recovered binding should load")
         .expect("recovered binding should exist");
     assert_eq!(binding.native_thread_id, native_thread_id);
+    assert_eq!(binding.thread_id, thread_id);
+    assert_eq!(binding.continuation_thread_id, continuation_thread_id);
+    if detached_child_owner {
+        let child_key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+            .expect("child session key should build");
+        assert!(
+            cli_manager.existing_session(&child_key).await.is_none(),
+            "recovery must not create a second native conversation owned by the hidden child"
+        );
+        assert!(
+            cli_manager.existing_session(&key).await.is_some(),
+            "recovery must resume the parent-owned native continuation"
+        );
+    }
     assert_eq!(
         binding.native_turn_id.as_deref(),
         Some("native_turn_default")
@@ -22343,6 +23108,7 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -22475,6 +23241,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_cli_stale_db_only".to_owned(),
             thread_id: "thread_cli_stale_db_only".to_owned(),
+            continuation_thread_id: "thread_cli_stale_db_only".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -22685,6 +23452,7 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: "turn_codex_steer".to_owned(),
                 thread_id: "thread_codex_steer".to_owned(),
+                continuation_thread_id: "thread_codex_steer".to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -22781,6 +23549,7 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_codex_steer_no_session".to_owned(),
             thread_id: "thread_codex_steer_no_session".to_owned(),
+            continuation_thread_id: "thread_codex_steer_no_session".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -22917,6 +23686,7 @@ async fn codex_steer_rejects_wrong_backend() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_codex_steer_wrong_backend".to_owned(),
             thread_id: "thread_codex_steer_wrong_backend".to_owned(),
+            continuation_thread_id: "thread_codex_steer_wrong_backend".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "claude".to_owned(),
             runtime_kind: "claude".to_owned(),
@@ -25129,6 +25899,7 @@ async fn seed_cli_runtime_approval_turn_for_runtime(
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             runtime_id: runtime_id.to_owned(),
             runtime_kind: runtime_kind.to_owned(),
@@ -26511,6 +27282,7 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -30392,6 +31164,7 @@ async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -30506,6 +31279,7 @@ async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -30680,6 +31454,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: "turn_cli_blocked_respond".to_owned(),
             thread_id: "thread_cli_blocked_respond".to_owned(),
+            continuation_thread_id: "thread_cli_blocked_respond".to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -31378,6 +32153,7 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -31533,6 +32309,7 @@ async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_nativ
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "claude".to_owned(),
                 runtime_kind: "claude".to_owned(),
@@ -31678,6 +32455,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -31829,6 +32607,7 @@ async fn cli_runtime_server_request_with_mismatched_starting_native_thread_is_ca
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -31941,6 +32720,7 @@ async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_sta
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32053,6 +32833,7 @@ async fn cli_runtime_server_request_without_native_turn_does_not_close_starting_
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32315,6 +33096,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_mismatched_native_thread_i
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32379,6 +33161,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_missing_native_thread_is_i
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32441,6 +33224,7 @@ async fn cli_runtime_thread_state_event_without_native_thread_is_ignored() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32503,6 +33287,7 @@ async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_bin
             NewCliRuntimeTurnBinding {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -32586,6 +33371,7 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -32681,6 +33467,7 @@ async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
         .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.clone(),
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
@@ -41554,7 +42341,33 @@ async fn wait_for_child_lineage_for_run(
         }
         sleep(Duration::from_millis(25)).await;
     }
-    panic!("timed out waiting for child lineage for run `{run_id}`");
+    let run = crud_store
+        .get_task_run(run_id)
+        .await
+        .expect("timed-out run should reload");
+    let task = if let Some(run) = run.as_ref() {
+        crud_store
+            .get_task(run.task_id.as_str())
+            .await
+            .expect("timed-out task should reload")
+    } else {
+        None
+    };
+    panic!("timed out waiting for child lineage for run `{run_id}`: run={run:?}, task={task:?}");
+}
+
+async fn wait_for_cli_runtime_turn_starts(
+    session: &RecordingCliRuntimeSession,
+    expected: usize,
+) -> Vec<CLIAgentRuntimeTurnStartParams> {
+    for _ in 0..200 {
+        let starts = session.turn_starts.lock().await.clone();
+        if starts.len() >= expected {
+            return starts;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    session.turn_starts.lock().await.clone()
 }
 
 async fn wait_for_task_anchor_status(

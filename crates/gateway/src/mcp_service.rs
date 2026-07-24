@@ -3980,6 +3980,7 @@ mod tests {
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
                 turn_id: fixture.turn_id.clone(),
                 thread_id: fixture.thread_id.clone(),
+                continuation_thread_id: fixture.thread_id.clone(),
                 workspace_id: fixture.workspace_id.clone(),
                 runtime_id: "runtime-codex".to_owned(),
                 runtime_kind: "codex".to_owned(),

@@ -10,6 +10,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub turn_id: String,
     pub thread_id: String,
+    pub continuation_thread_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
     pub runtime_kind: String,

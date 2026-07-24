@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    AgentExecutionBackend, ExecutionCheckpointPayload, ItemCompletedNotification,
-    ItemStartedNotification, PermissionBehavior, SandboxMode, TASK_COMPOSER_WORK_VERSION, Task,
-    TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec, TaskAgentToolPolicy,
-    TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind,
-    TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    AgentExecutionBackend, CLIAgentRuntimeKind, ExecutionCheckpointPayload,
+    ItemCompletedNotification, ItemStartedNotification, PermissionBehavior, SandboxMode,
+    TASK_COMPOSER_WORK_VERSION, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass,
+    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
@@ -243,9 +243,12 @@ impl TaskAgentExecutor {
         let mut composer_launch =
             rebound_composer_work_launch(task, child_thread_id.as_str(), child_turn_id.as_str())?;
         if let Some(launch) = composer_launch.as_ref() {
-            validate_internal_api_composer_launch(launch)?;
+            validate_composer_launch_backend(launch)?;
         }
-        let normalized_composer_capabilities = if let Some(launch) = composer_launch.as_mut() {
+        let cli_runtime_backend = task_cli_runtime_backend(task)?;
+        let normalized_composer_capabilities = if cli_runtime_backend.is_none()
+            && let Some(launch) = composer_launch.as_mut()
+        {
             let normalized = processor
                 .normalize_turn_skill_capabilities(
                     context.workspace_id.as_str(),
@@ -324,6 +327,129 @@ impl TaskAgentExecutor {
             permission_profile: None,
             cli_runtime_options: None,
         });
+        if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
+            let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
+                processor,
+                context.workspace_id.as_str(),
+                parent,
+                agent_spec,
+                child_permission_profile.clone(),
+                runtime_id.as_str(),
+                runtime_kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve hidden task CLI runtime execution security")?;
+            // The shared CLI preparation future is deliberately large. Run it
+            // from a fresh Tokio task so Task scheduler dispatch frames do not
+            // consume the native runtime worker's stack before preparation
+            // begins.
+            let prepare_processor = processor.clone();
+            let continuation_thread_id = parent.parent_thread_id.clone();
+            let task_run_id = run.id.clone();
+            let execution_id = execution.id.clone();
+            let prepared = message_fresh_task(async move {
+                prepare_processor
+                    .prepare_task_cli_runtime_turn(
+                        TurnStartParams {
+                            input: child_input,
+                            model: Some(effective_model.model),
+                            model_provider: Some(effective_model.model_provider),
+                            mode: Some(child_mode),
+                            ..turn_params
+                        },
+                        runtime_id,
+                        runtime_kind,
+                        child_permission_profile,
+                        child_security_snapshot,
+                        continuation_thread_id.clone(),
+                        continuation_thread_id,
+                        task_run_id,
+                        execution_id,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))?;
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if processor
+                        .crud_store
+                        .get_task_run(run.id.as_str())
+                        .await?
+                        .is_some_and(|current| current.status.is_terminal())
+                    {
+                        return Ok(TaskExecutorStartOutcome::Started);
+                    }
+                    return Err(error).context("failed to prepare hidden task CLI runtime turn");
+                }
+            };
+            if processor
+                .crud_store
+                .get_task_run(run.id.as_str())
+                .await?
+                .is_none_or(|current| current.status.is_terminal())
+            {
+                processor
+                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .await;
+                return Ok(TaskExecutorStartOutcome::Started);
+            }
+
+            if let Err(error) = handle
+                .link_child_thread_with_runtime(
+                    child_runtime.lineage.clone(),
+                    binding,
+                    child_runtime.task_run_turn.clone(),
+                    now,
+                )
+                .await
+            {
+                processor
+                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .await;
+                return Err(error).context("failed to link hidden task CLI runtime turn");
+            }
+
+            let started_at = now_timestamp_secs();
+            if let Err(error) = handle.mark_started(started_at).await {
+                processor
+                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .await;
+                return Err(error).context("failed to mark task CLI runtime run started");
+            }
+            if let Err(error) = processor
+                .crud_store
+                .mark_execution_running(
+                    execution.id.as_str(),
+                    started_at,
+                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await
+            {
+                processor
+                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .await;
+                return Err(error).context("failed to mark task CLI runtime execution running");
+            }
+
+            if processor
+                .activate_prepared_task_cli_runtime_turn(prepared)
+                .await
+                .is_ok()
+            {
+                spawn_execution_heartbeat(
+                    processor,
+                    execution.id,
+                    child_thread_id,
+                    child_turn_id,
+                    run.id.clone(),
+                );
+            }
+            return Ok(TaskExecutorStartOutcome::Started);
+        }
         let turn_outcome = processor
             .thread_manager
             .system_turn_start_with_permission_profile(
@@ -1209,6 +1335,63 @@ impl TaskAgentExecutor {
                 Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::InProgress => {
+                if task_cli_runtime_backend(&task_response.task)?.is_some() {
+                    let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
+                    let Some(binding) = processor
+                        .crud_store
+                        .get_cli_runtime_turn_binding(child_turn_id)
+                        .await?
+                    else {
+                        let message = "native CLI runtime binding is missing during task recovery";
+                        processor
+                            .report_turn_failure(
+                                child_runtime.task_run_turn.thread_id.clone(),
+                                child_runtime.task_run_turn.turn_id.clone(),
+                                TurnFailureRecoveryKind::TaskDispatch,
+                                message.to_owned(),
+                            )
+                            .await;
+                        self.fail_child_turn(
+                            child_runtime,
+                            message,
+                            TaskRunTurnStatus::Failed,
+                            handle,
+                        )
+                        .await?;
+                        return Ok(TaskExecutorStartOutcome::Started);
+                    };
+                    let parent = resolve_parent_context(processor, &task_response.task).await?;
+                    if binding.thread_id != child_runtime.task_run_turn.thread_id
+                        || binding.continuation_thread_id != parent.parent_thread_id
+                    {
+                        let message =
+                            "native CLI runtime binding ownership is invalid during task recovery";
+                        processor
+                            .report_turn_failure(
+                                child_runtime.task_run_turn.thread_id.clone(),
+                                child_runtime.task_run_turn.turn_id.clone(),
+                                TurnFailureRecoveryKind::TaskDispatch,
+                                message.to_owned(),
+                            )
+                            .await;
+                        self.fail_child_turn(
+                            child_runtime,
+                            message,
+                            TaskRunTurnStatus::Failed,
+                            handle,
+                        )
+                        .await?;
+                        return Ok(TaskExecutorStartOutcome::Started);
+                    }
+                    spawn_execution_heartbeat(
+                        processor,
+                        execution.id.clone(),
+                        child_runtime.task_run_turn.thread_id,
+                        child_runtime.task_run_turn.turn_id,
+                        run.id.clone(),
+                    );
+                    return Ok(TaskExecutorStartOutcome::Started);
+                }
                 self.restart_in_progress_child_turn(
                     processor,
                     task_response,
@@ -2451,16 +2634,43 @@ impl TaskExecutor for TaskAgentExecutor {
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
         let processor = self.processor()?;
         let child_runtimes = list_child_runtimes_for_run(&processor, run_id).await?;
+        let cancelled_at = now_timestamp_secs();
+        // Task cancellation owns the run terminal state. Commit it before
+        // interrupting the child so the generic turn-interruption projector
+        // cannot race in and reinterpret an intentional cancellation as a
+        // failed Task.
+        handle
+            .cancel_run(Some(reason.to_owned()), cancelled_at)
+            .await?;
         for child_runtime in child_runtimes {
-            let _ = processor
-                .agent_manager
-                .cancel_turn(
+            let cancelled_cli_runtime = processor
+                .cancel_task_cli_runtime_turn(
                     child_runtime.task_run_turn.thread_id.as_str(),
                     child_runtime.task_run_turn.turn_id.as_str(),
                     reason,
                 )
                 .await;
-            let cancelled_at = now_timestamp_secs();
+            match cancelled_cli_runtime {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = processor
+                        .agent_manager
+                        .cancel_turn(
+                            child_runtime.task_run_turn.thread_id.as_str(),
+                            child_runtime.task_run_turn.turn_id.as_str(),
+                            reason,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(
+                        run_id,
+                        turn_id = child_runtime.task_run_turn.turn_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to cancel native task CLI runtime turn"
+                    );
+                }
+            }
             let error = task_error(
                 "task_run_cancelled",
                 reason.to_owned(),
@@ -2479,26 +2689,6 @@ impl TaskExecutor for TaskAgentExecutor {
                 mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, reason)
                     .await?;
             }
-        }
-        if let Some(execution) = processor.crud_store.load_execution_for_run(run_id).await?
-            && !execution.status.is_terminal()
-        {
-            let error = task_error(
-                "task_run_cancelled",
-                reason.to_owned(),
-                TaskErrorClass::Cancelled,
-                Some(run_id.to_owned()),
-            );
-            let _ = processor
-                .crud_store
-                .mark_execution_terminal(
-                    execution.id.as_str(),
-                    pioneer_protocol::TaskRunExecutionStatus::Cancelled,
-                    now_timestamp_secs(),
-                    None,
-                    Some(&error),
-                )
-                .await?;
         }
         Ok(())
     }
@@ -2548,6 +2738,20 @@ fn composer_work_launch(task: &Task) -> Result<Option<&TurnStartParams>> {
     Ok(Some(&composer_work.launch))
 }
 
+fn task_cli_runtime_backend(task: &Task) -> Result<Option<(String, CLIAgentRuntimeKind)>> {
+    Ok(
+        composer_work_launch(task)?.and_then(|launch| match launch.execution_backend.as_ref() {
+            Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id,
+                runtime_kind,
+            }) => Some((runtime_id.clone(), *runtime_kind)),
+            None
+            | Some(AgentExecutionBackend::ApiProvider { .. })
+            | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
+        }),
+    )
+}
+
 fn rebound_composer_work_launch(
     task: &Task,
     child_thread_id: &str,
@@ -2572,17 +2776,11 @@ fn rebound_composer_work_launch(
     ))
 }
 
-fn validate_internal_api_composer_launch(launch: &TurnStartParams) -> Result<()> {
+fn validate_composer_launch_backend(launch: &TurnStartParams) -> Result<()> {
     match launch.execution_backend.as_ref() {
-        None | Some(AgentExecutionBackend::ApiProvider { .. }) => Ok(()),
-        Some(AgentExecutionBackend::CLIAgentRuntime {
-            runtime_id,
-            runtime_kind,
-        }) => bail!(
-            "composer work selected {:?} CLI runtime `{}`; native Task continuation is not implemented",
-            runtime_kind,
-            runtime_id
-        ),
+        None
+        | Some(AgentExecutionBackend::ApiProvider { .. })
+        | Some(AgentExecutionBackend::CLIAgentRuntime { .. }) => Ok(()),
         Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
             bail!("composer work selected unsupported ACP runtime `{runtime_id}`")
         }
@@ -3839,6 +4037,66 @@ async fn resolve_task_child_execution_security_snapshot(
         security_cap,
         child_permission_profile,
         effective_model_provider.to_owned(),
+        child_thread_id.to_owned(),
+        child_turn_id.to_owned(),
+        now_timestamp_secs().saturating_mul(1000),
+    )
+}
+
+async fn resolve_task_child_cli_execution_security_snapshot(
+    processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
+    parent: &TaskParentRuntimeContext,
+    agent_spec: &TaskAgentSpec,
+    child_permission_profile: TurnPermissionProfileSnapshot,
+    runtime_id: &str,
+    runtime_kind: CLIAgentRuntimeKind,
+    child_thread_id: &str,
+    child_turn_id: &str,
+) -> Result<TurnExecutionSecuritySnapshot> {
+    let security_cap = agent_spec.security_cap.as_ref().ok_or_else(|| {
+        anyhow!(
+            "task agent spec `{}` is missing security_cap",
+            agent_spec.id
+        )
+    })?;
+    let parent_turn_id = parent.parent_turn_id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "task agent spec `{}` cannot start child turn without parent turn security snapshot",
+            agent_spec.id
+        )
+    })?;
+    let parent_snapshot = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(parent_turn_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "parent turn `{}` is missing execution security snapshot for task agent spec `{}`",
+                parent_turn_id,
+                agent_spec.id
+            )
+        })?
+        .snapshot;
+    let execution_backend = match runtime_kind {
+        CLIAgentRuntimeKind::Codex => {
+            crate::turn_security::TurnSecurityResolverExecutionBackend::CodexCli {
+                runtime_id: runtime_id.to_owned(),
+            }
+        }
+        CLIAgentRuntimeKind::Claude => {
+            crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                runtime_id: runtime_id.to_owned(),
+            }
+        }
+    };
+    crate::turn_security::resolve_task_child_execution_security_for_backend(
+        workspace_id,
+        parent_turn_id,
+        &parent_snapshot,
+        security_cap,
+        child_permission_profile,
+        execution_backend,
         child_thread_id.to_owned(),
         child_turn_id.to_owned(),
         now_timestamp_secs().saturating_mul(1000),
