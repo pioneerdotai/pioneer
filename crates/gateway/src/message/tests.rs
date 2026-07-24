@@ -2346,6 +2346,19 @@ struct PreflightCaptureProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptParityRequestKind {
+    TurnPreflight,
+    Main,
+    PostTurnExtractor,
+}
+
+#[derive(Default)]
+struct PromptParityCaptureProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    visible_tools: Vec<String>,
+}
+
 struct HangingChildProvider {
     child_main_calls: AtomicUsize,
 }
@@ -2656,6 +2669,28 @@ impl PreflightCaptureProvider {
     }
 }
 
+impl PromptParityCaptureProvider {
+    fn with_visible_tools(visible_tools: Vec<String>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            visible_tools,
+        }
+    }
+
+    fn take_requests(&self) -> Vec<ChatRequest> {
+        std::mem::take(&mut *self.requests.lock().expect("prompt parity requests lock"))
+    }
+
+    fn request_count(&self, kind: PromptParityRequestKind) -> usize {
+        self.requests
+            .lock()
+            .expect("prompt parity requests lock")
+            .iter()
+            .filter(|request| prompt_parity_request_kind(request) == Some(kind))
+            .count()
+    }
+}
+
 impl HangingChildProvider {
     fn new() -> Self {
         Self {
@@ -2751,6 +2786,93 @@ impl Provider for PreflightCaptureProvider {
             Ok(StreamChunk::final_chunk()),
         ])
         .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for PromptParityCaptureProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let kind = prompt_parity_request_kind(&request);
+        self.requests
+            .lock()
+            .expect("prompt parity requests lock")
+            .push(request);
+        Ok(match kind {
+            Some(PromptParityRequestKind::TurnPreflight) => {
+                let visible_tools = self
+                    .visible_tools
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                test_turn_preflight_response_with_visible_tools(visible_tools.as_slice())
+            }
+            Some(PromptParityRequestKind::PostTurnExtractor) => text_response(r#"{"facts":[]}"#),
+            Some(PromptParityRequestKind::Main) | None => {
+                text_response("PROMPT PARITY ASSISTANT RESPONSE")
+            }
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        Ok(vec![pioneer_protocol::ProviderModelInfo {
+            id: "gpt-5.4".to_owned(),
+            name: Some("GPT-5.4 parity fixture".to_owned()),
+            description: Some("Reasoning-capable prompt parity test model".to_owned()),
+            created: None,
+            provider: "openai".to_owned(),
+            owned_by: Some("openai".to_owned()),
+            limits: pioneer_protocol::ProviderModelLimits::default(),
+            capabilities: pioneer_protocol::ProviderModelCapabilities {
+                tool_calling: Some(true),
+                thinking: Some(true),
+                reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    supported: Some(true),
+                    effort_options: vec![
+                        "minimal".to_owned(),
+                        "low".to_owned(),
+                        "medium".to_owned(),
+                        "high".to_owned(),
+                    ],
+                    default_effort: Some("medium".to_owned()),
+                    mandatory: Some(false),
+                    supports_token_budget: None,
+                    source: Some(pioneer_protocol::ReasoningCapabilitySource::StaticRegistry),
+                }),
+                ..pioneer_protocol::ProviderModelCapabilities::default()
+            },
+            transcription: None,
+            pricing: None,
+            active: Some(true),
+            family: Some("gpt-5".to_owned()),
+            lifecycle_status: None,
+        }])
     }
 }
 
@@ -3562,6 +3684,164 @@ fn is_memory_policy_classifier_request(request: &ChatRequest) -> bool {
             .content
             .contains("Pioneer memory turn policy classifier")
     })
+}
+
+fn is_memory_post_turn_extractor_request(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .contains("Pioneer post-turn memory extractor")
+    })
+}
+
+fn prompt_parity_request_kind(request: &ChatRequest) -> Option<PromptParityRequestKind> {
+    if is_turn_preflight_request(request) {
+        Some(PromptParityRequestKind::TurnPreflight)
+    } else if is_memory_post_turn_extractor_request(request) {
+        Some(PromptParityRequestKind::PostTurnExtractor)
+    } else if request.compiled_prompt.is_some() {
+        Some(PromptParityRequestKind::Main)
+    } else {
+        None
+    }
+}
+
+fn single_prompt_parity_request(
+    requests: &[ChatRequest],
+    kind: PromptParityRequestKind,
+) -> &ChatRequest {
+    let matching = requests
+        .iter()
+        .filter(|request| prompt_parity_request_kind(request) == Some(kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one {kind:?} request, captured kinds: {:?}",
+        requests
+            .iter()
+            .filter_map(prompt_parity_request_kind)
+            .collect::<Vec<_>>()
+    );
+    matching[0]
+}
+
+fn canonical_provider_messages_for_artifact_parity(
+    messages: &[pioneer_provider::ChatMessage],
+) -> Vec<pioneer_provider::ChatMessage> {
+    let mut messages = messages.to_vec();
+    for message in &mut messages {
+        for content_part in &mut message.content_parts {
+            let attachment = match content_part {
+                pioneer_provider::MessageContentPart::File { file } => file,
+                pioneer_provider::MessageContentPart::Image { image } => image,
+                pioneer_provider::MessageContentPart::Audio { audio } => audio,
+                pioneer_provider::MessageContentPart::Video { video } => video,
+                pioneer_provider::MessageContentPart::Text { .. } => continue,
+            };
+            let Some(artifact) = attachment.artifact.as_ref() else {
+                continue;
+            };
+            let pioneer_provider::AttachmentDataSource::Path { path } = &attachment.source else {
+                continue;
+            };
+
+            // Artifact resolution deliberately creates a fresh per-turn staging path. The
+            // provider adapter consumes the bytes, not that path string, so parity is defined by
+            // the durable artifact identity and verified content digest.
+            let bytes =
+                std::fs::read(path).expect("materialized parity artifact should be readable");
+            let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
+            if let Some(expected_sha256) = attachment.sha256.as_deref() {
+                assert_eq!(
+                    sha256, expected_sha256,
+                    "materialized parity artifact bytes must match the advertised SHA-256"
+                );
+            }
+            attachment.source = pioneer_provider::AttachmentDataSource::Reference {
+                reference: format!(
+                    "artifact:{}/{}/{}#sha256={sha256}",
+                    artifact.workspace_id,
+                    artifact.artifact_id,
+                    artifact.artifact_version_id.as_deref().unwrap_or_default()
+                ),
+            };
+        }
+    }
+    messages
+}
+
+fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &ChatRequest) {
+    assert_eq!(
+        direct.model, child.model,
+        "{stage} model must be identical for parent and detached child"
+    );
+    assert_eq!(
+        serde_json::to_value(canonical_provider_messages_for_artifact_parity(
+            direct.messages.as_slice()
+        ))
+        .expect("direct messages should serialize"),
+        serde_json::to_value(canonical_provider_messages_for_artifact_parity(
+            child.messages.as_slice()
+        ))
+        .expect("child messages should serialize"),
+        "{stage} provider messages must be identical for parent and detached child after verified artifact staging-path canonicalization"
+    );
+    assert_eq!(
+        serde_json::to_value(canonical_provider_messages_for_artifact_parity(
+            direct.rendered_messages_with_compiled_prompt().as_slice()
+        ))
+        .expect("direct rendered messages should serialize"),
+        serde_json::to_value(canonical_provider_messages_for_artifact_parity(
+            child.rendered_messages_with_compiled_prompt().as_slice()
+        ))
+        .expect("child rendered messages should serialize"),
+        "{stage} rendered provider messages must be identical for parent and detached child"
+    );
+    assert_eq!(
+        direct.temperature, child.temperature,
+        "{stage} temperature must be identical for parent and detached child"
+    );
+    assert_eq!(
+        direct.max_tokens, child.max_tokens,
+        "{stage} max_tokens must be identical for parent and detached child"
+    );
+    assert_eq!(
+        serde_json::to_value(&direct.tools).expect("direct tools should serialize"),
+        serde_json::to_value(&child.tools).expect("child tools should serialize"),
+        "{stage} tool definitions and schemas must be identical for parent and detached child"
+    );
+    assert_eq!(
+        serde_json::to_value(&direct.tool_choice).expect("direct tool choice should serialize"),
+        serde_json::to_value(&child.tool_choice).expect("child tool choice should serialize"),
+        "{stage} tool choice must be identical for parent and detached child"
+    );
+    assert_eq!(
+        direct.parallel_tool_calls, child.parallel_tool_calls,
+        "{stage} parallel-tool policy must be identical for parent and detached child"
+    );
+    assert_eq!(
+        direct.reasoning, child.reasoning,
+        "{stage} reasoning configuration must be identical for parent and detached child"
+    );
+    assert_eq!(
+        direct.compiled_prompt, child.compiled_prompt,
+        "{stage} compiled system prompt must be identical for parent and detached child"
+    );
+}
+
+async fn wait_for_prompt_parity_request_count(
+    provider: &PromptParityCaptureProvider,
+    kind: PromptParityRequestKind,
+    expected: usize,
+) -> bool {
+    for _ in 0..200 {
+        if provider.request_count(kind) >= expected {
+            return true;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    false
 }
 
 fn memory_policy_json_for_script(script: MemoryAgentE2eScript) -> String {
@@ -12927,6 +13207,604 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         "selected skills use the same compact read_skill contract as a parent turn"
     );
 
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
+    let provider = Arc::new(PromptParityCaptureProvider::default());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let mut harness =
+        setup_memory_agent_e2e_harness("detached_prompt_parity", provider_registry).await;
+    harness.processor.bind_task_bridge().await;
+    harness.processor.start_task_event_listener().await;
+
+    let direct_parent_thread_id = "thr_prompt_parity_direct";
+    let task_parent_thread_id = "thr_prompt_parity_task";
+    start_memory_e2e_thread(&mut harness, direct_parent_thread_id, "Agent", "openai").await;
+    start_memory_e2e_thread(&mut harness, task_parent_thread_id, "Agent", "openai").await;
+
+    let direct_seed_turn_id = "turn_prompt_parity_direct_seed";
+    let task_seed_turn_id = "turn_prompt_parity_task_seed";
+    let seed_text = "Identical prompt parity history.";
+    run_memory_e2e_turn(
+        &mut harness,
+        direct_parent_thread_id,
+        direct_seed_turn_id,
+        "Agent",
+        "openai",
+        seed_text,
+    )
+    .await;
+    run_memory_e2e_turn(
+        &mut harness,
+        task_parent_thread_id,
+        task_seed_turn_id,
+        "Agent",
+        "openai",
+        seed_text,
+    )
+    .await;
+    assert!(
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            2,
+        )
+        .await,
+        "both seed turns should finish post-turn extraction before comparison"
+    );
+    let _ = provider.take_requests();
+
+    let direct_turn_id = "turn_prompt_parity_direct";
+    let exact_user_text = "Verify exact parent and detached child prompt parity.";
+    run_memory_e2e_turn(
+        &mut harness,
+        direct_parent_thread_id,
+        direct_turn_id,
+        "Agent",
+        "openai",
+        exact_user_text,
+    )
+    .await;
+    if !wait_for_prompt_parity_request_count(
+        provider.as_ref(),
+        PromptParityRequestKind::PostTurnExtractor,
+        1,
+    )
+    .await
+    {
+        let hook_runs = harness
+            .crud_store
+            .list_hook_runs_for_turn(direct_turn_id, Some(HookPhase::TurnPostTurn), 20)
+            .await
+            .expect("direct post-turn hook runs should load");
+        panic!("direct post-turn extractor did not reach the provider; hook runs: {hook_runs:#?}");
+    }
+    let direct_requests = provider.take_requests();
+
+    let exact_launch = pioneer_protocol::TurnStartParams {
+        thread_id: task_parent_thread_id.to_owned(),
+        turn_id: "turn_prompt_parity_planned".to_owned(),
+        input: vec![UserInput::Text {
+            text: exact_user_text.to_owned(),
+            text_elements: Vec::new(),
+        }],
+        capabilities: Vec::new(),
+        model: Some("test-model".to_owned()),
+        model_provider: Some("openai".to_owned()),
+        sandbox_policy: None,
+        mode: Some(ThreadMode::Agent),
+        execution_backend: None,
+        reasoning: None,
+        permission_profile: None,
+        cli_runtime_options: None,
+    };
+    let mut params = test_task_create_params(
+        harness.workspace_id.as_str(),
+        task_parent_thread_id,
+        task_seed_turn_id,
+        "Prompt parity detached work",
+        3,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = None;
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("prompt parity task should have an agent spec");
+    agent_spec.agent_role = None;
+    agent_spec.agent_nickname = None;
+    params.metadata = Some(pioneer_protocol::TaskMetadata {
+        labels: vec!["prompt-parity".to_owned()],
+        data: None,
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch)),
+    });
+
+    let task = create_task_for_test(&harness.processor, params)
+        .await
+        .expect("detached prompt parity task should start");
+    let task_status = wait_for_task_status(
+        harness.crud_store.clone(),
+        task.task.id.as_str(),
+        TaskStatus::Completed,
+    )
+    .await;
+    if task_status != TaskStatus::Completed {
+        let failed = harness
+            .crud_store
+            .get_task(task.task.id.as_str())
+            .await
+            .expect("failed prompt parity task should reload")
+            .expect("failed prompt parity task should exist");
+        panic!(
+            "detached prompt parity task did not complete: status={task_status:?}, task_error={:?}, runs={:?}",
+            failed.task.error, failed.runs
+        );
+    }
+    if !wait_for_prompt_parity_request_count(
+        provider.as_ref(),
+        PromptParityRequestKind::PostTurnExtractor,
+        1,
+    )
+    .await
+    {
+        let lineage = wait_for_child_lineage_for_run(
+            harness.crud_store.clone(),
+            task.run
+                .as_ref()
+                .expect("detached parity task should have a run")
+                .id
+                .as_str(),
+        )
+        .await;
+        let hook_runs = harness
+            .crud_store
+            .list_hook_runs_for_turn(
+                lineage.child_turn_id.as_str(),
+                Some(HookPhase::TurnPostTurn),
+                20,
+            )
+            .await
+            .expect("child post-turn hook runs should load");
+        panic!("child post-turn extractor did not reach the provider; hook runs: {hook_runs:#?}");
+    }
+    let child_requests = provider.take_requests();
+
+    let direct_preflight =
+        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
+    let child_preflight =
+        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
+    assert_exact_chat_request_parity("turn preflight", direct_preflight, child_preflight);
+
+    let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
+    let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    assert_exact_chat_request_parity("main turn", direct_main, child_main);
+
+    let direct_post =
+        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::PostTurnExtractor);
+    let child_post =
+        single_prompt_parity_request(&child_requests, PromptParityRequestKind::PostTurnExtractor);
+    assert_exact_chat_request_parity("post-turn extractor", direct_post, child_post);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
+    let base_dir = unique_temp_dir("detached_full_prompt_parity");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create full prompt parity skill root");
+    }
+    let skill_path = write_test_skill(
+        &user_root,
+        "full-parity-skill",
+        r#"runtime:
+  tools:
+    - tool_slug: fetch_context
+      description: Fetch exact parity context
+      kind: http
+      parameters:
+        type: object
+        properties:
+          query:
+            type: string
+        required: [query]
+      execution_class: shared
+      config:
+        method: GET
+        url: https://example.com/parity"#,
+        "FULL PARITY SKILL BODY",
+    );
+    let expected_skill_id =
+        pioneer_protocol::SkillId::new("V".repeat(21)).expect("valid parity skill id");
+    let dynamic_skill_tool_name = format!("skill.{expected_skill_id}.fetch-context");
+    let mcp_capability_id = "mcp-tool:workspace:resend:send";
+    let provider = Arc::new(PromptParityCaptureProvider::with_visible_tools(vec![
+        "task_create".to_owned(),
+        "read_skill".to_owned(),
+        dynamic_skill_tool_name.clone(),
+        "mcp_resend_send".to_owned(),
+    ]));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    let mut harness = setup_memory_agent_e2e_harness_with_tool_loop_config(
+        "detached_full_prompt_parity",
+        provider_registry,
+        tool_loop_config,
+    )
+    .await;
+    harness.processor.bind_task_bridge().await;
+    harness.processor.start_task_event_listener().await;
+
+    let skill_id = seed_test_skill_installation(
+        harness.crud_store.as_ref(),
+        'V',
+        harness.workspace_id.as_str(),
+        "user",
+        skill_path.as_path(),
+        Some("tests"),
+        "full-parity-skill",
+    )
+    .await;
+    assert_eq!(skill_id, expected_skill_id);
+    seed_ready_fake_mcp_server(
+        harness.processor.as_ref(),
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+    )
+    .await;
+
+    let direct_parent_thread_id = "thr_full_prompt_parity_direct";
+    let task_parent_thread_id = "thr_full_prompt_parity_task";
+    start_memory_e2e_thread(&mut harness, direct_parent_thread_id, "Agent", "openai").await;
+    start_memory_e2e_thread(&mut harness, task_parent_thread_id, "Agent", "openai").await;
+
+    let direct_seed_turn_id = "turn_full_prompt_parity_direct_seed";
+    let task_seed_turn_id = "turn_full_prompt_parity_task_seed";
+    let seed_text = "Identical full request parity history.";
+    run_memory_e2e_turn(
+        &mut harness,
+        direct_parent_thread_id,
+        direct_seed_turn_id,
+        "Agent",
+        "openai",
+        seed_text,
+    )
+    .await;
+    run_memory_e2e_turn(
+        &mut harness,
+        task_parent_thread_id,
+        task_seed_turn_id,
+        "Agent",
+        "openai",
+        seed_text,
+    )
+    .await;
+    assert!(
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            2,
+        )
+        .await,
+        "both full-parity seed turns should finish post-turn extraction"
+    );
+    let _ = provider.take_requests();
+
+    let artifact = ingest_user_test_artifact(
+        harness.processor.as_ref(),
+        harness.workspace_id.as_str(),
+        "full-parity-context.txt",
+    )
+    .await;
+    let exact_input = vec![
+        UserInput::Text {
+            text: "Verify the complete parent and detached child LLM request.".to_owned(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            version_id: artifact.version_id.clone(),
+        },
+    ];
+    let exact_capabilities = vec![
+        TurnCapability {
+            id: pioneer_protocol::skill_capability_key(&skill_id),
+            kind: TurnCapabilityKind::Skill {
+                skill_id: skill_id.clone(),
+                pack_id: None,
+            },
+            label: Some("tests/full-parity-skill".to_owned()),
+        },
+        TurnCapability {
+            id: mcp_capability_id.to_owned(),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            label: Some("resend/send".to_owned()),
+        },
+    ];
+    let direct_turn_id = "turn_full_prompt_parity_direct";
+    let direct_launch = pioneer_protocol::TurnStartParams {
+        thread_id: direct_parent_thread_id.to_owned(),
+        turn_id: direct_turn_id.to_owned(),
+        input: exact_input.clone(),
+        capabilities: exact_capabilities.clone(),
+        model: Some("gpt-5.4".to_owned()),
+        model_provider: Some("openai".to_owned()),
+        sandbox_policy: Some(pioneer_protocol::SandboxPolicy::from_mode(
+            SandboxMode::FullAccess,
+        )),
+        mode: Some(ThreadMode::Agent),
+        execution_backend: Some(AgentExecutionBackend::ApiProvider {
+            provider: "openai".to_owned(),
+        }),
+        reasoning: Some(pioneer_protocol::TurnReasoningSelection {
+            effort: "high".to_owned(),
+        }),
+        permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
+            mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        }),
+        cli_runtime_options: None,
+    };
+    run_memory_e2e_turn_with_params(&mut harness, &direct_launch).await;
+    if !wait_for_prompt_parity_request_count(
+        provider.as_ref(),
+        PromptParityRequestKind::PostTurnExtractor,
+        1,
+    )
+    .await
+    {
+        let hook_runs = harness
+            .crud_store
+            .list_hook_runs_for_turn(direct_turn_id, Some(HookPhase::TurnPostTurn), 20)
+            .await
+            .expect("full direct post-turn hook runs should load");
+        panic!(
+            "full direct post-turn extractor did not reach the provider; hook runs: {hook_runs:#?}"
+        );
+    }
+    let direct_requests = provider.take_requests();
+
+    let planned_child_turn_id = "turn_full_prompt_parity_planned";
+    let task_launch = pioneer_protocol::TurnStartParams {
+        thread_id: task_parent_thread_id.to_owned(),
+        turn_id: planned_child_turn_id.to_owned(),
+        ..direct_launch.clone()
+    };
+    let mut params = test_task_create_params(
+        harness.workspace_id.as_str(),
+        task_parent_thread_id,
+        task_seed_turn_id,
+        "Full prompt parity detached work",
+        3,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = None;
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("full prompt parity task should have an agent spec");
+    agent_spec.agent_role = None;
+    agent_spec.agent_nickname = None;
+    params.metadata = Some(pioneer_protocol::TaskMetadata {
+        labels: vec!["full-prompt-parity".to_owned()],
+        data: None,
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(task_launch)),
+    });
+
+    let task = create_task_for_test(&harness.processor, params)
+        .await
+        .expect("full prompt parity task should start");
+    let task_status = wait_for_task_status(
+        harness.crud_store.clone(),
+        task.task.id.as_str(),
+        TaskStatus::Completed,
+    )
+    .await;
+    if task_status != TaskStatus::Completed {
+        let failed = harness
+            .crud_store
+            .get_task(task.task.id.as_str())
+            .await
+            .expect("failed full prompt parity task should reload")
+            .expect("failed full prompt parity task should exist");
+        panic!(
+            "full prompt parity task did not complete: status={task_status:?}, task_error={:?}, runs={:?}",
+            failed.task.error, failed.runs
+        );
+    }
+    let run = task
+        .run
+        .as_ref()
+        .expect("full prompt parity task should have a run");
+    let lineage = wait_for_child_lineage_for_run(harness.crud_store.clone(), run.id.as_str()).await;
+    if !wait_for_prompt_parity_request_count(
+        provider.as_ref(),
+        PromptParityRequestKind::PostTurnExtractor,
+        1,
+    )
+    .await
+    {
+        let hook_runs = harness
+            .crud_store
+            .list_hook_runs_for_turn(
+                lineage.child_turn_id.as_str(),
+                Some(HookPhase::TurnPostTurn),
+                20,
+            )
+            .await
+            .expect("full child post-turn hook runs should load");
+        panic!(
+            "full child post-turn extractor did not reach the provider; hook runs: {hook_runs:#?}"
+        );
+    }
+    let child_requests = provider.take_requests();
+
+    let expected_stages = vec![
+        PromptParityRequestKind::TurnPreflight,
+        PromptParityRequestKind::Main,
+        PromptParityRequestKind::PostTurnExtractor,
+    ];
+    assert_eq!(
+        direct_requests
+            .iter()
+            .filter_map(prompt_parity_request_kind)
+            .collect::<Vec<_>>(),
+        expected_stages,
+        "foreground full-parity execution should issue exactly the three expected LLM stages"
+    );
+    assert_eq!(
+        child_requests
+            .iter()
+            .filter_map(prompt_parity_request_kind)
+            .collect::<Vec<_>>(),
+        expected_stages,
+        "detached full-parity execution should issue exactly the three expected LLM stages"
+    );
+    assert_eq!(
+        direct_requests.len(),
+        expected_stages.len(),
+        "foreground full-parity execution must not issue an unclassified LLM request"
+    );
+    assert_eq!(
+        child_requests.len(),
+        expected_stages.len(),
+        "detached full-parity execution must not issue an unclassified LLM request"
+    );
+
+    let direct_preflight =
+        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
+    let child_preflight =
+        single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
+    assert_exact_chat_request_parity("full turn preflight", direct_preflight, child_preflight);
+    for expected_tool in ["task_create", "read_skill"] {
+        assert!(
+            direct_preflight.messages[0].content.contains(expected_tool),
+            "full preflight prompt should expose indexed tool `{expected_tool}`"
+        );
+    }
+
+    let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
+    let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    assert_exact_chat_request_parity("full main turn", direct_main, child_main);
+    assert_eq!(
+        direct_main.reasoning,
+        Some(pioneer_provider::ReasoningConfig::Effort(
+            pioneer_provider::ReasoningEffort::High
+        )),
+        "full parity scenario should exercise explicit reasoning"
+    );
+    assert!(
+        direct_main.tool_choice.is_none(),
+        "current provider-default automatic tool selection should remain unset explicitly"
+    );
+    assert_eq!(
+        direct_main.parallel_tool_calls,
+        Some(true),
+        "full parity scenario should exercise parallel tool-call policy"
+    );
+    let tools = direct_main
+        .tools
+        .as_ref()
+        .expect("full parity main request should include tools");
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    for expected_tool in [
+        "task_create",
+        "read_skill",
+        dynamic_skill_tool_name.as_str(),
+        "mcp_resend_send",
+    ] {
+        assert!(
+            tool_names.contains(expected_tool),
+            "full main request should include tool `{expected_tool}`"
+        );
+    }
+    let user_message = direct_main
+        .messages
+        .last()
+        .expect("full main request should include a user message");
+    assert_eq!(
+        user_message.content,
+        "Verify the complete parent and detached child LLM request."
+    );
+    assert!(matches!(
+        user_message.content_parts.as_slice(),
+        [pioneer_provider::MessageContentPart::File { file }]
+            if file.name.as_deref() == Some("full-parity-context.txt")
+                && file.artifact.as_ref().is_some_and(|reference| {
+                    reference.artifact_id == artifact.artifact_id
+                        && reference.artifact_version_id == artifact.version_id
+                })
+    ));
+    let compiled_prompt = direct_main
+        .compiled_prompt
+        .as_ref()
+        .expect("full main request should include a compiled prompt");
+    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
+    assert!(
+        compiled_prompt
+            .full_system_text
+            .contains("full-parity-skill")
+    );
+    assert!(compiled_prompt.full_system_text.contains(&format!(
+        "Exact skill reference for read_skill: `skill:{skill_id}`"
+    )));
+
+    let direct_post =
+        single_prompt_parity_request(&direct_requests, PromptParityRequestKind::PostTurnExtractor);
+    let child_post =
+        single_prompt_parity_request(&child_requests, PromptParityRequestKind::PostTurnExtractor);
+    assert_exact_chat_request_parity("full post-turn extractor", direct_post, child_post);
+
+    let direct_mcp_bindings = harness
+        .crud_store
+        .list_turn_mcp_bindings(direct_turn_id)
+        .await
+        .expect("direct MCP bindings should load");
+    let child_mcp_bindings = harness
+        .crud_store
+        .list_turn_mcp_bindings(lineage.child_turn_id.as_str())
+        .await
+        .expect("child MCP bindings should load");
+    assert_eq!(direct_mcp_bindings.len(), 1);
+    assert_eq!(child_mcp_bindings.len(), 1);
+    for binding in [&direct_mcp_bindings[0], &child_mcp_bindings[0]] {
+        assert_eq!(binding.server_name, "resend");
+        assert_eq!(binding.raw_tool_name, "send");
+        assert_eq!(binding.callable_name, "mcp_resend_send");
+        assert_eq!(binding.selection_reason, "explicit_composer_capability");
+        assert_eq!(binding.capability_id.as_deref(), Some(mcp_capability_id));
+    }
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
     let _ = std::fs::remove_dir_all(base_dir);
 }
 
@@ -36694,6 +37572,73 @@ async fn skills_install_blocks_dependency_failure_under_default_policy() {
     let _ = std::fs::remove_dir_all(base_dir);
 }
 
+async fn seed_ready_fake_mcp_server(
+    processor: &MessageProcessor,
+    crud_store: &CrudStore,
+    workspace_id: &str,
+) {
+    processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
+    let transport = pioneer_mcp::McpTransportConfig::Stdio {
+        command: "pioneer-fake-mcp".to_owned(),
+        args: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+        startup_timeout_ms: 5_000,
+        tool_timeout_ms: 5_000,
+    };
+    let install_record = pioneer_crud::McpServerInstallationRecord {
+        id: None,
+        scope_kind: "workspace".to_owned(),
+        scope_key: workspace_id.to_owned(),
+        name: "resend".to_owned(),
+        display_name: Some("Parity MCP".to_owned()),
+        source_kind: "config".to_owned(),
+        source_ref: json!({"kind":"prompt-parity-test"}).to_string(),
+        transport_kind: "stdio".to_owned(),
+        transport_json: serde_json::to_string(&transport).expect("transport should serialize"),
+        auth_json: serde_json::to_string(&pioneer_mcp::McpAuthConfig::default())
+            .expect("auth should serialize"),
+        secret_refs_json: "[]".to_owned(),
+        enabled: true,
+        allow_implicit_invocation: false,
+        required: false,
+        fingerprint: "prompt-parity-mcp-fingerprint".to_owned(),
+        updated_at_unix: 1_700_000_000,
+    };
+    crud_store
+        .upsert_mcp_server_installation(&install_record, 1_700_000_000)
+        .await
+        .expect("prompt parity MCP installation should persist");
+    processor
+        .mcp_service
+        .reload_workspace(workspace_id)
+        .await
+        .expect("prompt parity MCP runtime should reload");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = crud_store
+            .find_mcp_server_installation("workspace", workspace_id, "resend")
+            .await
+            .expect("prompt parity MCP installation lookup should succeed")
+            .expect("prompt parity MCP installation should exist");
+        if let Some(server_id) = row.id.as_deref()
+            && crud_store
+                .find_mcp_server_catalog_snapshot(server_id)
+                .await
+                .expect("prompt parity MCP catalog lookup should succeed")
+                .is_some()
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "prompt parity fake MCP server catalog should become ready"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 struct FakeMcpRuntimeConnector;
 
 #[async_trait::async_trait]
@@ -38532,6 +39477,19 @@ async fn setup_memory_agent_e2e_harness(
     case_id: &str,
     provider_registry: Arc<pioneer_provider::ProviderRegistry>,
 ) -> MemoryAgentE2eHarness {
+    setup_memory_agent_e2e_harness_with_tool_loop_config(
+        case_id,
+        provider_registry,
+        test_tool_loop_config(),
+    )
+    .await
+}
+
+async fn setup_memory_agent_e2e_harness_with_tool_loop_config(
+    case_id: &str,
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    tool_loop_config: ToolLoopConfig,
+) -> MemoryAgentE2eHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(128);
     let connection_id = session_manager.register_connection(tx).await;
@@ -38567,7 +39525,7 @@ async fn setup_memory_agent_e2e_harness(
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config(),
+        tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
         pioneer_config::GatewayArtifactsConfig::default(),
@@ -38705,6 +39663,26 @@ async fn run_memory_e2e_turn(
     text: &str,
 ) {
     start_memory_e2e_turn(harness, thread_id, turn_id, mode, model_provider, text).await;
+    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
+}
+
+async fn run_memory_e2e_turn_with_params(
+    harness: &mut MemoryAgentE2eHarness,
+    params: &pioneer_protocol::TurnStartParams,
+) {
+    let request_id = generate_test_request_id("tufull", params.turn_id.as_str());
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/start",
+        "params": params,
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_STARTED).await;
     let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
 }
 
