@@ -2285,6 +2285,7 @@ mod tests {
             &MemoryTurnContext {
                 workspace_id: "ws_1".to_owned(),
                 thread_id: "thr_1".to_owned(),
+                conversation_thread_id: None,
                 turn_id: "turn_1".to_owned(),
                 mode: ThreadMode::Agent,
                 input_text: "как меня зовут?".to_owned(),
@@ -2318,6 +2319,7 @@ mod tests {
             &MemoryTurnContext {
                 workspace_id: "ws_1".to_owned(),
                 thread_id: "thr_1".to_owned(),
+                conversation_thread_id: None,
                 turn_id: "turn_1".to_owned(),
                 mode: ThreadMode::Agent,
                 input_text: "а завтра какая?".to_owned(),

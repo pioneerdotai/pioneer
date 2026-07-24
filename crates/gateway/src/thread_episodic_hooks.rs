@@ -546,7 +546,11 @@ impl HookHandler for ThreadContextRecallHook {
             ));
             return Ok(response);
         };
-        let Some(thread_id) = request.context.thread_id.as_ref().map(|id| id.as_str()) else {
+        let Some(thread_id) = request
+            .context
+            .effective_conversation_thread_id()
+            .map(|id| id.as_str())
+        else {
             response.diagnostics.push(thread_context_warning_diagnostic(
                 "thread_context.invalid_context",
                 "thread context recall skipped: thread id missing",
@@ -918,6 +922,31 @@ mod tests {
                     .as_str()
                     .contains("thread:turn_1/item_1/chunk_1")
         }));
+    }
+
+    #[tokio::test]
+    async fn thread_context_hook_recalls_from_effective_conversation_thread() {
+        let provider = Arc::new(FakeThreadContextRecallProvider::default());
+        let hook = ThreadContextRecallHook {
+            recall_provider: provider.clone(),
+            artifact_store: None,
+            config: ThreadContextRecallHookConfig::default(),
+        };
+        let mut request = test_request(MemoryTurnPolicy::normal_default_allow());
+        request.context.conversation_thread_id = Some(
+            pioneer_hooks::HookThreadId::new("thread_parent")
+                .expect("valid conversation thread id"),
+        );
+
+        hook.execute(request).await.expect("hook should execute");
+
+        let inputs = provider.inputs.lock().await;
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].thread_id.0, "thread_parent");
+        assert_eq!(
+            inputs[0].turn_id.0, "turn_1",
+            "episodic provenance must retain the real child turn"
+        );
     }
 
     #[test]

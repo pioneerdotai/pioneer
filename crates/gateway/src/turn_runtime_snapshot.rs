@@ -108,6 +108,15 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
     })
 }
 
+pub(crate) fn restored_conversation_scope_from_snapshot(
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<(AgentTurnHookRuntimeContext, Vec<ChatMessage>)> {
+    Ok((
+        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?,
+        from_snapshot_json(&snapshot.history_json, "conversation history")?,
+    ))
+}
+
 fn execution_capabilities_json(capabilities: &[TurnCapability]) -> Result<String> {
     validate_execution_capabilities(capabilities)?;
     to_snapshot_json(capabilities, "turn capabilities")

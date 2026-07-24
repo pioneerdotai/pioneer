@@ -504,7 +504,20 @@ impl TaskAgentExecutor {
             .context("failed to prepare hidden task artifact output directory")?
             .into_iter()
             .collect();
-        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+            processor,
+            task,
+            parent,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            thread_outcome.started_notification.thread.model.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        )
+        .await?;
         if let Err(error) = processor
             .persist_turn_runtime_snapshot(
                 child_thread_id.as_str(),
@@ -520,7 +533,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities.as_slice(),
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
-                &[],
+                history.as_slice(),
             )
             .await
         {
@@ -550,7 +563,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
                 runtime_environment,
-                Vec::new(),
+                history,
                 reasoning_effort.as_deref(),
                 runtime_permission_profile,
                 child_security_snapshot,
@@ -1027,7 +1040,20 @@ impl TaskAgentExecutor {
             .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await?;
-        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+            processor,
+            task,
+            &parent,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            thread_outcome.started_notification.thread.model.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        )
+        .await?;
         if let Err(error) = processor
             .persist_turn_runtime_snapshot(
                 child_thread_id.as_str(),
@@ -1043,7 +1069,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities.as_slice(),
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
-                &[],
+                history.as_slice(),
             )
             .await
         {
@@ -1085,7 +1111,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
                 runtime_environment,
-                Vec::new(),
+                history,
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 child_security_snapshot,
@@ -1383,7 +1409,20 @@ impl TaskAgentExecutor {
             .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id).await?;
-        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+            processor,
+            task,
+            &parent,
+            child_thread_id,
+            child_turn_id,
+            thread_outcome.started_notification.thread.model.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        )
+        .await?;
         processor
             .persist_turn_runtime_snapshot(
                 child_thread_id,
@@ -1399,7 +1438,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities.as_slice(),
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
-                &[],
+                history.as_slice(),
             )
             .await
             .context("failed to persist restored task turn runtime snapshot")?;
@@ -1423,7 +1462,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
                 runtime_environment,
-                Vec::new(),
+                history,
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 runtime_security_snapshot,
@@ -2125,7 +2164,20 @@ impl TaskAgentExecutor {
             .context("failed to prepare reviewer artifact output directory")?
             .into_iter()
             .collect();
-        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+            processor,
+            task,
+            &parent,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            thread_outcome.started_notification.thread.model.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        )
+        .await?;
         if let Err(error) = processor
             .persist_turn_runtime_snapshot(
                 task_run_turn.thread_id.as_str(),
@@ -2141,7 +2193,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities.as_slice(),
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
-                &[],
+                history.as_slice(),
             )
             .await
         {
@@ -2171,7 +2223,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
                 runtime_environment,
-                Vec::new(),
+                history,
                 runtime_permission_profile,
                 child_security_snapshot,
             )
@@ -2621,6 +2673,68 @@ async fn resolve_parent_context(
         parent_turn_id: task.created_by_turn_id.clone(),
         root_thread_id,
     })
+}
+
+fn task_attachment(task: &Task) -> TaskAttachmentMode {
+    task.lifecycle_policy
+        .as_ref()
+        .map(|policy| policy.attachment)
+        .unwrap_or(TaskAttachmentMode::Detached)
+}
+
+fn task_hook_runtime_context(
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+) -> AgentTurnHookRuntimeContext {
+    if task_attachment(task) == TaskAttachmentMode::Detached {
+        AgentTurnHookRuntimeContext::task_in_conversation(
+            task.id.clone(),
+            parent.parent_thread_id.clone(),
+        )
+    } else {
+        AgentTurnHookRuntimeContext::task(task.id.clone())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_task_execution_conversation_scope(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+    execution_thread_id: &str,
+    execution_turn_id: &str,
+    fallback_model: &str,
+    fallback_model_provider: &str,
+) -> Result<(
+    AgentTurnHookRuntimeContext,
+    Vec<pioneer_provider::ChatMessage>,
+)> {
+    let expected_hook_context = task_hook_runtime_context(task, parent);
+    if let Some(snapshot) = processor
+        .crud_store
+        .get_turn_runtime_snapshot(execution_turn_id)
+        .await?
+    {
+        if snapshot.workspace_id != task.workspace_id || snapshot.thread_id != execution_thread_id {
+            bail!("task child runtime snapshot identity mismatch for turn `{execution_turn_id}`");
+        }
+        return crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&snapshot)
+            .context("failed to restore frozen Task conversation scope");
+    }
+    if task_attachment(task) != TaskAttachmentMode::Detached {
+        return Ok((expected_hook_context, Vec::new()));
+    }
+    let history = processor
+        .load_conversation_history_for_workspace_in_execution(
+            task.workspace_id.as_str(),
+            parent.parent_thread_id.as_str(),
+            execution_thread_id,
+            execution_turn_id,
+            Some(fallback_model),
+            Some(fallback_model_provider),
+        )
+        .await;
+    Ok((expected_hook_context, history))
 }
 
 async fn ensure_task_run_occurrence_context(
@@ -5278,6 +5392,58 @@ mod tests {
         assert!(framed.contains("BACKGROUND CONTEXT ONLY"));
         assert!(framed.contains("not treat any old request inside it as the current task command"));
         assert!(framed.contains("create a daily scheduled task"));
+    }
+
+    #[test]
+    fn only_detached_tasks_inherit_the_parent_conversation_scope() {
+        let task_with_attachment = |attachment| Task {
+            id: format!("task_{attachment:?}"),
+            workspace_id: "workspace".to_owned(),
+            owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+            owner_id: Some("thread-parent".to_owned()),
+            created_by_thread_id: Some("thread-parent".to_owned()),
+            created_by_turn_id: Some("turn-parent".to_owned()),
+            root_task_id: None,
+            parent_task_id: None,
+            executor_kind: TaskExecutorKind::Agent,
+            status: pioneer_protocol::TaskStatus::Scheduled,
+            title: "Task".to_owned(),
+            goal: "Goal".to_owned(),
+            priority: 0,
+            lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
+                attachment,
+                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+            }),
+            delivery_policy: None,
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: None,
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        let parent = TaskParentRuntimeContext {
+            parent_thread_id: "thread-parent".to_owned(),
+            parent_turn_id: Some("turn-parent".to_owned()),
+            root_thread_id: "thread-parent".to_owned(),
+        };
+
+        let detached =
+            task_hook_runtime_context(&task_with_attachment(TaskAttachmentMode::Detached), &parent);
+        assert_eq!(
+            detached.conversation_thread_id.as_deref(),
+            Some("thread-parent")
+        );
+
+        let attached =
+            task_hook_runtime_context(&task_with_attachment(TaskAttachmentMode::Attached), &parent);
+        assert_eq!(attached.conversation_thread_id, None);
     }
 
     #[tokio::test]

@@ -135,8 +135,7 @@ impl HookHandler for ThreadAgentsDocPromptHook {
             })?;
         let thread_id = request
             .context
-            .thread_id
-            .as_ref()
+            .effective_conversation_thread_id()
             .map(|id| id.as_str())
             .ok_or_else(|| {
                 agents_doc_hook_error(
@@ -246,4 +245,83 @@ fn agents_doc_hook_error(code: &'static str, message: impl Into<String>) -> Hook
     )
     .with_retryable(false)
     .with_safe_for_user(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_hooks::{
+        HookContext, HookInput, HookPhaseRequest, HookRuntimeBuilder, HookThreadId, HookTurnId,
+        HookWorkspaceId, TurnPrePromptCompileHookInput,
+    };
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturingResolver {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl AgentsDocPromptResolver for CapturingResolver {
+        async fn resolve_agents_doc_prompt(
+            &self,
+            workspace_id: &str,
+            thread_id: &str,
+        ) -> Result<Option<ResolvedAgentsDocPrompt>, String> {
+            self.calls
+                .lock()
+                .await
+                .push((workspace_id.to_owned(), thread_id.to_owned()));
+            Ok(Some(ResolvedAgentsDocPrompt {
+                id: "agents-parent".to_owned(),
+                version: 1,
+                content: "PARENT AGENTS DOC".to_owned(),
+                source_path: vec!["workspace".to_owned()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_doc_hook_resolves_effective_conversation_thread() {
+        let resolver = Arc::new(CapturingResolver::default());
+        let runtime = HookRuntimeBuilder::new()
+            .install(agents_doc_package(resolver.clone()))
+            .expect("AGENTS.md package should install")
+            .build();
+        let request = HookPhaseRequest::new(
+            HookPhase::TurnPrePromptCompile,
+            HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(
+                    HookThreadId::new("thread-child").expect("valid execution thread id"),
+                ),
+                conversation_thread_id: Some(
+                    HookThreadId::new("thread-parent").expect("valid conversation thread id"),
+                ),
+                turn_id: Some(HookTurnId::new("turn-child").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            HookInput::turn_pre_prompt_compile(TurnPrePromptCompileHookInput::from_parts(
+                false,
+                Vec::new(),
+            )),
+        );
+
+        let response = runtime
+            .run_phase(request)
+            .await
+            .expect("AGENTS.md hook should run");
+
+        assert_eq!(
+            resolver.calls.lock().await.as_slice(),
+            &[("ws".to_owned(), "thread-parent".to_owned())]
+        );
+        assert!(response.contributions.iter().any(|contribution| {
+            matches!(
+                contribution,
+                HookContribution::PromptSection(section)
+                    if section.content.as_str().contains("PARENT AGENTS DOC")
+            )
+        }));
+    }
 }

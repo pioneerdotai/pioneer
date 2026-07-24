@@ -18,7 +18,8 @@ pub(super) struct PreCompactionHookDispatch {
 
 pub(super) struct PreCompactionHookInputParts<'a> {
     pub workspace_id: &'a str,
-    pub thread_id: &'a str,
+    pub execution_thread_id: &'a str,
+    pub conversation_thread_id: &'a str,
     pub turn_id: &'a str,
     pub compaction_id: String,
     pub loaded_completed_turn_count: usize,
@@ -94,11 +95,15 @@ pub(super) async fn run_pre_compaction_hook_phase(
 pub(super) fn build_pre_compaction_hook_dispatch(
     parts: PreCompactionHookInputParts<'_>,
 ) -> Result<PreCompactionHookDispatch, pioneer_hooks::HookIdError> {
-    let context =
-        gateway_compaction_hook_context(parts.workspace_id, parts.thread_id, Some(parts.turn_id))?;
+    let context = gateway_compaction_hook_context(
+        parts.workspace_id,
+        parts.execution_thread_id,
+        parts.conversation_thread_id,
+        Some(parts.turn_id),
+    )?;
     let input = TurnPreCompactionHookInput::from_parts(
         HookWorkspaceId::new(parts.workspace_id.to_owned())?,
-        HookThreadId::new(parts.thread_id.to_owned())?,
+        HookThreadId::new(parts.conversation_thread_id.to_owned())?,
         Some(HookTurnId::new(parts.turn_id.to_owned())?),
         HookCompactionId::new(parts.compaction_id)?,
         TurnPreCompactionTrigger::ContextBudgetThreshold,
@@ -134,12 +139,16 @@ pub(super) fn build_pre_compaction_hook_dispatch(
 
 fn gateway_compaction_hook_context(
     workspace_id: &str,
-    thread_id: &str,
+    execution_thread_id: &str,
+    conversation_thread_id: &str,
     turn_id: Option<&str>,
 ) -> Result<HookContext, pioneer_hooks::HookIdError> {
     Ok(HookContext {
         workspace_id: Some(HookWorkspaceId::new(workspace_id.to_owned())?),
-        thread_id: Some(HookThreadId::new(thread_id.to_owned())?),
+        thread_id: Some(HookThreadId::new(execution_thread_id.to_owned())?),
+        conversation_thread_id: (conversation_thread_id != execution_thread_id)
+            .then(|| HookThreadId::new(conversation_thread_id.to_owned()))
+            .transpose()?,
         turn_id: turn_id
             .map(|turn_id| HookTurnId::new(turn_id.to_owned()))
             .transpose()?,

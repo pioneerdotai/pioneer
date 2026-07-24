@@ -783,7 +783,7 @@ impl MemoryToolHandler {
             }),
             MemoryScopeKind::Thread => Ok(MemoryScope {
                 kind,
-                key: self.context.thread_id.clone(),
+                key: self.context.effective_conversation_thread_id().to_owned(),
             }),
             MemoryScopeKind::Task => {
                 let Some(task_id) = self.context.task_id.as_deref() else {

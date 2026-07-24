@@ -877,6 +877,7 @@ fn hook_run_record_from_model(model: hook_run::Model) -> Result<HookRunRecord> {
     let context = HookContext {
         workspace_id: parse_optional_hook_id(model.workspace_id, "hook_run.workspace_id")?,
         thread_id: parse_optional_hook_id(model.thread_id, "hook_run.thread_id")?,
+        conversation_thread_id: None,
         turn_id: parse_optional_hook_id(model.turn_id, "hook_run.turn_id")?,
         task_id: parse_optional_hook_id(model.task_id, "hook_run.task_id")?,
         agent_id: parse_optional_hook_id(model.agent_id, "hook_run.agent_id")?,
@@ -983,6 +984,7 @@ fn hook_audit_event_record_from_model(
     let context = HookContext {
         workspace_id: parse_optional_hook_id(model.workspace_id, "hook_audit_event.workspace_id")?,
         thread_id: parse_optional_hook_id(model.thread_id, "hook_audit_event.thread_id")?,
+        conversation_thread_id: None,
         turn_id: parse_optional_hook_id(model.turn_id, "hook_audit_event.turn_id")?,
         task_id: parse_optional_hook_id(model.task_id, "hook_audit_event.task_id")?,
         agent_id: parse_optional_hook_id(model.agent_id, "hook_audit_event.agent_id")?,

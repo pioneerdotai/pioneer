@@ -181,6 +181,8 @@ pub struct HookContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<HookThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_thread_id: Option<HookThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<HookTurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<HookTaskId>,
@@ -200,6 +202,14 @@ pub struct HookContext {
     pub metadata: HookMetadata,
 }
 
+impl HookContext {
+    pub fn effective_conversation_thread_id(&self) -> Option<&HookThreadId> {
+        self.conversation_thread_id
+            .as_ref()
+            .or(self.thread_id.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +219,9 @@ mod tests {
         let context = HookContext {
             workspace_id: Some(HookWorkspaceId::new("workspace-1").expect("valid workspace id")),
             thread_id: Some(HookThreadId::new("thread-1").expect("valid thread id")),
+            conversation_thread_id: Some(
+                HookThreadId::new("thread-parent").expect("valid conversation thread id"),
+            ),
             turn_id: Some(HookTurnId::new("turn-1").expect("valid turn id")),
             mode: Some(HookContextMode::Agent),
             actor: Some(HookActor {
@@ -221,9 +234,31 @@ mod tests {
         let value = serde_json::to_value(&context).expect("context should serialize");
         assert_eq!(value["workspace_id"], "workspace-1");
         assert_eq!(value["mode"], "agent");
+        assert_eq!(value["conversation_thread_id"], "thread-parent");
         let decoded: HookContext =
             serde_json::from_value(value).expect("context should deserialize");
         assert_eq!(decoded, context);
+        assert_eq!(
+            decoded
+                .effective_conversation_thread_id()
+                .map(HookThreadId::as_str),
+            Some("thread-parent")
+        );
+    }
+
+    #[test]
+    fn hook_context_effective_conversation_thread_falls_back_to_execution_thread() {
+        let context = HookContext {
+            thread_id: Some(HookThreadId::new("thread-child").expect("valid thread id")),
+            ..HookContext::default()
+        };
+
+        assert_eq!(
+            context
+                .effective_conversation_thread_id()
+                .map(HookThreadId::as_str),
+            Some("thread-child")
+        );
     }
 
     #[test]

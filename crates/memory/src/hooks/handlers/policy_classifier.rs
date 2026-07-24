@@ -33,6 +33,11 @@ impl HookHandler for MemoryPolicyClassifierHook {
             request.context.thread_id.as_ref().map(|id| id.as_str()),
             "thread_id",
         )?;
+        let conversation_thread_id = request
+            .context
+            .effective_conversation_thread_id()
+            .map(|id| id.as_str())
+            .unwrap_or(thread_id);
         let turn_id = required_context_id(
             request.context.turn_id.as_ref().map(|id| id.as_str()),
             "turn_id",
@@ -40,7 +45,7 @@ impl HookHandler for MemoryPolicyClassifierHook {
 
         let context = MemoryTurnPolicyContext {
             workspace_id: workspace_id.to_owned(),
-            thread_id: thread_id.to_owned(),
+            thread_id: conversation_thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             mode: ThreadMode::Agent,
             input_text: input.input_text.clone(),
@@ -55,6 +60,11 @@ impl HookHandler for MemoryPolicyClassifierHook {
         let turn_context = MemoryTurnContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
+            conversation_thread_id: request
+                .context
+                .conversation_thread_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
             turn_id: turn_id.to_owned(),
             mode: ThreadMode::Agent,
             input_text: input.input_text.clone(),

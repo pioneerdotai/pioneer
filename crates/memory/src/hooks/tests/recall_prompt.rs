@@ -1244,6 +1244,7 @@ fn active_recall_thread_episodic_summary_is_bounded_and_metadata_only() {
     let context = MemoryTurnContext {
         workspace_id: "ws".to_owned(),
         thread_id: "thr".to_owned(),
+        conversation_thread_id: None,
         turn_id: "turn".to_owned(),
         mode: ThreadMode::Agent,
         input_text: "continue".to_owned(),

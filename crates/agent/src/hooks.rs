@@ -30,9 +30,14 @@ const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.thread
 pub struct AgentTurnHookRuntimeContext {
     pub mode: HookContextMode,
     pub actor_kind: HookActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_thread_id: Option<String>,
 }
 
 impl Default for AgentTurnHookRuntimeContext {
@@ -43,6 +48,7 @@ impl Default for AgentTurnHookRuntimeContext {
             actor_id: None,
             task_id: None,
             agent_id: None,
+            conversation_thread_id: None,
         }
     }
 }
@@ -56,7 +62,25 @@ impl AgentTurnHookRuntimeContext {
             actor_id: Some(task_id.clone()),
             task_id: Some(task_id),
             agent_id: None,
+            conversation_thread_id: None,
         }
+    }
+
+    pub fn task_in_conversation(
+        task_id: impl Into<String>,
+        conversation_thread_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            conversation_thread_id: Some(conversation_thread_id.into()),
+            ..Self::task(task_id)
+        }
+    }
+
+    pub fn effective_conversation_thread_id<'a>(&'a self, execution_thread_id: &'a str) -> &'a str {
+        self.conversation_thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.trim().is_empty())
+            .unwrap_or(execution_thread_id)
     }
 }
 
@@ -1334,6 +1358,12 @@ fn build_phase_request_with_input(
         HookContext {
             workspace_id: Some(HookWorkspaceId::new(context.workspace_id.clone())?),
             thread_id: Some(HookThreadId::new(context.thread_id.clone())?),
+            conversation_thread_id: context
+                .runtime_context
+                .conversation_thread_id
+                .as_ref()
+                .map(|id| HookThreadId::new(id.clone()))
+                .transpose()?,
             turn_id: Some(HookTurnId::new(context.turn_id.clone())?),
             task_id,
             agent_id,
@@ -2074,6 +2104,66 @@ mod tests {
         assert_eq!(
             prompt_context_manifest_contribution_kind(&durable_context_id),
             EffectiveTurnPromptManifestHookContributionKind::PromptContext
+        );
+    }
+
+    #[test]
+    fn hook_runtime_context_conversation_scope_is_backward_compatible() {
+        let legacy: AgentTurnHookRuntimeContext = serde_json::from_str(
+            r#"{"mode":"task","actor_kind":"task","actor_id":"task-1","task_id":"task-1"}"#,
+        )
+        .expect("legacy hook context should deserialize");
+        assert_eq!(legacy.conversation_thread_id, None);
+        assert_eq!(
+            legacy.effective_conversation_thread_id("thread-child"),
+            "thread-child"
+        );
+
+        let scoped = AgentTurnHookRuntimeContext::task_in_conversation("task-1", "thread-parent");
+        let json = serde_json::to_string(&scoped).expect("scoped context should serialize");
+        let restored: AgentTurnHookRuntimeContext =
+            serde_json::from_str(json.as_str()).expect("scoped context should deserialize");
+        assert_eq!(
+            restored.conversation_thread_id.as_deref(),
+            Some("thread-parent")
+        );
+    }
+
+    #[test]
+    fn hook_request_keeps_child_identity_and_parent_conversation_scope() {
+        let context = AgentTurnHookContext::with_runtime_context(
+            "workspace",
+            "thread-child",
+            "turn-child",
+            AgentTurnHookRuntimeContext::task_in_conversation("task-1", "thread-parent"),
+        );
+        let request = build_phase_request(
+            &context,
+            HookPhase::TurnPrePromptCompile,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+        )
+        .expect("hook request should build");
+
+        assert_eq!(
+            request.context.thread_id.as_ref().map(HookThreadId::as_str),
+            Some("thread-child")
+        );
+        assert_eq!(
+            request
+                .context
+                .conversation_thread_id
+                .as_ref()
+                .map(HookThreadId::as_str),
+            Some("thread-parent")
+        );
+        assert_eq!(
+            request.context.turn_id.as_ref().map(HookTurnId::as_str),
+            Some("turn-child")
+        );
+        assert_eq!(
+            request.context.task_id.as_ref().map(HookTaskId::as_str),
+            Some("task-1")
         );
     }
 

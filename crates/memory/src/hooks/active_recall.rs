@@ -793,7 +793,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_current_thread(MemoryCurrentThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    thread_id: context.thread_id.clone(),
+                    thread_id: context.effective_conversation_thread_id().to_owned(),
                     turn_id: context.turn_id.clone(),
                     query: query.to_owned(),
                     targets,
@@ -808,7 +808,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_related_threads(MemoryRelatedThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    current_thread_id: context.thread_id.clone(),
+                    current_thread_id: context.effective_conversation_thread_id().to_owned(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,
@@ -822,7 +822,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    current_thread_id: context.thread_id.clone(),
+                    current_thread_id: context.effective_conversation_thread_id().to_owned(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,
@@ -843,7 +843,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_current_task(MemoryCurrentTaskRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    thread_id: context.thread_id.clone(),
+                    thread_id: context.effective_conversation_thread_id().to_owned(),
                     task_id: task_id.clone(),
                     query: query.to_owned(),
                     targets,
@@ -858,7 +858,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_completed_tasks(MemoryCompletedTaskRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    thread_id: context.thread_id.clone(),
+                    thread_id: context.effective_conversation_thread_id().to_owned(),
                     task_id: context.task_id.clone(),
                     query: query.to_owned(),
                     targets,
@@ -1330,7 +1330,7 @@ fn active_recall_mode_skip_reason(
         | ActiveRecallMode::CurrentThread
         | ActiveRecallMode::RelatedThread
         | ActiveRecallMode::WorkspaceThread
-            if context.thread_id.trim().is_empty() =>
+            if context.effective_conversation_thread_id().trim().is_empty() =>
         {
             Some("missing_thread_context".to_owned())
         }
@@ -1510,7 +1510,7 @@ fn episodic_rank_score(
         .score
         .or(item.provenance.retrieval_score)
         .unwrap_or(0.0);
-    if item.provenance.thread_id.as_deref() == Some(context.thread_id.as_str()) {
+    if item.provenance.thread_id.as_deref() == Some(context.effective_conversation_thread_id()) {
         score += 0.2;
     }
     if item
@@ -1595,7 +1595,7 @@ pub(super) fn active_recall_planner_input(
     let deterministic_memory_ids = deterministic.memory_ids.iter().cloned().collect::<Vec<_>>();
     ActiveRecallPlannerInput {
         workspace_id: context.workspace_id.clone(),
-        thread_id: context.thread_id.clone(),
+        thread_id: context.effective_conversation_thread_id().to_owned(),
         turn_id: context.turn_id.clone(),
         task_id: context.task_id.clone(),
         agent_id: context.agent_id.clone(),
@@ -1635,7 +1635,7 @@ pub fn active_recall_thread_episodic_summary(
     context: &MemoryTurnContext,
     capabilities: &MemoryEpisodicRecallCapabilities,
 ) -> MemoryActiveRecallThreadEpisodicSummary {
-    let current_thread_id_present = !context.thread_id.trim().is_empty();
+    let current_thread_id_present = !context.effective_conversation_thread_id().trim().is_empty();
     let mut source_ids = BTreeSet::new();
     let mut prompt_context_source_count = 0usize;
     let mut prompt_context_chars = 0usize;

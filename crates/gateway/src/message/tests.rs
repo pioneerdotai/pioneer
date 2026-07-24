@@ -11018,18 +11018,79 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     ));
     initial_processor.bind_task_bridge().await;
 
-    let response = create_task_for_test(
-        &initial_processor,
-        test_task_create_params(
-            workspace_id.as_str(),
-            "thr_parent_recovered_preflight_task",
-            "turn_parent_recovered_preflight_task",
-            "Recovered hidden preflight child",
-            3,
-        ),
-    )
-    .await
-    .expect("task_create should start hidden child task");
+    let parent_thread_id = "thr_parent_recovered_preflight_task";
+    let parent_turn_id = "turn_parent_recovered_preflight_task";
+    let created_at = super::now_timestamp_secs();
+    let parent_thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: parent_thread_id.to_owned(),
+        name: Some("Recovered child parent".to_owned()),
+        preview: "recovery parent history".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "test-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at,
+        updated_at: created_at,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let parent_turn = Turn {
+        id: parent_turn_id.to_owned(),
+        status: TurnStatus::Completed,
+        turn_kind: TurnKind::Conversation,
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..parent_turn.clone()
+            },
+            &[UserInput::Text {
+                text: "RECOVERY SNAPSHOT HISTORY MARKER".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("recovery parent history should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: parent_turn,
+            },
+            created_at,
+        )
+        .await
+        .expect("recovery parent history should complete");
+
+    let mut task_params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "Recovered hidden preflight child",
+        3,
+    );
+    task_params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    let response = create_task_for_test(&initial_processor, task_params)
+        .await
+        .expect("task_create should start hidden child task");
     let run = response
         .run
         .clone()
@@ -11045,6 +11106,42 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+
+    let late_parent_turn = Turn {
+        id: "turn_parent_recovered_after_start".to_owned(),
+        status: TurnStatus::Completed,
+        turn_kind: TurnKind::Conversation,
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..late_parent_turn.clone()
+            },
+            &[UserInput::Text {
+                text: "LATE PARENT MESSAGE MUST NOT ENTER RECOVERY".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("late parent history should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: late_parent_turn,
+            },
+            created_at.saturating_add(1),
+        )
+        .await
+        .expect("late parent history should complete");
 
     let execution = crud_store
         .load_execution_for_run(run.id.as_str())
@@ -11253,6 +11350,21 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .full_system_text
             .contains("Original request preview: Recovered hidden preflight child"),
         "restored child prompt should include checkpoint original request facts"
+    );
+    let recovered_main_request = &requests[child_main_pos];
+    assert!(
+        recovered_main_request
+            .messages
+            .iter()
+            .any(|message| message.content == "RECOVERY SNAPSHOT HISTORY MARKER"),
+        "recovery must reuse the parent history frozen when the Detached child started"
+    );
+    assert!(
+        recovered_main_request
+            .messages
+            .iter()
+            .all(|message| { message.content != "LATE PARENT MESSAGE MUST NOT ENTER RECOVERY" }),
+        "recovery must not reread parent messages that arrived after the child start snapshot"
     );
 }
 
@@ -12390,6 +12502,60 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     let parent_thread_id = "thr_composer_work_exact";
     let parent_turn_id = "turn_composer_work_parent";
     let planned_turn_id = "turn_composer_work_planned";
+    let created_at = super::now_timestamp_secs();
+    let parent_thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: parent_thread_id.to_owned(),
+        name: Some("Composer work parent".to_owned()),
+        preview: "parent history marker".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "thread-default-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at,
+        updated_at: created_at,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let parent_turn = Turn {
+        id: parent_turn_id.to_owned(),
+        status: TurnStatus::Completed,
+        turn_kind: TurnKind::Conversation,
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..parent_turn.clone()
+            },
+            &[UserInput::Text {
+                text: "PARENT HISTORY MARKER".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("parent history turn should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: parent_turn,
+            },
+            created_at,
+        )
+        .await
+        .expect("parent history turn should complete");
     let artifact =
         ingest_user_test_artifact(&processor, workspace_id.as_str(), "launch-context.txt").await;
     let exact_input = vec![
@@ -12554,6 +12720,13 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         Some(pioneer_provider::ReasoningConfig::Effort(
             pioneer_provider::ReasoningEffort::High
         ))
+    );
+    assert!(
+        main_request
+            .messages
+            .iter()
+            .any(|message| message.content == "PARENT HISTORY MARKER"),
+        "detached composer work must receive canonical parent provider history"
     );
     let user_message = main_request
         .messages
@@ -38364,6 +38537,7 @@ fn memory_tool_context(harness: &MemoryGatewayHarness, turn_suffix: &str) -> Mem
     MemoryTurnContext {
         workspace_id: harness.workspace_id.clone(),
         thread_id: generate_test_request_id("thread", turn_suffix),
+        conversation_thread_id: None,
         turn_id: generate_test_request_id("turn", turn_suffix),
         mode: pioneer_protocol::ThreadMode::Agent,
         input_text: "phase09 memory tool test".to_owned(),
@@ -39417,6 +39591,99 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
         .await
         .expect("service get should succeed");
     assert!(get.record.is_some());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
+    let harness = setup_memory_gateway_harness("effective_parent_scope", true).await;
+    let parent_thread_id = "thread_effective_parent";
+    let now = super::now_timestamp_secs();
+    harness
+        .crud_store
+        .upsert_thread_model(&Thread {
+            workspace_id: harness.workspace_id.clone(),
+            id: parent_thread_id.to_owned(),
+            name: Some("Effective memory parent".to_owned()),
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: now,
+            updated_at: now,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        })
+        .await
+        .expect("effective parent thread should persist");
+    let mut context = memory_tool_context(&harness, "effective_parent_scope");
+    let child_thread_id = context.thread_id.clone();
+    let child_turn_id = context.turn_id.clone();
+    context.conversation_thread_id = Some(parent_thread_id.to_owned());
+    context.task_id = Some("task_effective_parent_scope".to_owned());
+    let materialization = materialize_memory_tools_for_context(&harness, context).await;
+    let tool_loop_config = test_tool_loop_config();
+    let tools = build_tools_with_environment_and_security_snapshot(
+        harness.runtime_home.clone(),
+        child_turn_id.clone(),
+        test_tools_permission_context(&child_turn_id),
+        tool_loop_config.web,
+        tool_loop_config.computer_use,
+        materialization.bundles,
+        BTreeMap::new(),
+        Some(test_full_access_execution_security_snapshot()),
+    )
+    .expect("effective-scope memory tools should build");
+
+    let output = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_effective_parent_scope",
+        json!({
+            "content": "effective parent thread memory",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "effective_parent_scope"
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        output
+            .get("scope")
+            .and_then(|scope| scope.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("thread")
+    );
+    assert_eq!(
+        output
+            .get("scope")
+            .and_then(|scope| scope.get("key"))
+            .and_then(serde_json::Value::as_str),
+        Some(parent_thread_id),
+        "conversation-level memory must use the visible parent Thread scope"
+    );
+    assert_eq!(
+        output
+            .get("provenance")
+            .and_then(|provenance| provenance.get("source_thread_id"))
+            .and_then(serde_json::Value::as_str),
+        Some(child_thread_id.as_str()),
+        "memory provenance must remain on the real hidden child"
+    );
+    assert_eq!(
+        output
+            .get("provenance")
+            .and_then(|provenance| provenance.get("source_turn_id"))
+            .and_then(serde_json::Value::as_str),
+        Some(child_turn_id.as_str())
+    );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }

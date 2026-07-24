@@ -20,3 +20,4 @@ hex.workspace = true
 [dev-dependencies]
 insta = "1"
 pretty_assertions = "1"
+tokio.workspace = true

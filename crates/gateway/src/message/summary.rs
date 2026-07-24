@@ -18,6 +18,8 @@ pub async fn compress_context(
     existing_summary: Option<&str>,
     target_tokens: usize,
     config: &SummaryConfig,
+    fallback_model: Option<&str>,
+    fallback_model_provider: Option<&str>,
 ) -> Result<String> {
     let thread = crud
         .get_thread_by_id(thread_id)
@@ -29,10 +31,12 @@ pub async fn compress_context(
     let model_provider = config
         .summary_model_provider
         .as_deref()
+        .or(fallback_model_provider)
         .unwrap_or(thread.model_provider.as_str());
     let model = config
         .summary_model
         .as_deref()
+        .or(fallback_model)
         .unwrap_or(thread.model.as_str());
 
     let provider =

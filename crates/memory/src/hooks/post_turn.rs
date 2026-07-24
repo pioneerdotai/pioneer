@@ -68,6 +68,11 @@ pub(super) fn memory_turn_context_from_post_turn_request(
     Ok(MemoryTurnContext {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
+        conversation_thread_id: request
+            .context
+            .conversation_thread_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
         turn_id: turn_id.to_owned(),
         mode: ThreadMode::Agent,
         input_text: input

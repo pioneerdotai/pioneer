@@ -19,6 +19,11 @@ pub(super) fn memory_turn_context_from_prompt_context_request(
     Ok(MemoryTurnContext {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
+        conversation_thread_id: request
+            .context
+            .conversation_thread_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
         turn_id: turn_id.to_owned(),
         mode: ThreadMode::Agent,
         input_text: input.input_text.clone(),
@@ -310,7 +315,7 @@ fn active_recall_local_planning_parts(
     };
     let decision_context = MemoryActiveRecallDecisionContext {
         workspace_id: context.workspace_id.clone(),
-        thread_id: context.thread_id.clone(),
+        thread_id: context.effective_conversation_thread_id().to_owned(),
         turn_id: context.turn_id.clone(),
         mode: context.mode,
         input_text_preview: planner_input.input_text_preview.clone(),
@@ -402,6 +407,7 @@ mod active_recall_local_preflight_tests {
         MemoryTurnContext {
             workspace_id: "ws".to_owned(),
             thread_id: "thr".to_owned(),
+            conversation_thread_id: None,
             turn_id: "turn".to_owned(),
             mode: ThreadMode::Agent,
             input_text: "как меня зовут?".to_owned(),

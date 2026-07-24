@@ -7376,7 +7376,10 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
             "thr_memory_task_context",
             "turn_memory_task_context",
             ThreadMode::Agent,
-            AgentTurnHookRuntimeContext::task("task-runtime-memory-context"),
+            AgentTurnHookRuntimeContext::task_in_conversation(
+                "task-runtime-memory-context",
+                "thr_memory_parent_context",
+            ),
             "test-model",
             "capture",
             HashMap::new(),
@@ -7397,19 +7400,20 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
 
     let recall_contexts = memory_provider.recall_contexts();
     assert!(!recall_contexts.is_empty());
-    assert!(
-        recall_contexts
-            .iter()
-            .all(|context| { context.task_id.as_deref() == Some("task-runtime-memory-context") })
-    );
+    assert!(recall_contexts.iter().all(|context| {
+        context.task_id.as_deref() == Some("task-runtime-memory-context")
+            && context.thread_id == "thr_memory_task_context"
+            && context.conversation_thread_id.as_deref() == Some("thr_memory_parent_context")
+            && context.effective_conversation_thread_id() == "thr_memory_parent_context"
+    }));
 
     let tool_contexts = memory_provider.tool_contexts();
     assert!(!tool_contexts.is_empty());
-    assert!(
-        tool_contexts
-            .iter()
-            .all(|context| { context.task_id.as_deref() == Some("task-runtime-memory-context") })
-    );
+    assert!(tool_contexts.iter().all(|context| {
+        context.task_id.as_deref() == Some("task-runtime-memory-context")
+            && context.thread_id == "thr_memory_task_context"
+            && context.conversation_thread_id.as_deref() == Some("thr_memory_parent_context")
+    }));
 }
 
 #[tokio::test]

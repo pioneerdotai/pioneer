@@ -1628,6 +1628,7 @@ async fn run_agent_turn_preflight_stage(
     let memory_context = MemoryTurnContext {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
+        conversation_thread_id: hook_runtime_context.conversation_thread_id.clone(),
         turn_id: turn_id.to_owned(),
         mode: ThreadMode::Agent,
         input_text: input_text.to_owned(),
@@ -1635,7 +1636,10 @@ async fn run_agent_turn_preflight_stage(
         agent_id: hook_runtime_context.agent_id.clone(),
     };
     let episodic_capabilities = MemoryEpisodicRecallCapabilities {
-        current_thread_search: !thread_id.trim().is_empty(),
+        current_thread_search: !memory_context
+            .effective_conversation_thread_id()
+            .trim()
+            .is_empty(),
         related_thread_search: false,
         workspace_thread_search: false,
         full_input_query: false,

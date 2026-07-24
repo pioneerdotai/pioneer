@@ -957,8 +957,15 @@ impl MessageProcessor {
                 None
             }
         };
-        self.load_conversation_history_inner(workspace_id.as_deref(), thread_id, turn_id)
-            .await
+        self.load_conversation_history_inner(
+            workspace_id.as_deref(),
+            thread_id,
+            thread_id,
+            turn_id,
+            None,
+            None,
+        )
+        .await
     }
 
     pub(super) async fn load_conversation_history_for_workspace(
@@ -967,15 +974,46 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) -> Vec<ChatMessage> {
-        self.load_conversation_history_inner(Some(workspace_id), thread_id, turn_id)
-            .await
+        self.load_conversation_history_inner(
+            Some(workspace_id),
+            thread_id,
+            thread_id,
+            turn_id,
+            None,
+            None,
+        )
+        .await
     }
 
+    pub(super) async fn load_conversation_history_for_workspace_in_execution(
+        &self,
+        workspace_id: &str,
+        conversation_thread_id: &str,
+        execution_thread_id: &str,
+        execution_turn_id: &str,
+        fallback_model: Option<&str>,
+        fallback_model_provider: Option<&str>,
+    ) -> Vec<ChatMessage> {
+        self.load_conversation_history_inner(
+            Some(workspace_id),
+            conversation_thread_id,
+            execution_thread_id,
+            execution_turn_id,
+            fallback_model,
+            fallback_model_provider,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn load_conversation_history_inner(
         &self,
         workspace_id: Option<&str>,
-        thread_id: &str,
-        turn_id: &str,
+        conversation_thread_id: &str,
+        execution_thread_id: &str,
+        execution_turn_id: &str,
+        fallback_model: Option<&str>,
+        fallback_model_provider: Option<&str>,
     ) -> Vec<ChatMessage> {
         use crate::tokenizer::count_tokens;
 
@@ -987,27 +1025,34 @@ impl MessageProcessor {
 
         let budget = self.context_budget.history_budget();
 
-        let (existing_summary, existing_summary_turn_count) =
-            match self.crud_store.get_thread_summary(thread_id).await {
-                Ok(Some((text, turn_count))) => (Some(text), Some(turn_count)),
-                Ok(None) => (None, None),
-                Err(error) => {
-                    warn!(
-                        thread_id,
-                        error = %format!("{error:#}"),
-                        "failed to load existing thread summary"
-                    );
-                    (None, None)
-                }
-            };
+        let (existing_summary, existing_summary_turn_count) = match self
+            .crud_store
+            .get_thread_summary(conversation_thread_id)
+            .await
+        {
+            Ok(Some((text, turn_count))) => (Some(text), Some(turn_count)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                warn!(
+                    thread_id = conversation_thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to load existing thread summary"
+                );
+                (None, None)
+            }
+        };
 
         let entries_result = if let Some(workspace_id) = workspace_id {
             self.crud_store
-                .get_thread_conversation_history_with_artifacts(workspace_id, thread_id, MAX_TURNS)
+                .get_thread_conversation_history_with_artifacts(
+                    workspace_id,
+                    conversation_thread_id,
+                    MAX_TURNS,
+                )
                 .await
         } else {
             self.crud_store
-                .get_thread_conversation_history(thread_id, MAX_TURNS)
+                .get_thread_conversation_history(conversation_thread_id, MAX_TURNS)
                 .await
         };
 
@@ -1015,7 +1060,7 @@ impl MessageProcessor {
             Ok(entries) => entries,
             Err(error) => {
                 warn!(
-                    thread_id,
+                    thread_id = conversation_thread_id,
                     error = %format!("{error:#}"),
                     "failed to load conversation history, proceeding without it"
                 );
@@ -1055,7 +1100,7 @@ impl MessageProcessor {
             budget.saturating_mul(usize::from(COMPRESSION_TARGET_BPS)) / BPS_DENOMINATOR;
 
         debug!(
-            thread_id,
+            thread_id = conversation_thread_id,
             total_tokens,
             budget,
             threshold,
@@ -1068,24 +1113,28 @@ impl MessageProcessor {
         }
 
         info!(
-            thread_id,
+            thread_id = conversation_thread_id,
             total_tokens, threshold, "context threshold reached, compressing conversation"
         );
 
         let hook_runtime = self.hook_runtime.read().await.clone();
         if let Some(runtime) = hook_runtime.as_ref() {
-            let thread = match self.crud_store.get_thread_by_id(thread_id).await {
+            let thread = match self
+                .crud_store
+                .get_thread_by_id(conversation_thread_id)
+                .await
+            {
                 Ok(Some(thread)) => Some(thread),
                 Ok(None) => {
                     warn!(
-                        thread_id,
+                        thread_id = conversation_thread_id,
                         "thread not found while preparing pre-compaction hook input"
                     );
                     None
                 }
                 Err(error) => {
                     warn!(
-                        thread_id,
+                        thread_id = conversation_thread_id,
                         error = %format!("{error:#}"),
                         "failed to load thread while preparing pre-compaction hook input"
                     );
@@ -1098,8 +1147,9 @@ impl MessageProcessor {
                 let dispatch = match hooks::build_pre_compaction_hook_dispatch(
                     hooks::PreCompactionHookInputParts {
                         workspace_id: thread.workspace_id.as_str(),
-                        thread_id,
-                        turn_id,
+                        execution_thread_id,
+                        conversation_thread_id,
+                        turn_id: execution_turn_id,
                         compaction_id,
                         loaded_completed_turn_count: entries.len(),
                         source_entry_count: entries.len(),
@@ -1119,8 +1169,9 @@ impl MessageProcessor {
                     Ok(dispatch) => Some(dispatch),
                     Err(error) => {
                         warn!(
-                            thread_id,
-                            turn_id,
+                            thread_id = execution_thread_id,
+                            turn_id = execution_turn_id,
+                            conversation_thread_id,
                             error = %error,
                             "failed to build typed pre-compaction hook context"
                         );
@@ -1133,8 +1184,9 @@ impl MessageProcessor {
                         Ok(outcome) => {
                             if !outcome.diagnostics.is_empty() || !outcome.runs.is_empty() {
                                 debug!(
-                                    thread_id,
-                                    turn_id,
+                                    thread_id = execution_thread_id,
+                                    turn_id = execution_turn_id,
+                                    conversation_thread_id,
                                     diagnostic_count = outcome.diagnostics.len(),
                                     run_count = outcome.runs.len(),
                                     "pre-compaction hook phase completed"
@@ -1143,8 +1195,9 @@ impl MessageProcessor {
                         }
                         Err(error) => {
                             warn!(
-                                thread_id,
-                                turn_id,
+                                thread_id = execution_thread_id,
+                                turn_id = execution_turn_id,
+                                conversation_thread_id,
                                 error = %error.runtime_error,
                                 message = error.safe_message.as_str(),
                                 "pre-compaction hook phase blocked context compression"
@@ -1162,12 +1215,12 @@ impl MessageProcessor {
         }
 
         let compressing_notification = ContextCompressingNotification {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
+            thread_id: execution_thread_id.to_owned(),
+            turn_id: execution_turn_id.to_owned(),
             message: "Compressing conversation history...".to_owned(),
         };
         self.send_notification_to_thread_subscribers(
-            thread_id,
+            execution_thread_id,
             events::CONTEXT_COMPRESSING,
             &compressing_notification,
         )
@@ -1176,11 +1229,13 @@ impl MessageProcessor {
         match summary::compress_context(
             &self.crud_store,
             &self.provider_registry,
-            thread_id,
+            conversation_thread_id,
             &entries,
             existing_summary.as_deref(),
             target_tokens,
             &self.summary_config,
+            fallback_model,
+            fallback_model_provider,
         )
         .await
         {
@@ -1188,19 +1243,19 @@ impl MessageProcessor {
                 let compressed_tokens = count_tokens(&compressed_summary);
 
                 let compressed_notification = ContextCompressedNotification {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
+                    thread_id: execution_thread_id.to_owned(),
+                    turn_id: execution_turn_id.to_owned(),
                     compressed_tokens,
                 };
                 self.send_notification_to_thread_subscribers(
-                    thread_id,
+                    execution_thread_id,
                     events::CONTEXT_COMPRESSED,
                     &compressed_notification,
                 )
                 .await;
 
                 debug!(
-                    thread_id,
+                    thread_id = conversation_thread_id,
                     compressed_tokens,
                     original_tokens = total_tokens,
                     "context compressed successfully"
@@ -1213,7 +1268,7 @@ impl MessageProcessor {
             }
             Err(error) => {
                 warn!(
-                    thread_id,
+                    thread_id = conversation_thread_id,
                     error = %format!("{error:#}"),
                     "context compression failed, falling back to truncation"
                 );

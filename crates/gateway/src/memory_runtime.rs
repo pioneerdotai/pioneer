@@ -113,7 +113,7 @@ impl GatewayMemoryRuntime {
     ) -> MemoryOperationContext {
         MemoryOperationContext {
             workspace_id: Some(turn.workspace_id.clone()),
-            thread_id: Some(turn.thread_id.clone()),
+            thread_id: Some(turn.effective_conversation_thread_id().to_owned()),
             task_id: turn.task_id.clone(),
             agent_id: turn.agent_id.clone(),
             actor,

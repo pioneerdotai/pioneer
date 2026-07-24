@@ -509,6 +509,7 @@ fn test_memory_turn_context() -> MemoryTurnContext {
     MemoryTurnContext {
         workspace_id: "ws".to_owned(),
         thread_id: "thr".to_owned(),
+        conversation_thread_id: None,
         turn_id: "turn".to_owned(),
         mode: ThreadMode::Agent,
         input_text: "remember my preference".to_owned(),
