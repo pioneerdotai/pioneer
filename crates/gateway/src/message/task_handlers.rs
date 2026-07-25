@@ -23,7 +23,16 @@ impl MessageProcessor {
             return Ok(pioneer_tasks::TaskCreateContext::default());
         }
 
-        let Some(source_turn_id) = params.created_by_turn_id.as_deref() else {
+        // Keep snapshot identity identical to the executor's restoration rule:
+        // Composer work is sourced by its replayed launch turn, while ordinary
+        // Tasks fall back to the turn that created them.
+        let source_turn_id = params
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref())
+            .map(|composer_work| composer_work.launch.turn_id.as_str())
+            .or(params.created_by_turn_id.as_deref());
+        let Some(source_turn_id) = source_turn_id else {
             // An immediate detached Task without a creator turn is frozen by
             // the executor at run admission, where the run identity exists.
             return Ok(pioneer_tasks::TaskCreateContext::default());

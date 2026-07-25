@@ -3826,6 +3826,9 @@ fn canonical_provider_messages_for_artifact_parity(
 ) -> Vec<pioneer_provider::ChatMessage> {
     let mut messages = messages.to_vec();
     for message in &mut messages {
+        if message.role == pioneer_provider::Role::System {
+            message.content = canonical_prompt_text_for_parity(message.content.as_str());
+        }
         for content_part in &mut message.content_parts {
             let attachment = match content_part {
                 pioneer_provider::MessageContentPart::File { file } => file,
@@ -3866,6 +3869,33 @@ fn canonical_provider_messages_for_artifact_parity(
     messages
 }
 
+fn canonical_prompt_text_for_parity(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            if line.starts_with("Current date/time: ") {
+                "Current date/time: <dynamic runtime clock>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn canonical_compiled_prompt_for_parity(
+    prompt: Option<&pioneer_provider::CompiledPromptPayload>,
+) -> Option<pioneer_provider::CompiledPromptPayload> {
+    prompt.cloned().map(|mut prompt| {
+        prompt.stable_system_text =
+            canonical_prompt_text_for_parity(prompt.stable_system_text.as_str());
+        prompt.dynamic_system_text =
+            canonical_prompt_text_for_parity(prompt.dynamic_system_text.as_str());
+        prompt.full_system_text =
+            canonical_prompt_text_for_parity(prompt.full_system_text.as_str());
+        prompt
+    })
+}
+
 fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &ChatRequest) {
     assert_eq!(
         direct.model, child.model,
@@ -3891,7 +3921,7 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
             child.rendered_messages_with_compiled_prompt().as_slice()
         ))
         .expect("child rendered messages should serialize"),
-        "{stage} rendered provider messages must be identical for parent and detached child"
+        "{stage} rendered provider messages must be identical for parent and detached child after dynamic runtime-clock canonicalization"
     );
     assert_eq!(
         direct.temperature, child.temperature,
@@ -3920,8 +3950,9 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
         "{stage} reasoning configuration must be identical for parent and detached child"
     );
     assert_eq!(
-        direct.compiled_prompt, child.compiled_prompt,
-        "{stage} compiled system prompt must be identical for parent and detached child"
+        canonical_compiled_prompt_for_parity(direct.compiled_prompt.as_ref()),
+        canonical_compiled_prompt_for_parity(child.compiled_prompt.as_ref()),
+        "{stage} compiled system prompt must be identical for parent and detached child after dynamic runtime-clock canonicalization"
     );
 }
 
@@ -4883,11 +4914,12 @@ async fn create_task_for_test(
     params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
     ensure_task_create_parent_turn_for_test(processor, &params).await?;
+    let context = processor.task_create_context_for_params(&params).await?;
     message_future(
         processor
             .task_runtime
             .service()
-            .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+            .create_task(context, params),
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error:#}"))
@@ -12346,7 +12378,8 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     initial_processor.bind_task_bridge().await;
 
     let parent_thread_id = "thr_parent_recovered_preflight_task";
-    let parent_turn_id = "turn_parent_recovered_preflight_task";
+    let parent_history_turn_id = "turn_parent_recovered_preflight_history";
+    let source_turn_id = "turn_parent_recovered_preflight_task";
     let created_at = super::now_timestamp_secs();
     let parent_thread = Thread {
         workspace_id: workspace_id.clone(),
@@ -12367,7 +12400,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         turns: Vec::new(),
     };
     let parent_turn = Turn {
-        id: parent_turn_id.to_owned(),
+        id: parent_history_turn_id.to_owned(),
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
         origin: TurnOrigin::User,
@@ -12405,7 +12438,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     let mut task_params = test_task_create_params(
         workspace_id.as_str(),
         parent_thread_id,
-        parent_turn_id,
+        source_turn_id,
         "Recovered hidden preflight child",
         3,
     );
@@ -12422,6 +12455,20 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .run
         .clone()
         .expect("immediate task should create run");
+    let frozen_conversation = crud_store
+        .get_task_run_conversation_snapshot(run.id.as_str())
+        .await
+        .expect("recovery conversation snapshot should load")
+        .expect("recovery conversation snapshot should be frozen at task creation");
+    let frozen_history: Vec<pioneer_provider::ChatMessage> =
+        serde_json::from_str(frozen_conversation.history_json.as_str())
+            .expect("recovery conversation snapshot should decode");
+    assert!(
+        frozen_history
+            .iter()
+            .any(|message| message.content == "RECOVERY SNAPSHOT HISTORY MARKER"),
+        "the frozen snapshot fixture must contain prior history distinct from the current Task source turn"
+    );
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
     for _ in 0..100 {
         if initial_provider.child_main_call_count() > 0 {
