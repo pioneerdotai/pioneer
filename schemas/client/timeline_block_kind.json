@@ -56,6 +56,22 @@
     {
       "type": "object",
       "properties": {
+        "kind": {
+          "type": "string",
+          "const": "detached_task_run"
+        },
+        "task": {
+          "$ref": "#/$defs/TaskTurnItem"
+        }
+      },
+      "required": [
+        "kind",
+        "task"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "itemId": {
           "type": "string"
         },
@@ -656,6 +672,179 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
+    "TaskExecutorKind": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "tool",
+        "workflow",
+        "webhook",
+        "system"
+      ]
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "scheduled",
+        "queued",
+        "running",
+        "waiting",
+        "waiting_review",
+        "completed",
+        "failed",
+        "blocked",
+        "cancelled"
+      ]
+    },
+    "TaskTriggerKind": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "scheduled_at",
+        "interval",
+        "cron",
+        "manual",
+        "external",
+        "dependency"
+      ]
+    },
+    "TaskTurnItem": {
+      "type": "object",
+      "properties": {
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attachment": {
+          "$ref": "#/$defs/TaskAttachmentMode",
+          "default": "attached"
+        },
+        "childThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "childTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "createdByTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "errorPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executorKind": {
+          "$ref": "#/$defs/TaskExecutorKind"
+        },
+        "id": {
+          "type": "string"
+        },
+        "maxDepth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "nextFireAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "parentTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resultPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "triggerKind": {
+          "$ref": "#/$defs/TaskTriggerKind"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "title",
+        "status",
+        "triggerKind",
+        "executorKind",
+        "depth",
+        "maxDepth",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TextElement": {
       "type": "object",

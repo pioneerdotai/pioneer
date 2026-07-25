@@ -2829,6 +2829,8 @@ pub struct TaskTurnItem {
     pub result_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -3014,6 +3016,7 @@ mod tests {
             progress_preview: None,
             result_preview: None,
             error_preview: None,
+            started_at: Some(1_700_000_001),
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         };
@@ -3023,6 +3026,7 @@ mod tests {
         assert_eq!(encoded["createdByTurnId"], json!("turn_creator"));
         assert_eq!(encoded["attachment"], json!("detached"));
         assert_eq!(encoded["triggerKind"], json!("scheduled_at"));
+        assert_eq!(encoded["startedAt"], json!(1_700_000_001));
 
         let decoded: TaskTurnItem = serde_json::from_value(encoded).expect("item should decode");
         assert_eq!(decoded, item);

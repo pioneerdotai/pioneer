@@ -14140,6 +14140,15 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     )
     .await;
     assert_eq!(delivered_anchor.status, TaskStatus::Completed);
+    let persisted_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("completed TaskRun should reload")
+        .expect("completed TaskRun should exist");
+    assert_eq!(
+        delivered_anchor.started_at, persisted_run.started_at,
+        "Task-card timing must preserve the actual TaskRun start"
+    );
 
     let delivered_items = crud_store
         .get_turn_item_events(parent_thread_id, run.id.as_str())
@@ -19057,6 +19066,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
                 progress_preview: None,
                 result_preview: Some("Proposal summary is ready".to_owned()),
                 error_preview: None,
+                started_at: Some(1),
                 created_at: 1,
                 updated_at: 2,
             },

@@ -2457,8 +2457,10 @@ fn upsert_detached_task_run_block(
                     None => turn_block_sort_key(thread, turn_id, 100, suffix.as_str(), now_unix_ms),
                 }
             }),
-        started_at_unix_ms: existing
-            .and_then(|block| block.started_at_unix_ms)
+        started_at_unix_ms: task
+            .started_at
+            .map(|started_at| started_at.saturating_mul(1_000))
+            .or_else(|| existing.and_then(|block| block.started_at_unix_ms))
             .or(Some(now_unix_ms)),
         updated_at_unix_ms: Some(now_unix_ms),
         kind: TimelineBlockKind::DetachedTaskRun { task: task.clone() },
@@ -3305,6 +3307,63 @@ mod tests {
         assert!(source_user_index < task_index);
         assert!(task_index < user_index);
         assert!(user_index < result_index);
+    }
+
+    #[test]
+    fn detached_task_running_clock_reanchors_after_queue_wait() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnStarted {
+                thread_id: "thread_a".to_owned(),
+                turn: detached_task_turn("task_turn"),
+            },
+            1_000,
+        ));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: task_turn_item(TaskAttachmentMode::Detached, TaskStatus::Queued),
+            },
+            1_000,
+        ));
+        let block_id = "turn:task_turn:detached-task-run:task_anchor";
+        assert_eq!(
+            state
+                .thread("thread_a")
+                .and_then(|thread| thread.top_level.block(block_id))
+                .and_then(|block| block.started_at_unix_ms),
+            Some(1_000),
+        );
+
+        let mut running_task = task_turn_item(TaskAttachmentMode::Detached, TaskStatus::Running);
+        let TurnItem::Task { item } = &mut running_task else {
+            unreachable!("task fixture must stay a task item");
+        };
+        item.started_at = Some(20);
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemUpdated {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: running_task,
+            },
+            20_500,
+        ));
+        assert_eq!(
+            state
+                .thread("thread_a")
+                .and_then(|thread| thread.top_level.block(block_id))
+                .and_then(|block| block.started_at_unix_ms),
+            Some(20_000),
+            "running elapsed time must exclude the queued interval",
+        );
     }
 
     #[test]
@@ -4926,6 +4985,11 @@ mod tests {
                 progress_preview: Some("Collecting sources".to_owned()),
                 result_preview: None,
                 error_preview: None,
+                started_at: (!matches!(
+                    status,
+                    TaskStatus::Draft | TaskStatus::Scheduled | TaskStatus::Queued
+                ))
+                .then_some(2),
                 created_at: 1,
                 updated_at: 2,
             },

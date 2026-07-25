@@ -165,12 +165,6 @@
         "user"
       ]
     },
-    "SkillId": {
-      "type": "string",
-      "maxLength": 21,
-      "minLength": 21,
-      "pattern": "^[A-Za-z0-9]{21}$"
-    },
     "SelectableMcpCapability": {
       "type": "object",
       "properties": {
@@ -229,6 +223,12 @@
         "scope_kind",
         "selectable"
       ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     }
   }
 }

@@ -246,6 +246,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
         let desktop_entity = cx.entity().clone();
         let management = self.skills_management.clone();
         let initial_selections = self.composer_skill_selections.clone();
@@ -291,6 +294,7 @@ impl PioneerDesktop {
                 .footer({
                     let desktop_entity = desktop_entity.clone();
                     let picker_state = picker_state.clone();
+                    let target_thread_id = target_thread_id.clone();
                     move |_, _, _, cx| {
                         let selections = normalize_composer_skill_selections(
                             picker_state.read(cx).skill_selections.iter().cloned(),
@@ -307,11 +311,17 @@ impl PioneerDesktop {
                                 .disabled(selections.is_empty())
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
+                                    let target_thread_id = target_thread_id.clone();
                                     move |_, window, cx| {
                                         if selections.is_empty() {
                                             return;
                                         }
                                         let _ = desktop_entity.update(cx, |view, cx| {
+                                            if view.current_active_thread_id()
+                                                != Some(target_thread_id.as_str())
+                                            {
+                                                return;
+                                            }
                                             view.reduce_composer_domain(
                                                 ComposerDomainAction::SetSkillSelections {
                                                     selections: selections.clone(),
@@ -346,6 +356,9 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
         let desktop_entity = cx.entity().clone();
         let server_rows = self.selectable_mcp_server_capabilities("");
         let initial_details = self.mcp_server_details.clone();
@@ -439,6 +452,7 @@ impl PioneerDesktop {
                 .footer({
                     let desktop_entity = desktop_entity.clone();
                     let picker_state = picker_state.clone();
+                    let target_thread_id = target_thread_id.clone();
                     move |_, _, _, cx| {
                         let capabilities =
                             selected_mcp_composer_capabilities(&picker_state.read(cx));
@@ -454,11 +468,17 @@ impl PioneerDesktop {
                                 .disabled(capabilities.is_empty())
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
+                                    let target_thread_id = target_thread_id.clone();
                                     move |_, window, cx| {
                                         if capabilities.is_empty() {
                                             return;
                                         }
                                         let _ = desktop_entity.update(cx, |view, cx| {
+                                            if view.current_active_thread_id()
+                                                != Some(target_thread_id.as_str())
+                                            {
+                                                return;
+                                            }
                                             view.add_composer_capabilities(capabilities.clone());
                                             cx.notify();
                                         });
@@ -530,34 +550,48 @@ impl PioneerDesktop {
             return;
         };
 
+        let connection_id = self.gateway.ws_connection_id;
         let ws_sender = self.gateway.ws_command_sender.clone();
-        cx.spawn(move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let cx = cx.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
             async move {
+                let workspace_id_for_request = workspace_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.skills_list(skill_catalog::skill_list_params(workspace_id))
+                        ws_sender
+                            .skills_list(skill_catalog::skill_list_params(workspace_id_for_request))
                     })
                     .await;
 
-                let _ = cx.update(|cx| {
-                    picker_state.update(cx, |state, cx| match result {
-                        Ok(response) => {
-                            let split =
-                                skill_catalog::derive_skills_catalog_and_installed(response.skills);
-                            let management = skill_catalog::project_skill_management(
-                                split.installed.as_slice(),
-                                response.packs,
-                            );
-                            state.finish_loading_skills(management, cx);
+                let _ = this.update(&mut cx, |view, cx| match result {
+                    Ok(response) => {
+                        let split =
+                            skill_catalog::derive_skills_catalog_and_installed(response.skills);
+                        let management = skill_catalog::project_skill_management(
+                            split.installed.as_slice(),
+                            response.packs,
+                        );
+                        if view.gateway.ws_connection_id == connection_id
+                            && view.skills_workspace_scope().as_deref()
+                                == Some(workspace_id.as_str())
+                        {
+                            // The picker, chips, and submit preparation must
+                            // resolve selections against the same catalog.
+                            view.skills_management = management.clone();
                         }
-                        Err(error) => {
+                        picker_state.update(cx, |state, cx| {
+                            state.finish_loading_skills(management, cx);
+                        });
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        picker_state.update(cx, |state, cx| {
                             state.fail_loading_skills(
                                 format!("{}: {error:#}", t!("skills.error.load_failed")),
                                 cx,
                             );
-                        }
-                    });
+                        });
+                    }
                 });
             }
         })

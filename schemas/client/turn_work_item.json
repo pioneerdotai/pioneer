@@ -854,6 +854,13 @@
         "error"
       ]
     },
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
     "TaskExecutorKind": {
       "type": "string",
       "enum": [
@@ -1756,6 +1763,10 @@
                 "null"
               ]
             },
+            "attachment": {
+              "$ref": "#/$defs/TaskAttachmentMode",
+              "default": "attached"
+            },
             "childThreadId": {
               "type": [
                 "string",
@@ -1771,6 +1782,12 @@
             "createdAt": {
               "type": "integer",
               "format": "int64"
+            },
+            "createdByTurnId": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "depth": {
               "type": "integer",
@@ -1828,6 +1845,13 @@
                 "string",
                 "null"
               ]
+            },
+            "startedAt": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
             },
             "status": {
               "$ref": "#/$defs/TaskStatus"

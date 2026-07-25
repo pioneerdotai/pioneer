@@ -1,90 +1,33 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ClientComposerCapabilitiesUpdateRequest",
+  "title": "ClientComposerSubmissionPlanRequest",
   "type": "object",
   "properties": {
-    "action": {
-      "$ref": "#/$defs/ClientComposerCapabilitiesUpdateAction"
-    },
     "capabilities": {
       "type": "array",
+      "default": [],
       "items": {
         "$ref": "#/$defs/ComposerCapability"
       }
+    },
+    "has_attachments": {
+      "type": "boolean",
+      "default": false
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "text": {
+      "type": "string",
+      "default": ""
     }
   },
   "additionalProperties": false,
-  "required": [
-    "capabilities",
-    "action"
-  ],
   "$defs": {
-    "ClientComposerCapabilitiesUpdateAction": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "Add": {
-              "type": "object",
-              "properties": {
-                "capability": {
-                  "$ref": "#/$defs/ComposerCapability"
-                }
-              },
-              "required": [
-                "capability"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "Add"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "Remove": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "Remove"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "RemoveAt": {
-              "type": "object",
-              "properties": {
-                "index": {
-                  "type": "integer",
-                  "format": "uint",
-                  "minimum": 0
-                }
-              },
-              "required": [
-                "index"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "RemoveAt"
-          ]
-        }
-      ]
-    },
     "ComposerCapability": {
       "type": "object",
       "properties": {

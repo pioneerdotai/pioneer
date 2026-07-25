@@ -20,6 +20,7 @@
   ],
   "$defs": {
     "ComposerCapabilityTarget": {
+      "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
       "type": "object",
       "properties": {
         "kind": {

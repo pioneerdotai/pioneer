@@ -172,6 +172,9 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -197,6 +200,9 @@ impl PioneerDesktop {
                 };
 
                 let _ = this.update(&mut cx, |view, cx| {
+                    if view.current_active_thread_id() != Some(target_thread_id.as_str()) {
+                        return;
+                    }
                     view.append_composer_attachment_paths(paths);
                     cx.notify();
                 });

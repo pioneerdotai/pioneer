@@ -383,7 +383,11 @@ impl PioneerDesktop {
         let running_activity = is_running.then(|| {
             self.render_running_activity_content(
                 format!("task:{}", task_item.id),
-                item_view.started_at_unix_ms.or(Some(task_item.created_at)),
+                task_item
+                    .started_at
+                    .map(|started_at| started_at.saturating_mul(1_000))
+                    .or(item_view.started_at_unix_ms)
+                    .or(Some(task_item.created_at.saturating_mul(1_000))),
                 None,
                 cx,
             )

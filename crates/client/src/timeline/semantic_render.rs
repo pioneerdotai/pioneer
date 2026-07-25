@@ -264,7 +264,11 @@ fn push_detached_task_run(
             turn_id: turn_id.to_owned(),
             item_type: "task".to_owned(),
             status,
-            started_at_unix_ms: block.started_at_unix_ms.or(Some(task.created_at)),
+            started_at_unix_ms: task
+                .started_at
+                .map(|started_at| started_at.saturating_mul(1_000))
+                .or(block.started_at_unix_ms)
+                .or(Some(task.created_at.saturating_mul(1_000))),
             updated_at_unix_ms: block.updated_at_unix_ms.or(Some(task.updated_at)),
             completed_at_unix_ms: terminal
                 .then(|| block.updated_at_unix_ms.or(Some(task.updated_at)))
@@ -602,7 +606,7 @@ mod tests {
             model.projection.items[0].status,
             TimelineEntryStatus::Running
         );
-        assert_eq!(model.projection.items[0].started_at_unix_ms, Some(2));
+        assert_eq!(model.projection.items[0].started_at_unix_ms, Some(2_000));
         assert!(matches!(
             &model.projection.items[0].item,
             TurnItem::Task { item }
@@ -880,6 +884,11 @@ mod tests {
                     progress_preview: Some("Collecting sources".to_owned()),
                     result_preview: None,
                     error_preview: None,
+                    started_at: (!matches!(
+                        status,
+                        TaskStatus::Draft | TaskStatus::Scheduled | TaskStatus::Queued
+                    ))
+                    .then_some(2),
                     created_at: 2,
                     updated_at: 3,
                 },

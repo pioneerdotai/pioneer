@@ -1818,6 +1818,13 @@
         "error"
       ]
     },
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
     "TaskExecutorKind": {
       "type": "string",
       "enum": [
@@ -1853,6 +1860,135 @@
         "manual",
         "external",
         "dependency"
+      ]
+    },
+    "TaskTurnItem": {
+      "type": "object",
+      "properties": {
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attachment": {
+          "$ref": "#/$defs/TaskAttachmentMode",
+          "default": "attached"
+        },
+        "childThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "childTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "createdByTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "errorPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executorKind": {
+          "$ref": "#/$defs/TaskExecutorKind"
+        },
+        "id": {
+          "type": "string"
+        },
+        "maxDepth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "nextFireAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "parentTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resultPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "triggerKind": {
+          "$ref": "#/$defs/TaskTriggerKind"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "title",
+        "status",
+        "triggerKind",
+        "executorKind",
+        "depth",
+        "maxDepth",
+        "createdAt",
+        "updatedAt"
       ]
     },
     "TextElement": {
@@ -1964,11 +2100,29 @@
       ]
     },
     "ThreadOriginKind": {
-      "type": "string",
-      "enum": [
-        "user",
-        "task_run",
-        "system"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "task_run",
+            "system"
+          ]
+        },
+        {
+          "description": "A user-visible collaborative thread whose Composer submissions execute\nasynchronously in detached task children.",
+          "type": "string",
+          "const": "collaborative"
+        },
+        {
+          "description": "A one-to-one conversation whose Composer submissions execute\nsynchronously in the thread itself.",
+          "type": "string",
+          "const": "direct_message"
+        },
+        {
+          "description": "Compatibility value for threads created before execution semantics were\nmade explicit. It retains foreground Composer behavior.",
+          "type": "string",
+          "const": "user"
+        }
       ]
     },
     "ThreadSidebarVisibility": {
@@ -2084,6 +2238,22 @@
           "required": [
             "kind",
             "work"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "detached_task_run"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskTurnItem"
+            }
+          },
+          "required": [
+            "kind",
+            "task"
           ]
         },
         {
@@ -3428,6 +3598,10 @@
                 "null"
               ]
             },
+            "attachment": {
+              "$ref": "#/$defs/TaskAttachmentMode",
+              "default": "attached"
+            },
             "childThreadId": {
               "type": [
                 "string",
@@ -3443,6 +3617,12 @@
             "createdAt": {
               "type": "integer",
               "format": "int64"
+            },
+            "createdByTurnId": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "depth": {
               "type": "integer",
@@ -3500,6 +3680,13 @@
                 "string",
                 "null"
               ]
+            },
+            "startedAt": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
             },
             "status": {
               "$ref": "#/$defs/TaskStatus"

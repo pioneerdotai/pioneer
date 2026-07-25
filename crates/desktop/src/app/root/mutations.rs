@@ -1,8 +1,8 @@
 use super::*;
 use crate::state;
 use pioneer_client::composer::draft::{
-    ComposerDomainDraft, ComposerDraftLifecycleAction, normalize_composer_draft_text,
-    reduce_composer_draft_lifecycle,
+    ComposerDomainDraft, ComposerDraftLifecycleAction, composer_thread_switch_fallback,
+    normalize_composer_draft_text, reduce_composer_draft_lifecycle,
 };
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::state::reducers as client_state_reducers;
@@ -157,10 +157,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let fallback = ComposerDomainDraft {
-            text: String::new(),
-            domain: self.composer_domain_state(),
-        };
+        let fallback = composer_thread_switch_fallback(self.composer_domain_state());
         let transition = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
             ComposerDraftLifecycleAction::SwitchThread {
@@ -188,10 +185,7 @@ impl PioneerDesktop {
             domain: self.composer_domain_state(),
         });
         self.set_active_thread_id(Some(thread_id.clone()));
-        let fallback = ComposerDomainDraft {
-            text: String::new(),
-            domain: self.composer_domain_state(),
-        };
+        let fallback = composer_thread_switch_fallback(self.composer_domain_state());
         let transition = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
             ComposerDraftLifecycleAction::SwitchThread {

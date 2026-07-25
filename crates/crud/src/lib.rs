@@ -11944,7 +11944,20 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             return Ok(());
         };
 
-        let reasoning_effort = turn_model.reasoning_effort.clone();
+        // TaskRun occurrence turns are timeline/lifecycle markers, not Composer
+        // selections. In collaborative threads they are newer than the source
+        // user Conversation turn and intentionally carry no reasoning effort.
+        // Keep the newest turn as the status marker, but restore Composer
+        // metadata from the newest Conversation turn. A null value there is
+        // meaningful: it explicitly restores the provider default instead of
+        // leaking an older non-default effort into the thread.
+        let reasoning_effort = if turn_model.turn_kind == turn_kind_to_db(TurnKind::Conversation) {
+            turn_model.reasoning_effort.clone()
+        } else {
+            turn::find_latest_conversation_turn_for_thread(&self.connection, thread.id.as_str())
+                .await?
+                .and_then(|turn| turn.reasoning_effort)
+        };
         if let Some(turn) = thread_snapshot_turn_from_db_model(turn_model)? {
             thread.reasoning_effort = reasoning_effort;
             thread.turns.push(turn);
@@ -25459,6 +25472,30 @@ mod tests {
             .await
             .expect("second turn start should persist");
 
+        let task_run_thread = Thread {
+            updated_at: second_timestamp + 1,
+            ..second_thread.clone()
+        };
+        let task_run_turn = Turn {
+            id: "turn_000000000000000005".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start_with_reasoning_effort(
+                &task_run_thread,
+                SandboxMode::FullAccess,
+                &task_run_turn,
+                &[],
+                None,
+            )
+            .await
+            .expect("task run marker should persist");
+
         let threads = store
             .list_threads_for_workspace(workspace_id, 10)
             .await
@@ -25472,7 +25509,8 @@ mod tests {
         assert_eq!(listed.model_provider, "custom-provider");
         assert_eq!(listed.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(listed.turns.len(), 1);
-        assert_eq!(listed.turns[0].id, second_turn.id);
+        assert_eq!(listed.turns[0].id, task_run_turn.id);
+        assert_eq!(listed.turns[0].turn_kind, TurnKind::TaskRun);
 
         let fetched = store
             .get_thread_model(thread_id)
@@ -25481,7 +25519,69 @@ mod tests {
             .expect("thread should exist");
         assert_eq!(fetched.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(fetched.turns.len(), 1);
-        assert_eq!(fetched.turns[0].id, second_turn.id);
+        assert_eq!(fetched.turns[0].id, task_run_turn.id);
+        assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+
+        let default_effort_thread = Thread {
+            updated_at: second_timestamp + 2,
+            ..second_thread.clone()
+        };
+        let default_effort_turn = Turn {
+            id: "turn_000000000000000006".to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start_with_reasoning_effort(
+                &default_effort_thread,
+                SandboxMode::FullAccess,
+                &default_effort_turn,
+                &[],
+                None,
+            )
+            .await
+            .expect("default-effort conversation turn should persist");
+
+        let latest_task_run_thread = Thread {
+            updated_at: second_timestamp + 3,
+            ..default_effort_thread
+        };
+        let latest_task_run_turn = Turn {
+            id: "turn_000000000000000007".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start_with_reasoning_effort(
+                &latest_task_run_thread,
+                SandboxMode::FullAccess,
+                &latest_task_run_turn,
+                &[],
+                None,
+            )
+            .await
+            .expect("latest task run marker should persist");
+
+        let fetched = store
+            .get_thread_model(thread_id)
+            .await
+            .expect("thread should load after default effort")
+            .expect("thread should exist after default effort");
+        assert!(
+            fetched.reasoning_effort.is_none(),
+            "the latest Conversation turn must be allowed to clear an older effort"
+        );
+        assert_eq!(fetched.turns.len(), 1);
+        assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
+        assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
     }
 
     #[tokio::test]

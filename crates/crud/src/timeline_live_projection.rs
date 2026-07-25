@@ -24,6 +24,7 @@ use crate::timeline_projection_model::{
     turn_work_presentation, turn_work_state, user_block_id, work_block_id, work_item_order_key,
     work_item_projection_id,
 };
+use crate::util::unix_to_datetime;
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
     TurnWorkProjectionRecord, WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_HIDDEN,
@@ -692,6 +693,7 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
     let causal_turn =
         detached_task_run_causal_turn(db, thread_model, turn_model, item_model).await?;
     let sort_turn = causal_turn.as_ref().unwrap_or(turn_model);
+    let started_at = detached_task_run_started_at(item_model);
     timeline_repository::delete_turn_work_item_projection_for_item(
         db,
         turn_model.id.as_str(),
@@ -721,7 +723,7 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
             ),
             source_kind: Some("turn_item".to_owned()),
             source_key: Some(item_model.item_id.clone()),
-            started_at: Some(item_model.created_at),
+            started_at: Some(started_at),
             completed_at: None,
             metadata_json: json!({
                 "turnId": turn_model.id,
@@ -735,6 +737,18 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
         },
     )
     .await
+}
+
+fn detached_task_run_started_at(item_model: &turn_item_entity::Model) -> DateTimeWithTimeZone {
+    let run_started_at = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+        .ok()
+        .and_then(|item| match item {
+            TurnItem::Task { item } => item.started_at,
+            _ => None,
+        });
+    run_started_at
+        .map(unix_to_datetime)
+        .unwrap_or(item_model.created_at)
 }
 
 async fn detached_task_run_causal_turn<C: ConnectionTrait>(
@@ -1148,6 +1162,64 @@ fn max_datetime(left: DateTimeWithTimeZone, right: DateTimeWithTimeZone) -> Date
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_protocol::{
+        TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
+    };
+
+    fn detached_task_item_row(started_at: Option<i64>) -> turn_item_entity::Model {
+        let created_at = unix_to_datetime(10);
+        turn_item_entity::Model {
+            id: "row_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            item_id: "task_anchor".to_owned(),
+            item_type: "task".to_owned(),
+            status: Some("running".to_owned()),
+            payload: serde_json::to_string(&TurnItem::Task {
+                item: TaskTurnItem {
+                    id: "task_anchor".to_owned(),
+                    task_id: "task_1".to_owned(),
+                    created_by_turn_id: None,
+                    run_id: Some("run_1".to_owned()),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: "Queued task".to_owned(),
+                    status: TaskStatus::Running,
+                    attachment: TaskAttachmentMode::Detached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: Some("child_1".to_owned()),
+                    child_turn_id: Some("child_turn_1".to_owned()),
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: None,
+                    result_preview: None,
+                    error_preview: None,
+                    started_at,
+                    created_at: 10,
+                    updated_at: 20,
+                },
+            })
+            .expect("task item should serialize"),
+            active_attempt_number: 0,
+            active_attempt_status: None,
+            active_attempt_id: None,
+            last_heartbeat_at: None,
+            lease_expires_at: None,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn detached_task_projection_prefers_run_start_over_queue_creation() {
+        let running = detached_task_item_row(Some(20));
+        assert_eq!(detached_task_run_started_at(&running), unix_to_datetime(20));
+
+        let queued = detached_task_item_row(None);
+        assert_eq!(detached_task_run_started_at(&queued), unix_to_datetime(10));
+    }
 
     #[test]
     fn newer_active_item_wins_over_stale_orphan() {

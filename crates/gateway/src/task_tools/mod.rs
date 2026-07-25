@@ -3580,6 +3580,7 @@ async fn task_turn_item_from_response_with_run(
             run.and_then(|run| run.error.as_ref())
                 .or(task.error.as_ref()),
         ),
+        started_at: run.and_then(|run| run.started_at),
         created_at: task.created_at,
         updated_at: task.updated_at,
     })
@@ -4221,6 +4222,7 @@ mod tests {
             progress_preview: None,
             result_preview: None,
             error_preview: None,
+            started_at: None,
             created_at: 100,
             updated_at: 100,
         }

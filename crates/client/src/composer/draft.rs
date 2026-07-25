@@ -59,6 +59,20 @@ pub struct ComposerDraftLifecycleTransition {
     pub changed: bool,
 }
 
+/// Build the fallback for a thread that has no saved Composer draft.
+///
+/// Model, mode, and permission preferences may follow the active shell, but
+/// user payload is thread-owned and must never leak into another thread.
+pub fn composer_thread_switch_fallback(mut domain: ComposerDomainState) -> ComposerDomainDraft {
+    domain.attachments.clear();
+    domain.capabilities.clear();
+    domain.skill_selections.clear();
+    ComposerDomainDraft {
+        text: String::new(),
+        domain,
+    }
+}
+
 pub fn reduce_composer_draft_lifecycle(
     state: &ComposerDraftLifecycleState,
     action: ComposerDraftLifecycleAction,
@@ -351,6 +365,52 @@ mod tests {
         assert_eq!(switched.state.drafts.get("thread-a"), Some(&current));
         assert_eq!(switched.state.drafts.get("thread-b"), Some(&fallback));
         assert_eq!(switched.restored_draft, Some(fallback));
+    }
+
+    #[test]
+    fn thread_switch_fallback_preserves_preferences_without_leaking_payload() {
+        let mut domain = ComposerDomainState::default();
+        domain
+            .attachments
+            .push(crate::composer::attachments::ComposerAttachment {
+                file_name: "private.txt".to_owned(),
+                path: "/tmp/private.txt".to_owned(),
+                kind: crate::composer::attachments::ComposerAttachmentKind::File,
+                upload_state: crate::composer::attachments::ComposerAttachmentUploadState::Local,
+            });
+        let capability_skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).expect("skill id");
+        domain
+            .capabilities
+            .push(crate::composer::capabilities::ComposerCapability {
+                id: pioneer_protocol::skill_capability_key(&capability_skill_id),
+                kind: crate::composer::capabilities::ComposerCapabilityKind::Skill {
+                    skill_id: capability_skill_id,
+                    owner: Some("tests".to_owned()),
+                    slug: "skill".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+                label: "Skill".to_owned(),
+            });
+        domain.skill_selections.push(
+            crate::composer::skill_selection::ComposerSkillSelection::Skill {
+                skill_id: pioneer_protocol::SkillId::new("T".repeat(21)).expect("skill id"),
+                pack_id: None,
+            },
+        );
+        domain.selected_model = Some("gpt-5".to_owned());
+        domain.selected_permission_mode = TurnPermissionMode::Supervised;
+
+        let fallback = composer_thread_switch_fallback(domain);
+
+        assert!(fallback.text.is_empty());
+        assert!(fallback.domain.attachments.is_empty());
+        assert!(fallback.domain.capabilities.is_empty());
+        assert!(fallback.domain.skill_selections.is_empty());
+        assert_eq!(fallback.domain.selected_model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            fallback.domain.selected_permission_mode,
+            TurnPermissionMode::Supervised
+        );
     }
 
     #[test]

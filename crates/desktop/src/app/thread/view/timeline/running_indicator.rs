@@ -330,6 +330,7 @@ mod tests {
                         progress_preview: None,
                         result_preview: None,
                         error_preview: None,
+                        started_at: Some(1),
                         created_at: 1_000,
                         updated_at: 2_000,
                     },

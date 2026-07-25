@@ -817,6 +817,7 @@ mod tests {
                 progress_preview: Some("Collecting sources".to_owned()),
                 result_preview: None,
                 error_preview: None,
+                started_at: Some(1),
                 created_at: 1,
                 updated_at: 2,
             },
