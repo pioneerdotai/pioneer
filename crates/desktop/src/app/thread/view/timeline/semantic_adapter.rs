@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_pending_requests_preserve_child_thread_scope() {
+    fn semantic_pending_requests_preserve_grandchild_thread_scope_on_root_page() {
         let pending_requests = pending_requests_from_semantic_rows(&[SemanticTimelineRow {
             id: SemanticTimelineRowId::TopLevelBlock {
                 block_id: "approval_block".to_owned(),
@@ -189,17 +189,17 @@ mod tests {
             kind: SemanticTimelineRowKind::PendingRequest {
                 block: TimelineBlock {
                     workspace_id: "workspace_a".to_owned(),
-                    thread_id: "child_thread".to_owned(),
+                    thread_id: "grandchild_thread".to_owned(),
                     block_id: "approval_block".to_owned(),
-                    turn_id: Some("child_turn".to_owned()),
+                    turn_id: Some("grandchild_turn".to_owned()),
                     sort_key: "0001".to_owned(),
                     started_at_unix_ms: Some(1),
                     updated_at_unix_ms: Some(2),
                     kind: TimelineBlockKind::PendingRequest {
                         runtime_id: "codex".to_owned(),
-                        request_id: "child_req".to_owned(),
+                        request_id: "grandchild_req".to_owned(),
                         status: CLIRuntimePendingRequestStatus::Pending,
-                        item_id: Some("child_item".to_owned()),
+                        item_id: Some("grandchild_item".to_owned()),
                         request: CLIRuntimePendingRequest {
                             kind: CLIRuntimeRequestKind::CommandApproval,
                             title: Some("Run command".to_owned()),
@@ -213,13 +213,19 @@ mod tests {
         }]);
 
         assert_eq!(pending_requests.len(), 1);
-        assert_eq!(pending_requests[0].request_id, "child_req");
+        assert_eq!(pending_requests[0].request_id, "grandchild_req");
         assert_eq!(
             pending_requests[0].thread_id.as_deref(),
-            Some("child_thread")
+            Some("grandchild_thread")
         );
-        assert_eq!(pending_requests[0].turn_id.as_deref(), Some("child_turn"));
-        assert_eq!(pending_requests[0].item_id.as_deref(), Some("child_item"));
+        assert_eq!(
+            pending_requests[0].turn_id.as_deref(),
+            Some("grandchild_turn")
+        );
+        assert_eq!(
+            pending_requests[0].item_id.as_deref(),
+            Some("grandchild_item")
+        );
     }
 
     fn timeline_row(key: &str, kind: TimelineRowKind) -> TimelineRenderRow {

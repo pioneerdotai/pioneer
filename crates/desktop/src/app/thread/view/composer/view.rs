@@ -18,6 +18,7 @@ use gpui_component::{
 use pioneer_client::composer::skill_selection::{
     ComposerSkillChip, ComposerSkillChipKind, ComposerSkillSelection, project_composer_skill_chips,
 };
+use pioneer_client::state::snapshot::ActiveThreadSnapshot;
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +46,24 @@ struct DesktopComposerPrimaryActionInput {
     is_cancelling: bool,
     upload_in_progress: bool,
     voice_send_processing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopComposerActiveTurnState {
+    has_in_flight_turn: bool,
+    is_cancelling: bool,
+    can_stop: bool,
+}
+
+fn desktop_composer_active_turn_state(
+    active_thread: &ActiveThreadSnapshot,
+    gateway_connected: bool,
+) -> DesktopComposerActiveTurnState {
+    DesktopComposerActiveTurnState {
+        has_in_flight_turn: active_thread.has_in_flight_turn(),
+        is_cancelling: active_thread.is_cancelling_turn(),
+        can_stop: active_thread.can_request_turn_cancel(gateway_connected),
+    }
 }
 
 fn resolve_desktop_composer_primary_action(
@@ -85,15 +104,17 @@ impl PioneerDesktop {
         let skill_chips = self.composer_skill_chips();
         let upload_error = self.composer_upload_error.clone();
         let microphone_error = self.desktop_microphone_error_message();
-        let task_child_locked = self.active_task_thread_navigation().is_some();
         let can_send = self.can_submit_message(cx);
         let active_thread_snapshot = self.client_snapshot().active_thread;
         let gateway_connected =
             self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
-        let is_cancelling = !task_child_locked && active_thread_snapshot.is_cancelling_turn();
-        let can_stop =
-            !task_child_locked && active_thread_snapshot.can_request_turn_cancel(gateway_connected);
-        let has_in_flight_turn = !task_child_locked && active_thread_snapshot.has_in_flight_turn();
+        // A TaskRun thread is a normal foreground conversation. Its active turn must remain
+        // visible here so the Composer exposes Stop instead of a disabled Send action.
+        let active_turn_state =
+            desktop_composer_active_turn_state(&active_thread_snapshot, gateway_connected);
+        let is_cancelling = active_turn_state.is_cancelling;
+        let can_stop = active_turn_state.can_stop;
+        let has_in_flight_turn = active_turn_state.has_in_flight_turn;
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let cli_runtime_thread_binding = if has_in_flight_turn {
             active_thread_snapshot
@@ -114,7 +135,6 @@ impl PioneerDesktop {
             });
         let can_steer_cli_runtime_turn = has_cli_runtime_steer_target
             && gateway_connected
-            && !task_child_locked
             && !is_cancelling
             && !self.composer_upload_in_progress
             && attachments.is_empty()
@@ -247,7 +267,7 @@ impl PioneerDesktop {
                                 } else {
                                     Input::new(&composer_state)
                                         .appearance(false)
-                                        .disabled(task_child_locked || desktop_voice_context_locked)
+                                        .disabled(desktop_voice_context_locked)
                                         .into_any_element()
                                 }),
                         )
@@ -332,9 +352,7 @@ impl PioneerDesktop {
 
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let disabled = self.composer_upload_in_progress
-            || self.active_task_thread_navigation().is_some()
-            || self.desktop_voice_context_locked();
+        let disabled = self.composer_upload_in_progress || self.desktop_voice_context_locked();
         Button::new("composer-add-attachment")
             .small()
             .ghost()
@@ -816,6 +834,42 @@ mod tests {
         DesktopVoiceEntryAvailability::Hidden,
         DesktopVoiceEntryAvailability::Ready,
     ];
+
+    #[::core::prelude::v1::test]
+    fn task_child_foreground_turn_exposes_stop_state() {
+        assert_eq!(
+            pioneer_protocol::ThreadOriginKind::TaskRun.composer_execution_mode(),
+            pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn,
+        );
+        let active_thread = ActiveThreadSnapshot {
+            thread_id: Some("task-child".to_owned()),
+            in_flight_turn_id: Some("child-turn".to_owned()),
+            phase: pioneer_client::state::snapshot::ActiveThreadPhaseSnapshot::Running,
+            ..ActiveThreadSnapshot::default()
+        };
+
+        assert_eq!(
+            desktop_composer_active_turn_state(&active_thread, true),
+            DesktopComposerActiveTurnState {
+                has_in_flight_turn: true,
+                is_cancelling: false,
+                can_stop: true,
+            }
+        );
+        assert_eq!(
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                has_in_flight_turn: true,
+                can_stop: true,
+                voice_entry_availability: DesktopVoiceEntryAvailability::Hidden,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Stop,
+                disabled: false,
+                loading: false,
+            }
+        );
+    }
 
     #[::core::prelude::v1::test]
     fn desktop_composer_primary_action_priority_matrix_is_complete() {

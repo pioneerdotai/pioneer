@@ -18,9 +18,10 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
     AgentExecutionBackend, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef,
-    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, TurnCapabilityKind, TurnPermissionMode,
-    TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary,
-    UserInput, UserMessageAttachment, VoiceTurnContext,
+    ThreadComposerExecutionMode, ThreadMode, TurnCLIRuntimeOptions, TurnCapability,
+    TurnCapabilityKind, TurnPermissionMode, TurnSkillCapabilitySummary,
+    TurnSkillPackCapabilitySummary, TurnSkillPackPresentationSummary, UserInput,
+    UserMessageAttachment, VoiceTurnContext,
 };
 use std::collections::HashSet;
 
@@ -111,6 +112,7 @@ pub struct PreparedComposerTurnSubmitContext {
     pub thread_id: String,
     pub turn_id: String,
     pub pending_request_id: String,
+    pub composer_execution_mode: ThreadComposerExecutionMode,
     pub selected_model: Option<String>,
     pub selected_provider: Option<String>,
     pub turn_model_provider: Option<String>,
@@ -140,6 +142,7 @@ pub struct PreparedComposerTurnSubmitReduction {
     pub clear_thread_draft_id: String,
     pub thread_snapshot_update: PreparedComposerThreadSnapshotUpdate,
     pub promote_thread_from_draft_id: String,
+    pub composer_execution_mode: ThreadComposerExecutionMode,
     pub local_turn_start_requested_event: crate::conversation::ConversationEvent,
     pub turn_start_params_plan: turn_start::TurnStartParamsPlan,
     pub send_context: turn_start::TurnStartSendContext,
@@ -650,6 +653,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
             updated_at_unix: context.updated_at_unix,
         },
         promote_thread_from_draft_id: context.thread_id.clone(),
+        composer_execution_mode: context.composer_execution_mode,
         local_turn_start_requested_event: turn_start::local_turn_start_requested_event(
             context.thread_id.clone(),
             context.turn_id.clone(),
@@ -1652,6 +1656,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                composer_execution_mode: ThreadComposerExecutionMode::ForegroundTurn,
                 selected_model: Some("gpt-5".to_owned()),
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
@@ -1745,6 +1750,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                composer_execution_mode: ThreadComposerExecutionMode::ForegroundTurn,
                 selected_model: Some("gpt-5".to_owned()),
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
@@ -1783,6 +1789,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                composer_execution_mode: ThreadComposerExecutionMode::ForegroundTurn,
                 selected_model: Some("gpt-5".to_owned()),
                 selected_provider: Some("cli_runtime:codex".to_owned()),
                 turn_model_provider: None,

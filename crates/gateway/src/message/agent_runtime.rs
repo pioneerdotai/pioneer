@@ -4636,7 +4636,7 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
     ) -> bool {
-        self.mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, None)
+        self.mark_turn_interrupted_with_recovery_disposition(thread_id, turn_id, reason, None, true)
             .await
     }
 
@@ -4647,12 +4647,60 @@ impl MessageProcessor {
         reason: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let user_cancellation_reason = self
+            .user_turn_cancel_intents
+            .lock()
+            .await
+            .get(&(thread_id.clone(), turn_id.clone()))
+            .cloned();
+        if let Some(user_cancellation_reason) = user_cancellation_reason {
+            return self
+                .mark_turn_interrupted_with_recovery_disposition(
+                    thread_id,
+                    turn_id,
+                    user_cancellation_reason,
+                    recovery,
+                    true,
+                )
+                .await;
+        }
+        self.mark_turn_interrupted_with_recovery_disposition(
+            thread_id, turn_id, reason, recovery, false,
+        )
+        .await
+    }
+
+    async fn mark_turn_interrupted_with_recovery_disposition(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        user_cancellation: bool,
+    ) -> bool {
         if let Some((_workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
             .await
         {
             if current_turn.status == TurnStatus::Interrupted {
+                if user_cancellation
+                    && let Err(error) = self
+                        .task_agent_executor
+                        .reconcile_child_turn_cancelled(
+                            thread_id.as_str(),
+                            turn_id.as_str(),
+                            reason.as_str(),
+                        )
+                        .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to reconcile already-interrupted child task turn as cancelled"
+                    );
+                }
                 return true;
             }
             if current_turn.status != TurnStatus::InProgress {
@@ -4760,23 +4808,37 @@ impl MessageProcessor {
             );
         }
 
-        if let Err(error) = self
-            .task_agent_executor
-            .reconcile_child_turn_failed(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                turn_failed
-                    .turn
-                    .error
-                    .as_deref()
-                    .unwrap_or("turn interrupted"),
-            )
-            .await
-        {
+        let reconciliation = if user_cancellation {
+            self.task_agent_executor
+                .reconcile_child_turn_cancelled(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    turn_failed
+                        .turn
+                        .error
+                        .as_deref()
+                        .unwrap_or("turn cancelled by user"),
+                )
+                .await
+        } else {
+            self.task_agent_executor
+                .reconcile_child_turn_failed(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    turn_failed
+                        .turn
+                        .error
+                        .as_deref()
+                        .unwrap_or("turn interrupted"),
+                )
+                .await
+        };
+        if let Err(error) = reconciliation {
             warn!(
                 thread_id,
                 turn_id,
                 error = %format!("{error:#}"),
+                user_cancellation,
                 "failed to reconcile interrupted child task turn"
             );
         }
@@ -5285,12 +5347,16 @@ impl MessageProcessor {
             return Ok(());
         };
 
-        if thread.origin_kind != pioneer_protocol::ThreadOriginKind::User
-            || self
-                .crud_store
-                .get_task_thread_lineage(thread_id)
-                .await?
-                .is_some()
+        if !matches!(
+            thread.origin_kind,
+            pioneer_protocol::ThreadOriginKind::User
+                | pioneer_protocol::ThreadOriginKind::Collaborative
+                | pioneer_protocol::ThreadOriginKind::DirectMessage
+        ) || self
+            .crud_store
+            .get_task_thread_lineage(thread_id)
+            .await?
+            .is_some()
         {
             self.record_title_job_state(thread_id, ThreadTitleJobState::Succeeded, 0)
                 .await;

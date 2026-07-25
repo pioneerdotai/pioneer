@@ -3,6 +3,7 @@ use pioneer_entity::{
     cli_runtime_pending_request, thread as thread_entity, turn as turn_entity,
     turn_item as turn_item_entity,
 };
+use pioneer_protocol::{TaskTriggerKind, TurnItem};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
@@ -14,7 +15,7 @@ use crate::repositories::cli_runtime_binding::{
     CliRuntimePendingRequestRecord, CliRuntimePendingRequestStatus,
 };
 use crate::repositories::thread_timeline_projection as timeline_repository;
-use crate::repositories::{thread, turn};
+use crate::repositories::{task, thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row_for_turn};
 use crate::timeline_projection_model::{
     ItemEventOrder, approval_block_id, assistant_block_id, classification_metadata_json,
@@ -688,6 +689,9 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
     item_model: &turn_item_entity::Model,
     projected_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let causal_turn =
+        detached_task_run_causal_turn(db, thread_model, turn_model, item_model).await?;
+    let sort_turn = causal_turn.as_ref().unwrap_or(turn_model);
     timeline_repository::delete_turn_work_item_projection_for_item(
         db,
         turn_model.id.as_str(),
@@ -711,7 +715,7 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_DETACHED_TASK_RUN.to_owned(),
             sort_key: turn_block_sort_key(
-                turn_model,
+                sort_turn,
                 100,
                 format!("detached-task-run:{}", item_model.item_id).as_str(),
             ),
@@ -723,6 +727,7 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
                 "turnId": turn_model.id,
                 "itemId": item_model.item_id,
                 "attachment": "detached",
+                "causalTurnId": causal_turn.as_ref().map(|turn| turn.id.as_str()),
             })
             .to_string(),
             created_at: item_model.created_at,
@@ -730,6 +735,46 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
         },
     )
     .await
+}
+
+async fn detached_task_run_causal_turn<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &thread_entity::Model,
+    turn_model: &turn_entity::Model,
+    item_model: &turn_item_entity::Model,
+) -> Result<Option<turn_entity::Model>> {
+    let Ok(TurnItem::Task { item }) = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+    else {
+        return Ok(None);
+    };
+    if item.trigger_kind != TaskTriggerKind::Immediate {
+        return Ok(None);
+    }
+
+    let mut causal_turn_id = item.created_by_turn_id;
+    if causal_turn_id.is_none() {
+        causal_turn_id = task::find_task_by_id(db, item.task_id.as_str())
+            .await?
+            .and_then(|task| {
+                (task.created_by_thread_id.as_deref() == Some(thread_model.id.as_str()))
+                    .then_some(task.created_by_turn_id)
+                    .flatten()
+            });
+    }
+    let Some(causal_turn_id) = causal_turn_id else {
+        return Ok(None);
+    };
+    if causal_turn_id == turn_model.id {
+        return Ok(None);
+    }
+    let Some(causal_turn) = turn::find_turn_by_id(db, causal_turn_id.as_str()).await? else {
+        return Ok(None);
+    };
+    if causal_turn.thread_id != thread_model.id {
+        return Ok(None);
+    }
+
+    Ok(Some(causal_turn))
 }
 
 async fn turn_has_detached_task_run_block<C: ConnectionTrait>(
@@ -834,7 +879,13 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         > 0;
     let has_detached_task_run =
         turn_has_detached_task_run_block(db, turn_model.id.as_str()).await?;
-    let needs_work_block = work_count > 0 || (!has_final && !has_detached_task_run);
+    // A collaborative Composer admission turn durably owns only the user's
+    // message. Once it completes, the detached Task card represents the agent
+    // work separately. Do not leave an empty "Worked" block behind for that
+    // successful message-only turn (or for any other successful empty turn).
+    let completed_without_work = turn_model.status == "completed" && work_count == 0;
+    let needs_work_block =
+        work_count > 0 || (!has_final && !has_detached_task_run && !completed_without_work);
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;

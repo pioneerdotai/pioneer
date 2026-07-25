@@ -44,7 +44,6 @@ pub(super) enum DesktopVoiceEntryAvailability {
 struct DesktopVoiceEntryContext {
     voice_composer_idle: bool,
     gateway_connected: bool,
-    task_thread_unlocked: bool,
     active_thread: bool,
     model_selected: bool,
     conversation_can_submit: bool,
@@ -55,7 +54,6 @@ impl DesktopVoiceEntryContext {
     fn allows_voice(self) -> bool {
         self.voice_composer_idle
             && self.gateway_connected
-            && self.task_thread_unlocked
             && self.active_thread
             && self.model_selected
             && self.conversation_can_submit
@@ -188,7 +186,6 @@ impl PioneerDesktop {
                 voice_composer_idle: !self.desktop_voice_composer.is_active(),
                 gateway_connected: self.gateway.connection_state
                     == GatewayConnectionState::Connected,
-                task_thread_unlocked: self.active_task_thread_navigation().is_none(),
                 active_thread: self.current_active_thread_id().is_some(),
                 model_selected: self.has_complete_composer_model_selection(),
                 conversation_can_submit: self
@@ -669,7 +666,6 @@ mod tests {
     const READY_CONTEXT: DesktopVoiceEntryContext = DesktopVoiceEntryContext {
         voice_composer_idle: true,
         gateway_connected: true,
-        task_thread_unlocked: true,
         active_thread: true,
         model_selected: true,
         conversation_can_submit: true,
@@ -703,10 +699,6 @@ mod tests {
             },
             DesktopVoiceEntryContext {
                 gateway_connected: false,
-                ..READY_CONTEXT
-            },
-            DesktopVoiceEntryContext {
-                task_thread_unlocked: false,
                 ..READY_CONTEXT
             },
             DesktopVoiceEntryContext {

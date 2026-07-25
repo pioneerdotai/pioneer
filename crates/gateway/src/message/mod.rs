@@ -352,6 +352,7 @@ pub struct MessageProcessor {
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
+    user_turn_cancel_intents: Arc<Mutex<HashMap<(String, String), String>>>,
     cli_runtime_pending_turn_events:
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnEvent>>>>,
     cli_runtime_pending_turn_server_requests:
@@ -489,6 +490,7 @@ struct PendingNativePermissionApprovalRequest {
     workspace_id: String,
     thread_id: String,
     turn_id: String,
+    request: TurnPermissionApprovalRequest,
     respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
 }
 
@@ -665,6 +667,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
+            user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_machine_requests: Arc::new(Mutex::new(
@@ -2419,6 +2422,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
+            user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_machine_requests: Arc::new(Mutex::new(

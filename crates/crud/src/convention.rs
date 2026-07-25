@@ -381,6 +381,8 @@ pub fn thread_status_to_db(status: ThreadStatus) -> &'static str {
 
 pub fn thread_origin_kind_to_db(kind: ThreadOriginKind) -> &'static str {
     match kind {
+        ThreadOriginKind::Collaborative => "collaborative",
+        ThreadOriginKind::DirectMessage => "direct_message",
         ThreadOriginKind::User => "user",
         ThreadOriginKind::TaskRun => "task_run",
         ThreadOriginKind::System => "system",
@@ -389,6 +391,8 @@ pub fn thread_origin_kind_to_db(kind: ThreadOriginKind) -> &'static str {
 
 pub fn thread_origin_kind_from_db(value: &str) -> Option<ThreadOriginKind> {
     match value {
+        "collaborative" => Some(ThreadOriginKind::Collaborative),
+        "direct_message" => Some(ThreadOriginKind::DirectMessage),
         "user" => Some(ThreadOriginKind::User),
         "task_run" => Some(ThreadOriginKind::TaskRun),
         "system" => Some(ThreadOriginKind::System),

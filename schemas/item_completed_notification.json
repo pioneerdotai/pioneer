@@ -1746,6 +1746,12 @@
               "type": "integer",
               "format": "int64"
             },
+            "createdByTurnId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "depth": {
               "type": "integer",
               "format": "int64"

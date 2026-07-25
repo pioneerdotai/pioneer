@@ -3540,6 +3540,7 @@ async fn task_turn_item_from_response_with_run(
     Ok(TaskTurnItem {
         id: item_id,
         task_id: task.id.clone(),
+        created_by_turn_id: task.created_by_turn_id.clone(),
         run_id: run.map(|run| run.id.clone()),
         parent_task_id: task.parent_task_id.clone(),
         root_task_id: task.root_task_id.clone(),
@@ -4194,6 +4195,7 @@ mod tests {
         TaskTurnItem {
             id: "task_task_1234567890123456".to_owned(),
             task_id: "task_1234567890123456".to_owned(),
+            created_by_turn_id: None,
             run_id: None,
             parent_task_id: None,
             root_task_id: None,

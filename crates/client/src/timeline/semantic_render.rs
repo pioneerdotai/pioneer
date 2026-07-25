@@ -602,6 +602,7 @@ mod tests {
             model.projection.items[0].status,
             TimelineEntryStatus::Running
         );
+        assert_eq!(model.projection.items[0].started_at_unix_ms, Some(2));
         assert!(matches!(
             &model.projection.items[0].item,
             TurnItem::Task { item }
@@ -861,6 +862,7 @@ mod tests {
                 task: TaskTurnItem {
                     id: "task_anchor_a".to_owned(),
                     task_id: "task_a".to_owned(),
+                    created_by_turn_id: None,
                     run_id: Some("run_a".to_owned()),
                     parent_task_id: None,
                     root_task_id: None,

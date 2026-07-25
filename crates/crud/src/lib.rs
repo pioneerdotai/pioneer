@@ -9266,9 +9266,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             BTreeMap::new()
         };
 
-        let mut entries = Vec::with_capacity(turns.len());
+        self.build_ordered_conversation_entries(&turns, &artifact_refs)
+            .await
+    }
 
-        for turn_model in &turns {
+    async fn build_ordered_conversation_entries(
+        &self,
+        turns: &[pioneer_entity::turn::Model],
+        artifact_refs: &BTreeMap<String, ConversationTurnArtifactRefs>,
+    ) -> Result<Vec<ConversationEntry>> {
+        let mut ordered_entries = Vec::with_capacity(turns.len());
+
+        for turn_model in turns {
             let inputs = turn::find_turn_inputs(&self.connection, &turn_model.id).await?;
             let user_text: String = inputs
                 .iter()
@@ -9294,24 +9303,63 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 .cloned()
                 .unwrap_or_default();
 
-            entries.push(ConversationEntry {
-                turn_id: turn_model.id.clone(),
-                user_text: if user_text.is_empty() {
-                    None
-                } else {
-                    Some(user_text)
+            let has_user_message = !user_text.is_empty();
+            let has_assistant_message = !assistant_text.is_empty();
+            let effective_timestamp_millis = if has_user_message {
+                turn_model.created_at.timestamp_millis()
+            } else if has_assistant_message {
+                items
+                    .first()
+                    .map(|item| item.created_at.timestamp_millis())
+                    .unwrap_or_else(|| turn_model.created_at.timestamp_millis())
+            } else {
+                turn_model.created_at.timestamp_millis()
+            };
+            let message_rank = if has_user_message {
+                0_u8
+            } else if has_assistant_message {
+                1_u8
+            } else {
+                2_u8
+            };
+
+            ordered_entries.push((
+                effective_timestamp_millis,
+                message_rank,
+                turn_model.id.clone(),
+                ConversationEntry {
+                    turn_id: turn_model.id.clone(),
+                    user_text: if has_user_message {
+                        Some(user_text)
+                    } else {
+                        None
+                    },
+                    assistant_text: if has_assistant_message {
+                        Some(assistant_text)
+                    } else {
+                        None
+                    },
+                    user_artifacts: refs.user,
+                    assistant_artifacts: refs.assistant,
                 },
-                assistant_text: if assistant_text.is_empty() {
-                    None
-                } else {
-                    Some(assistant_text)
-                },
-                user_artifacts: refs.user,
-                assistant_artifacts: refs.assistant,
-            });
+            ));
         }
 
-        Ok(entries)
+        // A foreground turn stores its user input and assistant response together, so ordering
+        // turns by `turn.created_at` used to be sufficient. Detached Composer work deliberately
+        // splits that pair into two parent turns: a message-only Conversation turn and an
+        // assistant-only TaskRun occurrence. Both are admitted in the same second, while the
+        // delivered AgentMessage is created later. Order assistant-only entries by the message's
+        // own delivery timestamp so provider history follows the same chronology as the durable
+        // conversation instead of reversing equal-timestamp request/result pairs.
+        ordered_entries.sort_by(|left, right| {
+            (left.0, left.1, left.2.as_str()).cmp(&(right.0, right.1, right.2.as_str()))
+        });
+
+        Ok(ordered_entries
+            .into_iter()
+            .map(|(_, _, _, entry)| entry)
+            .collect())
     }
 
     pub async fn get_first_thread_user_text(&self, thread_id: &str) -> Result<Option<String>> {
@@ -12052,50 +12100,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         skip: u64,
         take: u64,
     ) -> Result<Vec<ConversationEntry>> {
-        let turns =
-            turn::find_completed_turns_in_range(&self.connection, thread_id, skip, take).await?;
-
-        let mut entries = Vec::with_capacity(turns.len());
-        for turn_model in &turns {
-            let inputs = turn::find_turn_inputs(&self.connection, &turn_model.id).await?;
-            let user_text: String = inputs
-                .iter()
-                .filter(|i| i.input_type == "text")
-                .filter_map(|i| i.text.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let items = turn::find_completed_turn_items(&self.connection, &turn_model.id).await?;
-            let assistant_text: String = items
-                .iter()
-                .filter_map(|item| {
-                    serde_json::from_str::<pioneer_protocol::TurnItem>(&item.payload).ok()
-                })
-                .filter_map(|item| match item {
-                    pioneer_protocol::TurnItem::AgentMessage { text, .. } => Some(text),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-
-            entries.push(ConversationEntry {
-                turn_id: turn_model.id.clone(),
-                user_text: if user_text.is_empty() {
-                    None
-                } else {
-                    Some(user_text)
-                },
-                assistant_text: if assistant_text.is_empty() {
-                    None
-                } else {
-                    Some(assistant_text)
-                },
-                user_artifacts: Vec::new(),
-                assistant_artifacts: Vec::new(),
-            });
+        if take == 0 {
+            return Ok(Vec::new());
         }
 
-        Ok(entries)
+        let turns = turn::find_completed_turns_for_thread(&self.connection, thread_id).await?;
+        let entries = self
+            .build_ordered_conversation_entries(&turns, &BTreeMap::new())
+            .await?;
+        let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+        let take = usize::try_from(take).unwrap_or(usize::MAX);
+
+        Ok(entries.into_iter().skip(skip).take(take).collect())
     }
 
     pub async fn get_thread_history(

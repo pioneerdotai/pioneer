@@ -407,12 +407,14 @@ impl PioneerDesktop {
         let request_key = format!("thread/timeline/page:newest:{thread_id}");
         {
             let thread = self.semantic_timelines.thread_mut(thread_id.to_owned());
-            if !thread.top_level.is_empty()
-                || matches!(
-                    thread.top_level.request_status,
-                    pioneer_client::timeline::semantic::TimelineRequestStatus::Loading { .. }
-                )
-            {
+            if matches!(
+                thread.top_level.request_status,
+                pioneer_client::timeline::semantic::TimelineRequestStatus::Loading { .. }
+            ) {
+                return;
+            }
+            if !thread.top_level.is_empty() {
+                self.request_semantic_thread_newest_page(thread_id.to_owned(), cx);
                 return;
             }
             thread.top_level.request_status =

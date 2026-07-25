@@ -447,6 +447,32 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            let thread = match self
+                .thread_manager
+                .thread_get(params.thread_id.trim())
+                .await
+            {
+                Some(thread) => thread,
+                None => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("thread `{}` is not loaded", params.thread_id.trim()),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if thread.origin_kind.composer_execution_mode()
+                == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
+            {
+                self.composer_detached_task_start(connection_id, request_id, params, thread)
+                    .await;
+                return;
+            }
             let requested_reasoning_effort = requested_reasoning_effort(&params);
             if let Some(effort) = requested_reasoning_effort.as_deref() {
                 debug!(
@@ -517,6 +543,283 @@ impl MessageProcessor {
             self.dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
         })
+    }
+
+    /// Admit a collaborative Composer submission as a durable user message
+    /// followed by an immediate detached task. The message turn completes
+    /// synchronously; the task child owns all agent execution.
+    async fn composer_detached_task_start(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        mut params: TurnStartParams,
+        thread: pioneer_protocol::Thread,
+    ) {
+        let normalized_capabilities = match self
+            .normalize_turn_skill_capabilities(
+                thread.workspace_id.as_str(),
+                params.capabilities.as_slice(),
+            )
+            .await
+        {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
+        params.capabilities = normalized_capabilities.execution.clone();
+        if let Err(error) = self
+            .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
+            .await
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to validate artifact input: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
+        let skill_catalog = match self
+            .validate_turn_skill_capabilities(
+                thread.workspace_id.as_str(),
+                params.capabilities.as_slice(),
+            )
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(message) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
+        let capability_attachments =
+            match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
+                normalized_capabilities.presentation.as_slice(),
+                &skill_catalog,
+                &normalized_capabilities.pack_names,
+            ) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to snapshot selected capability presentation: {error:#}"
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+        let launch = params.clone();
+        let outcome = match self.thread_manager.turn_start(connection_id, params).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to admit Composer message: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
+            Ok(event) => event,
+            Err(error) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resolve Composer permission profile: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = self
+            .crud_store
+            .materialize_turn_start_with_reasoning_effort_and_permission_audit(
+                &outcome.materialization.thread,
+                outcome.materialization.sandbox_mode,
+                &outcome.materialization.turn,
+                &outcome.materialization.input,
+                requested_reasoning_effort(&launch).as_deref(),
+                profile_audit,
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to persist Composer message: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
+        let security_snapshot = match self
+            .persist_turn_execution_security_snapshot(&launch, &outcome, None)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let first_text = first_user_text(launch.input.as_slice());
+        let goal = first_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("Composer task")
+            .to_owned();
+        let title = goal.chars().take(96).collect::<String>();
+        let permission_profile = outcome.materialization.turn.permission_profile.clone();
+        // CLI Composer requests intentionally omit `model_provider`: the
+        // execution backend is the authoritative runtime selection. Persist
+        // the canonical provider key in the Task agent spec so the hidden
+        // child cannot inherit an unrelated API provider from the parent
+        // thread.
+        let task_model_provider = match launch.execution_backend.as_ref() {
+            Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => {
+                cli_runtime_provider_key(runtime_id.as_str())
+            }
+            _ => outcome.materialization.thread.model_provider.clone(),
+        };
+        let task_params = pioneer_protocol::TaskCreateParams {
+            workspace_id: thread.workspace_id.clone(),
+            owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+            owner_id: Some(thread.id.clone()),
+            created_by_thread_id: Some(thread.id.clone()),
+            created_by_turn_id: Some(launch.turn_id.clone()),
+            parent_task_id: None,
+            executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+            title,
+            goal: goal.clone(),
+            priority: 0,
+            trigger: pioneer_protocol::TaskTriggerInput {
+                spec: pioneer_protocol::TaskTriggerSpec::Immediate,
+            },
+            agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
+                agent_role: thread.agent_role.clone(),
+                agent_nickname: thread.agent_nickname.clone(),
+                model: Some(outcome.materialization.thread.model.clone()),
+                model_provider: Some(task_model_provider),
+                prompt: pioneer_protocol::TaskAgentPrompt {
+                    goal,
+                    instructions: Vec::new(),
+                    input: None,
+                    output_instructions: None,
+                },
+                context_policy: None,
+                tool_policy: None,
+                permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                    &permission_profile,
+                )),
+                security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
+                    &security_snapshot,
+                )),
+                result_contract: None,
+                review_policy: None,
+                depth: 0,
+                max_depth: 3,
+            }),
+            lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
+                attachment: pioneer_protocol::TaskAttachmentMode::Detached,
+                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+            }),
+            delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
+                mode: pioneer_protocol::TaskDeliveryMode::OwnerThread,
+                thread_id: None,
+                webhook_url: None,
+                include_result: true,
+                format: pioneer_protocol::TaskDeliveryFormat::FullResult,
+            }),
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: Some(pioneer_protocol::TaskMetadata {
+                labels: vec!["composer".to_owned()],
+                data: None,
+                composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
+            }),
+        };
+        if let Err(error) = self
+            .task_runtime
+            .service()
+            .create_task(pioneer_tasks::TaskCreateContext::default(), task_params)
+            .await
+        {
+            self.report_turn_failure(
+                thread.id.clone(),
+                launch.turn_id.clone(),
+                TurnFailureRecoveryKind::TurnStart,
+                format!("failed to create detached Composer task: {error:#}"),
+            )
+            .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to create detached Composer task: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if !self
+            .finish_turn_start_success(
+                connection_id,
+                request_id,
+                &outcome,
+                capability_attachments.as_slice(),
+            )
+            .await
+        {
+            return;
+        }
+        let _ = self.complete_turn(thread.id, launch.turn_id, None).await;
     }
 
     pub(super) async fn prepare_api_provider_turn_start(
@@ -3961,8 +4264,12 @@ impl MessageProcessor {
 
         // Spawn background title generation on first turn (fire-and-forget) only for user-origin threads.
         if outcome.materialization.thread.name.is_none()
-            && outcome.materialization.thread.origin_kind
-                == pioneer_protocol::ThreadOriginKind::User
+            && matches!(
+                outcome.materialization.thread.origin_kind,
+                pioneer_protocol::ThreadOriginKind::User
+                    | pioneer_protocol::ThreadOriginKind::Collaborative
+                    | pioneer_protocol::ThreadOriginKind::DirectMessage
+            )
         {
             self.spawn_initial_thread_title_task(
                 outcome.started_notification.thread_id.clone(),
@@ -4043,6 +4350,28 @@ impl MessageProcessor {
         }
 
         if turn.status != TurnStatus::InProgress {
+            if turn.status == TurnStatus::Interrupted
+                && !self
+                    .mark_turn_interrupted(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        turn.error.clone().unwrap_or_else(|| reason.clone()),
+                    )
+                    .await
+            {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "failed to reconcile interrupted turn `{turn_id}` in thread `{thread_id}`"
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
             self.send_turn_cancel_response(
                 connection_id,
                 request_id,
@@ -4132,6 +4461,11 @@ impl MessageProcessor {
             return;
         }
 
+        let cancel_intent_key = (thread_id.clone(), turn_id.clone());
+        self.user_turn_cancel_intents
+            .lock()
+            .await
+            .insert(cancel_intent_key.clone(), reason.clone());
         match self
             .agent_manager
             .cancel_turn(thread_id.as_str(), turn_id.as_str(), reason.as_str())
@@ -4147,6 +4481,10 @@ impl MessageProcessor {
                 );
             }
             Err(error) => {
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -4160,10 +4498,14 @@ impl MessageProcessor {
             }
         }
 
-        if !self
+        let interrupted = self
             .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason)
+            .await;
+        self.user_turn_cancel_intents
+            .lock()
             .await
-        {
+            .remove(&cancel_intent_key);
+        if !interrupted {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(

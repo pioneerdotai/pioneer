@@ -7833,6 +7833,7 @@ mod tests {
             item: TaskTurnItem {
                 id: "task_item".to_owned(),
                 task_id: "task_1".to_owned(),
+                created_by_turn_id: None,
                 run_id: Some("run_1".to_owned()),
                 parent_task_id: None,
                 root_task_id: None,
@@ -7877,6 +7878,7 @@ mod tests {
                 item: TaskTurnItem {
                     id: "task_item_private".to_owned(),
                     task_id: "task_1".to_owned(),
+                    created_by_turn_id: None,
                     run_id: Some("run_1".to_owned()),
                     parent_task_id: None,
                     root_task_id: None,

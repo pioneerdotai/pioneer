@@ -19,10 +19,6 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
-        if self.active_task_thread_navigation().is_some() {
-            return false;
-        }
-
         let composer_text = self.composer_state.read(cx).value();
         let effective_capabilities = self.effective_composer_capabilities();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {

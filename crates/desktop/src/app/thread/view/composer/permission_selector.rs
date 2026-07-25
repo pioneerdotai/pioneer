@@ -59,10 +59,7 @@ impl PioneerDesktop {
                     .small()
                     .ghost()
                     .compact()
-                    .disabled(
-                        self.active_task_thread_navigation().is_some()
-                            || self.desktop_voice_context_locked(),
-                    )
+                    .disabled(self.desktop_voice_context_locked())
                     .child(
                         h_flex()
                             .items_center()

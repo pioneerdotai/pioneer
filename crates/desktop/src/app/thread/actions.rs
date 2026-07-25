@@ -287,6 +287,11 @@ impl PioneerDesktop {
         let Some(thread_id) = self.active_thread_id.clone() else {
             return;
         };
+        let composer_execution_mode = self
+            .thread_coordinator(thread_id.as_str())
+            .and_then(|coordinator| coordinator.thread())
+            .map(|thread| thread.origin_kind.composer_execution_mode())
+            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let composer_attachments = self.composer_attachments.clone();
@@ -381,6 +386,7 @@ impl PioneerDesktop {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
                                     pending_request_id: pending_request_id.clone(),
+                                    composer_execution_mode,
                                     selected_model: selected_model.clone(),
                                     selected_provider: selected_provider.clone(),
                                     turn_model_provider: turn_model_provider.clone(),
@@ -441,10 +447,11 @@ impl PioneerDesktop {
                             return;
                         };
                         conversation.apply(reduction.local_turn_start_requested_event.clone());
-                        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+                        if pioneer_client::timeline::semantic::apply_local_composer_event_to_semantic_timeline(
                             &mut view.semantic_timelines,
                             workspace_id.as_str(),
                             &reduction.local_turn_start_requested_event,
+                            reduction.composer_execution_mode,
                             pioneer_client::timeline::labels::now_unix_ms(),
                         ) {
                             view.semantic_timeline_revision =
@@ -565,14 +572,26 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if let Err(error) = result
-                        && let Some(conversation) = view.thread_conversation_mut(thread_id.as_str())
-                    {
-                        conversation.apply(turn_cancel::local_turn_cancel_rejected_event(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("{error:#}"),
-                        ));
+                    match result {
+                        Ok(response) => {
+                            if let Some(event) = turn_cancel::turn_cancel_response_event(response)
+                                && let Some(conversation) =
+                                    view.thread_conversation_mut(thread_id.as_str())
+                            {
+                                conversation.apply(event);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(conversation) =
+                                view.thread_conversation_mut(thread_id.as_str())
+                            {
+                                conversation.apply(turn_cancel::local_turn_cancel_rejected_event(
+                                    thread_id.clone(),
+                                    turn_id.clone(),
+                                    format!("{error:#}"),
+                                ));
+                            }
+                        }
                     }
 
                     cx.notify();

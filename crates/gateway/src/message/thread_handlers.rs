@@ -143,6 +143,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        let replay_workspace_id = outcome.response.thread.workspace_id.clone();
+        let replay_thread_id = outcome.response.thread.id.clone();
 
         let response = match JsonRpcResponse::from_result(request_id, &outcome.response) {
             Ok(response) => response,
@@ -200,6 +202,13 @@ impl MessageProcessor {
                 error!(error = %error, "failed to serialize thread/started notification");
             }
         }
+
+        self.replay_native_permission_requests_for_thread(
+            connection_id,
+            replay_workspace_id.as_str(),
+            replay_thread_id.as_str(),
+        )
+        .await;
     }
 
     pub(super) async fn thread_tree(

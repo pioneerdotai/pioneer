@@ -1,11 +1,47 @@
 use super::*;
 use anyhow::{Result, anyhow, bail};
+use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const DELIVERY_TURN_ID_LEN: usize = 21;
 
 impl MessageProcessor {
+    pub(super) async fn task_run_awaits_owner_thread_delivery(
+        &self,
+        task_response: &TaskGetResponse,
+        run_id: &str,
+    ) -> Result<bool> {
+        let Some(current) = self
+            .crud_store
+            .get_task(task_response.task.id.as_str())
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !current
+            .runs
+            .iter()
+            .any(|run| run.id == run_id && run.status == TaskRunStatus::Succeeded)
+        {
+            return Ok(false);
+        }
+        let deliveries = self
+            .crud_store
+            .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                workspace_id: current.task.workspace_id.clone(),
+                task_id: Some(current.task.id.clone()),
+                run_id: Some(run_id.to_owned()),
+                statuses: vec![TaskDeliveryStatus::Pending, TaskDeliveryStatus::Delivering],
+                limit: Some(100),
+            })
+            .await?;
+        Ok(deliveries
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.mode == TaskDeliveryMode::OwnerThread))
+    }
+
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
         self.task_runtime
             .service()

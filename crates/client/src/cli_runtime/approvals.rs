@@ -1224,21 +1224,25 @@ mod tests {
     }
 
     #[test]
-    fn native_permission_request_is_visible_in_parent_thread_scope() {
+    fn native_permission_request_is_visible_in_every_ancestor_thread_scope() {
         let mut request = native_permission_request("req_native");
-        request.thread_id = "child_thread".to_owned();
-        request.visible_thread_ids = vec!["parent_thread".to_owned()];
+        request.thread_id = "grandchild_thread".to_owned();
+        request.visible_thread_ids = vec!["child_thread".to_owned(), "root_thread".to_owned()];
         let pending = PendingRequest::from_native_permission_request(request);
         let mut state = PendingRequestState::default();
 
         state.apply(PendingRequestsReduction::Opened(pending.clone()));
 
         assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("grandchild_thread")),
+            vec![pending.clone()]
+        );
+        assert_eq!(
             state.pending_for_scope(Some("ws"), Some("child_thread")),
             vec![pending.clone()]
         );
         assert_eq!(
-            state.pending_for_scope(Some("ws"), Some("parent_thread")),
+            state.pending_for_scope(Some("ws"), Some("root_thread")),
             vec![pending]
         );
         assert!(
@@ -1253,7 +1257,7 @@ mod tests {
 
         assert!(
             state
-                .pending_for_scope(Some("ws"), Some("parent_thread"))
+                .pending_for_scope(Some("ws"), Some("root_thread"))
                 .is_empty()
         );
         assert!(

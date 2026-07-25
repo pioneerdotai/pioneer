@@ -105,7 +105,7 @@ use pioneer_protocol::{
     TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
     TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
     TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
     TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
     TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
@@ -148,7 +148,7 @@ use sea_orm::{
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -6338,6 +6338,364 @@ async fn start_thread_for_artifact_test(
         .response
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
+{
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, _crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            Arc::new(CaptureSummaryProvider::new("detached result")),
+        )),
+        session_manager,
+        workspace_manager,
+        _crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let parent_thread_id = "thr_collaborative_composer";
+    processor
+        .thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: None,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::Collaborative),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("collaborative thread should start");
+
+    let turn_id = "turn_collaborative_message";
+    let request_id = generate_test_request_id("composer", "detached");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": parent_thread_id,
+                    "turn_id": turn_id,
+                    "input": [{"type": "text", "text": "research this asynchronously"}],
+                    "model": "test-model",
+                    "model_provider": "openai",
+                    "mode": "Agent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let started: pioneer_protocol::TurnStartResponse =
+        serde_json::from_value(response.result).expect("turn/start response should decode");
+    assert_eq!(started.turn.id, turn_id);
+
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(pioneer_protocol::TaskListParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("Composer task should be queryable");
+    assert_eq!(tasks.tasks.len(), 1);
+    let task = &tasks.tasks[0];
+    assert_eq!(
+        task.lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment),
+        Some(TaskAttachmentMode::Detached)
+    );
+    let launch = &task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+        .expect("Composer launch snapshot should be durable")
+        .launch;
+    assert_eq!(launch.thread_id, parent_thread_id);
+    assert_eq!(launch.turn_id, turn_id);
+
+    let parent = thread_manager
+        .thread_get(parent_thread_id)
+        .await
+        .expect("parent thread should remain loaded");
+    assert_eq!(parent.status, pioneer_protocol::ThreadStatus::Idle);
+    assert_eq!(
+        ThreadOriginKind::TaskRun.composer_execution_mode(),
+        pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn
+    );
+}
+
+#[test]
+fn collaborative_child_stop_cancels_task_and_survives_late_delivery() {
+    run_large_stack_message_test(
+        "collaborative child cancellation and late delivery test",
+        assert_collaborative_child_stop_cancels_task_and_survives_late_delivery(),
+    );
+}
+
+async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery() {
+    let (tx, mut rx) = mpsc::channel(256);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "delayed"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "too late".to_owned(),
+        }),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager.clone(),
+        provider_registry,
+        session_manager.clone(),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let parent_thread_id = "thr_collab_child_stop";
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("delayed".to_owned()),
+                sandbox: None,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::Collaborative),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("collaborative parent should start");
+
+    let message_turn_id = "turn_collab_child_stop";
+    let start_request_id = generate_test_request_id("collabstop", "start");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": parent_thread_id,
+                    "turn_id": message_turn_id,
+                    "input": [{"type": "text", "text": "keep working until stopped"}],
+                    "model": "test-model",
+                    "model_provider": "delayed",
+                    "mode": "Agent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, start_request_id.as_str()).await;
+
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("Composer task should load");
+    let task = tasks
+        .tasks
+        .first()
+        .cloned()
+        .expect("Composer should create one detached task");
+    let run_id = wait_for_task_run_id(crud_store.clone(), task.id.as_str()).await;
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
+
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: lineage.child_thread_id.clone(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: None,
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("child subscription should start");
+
+    // Keep a workspace-scoped observer that is not subscribed to either
+    // thread. This models a client viewing the child while retaining a cached
+    // parent timeline.
+    let (observer_tx, mut observer_rx) = mpsc::channel(256);
+    let observer_connection_id = session_manager.register_connection(observer_tx).await;
+    session_manager
+        .set_connection_workspace(observer_connection_id, Some(workspace_id.clone()))
+        .await;
+
+    let cancel_request_id = generate_test_request_id("collabstop", "cancel");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": cancel_request_id,
+                "method": "turn/cancel",
+                "params": {
+                    "thread_id": lineage.child_thread_id,
+                    "turn_id": lineage.child_turn_id,
+                    "reason": "user stopped child turn"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (cancel_response, failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
+    let cancel_result: TurnCancelResponse =
+        serde_json::from_value(cancel_response.result).expect("turn/cancel response should decode");
+    assert_eq!(cancel_result.turn.status, TurnStatus::Interrupted);
+    let failed: TurnFailedNotification = serde_json::from_value(
+        failed_notification
+            .params
+            .expect("turn/failed params should exist"),
+    )
+    .expect("turn/failed params should decode");
+    assert_eq!(failed.turn.status, TurnStatus::Interrupted);
+
+    assert_eq!(
+        wait_for_task_status(crud_store.clone(), task.id.as_str(), TaskStatus::Cancelled).await,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run_id.as_str(),
+            TaskRunStatus::Cancelled,
+        )
+        .await,
+        TaskRunStatus::Cancelled
+    );
+    let occurrence_turn_id = lineage
+        .created_by_turn_id
+        .as_deref()
+        .expect("detached child should retain its parent occurrence");
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            occurrence_turn_id,
+            TurnStatus::Interrupted,
+        )
+        .await,
+        TurnStatus::Interrupted
+    );
+
+    let expected_parent_block_id = pioneer_crud::detached_task_run_block_id(
+        occurrence_turn_id,
+        crate::task_tools::task_run_anchor_id(run_id.as_str()).as_str(),
+    );
+    let mut saw_offscreen_parent_refresh = false;
+    for _ in 0..8 {
+        let notification =
+            recv_notification_by_method(&mut observer_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+                .await;
+        let notification: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+            serde_json::from_value(
+                notification
+                    .params
+                    .expect("timeline blocks notification should include params"),
+            )
+            .expect("timeline blocks notification should decode");
+        if notification.thread_id == parent_thread_id
+            && notification
+                .changed_block_ids
+                .contains(&expected_parent_block_id)
+        {
+            saw_offscreen_parent_refresh = true;
+            break;
+        }
+    }
+    assert!(
+        saw_offscreen_parent_refresh,
+        "a workspace client viewing the child must receive the parent Task-card refresh"
+    );
+
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(2), 10)
+        .await
+        .expect("cancelled API child delivery worker should run");
+    let (_, reloaded_occurrence) = crud_store
+        .get_turn(parent_thread_id, occurrence_turn_id)
+        .await
+        .expect("occurrence should reload")
+        .expect("occurrence should exist");
+    assert_eq!(
+        reloaded_occurrence.status,
+        TurnStatus::Interrupted,
+        "late cancellation delivery must preserve the durable interrupted state"
+    );
+    let anchor = wait_for_task_anchor_item_status(
+        crud_store,
+        occurrence_turn_id,
+        crate::task_tools::task_run_anchor_id(run_id.as_str()).as_str(),
+        TaskStatus::Cancelled,
+    )
+    .await;
+    assert_eq!(anchor.status, TaskStatus::Cancelled);
+}
+
 async fn ingest_user_test_artifact(
     processor: &MessageProcessor,
     workspace_id: &str,
@@ -10428,6 +10786,40 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         .await
         .expect("run completed event should project occurrence turn");
     assert_eq!(
+        crud_store
+            .get_turn(parent_thread_id, accepted.run.id.as_str())
+            .await
+            .expect("occurrence turn lookup should succeed")
+            .expect("occurrence turn should exist")
+            .1
+            .status,
+        TurnStatus::InProgress,
+        "accepted result must keep the parent occurrence active until delivery"
+    );
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+        .await
+        .expect("accepted result delivery should run");
+    let delivery_delivered_event = processor
+        .task_runtime
+        .service()
+        .list_task_events_after(accepted.task.id.as_str(), 0)
+        .await
+        .expect("task events should list after delivery")
+        .into_iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                TaskEventPayload::DeliveryDelivered { delivery, .. }
+                    if delivery.run_id == accepted.run.id
+            )
+        })
+        .expect("accepted result should emit DeliveryDelivered");
+    processor
+        .emit_task_event(delivery_delivered_event)
+        .await
+        .expect("delivery event should complete occurrence turn");
+    assert_eq!(
         wait_for_turn_status(
             crud_store.clone(),
             parent_thread_id,
@@ -12984,7 +13376,19 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         .expect("occurrence turn should exist");
     assert_eq!(occurrence_turn.turn_kind, TurnKind::TaskRun);
     assert_eq!(occurrence_turn.origin, TurnOrigin::DetachedTask);
-    assert_eq!(occurrence_turn.status, TurnStatus::Completed);
+    assert_eq!(
+        occurrence_turn.status,
+        TurnStatus::InProgress,
+        "the parent occurrence must remain active until its final AgentMessage is delivered"
+    );
+    let anchor_item_id = crate::task_tools::task_run_anchor_id(run.id.as_str());
+    let pending_delivery_anchor =
+        load_task_anchor_item(crud_store.clone(), run.id.as_str(), anchor_item_id.as_str()).await;
+    assert_eq!(
+        pending_delivery_anchor.status,
+        TaskStatus::Running,
+        "the parent Task card must remain running while owner-thread delivery is pending"
+    );
 
     let occurrence_items = crud_store
         .get_turn_item_events(parent_thread_id, run.id.as_str())
@@ -13016,13 +13420,13 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             && block.source_key.as_deref()
                 == Some(crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str())
     }));
-    let completed_card = projected_blocks
+    let pending_delivery_card = projected_blocks
         .iter()
         .find(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN)
-        .expect("completed detached card should remain in the timeline");
-    assert_eq!(completed_card.block_id, running_card_id);
+        .expect("pending-delivery detached card should remain in the timeline");
+    assert_eq!(pending_delivery_card.block_id, running_card_id);
     assert_eq!(
-        completed_card.sort_key, running_card_sort_key,
+        pending_delivery_card.sort_key, running_card_sort_key,
         "Task status updates must not move the standalone card"
     );
     assert!(
@@ -13077,6 +13481,25 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         Some(run.id.as_str()),
         "result should be appended to the Task occurrence turn"
     );
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            run.id.as_str(),
+            TurnStatus::Completed,
+        )
+        .await,
+        TurnStatus::Completed,
+        "the parent occurrence may complete only after owner-thread delivery"
+    );
+    let delivered_anchor = wait_for_task_anchor_item_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        anchor_item_id.as_str(),
+        TaskStatus::Completed,
+    )
+    .await;
+    assert_eq!(delivered_anchor.status, TaskStatus::Completed);
 
     let delivered_items = crud_store
         .get_turn_item_events(parent_thread_id, run.id.as_str())
@@ -13099,6 +13522,36 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(
         delivered_agent_messages, 1,
         "background result must be delivered to the parent exactly once"
+    );
+    let delivered_message_index = delivered_items
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::AgentMessage { text, .. },
+                    ..
+                } if text.contains("immediate background result")
+            )
+        })
+        .expect("delivered AgentMessage event should exist");
+    let completed_card_index = delivered_items
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemUpdated {
+                    item: TurnItem::Task { item },
+                    ..
+                } if item.id == anchor_item_id && item.status == TaskStatus::Completed
+            )
+        })
+        .expect("terminal Task card update should exist");
+    assert!(
+        delivered_message_index < completed_card_index,
+        "the complete AgentMessage must be committed before the parent Task card becomes completed"
     );
     let ingestion_calls = delivery_ingestor.calls.lock().await;
     assert_eq!(
@@ -13446,6 +13899,322 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     );
 
     let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage() {
+    for (runtime_id, runtime_kind, model) in [
+        ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
+        ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
+    ] {
+        let (tx, mut rx) = mpsc::channel(128);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("thread-default-model", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+        let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let processor = Arc::new(
+            MessageProcessor::new(
+                thread_manager.clone(),
+                test_provider(),
+                session_manager,
+                workspace_manager,
+                crud_store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_context_budget(),
+                test_tool_loop_config(),
+            )
+            .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+        );
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+
+        let parent_thread_id = format!("thr_dynamic_native_{runtime_id}");
+        thread_manager
+            .thread_start(
+                connection_id,
+                workspace_id.clone(),
+                ThreadStartParams {
+                    thread_id: parent_thread_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    name: Some(format!("Dynamic {runtime_id} parent")),
+                    model: Some("thread-default-model".to_owned()),
+                    model_provider: Some("openai".to_owned()),
+                    sandbox: Some(SandboxMode::FullAccess),
+                    mode: Some(ThreadMode::Agent),
+                    origin_kind: Some(ThreadOriginKind::Collaborative),
+                    sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                    agent_nickname: None,
+                    agent_role: None,
+                },
+            )
+            .await
+            .expect("collaborative native parent should start");
+
+        let turn_id = format!("turn_dynamic_native_{runtime_id}");
+        let request_id = generate_test_request_id("dynamic", runtime_id);
+        let input_marker = format!("dynamic Composer request for {runtime_id}");
+        let launch = pioneer_protocol::TurnStartParams {
+            thread_id: parent_thread_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![UserInput::Text {
+                text: input_marker.clone(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: Some(model.to_owned()),
+            // This is the real shell contract for CLI runtimes. The backend,
+            // not the parent thread's API provider, owns provider identity.
+            model_provider: None,
+            sandbox_policy: Some(pioneer_protocol::SandboxPolicy::from_mode(
+                SandboxMode::FullAccess,
+            )),
+            mode: Some(ThreadMode::Agent),
+            execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: runtime_id.to_owned(),
+                runtime_kind,
+            }),
+            reasoning: None,
+            permission_profile: Some(
+                pioneer_protocol::TurnPermissionProfileSelection::full_access(),
+            ),
+            cli_runtime_options: Some(pioneer_protocol::TurnCLIRuntimeOptions {
+                sandbox: None,
+                effort: None,
+                personality: Some(format!("{runtime_id}-dynamic-personality")),
+                summary: Some(format!("{runtime_id}-dynamic-summary")),
+                steer_if_active: None,
+            }),
+        };
+        cli_session
+            .set_next_native_turn_id(format!("native_dynamic_turn_{runtime_id}"))
+            .await;
+        processor
+            .process_request(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": serde_json::to_value(&launch)
+                        .expect("dynamic CLI launch should serialize")
+                })
+                .to_string(),
+            )
+            .await;
+
+        let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let started: pioneer_protocol::TurnStartResponse =
+            serde_json::from_value(response.result).expect("turn/start response should decode");
+        assert_eq!(started.turn.id, turn_id);
+        assert!(
+            crud_store
+                .get_turn_work_projection(turn_id.as_str())
+                .await
+                .expect("message-only turn work projection should load")
+                .is_none(),
+            "the completed parent message-only turn must not leave an empty Worked block"
+        );
+
+        let tasks = processor
+            .task_runtime
+            .service()
+            .list_tasks(pioneer_protocol::TaskListParams {
+                workspace_id: workspace_id.clone(),
+                owner_kind: Some(TaskOwnerKind::Thread),
+                owner_id: Some(parent_thread_id.clone()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("dynamic Composer task should list");
+        assert_eq!(tasks.tasks.len(), 1);
+        let task_response = crud_store
+            .get_task(tasks.tasks[0].id.as_str())
+            .await
+            .expect("dynamic Composer task should load")
+            .expect("dynamic Composer task should exist");
+        assert_eq!(
+            task_response
+                .agent_specs
+                .first()
+                .and_then(|spec| spec.model_provider.as_deref()),
+            Some(format!("cli_runtime:{runtime_id}").as_str()),
+            "the Task agent spec must not inherit the parent API provider"
+        );
+        assert_eq!(
+            task_response
+                .task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .and_then(|work| work.launch.model_provider.as_deref()),
+            None,
+            "the exact shell launch snapshot should retain its absent provider claim"
+        );
+        let run = task_response
+            .runs
+            .first()
+            .cloned()
+            .expect("immediate dynamic Composer task should have a run");
+        let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+        let occurrence_blocks = thread_timeline_block::Entity::find()
+            .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id.as_str()))
+            .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
+            .all(&crud_store.database_connection())
+            .await
+            .expect("dynamic Composer occurrence blocks should load");
+        assert!(
+            occurrence_blocks
+                .iter()
+                .any(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN),
+            "the parent timeline must contain the standalone Task card"
+        );
+        assert!(
+            occurrence_blocks
+                .iter()
+                .all(|block| block.block_kind != BLOCK_KIND_TURN_WORK),
+            "the detached occurrence itself must not create a Worked group"
+        );
+        let source_user_block = thread_timeline_block::Entity::find()
+            .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id.as_str()))
+            .filter(thread_timeline_block::Column::TurnId.eq(turn_id.as_str()))
+            .filter(
+                thread_timeline_block::Column::BlockKind.eq(pioneer_crud::BLOCK_KIND_USER_MESSAGE),
+            )
+            .one(&crud_store.database_connection())
+            .await
+            .expect("dynamic Composer source user block should load")
+            .expect("dynamic Composer source user block should exist");
+        let task_card = occurrence_blocks
+            .iter()
+            .find(|block| block.block_kind == BLOCK_KIND_DETACHED_TASK_RUN)
+            .expect("dynamic Composer Task card should exist");
+        assert!(
+            source_user_block.sort_key.as_str() < task_card.sort_key.as_str(),
+            "the standalone Task card must sort after the user message that created it"
+        );
+        let source_sort_base = source_user_block
+            .sort_key
+            .split(":000:")
+            .next()
+            .expect("source user sort key should contain its rank");
+        assert!(
+            task_card.sort_key.starts_with(source_sort_base),
+            "the standalone Task card must inherit its source message causal sort base"
+        );
+        let task_card_item_id = task_card
+            .source_key
+            .clone()
+            .expect("dynamic Composer Task card should retain its source item");
+        let Some(TurnItem::Task {
+            item: mut legacy_task_item,
+        }) = crud_store
+            .get_turn_item(run.id.as_str(), task_card_item_id.as_str())
+            .await
+            .expect("dynamic Composer Task item should load")
+        else {
+            panic!("dynamic Composer Task item should exist");
+        };
+        assert_eq!(
+            legacy_task_item.created_by_turn_id.as_deref(),
+            Some(turn_id.as_str())
+        );
+        legacy_task_item.created_by_turn_id = None;
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: parent_thread_id.clone(),
+                    turn_id: run.id.clone(),
+                    item: TurnItem::Task {
+                        item: legacy_task_item,
+                    },
+                },
+                super::now_timestamp_secs(),
+            )
+            .await
+            .expect("legacy Task item snapshot should reproject through durable Task lineage");
+        let reprojected_task_card = thread_timeline_block::Entity::find()
+            .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id.as_str()))
+            .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
+            .filter(
+                thread_timeline_block::Column::BlockKind
+                    .eq(pioneer_crud::BLOCK_KIND_DETACHED_TASK_RUN),
+            )
+            .one(&crud_store.database_connection())
+            .await
+            .expect("reprojected legacy Task card should load")
+            .expect("reprojected legacy Task card should exist");
+        assert!(
+            reprojected_task_card.sort_key.starts_with(source_sort_base),
+            "projection rebuild must recover the source sort base from the durable Task row"
+        );
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].model.as_deref(), Some(model));
+        assert!(
+            starts[0].input.to_string().contains(input_marker.as_str()),
+            "the native runtime must receive the exact Composer input"
+        );
+        let child_thread = crud_store
+            .get_thread_model(lineage.child_thread_id.as_str())
+            .await
+            .expect("hidden child thread should load")
+            .expect("hidden child thread should exist");
+        assert_eq!(
+            child_thread.model_provider,
+            format!("cli_runtime:{runtime_id}")
+        );
+
+        complete_recorded_cli_task_turn(
+            &processor,
+            &cli_manager,
+            workspace_id.as_str(),
+            runtime_id,
+            parent_thread_id.as_str(),
+            starts[0].native_thread_id.as_str(),
+            format!("native_dynamic_turn_{runtime_id}").as_str(),
+            format!(
+                r#"<task_result>{{"summary":"{runtime_id} dynamic result","data":{{"runtime":"{runtime_id}"}}}}</task_result>"#
+            )
+            .as_str(),
+        )
+        .await;
+        assert_eq!(
+            wait_for_task_status(
+                crud_store.clone(),
+                task_response.task.id.as_str(),
+                TaskStatus::Completed,
+            )
+            .await,
+            TaskStatus::Completed,
+            "{runtime_id} dynamic Composer Task should complete"
+        );
+        processor
+            .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+            .await
+            .expect("dynamic Composer delivery worker should run");
+        let occurrence_items = crud_store
+            .get_turn_item_events(parent_thread_id.as_str(), run.id.as_str())
+            .await
+            .expect("dynamic Composer occurrence items should load")
+            .expect("dynamic Composer occurrence turn should exist");
+        assert!(occurrence_items.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::AgentMessage { text, .. },
+                    ..
+                } if text.contains(format!("{runtime_id} dynamic result").as_str())
+            )
+        }));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13892,6 +14661,21 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
         .await,
         TaskRunStatus::Cancelled
     );
+    let first_occurrence_turn_id = first_lineage
+        .created_by_turn_id
+        .as_deref()
+        .expect("cancelled detached Task should retain its parent occurrence turn");
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            first_occurrence_turn_id,
+            TurnStatus::Interrupted,
+        )
+        .await,
+        TurnStatus::Interrupted,
+        "Task cancellation must project as an interrupted occurrence, not a failure"
+    );
 
     cli_session
         .set_next_native_turn_id("native_cancel_turn_2")
@@ -13933,6 +14717,230 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
         TaskStatus::Completed
     );
     let _ = second_run;
+}
+
+#[test]
+fn cancelling_detached_native_child_turn_cancels_parent_task_anchor() {
+    run_large_stack_message_test(
+        "detached native child cancellation projection test",
+        assert_detached_native_child_turn_cancellation(),
+    );
+}
+
+async fn assert_detached_native_child_turn_cancellation() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager),
+    );
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let parent_thread_id = "thr_native_child_turn_cancel";
+    let source_turn_id = "turn_native_child_turn_cancel_source";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        parent_thread_id,
+        source_turn_id,
+        "CANCEL CHILD TURN PARENT HISTORY",
+    )
+    .await;
+    cli_session
+        .set_next_native_turn_id("native_child_turn_cancel")
+        .await;
+    let created = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id,
+            source_turn_id,
+            "claude",
+            CLIAgentRuntimeKind::Claude,
+            "claude-sonnet",
+            "cancel this child turn from its Composer",
+        ),
+    )
+    .await
+    .expect("cancellable native child Task should start");
+    let run = created
+        .run
+        .clone()
+        .expect("cancellable child run should exist");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+    assert_eq!(starts.len(), 1);
+
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: lineage.child_thread_id.clone(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: None,
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("child thread subscription should succeed");
+
+    let cancel_request_id = generate_test_request_id("childturncancel", "stop");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": cancel_request_id,
+                "method": "turn/cancel",
+                "params": {
+                    "thread_id": lineage.child_thread_id,
+                    "turn_id": lineage.child_turn_id,
+                    "reason": "user stopped child turn"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (cancel_response, failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
+    let cancel_result: TurnCancelResponse =
+        serde_json::from_value(cancel_response.result).expect("turn/cancel response should decode");
+    assert_eq!(cancel_result.turn.status, TurnStatus::Interrupted);
+    let failed: TurnFailedNotification = serde_json::from_value(
+        failed_notification
+            .params
+            .expect("turn/failed params should exist"),
+    )
+    .expect("turn/failed params should decode");
+    assert_eq!(failed.turn.status, TurnStatus::Interrupted);
+
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            created.task.id.as_str(),
+            TaskStatus::Cancelled,
+        )
+        .await,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::Cancelled
+        )
+        .await,
+        TaskRunStatus::Cancelled
+    );
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn should reload")
+        .expect("task run turn should exist");
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::Cancelled);
+
+    let parent_occurrence_turn_id = lineage
+        .created_by_turn_id
+        .as_deref()
+        .expect("detached child lineage should point at its parent occurrence turn");
+    let parent_anchor = wait_for_task_anchor_item_status(
+        crud_store.clone(),
+        parent_occurrence_turn_id,
+        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+        TaskStatus::Cancelled,
+    )
+    .await;
+    assert_eq!(parent_anchor.status, TaskStatus::Cancelled);
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            parent_occurrence_turn_id,
+            TurnStatus::Interrupted,
+        )
+        .await,
+        TurnStatus::Interrupted
+    );
+
+    // Cancellation also produces a terminal owner-thread delivery. That
+    // delivery must never overwrite the already-interrupted occurrence turn
+    // with `Completed`; reloading the parent timeline reads this durable turn.
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(2), 10)
+        .await
+        .expect("cancelled child delivery worker should run");
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(created.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("cancelled child deliveries should reload");
+    assert!(
+        !deliveries.deliveries.is_empty(),
+        "cancelled child should enqueue an owner-thread delivery"
+    );
+    assert!(
+        deliveries
+            .deliveries
+            .iter()
+            .all(|delivery| delivery.status == TaskDeliveryStatus::Delivered),
+        "all cancellation deliveries should be terminal before the reload assertion"
+    );
+    let (_, reloaded_occurrence_turn) = crud_store
+        .get_turn(parent_thread_id, parent_occurrence_turn_id)
+        .await
+        .expect("parent occurrence should reload")
+        .expect("parent occurrence should remain durable");
+    assert_eq!(
+        reloaded_occurrence_turn.status,
+        TurnStatus::Interrupted,
+        "late delivery must not turn a cancelled occurrence into Completed"
+    );
+    let reloaded_anchor = wait_for_task_anchor_item_status(
+        crud_store,
+        parent_occurrence_turn_id,
+        crate::task_tools::task_run_anchor_id(run.id.as_str()).as_str(),
+        TaskStatus::Cancelled,
+    )
+    .await;
+    assert_eq!(reloaded_anchor.status, TaskStatus::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14703,6 +15711,163 @@ async fn task_depth_limit_rejects_subtask_creation() {
         .await
         .expect_err("child task beyond max depth should fail");
     assert!(format!("{error:#}").contains("exceeds max depth"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![
+            ProviderToolCall {
+                id: "call_create_nested_subagent".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: json!({
+                    "title": "Nested permission subagent",
+                    "goal": "Complete nested attached work",
+                    "instructions": ["Return a concise nested result."]
+                })
+                .to_string(),
+            },
+            ProviderToolCall {
+                id: "call_create_nested_background_task".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: json!({
+                    "title": "Nested permission background task",
+                    "goal": "Complete nested detached work",
+                    "instructions": ["Return a concise nested result."],
+                    "background": true
+                })
+                .to_string(),
+            },
+        ],
+        r#"<task_result>{"summary":"nested work completed"}</task_result>"#,
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "nested", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "nested"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let root_thread_id = "thread_nested_permission_root";
+    let root_turn_id = "turn_nested_permission_root";
+    let mut root_params = test_task_create_params(
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+        "Root task creates a nested worker",
+        3,
+    );
+    root_params
+        .agent_spec
+        .as_mut()
+        .expect("root agent spec should exist")
+        .model_provider = Some("nested".to_owned());
+    let root = create_task_for_test(&processor, root_params)
+        .await
+        .expect("root task should start");
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            root.task.id.as_str(),
+            pioneer_protocol::TaskStatus::Completed,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::Completed,
+        "root task should complete after its nested attached task"
+    );
+
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(pioneer_protocol::TaskListParams {
+            workspace_id: workspace_id.clone(),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("nested task list should load");
+    let nested = tasks
+        .tasks
+        .iter()
+        .filter(|task| task.parent_task_id.as_deref() == Some(root.task.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        nested.len(),
+        2,
+        "the child should create one attached subagent and one detached task"
+    );
+    assert!(
+        nested.iter().any(|task| {
+            task.lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment)
+                == Some(TaskAttachmentMode::Attached)
+        }),
+        "nested task set should include an attached subagent"
+    );
+    assert!(
+        nested.iter().any(|task| {
+            task.lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment)
+                == Some(TaskAttachmentMode::Detached)
+        }),
+        "nested task set should include a detached task"
+    );
+
+    let root_response = crud_store
+        .get_task(root.task.id.as_str())
+        .await
+        .expect("root task should reload")
+        .expect("root task should exist");
+    let root_lineage = root_response
+        .thread_lineage
+        .last()
+        .expect("root task should have an executor child thread");
+    assert_eq!(root_lineage.parent_thread_id, root_thread_id);
+    assert_eq!(root_lineage.root_thread_id, root_thread_id);
+    for nested_task in nested {
+        assert_eq!(
+            nested_task.root_task_id.as_deref(),
+            Some(root.task.id.as_str())
+        );
+        assert_eq!(
+            nested_task.created_by_thread_id.as_deref(),
+            Some(root_lineage.child_thread_id.as_str())
+        );
+
+        let nested_response = crud_store
+            .get_task(nested_task.id.as_str())
+            .await
+            .expect("nested task should reload")
+            .expect("nested task should exist");
+        let nested_lineage = nested_response
+            .thread_lineage
+            .last()
+            .expect("nested task should have a grandchild executor thread");
+        assert_eq!(
+            nested_lineage.parent_thread_id,
+            root_lineage.child_thread_id
+        );
+        assert_eq!(nested_lineage.root_thread_id, root_thread_id);
+        assert_eq!(nested_lineage.depth, 2);
+        assert_eq!(
+            nested_response.agent_specs.last().map(|spec| spec.depth),
+            Some(2)
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17160,6 +18325,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
             item: TaskTurnItem {
                 id: "task_summary_item".to_owned(),
                 task_id: "task_1".to_owned(),
+                created_by_turn_id: None,
                 run_id: Some("run_1".to_owned()),
                 parent_task_id: None,
                 root_task_id: None,
@@ -24083,7 +25249,8 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_permission_request_from_child_is_visible_in_parent_thread_scope() {
+async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_scopes_and_resolves_from_root()
+ {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -24095,7 +25262,7 @@ async fn native_permission_request_from_child_is_visible_in_parent_thread_scope(
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
-        session_manager,
+        session_manager.clone(),
         workspace_manager,
         crud_store,
         test_gateway_secrets(),
@@ -24103,11 +25270,20 @@ async fn native_permission_request_from_child_is_visible_in_parent_thread_scope(
         test_context_budget(),
         test_tool_loop_config(),
     );
-    let parent_thread_id = "thread_native_permission_parent";
-    let parent_turn_id = "turn_native_permission_parent";
+    let root_thread_id = "thread_native_permission_root";
+    let root_turn_id = "turn_native_permission_root";
     let child_thread_id = "thread_native_permission_child";
     let child_turn_id = "turn_native_permission_child";
+    let grandchild_thread_id = "thread_native_permission_grandchild";
+    let grandchild_turn_id = "turn_native_permission_grandchild";
 
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+    )
+    .await;
     processor
         .crud_store
         .append_task_event(
@@ -24116,12 +25292,12 @@ async fn native_permission_request_from_child_is_visible_in_parent_thread_scope(
                 run_id: "run_native_permission_child".to_owned(),
                 lineage: TaskThreadLineage {
                     child_thread_id: child_thread_id.to_owned(),
-                    parent_thread_id: parent_thread_id.to_owned(),
-                    root_thread_id: parent_thread_id.to_owned(),
+                    parent_thread_id: root_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
                     depth: 1,
                     origin_kind: Some("task_run".to_owned()),
-                    created_by_thread_id: Some(parent_thread_id.to_owned()),
-                    created_by_turn_id: Some(parent_turn_id.to_owned()),
+                    created_by_thread_id: Some(root_thread_id.to_owned()),
+                    created_by_turn_id: Some(root_turn_id.to_owned()),
                     created_at: 10,
                 },
             },
@@ -24129,24 +25305,45 @@ async fn native_permission_request_from_child_is_visible_in_parent_thread_scope(
         )
         .await
         .expect("child task lineage should persist");
-    let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_native_permission_grandchild".to_owned(),
+                run_id: "run_native_permission_grandchild".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: grandchild_thread_id.to_owned(),
+                    parent_thread_id: child_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 2,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(child_thread_id.to_owned()),
+                    created_by_turn_id: Some(child_turn_id.to_owned()),
+                    created_at: 11,
+                },
+            },
+            11,
+        )
+        .await
+        .expect("grandchild task lineage should persist");
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
     processor
         .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
-            request_id: "perm-approval-child-visible-1".to_owned(),
+            request_id: "perm-approval-grandchild-visible-1".to_owned(),
             workspace_id: Some(workspace_id.clone()),
-            thread_id: Some(child_thread_id.to_owned()),
-            turn_id: Some(child_turn_id.to_owned()),
+            thread_id: Some(grandchild_thread_id.to_owned()),
+            turn_id: Some(grandchild_turn_id.to_owned()),
             tool_name: "exec_command".to_owned(),
             key: pioneer_tools::PermissionRequestKey {
                 profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
                 tool_name: "exec_command".to_owned(),
                 action: pioneer_tools::PermissionActionKind::ShellCommand,
-                normalized_scope_hash: "scope-hash-child-visible".to_owned(),
-                turn_id: child_turn_id.to_owned(),
+                normalized_scope_hash: "scope-hash-grandchild-visible".to_owned(),
+                turn_id: grandchild_turn_id.to_owned(),
             },
             reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
-            summary: Some("run child shell command".to_owned()),
+            summary: Some("run grandchild shell command".to_owned()),
             details: Vec::new(),
             respond_to: respond_tx,
         })
@@ -24157,15 +25354,82 @@ async fn native_permission_request_from_child_is_visible_in_parent_thread_scope(
     let opened_params = opened.params.as_ref().expect("opened params");
     assert_eq!(
         opened_params["request"]["thread_id"],
-        serde_json::json!(child_thread_id)
+        serde_json::json!(grandchild_thread_id)
     );
     assert_eq!(
         opened_params["request"]["turn_id"],
-        serde_json::json!(child_turn_id)
+        serde_json::json!(grandchild_turn_id)
     );
     assert_eq!(
         opened_params["request"]["visible_thread_ids"],
-        serde_json::json!([parent_thread_id])
+        serde_json::json!([child_thread_id, root_thread_id])
+    );
+
+    let (replay_tx, mut replay_rx) = mpsc::channel(16);
+    let replay_connection_id = session_manager.register_connection(replay_tx).await;
+    let replay_start_request_id = "permreplaystart000001";
+    processor
+        .process_request(
+            replay_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": replay_start_request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": root_thread_id,
+                    "workspace_id": workspace_id,
+                    "mode": "Agent",
+                    "model": "test-model",
+                    "model_provider": "openai"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut replay_rx, replay_start_request_id).await;
+    let _ = recv_notification_by_method(&mut replay_rx, events::THREAD_STARTED).await;
+    let replayed =
+        recv_notification_by_method(&mut replay_rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    assert_eq!(
+        replayed.params.as_ref().expect("replayed request params")["request"]["request_id"],
+        serde_json::json!("perm-approval-grandchild-visible-1")
+    );
+
+    let respond_request_id = "permgranddeny00000001";
+    message_future(
+        processor.process_request(
+            replay_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": respond_request_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": "perm-approval-grandchild-visible-1",
+                    "resolution": "deny"
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    let (response, resolved) = recv_response_and_notification_by_id_method(
+        &mut replay_rx,
+        respond_request_id,
+        events::TURN_PERMISSION_REQUEST_RESOLVED,
+    )
+    .await;
+    assert_eq!(response.result["resolution"], serde_json::json!("deny"));
+    assert_eq!(
+        resolved.params.as_ref().expect("resolved params")["thread_id"],
+        serde_json::json!(grandchild_thread_id)
+    );
+    assert_eq!(
+        respond_rx
+            .await
+            .expect("grandchild permission broker should receive root response"),
+        pioneer_tools::PermissionApprovalResolution::Deny {
+            message: "permission request denied by user".to_owned()
+        }
     );
 }
 
@@ -24524,6 +25788,170 @@ async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     assert_eq!(
         stored.status,
         pioneer_crud::CliRuntimePendingRequestStatus::Answered
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reaches_origin_session() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let root_thread_id = "thread_cli_approval_root";
+    let root_turn_id = "turn_cli_approval_root";
+    let child_thread_id = "thread_cli_approval_child";
+    let child_turn_id = "turn_cli_approval_child";
+    let grandchild_thread_id = "thread_cli_command_approval";
+    let grandchild_turn_id = "codex-turn-command";
+
+    materialize_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+    )
+    .await;
+    materialize_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        child_thread_id,
+        child_turn_id,
+    )
+    .await;
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_cli_approval_child".to_owned(),
+                run_id: "run_cli_approval_child".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: child_thread_id.to_owned(),
+                    parent_thread_id: root_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(root_thread_id.to_owned()),
+                    created_by_turn_id: Some(root_turn_id.to_owned()),
+                    created_at: 10,
+                },
+            },
+            10,
+        )
+        .await
+        .expect("child task lineage should persist");
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_cli_approval_grandchild".to_owned(),
+                run_id: "run_cli_approval_grandchild".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: grandchild_thread_id.to_owned(),
+                    parent_thread_id: child_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 2,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(child_thread_id.to_owned()),
+                    created_by_turn_id: Some(child_turn_id.to_owned()),
+                    created_at: 11,
+                },
+            },
+            11,
+        )
+        .await
+        .expect("grandchild task lineage should persist");
+
+    let opened = open_test_codex_command_approval(
+        &processor,
+        &mut rx,
+        workspace_id.as_str(),
+        json!("grandchild-native-approval"),
+    )
+    .await;
+    let page_before = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        root_thread_id,
+        "clipermrootbefore0001",
+    )
+    .await;
+    let proxy = page_before
+        .blocks
+        .iter()
+        .find(|block| {
+            matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::PendingRequest {
+                    request_id,
+                    status: pioneer_protocol::CLIRuntimePendingRequestStatus::Pending,
+                    ..
+                } if request_id == &opened.request_id
+            )
+        })
+        .expect("root timeline should contain the grandchild approval proxy");
+    assert_eq!(proxy.thread_id, grandchild_thread_id);
+    assert_eq!(proxy.turn_id.as_deref(), Some(grandchild_turn_id));
+
+    let respond_request_id = "clipermrootdeny000001";
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": respond_request_id,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": opened.request_id,
+                    "resolution": {
+                        "status": "denied",
+                        "reason": "denied from root parent"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        respond_request_id,
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let result: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("respond result should decode");
+    assert_eq!(
+        result.resolution,
+        CLIRuntimeRequestResolution::Denied {
+            reason: Some("denied from root parent".to_owned())
+        }
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(
+        responses.as_slice(),
+        [(
+            json!("grandchild-native-approval"),
+            json!({ "decision": "decline" })
+        )]
+    );
+    drop(responses);
+
+    let page_after = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        root_thread_id,
+        "clipermrootafter00001",
+    )
+    .await;
+    assert!(
+        page_after.blocks.iter().all(|block| {
+            !matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::PendingRequest { request_id, .. }
+                    if request_id == &opened.request_id
+            )
+        }),
+        "resolved grandchild approval must disappear from the root timeline"
     );
 }
 
@@ -27064,8 +28492,15 @@ async fn turn_get_returns_turn_snapshot() {
     assert_eq!(turn_get.turn.id, "turn_000000000000000021");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
+#[test]
+fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
+    run_large_stack_message_test(
+        "turn cancel interruption and idempotency test",
+        assert_turn_cancel_interrupts_running_turn_and_is_idempotent(),
+    );
+}
+
+async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -29680,17 +31115,26 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread() {
-    let mut harness = setup_live_semantic_timeline_harness("child_approval").await;
+async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_ancestor() {
+    let mut harness = setup_live_semantic_timeline_harness("grandchild_approval").await;
     let now = chrono::Utc::now().fixed_offset();
-    let child_thread_id = "thr_semantic_live_child_approval_child";
-    let child_turn_id = "turn_semantic_live_child_approval_child";
-    let request_id = "semantic_live_child_approval_req";
+    let child_thread_id = "thr_semantic_live_grandchild_approval_child";
+    let child_turn_id = "turn_semantic_live_grandchild_approval_child";
+    let grandchild_thread_id = "thr_semantic_live_grandchild_approval_grandchild";
+    let grandchild_turn_id = "turn_semantic_live_grandchild_approval_grandchild";
+    let request_id = "semantic_live_grandchild_approval_req";
     materialize_artifact_api_thread(
         harness.processor.crud_store.as_ref(),
         harness.workspace_id.as_str(),
         child_thread_id,
         child_turn_id,
+    )
+    .await;
+    materialize_artifact_api_thread(
+        harness.processor.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        grandchild_thread_id,
+        grandchild_turn_id,
     )
     .await;
     harness
@@ -29715,14 +31159,36 @@ async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread(
         )
         .await
         .expect("child task lineage should persist");
+    harness
+        .processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_semantic_live_grandchild_approval".to_owned(),
+                run_id: "run_semantic_live_grandchild_approval".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: grandchild_thread_id.to_owned(),
+                    parent_thread_id: child_thread_id.to_owned(),
+                    root_thread_id: harness.thread_id.clone(),
+                    depth: 2,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(child_thread_id.to_owned()),
+                    created_by_turn_id: Some(child_turn_id.to_owned()),
+                    created_at: 11,
+                },
+            },
+            11,
+        )
+        .await
+        .expect("grandchild task lineage should persist");
 
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
-        title: Some("Run child command".to_owned()),
-        message: Some("Approve child semantic live command".to_owned()),
-        native_request_id: Some("semantic-native-child-approval".to_owned()),
+        title: Some("Run grandchild command".to_owned()),
+        message: Some("Approve grandchild semantic live command".to_owned()),
+        native_request_id: Some("semantic-native-grandchild-approval".to_owned()),
         payload: Some(json!({
-            "command": "echo child approval"
+            "command": "echo grandchild approval"
         })),
     };
     harness
@@ -29732,11 +31198,11 @@ async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread(
             runtime_id: "codex".to_owned(),
             runtime_kind: "codex".to_owned(),
             workspace_id: harness.workspace_id.clone(),
-            thread_id: child_thread_id.to_owned(),
-            turn_id: Some(child_turn_id.to_owned()),
-            native_thread_id: Some("semantic-native-child-thread".to_owned()),
-            native_turn_id: Some("semantic-native-child-turn".to_owned()),
-            native_item_id: Some("semantic-native-child-item".to_owned()),
+            thread_id: grandchild_thread_id.to_owned(),
+            turn_id: Some(grandchild_turn_id.to_owned()),
+            native_thread_id: Some("semantic-native-grandchild-thread".to_owned()),
+            native_turn_id: Some("semantic-native-grandchild-turn".to_owned()),
+            native_item_id: Some("semantic-native-grandchild-item".to_owned()),
             request_kind: "command_approval".to_owned(),
             payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
                 .expect("pending request payload should serialize"),
@@ -29746,22 +31212,50 @@ async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread(
         .await
         .expect("child pending request should open");
 
-    let blocks_changed =
-        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
-    let blocks_changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
-        serde_json::from_value(
-            blocks_changed
-                .params
-                .expect("timeline blocks notification should include params"),
-        )
-        .expect("timeline blocks notification should decode");
-    assert_eq!(blocks_changed.thread_id, harness.thread_id);
+    let approval_block_id = pioneer_crud::approval_block_id(grandchild_turn_id, request_id);
+    let mut opened_by_thread = HashMap::new();
+    for _ in 0..3 {
+        let notification =
+            recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+                .await;
+        let notification: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+            serde_json::from_value(
+                notification
+                    .params
+                    .expect("timeline blocks notification should include params"),
+            )
+            .expect("timeline blocks notification should decode");
+        opened_by_thread.insert(notification.thread_id.clone(), notification);
+    }
     assert_eq!(
-        blocks_changed.changed_block_ids,
-        vec![pioneer_crud::approval_block_id(child_turn_id, request_id)]
+        opened_by_thread.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([
+            grandchild_thread_id.to_owned(),
+            child_thread_id.to_owned(),
+            harness.thread_id.clone(),
+        ])
     );
+    assert_eq!(
+        opened_by_thread[grandchild_thread_id].changed_block_ids,
+        vec![
+            approval_block_id.clone(),
+            pioneer_crud::work_block_id(grandchild_turn_id),
+        ]
+    );
+    for ancestor_thread_id in [child_thread_id, harness.thread_id.as_str()] {
+        assert_eq!(
+            opened_by_thread[ancestor_thread_id].changed_block_ids,
+            vec![approval_block_id.clone()]
+        );
+        assert!(
+            opened_by_thread[ancestor_thread_id]
+                .removed_block_ids
+                .is_empty()
+        );
+    }
 
-    let page = request_live_thread_timeline_page(&mut harness, "child-approval-parent-page").await;
+    let page =
+        request_live_thread_timeline_page(&mut harness, "grandchild-approval-root-page").await;
     let approval = page
         .blocks
         .iter()
@@ -29775,16 +31269,41 @@ async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread(
             } => Some((block, request_id, status, item_id, request)),
             _ => None,
         })
-        .expect("parent page should contain child approval proxy block");
-    assert_eq!(approval.0.thread_id, child_thread_id);
-    assert_eq!(approval.0.turn_id.as_deref(), Some(child_turn_id));
+        .expect("root page should contain grandchild approval proxy block");
+    assert_eq!(approval.0.thread_id, grandchild_thread_id);
+    assert_eq!(approval.0.turn_id.as_deref(), Some(grandchild_turn_id));
     assert_eq!(approval.1, request_id);
     assert_eq!(
         *approval.2,
         pioneer_protocol::CLIRuntimePendingRequestStatus::Pending
     );
-    assert_eq!(approval.3.as_deref(), Some("semantic-native-child-item"));
-    assert_eq!(approval.4.title.as_deref(), Some("Run child command"));
+    assert_eq!(
+        approval.3.as_deref(),
+        Some("semantic-native-grandchild-item")
+    );
+    assert_eq!(approval.4.title.as_deref(), Some("Run grandchild command"));
+
+    let child_page = request_live_thread_timeline_page_for_thread(
+        &mut harness,
+        "grandchild-approval-child-page",
+        child_thread_id,
+    )
+    .await;
+    let child_proxy = child_page
+        .blocks
+        .iter()
+        .find(|block| {
+            matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::PendingRequest {
+                    request_id: projected_request_id,
+                    ..
+                } if projected_request_id == request_id
+            )
+        })
+        .expect("immediate parent page should contain grandchild approval proxy block");
+    assert_eq!(child_proxy.thread_id, grandchild_thread_id);
+    assert_eq!(child_proxy.turn_id.as_deref(), Some(grandchild_turn_id));
 
     let resolved_at = now + chrono::TimeDelta::milliseconds(1);
     let resolved = harness
@@ -29808,21 +31327,42 @@ async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread(
         .notify_semantic_timeline_pending_request_changed(&resolved)
         .await;
 
-    let removed_blocks =
-        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
-    let removed_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
-        serde_json::from_value(
-            removed_blocks
-                .params
-                .expect("timeline blocks notification should include params"),
-        )
-        .expect("timeline blocks notification should decode");
-    assert_eq!(removed_blocks.thread_id, harness.thread_id);
-    assert_eq!(removed_blocks.changed_block_ids, Vec::<String>::new());
+    let mut resolved_by_thread = HashMap::new();
+    for _ in 0..3 {
+        let notification =
+            recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+                .await;
+        let notification: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+            serde_json::from_value(
+                notification
+                    .params
+                    .expect("timeline blocks notification should include params"),
+            )
+            .expect("timeline blocks notification should decode");
+        resolved_by_thread.insert(notification.thread_id.clone(), notification);
+    }
     assert_eq!(
-        removed_blocks.removed_block_ids,
-        vec![pioneer_crud::approval_block_id(child_turn_id, request_id)]
+        resolved_by_thread.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([
+            grandchild_thread_id.to_owned(),
+            child_thread_id.to_owned(),
+            harness.thread_id.clone(),
+        ])
     );
+    assert_eq!(
+        resolved_by_thread[grandchild_thread_id].changed_block_ids,
+        vec![pioneer_crud::work_block_id(grandchild_turn_id)]
+    );
+    for thread_id in [
+        grandchild_thread_id,
+        child_thread_id,
+        harness.thread_id.as_str(),
+    ] {
+        assert_eq!(
+            resolved_by_thread[thread_id].removed_block_ids,
+            vec![approval_block_id.clone()]
+        );
+    }
 }
 
 async fn setup_semantic_timeline_query_harness() -> SemanticTimelineQueryHarness {
@@ -29931,6 +31471,9 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
     let thread_id = format!("thr_semantic_live_{case_id}");
     let turn_id = format!("turn_semantic_live_{case_id}");
 
@@ -30171,13 +31714,22 @@ async fn request_live_thread_timeline_page(
     harness: &mut LiveSemanticTimelineHarness,
     suffix: &str,
 ) -> pioneer_protocol::ThreadTimelinePageResponse {
+    let thread_id = harness.thread_id.clone();
+    request_live_thread_timeline_page_for_thread(harness, suffix, thread_id.as_str()).await
+}
+
+async fn request_live_thread_timeline_page_for_thread(
+    harness: &mut LiveSemanticTimelineHarness,
+    suffix: &str,
+    thread_id: &str,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
     let request_id = generate_test_request_id("semlive", suffix);
     let request = json!({
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "thread/timeline/page",
         "params": {
-            "threadId": harness.thread_id,
+            "threadId": thread_id,
             "anchor": { "kind": "oldest" },
             "limit": 20
         }
@@ -30187,6 +31739,33 @@ async fn request_live_thread_timeline_page(
         .process_request(harness.connection_id, &request.to_string())
         .await;
     let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    serde_json::from_value(response.result).expect("thread/timeline/page should decode")
+}
+
+async fn request_thread_timeline_page_for_test(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    request_id: &str,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "thread/timeline/page",
+                "params": {
+                    "threadId": thread_id,
+                    "anchor": { "kind": "oldest" },
+                    "limit": 100
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(rx, request_id).await;
     serde_json::from_value(response.result).expect("thread/timeline/page should decode")
 }
 
@@ -39620,6 +41199,189 @@ async fn seed_phase_13_compaction_thread(
     }
 }
 
+#[tokio::test]
+async fn detached_composer_history_orders_each_delivered_answer_after_its_user_message() {
+    let provider = Arc::new(CaptureSummaryProvider::new("unused"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    let thread_id = generate_test_request_id("history", "detached-order");
+    let base_timestamp = phase_13_now_secs();
+
+    for (index, (user_text, assistant_text)) in [
+        ("Ты кто?", "Я Пионер."),
+        ("Что ты умеешь?", "Помогаю с реальной работой."),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let timestamp = base_timestamp + i64::try_from(index).expect("test index") * 10;
+        let thread =
+            phase_13_test_thread(harness.workspace_id.as_str(), thread_id.as_str(), timestamp);
+        let user_turn_id = format!("{thread_id}_user_{index}");
+        let user_turn = Turn {
+            id: user_turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        harness
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &user_turn,
+                &[UserInput::Text {
+                    text: user_text.to_owned(),
+                    text_elements: Vec::new(),
+                }],
+            )
+            .await
+            .expect("message-only parent turn should materialize");
+        harness
+            .crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..user_turn
+                    },
+                },
+                timestamp,
+            )
+            .await
+            .expect("message-only parent turn should complete");
+
+        // Dynamic Composer admits the Task occurrence in the same second as its source message.
+        // Its delivered AgentMessage is created later and must define the assistant history slot.
+        let task_turn_id = format!("{thread_id}_task_{index}");
+        let task_turn = Turn {
+            id: task_turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::DetachedTask,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        harness
+            .crud_store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &task_turn, &[])
+            .await
+            .expect("Task occurrence turn should materialize");
+        harness
+            .crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: task_turn_id,
+                    item: TurnItem::AgentMessage {
+                        id: format!("delivered_answer_{index}"),
+                        text: assistant_text.to_owned(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("delivered Task answer should materialize");
+        harness
+            .crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..task_turn
+                    },
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("Task occurrence turn should complete");
+    }
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "next_child_turn")
+        .await;
+    let roles_and_content = history
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect::<Vec<_>>();
+
+    let expected = vec![
+        (pioneer_provider::Role::User, "Ты кто?".to_owned()),
+        (pioneer_provider::Role::Assistant, "Я Пионер.".to_owned()),
+        (pioneer_provider::Role::User, "Что ты умеешь?".to_owned()),
+        (
+            pioneer_provider::Role::Assistant,
+            "Помогаю с реальной работой.".to_owned(),
+        ),
+    ];
+    assert_eq!(
+        roles_and_content, expected,
+        "provider history must preserve the causal request/result order after async Composer split"
+    );
+
+    let bounded_entries = harness
+        .crud_store
+        .get_thread_conversation_history(thread_id.as_str(), 1)
+        .await
+        .expect("bounded provider history should load");
+    let bounded_roles_and_content = harness
+        .processor
+        .build_messages_from_entries(None, &bounded_entries)
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_roles_and_content,
+        expected[2..].to_vec(),
+        "the terminal-turn limit must retain the complete equal-timestamp request/result bucket"
+    );
+
+    let summary_entries = harness
+        .crud_store
+        .get_turns_for_summary(thread_id.as_str(), 0, 10)
+        .await
+        .expect("summary-range history should load");
+    let summary_roles_and_content = harness
+        .processor
+        .build_messages_from_entries(None, &summary_entries)
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary_roles_and_content, expected,
+        "summary and compaction history must use the same async message ordering"
+    );
+
+    let paged_summary_entries = harness
+        .crud_store
+        .get_turns_for_summary(thread_id.as_str(), 1, 2)
+        .await
+        .expect("paged summary history should load");
+    let paged_summary_roles_and_content = harness
+        .processor
+        .build_messages_from_entries(None, &paged_summary_entries)
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paged_summary_roles_and_content,
+        expected[1..3].to_vec(),
+        "summary pagination must be applied after canonical message ordering"
+    );
+}
+
 fn phase_13_prompt_section_contribution() -> HookContribution {
     HookContribution::PromptSection(PromptSectionContribution {
         contribution_id: pioneer_hooks::HookContributionId::new("phase13.prompt_section")
@@ -42284,6 +44046,26 @@ async fn load_task_anchor_item(
         panic!("task anchor read model was not found");
     };
     item
+}
+
+async fn wait_for_task_anchor_item_status(
+    crud_store: Arc<CrudStore>,
+    turn_id: &str,
+    item_id: &str,
+    expected_status: TaskStatus,
+) -> TaskTurnItem {
+    for _ in 0..100 {
+        if let Some(TurnItem::Task { item }) = crud_store
+            .get_turn_item(turn_id, item_id)
+            .await
+            .expect("turn item query should succeed")
+            && item.status == expected_status
+        {
+            return item;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    load_task_anchor_item(crud_store, turn_id, item_id).await
 }
 
 async fn wait_for_task_anchor_progress_preview(

@@ -46,10 +46,28 @@ impl MigrationTrait for Migration {
                     .col(Alias::new("created_at"))
                     .to_owned(),
             )
-            .await
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE thread SET origin_kind = 'collaborative' \
+                 WHERE origin_kind = 'user' AND sidebar_visibility = 'visible'",
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE thread SET origin_kind = 'user' \
+                 WHERE origin_kind = 'collaborative'",
+            )
+            .await?;
+
         manager
             .drop_index(
                 Index::drop()

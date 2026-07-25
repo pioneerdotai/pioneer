@@ -560,16 +560,49 @@ pub async fn find_terminal_turns_for_thread<C: ConnectionTrait>(
     thread_id: &str,
     limit: u64,
 ) -> Result<Vec<turn::Model>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut rows = turn::Entity::find()
         .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn::Column::Status.is_in(["completed", "failed", "interrupted"]))
         .order_by_desc(turn::Column::CreatedAt)
+        .order_by_desc(turn::Column::Id)
         .limit(limit)
         .all(db)
         .await
         .context("failed to query terminal turns for thread")?;
 
-    rows.reverse();
+    // Dynamic Composer admits the source Conversation turn and its detached TaskRun occurrence
+    // in the same second. Keep the entire timestamp bucket at the history-window boundary so a
+    // hard LIMIT cannot retain the delivered assistant entry while dropping its source message
+    // (or vice versa).
+    if rows.len() == usize::try_from(limit).unwrap_or(usize::MAX) {
+        if let Some(boundary_created_at) = rows.last().map(|row| row.created_at) {
+            let existing_ids = rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let boundary_rows = turn::Entity::find()
+                .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+                .filter(turn::Column::Status.is_in(["completed", "failed", "interrupted"]))
+                .filter(turn::Column::CreatedAt.eq(boundary_created_at))
+                .order_by_desc(turn::Column::Id)
+                .all(db)
+                .await
+                .context("failed to query terminal turn history boundary")?;
+            rows.extend(
+                boundary_rows
+                    .into_iter()
+                    .filter(|row| !existing_ids.contains(&row.id)),
+            );
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        (left.created_at, left.id.as_str()).cmp(&(right.created_at, right.id.as_str()))
+    });
     Ok(rows)
 }
 
@@ -619,6 +652,8 @@ pub async fn find_completed_turn_items<C: ConnectionTrait>(
         .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_item::Column::ItemType.eq("agent_message"))
         .filter(turn_item::Column::Status.eq("completed"))
+        .order_by_asc(turn_item::Column::CreatedAt)
+        .order_by_asc(turn_item::Column::ItemId)
         .all(db)
         .await
         .context("failed to query completed turn items")
@@ -637,21 +672,18 @@ pub async fn count_completed_turns_for_thread<C: ConnectionTrait>(
     Ok(count)
 }
 
-pub async fn find_completed_turns_in_range<C: ConnectionTrait>(
+pub async fn find_completed_turns_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
-    skip: u64,
-    take: u64,
 ) -> Result<Vec<turn::Model>> {
     turn::Entity::find()
         .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn::Column::Status.eq("completed"))
         .order_by_asc(turn::Column::CreatedAt)
-        .offset(skip)
-        .limit(take)
+        .order_by_asc(turn::Column::Id)
         .all(db)
         .await
-        .context("failed to query completed turns in range")
+        .context("failed to query completed turns for thread")
 }
 
 #[cfg(test)]

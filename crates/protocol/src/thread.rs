@@ -27,14 +27,40 @@ pub enum ThreadMode {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadOriginKind {
+    /// A user-visible collaborative thread whose Composer submissions execute
+    /// asynchronously in detached task children.
+    Collaborative,
+    /// A one-to-one conversation whose Composer submissions execute
+    /// synchronously in the thread itself.
+    DirectMessage,
+    /// Compatibility value for threads created before execution semantics were
+    /// made explicit. It retains foreground Composer behavior.
     User,
     TaskRun,
     System,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadComposerExecutionMode {
+    DetachedTask,
+    ForegroundTurn,
+}
+
 impl ThreadOriginKind {
     pub const fn user() -> Self {
         Self::User
+    }
+
+    /// Central product policy for Composer admission. Shells must not infer
+    /// execution behavior independently from visibility or lineage.
+    pub const fn composer_execution_mode(self) -> ThreadComposerExecutionMode {
+        match self {
+            Self::Collaborative => ThreadComposerExecutionMode::DetachedTask,
+            Self::DirectMessage | Self::User | Self::TaskRun | Self::System => {
+                ThreadComposerExecutionMode::ForegroundTurn
+            }
+        }
     }
 }
 
@@ -540,6 +566,27 @@ mod tests {
 
         let encoded = serde_json::to_value(ThreadMode::Agent).expect("mode should encode");
         assert_eq!(encoded, json!("Agent"));
+    }
+
+    #[test]
+    fn composer_execution_policy_is_owned_by_thread_product_kind() {
+        use super::ThreadComposerExecutionMode;
+
+        assert_eq!(
+            ThreadOriginKind::Collaborative.composer_execution_mode(),
+            ThreadComposerExecutionMode::DetachedTask
+        );
+        for kind in [
+            ThreadOriginKind::DirectMessage,
+            ThreadOriginKind::TaskRun,
+            ThreadOriginKind::System,
+            ThreadOriginKind::User,
+        ] {
+            assert_eq!(
+                kind.composer_execution_mode(),
+                ThreadComposerExecutionMode::ForegroundTurn
+            );
+        }
     }
 
     #[test]

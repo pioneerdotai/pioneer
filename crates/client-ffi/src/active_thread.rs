@@ -33,6 +33,7 @@ use pioneer_client::{
             SemanticTimelineCachePatch, SemanticTimelineState, TopLevelPageMergeMode,
             WorkPageMergeMode, apply_conversation_event_to_semantic_timeline,
             apply_conversation_event_to_semantic_timeline_with_patch,
+            apply_local_composer_event_to_semantic_timeline_with_patch,
             apply_semantic_timeline_live_update_with_patch,
             apply_thread_timeline_page as apply_semantic_thread_timeline_page,
             apply_turn_work_items_get_response as apply_semantic_turn_work_items_get_response,
@@ -51,11 +52,11 @@ use pioneer_client::{
         },
     },
 };
-use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AgentExecutionBackend, GatewayNotification, RuntimeSummary, Thread, ThreadGetParams,
     ThreadMode, ThreadTimelinePageResponse, TurnWorkItemsGetResponse, TurnWorkPageResponse,
 };
+use pioneer_protocol::{ThreadComposerExecutionMode, TurnPermissionMode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -545,7 +546,7 @@ impl ClientFfiActiveThreadState {
         let ids = plan_turn_start_ids();
         let turn_id = ids.turn_id;
         let pending_request_id = ids.pending_request_id;
-        let (workspace_id, endpoint_kind) = {
+        let (workspace_id, endpoint_kind, composer_execution_mode) = {
             let inner = self
                 .inner
                 .lock()
@@ -553,7 +554,14 @@ impl ClientFfiActiveThreadState {
             let coordinator = inner.coordinators.get(thread_id.as_str()).ok_or_else(|| {
                 anyhow::anyhow!("active thread must be opened before starting turn")
             })?;
-            (coordinator.workspace_id.clone(), None)
+            (
+                coordinator.workspace_id.clone(),
+                None,
+                coordinator
+                    .thread()
+                    .map(|thread| thread.origin_kind.composer_execution_mode())
+                    .unwrap_or(ThreadComposerExecutionMode::ForegroundTurn),
+            )
         };
         let selection = {
             let inner = self
@@ -614,6 +622,7 @@ impl ClientFfiActiveThreadState {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
                 pending_request_id: pending_request_id.clone(),
+                composer_execution_mode,
                 selected_model: Some(selection.selected_model),
                 selected_provider: Some(selection.selected_provider.clone()),
                 turn_model_provider,
@@ -658,10 +667,11 @@ impl ClientFfiActiveThreadState {
                     thread_snapshot_update.updated_at_unix,
                 );
             }
-            apply_conversation_event_to_semantic_timeline_with_patch(
+            apply_local_composer_event_to_semantic_timeline_with_patch(
                 &mut inner.semantic_timelines,
                 workspace_id.as_str(),
                 &local_turn_start_requested_event,
+                submit_reduction.composer_execution_mode,
                 now_unix_ms(),
             )
         };
@@ -813,14 +823,45 @@ impl ClientFfiActiveThreadState {
             });
         };
 
-        if let Err(error) = ws_commands::turn_cancel(&runtime.ws_command_sender(), params) {
-            let message = format!("{error:#}");
-            self.apply_local_turn_cancel_rejected(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                message.as_str(),
-            )?;
-            return Err(anyhow::anyhow!(message));
+        let response = match ws_commands::turn_cancel(&runtime.ws_command_sender(), params) {
+            Ok(response) => response,
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.apply_local_turn_cancel_rejected(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    message.as_str(),
+                )?;
+                return Err(anyhow::anyhow!(message));
+            }
+        };
+
+        if let Some(event) = turn_cancel::turn_cancel_response_event(response) {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            let workspace_id = inner
+                .coordinators
+                .get(thread_id.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("active thread must be opened before cancelling turn")
+                })?
+                .workspace_id
+                .clone();
+            let coordinator = inner
+                .coordinators
+                .get_mut(thread_id.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("active thread must be opened before cancelling turn")
+                })?;
+            coordinator.conversation.apply(event.clone());
+            apply_conversation_event_to_semantic_timeline(
+                &mut inner.semantic_timelines,
+                workspace_id.as_str(),
+                &event,
+                now_unix_ms(),
+            );
         }
 
         let inner = self
@@ -1874,12 +1915,24 @@ mod tests {
     }
 
     fn pending_request(request_id: &str, workspace_id: &str, thread_id: &str) -> PendingRequest {
+        pending_request_visible_in(request_id, workspace_id, thread_id, &[])
+    }
+
+    fn pending_request_visible_in(
+        request_id: &str,
+        workspace_id: &str,
+        thread_id: &str,
+        visible_thread_ids: &[&str],
+    ) -> PendingRequest {
         PendingRequest::from_native_permission_request(TurnPermissionApprovalRequest {
             request_id: request_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn".to_owned(),
-            visible_thread_ids: Vec::new(),
+            visible_thread_ids: visible_thread_ids
+                .iter()
+                .map(|thread_id| (*thread_id).to_owned())
+                .collect(),
             tool_name: "exec_command".to_owned(),
             action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
             scope_hash: format!("{request_id}_scope"),
@@ -2196,6 +2249,87 @@ mod tests {
 
         assert_eq!(snapshot.pending_requests.len(), 1);
         assert_eq!(snapshot.pending_requests[0].request_id, "req_a");
+    }
+
+    #[test]
+    fn active_root_snapshot_includes_grandchild_native_permission_request() {
+        let mut inner = ClientFfiActiveThreadInner {
+            active_thread_id: Some("root_thread".to_owned()),
+            ..Default::default()
+        };
+        inner.coordinators.insert(
+            "root_thread".to_owned(),
+            ThreadCoordinator::new(thread("root_thread", "ws_a")),
+        );
+        inner
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(
+                pending_request_visible_in(
+                    "req_grandchild",
+                    "ws_a",
+                    "grandchild_thread",
+                    &["child_thread", "root_thread"],
+                ),
+            ));
+
+        let snapshot = snapshot_from_inner(&inner, &[]);
+
+        assert_eq!(snapshot.pending_requests.len(), 1);
+        assert_eq!(snapshot.pending_requests[0].request_id, "req_grandchild");
+        assert_eq!(
+            snapshot.pending_requests[0].thread_id.as_deref(),
+            Some("grandchild_thread")
+        );
+    }
+
+    #[test]
+    fn collaborative_parent_optimistic_snapshot_does_not_flash_foreground_running_row() {
+        let mut collaborative = thread("thread_a", "ws_a");
+        collaborative.origin_kind = ThreadOriginKind::Collaborative;
+        let mut inner = ClientFfiActiveThreadInner {
+            active_thread_id: Some("thread_a".to_owned()),
+            ..Default::default()
+        };
+        inner
+            .coordinators
+            .insert("thread_a".to_owned(), ThreadCoordinator::new(collaborative));
+        let event = pioneer_client::conversation::ConversationEvent::LocalTurnStartRequested {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            pending_request_id: "pending_a".to_owned(),
+            user_text: "start detached work".to_owned(),
+            attachments: Vec::new(),
+        };
+        inner
+            .coordinators
+            .get_mut("thread_a")
+            .expect("coordinator")
+            .conversation
+            .apply(event.clone());
+        assert!(
+            apply_local_composer_event_to_semantic_timeline_with_patch(
+                &mut inner.semantic_timelines,
+                "ws_a",
+                &event,
+                ThreadComposerExecutionMode::DetachedTask,
+                10,
+            )
+            .changed_blocks
+            .iter()
+            .all(|block| !matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::TurnWork { .. }
+            ))
+        );
+
+        let snapshot = snapshot_from_inner(&inner, &[]);
+        assert!(
+            snapshot.rows.iter().all(|row| !matches!(
+                &row.kind,
+                pioneer_client::timeline::rows::TimelineRowKind::RunningTurn(_)
+            )),
+            "mobile boundary must expose the optimistic user row without a foreground running row"
+        );
     }
 
     #[test]

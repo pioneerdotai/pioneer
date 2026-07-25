@@ -964,6 +964,7 @@ impl MessageProcessor {
             turn_id,
             None,
             None,
+            None,
         )
         .await
     }
@@ -981,16 +982,18 @@ impl MessageProcessor {
             turn_id,
             None,
             None,
+            None,
         )
         .await
     }
 
-    pub(super) async fn load_conversation_history_for_workspace_in_execution(
+    pub(super) async fn load_conversation_history_for_workspace_in_execution_excluding_turn(
         &self,
         workspace_id: &str,
         conversation_thread_id: &str,
         execution_thread_id: &str,
         execution_turn_id: &str,
+        excluded_conversation_turn_id: Option<&str>,
         fallback_model: Option<&str>,
         fallback_model_provider: Option<&str>,
     ) -> Vec<ChatMessage> {
@@ -1001,6 +1004,7 @@ impl MessageProcessor {
             execution_turn_id,
             fallback_model,
             fallback_model_provider,
+            excluded_conversation_turn_id,
         )
         .await
     }
@@ -1014,6 +1018,7 @@ impl MessageProcessor {
         execution_turn_id: &str,
         fallback_model: Option<&str>,
         fallback_model_provider: Option<&str>,
+        excluded_conversation_turn_id: Option<&str>,
     ) -> Vec<ChatMessage> {
         use crate::tokenizer::count_tokens;
 
@@ -1056,7 +1061,7 @@ impl MessageProcessor {
                 .await
         };
 
-        let entries = match entries_result {
+        let mut entries = match entries_result {
             Ok(entries) => entries,
             Err(error) => {
                 warn!(
@@ -1067,6 +1072,9 @@ impl MessageProcessor {
                 return Vec::new();
             }
         };
+        if let Some(excluded_turn_id) = excluded_conversation_turn_id {
+            entries.retain(|entry| entry.turn_id != excluded_turn_id);
+        }
 
         let mut total_tokens: usize = 0;
 

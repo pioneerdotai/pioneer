@@ -436,11 +436,29 @@
       ]
     },
     "ThreadOriginKind": {
-      "type": "string",
-      "enum": [
-        "user",
-        "task_run",
-        "system"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "task_run",
+            "system"
+          ]
+        },
+        {
+          "description": "A user-visible collaborative thread whose Composer submissions execute\nasynchronously in detached task children.",
+          "type": "string",
+          "const": "collaborative"
+        },
+        {
+          "description": "A one-to-one conversation whose Composer submissions execute\nsynchronously in the thread itself.",
+          "type": "string",
+          "const": "direct_message"
+        },
+        {
+          "description": "Compatibility value for threads created before execution semantics were\nmade explicit. It retains foreground Composer behavior.",
+          "type": "string",
+          "const": "user"
+        }
       ]
     },
     "ThreadPlacement": {

@@ -15,7 +15,9 @@ use crate::app::{
 };
 use crate::assets::PioneerIconName;
 use gpui::{prelude::*, *};
-use gpui_component::{Icon, IconName, StyledExt, h_flex, theme::ActiveTheme, v_flex};
+use gpui_component::{
+    Icon, IconName, StyledExt, divider::Divider, h_flex, theme::ActiveTheme, v_flex,
+};
 use pioneer_client::{
     security::{
         ClientSecurityEnforcementStatus, ClientSecurityFilesystemAccess, ClientTurnSecuritySummary,
@@ -23,7 +25,9 @@ use pioneer_client::{
     },
     timeline::labels as timeline_labels,
 };
-use pioneer_protocol::{TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot};
+use pioneer_protocol::{
+    TaskAttachmentMode, TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot,
+};
 use std::hash::{Hash, Hasher};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
@@ -293,9 +297,14 @@ impl PioneerDesktop {
                 content_width,
                 cx,
             ),
-            TurnItem::Task { item: task_item } => {
-                self.render_item_task(task_item, is_first_row, is_last_row, content_width, cx)
-            }
+            TurnItem::Task { item: task_item } => self.render_item_task(
+                item_view,
+                task_item,
+                is_first_row,
+                is_last_row,
+                content_width,
+                cx,
+            ),
             TurnItem::CommandExecution { .. } => self.render_item_command_execution(
                 entry,
                 item_view,
@@ -355,6 +364,7 @@ impl PioneerDesktop {
 
     fn render_item_task(
         &self,
+        item_view: &ItemView,
         task_item: &pioneer_protocol::TaskTurnItem,
         is_first_row: bool,
         is_last_row: bool,
@@ -362,59 +372,92 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let status = task_status_label(task_item.status);
+        let is_running = task_item.status == TaskStatus::Running;
+        let uses_card_shell =
+            task_uses_stable_card_shell(task_item.attachment, task_item.child_thread_id.as_deref());
         let detail = task_item
             .error_preview
             .as_ref()
             .or(task_item.progress_preview.as_ref())
             .cloned();
+        let running_activity = is_running.then(|| {
+            self.render_running_activity_content(
+                format!("task:{}", task_item.id),
+                item_view.started_at_unix_ms.or(Some(task_item.created_at)),
+                None,
+                cx,
+            )
+        });
         let child_thread_id = task_item.child_thread_id.clone();
         let title = task_item.title.clone();
         let mut row_id_hasher = std::collections::hash_map::DefaultHasher::new();
         task_item.id.hash(&mut row_id_hasher);
         let row_id = row_id_hasher.finish();
-        let content = h_flex()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .child(Icon::new(IconName::Info).size_4().opacity(0.8))
-            .child(
+
+        let content =
+            h_flex().w_full().child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(task_item.title.clone()),
+                            )
+                            .when(uses_card_shell, |this| {
+                                this.child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6))
+                            }),
+                    )
+                    .child(Divider::horizontal())
                     .child(
                         div()
-                            .text_sm()
-                            .line_height(relative(1.45))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(task_item.title.clone()),
-                    )
-                    .child(div().text_xs().opacity(0.6).child(status))
-                    .when_some(detail, |this, detail| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .line_height(relative(1.35))
-                                .opacity(0.6)
-                                .child(Self::truncate_for_card(detail.as_str(), 160)),
-                        )
-                    }),
-            )
-            .when(child_thread_id.is_some(), |this| {
-                this.child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6))
-            });
+                            .when(!is_running, |this| {
+                                this.child(
+                                    v_flex()
+                                        .py_2()
+                                        .child(div().font_semibold().child(status))
+                                        .when_some(detail, |this, detail| {
+                                            this.child(div().text_xs().opacity(0.6).child(
+                                                Self::truncate_for_card(detail.as_str(), 160),
+                                            ))
+                                        }),
+                                )
+                            })
+                            .when_some(running_activity, |this, running_activity| {
+                                this.child(div().py_2().child(running_activity))
+                            }),
+                    ),
+            );
 
-        let content = if let Some(child_thread_id) = child_thread_id {
-            content
-                .id(("task-anchor-open-child", row_id))
-                .rounded_md()
-                .px_2()
-                .py_1()
-                .hover(|this| this.bg(cx.theme().muted.opacity(0.6)))
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    view.open_task_child_thread(child_thread_id.clone(), title.clone(), window, cx);
-                }))
-                .into_any_element()
+        let content = if uses_card_shell {
+            let card = content
+                .id(("task-anchor-card", row_id))
+                .rounded_2xl()
+                .px_4()
+                .py_2p5()
+                .border_1()
+                .border_color(cx.theme().border);
+            if let Some(child_thread_id) = child_thread_id {
+                card.hover(|this| this.bg(cx.theme().muted.opacity(0.6)))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.open_task_child_thread(
+                            child_thread_id.clone(),
+                            title.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            } else {
+                card.into_any_element()
+            }
         } else {
             content.into_any_element()
         };
@@ -465,5 +508,34 @@ impl PioneerDesktop {
         result.push('\n');
         result.push_str(&t!("timeline.common.truncated").to_string());
         result
+    }
+}
+
+fn task_uses_stable_card_shell(
+    attachment: TaskAttachmentMode,
+    child_thread_id: Option<&str>,
+) -> bool {
+    attachment == TaskAttachmentMode::Detached || child_thread_id.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_uses_stable_card_shell;
+    use pioneer_protocol::TaskAttachmentMode;
+
+    #[test]
+    fn detached_task_card_shell_does_not_depend_on_child_binding() {
+        assert!(task_uses_stable_card_shell(
+            TaskAttachmentMode::Detached,
+            None
+        ));
+        assert!(task_uses_stable_card_shell(
+            TaskAttachmentMode::Detached,
+            Some("child")
+        ));
+        assert!(!task_uses_stable_card_shell(
+            TaskAttachmentMode::Attached,
+            None
+        ));
     }
 }

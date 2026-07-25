@@ -1,7 +1,7 @@
 //! Turn cancel orchestration.
 
 use crate::conversation::events::ConversationEvent;
-use pioneer_protocol::TurnCancelParams;
+use pioneer_protocol::{TurnCancelParams, TurnCancelResponse, TurnStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnCancelPlan {
@@ -70,6 +70,24 @@ pub fn local_turn_cancel_rejected_event(
     }
 }
 
+pub fn turn_cancel_response_event(response: TurnCancelResponse) -> Option<ConversationEvent> {
+    let TurnCancelResponse {
+        thread_id, turn, ..
+    } = response;
+    match turn.status {
+        TurnStatus::InProgress => None,
+        TurnStatus::Completed => Some(ConversationEvent::TurnCompleted { thread_id, turn }),
+        TurnStatus::Failed | TurnStatus::Interrupted => {
+            Some(ConversationEvent::TurnFailed { thread_id, turn })
+        }
+        TurnStatus::Blocked => Some(ConversationEvent::TurnBlocked {
+            thread_id,
+            turn,
+            resume: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +146,36 @@ mod tests {
                 ref turn_id,
                 ref error,
             } if thread_id == "thread" && turn_id == "turn" && error == "boom"
+        ));
+    }
+
+    #[test]
+    fn turn_cancel_response_event_terminalizes_interrupted_turn_immediately() {
+        let event = turn_cancel_response_event(TurnCancelResponse {
+            thread_id: "thread".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            turn: pioneer_protocol::Turn {
+                id: "turn".to_owned(),
+                status: TurnStatus::Interrupted,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: Some("stopped".to_owned()),
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::system_turn_permission_profile_snapshot(
+                    pioneer_protocol::TurnPermissionMode::FullAccess,
+                ),
+            },
+        })
+        .expect("interrupted cancel response should produce an event");
+
+        assert!(matches!(
+            event,
+            ConversationEvent::TurnFailed {
+                ref thread_id,
+                ref turn,
+            } if thread_id == "thread"
+                && turn.id == "turn"
+                && turn.status == TurnStatus::Interrupted
         ));
     }
 }

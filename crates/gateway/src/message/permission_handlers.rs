@@ -51,6 +51,7 @@ impl MessageProcessor {
             workspace_id: workspace_id.clone(),
             thread_id,
             turn_id,
+            request: protocol_request.clone(),
             respond_to: request.respond_to,
         };
 
@@ -73,6 +74,63 @@ impl MessageProcessor {
             },
         )
         .await;
+    }
+
+    pub(super) async fn replay_native_permission_requests_for_thread(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: &str,
+    ) {
+        let mut requests = self
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .values()
+            .filter(|pending| {
+                pending.workspace_id == workspace_id
+                    && (pending.request.thread_id == thread_id
+                        || pending
+                            .request
+                            .visible_thread_ids
+                            .iter()
+                            .any(|visible_thread_id| visible_thread_id == thread_id))
+            })
+            .map(|pending| pending.request.clone())
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+
+        for request in requests {
+            self.send_notification_to_connections(
+                events::TURN_PERMISSION_REQUEST_OPENED,
+                &TurnPermissionRequestOpenedNotification {
+                    request: request.clone(),
+                },
+                vec![connection_id],
+            )
+            .await;
+
+            let still_pending = self
+                .native_permission_pending_requests
+                .lock()
+                .await
+                .get(request.request_id.as_str())
+                .is_some_and(|pending| pending.request == request);
+            if !still_pending {
+                self.send_notification_to_connections(
+                    events::TURN_PERMISSION_REQUEST_RESOLVED,
+                    &TurnPermissionRequestResolvedNotification {
+                        request_id: request.request_id,
+                        workspace_id: request.workspace_id,
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                        resolution: TurnPermissionApprovalResolution::Expired,
+                    },
+                    vec![connection_id],
+                )
+                .await;
+            }
+        }
     }
 
     pub(super) async fn turn_permission_request_respond(

@@ -799,6 +799,7 @@ mod tests {
             item: TaskTurnItem {
                 id: "item_1".to_owned(),
                 task_id: "task_1".to_owned(),
+                created_by_turn_id: None,
                 run_id: Some("run_1".to_owned()),
                 parent_task_id: None,
                 root_task_id: None,

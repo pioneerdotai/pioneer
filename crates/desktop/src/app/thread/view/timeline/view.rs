@@ -52,6 +52,7 @@ impl PioneerDesktop {
             expanded_revision,
         );
 
+        self.ensure_running_task_indicator_timer(projection.as_ref(), cx);
         let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
         let rows = Rc::new(merge_pending_timeline_render_rows(rows, pending_requests));
         let rows_layout_hash =

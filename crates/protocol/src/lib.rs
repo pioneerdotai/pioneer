@@ -210,8 +210,8 @@ pub use task::{
     TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
 };
 pub use thread::{
-    SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadFolder,
-    ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
+    SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadComposerExecutionMode,
+    ThreadFolder, ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
     ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
     ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode, ThreadMoveParams,
     ThreadMoveResponse, ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility,

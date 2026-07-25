@@ -263,6 +263,14 @@ impl TaskAgentExecutor {
             None
         };
         let effective_model = effective_task_child_model(task, agent_spec)?;
+        // A CLI backend owns provider identity. In particular, Composer sends
+        // no `model_provider` for native runtimes, and the parent thread may
+        // still carry the last API-provider key. Never project that key into
+        // the hidden child.
+        let effective_model_provider = cli_runtime_backend
+            .as_ref()
+            .map(|(runtime_id, _)| format!("cli_runtime:{}", runtime_id.trim()))
+            .unwrap_or_else(|| effective_model.model_provider.clone());
         let child_mode = composer_launch
             .as_ref()
             .and_then(|launch| launch.mode)
@@ -284,7 +292,7 @@ impl TaskAgentExecutor {
             workspace_id: context.workspace_id.clone(),
             name: thread_name_from_task(task),
             model: Some(effective_model.model.clone()),
-            model_provider: Some(effective_model.model_provider.clone()),
+            model_provider: Some(effective_model_provider.clone()),
             sandbox: Some(sandbox_mode),
             mode: Some(child_mode),
             origin_kind: Some(ThreadOriginKind::TaskRun),
@@ -319,7 +327,7 @@ impl TaskAgentExecutor {
             input: child_input.clone(),
             capabilities: Vec::new(),
             model: Some(effective_model.model.clone()),
-            model_provider: Some(effective_model.model_provider.clone()),
+            model_provider: Some(effective_model_provider.clone()),
             sandbox_policy: None,
             mode: Some(child_mode),
             execution_backend: None,
@@ -355,7 +363,7 @@ impl TaskAgentExecutor {
                         TurnStartParams {
                             input: child_input,
                             model: Some(effective_model.model),
-                            model_provider: Some(effective_model.model_provider),
+                            model_provider: Some(effective_model_provider),
                             mode: Some(child_mode),
                             ..turn_params
                         },
@@ -1800,6 +1808,39 @@ impl TaskAgentExecutor {
         Ok(true)
     }
 
+    pub(super) async fn reconcile_child_turn_cancelled(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let processor = self.processor()?;
+        let Some(child_runtime) =
+            load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
+        else {
+            return Ok(false);
+        };
+        let Some(task_response) = processor
+            .crud_store
+            .get_task(child_runtime.task_run_turn.task_id.as_str())
+            .await?
+        else {
+            return Ok(true);
+        };
+        if task_response.task.status.is_terminal() {
+            return Ok(true);
+        }
+        let handle = TaskExecutionHandle::new(
+            processor.crud_store.clone(),
+            processor.task_runtime.event_bus(),
+            child_runtime.task_run_turn.task_id.clone(),
+            child_runtime.task_run_turn.run_id.clone(),
+        );
+        self.cancel_child_turn(child_runtime, reason, handle)
+            .await?;
+        Ok(true)
+    }
+
     pub(super) async fn reconcile_child_turn_blocked(
         &self,
         thread_id: &str,
@@ -1870,7 +1911,15 @@ impl TaskAgentExecutor {
                     candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
                 )
                 .await?;
-            mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+            if !processor
+                .task_run_awaits_owner_thread_delivery(
+                    &task_response,
+                    child_runtime.task_run_turn.run_id.as_str(),
+                )
+                .await?
+            {
+                mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+            }
             return Ok(());
         }
         if let Some(candidate) = processor
@@ -1969,7 +2018,16 @@ impl TaskAgentExecutor {
                     )
                     .await?;
                 handle.complete_run(Some(result), completed_at).await?;
-                mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+                if !processor
+                    .task_run_awaits_owner_thread_delivery(
+                        &task_response,
+                        child_runtime.task_run_turn.run_id.as_str(),
+                    )
+                    .await?
+                {
+                    mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage)
+                        .await?;
+                }
             }
             Err(error)
                 if review_policy.as_ref().is_some_and(|policy| {
@@ -2558,6 +2616,42 @@ impl TaskAgentExecutor {
         Ok(())
     }
 
+    async fn cancel_child_turn(
+        &self,
+        child_runtime: TaskRunChildRuntime,
+        reason: &str,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
+        let processor = self.processor()?;
+        let cancelled_at = now_timestamp_secs();
+        let error = task_error(
+            "child_turn_cancelled",
+            reason.to_owned(),
+            TaskErrorClass::Cancelled,
+            Some(child_runtime.task_run_turn.run_id.clone()),
+        );
+        record_task_run_turn_failure(
+            &handle,
+            &child_runtime.task_run_turn,
+            TaskRunTurnStatus::Cancelled,
+            Some(error),
+            cancelled_at,
+        )
+        .await?;
+        handle
+            .cancel_run(Some(reason.to_owned()), cancelled_at)
+            .await?;
+        mark_task_run_occurrence_turn_terminal(
+            &processor,
+            &child_runtime.lineage,
+            TurnStatus::Interrupted,
+            Some(reason.to_owned()),
+            cancelled_at,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn block_child_turn(
         &self,
         child_runtime: TaskRunChildRuntime,
@@ -2686,8 +2780,14 @@ impl TaskExecutor for TaskAgentExecutor {
             )
             .await?;
             if child_runtime.task_run_turn.kind != TaskRunTurnKind::Review {
-                mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, reason)
-                    .await?;
+                mark_task_run_occurrence_turn_terminal(
+                    &processor,
+                    &child_runtime.lineage,
+                    TurnStatus::Interrupted,
+                    Some(reason.to_owned()),
+                    cancelled_at,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -2935,12 +3035,18 @@ async fn load_task_execution_conversation_scope(
     if task_attachment(task) != TaskAttachmentMode::Detached {
         return Ok((expected_hook_context, Vec::new()));
     }
+    let launch_turn_id = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+        .map(|composer_work| composer_work.launch.turn_id.as_str());
     let history = processor
-        .load_conversation_history_for_workspace_in_execution(
+        .load_conversation_history_for_workspace_in_execution_excluding_turn(
             task.workspace_id.as_str(),
             parent.parent_thread_id.as_str(),
             execution_thread_id,
             execution_turn_id,
+            launch_turn_id,
             Some(fallback_model),
             Some(fallback_model_provider),
         )

@@ -2800,6 +2800,8 @@ pub struct TaskTurnItem {
     pub id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
@@ -2994,6 +2996,7 @@ mod tests {
         let item = TaskTurnItem {
             id: "item_1".to_owned(),
             task_id: "task_1".to_owned(),
+            created_by_turn_id: Some("turn_creator".to_owned()),
             run_id: Some("run_1".to_owned()),
             parent_task_id: None,
             root_task_id: Some("task_root".to_owned()),
@@ -3017,6 +3020,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&item).expect("item should encode");
         assert_eq!(encoded["taskId"], json!("task_1"));
+        assert_eq!(encoded["createdByTurnId"], json!("turn_creator"));
         assert_eq!(encoded["attachment"], json!("detached"));
         assert_eq!(encoded["triggerKind"], json!("scheduled_at"));
 
