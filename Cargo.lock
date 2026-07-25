@@ -8156,7 +8156,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8181,7 +8181,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -8196,7 +8196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8222,7 +8222,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -8246,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -8264,7 +8264,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -8278,7 +8278,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8302,7 +8302,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "pioneer-client",
@@ -8316,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "config",
@@ -8327,7 +8327,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8348,7 +8348,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8389,7 +8389,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "sea-orm",
  "serde",
@@ -8397,7 +8397,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8457,7 +8457,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -8472,7 +8472,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -8485,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8507,7 +8507,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8530,7 +8530,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -8543,7 +8543,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -8554,7 +8554,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8573,7 +8573,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "hex",
  "nanoid",
@@ -8585,7 +8585,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8608,7 +8608,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -8618,7 +8618,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -8636,7 +8636,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8658,7 +8658,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8679,7 +8679,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8710,7 +8710,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "pioneer-config",
