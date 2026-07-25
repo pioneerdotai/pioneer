@@ -361,6 +361,48 @@ impl MessageProcessor {
                         }
                     };
 
+                let thread = match self
+                    .thread_manager
+                    .thread_get(turn_params.thread_id.trim())
+                    .await
+                {
+                    Some(thread) => thread,
+                    None => {
+                        self.send_voice_session_result_notification(
+                            connection_id,
+                            VoiceSessionResultNotification {
+                                session_id: session.session_id.clone(),
+                                outcome: VoiceSessionOutcome::Failed,
+                                turn_id: Some(session.turn_id.clone()),
+                                error: Some(VoiceError {
+                                    kind: VoiceErrorKind::Unknown,
+                                    message: format!(
+                                        "thread `{}` is not loaded",
+                                        turn_params.thread_id.trim()
+                                    ),
+                                }),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if thread.origin_kind.composer_execution_mode()
+                    == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
+                {
+                    self.composer_detached_task_start(
+                        connection_id,
+                        request_id,
+                        turn_params,
+                        thread,
+                        super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
+                            session_id: session.session_id.clone(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+
                 if let Some(backend) = turn_params.execution_backend.clone() {
                     match backend {
                         AgentExecutionBackend::ApiProvider { .. } => {}

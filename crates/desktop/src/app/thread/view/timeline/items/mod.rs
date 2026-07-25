@@ -422,7 +422,7 @@ impl PioneerDesktop {
                                 this.child(
                                     v_flex()
                                         .py_2()
-                                        .child(div().font_semibold().child(status))
+                                        .child(div().text_sm().font_semibold().child(status))
                                         .when_some(detail, |this, detail| {
                                             this.child(div().text_xs().opacity(0.6).child(
                                                 Self::truncate_for_card(detail.as_str(), 160),

@@ -480,8 +480,14 @@ impl MessageProcessor {
             if thread.origin_kind.composer_execution_mode()
                 == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
             {
-                self.composer_detached_task_start(connection_id, request_id, params, thread)
-                    .await;
+                self.composer_detached_task_start(
+                    connection_id,
+                    request_id,
+                    params,
+                    thread,
+                    TurnStartSuccessResponse::TurnStart,
+                )
+                .await;
                 return;
             }
             let requested_reasoning_effort = requested_reasoning_effort(&params);
@@ -559,13 +565,15 @@ impl MessageProcessor {
     /// Admit a collaborative Composer submission as a durable user message
     /// followed by an immediate detached task. The message turn completes
     /// synchronously; the task child owns all agent execution.
-    async fn composer_detached_task_start(
+    pub(super) async fn composer_detached_task_start(
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
         mut params: TurnStartParams,
         thread: pioneer_protocol::Thread,
+        success_response: TurnStartSuccessResponse,
     ) {
+        let turn_id = params.turn_id.clone();
         let normalized_capabilities = match self
             .normalize_turn_skill_capabilities(
                 thread.workspace_id.as_str(),
@@ -575,9 +583,12 @@ impl MessageProcessor {
         {
             Ok(normalized) => normalized,
             Err(message) => {
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    message,
                 )
                 .await;
                 return;
@@ -588,13 +599,12 @@ impl MessageProcessor {
             .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
             .await
         {
-            self.send_error(
+            self.send_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to validate artifact input: {error:#}"),
-                ),
+                request_id.clone(),
+                &success_response,
+                turn_id.as_str(),
+                format!("failed to validate artifact input: {error:#}"),
             )
             .await;
             return;
@@ -608,9 +618,12 @@ impl MessageProcessor {
         {
             Ok(catalog) => catalog,
             Err(message) => {
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    message,
                 )
                 .await;
                 return;
@@ -624,15 +637,12 @@ impl MessageProcessor {
             ) {
                 Ok(attachments) => attachments,
                 Err(error) => {
-                    self.send_error(
+                    self.send_turn_start_failure(
                         connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!(
-                                "failed to snapshot selected capability presentation: {error:#}"
-                            ),
-                        ),
+                        request_id.clone(),
+                        &success_response,
+                        turn_id.as_str(),
+                        format!("failed to snapshot selected capability presentation: {error:#}"),
                     )
                     .await;
                     return;
@@ -643,13 +653,12 @@ impl MessageProcessor {
         let outcome = match self.thread_manager.turn_start(connection_id, params).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to admit Composer message: {error:#}"),
-                    ),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    format!("failed to admit Composer message: {error:#}"),
                 )
                 .await;
                 return;
@@ -661,13 +670,12 @@ impl MessageProcessor {
                 self.thread_manager
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to resolve Composer permission profile: {error:#}"),
-                    ),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    format!("failed to resolve Composer permission profile: {error:#}"),
                 )
                 .await;
                 return;
@@ -688,13 +696,12 @@ impl MessageProcessor {
             self.thread_manager
                 .rollback_turn_start(outcome.rollback_context.clone())
                 .await;
-            self.send_error(
+            self.send_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist Composer message: {error:#}"),
-                ),
+                request_id.clone(),
+                &success_response,
+                turn_id.as_str(),
+                format!("failed to persist Composer message: {error:#}"),
             )
             .await;
             return;
@@ -705,9 +712,12 @@ impl MessageProcessor {
         {
             Ok(snapshot) => snapshot,
             Err(message) => {
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    message,
                 )
                 .await;
                 return;
@@ -758,13 +768,12 @@ impl MessageProcessor {
                     format!("failed to freeze Composer task history: {error:#}"),
                 )
                 .await;
-                self.send_error(
+                self.send_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to freeze Composer task history: {error:#}"),
-                    ),
+                    request_id.clone(),
+                    &success_response,
+                    turn_id.as_str(),
+                    format!("failed to freeze Composer task history: {error:#}"),
                 )
                 .await;
                 return;
@@ -851,27 +860,39 @@ impl MessageProcessor {
                 format!("failed to create detached Composer task: {error:#}"),
             )
             .await;
-            self.send_error(
+            self.send_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to create detached Composer task: {error:#}"),
-                ),
+                request_id.clone(),
+                &success_response,
+                turn_id.as_str(),
+                format!("failed to create detached Composer task: {error:#}"),
             )
             .await;
             return;
         }
 
-        if !self
-            .finish_turn_start_success(
-                connection_id,
-                request_id,
-                &outcome,
-                capability_attachments.as_slice(),
-            )
-            .await
-        {
+        let success_sent = match &success_response {
+            TurnStartSuccessResponse::TurnStart => {
+                self.finish_turn_start_success(
+                    connection_id,
+                    request_id,
+                    &outcome,
+                    capability_attachments.as_slice(),
+                )
+                .await
+            }
+            TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
+                self.finish_voice_session_finalize_accepted_turn_start_success(
+                    connection_id,
+                    &outcome,
+                    capability_attachments.as_slice(),
+                    session_id,
+                )
+                .await
+            }
+            TurnStartSuccessResponse::Task { .. } => false,
+        };
+        if !success_sent {
             return;
         }
         let _ = self.complete_turn(thread.id, launch.turn_id, None).await;
@@ -1222,7 +1243,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn send_cli_runtime_turn_start_failure(
+    async fn send_turn_start_failure(
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
@@ -1248,7 +1269,7 @@ impl MessageProcessor {
                     session_id = %session_id,
                     turn_id,
                     error = %error.message,
-                    "accepted voice finalize failed while starting CLI runtime turn"
+                    "accepted voice finalize failed while admitting turn"
                 );
                 self.send_voice_session_result_notification(
                     connection_id,
@@ -1359,7 +1380,7 @@ impl MessageProcessor {
             let submitted_model_provider = params.model_provider.clone();
             macro_rules! send_turn_start_failure {
                 ($message:expr) => {{
-                    self.send_cli_runtime_turn_start_failure(
+                    self.send_turn_start_failure(
                         connection_id,
                         request_id.clone(),
                         &success_response,
@@ -3572,7 +3593,7 @@ impl MessageProcessor {
         turn_id: &str,
     ) -> Option<pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig> {
         if self.cli_runtime_manager.is_none() {
-            self.send_cli_runtime_turn_start_failure(
+            self.send_turn_start_failure(
                 connection_id,
                 request_id,
                 success_response,
@@ -3586,7 +3607,7 @@ impl MessageProcessor {
         let runtimes = match self.load_cli_runtime_instances() {
             Ok(runtimes) => runtimes,
             Err(error) => {
-                self.send_cli_runtime_turn_start_failure(
+                self.send_turn_start_failure(
                     connection_id,
                     request_id,
                     success_response,
@@ -3598,7 +3619,7 @@ impl MessageProcessor {
             }
         };
         if runtimes.is_empty() {
-            self.send_cli_runtime_turn_start_failure(
+            self.send_turn_start_failure(
                 connection_id,
                 request_id,
                 success_response,
@@ -3613,7 +3634,7 @@ impl MessageProcessor {
             .into_iter()
             .find(|runtime| runtime.id == runtime_id)
         else {
-            self.send_cli_runtime_turn_start_failure(
+            self.send_turn_start_failure(
                 connection_id,
                 request_id,
                 success_response,
@@ -3624,7 +3645,7 @@ impl MessageProcessor {
             return None;
         };
         if !runtime.enabled {
-            self.send_cli_runtime_turn_start_failure(
+            self.send_turn_start_failure(
                 connection_id,
                 request_id,
                 success_response,
@@ -3635,7 +3656,7 @@ impl MessageProcessor {
             return None;
         }
         if !cli_runtime_kind_matches_config(runtime_kind, runtime.kind) {
-            self.send_cli_runtime_turn_start_failure(
+            self.send_turn_start_failure(
                 connection_id,
                 request_id,
                 success_response,

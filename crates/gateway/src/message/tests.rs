@@ -8441,6 +8441,253 @@ fn test_gateway_voice_supervisor() -> Arc<crate::voice::supervisor::VoiceInputSu
     ))
 }
 
+async fn submit_test_voice_turn(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> VoiceSessionResultNotification {
+    let start_request_id = generate_test_request_id("voice_policy", turn_id);
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "voice/session/start",
+                "params": {
+                    "context": {
+                        "workspace_id": workspace_id,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id
+                    },
+                    "audio_format": {
+                        "sample_rate_hz": 16000,
+                        "channels": 1,
+                        "encoding": "pcm_s16_le"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let start_response = recv_response_by_id(rx, start_request_id.as_str()).await;
+    let start_payload: pioneer_protocol::VoiceSessionStartResponse =
+        serde_json::from_value(start_response.result).expect("voice/session/start decode");
+    assert_eq!(start_payload.status, VoiceStatus::Recording);
+
+    processor
+        .process_binary_frame(
+            connection_id,
+            voice_test_frame(start_payload.session_id.as_str(), 0, 960, 12_000).as_slice(),
+        )
+        .await;
+    let _ = recv_notification_by_method(rx, events::VOICE_CHUNK_ACK).await;
+
+    let finalize_request_id = generate_test_request_id("voice_policy_finalize", turn_id);
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": finalize_request_id,
+                "method": "voice/session/finalize",
+                "params": {
+                    "session_id": start_payload.session_id,
+                    "context": {
+                        "workspace_id": workspace_id,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let finalize_response = recv_response_by_id(rx, finalize_request_id.as_str()).await;
+    let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
+        serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
+    assert_eq!(finalize_payload.status, VoiceStatus::Transcribing);
+
+    let result = recv_notification_by_method(rx, events::VOICE_SESSION_RESULT).await;
+    serde_json::from_value(result.params.expect("voice/session/result params"))
+        .expect("voice/session/result decode")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collaborative_voice_composer_admits_detached_task() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider = Arc::new(CaptureSummaryProvider::new("must run in child"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor(
+        "run this voice command asynchronously",
+    ));
+    let parent_thread_id = "thr_voice_collaborative";
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: None,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::Collaborative),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("collaborative thread should start");
+
+    let turn_id = "turn_voice_detached";
+    let result = submit_test_voice_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        parent_thread_id,
+        turn_id,
+    )
+    .await;
+    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(result.turn_id.as_deref(), Some(turn_id));
+
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("voice Composer task should be queryable");
+    assert_eq!(tasks.tasks.len(), 1);
+    assert_eq!(
+        tasks.tasks[0].created_by_turn_id.as_deref(),
+        Some(turn_id),
+        "voice Task must retain the parent message turn as its causal source"
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "collaborative voice must not dispatch an agent turn in the parent thread"
+    );
+    let (_, parent_turn) = crud_store
+        .get_turn(parent_thread_id, turn_id)
+        .await
+        .expect("parent voice message turn lookup should succeed")
+        .expect("parent voice message turn should exist");
+    assert_eq!(parent_turn.status, TurnStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_voice_composer_stays_foreground() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider = Arc::new(CaptureSummaryProvider::new("foreground child result"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child"));
+    let child_thread_id = "thr_voice_task_run";
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: child_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: None,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::TaskRun),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("TaskRun child thread should start");
+
+    let turn_id = "turn_voice_task_run";
+    let result = submit_test_voice_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        child_thread_id,
+        turn_id,
+    )
+    .await;
+    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(result.turn_id.as_deref(), Some(turn_id));
+
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    assert!(
+        provider.call_count() >= 1,
+        "voice inside a TaskRun child must execute through that child's provider"
+    );
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id,
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(child_thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("child-owned tasks should be queryable");
+    assert!(
+        tasks.tasks.is_empty(),
+        "foreground child voice must not be wrapped in another Composer task"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_session_transcript_starts_turn_and_preserves_context_attachments() {
     let base_dir = unique_temp_dir("voice_turn_capability");
