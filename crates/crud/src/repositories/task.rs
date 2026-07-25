@@ -133,6 +133,23 @@ pub async fn list_tasks_by_root<C: ConnectionTrait>(
         .context("failed to list root task tree")
 }
 
+pub async fn list_tasks_by_creator_turns<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_ids: &[String],
+) -> Result<Vec<task::Model>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    task::Entity::find()
+        .filter(task::Column::CreatedByThreadId.eq(thread_id.to_owned()))
+        .filter(task::Column::CreatedByTurnId.is_in(turn_ids.to_vec()))
+        .order_by_asc(task::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to list tasks by creator turns")
+}
+
 pub async fn update_task_status<C: ConnectionTrait>(
     db: &C,
     task_id: &str,

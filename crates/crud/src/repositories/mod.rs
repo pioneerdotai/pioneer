@@ -28,6 +28,7 @@ pub mod task_event;
 pub mod task_result_candidate;
 pub mod task_result_review_event;
 pub mod task_run;
+pub mod task_run_conversation_snapshot;
 pub mod task_run_execution;
 pub mod task_run_thread_binding;
 pub mod task_run_turn;

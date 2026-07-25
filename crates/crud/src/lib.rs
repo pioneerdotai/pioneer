@@ -23,8 +23,8 @@ use pioneer_protocol::{
     TaskEventsResponse, TaskExecutorKind, TaskGetResponse, TaskListParams, TaskResult,
     TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewEvent, TaskRun,
     TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskThreadLineage, TaskTree,
-    TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
     ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement, ThreadStatus,
     TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
     TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
@@ -377,12 +377,12 @@ use crate::repositories::{
     skill_audit_event, skill_dependency_snapshot, skill_installation, skill_pack_installation,
     skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
     task_delivery, task_dependency, task_event, task_result_candidate, task_result_review_event,
-    task_run, task_run_execution, task_run_thread_binding, task_run_turn, task_trigger,
-    task_write_lock, thread, thread_agents_doc, thread_episodic as thread_episodic_repository,
-    thread_lineage, thread_tree, turn, turn_cli_runtime_instruction, turn_event,
-    turn_event_projection_state, turn_execution_window, turn_item_attempt, turn_liveness,
-    turn_llm_context, turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot,
-    turn_skill_binding,
+    task_run, task_run_conversation_snapshot, task_run_execution, task_run_thread_binding,
+    task_run_turn, task_trigger, task_write_lock, thread, thread_agents_doc,
+    thread_episodic as thread_episodic_repository, thread_lineage, thread_tree, turn,
+    turn_cli_runtime_instruction, turn_event, turn_event_projection_state, turn_execution_window,
+    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
+    turn_runtime_snapshot, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -417,6 +417,9 @@ pub use crate::repositories::hook_run::{
     HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookAuditEventRecord, HookRunAttemptCompletionRecord,
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
+};
+pub use crate::repositories::task_run_conversation_snapshot::{
+    NewTaskRunConversationSnapshot, TaskRunConversationSnapshotRecord,
 };
 pub use crate::repositories::turn::TurnExecutionSecuritySnapshotRecord;
 pub use crate::repositories::turn_cli_runtime_instruction::{
@@ -548,6 +551,37 @@ pub struct ConversationEntry {
     pub assistant_text: Option<String>,
     pub user_artifacts: Vec<ConversationArtifactRef>,
     pub assistant_artifacts: Vec<ConversationArtifactRef>,
+}
+
+fn conversation_entry_has_user_content(entry: &ConversationEntry) -> bool {
+    entry
+        .user_text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+        || !entry.user_artifacts.is_empty()
+}
+
+fn conversation_entry_has_assistant_content(entry: &ConversationEntry) -> bool {
+    entry
+        .assistant_text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+        || !entry.assistant_artifacts.is_empty()
+}
+
+fn terminal_task_history_marker(status: TaskStatus) -> Option<&'static str> {
+    match status {
+        TaskStatus::Cancelled => Some("[Task was cancelled by the user before completion.]"),
+        TaskStatus::Failed => Some("[Task failed before producing a complete response.]"),
+        TaskStatus::Blocked => Some("[Task was blocked before producing a complete response.]"),
+        TaskStatus::Draft
+        | TaskStatus::Scheduled
+        | TaskStatus::Queued
+        | TaskStatus::Running
+        | TaskStatus::Waiting
+        | TaskStatus::WaitingReview
+        | TaskStatus::Completed => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6879,6 +6913,30 @@ impl CrudStore {
         }))
     }
 
+    pub async fn insert_task_run_conversation_snapshot_if_absent(
+        &self,
+        snapshot: NewTaskRunConversationSnapshot,
+    ) -> Result<TaskRunConversationSnapshotRecord> {
+        self.run_serialized_write(|| {
+            task_run_conversation_snapshot::insert_if_absent(&self.connection, snapshot.clone())
+        })
+        .await
+    }
+
+    pub async fn get_task_run_conversation_snapshot(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<TaskRunConversationSnapshotRecord>> {
+        task_run_conversation_snapshot::find_by_run(&self.connection, run_id).await
+    }
+
+    pub async fn delete_task_run_conversation_snapshot(&self, run_id: &str) -> Result<u64> {
+        self.run_serialized_write(|| {
+            task_run_conversation_snapshot::delete_by_run(&self.connection, run_id)
+        })
+        .await
+    }
+
     pub async fn list_tasks(&self, params: TaskListParams) -> Result<Vec<Task>> {
         let limit = params.limit.map(u64::from);
         let rows = if let Some(parent_task_id) = params.parent_task_id.as_deref() {
@@ -9240,6 +9298,53 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .await
     }
 
+    pub async fn get_thread_causally_closed_conversation_history(
+        &self,
+        thread_id: &str,
+        max_entries: usize,
+    ) -> Result<Vec<ConversationEntry>> {
+        self.get_thread_causally_closed_conversation_history_inner(None, thread_id, max_entries)
+            .await
+    }
+
+    pub async fn get_thread_causally_closed_conversation_history_with_artifacts(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        max_entries: usize,
+    ) -> Result<Vec<ConversationEntry>> {
+        self.get_thread_causally_closed_conversation_history_inner(
+            Some(workspace_id),
+            thread_id,
+            max_entries,
+        )
+        .await
+    }
+
+    async fn get_thread_causally_closed_conversation_history_inner(
+        &self,
+        workspace_id: Option<&str>,
+        thread_id: &str,
+        max_entries: usize,
+    ) -> Result<Vec<ConversationEntry>> {
+        if max_entries == 0 {
+            return Ok(Vec::new());
+        }
+        // A detached exchange occupies two durable turns before causal pairing:
+        // the source Conversation turn and the delivered TaskRun turn.
+        let raw_limit = max_entries.saturating_mul(2);
+        let entries = self
+            .get_thread_conversation_history_inner(workspace_id, thread_id, raw_limit)
+            .await?;
+        let mut entries = self
+            .project_causally_closed_conversation_entries(thread_id, entries)
+            .await?;
+        if entries.len() > max_entries {
+            entries.drain(..entries.len().saturating_sub(max_entries));
+        }
+        Ok(entries)
+    }
+
     async fn get_thread_conversation_history_inner(
         &self,
         workspace_id: Option<&str>,
@@ -9268,6 +9373,187 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
         self.build_ordered_conversation_entries(&turns, &artifact_refs)
             .await
+    }
+
+    async fn project_causally_closed_conversation_entries(
+        &self,
+        thread_id: &str,
+        entries: Vec<ConversationEntry>,
+    ) -> Result<Vec<ConversationEntry>> {
+        let entry_turn_ids = entries
+            .iter()
+            .map(|entry| entry.turn_id.clone())
+            .collect::<Vec<_>>();
+        // Task occurrences and delivery turns are transport records, not standalone
+        // conversation turns. Recognize them from the whole window before looking
+        // for their source command: a long-running Task can finish after its source
+        // has already fallen outside the selected history window.
+        let occurrence_turn_ids =
+            task_run::list_runs_by_ids(&self.connection, entry_turn_ids.as_slice())
+                .await?
+                .into_iter()
+                .map(|run| run.id)
+                .collect::<HashSet<_>>();
+        let delivery_turn_ids = task_delivery::list_thread_deliveries_by_delivered_turns(
+            &self.connection,
+            thread_id,
+            entry_turn_ids.as_slice(),
+        )
+        .await?
+        .into_iter()
+        .filter_map(|delivery| delivery.delivered_turn_id)
+        .collect::<HashSet<_>>();
+
+        let user_only_turn_ids = entries
+            .iter()
+            .filter(|entry| {
+                conversation_entry_has_user_content(entry)
+                    && !conversation_entry_has_assistant_content(entry)
+            })
+            .map(|entry| entry.turn_id.clone())
+            .collect::<Vec<_>>();
+        if user_only_turn_ids.is_empty() {
+            return Ok(entries
+                .into_iter()
+                .filter(|entry| {
+                    !occurrence_turn_ids.contains(entry.turn_id.as_str())
+                        && !delivery_turn_ids.contains(entry.turn_id.as_str())
+                })
+                .collect());
+        }
+
+        let tasks = task_repository::list_tasks_by_creator_turns(
+            &self.connection,
+            thread_id,
+            user_only_turn_ids.as_slice(),
+        )
+        .await?;
+        if tasks.is_empty() {
+            return Ok(entries
+                .into_iter()
+                .filter(|entry| {
+                    !occurrence_turn_ids.contains(entry.turn_id.as_str())
+                        && !delivery_turn_ids.contains(entry.turn_id.as_str())
+                })
+                .collect());
+        }
+
+        let task_source_turns = tasks
+            .iter()
+            .filter_map(|task| {
+                task.created_by_turn_id
+                    .as_ref()
+                    .map(|turn_id| (task.id.clone(), turn_id.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let linked_source_turn_ids = task_source_turns.values().cloned().collect::<HashSet<_>>();
+        let task_ids = task_source_turns.keys().cloned().collect::<Vec<_>>();
+        let deliveries = task_delivery::list_delivered_thread_deliveries_for_tasks(
+            &self.connection,
+            task_ids.as_slice(),
+            thread_id,
+        )
+        .await?;
+        let entries_by_turn_id = entries
+            .iter()
+            .map(|entry| (entry.turn_id.clone(), entry.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut delivered_turn_ids_by_source = HashMap::<String, Vec<String>>::new();
+        let mut delivered_task_ids = HashSet::new();
+        let mut consumed_delivery_turn_ids = HashSet::new();
+        for delivery in deliveries {
+            let Some(source_turn_id) = task_source_turns.get(delivery.task_id.as_str()) else {
+                continue;
+            };
+            let Some(delivered_turn_id) = delivery.delivered_turn_id else {
+                continue;
+            };
+            let Some(delivered_entry) = entries_by_turn_id.get(delivered_turn_id.as_str()) else {
+                continue;
+            };
+            // Delivery status can race slightly ahead of the terminal item projection.
+            // The source is closed only after the complete assistant payload is queryable.
+            if !conversation_entry_has_assistant_content(delivered_entry) {
+                continue;
+            }
+            delivered_turn_ids_by_source
+                .entry(source_turn_id.clone())
+                .or_default()
+                .push(delivered_turn_id.clone());
+            delivered_task_ids.insert(delivery.task_id);
+            consumed_delivery_turn_ids.insert(delivered_turn_id);
+        }
+        let mut terminal_outcomes_by_source = HashMap::<String, Vec<String>>::new();
+        for task in &tasks {
+            if delivered_task_ids.contains(task.id.as_str()) {
+                continue;
+            }
+            let Some(status) = task_status_from_db(task.status.as_str()) else {
+                continue;
+            };
+            let Some(marker) = terminal_task_history_marker(status) else {
+                continue;
+            };
+            let Some(source_turn_id) = task_source_turns.get(task.id.as_str()) else {
+                continue;
+            };
+            terminal_outcomes_by_source
+                .entry(source_turn_id.clone())
+                .or_default()
+                .push(marker.to_owned());
+        }
+
+        let mut projected = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if delivery_turn_ids.contains(entry.turn_id.as_str())
+                || consumed_delivery_turn_ids.contains(entry.turn_id.as_str())
+                || occurrence_turn_ids.contains(entry.turn_id.as_str())
+            {
+                continue;
+            }
+            let is_user_only = conversation_entry_has_user_content(&entry)
+                && !conversation_entry_has_assistant_content(&entry);
+            if !is_user_only || !linked_source_turn_ids.contains(entry.turn_id.as_str()) {
+                projected.push(entry);
+                continue;
+            }
+            let delivered_turn_ids = delivered_turn_ids_by_source.get(entry.turn_id.as_str());
+            let terminal_outcomes = terminal_outcomes_by_source.get(entry.turn_id.as_str());
+            if delivered_turn_ids.is_none() && terminal_outcomes.is_none() {
+                // An unfinished sibling Task is not ordinary conversation history.
+                continue;
+            }
+
+            let mut closed_entry = entry;
+            let mut assistant_text = Vec::new();
+            let mut assistant_artifacts = Vec::new();
+            if let Some(delivered_turn_ids) = delivered_turn_ids {
+                for delivered_turn_id in delivered_turn_ids {
+                    let Some(delivered_entry) = entries_by_turn_id.get(delivered_turn_id.as_str())
+                    else {
+                        continue;
+                    };
+                    if let Some(text) = delivered_entry
+                        .assistant_text
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    {
+                        assistant_text.push(text.to_owned());
+                    }
+                    assistant_artifacts.extend(delivered_entry.assistant_artifacts.iter().cloned());
+                }
+            }
+            if let Some(terminal_outcomes) = terminal_outcomes {
+                assistant_text.extend(terminal_outcomes.iter().cloned());
+            }
+            if !assistant_text.is_empty() {
+                closed_entry.assistant_text = Some(assistant_text.join("\n\n"));
+            }
+            closed_entry.assistant_artifacts = assistant_artifacts;
+            projected.push(closed_entry);
+        }
+        Ok(projected)
     }
 
     async fn build_ordered_conversation_entries(
@@ -9303,8 +9589,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 .cloned()
                 .unwrap_or_default();
 
-            let has_user_message = !user_text.is_empty();
-            let has_assistant_message = !assistant_text.is_empty();
+            let has_user_message = !user_text.is_empty() || !refs.user.is_empty();
+            let has_assistant_message = !assistant_text.is_empty() || !refs.assistant.is_empty();
             let effective_timestamp_millis = if has_user_message {
                 turn_model.created_at.timestamp_millis()
             } else if has_assistant_message {
@@ -12107,6 +12393,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let turns = turn::find_completed_turns_for_thread(&self.connection, thread_id).await?;
         let entries = self
             .build_ordered_conversation_entries(&turns, &BTreeMap::new())
+            .await?;
+        let entries = self
+            .project_causally_closed_conversation_entries(thread_id, entries)
             .await?;
         let skip = usize::try_from(skip).unwrap_or(usize::MAX);
         let take = usize::try_from(take).unwrap_or(usize::MAX);

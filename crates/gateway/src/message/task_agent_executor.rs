@@ -305,6 +305,31 @@ impl TaskAgentExecutor {
             .system_thread_start_seeded(context.workspace_id.clone(), thread_params, None, None)
             .await
             .context("failed to create hidden task thread")?;
+        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
+            Some(
+                load_task_execution_conversation_scope(
+                    processor,
+                    task,
+                    run,
+                    parent,
+                    child_runtime.task_run_turn.kind,
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
+                    thread_outcome.started_notification.thread.model.as_str(),
+                    thread_outcome
+                        .started_notification
+                        .thread
+                        .model_provider
+                        .as_str(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let frozen_parent_history = frozen_conversation_scope
+            .as_ref()
+            .map(|(_, history)| history.as_slice());
 
         let child_input = if let Some(launch) = composer_launch.as_ref() {
             launch.input.clone()
@@ -317,6 +342,7 @@ impl TaskAgentExecutor {
                 parent,
                 None,
                 &child_permission_profile,
+                frozen_parent_history,
             )
             .await?;
             materialize_child_task_input(prompt, agent_spec)
@@ -336,6 +362,10 @@ impl TaskAgentExecutor {
             cli_runtime_options: None,
         });
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
+            let conversation_history = frozen_conversation_scope
+                .as_ref()
+                .map(|(_, history)| history.clone())
+                .unwrap_or_default();
             let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
                 processor,
                 context.workspace_id.as_str(),
@@ -375,6 +405,7 @@ impl TaskAgentExecutor {
                         continuation_thread_id,
                         task_run_id,
                         execution_id,
+                        conversation_history,
                     )
                     .await
             })
@@ -641,6 +672,7 @@ impl TaskAgentExecutor {
         let (hook_runtime_context, history) = load_task_execution_conversation_scope(
             processor,
             task,
+            run,
             parent,
             child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
@@ -906,6 +938,28 @@ impl TaskAgentExecutor {
             .await
             .context("failed to restore revision task thread")?;
         let child_permission_profile = effective_task_child_permission_profile(agent_spec, None)?;
+        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
+            Some(
+                load_task_execution_conversation_scope(
+                    processor,
+                    task,
+                    run,
+                    &parent,
+                    child_runtime.task_run_turn.kind,
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                    thread_outcome.started_notification.thread.model.as_str(),
+                    thread_outcome
+                        .started_notification
+                        .thread
+                        .model_provider
+                        .as_str(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -915,6 +969,9 @@ impl TaskAgentExecutor {
                 &parent,
                 Some(&child_runtime.task_run_turn),
                 &child_permission_profile,
+                frozen_conversation_scope
+                    .as_ref()
+                    .map(|(_, history)| history.as_slice()),
             )
             .await?,
             agent_spec,
@@ -1178,6 +1235,7 @@ impl TaskAgentExecutor {
         let (hook_runtime_context, history) = load_task_execution_conversation_scope(
             processor,
             task,
+            run,
             &parent,
             child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
@@ -1485,6 +1543,28 @@ impl TaskAgentExecutor {
             .context("failed to restore hidden task thread")?;
         let child_permission_profile =
             effective_task_child_permission_profile(agent_spec, launch_permission_profile)?;
+        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
+            Some(
+                load_task_execution_conversation_scope(
+                    processor,
+                    task,
+                    run,
+                    &parent,
+                    child_runtime.task_run_turn.kind,
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                    thread_outcome.started_notification.thread.model.as_str(),
+                    thread_outcome
+                        .started_notification
+                        .thread
+                        .model_provider
+                        .as_str(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -1494,6 +1574,9 @@ impl TaskAgentExecutor {
                 &parent,
                 Some(&child_runtime.task_run_turn),
                 &child_permission_profile,
+                frozen_conversation_scope
+                    .as_ref()
+                    .map(|(_, history)| history.as_slice()),
             )
             .await?,
             agent_spec,
@@ -1605,6 +1688,7 @@ impl TaskAgentExecutor {
         let (hook_runtime_context, history) = load_task_execution_conversation_scope(
             processor,
             task,
+            run,
             &parent,
             child_runtime.task_run_turn.kind,
             child_thread_id,
@@ -2231,6 +2315,16 @@ impl TaskAgentExecutor {
         }
 
         let task = &task_response.task;
+        let run = processor
+            .crud_store
+            .get_task_run(task_run_turn.run_id.as_str())
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "reviewer Task run `{}` disappeared before dispatch",
+                    task_run_turn.run_id
+                )
+            })?;
         let parent = resolve_parent_context(processor, task).await?;
         let effective_model = effective_agent_model(agent_spec)?;
         let thread_params = pioneer_protocol::ThreadStartParams {
@@ -2411,6 +2505,7 @@ impl TaskAgentExecutor {
         let (hook_runtime_context, history) = load_task_execution_conversation_scope(
             processor,
             task,
+            &run,
             &parent,
             task_run_turn.kind,
             task_run_turn.thread_id.as_str(),
@@ -3010,6 +3105,7 @@ fn task_hook_runtime_context(
 async fn load_task_execution_conversation_scope(
     processor: &Arc<MessageProcessor>,
     task: &Task,
+    run: &TaskRun,
     parent: &TaskParentRuntimeContext,
     task_run_turn_kind: TaskRunTurnKind,
     execution_thread_id: &str,
@@ -3035,23 +3131,96 @@ async fn load_task_execution_conversation_scope(
     if task_attachment(task) != TaskAttachmentMode::Detached {
         return Ok((expected_hook_context, Vec::new()));
     }
-    let launch_turn_id = task
+    let source_turn_id = task
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.composer_work.as_ref())
-        .map(|composer_work| composer_work.launch.turn_id.as_str());
+        .map(|composer_work| composer_work.launch.turn_id.as_str())
+        .or(task.created_by_turn_id.as_deref());
+    if let Some(snapshot) = processor
+        .crud_store
+        .get_task_run_conversation_snapshot(run.id.as_str())
+        .await?
+    {
+        let history =
+            restore_task_run_conversation_snapshot(&snapshot, task, parent, source_turn_id)?;
+        return Ok((expected_hook_context, history));
+    }
+    if let Some(retry_of_run_id) = run.retry_of_run_id.as_deref()
+        && let Some(snapshot) = processor
+            .crud_store
+            .get_task_run_conversation_snapshot(retry_of_run_id)
+            .await?
+    {
+        let history =
+            restore_task_run_conversation_snapshot(&snapshot, task, parent, source_turn_id)?;
+        let persisted = processor
+            .crud_store
+            .insert_task_run_conversation_snapshot_if_absent(
+                pioneer_crud::NewTaskRunConversationSnapshot {
+                    run_id: run.id.clone(),
+                    task_id: task.id.clone(),
+                    workspace_id: task.workspace_id.clone(),
+                    conversation_thread_id: parent.parent_thread_id.clone(),
+                    source_turn_id: source_turn_id.map(str::to_owned),
+                    history_json: serde_json::to_string(&history)
+                        .context("failed to serialize inherited Task conversation snapshot")?,
+                    created_at: chrono::Utc::now().fixed_offset(),
+                },
+            )
+            .await?;
+        let history =
+            restore_task_run_conversation_snapshot(&persisted, task, parent, source_turn_id)?;
+        return Ok((expected_hook_context, history));
+    }
     let history = processor
         .load_conversation_history_for_workspace_in_execution_excluding_turn(
             task.workspace_id.as_str(),
             parent.parent_thread_id.as_str(),
             execution_thread_id,
             execution_turn_id,
-            launch_turn_id,
+            source_turn_id,
             Some(fallback_model),
             Some(fallback_model_provider),
         )
         .await;
+    let persisted = processor
+        .crud_store
+        .insert_task_run_conversation_snapshot_if_absent(
+            pioneer_crud::NewTaskRunConversationSnapshot {
+                run_id: run.id.clone(),
+                task_id: task.id.clone(),
+                workspace_id: task.workspace_id.clone(),
+                conversation_thread_id: parent.parent_thread_id.clone(),
+                source_turn_id: source_turn_id.map(str::to_owned),
+                history_json: serde_json::to_string(&history)
+                    .context("failed to serialize Task conversation snapshot")?,
+                created_at: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await?;
+    let history = restore_task_run_conversation_snapshot(&persisted, task, parent, source_turn_id)?;
     Ok((expected_hook_context, history))
+}
+
+fn restore_task_run_conversation_snapshot(
+    snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+    source_turn_id: Option<&str>,
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    if snapshot.task_id != task.id
+        || snapshot.workspace_id != task.workspace_id
+        || snapshot.conversation_thread_id != parent.parent_thread_id
+        || snapshot.source_turn_id.as_deref() != source_turn_id
+    {
+        bail!(
+            "Task run `{}` conversation snapshot identity does not match its execution context",
+            snapshot.run_id
+        );
+    }
+    serde_json::from_str(snapshot.history_json.as_str())
+        .context("failed to restore frozen Task conversation history")
 }
 
 async fn ensure_task_run_occurrence_context(
@@ -4436,12 +4605,14 @@ async fn materialize_child_task_prompt(
     parent: &TaskParentRuntimeContext,
     task_run_turn: Option<&TaskRunTurn>,
     effective_permission_profile: &TurnPermissionProfileSnapshot,
+    frozen_parent_history: Option<&[pioneer_provider::ChatMessage]>,
 ) -> Result<String> {
     let parent_context = render_context_policy(
         processor,
         task_response.task.workspace_id.as_str(),
         agent_spec,
         parent,
+        frozen_parent_history,
     )
     .await?;
     let trigger = run
@@ -4705,11 +4876,14 @@ async fn render_context_policy(
     workspace_id: &str,
     agent_spec: &TaskAgentSpec,
     parent: &TaskParentRuntimeContext,
+    frozen_parent_history: Option<&[pioneer_provider::ChatMessage]>,
 ) -> Result<Option<String>> {
     let Some(policy) = agent_spec.context_policy.as_ref() else {
-        return Ok(render_parent_history(processor, parent, Some(6), true)
-            .await?
-            .map(frame_background_context));
+        let rendered = match frozen_parent_history {
+            Some(history) => render_frozen_parent_history(history, Some(6), true),
+            None => render_parent_history(processor, parent, Some(6), true).await?,
+        };
+        return Ok(rendered.map(frame_background_context));
     };
 
     let mut sections = Vec::new();
@@ -4720,26 +4894,50 @@ async fn render_context_policy(
             .as_ref()
             .and_then(render_agent_context)
             .map(|value| format!("Context:\n{value}"))),
-        TaskAgentContextMode::SummaryOnly => {
-            render_parent_summary(processor, parent, policy.include_parent_summary).await
-        }
-        TaskAgentContextMode::LastNTurns => {
-            render_parent_history(
-                processor,
-                parent,
-                policy.max_turns.map(|value| value as usize).or(Some(6)),
+        TaskAgentContextMode::SummaryOnly => match frozen_parent_history {
+            Some(history) => Ok(render_frozen_parent_summary(
+                history,
                 policy.include_parent_summary,
-            )
-            .await
+            )),
+            None => render_parent_summary(processor, parent, policy.include_parent_summary).await,
+        },
+        TaskAgentContextMode::LastNTurns => {
+            let max_turns = policy.max_turns.map(|value| value as usize).or(Some(6));
+            match frozen_parent_history {
+                Some(history) => Ok(render_frozen_parent_history(
+                    history,
+                    max_turns,
+                    policy.include_parent_summary,
+                )),
+                None => {
+                    render_parent_history(
+                        processor,
+                        parent,
+                        max_turns,
+                        policy.include_parent_summary,
+                    )
+                    .await
+                }
+            }
         }
         TaskAgentContextMode::InheritParent => {
-            render_parent_history(
-                processor,
-                parent,
-                policy.max_turns.map(|value| value as usize).or(Some(12)),
-                policy.include_parent_summary,
-            )
-            .await
+            let max_turns = policy.max_turns.map(|value| value as usize).or(Some(12));
+            match frozen_parent_history {
+                Some(history) => Ok(render_frozen_parent_history(
+                    history,
+                    max_turns,
+                    policy.include_parent_summary,
+                )),
+                None => {
+                    render_parent_history(
+                        processor,
+                        parent,
+                        max_turns,
+                        policy.include_parent_summary,
+                    )
+                    .await
+                }
+            }
         }
     }? {
         sections.push(rendered);
@@ -4757,6 +4955,60 @@ async fn render_context_policy(
     } else {
         Ok(Some(frame_background_context(sections.join("\n\n"))))
     }
+}
+
+fn render_frozen_parent_summary(
+    history: &[pioneer_provider::ChatMessage],
+    include_parent_summary: bool,
+) -> Option<String> {
+    if !include_parent_summary {
+        return None;
+    }
+    history
+        .iter()
+        .find(|message| message.role == pioneer_provider::Role::System)
+        .map(|message| message.content.trim())
+        .map(|content| {
+            content
+                .strip_prefix("Summary of earlier conversation:\n")
+                .unwrap_or(content)
+        })
+        .filter(|content| !content.is_empty())
+        .map(|content| format!("Parent thread summary:\n{content}"))
+}
+
+fn render_frozen_parent_history(
+    history: &[pioneer_provider::ChatMessage],
+    max_turns: Option<usize>,
+    include_parent_summary: bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(summary) = render_frozen_parent_summary(history, include_parent_summary) {
+        parts.push(summary);
+    }
+
+    let max_messages = max_turns.unwrap_or(6).max(1).saturating_mul(2);
+    let conversation = history
+        .iter()
+        .filter_map(|message| {
+            let label = match message.role {
+                pioneer_provider::Role::User => "User",
+                pioneer_provider::Role::Assistant => "Assistant",
+                pioneer_provider::Role::System | pioneer_provider::Role::Tool => return None,
+            };
+            let content = message.content.trim();
+            (!content.is_empty()).then(|| format!("{label}: {content}"))
+        })
+        .collect::<Vec<_>>();
+    let start = conversation.len().saturating_sub(max_messages);
+    if start < conversation.len() {
+        parts.push(format!(
+            "Recent parent thread context:\n{}",
+            conversation[start..].join("\n")
+        ));
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn frame_background_context(context: String) -> String {
@@ -4805,7 +5057,7 @@ async fn render_parent_history(
     let entries = if let Some(workspace_id) = parent_workspace_id.as_deref() {
         processor
             .crud_store
-            .get_thread_conversation_history_with_artifacts(
+            .get_thread_causally_closed_conversation_history_with_artifacts(
                 workspace_id,
                 parent.parent_thread_id.as_str(),
                 max_turns,
@@ -4815,7 +5067,10 @@ async fn render_parent_history(
     } else {
         processor
             .crud_store
-            .get_thread_conversation_history(parent.parent_thread_id.as_str(), max_turns)
+            .get_thread_causally_closed_conversation_history(
+                parent.parent_thread_id.as_str(),
+                max_turns,
+            )
             .await
             .unwrap_or_default()
     };

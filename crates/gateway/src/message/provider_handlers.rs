@@ -965,6 +965,7 @@ impl MessageProcessor {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -983,6 +984,7 @@ impl MessageProcessor {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -1005,6 +1007,7 @@ impl MessageProcessor {
             fallback_model,
             fallback_model_provider,
             excluded_conversation_turn_id,
+            true,
         )
         .await
     }
@@ -1019,6 +1022,7 @@ impl MessageProcessor {
         fallback_model: Option<&str>,
         fallback_model_provider: Option<&str>,
         excluded_conversation_turn_id: Option<&str>,
+        causally_closed: bool,
     ) -> Vec<ChatMessage> {
         use crate::tokenizer::count_tokens;
 
@@ -1048,12 +1052,26 @@ impl MessageProcessor {
         };
 
         let entries_result = if let Some(workspace_id) = workspace_id {
+            if causally_closed {
+                self.crud_store
+                    .get_thread_causally_closed_conversation_history_with_artifacts(
+                        workspace_id,
+                        conversation_thread_id,
+                        MAX_TURNS,
+                    )
+                    .await
+            } else {
+                self.crud_store
+                    .get_thread_conversation_history_with_artifacts(
+                        workspace_id,
+                        conversation_thread_id,
+                        MAX_TURNS,
+                    )
+                    .await
+            }
+        } else if causally_closed {
             self.crud_store
-                .get_thread_conversation_history_with_artifacts(
-                    workspace_id,
-                    conversation_thread_id,
-                    MAX_TURNS,
-                )
+                .get_thread_causally_closed_conversation_history(conversation_thread_id, MAX_TURNS)
                 .await
         } else {
             self.crud_store

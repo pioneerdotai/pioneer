@@ -457,24 +457,32 @@ impl TaskToolHandler {
             return Ok(function_output(output));
         }
         let params = self.create_params(input).await?;
+        let create_context = self
+            .processor
+            .task_create_context_for_params(&params)
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to freeze detached Task context: {error:#}"
+                ))
+            })?;
         let service = self.processor.task_runtime.service();
-        let response = match task_tool_fresh_task(async move {
-            service
-                .create_task(pioneer_tasks::TaskCreateContext::default(), params)
-                .await
-        })
-        .await
-        {
-            Ok(response) => {
-                response.map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
-            }
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                return Err(ToolError::execution_failed(format!(
-                    "task_create worker failed: {error}"
-                )));
-            }
-        };
+        let response =
+            match task_tool_fresh_task(
+                async move { service.create_task(create_context, params).await },
+            )
+            .await
+            {
+                Ok(response) => {
+                    response.map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+                }
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    return Err(ToolError::execution_failed(format!(
+                        "task_create worker failed: {error}"
+                    )));
+                }
+            };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
         let output = task_create_tool_output(&response, &anchor);
         self.cache_mutation_output(cache_key.as_deref(), &output)

@@ -29,7 +29,9 @@ pub use invariant::{
     TaskRuntimeInvariantSeverity, TaskRuntimeInvariantViolation, TaskRuntimeInvariantViolationKind,
 };
 pub use notifications::TaskNotificationMapper;
-pub use policy::{TaskCreateContext, TaskMutationContext, TaskWaitContext};
+pub use policy::{
+    TaskCreateContext, TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitContext,
+};
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};
 pub use review::{

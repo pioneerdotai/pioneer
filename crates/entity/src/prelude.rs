@@ -39,6 +39,7 @@ pub use super::task_event::Entity as TaskEvent;
 pub use super::task_result_candidate::Entity as TaskResultCandidate;
 pub use super::task_result_review_event::Entity as TaskResultReviewEvent;
 pub use super::task_run::Entity as TaskRun;
+pub use super::task_run_conversation_snapshot::Entity as TaskRunConversationSnapshot;
 pub use super::task_run_execution::Entity as TaskRunExecution;
 pub use super::task_run_thread_binding::Entity as TaskRunThreadBinding;
 pub use super::task_run_turn::Entity as TaskRunTurn;

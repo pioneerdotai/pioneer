@@ -70,6 +70,36 @@ pub async fn list_runs_by_task<C: ConnectionTrait>(
         .context("failed to list task runs")
 }
 
+pub async fn list_runs_by_tasks<C: ConnectionTrait>(
+    db: &C,
+    task_ids: &[String],
+) -> Result<Vec<task_run::Model>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    task_run::Entity::find()
+        .filter(task_run::Column::TaskId.is_in(task_ids.to_vec()))
+        .order_by_asc(task_run::Column::CreatedAt)
+        .order_by_asc(task_run::Column::RunNumber)
+        .all(db)
+        .await
+        .context("failed to list task runs by tasks")
+}
+
+pub async fn list_runs_by_ids<C: ConnectionTrait>(
+    db: &C,
+    run_ids: &[String],
+) -> Result<Vec<task_run::Model>> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    task_run::Entity::find()
+        .filter(task_run::Column::Id.is_in(run_ids.to_vec()))
+        .all(db)
+        .await
+        .context("failed to list task runs by ids")
+}
+
 pub async fn list_runs_by_status<C: ConnectionTrait>(
     db: &C,
     status: TaskRunStatus,

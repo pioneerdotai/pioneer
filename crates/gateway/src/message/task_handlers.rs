@@ -1,19 +1,116 @@
 use super::*;
 
 impl MessageProcessor {
+    pub(crate) async fn task_create_context_for_params(
+        &self,
+        params: &TaskCreateParams,
+    ) -> anyhow::Result<pioneer_tasks::TaskCreateContext> {
+        if params.trigger.spec.kind() != pioneer_protocol::TaskTriggerKind::Immediate {
+            return Ok(pioneer_tasks::TaskCreateContext::default());
+        }
+        let attachment = params
+            .lifecycle_policy
+            .as_ref()
+            .map(|policy| policy.attachment)
+            .unwrap_or_else(|| {
+                if params.created_by_turn_id.is_some() {
+                    pioneer_protocol::TaskAttachmentMode::Attached
+                } else {
+                    pioneer_protocol::TaskAttachmentMode::Detached
+                }
+            });
+        if attachment != pioneer_protocol::TaskAttachmentMode::Detached {
+            return Ok(pioneer_tasks::TaskCreateContext::default());
+        }
+
+        let Some(source_turn_id) = params.created_by_turn_id.as_deref() else {
+            // An immediate detached Task without a creator turn is frozen by
+            // the executor at run admission, where the run identity exists.
+            return Ok(pioneer_tasks::TaskCreateContext::default());
+        };
+        let conversation_thread_id = params
+            .created_by_thread_id
+            .clone()
+            .or_else(|| {
+                (params.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then(|| params.owner_id.clone())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "immediate detached Task `{}` has no conversation thread to snapshot",
+                    params.title
+                )
+            })?;
+        let thread = self
+            .crud_store
+            .get_thread_by_id(conversation_thread_id.as_str())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Task conversation thread `{conversation_thread_id}` does not exist"
+                )
+            })?;
+        if thread.workspace_id != params.workspace_id {
+            anyhow::bail!(
+                "Task conversation thread `{conversation_thread_id}` belongs to another workspace"
+            );
+        }
+        let fallback_model = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.model.as_deref())
+            .unwrap_or(thread.model.as_str());
+        let fallback_model_provider = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.model_provider.as_deref())
+            .unwrap_or(thread.model_provider.as_str());
+        let history = self
+            .load_conversation_history_for_workspace_in_execution_excluding_turn(
+                params.workspace_id.as_str(),
+                conversation_thread_id.as_str(),
+                conversation_thread_id.as_str(),
+                source_turn_id,
+                Some(source_turn_id),
+                Some(fallback_model),
+                Some(fallback_model_provider),
+            )
+            .await;
+
+        Ok(pioneer_tasks::TaskCreateContext {
+            conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
+                conversation_thread_id,
+                source_turn_id: Some(source_turn_id.to_owned()),
+                history_json: serde_json::to_string(&history)
+                    .context("failed to serialize detached Task conversation snapshot")?,
+            }),
+            ..Default::default()
+        })
+    }
+
     pub(super) async fn task_create(
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
         params: TaskCreateParams,
     ) {
-        match message_future(
-            self.task_runtime
-                .service()
-                .create_task(pioneer_tasks::TaskCreateContext::default(), params),
-        )
-        .await
-        {
+        let context = match self.task_create_context_for_params(&params).await {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to freeze task context: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        match message_future(self.task_runtime.service().create_task(context, params)).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await

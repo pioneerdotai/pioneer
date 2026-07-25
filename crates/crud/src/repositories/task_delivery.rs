@@ -173,6 +173,42 @@ pub async fn list_deliveries_for_task<C: ConnectionTrait>(
         .context("failed to list task deliveries by task")
 }
 
+pub async fn list_delivered_thread_deliveries_for_tasks<C: ConnectionTrait>(
+    db: &C,
+    task_ids: &[String],
+    target_thread_id: &str,
+) -> Result<Vec<task_delivery::Model>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    task_delivery::Entity::find()
+        .filter(task_delivery::Column::TaskId.is_in(task_ids.to_vec()))
+        .filter(task_delivery::Column::TargetThreadId.eq(target_thread_id.to_owned()))
+        .filter(task_delivery::Column::Status.eq("delivered"))
+        .filter(task_delivery::Column::DeliveredTurnId.is_not_null())
+        .order_by_asc(task_delivery::Column::DeliveredAt)
+        .order_by_asc(task_delivery::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to list delivered task conversation links")
+}
+
+pub async fn list_thread_deliveries_by_delivered_turns<C: ConnectionTrait>(
+    db: &C,
+    target_thread_id: &str,
+    delivered_turn_ids: &[String],
+) -> Result<Vec<task_delivery::Model>> {
+    if delivered_turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    task_delivery::Entity::find()
+        .filter(task_delivery::Column::TargetThreadId.eq(target_thread_id.to_owned()))
+        .filter(task_delivery::Column::DeliveredTurnId.is_in(delivered_turn_ids.to_vec()))
+        .all(db)
+        .await
+        .context("failed to list task deliveries by delivered turns")
+}
+
 pub async fn list_attempts_for_deliveries<C: ConnectionTrait>(
     db: &C,
     delivery_ids: &[String],

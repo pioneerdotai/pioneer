@@ -4,9 +4,17 @@ use pioneer_protocol::{
     TaskRetryBackoffKind, TaskRetryPolicy, TaskTriggerKind,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunConversationSnapshotSeed {
+    pub conversation_thread_id: String,
+    pub source_turn_id: Option<String>,
+    pub history_json: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskCreateContext {
     pub actor_id: Option<String>,
+    pub conversation_snapshot: Option<TaskRunConversationSnapshotSeed>,
 }
 
 #[derive(Debug, Clone, Default)]

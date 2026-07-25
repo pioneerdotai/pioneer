@@ -53,6 +53,7 @@ pub(super) enum TurnStartSuccessResponse {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
+        conversation_history: Vec<ChatMessage>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -115,6 +116,16 @@ impl TurnStartSuccessResponse {
                 execution_id,
                 ..
             } => Some((task_run_id.as_str(), execution_id.as_str())),
+            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
+        }
+    }
+
+    fn task_conversation_history(&self) -> Option<&[ChatMessage]> {
+        match self {
+            Self::Task {
+                conversation_history,
+                ..
+            } => Some(conversation_history.as_slice()),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
         }
     }
@@ -723,6 +734,42 @@ impl MessageProcessor {
             }
             _ => outcome.materialization.thread.model_provider.clone(),
         };
+        // Freeze the causally closed parent branch before the Task becomes
+        // visible to the scheduler. A later sibling message must not change
+        // the context of this run, even if execution starts later.
+        let frozen_history = self
+            .load_conversation_history_for_workspace_in_execution_excluding_turn(
+                thread.workspace_id.as_str(),
+                thread.id.as_str(),
+                thread.id.as_str(),
+                launch.turn_id.as_str(),
+                Some(launch.turn_id.as_str()),
+                Some(outcome.materialization.thread.model.as_str()),
+                Some(task_model_provider.as_str()),
+            )
+            .await;
+        let frozen_history_json = match serde_json::to_string(&frozen_history) {
+            Ok(history_json) => history_json,
+            Err(error) => {
+                self.report_turn_failure(
+                    thread.id.clone(),
+                    launch.turn_id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
+                    format!("failed to freeze Composer task history: {error:#}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to freeze Composer task history: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let task_params = pioneer_protocol::TaskCreateParams {
             workspace_id: thread.workspace_id.clone(),
             owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
@@ -783,10 +830,18 @@ impl MessageProcessor {
                 composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
             }),
         };
+        let create_context = pioneer_tasks::TaskCreateContext {
+            conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
+                conversation_thread_id: thread.id.clone(),
+                source_turn_id: Some(launch.turn_id.clone()),
+                history_json: frozen_history_json,
+            }),
+            ..Default::default()
+        };
         if let Err(error) = self
             .task_runtime
             .service()
-            .create_task(pioneer_tasks::TaskCreateContext::default(), task_params)
+            .create_task(create_context, task_params)
             .await
         {
             self.report_turn_failure(
@@ -1223,6 +1278,7 @@ impl MessageProcessor {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
+        conversation_history: Vec<ChatMessage>,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let response = TurnStartSuccessResponse::Task {
@@ -1232,6 +1288,7 @@ impl MessageProcessor {
             context_thread_id,
             task_run_id,
             execution_id,
+            conversation_history,
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -2393,6 +2450,7 @@ impl MessageProcessor {
                     context_thread_id.as_str(),
                     combined_preflight.mcp_projection.as_ref(),
                     selected_skill_names.as_slice(),
+                    success_response.task_conversation_history(),
                 )
                 .await
             {
@@ -4032,19 +4090,24 @@ impl MessageProcessor {
         context_thread_id: &str,
         mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
         selected_skill_names: &[String],
+        frozen_history: Option<&[ChatMessage]>,
     ) -> anyhow::Result<pioneer_promt::CompiledInstructionDeliveryPlan> {
         let native_cwd = self
             .crud_store
             .get_cli_runtime_thread_binding(continuation_thread_id)
             .await?
             .and_then(|binding| binding.native_cwd);
-        let history = self
-            .load_conversation_history_for_workspace(
-                outcome.started_notification.workspace_id.as_str(),
-                context_thread_id,
-                outcome.started_notification.turn.id.as_str(),
-            )
-            .await;
+        let history = match frozen_history {
+            Some(history) => history.to_vec(),
+            None => {
+                self.load_conversation_history_for_workspace(
+                    outcome.started_notification.workspace_id.as_str(),
+                    context_thread_id,
+                    outcome.started_notification.turn.id.as_str(),
+                )
+                .await
+            }
+        };
         let permission_profile =
             self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
         crate::cli_runtime::context::compile_cli_runtime_delivery_plan(

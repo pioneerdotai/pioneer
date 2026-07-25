@@ -2374,6 +2374,13 @@ struct HangingChildProvider {
     child_main_calls: AtomicUsize,
 }
 
+struct ConcurrentComposerHistoryProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    first_started: Notify,
+    second_started: Notify,
+    release_first: Notify,
+}
+
 struct FlakyTitleProvider {
     failures_before_success: usize,
     text: String,
@@ -2714,6 +2721,24 @@ impl HangingChildProvider {
     }
 }
 
+impl ConcurrentComposerHistoryProvider {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            first_started: Notify::new(),
+            second_started: Notify::new(),
+            release_first: Notify::new(),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("concurrent Composer request lock")
+            .clone()
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for CaptureSummaryProvider {
     fn name(&self) -> &str {
@@ -2915,6 +2940,65 @@ impl Provider for HangingChildProvider {
             return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
         }
         Ok(text_response("parent done"))
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ConcurrentComposerHistoryProvider {
+    fn name(&self) -> &str {
+        "concurrent-composer-history"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
+        let current_command = request.messages.last().and_then(|message| {
+            (message.role == pioneer_provider::Role::User).then(|| message.content.clone())
+        });
+        self.requests
+            .lock()
+            .expect("concurrent Composer request lock")
+            .push(request);
+        match current_command.as_deref() {
+            Some("ASYNC_TASK_A") => {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+                Ok(text_response(
+                    r#"<task_result>{"summary":"A complete","data":{"rawText":"A complete"}}</task_result>"#,
+                ))
+            }
+            Some("ASYNC_TASK_B") => {
+                self.second_started.notify_one();
+                Ok(text_response(
+                    r#"<task_result>{"summary":"B complete","data":{"rawText":"B complete"}}</task_result>"#,
+                ))
+            }
+            _ => Ok(text_response(r#"{"facts":[]}"#)),
+        }
     }
 
     async fn stream_chat(
@@ -6450,6 +6534,242 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
+    let (tx, mut rx) = mpsc::channel(256);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let provider = Arc::new(ConcurrentComposerHistoryProvider::new());
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let parent_thread_id = "thr_concurrent_frozen_composer";
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: parent_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: Some("Concurrent frozen Composer".to_owned()),
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::Collaborative),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("collaborative thread should start");
+
+    for (turn_id, command) in [
+        ("turn_concurrent_task_a", "ASYNC_TASK_A"),
+        ("turn_concurrent_task_b", "ASYNC_TASK_B"),
+    ] {
+        let request_id = generate_test_request_id("frozen", turn_id);
+        processor
+            .process_request(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": parent_thread_id,
+                        "turn_id": turn_id,
+                        "input": [{"type": "text", "text": command}],
+                        "model": "test-model",
+                        "model_provider": "openai",
+                        "mode": "Agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let started: TurnStartResponse =
+            serde_json::from_value(response.result).expect("turn/start response should decode");
+        assert_eq!(started.turn.id, turn_id);
+
+        if command == "ASYNC_TASK_A" {
+            timeout(Duration::from_secs(5), provider.first_started.notified())
+                .await
+                .expect("Task A provider request should start");
+        } else {
+            timeout(Duration::from_secs(5), provider.second_started.notified())
+                .await
+                .expect("Task B must start while Task A is still blocked");
+        }
+    }
+
+    let requests = provider.snapshot_requests();
+    let task_b_request = requests
+        .iter()
+        .find(|request| {
+            request
+                .messages
+                .last()
+                .is_some_and(|message| message.content == "ASYNC_TASK_B")
+        })
+        .expect("Task B main request should be captured");
+    assert_eq!(
+        task_b_request
+            .messages
+            .iter()
+            .filter(|message| message.content == "ASYNC_TASK_B")
+            .count(),
+        1,
+        "Task B must receive exactly one actionable current command"
+    );
+    assert!(
+        task_b_request
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("ASYNC_TASK_A")),
+        "the unfinished sibling command A must not enter Task B history"
+    );
+
+    let tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("Composer tasks should list");
+    let task_for_turn = |turn_id: &str| {
+        tasks.tasks.iter().find(|task| {
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_some_and(|work| work.launch.turn_id == turn_id)
+        })
+    };
+    let task_a = task_for_turn("turn_concurrent_task_a").expect("Task A should exist");
+    let task_b = task_for_turn("turn_concurrent_task_b").expect("Task B should exist");
+    let task_a_state = crud_store
+        .get_task(task_a.id.as_str())
+        .await
+        .expect("Task A should load")
+        .expect("Task A should persist");
+    assert!(
+        task_a_state
+            .runs
+            .last()
+            .is_some_and(|run| !run.status.is_terminal()),
+        "Task A must still be active when independent Task B starts"
+    );
+    let task_b_state = crud_store
+        .get_task(task_b.id.as_str())
+        .await
+        .expect("Task B should load")
+        .expect("Task B should persist");
+    let task_b_run = task_b_state
+        .runs
+        .last()
+        .expect("Task B should have an immediate run");
+    let frozen = crud_store
+        .get_task_run_conversation_snapshot(task_b_run.id.as_str())
+        .await
+        .expect("Task B snapshot should load")
+        .expect("Task B history must be frozen at admission");
+    let frozen_history: Vec<pioneer_provider::ChatMessage> =
+        serde_json::from_str(frozen.history_json.as_str())
+            .expect("Task B frozen history should decode");
+    assert!(
+        frozen_history.iter().all(|message| {
+            !message.content.contains("ASYNC_TASK_A") && !message.content.contains("ASYNC_TASK_B")
+        }),
+        "the immutable branch contains only causally closed prior exchanges; B is supplied separately"
+    );
+
+    let task_a_id = task_a.id.clone();
+    let task_b_id = task_b.id.clone();
+    provider.release_first.notify_one();
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            task_a_id.as_str(),
+            TaskStatus::Completed
+        )
+        .await,
+        TaskStatus::Completed
+    );
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            task_b_id.as_str(),
+            TaskStatus::Completed
+        )
+        .await,
+        TaskStatus::Completed
+    );
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+        .await
+        .expect("completed Task results should deliver to the parent");
+    let mut closed_entries = Vec::new();
+    for _ in 0..200 {
+        closed_entries = crud_store
+            .get_thread_causally_closed_conversation_history(parent_thread_id, 10)
+            .await
+            .expect("causally closed parent history should load");
+        if closed_entries.len() >= 2
+            && closed_entries
+                .iter()
+                .all(|entry| entry.assistant_text.is_some())
+        {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        closed_entries
+            .iter()
+            .filter_map(|entry| entry.user_text.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["ASYNC_TASK_A", "ASYNC_TASK_B"],
+        "completed sibling Tasks must re-enter later history in source-command order"
+    );
+    assert!(
+        closed_entries.iter().any(|entry| entry
+            .assistant_text
+            .as_deref()
+            .is_some_and(|text| text.contains("A complete")))
+            && closed_entries.iter().any(|entry| entry
+                .assistant_text
+                .as_deref()
+                .is_some_and(|text| text.contains("B complete"))),
+        "each completed source command must be paired with its fully delivered result"
+    );
+}
+
 #[test]
 fn collaborative_child_stop_cancels_task_and_survives_late_delivery() {
     run_large_stack_message_test(
@@ -6640,6 +6960,32 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         )
         .await,
         TurnStatus::Interrupted
+    );
+    let causal_history = crud_store
+        .get_thread_causally_closed_conversation_history(parent_thread_id, 10)
+        .await
+        .expect("cancelled Task causal history should load");
+    let cancelled_exchange = causal_history
+        .iter()
+        .find(|entry| entry.turn_id == message_turn_id)
+        .expect("cancelled Task source should remain as a closed exchange");
+    assert_eq!(
+        cancelled_exchange.user_text.as_deref(),
+        Some("keep working until stopped")
+    );
+    assert!(
+        cancelled_exchange
+            .assistant_text
+            .as_deref()
+            .is_some_and(|text| text.contains("cancelled by the user")),
+        "a cancelled Task should close with a durable status marker"
+    );
+    assert!(
+        cancelled_exchange
+            .assistant_text
+            .as_deref()
+            .is_none_or(|text| !text.contains("too late")),
+        "partial or late provider output must not enter cancelled history"
     );
 
     let expected_parent_block_id = pioneer_crud::detached_task_run_block_id(
@@ -13712,6 +14058,52 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
             version_id: artifact.version_id.clone(),
         },
     ];
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: planned_turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: default_test_permission_profile(),
+            },
+            exact_input.as_slice(),
+        )
+        .await
+        .expect("Composer source turn should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: Turn {
+                    id: planned_turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::Conversation,
+                    origin: TurnOrigin::User,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+            },
+            created_at.saturating_add(1),
+        )
+        .await
+        .expect("Composer source turn should complete");
+    crud_store
+        .set_turn_execution_security_snapshot(
+            planned_turn_id,
+            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                "/tmp/pioneer-message-tests",
+                created_at.saturating_add(1).saturating_mul(1_000),
+            ),
+        )
+        .await
+        .expect("Composer source security snapshot should persist");
     let exact_capabilities = vec![TurnCapability {
         id: pioneer_protocol::skill_capability_key(&skill_id),
         kind: TurnCapabilityKind::Skill {
@@ -13745,7 +14137,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     let mut params = test_task_create_params(
         workspace_id.as_str(),
         parent_thread_id,
-        parent_turn_id,
+        planned_turn_id,
         "Task prompt must not replace composer input",
         3,
     );
@@ -14062,6 +14454,24 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             .first()
             .cloned()
             .expect("immediate dynamic Composer task should have a run");
+        let conversation_snapshot = crud_store
+            .get_task_run_conversation_snapshot(run.id.as_str())
+            .await
+            .expect("native Task conversation snapshot should load")
+            .expect("native Task conversation snapshot must be frozen at admission");
+        assert_eq!(
+            conversation_snapshot.source_turn_id.as_deref(),
+            Some(turn_id.as_str())
+        );
+        let frozen_history: Vec<pioneer_provider::ChatMessage> =
+            serde_json::from_str(conversation_snapshot.history_json.as_str())
+                .expect("native Task conversation snapshot should decode");
+        assert!(
+            frozen_history
+                .iter()
+                .all(|message| !message.content.contains(input_marker.as_str())),
+            "the current native command is separate from its frozen prior history"
+        );
         let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
         let occurrence_blocks = thread_timeline_block::Entity::find()
             .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id.as_str()))
@@ -14162,6 +14572,15 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             starts[0].input.to_string().contains(input_marker.as_str()),
             "the native runtime must receive the exact Composer input"
         );
+        assert_eq!(
+            starts[0]
+                .input
+                .to_string()
+                .match_indices(input_marker.as_str())
+                .count(),
+            1,
+            "the native runtime must receive exactly one current Composer command"
+        );
         let child_thread = crud_store
             .get_thread_model(lineage.child_thread_id.as_str())
             .await
@@ -14246,13 +14665,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
         processor.start_task_event_listener().await;
 
         let parent_thread_id = format!("thr_native_task_{runtime_id}");
-        let parent_turn_id = format!("turn_native_parent_{runtime_id}");
+        let history_turn_id = format!("turn_native_parent_history_{runtime_id}");
+        let source_turn_id = format!("planned_{runtime_id}");
         let history_marker = format!("PARENT NATIVE HISTORY {runtime_id}");
         seed_completed_task_parent_with_history(
             &processor,
             workspace_id.as_str(),
             parent_thread_id.as_str(),
-            parent_turn_id.as_str(),
+            history_turn_id.as_str(),
             history_marker.as_str(),
         )
         .await;
@@ -14260,7 +14680,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
         let params = detached_cli_task_create_params(
             workspace_id.as_str(),
             parent_thread_id.as_str(),
-            parent_turn_id.as_str(),
+            source_turn_id.as_str(),
             runtime_id,
             runtime_kind,
             model,

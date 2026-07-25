@@ -19,7 +19,9 @@ use crate::review::{
 use crate::scheduler::TaskScheduler;
 use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
-use pioneer_crud::{AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore};
+use pioneer_crud::{
+    AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
+};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
     TaskAcceptParams, TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
@@ -1503,7 +1505,7 @@ impl TaskService {
 
     pub async fn create_task(
         &self,
-        _context: TaskCreateContext,
+        context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
         validate_create_params(&params)?;
@@ -1667,7 +1669,53 @@ impl TaskService {
                 reason: pioneer_protocol::TaskRescheduleReason::TriggerFired,
             });
         }
-        let appended = self.append_events(events, now).await?;
+        let inserted_conversation_snapshot_run_id =
+            match (context.conversation_snapshot, immediate_run.as_ref()) {
+                (Some(seed), Some(run)) => {
+                    let persisted = self
+                        .store
+                        .insert_task_run_conversation_snapshot_if_absent(
+                            NewTaskRunConversationSnapshot {
+                                run_id: run.id.clone(),
+                                task_id: task.id.clone(),
+                                workspace_id: task.workspace_id.clone(),
+                                conversation_thread_id: seed.conversation_thread_id.clone(),
+                                source_turn_id: seed.source_turn_id.clone(),
+                                history_json: seed.history_json.clone(),
+                                created_at: chrono::Utc::now().fixed_offset(),
+                            },
+                        )
+                        .await?;
+                    if persisted.task_id != task.id
+                        || persisted.workspace_id != task.workspace_id
+                        || persisted.conversation_thread_id != seed.conversation_thread_id
+                        || persisted.source_turn_id != seed.source_turn_id
+                        || persisted.history_json != seed.history_json
+                    {
+                        bail!(
+                            "task run `{}` conversation snapshot conflicts with task creation",
+                            run.id
+                        );
+                    }
+                    Some(run.id.clone())
+                }
+                (Some(_), None) => {
+                    bail!("conversation snapshots can only seed an immediate task run")
+                }
+                (None, _) => None,
+            };
+        let appended = match self.append_events(events, now).await {
+            Ok(appended) => appended,
+            Err(error) => {
+                if let Some(run_id) = inserted_conversation_snapshot_run_id.as_deref() {
+                    let _ = self
+                        .store
+                        .delete_task_run_conversation_snapshot(run_id)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         self.publish_and_wake(appended).await;
         if trigger_kind == TaskTriggerKind::Immediate {
             self.process_due_once(now).await?;
