@@ -26,6 +26,19 @@ use pioneer_protocol::{
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
 };
 
+// Keep every RPC branch in its own erased future. A single async block around the
+// whole dispatch match makes its generated poll function reserve stack space for
+// the state of every handler, even though only one branch can ever run.
+macro_rules! dispatch_request_future {
+    ($method:expr; $($pattern:pat => $body:block)*) => {
+        match $method {
+            $(
+                $pattern => message_future(async move $body),
+            )*
+        }
+    };
+}
+
 fn vector_provider_key_name(
     provider: Option<pioneer_protocol::GatewayThreadEpisodicVectorProvider>,
 ) -> Option<&'static str> {
@@ -93,9 +106,8 @@ impl MessageProcessor {
             });
         }
 
-        // Keep turn/start outside the monolithic async dispatcher. Polling the CLI runtime
-        // turn-start future from inside that dispatcher nests both state machines on one Tokio
-        // worker stack and can exceed the runtime's default stack before the turn is persisted.
+        // turn/start already exposes its handler future directly, so keep its parsing path
+        // synchronous instead of adding an otherwise unnecessary dispatch wrapper.
         if request.method == methods::TURN_START {
             return self.dispatch_turn_start(connection_id, request);
         }
@@ -130,8 +142,9 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request: JsonRpcRequest,
     ) -> MessageFuture<'a, ()> {
-        message_future(async move {
-            match request.method.as_str() {
+        let method = request.method.clone();
+        dispatch_request_future! {
+            method.as_str();
                 methods::WORKSPACE_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceListParams>(params_value) {
@@ -2759,8 +2772,7 @@ impl MessageProcessor {
                     )
                     .await;
                 }
-            }
-        })
+        }
     }
 
     async fn dispatch_memory_candidates_list(
