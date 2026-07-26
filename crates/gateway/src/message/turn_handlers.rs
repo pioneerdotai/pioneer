@@ -649,7 +649,13 @@ impl MessageProcessor {
                 }
             };
 
+        // Preserve the exact client launch for Task replay, but admit the
+        // parent message with the canonical provider selected by its
+        // execution backend. CLI clients intentionally omit `model_provider`,
+        // so leaving the field empty here would keep the parent's previous
+        // API provider even though the detached child runs in Codex/Claude.
         let launch = params.clone();
+        canonicalize_cli_runtime_model_provider(&mut params);
         let outcome = match self.thread_manager.turn_start(connection_id, params).await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -733,17 +739,7 @@ impl MessageProcessor {
             .to_owned();
         let title = goal.chars().take(96).collect::<String>();
         let permission_profile = outcome.materialization.turn.permission_profile.clone();
-        // CLI Composer requests intentionally omit `model_provider`: the
-        // execution backend is the authoritative runtime selection. Persist
-        // the canonical provider key in the Task agent spec so the hidden
-        // child cannot inherit an unrelated API provider from the parent
-        // thread.
-        let task_model_provider = match launch.execution_backend.as_ref() {
-            Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => {
-                cli_runtime_provider_key(runtime_id.as_str())
-            }
-            _ => outcome.materialization.thread.model_provider.clone(),
-        };
+        let task_model_provider = outcome.materialization.thread.model_provider.clone();
         // Freeze the causally closed parent branch before the Task becomes
         // visible to the scheduler. A later sibling message must not change
         // the context of this run, even if execution starts later.
@@ -5780,6 +5776,14 @@ fn normalize_cli_runtime_sandbox_label(value: &str) -> String {
 
 fn cli_runtime_provider_key(runtime_id: &str) -> String {
     format!("cli_runtime:{}", runtime_id.trim())
+}
+
+fn canonicalize_cli_runtime_model_provider(params: &mut TurnStartParams) {
+    if let Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) =
+        params.execution_backend.as_ref()
+    {
+        params.model_provider = Some(cli_runtime_provider_key(runtime_id));
+    }
 }
 
 fn cli_mcp_client_target(

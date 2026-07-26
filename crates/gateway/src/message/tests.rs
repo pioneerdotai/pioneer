@@ -14707,6 +14707,29 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         let started: pioneer_protocol::TurnStartResponse =
             serde_json::from_value(response.result).expect("turn/start response should decode");
         assert_eq!(started.turn.id, turn_id);
+        let live_parent = thread_manager
+            .thread_get(parent_thread_id.as_str())
+            .await
+            .expect("live collaborative parent should remain loaded");
+        assert_eq!(live_parent.model, model);
+        assert_eq!(
+            live_parent.model_provider,
+            format!("cli_runtime:{runtime_id}"),
+            "detached admission must commit the backend-selected provider to the live parent"
+        );
+        assert_eq!(live_parent.reasoning_effort, None);
+        let persisted_parent = crud_store
+            .get_thread_model(parent_thread_id.as_str())
+            .await
+            .expect("persisted collaborative parent should load")
+            .expect("persisted collaborative parent should exist");
+        assert_eq!(persisted_parent.model, model);
+        assert_eq!(
+            persisted_parent.model_provider,
+            format!("cli_runtime:{runtime_id}"),
+            "cold hydration must restore the backend-selected provider"
+        );
+        assert_eq!(persisted_parent.reasoning_effort, None);
         assert!(
             crud_store
                 .get_turn_work_projection(turn_id.as_str())
@@ -14871,6 +14894,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].model.as_deref(), Some(model));
+        assert_eq!(starts[0].effort, None);
         assert!(
             starts[0].input.to_string().contains(input_marker.as_str()),
             "the native runtime must receive the exact Composer input"
