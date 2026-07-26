@@ -2,7 +2,8 @@ use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
         MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID,
-        SETTINGS_CONTENT_MEMORY_NODE_ID, VoiceInputEnableAction,
+        SETTINGS_CONTENT_MEMORY_NODE_ID, SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
+        SelfImprovementModelSetting, VoiceInputEnableAction,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
@@ -13,11 +14,13 @@ use gpui_component::{
     tree::TreeItem,
 };
 use pioneer_client::settings::{
-    gateway as gateway_settings, memory as settings_memory, voice as voice_input_settings,
+    gateway as gateway_settings, memory as settings_memory,
+    self_improvement as settings_self_improvement, voice as voice_input_settings,
 };
 use pioneer_protocol::{
-    GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate,
-    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySelfImprovementModelSelection,
+    GatewaySettingsUpdate, GatewayThreadEpisodicVectorProvider,
+    GatewayThreadEpisodicVectorSearchSettings,
 };
 #[cfg(test)]
 use pioneer_protocol::{
@@ -56,6 +59,7 @@ impl PioneerDesktop {
         let selected_ix = match self.settings_content_view {
             SettingsContentView::General => Some(0),
             SettingsContentView::Memory => Some(1),
+            SettingsContentView::SelfImprovement => Some(2),
         };
         let settings_tree_state = self.settings_tree_state.clone();
         settings_tree_state.update(cx, |state, cx| {
@@ -63,6 +67,10 @@ impl PioneerDesktop {
                 vec![
                     TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general"),
                     TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
+                    TreeItem::new(
+                        SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
+                        "self-improvement",
+                    ),
                 ],
                 cx,
             );
@@ -324,6 +332,33 @@ impl PioneerDesktop {
             settings_memory::memory_settings_with_model_selection(memory, setting, model_selection),
             cx,
         );
+    }
+
+    pub(super) fn apply_self_improvement_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(plan) =
+            settings_self_improvement::enabled_update_plan(self.gateway.settings.as_ref(), enabled)
+        else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
+    }
+
+    pub(super) fn apply_self_improvement_model_setting(
+        &mut self,
+        setting: SelfImprovementModelSetting,
+        selection: Option<GatewaySelfImprovementModelSelection>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = settings_self_improvement::model_update_plan(
+            self.gateway.settings.as_ref(),
+            setting,
+            selection,
+        ) else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
     pub(super) fn apply_preflight_model_setting(
@@ -826,6 +861,28 @@ mod tests {
         assert!(source.contains("voice_input_settings::voice_input_model_selection_plan"));
         assert!(source.contains("voice_input_settings::voice_input_retry_plan"));
         assert!(!source.contains("fn plan_voice_input_"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn self_improvement_lifecycle_uses_shared_client_plans_and_authoritative_response() {
+        let source = production_lifecycle_source();
+        let self_improvement = source
+            .split("pub(super) fn apply_self_improvement_enabled")
+            .nth(1)
+            .expect("Self-improvement lifecycle exists")
+            .split("pub(super) fn apply_preflight_model_setting")
+            .next()
+            .expect("Self-improvement lifecycle boundary exists");
+        assert!(self_improvement.contains("settings_self_improvement::enabled_update_plan"));
+        assert!(self_improvement.contains("settings_self_improvement::model_update_plan"));
+        assert!(self_improvement.contains("self.apply_gateway_settings_update"));
+
+        let common_update = source
+            .split("pub(in crate::app) fn apply_gateway_settings_update")
+            .nth(1)
+            .expect("common settings update exists");
+        assert!(common_update.contains("apply_optimistic_gateway_settings_update"));
+        assert!(common_update.contains("apply_gateway_settings_update_response"));
     }
 
     #[::core::prelude::v1::test]

@@ -362,6 +362,7 @@ pub(crate) fn test_config() -> AppConfig {
                 run_migrations_on_startup: true,
             },
             memory: GatewayMemoryConfig::default(),
+            self_improvement: Default::default(),
             thread_episodic: Default::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),

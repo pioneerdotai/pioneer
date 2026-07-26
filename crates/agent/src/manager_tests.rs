@@ -46,8 +46,9 @@ use pioneer_provider::{
     ProviderRegistry, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
 };
 use pioneer_skills::{
-    SkillAuditAction, SkillAuditDecision, SkillCatalogInstallation, SkillCatalogLoadParams,
-    SkillCatalogSnapshot, SkillPolicyKey, SkillSourceKind, SkillTrustLevel, load_catalog,
+    AgentSkillRuntimeEntry, SkillAuditAction, SkillAuditDecision, SkillCatalogInstallation,
+    SkillCatalogLoadParams, SkillCatalogSnapshot, SkillPolicyKey, SkillSourceKind, SkillTrustLevel,
+    load_catalog,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
@@ -645,6 +646,10 @@ struct TextOnlyAgentProvider {
     inner: CaptureAgentProvider,
 }
 
+struct NoToolCaptureProvider {
+    inner: CaptureAgentProvider,
+}
+
 impl TextOnlyAgentProvider {
     fn with_preflight_response(preflight_response_text: impl Into<String>) -> Self {
         Self {
@@ -652,6 +657,12 @@ impl TextOnlyAgentProvider {
         }
     }
 
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.inner.snapshot_requests()
+    }
+}
+
+impl NoToolCaptureProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
         self.inner.snapshot_requests()
     }
@@ -3198,6 +3209,35 @@ impl Provider for TextOnlyAgentProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl Provider for NoToolCaptureProvider {
+    fn name(&self) -> &str {
+        "no-tool-capture"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: false,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.inner.chat(request).await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        self.inner.stream_chat(request).await
+    }
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -3414,7 +3454,9 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
-            let Some(event) = test_agent_event_from_durable(event) else {
+            let event = test_agent_event_from_durable(event);
+            durable_rx.acknowledge_last(Ok(()));
+            let Some(event) = event else {
                 continue;
             };
             if tx.send(event).await.is_err() {
@@ -3637,6 +3679,148 @@ async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
     let main_request = &requests[1];
     assert!(main_request.compiled_prompt.is_some());
     assert!(main_request.tools.is_some());
+}
+
+fn agent_skill_delivery_fixture() -> AgentSkillRuntimeEntry {
+    AgentSkillRuntimeEntry {
+        skill_id: pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA")
+            .expect("valid Agent skill ID"),
+        slug: "private-agent-procedure".to_owned(),
+        version_id: "VVVVVVVVVVVVVVVVVVVVV".to_owned(),
+        version_number: 1,
+        display_name: "Private Agent procedure".to_owned(),
+        runtime_description: "Use for a private learned procedure.".to_owned(),
+        body: "PRIVATE_AGENT_BODY_MUST_REQUIRE_READ_SKILL".to_owned(),
+        fingerprint: "a".repeat(64),
+    }
+}
+
+async fn start_agent_skill_delivery_turn(
+    manager: &AgentManager,
+    thread_id: &str,
+    turn_id: &str,
+    provider_name: &str,
+) -> Vec<AgentEvent> {
+    manager
+        .ensure_thread(thread_id, "ws_agent_skill_delivery")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(manager, thread_id).await;
+    manager
+        .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            provider_name,
+            HashMap::new(),
+            test_skill_catalog(&manager.tool_loop_config.skills),
+            vec![agent_skill_delivery_fixture()],
+            vec![UserInput::Text {
+                text: "Use learned procedures when relevant.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+            None,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+            test_full_access_security_snapshot(),
+        )
+        .await
+        .expect("turn should start");
+    recv_events_until_terminal(&mut events).await
+}
+
+fn final_provider_payload_projection(request: &ChatRequest) -> serde_json::Value {
+    serde_json::json!({
+        "messages": serde_json::to_value(&request.messages).expect("messages serialize"),
+        "tools": serde_json::to_value(&request.tools).expect("tools serialize"),
+        "compiled_prompt": request.compiled_prompt.as_ref().map(|prompt| {
+            prompt.full_system_text.clone()
+        }),
+    })
+}
+
+#[tokio::test]
+async fn agent_skill_data_reaches_only_tool_capable_final_provider_payload() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let observed = start_agent_skill_delivery_turn(
+        &manager,
+        "thr_agent_skill_tool_provider",
+        "turn_agent_skill_tool_provider",
+        "capture",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let payload = final_provider_payload_projection(&requests[0]).to_string();
+    assert!(payload.contains("AAAAAAAAAAAAAAAAAAAAA"));
+    assert!(payload.contains("Private Agent procedure"));
+    assert!(
+        !payload.contains("PRIVATE_AGENT_BODY_MUST_REQUIRE_READ_SKILL"),
+        "inline body must remain behind read_skill rather than entering the provider prompt"
+    );
+    assert!(
+        requests[0]
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.name == "read_skill"))
+    );
+    assert!(observed.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::TurnSkillsResolved { bindings, .. }
+                if bindings.iter().any(|binding|
+                    binding.skill_id.as_str() == "AAAAAAAAAAAAAAAAAAAAA"
+                        && binding.source_kind == "agent"
+                )
+        )
+    }));
+
+    let no_tool_provider = Arc::new(NoToolCaptureProvider {
+        inner: CaptureAgentProvider::default(),
+    });
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "no-tool-capture",
+        no_tool_provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let observed = start_agent_skill_delivery_turn(
+        &manager,
+        "thr_agent_skill_no_tool_provider",
+        "turn_agent_skill_no_tool_provider",
+        "no-tool-capture",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = no_tool_provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let payload = final_provider_payload_projection(&requests[0]).to_string();
+    for forbidden in [
+        "AAAAAAAAAAAAAAAAAAAAA",
+        "VVVVVVVVVVVVVVVVVVVVV",
+        "Private Agent procedure",
+        "PRIVATE_AGENT_BODY_MUST_REQUIRE_READ_SKILL",
+    ] {
+        assert!(
+            !payload.contains(forbidden),
+            "ineligible native provider payload leaked Agent data: {forbidden}"
+        );
+    }
+    assert!(observed.iter().all(|event| {
+        !matches!(
+            event,
+            AgentEvent::TurnSkillsResolved { bindings, .. }
+                if bindings.iter().any(|binding| binding.source_kind == "agent")
+        )
+    }));
 }
 
 #[tokio::test]

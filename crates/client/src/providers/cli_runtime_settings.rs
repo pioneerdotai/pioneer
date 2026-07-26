@@ -265,6 +265,7 @@ fn cli_runtime_provider_settings_plan(
         update: GatewaySettingsUpdate {
             general: None,
             memory: None,
+            self_improvement: None,
             thread_episodic: None,
             cli_runtimes: Some(cli_runtimes),
             remote_access: None,
@@ -585,6 +586,7 @@ mod tests {
         GatewaySettingsSnapshot {
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
+            self_improvement: Default::default(),
             thread_episodic: Default::default(),
             cli_runtimes: GatewayCliRuntimeSettings { instances },
             remote_access: Default::default(),

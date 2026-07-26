@@ -773,6 +773,7 @@ description = "Gestiona las preferencias de la aplicación."
 back = "Atrás"
 general = "General"
 memory = "Memoria"
+self_improvement = "Auto-mejora"
 
 [settings.option.language]
 label = "Idioma de la aplicación"
@@ -873,6 +874,29 @@ description = "Mostrar diagnósticos de los mecanismos de memoria en vistas loca
 default = "Predeterminado"
 select_model = "Seleccionar modelo"
 dialog_title = "Seleccionar modelo de memoria"
+
+[settings.self_improvement]
+title = "Auto-mejora"
+description = "Crea y mantiene habilidades del agente a partir de patrones útiles del trabajo completado."
+configuration_incomplete = "Selecciona un modelo predeterminado antes de ejecutar la auto-mejora."
+
+[settings.self_improvement.enabled]
+label = "Auto-mejora"
+description = "Permite que Pioneer aprenda habilidades reutilizables del agente a partir de turnos completados."
+
+[settings.self_improvement.default_model]
+label = "Modelo predeterminado"
+description = "Modelo obligatorio para el aprendizaje diario y la creación de habilidades."
+
+[settings.self_improvement.reviewer_model]
+label = "Modelo revisor"
+description = "Revisor independiente opcional. Usa el modelo predeterminado si no se selecciona."
+
+[settings.self_improvement.model]
+not_selected = "Sin seleccionar"
+use_default = "Usar modelo predeterminado"
+select_model = "Seleccionar modelo"
+dialog_title = "Seleccionar modelo de auto-mejora"
 
 [settings.memory.vector_search]
 label = "Búsqueda vectorial"

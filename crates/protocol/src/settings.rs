@@ -19,6 +19,8 @@ pub struct GatewaySettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<GatewayMemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_improvement: Option<GatewaySelfImprovementSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_episodic: Option<GatewayThreadEpisodicSettingsUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_runtimes: Option<GatewayCliRuntimeSettings>,
@@ -51,6 +53,8 @@ pub struct GatewaySettingsSnapshot {
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
+    #[serde(default)]
+    pub self_improvement: GatewaySelfImprovementSettings,
     #[serde(default)]
     pub thread_episodic: GatewayThreadEpisodicSettings,
     #[serde(default)]
@@ -179,6 +183,40 @@ impl Default for GatewayMemorySettings {
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GatewaySelfImprovementSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<GatewaySelfImprovementModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<GatewaySelfImprovementModelSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GatewaySelfImprovementModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+impl GatewaySelfImprovementModelSelection {
+    pub fn normalized(self) -> Result<Self, String> {
+        let provider = self.provider.trim();
+        let model = self.model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return Err(
+                "self-improvement model selection requires both provider and model".to_owned(),
+            );
+        }
+        Ok(Self {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
     }
 }
 
@@ -681,7 +719,8 @@ mod tests {
     use super::{
         GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
         GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemorySettings,
-        GatewayRemoteAccessSettings, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+        GatewayRemoteAccessSettings, GatewaySelfImprovementModelSelection,
+        GatewaySelfImprovementSettings, GatewaySettingsSnapshot, GatewaySettingsUpdate,
         GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
         GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
         GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
@@ -743,10 +782,36 @@ mod tests {
     }
 
     #[test]
+    fn self_improvement_snapshot_and_sectional_update_roundtrip() {
+        let self_improvement = GatewaySelfImprovementSettings {
+            enabled: true,
+            default_model: Some(GatewaySelfImprovementModelSelection {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+            }),
+            reviewer_model: None,
+        };
+        let update = GatewaySettingsUpdate {
+            self_improvement: Some(self_improvement.clone()),
+            ..GatewaySettingsUpdate::default()
+        };
+
+        let serialized = serde_json::to_string(&update).expect("update must serialize");
+        assert!(serialized.contains("\"self_improvement\""));
+        assert!(serialized.contains("\"provider\":\"openai\""));
+        assert!(!serialized.contains("source"));
+
+        let roundtrip: GatewaySettingsUpdate =
+            serde_json::from_str(&serialized).expect("update must deserialize");
+        assert_eq!(roundtrip.self_improvement, Some(self_improvement));
+    }
+
+    #[test]
     fn settings_snapshot_roundtrips_thread_episodic_settings() {
         let snapshot = GatewaySettingsSnapshot {
             general: GatewayGeneralSettings::default(),
             memory: Default::default(),
+            self_improvement: Default::default(),
             thread_episodic: GatewayThreadEpisodicSettings {
                 enabled: true,
                 indexing_enabled: false,
@@ -900,6 +965,7 @@ mod tests {
         let snapshot = GatewaySettingsSnapshot {
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
+            self_improvement: GatewaySelfImprovementSettings::default(),
             thread_episodic: GatewayThreadEpisodicSettings {
                 vector_search: GatewayThreadEpisodicVectorSearchSettings {
                     enabled: true,

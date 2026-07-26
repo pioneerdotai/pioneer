@@ -773,6 +773,7 @@ description = "Gérez les préférences de l'application."
 back = "Retour"
 general = "Général"
 memory = "Mémoire"
+self_improvement = "Auto-amélioration"
 
 [settings.option.language]
 label = "Langue de l'application"
@@ -873,6 +874,29 @@ description = "Afficher les diagnostics des mécanismes de mémoire dans les vue
 default = "Par défaut"
 select_model = "Sélectionner un modèle"
 dialog_title = "Sélectionner le modèle de mémoire"
+
+[settings.self_improvement]
+title = "Auto-amélioration"
+description = "Crée et maintient des compétences d’agent à partir de motifs utiles du travail terminé."
+configuration_incomplete = "Sélectionnez un modèle par défaut avant d’activer l’auto-amélioration."
+
+[settings.self_improvement.enabled]
+label = "Auto-amélioration"
+description = "Autorise Pioneer à apprendre des compétences d’agent réutilisables à partir des tours terminés."
+
+[settings.self_improvement.default_model]
+label = "Modèle par défaut"
+description = "Modèle requis pour l’apprentissage quotidien et la création de compétences."
+
+[settings.self_improvement.reviewer_model]
+label = "Modèle de vérification"
+description = "Vérification indépendante facultative. Utilise le modèle par défaut si aucun n’est choisi."
+
+[settings.self_improvement.model]
+not_selected = "Non sélectionné"
+use_default = "Utiliser le modèle par défaut"
+select_model = "Sélectionner un modèle"
+dialog_title = "Sélectionner le modèle d’auto-amélioration"
 
 [settings.memory.vector_search]
 label = "Recherche vectorielle"

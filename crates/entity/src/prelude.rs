@@ -8,6 +8,8 @@ pub use super::agent_memory_policy_decision::Entity as AgentMemoryPolicyDecision
 pub use super::agent_memory_quality_decision::Entity as AgentMemoryQualityDecision;
 pub use super::agent_memory_quarantine::Entity as AgentMemoryQuarantine;
 pub use super::agent_memory_repair_job::Entity as AgentMemoryRepairJob;
+pub use super::agent_skill::Entity as AgentSkill;
+pub use super::agent_skill_version::Entity as AgentSkillVersion;
 pub use super::artifact::Entity as Artifact;
 pub use super::artifact_binding::Entity as ArtifactBinding;
 pub use super::artifact_blob::Entity as ArtifactBlob;
@@ -24,6 +26,9 @@ pub use super::mcp_audit_event::Entity as McpAuditEvent;
 pub use super::mcp_server_catalog_snapshot::Entity as McpServerCatalogSnapshot;
 pub use super::mcp_server_installation::Entity as McpServerInstallation;
 pub use super::recovery_job::Entity as RecoveryJob;
+pub use super::self_improvement_run::Entity as SelfImprovementRun;
+pub use super::self_improvement_source_turn::Entity as SelfImprovementSourceTurn;
+pub use super::self_improvement_workspace_state::Entity as SelfImprovementWorkspaceState;
 pub use super::skill_audit_event::Entity as SkillAuditEvent;
 pub use super::skill_dependency_snapshot::Entity as SkillDependencySnapshot;
 pub use super::skill_installation::Entity as SkillInstallation;

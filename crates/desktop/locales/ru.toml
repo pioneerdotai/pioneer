@@ -1065,6 +1065,7 @@ description = "Управляйте параметрами приложения.
 back = "Назад"
 general = "Общие"
 memory = "Память"
+self_improvement = "Самообучение"
 
 [settings.option.language]
 label = "Язык приложения"
@@ -1165,6 +1166,29 @@ description = "Показывать диагностику механизмов 
 default = "По умолчанию"
 select_model = "Выбрать модель"
 dialog_title = "Выбор модели памяти"
+
+[settings.self_improvement]
+title = "Самообучение"
+description = "Создаёт и обновляет навыки агента на основе полезных повторяющихся решений."
+configuration_incomplete = "Выберите общую модель, чтобы самообучение могло работать."
+
+[settings.self_improvement.enabled]
+label = "Самообучение"
+description = "Разрешить Pioneer создавать переиспользуемые навыки агента из завершённых ходов."
+
+[settings.self_improvement.default_model]
+label = "Общая модель"
+description = "Обязательная модель для ежедневного обучения и создания навыков."
+
+[settings.self_improvement.reviewer_model]
+label = "Модель проверки"
+description = "Необязательная независимая проверка. Если модель не выбрана, используется общая."
+
+[settings.self_improvement.model]
+not_selected = "Не выбрана"
+use_default = "Использовать общую модель"
+select_model = "Выбрать модель"
+dialog_title = "Выбор модели самообучения"
 
 [settings.memory.vector_search]
 label = "Векторный поиск"

@@ -1,10 +1,11 @@
 use crate::{AgentMcpAvailability, SkillsLoopConfig, WorkspaceSkillPolicy};
 use pioneer_protocol::{TurnSkillBinding, UserInput};
 use pioneer_skills::{
-    ResolvedSkill, SkillAuditEvent, SkillCatalogSnapshot, SkillExplicitRef, SkillPolicy,
-    SkillPolicyKey, SkillPolicySet, SkillPromptBudget, SkillResolutionInput, SkillResolutionResult,
-    SkillRuntimePlan, SkillValidationPolicy, build_skill_prompt, build_skill_runtime_plan,
-    resolve_skills,
+    AgentSkillRuntimeEntry, MAX_ACTIVE_AGENT_SKILLS, ResolvedSkill, SkillAuditEvent,
+    SkillCatalogSnapshot, SkillExplicitRef, SkillPolicy, SkillPolicyKey, SkillPolicySet,
+    SkillPromptBudget, SkillResolutionInput, SkillResolutionResult, SkillRuntimePlan,
+    SkillValidationPolicy, build_combined_skill_prompt, build_skill_runtime_plan,
+    merge_agent_skill_overlay, resolve_skills,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -14,6 +15,7 @@ pub(super) struct TurnSkillResolution {
     pub result: SkillResolutionResult,
     pub runtime_plan: SkillRuntimePlan,
     pub audit_events: Vec<SkillAuditEvent>,
+    pub agent_overlay_error: Option<String>,
 }
 
 fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
@@ -71,23 +73,48 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
     input: &[UserInput],
     explicit_refs: &[SkillExplicitRef],
     catalog: &SkillCatalogSnapshot,
+    agent_overlay: &[AgentSkillRuntimeEntry],
     skills: &SkillsLoopConfig,
     workspace_skill_policies: &HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     mcp_availability: &AgentMcpAvailability,
 ) -> anyhow::Result<TurnSkillResolution> {
     if !skills.enabled {
+        let base_runtime_plan = SkillRuntimePlan {
+            tools: Vec::new(),
+            read_skill_index: HashMap::new(),
+            excluded_tools: Vec::new(),
+        };
+        let mut runtime_plan = base_runtime_plan.clone();
+        let overlay_result =
+            merge_agent_skill_overlay(&mut runtime_plan, agent_overlay, MAX_ACTIVE_AGENT_SKILLS)
+                .and_then(|()| {
+                    build_combined_skill_prompt(
+                        &[],
+                        agent_overlay,
+                        SkillPromptBudget {
+                            max_chars: skills.prompt_max_chars,
+                            compact_mode_threshold: skills.runtime.compact_mode_threshold,
+                            include_read_skill_hint: true,
+                        },
+                    )
+                });
+        let (prompt, agent_overlay_error) = match overlay_result {
+            Ok(prompt) => (prompt.text, None),
+            Err(error) => (String::new(), Some(error.to_string())),
+        };
         return Ok(TurnSkillResolution {
-            prompt: String::new(),
+            prompt,
             result: SkillResolutionResult {
                 active: Vec::new(),
                 excluded: Vec::new(),
             },
-            runtime_plan: SkillRuntimePlan {
-                tools: Vec::new(),
-                read_skill_index: HashMap::new(),
-                excluded_tools: Vec::new(),
+            runtime_plan: if agent_overlay_error.is_some() {
+                base_runtime_plan
+            } else {
+                runtime_plan
             },
             audit_events: Vec::new(),
+            agent_overlay_error,
         });
     }
 
@@ -189,7 +216,7 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
             .then_with(|| left.action.cmp(&right.action))
     });
 
-    let runtime_plan = build_skill_runtime_plan(
+    let base_runtime_plan = build_skill_runtime_plan(
         result.active.as_slice(),
         pioneer_skills::SkillRuntimeBudget {
             enable_dynamic_tools: skills.runtime.enable_dynamic_tools,
@@ -207,26 +234,53 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
         },
     );
 
-    let prompt = build_skill_prompt(
+    let base_prompt = build_combined_skill_prompt(
         result.active.as_slice(),
+        &[],
         SkillPromptBudget {
             max_chars: skills.prompt_max_chars,
             compact_mode_threshold: skills.runtime.compact_mode_threshold,
             include_read_skill_hint: skills.runtime.enable_read_skill,
         },
-    )
+    )?
     .text;
+    let mut runtime_plan = base_runtime_plan.clone();
+    let overlay_result =
+        merge_agent_skill_overlay(&mut runtime_plan, agent_overlay, MAX_ACTIVE_AGENT_SKILLS)
+            .and_then(|()| {
+                build_combined_skill_prompt(
+                    result.active.as_slice(),
+                    agent_overlay,
+                    SkillPromptBudget {
+                        max_chars: skills.prompt_max_chars,
+                        compact_mode_threshold: skills.runtime.compact_mode_threshold,
+                        include_read_skill_hint: skills.runtime.enable_read_skill
+                            || !agent_overlay.is_empty(),
+                    },
+                )
+            });
+    let (prompt, agent_overlay_error) = match overlay_result {
+        Ok(prompt) => (prompt.text, None),
+        Err(error) => {
+            runtime_plan = base_runtime_plan;
+            (base_prompt, Some(error.to_string()))
+        }
+    };
 
     Ok(TurnSkillResolution {
         prompt,
         result,
         runtime_plan,
         audit_events,
+        agent_overlay_error,
     })
 }
 
-pub(super) fn to_turn_skill_bindings(active: &[ResolvedSkill]) -> Vec<TurnSkillBinding> {
-    active
+pub(super) fn to_turn_skill_bindings(
+    active: &[ResolvedSkill],
+    agent_overlay: &[AgentSkillRuntimeEntry],
+) -> Vec<TurnSkillBinding> {
+    let mut bindings = active
         .iter()
         .map(|skill| TurnSkillBinding {
             skill_id: skill.skill_id.clone(),
@@ -242,19 +296,31 @@ pub(super) fn to_turn_skill_bindings(active: &[ResolvedSkill]) -> Vec<TurnSkillB
                 .to_owned(),
             resolved_reason: skill.reason.as_db_value().to_owned(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    bindings.extend(agent_overlay.iter().map(|entry| TurnSkillBinding {
+        skill_id: entry.skill_id.clone(),
+        skill_owner: None,
+        skill_slug: entry.slug.clone(),
+        skill_version: Some(entry.version_number.to_string()),
+        fingerprint: entry.fingerprint.clone(),
+        source_kind: "agent".to_owned(),
+        resolved_reason: "agent_catalog".to_owned(),
+    }));
+    bindings.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+    bindings
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_turn_skills_with_explicit_refs;
+    use super::{resolve_turn_skills_with_explicit_refs, to_turn_skill_bindings};
     use crate::{
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
     };
     use pioneer_skills::{
-        SkillCatalogInstallation, SkillCatalogLoadParams, SkillCatalogSnapshot, SkillExplicitRef,
-        SkillPolicyKey, SkillSourceKind, SkillTrustLevel, load_catalog,
+        AgentSkillRuntimeEntry, ReadSkillSource, SkillCatalogInstallation, SkillCatalogLoadParams,
+        SkillCatalogSnapshot, SkillExplicitRef, SkillPolicyKey, SkillSourceKind, SkillTrustLevel,
+        load_catalog,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -356,6 +422,21 @@ mod tests {
         }
     }
 
+    fn agent_entry() -> AgentSkillRuntimeEntry {
+        AgentSkillRuntimeEntry {
+            skill_id: pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid Agent skill ID"),
+            slug: "stable-procedure".to_owned(),
+            version_id: "111111111111111111111".to_owned(),
+            version_number: 1,
+            display_name: "Stable procedure".to_owned(),
+            runtime_description: "Use for stable procedures. Do not use when: unrelated."
+                .to_owned(),
+            body: "Exact inline Agent instructions.".to_owned(),
+            fingerprint: "a".repeat(64),
+        }
+    }
+
     #[test]
     fn skill_activates_when_dependency_exists_only_in_metadata() {
         let root = temp_case("metadata-pass");
@@ -380,6 +461,7 @@ Instructions
             &[],
             &explicit_refs,
             &catalog,
+            &[],
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -415,6 +497,7 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
             &[],
             &explicit_refs,
             &catalog,
+            &[],
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -471,6 +554,7 @@ HIDDEN SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
             &[],
             &explicit_refs,
             &catalog,
+            &[],
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -525,6 +609,7 @@ Instructions
             &[],
             &explicit_refs,
             &catalog,
+            &[],
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -539,5 +624,132 @@ Instructions
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_overlay_materializes_prompt_and_read_index_when_ordinary_skills_are_off() {
+        let root = temp_case("agent-overlay-ordinary-off");
+        let mut config = test_skills_config(root.as_path());
+        config.enabled = false;
+        config.runtime.enable_read_skill = false;
+        let entry = agent_entry();
+        let result = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &[],
+            &SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
+            std::slice::from_ref(&entry),
+            &config,
+            &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .expect("Agent overlay must not depend on ordinary skills");
+
+        assert!(result.result.active.is_empty());
+        assert!(result.agent_overlay_error.is_none());
+        assert!(result.prompt.contains("[Agent Skills]"));
+        let read = result
+            .runtime_plan
+            .read_skill_index
+            .get("skill:AAAAAAAAAAAAAAAAAAAAA")
+            .expect("inline Agent entry must be readable");
+        assert_eq!(read.body, "Exact inline Agent instructions.");
+        assert!(matches!(
+            read.source,
+            ReadSkillSource::InlineAgent { ref version_id }
+                if version_id == "111111111111111111111"
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_agent_overlay_preserves_the_exact_ordinary_turn_path() {
+        let root = temp_case("agent-overlay-fail-closed");
+        let skill_dir = root.join("tests").join("weather");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: weather
+slug: weather
+description: Get weather forecasts.
+---
+Use the ordinary weather procedure.
+"#,
+        )
+        .expect("write ordinary skill");
+        let catalog = test_catalog(root.as_path(), "weather");
+        let config = test_skills_config(root.as_path());
+        let explicit_refs = [explicit_skill_ref("weather")];
+        let policies = HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new();
+        let availability = crate::AgentMcpAvailability::default();
+        let ordinary = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &explicit_refs,
+            &catalog,
+            &[],
+            &config,
+            &policies,
+            &availability,
+        )
+        .expect("ordinary turn must resolve");
+
+        let mut collision = agent_entry();
+        collision.skill_id = test_skill_id("weather");
+        let valid = agent_entry();
+        let mut corrupt = agent_entry();
+        corrupt.skill_id = pioneer_protocol::SkillId::new("BBBBBBBBBBBBBBBBBBBBB")
+            .expect("valid distinct Agent skill ID");
+        corrupt.body = " ".to_owned();
+
+        for rejected_overlay in [vec![collision], vec![valid, corrupt]] {
+            let result = resolve_turn_skills_with_explicit_refs(
+                &[],
+                &explicit_refs,
+                &catalog,
+                rejected_overlay.as_slice(),
+                &config,
+                &policies,
+                &availability,
+            )
+            .expect("optional Agent overlay rejection must preserve the base turn");
+
+            assert!(result.agent_overlay_error.is_some());
+            assert_eq!(result.prompt, ordinary.prompt);
+            assert_eq!(
+                result.runtime_plan.read_skill_index,
+                ordinary.runtime_plan.read_skill_index
+            );
+            assert_eq!(result.runtime_plan.tools, ordinary.runtime_plan.tools);
+            assert!(!result.prompt.contains("[Agent Skills]"));
+            assert!(
+                result
+                    .runtime_plan
+                    .read_skill_index
+                    .values()
+                    .all(|entry| matches!(entry.source, ReadSkillSource::Package { .. }))
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_binding_is_exact_and_explicitly_diagnostic() {
+        let entry = agent_entry();
+        let bindings = to_turn_skill_bindings(&[], std::slice::from_ref(&entry));
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].skill_id, entry.skill_id);
+        assert_eq!(bindings[0].skill_owner, None);
+        assert_eq!(bindings[0].skill_slug, entry.slug);
+        assert_eq!(bindings[0].skill_version.as_deref(), Some("1"));
+        assert_eq!(bindings[0].fingerprint, entry.fingerprint);
+        assert_eq!(bindings[0].source_kind, "agent");
+        assert_eq!(bindings[0].resolved_reason, "agent_catalog");
     }
 }

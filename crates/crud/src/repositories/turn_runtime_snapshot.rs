@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_runtime_snapshot};
 use pioneer_protocol::TurnStatus;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{OnConflict, Query};
+use sea_orm::sea_query::{Expr, OnConflict, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 
 use crate::convention::turn_status_to_db;
@@ -16,6 +16,7 @@ pub struct TurnRuntimeSnapshotRecord {
     pub model: String,
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
+    pub agent_skill_versions_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -36,6 +37,7 @@ pub struct NewTurnRuntimeSnapshot {
     pub model: String,
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
+    pub agent_skill_versions_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -60,6 +62,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         model: Set(snapshot.model),
         provider_name: Set(snapshot.provider_name),
         reasoning_effort: Set(snapshot.reasoning_effort),
+        agent_skill_versions_json: Set(snapshot.agent_skill_versions_json),
         hook_runtime_context_json: Set(snapshot.hook_runtime_context_json),
         workspace_skill_policies_json: Set(snapshot.workspace_skill_policies_json),
         input_json: Set(snapshot.input_json),
@@ -79,6 +82,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                 turn_runtime_snapshot::Column::Model,
                 turn_runtime_snapshot::Column::ProviderName,
                 turn_runtime_snapshot::Column::ReasoningEffort,
+                turn_runtime_snapshot::Column::AgentSkillVersionsJson,
                 turn_runtime_snapshot::Column::HookRuntimeContextJson,
                 turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
                 turn_runtime_snapshot::Column::InputJson,
@@ -108,6 +112,35 @@ pub async fn find_turn_runtime_snapshot<C: ConnectionTrait>(
         .await
         .context("failed to query turn_runtime_snapshot row")?;
     Ok(row.map(record_from_model))
+}
+
+pub async fn clear_agent_skill_versions_if_matches<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    expected_agent_skill_versions_json: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = turn_runtime_snapshot::Entity::update_many()
+        .col_expr(
+            turn_runtime_snapshot::Column::AgentSkillVersionsJson,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_runtime_snapshot::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(turn_runtime_snapshot::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_runtime_snapshot::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(
+            turn_runtime_snapshot::Column::AgentSkillVersionsJson
+                .eq(expected_agent_skill_versions_json.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to clear Agent skill pins from turn_runtime_snapshot row")?
+        .rows_affected;
+    Ok(affected == 1)
 }
 
 pub async fn delete_turn_runtime_snapshot<C: ConnectionTrait>(
@@ -153,6 +186,7 @@ fn record_from_model(model: turn_runtime_snapshot::Model) -> TurnRuntimeSnapshot
         model: model.model,
         provider_name: model.provider_name,
         reasoning_effort: model.reasoning_effort,
+        agent_skill_versions_json: model.agent_skill_versions_json,
         hook_runtime_context_json: model.hook_runtime_context_json,
         workspace_skill_policies_json: model.workspace_skill_policies_json,
         input_json: model.input_json,

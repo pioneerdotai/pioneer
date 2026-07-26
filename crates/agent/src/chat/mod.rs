@@ -7,6 +7,8 @@ mod tool_retry_lifecycle;
 mod tooling;
 mod validator;
 
+pub(crate) use provider::classify_provider_failure_message;
+
 use self::preflight::{
     TurnPreflightOrchestratorInput, TurnPreflightOrchestratorResult, TurnPreflightTurnInput,
     build_turn_preflight_diagnostics_snapshot, run_turn_preflight_orchestrator,
@@ -118,6 +120,24 @@ const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
 const TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS: u64 = 250;
+
+fn readable_agent_skill_overlay(
+    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+    provider_tool_calling: bool,
+) -> &[pioneer_skills::AgentSkillRuntimeEntry] {
+    if provider_tool_calling {
+        agent_skill_overlay
+    } else {
+        &[]
+    }
+}
+
+fn agent_skill_cards_have_read_path(
+    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+    read_skill_materialized: bool,
+) -> bool {
+    agent_skill_overlay.is_empty() || read_skill_materialized
+}
 
 async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
     match timeout(
@@ -871,6 +891,28 @@ async fn emit_durable_event(
         .publish_durable(event)
         .await
         .map_err(agent_event_error)
+}
+
+async fn emit_turn_skills_resolved_event(
+    event_tx: &AgentEventHub,
+    thread_id: &str,
+    turn_id: &str,
+    bindings: Vec<pioneer_protocol::TurnSkillBinding>,
+    require_gateway_confirmation: bool,
+) -> Result<(), ChatTurnError> {
+    let event = AgentDurableEvent::TurnSkillsResolved {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        bindings,
+    };
+    if require_gateway_confirmation {
+        event_tx
+            .publish_durable_and_wait(event)
+            .await
+            .map_err(agent_event_error)
+    } else {
+        emit_durable_event(event_tx, event).await
+    }
 }
 
 async fn emit_progress_event(
@@ -2229,6 +2271,7 @@ pub(super) async fn execute_chat_turn_flow(
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     skill_catalog: pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: Vec<pioneer_skills::AgentSkillRuntimeEntry>,
     input: Vec<UserInput>,
     capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -2296,6 +2339,7 @@ pub(super) async fn execute_chat_turn_flow(
                 &capabilities,
                 &workspace_skill_policies,
                 &skill_catalog,
+                &agent_skill_overlay,
                 runtime_environment,
                 retained_llm_context,
                 execution_window_index,
@@ -2858,6 +2902,7 @@ async fn execute_agent_provider_response(
     capabilities: &[TurnCapability],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     runtime_environment: HashMap<String, String>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_window_index: u32,
@@ -2999,6 +3044,7 @@ async fn execute_agent_provider_response(
         input,
         normalized_capabilities.skill_refs.as_slice(),
         skill_catalog,
+        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling),
         &tool_loop_config.skills,
         workspace_skill_policies,
         &projected_mcp_availability,
@@ -3037,6 +3083,15 @@ async fn execute_agent_provider_response(
             )));
         }
     };
+    if let Some(error) = skills_resolution.agent_overlay_error.as_deref() {
+        warn!(
+            workspace_id,
+            thread_id,
+            turn_id,
+            error,
+            "Agent skill overlay was rejected; continuing with ordinary skills only"
+        );
+    }
 
     if !skills_resolution.audit_events.is_empty() {
         emit_durable_event(
@@ -3132,18 +3187,6 @@ async fn execute_agent_provider_response(
         }
     }
 
-    let bindings = skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice());
-
-    emit_durable_event(
-        event_tx.as_ref(),
-        AgentDurableEvent::TurnSkillsResolved {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            bindings,
-        },
-    )
-    .await?;
-
     emit_capability_resolution_events(
         event_tx.as_ref(),
         workspace_id,
@@ -3164,7 +3207,7 @@ async fn execute_agent_provider_response(
     .await?;
     let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
-    let skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
+    let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
 
     let task_materialization = if provider_tool_calling {
         materialize_task_tooling(
@@ -3208,6 +3251,23 @@ async fn execute_agent_provider_response(
     }
 
     if !provider_tool_calling {
+        if !agent_skill_overlay.is_empty() {
+            if recovery.is_some() {
+                return Err(ChatTurnError::Terminal(
+                    "pinned Agent skills cannot be recovered without native tool calling"
+                        .to_owned(),
+                ));
+            }
+            emit_turn_skills_resolved_event(
+                event_tx.as_ref(),
+                thread_id,
+                turn_id,
+                skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice(), &[]),
+                true,
+            )
+            .await?;
+        }
+
         let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
@@ -3586,6 +3646,61 @@ async fn execute_agent_provider_response(
         turn_id,
         initial_visibility.diagnostics.as_slice(),
     );
+
+    let read_skill_is_visible = initial_visibility
+        .visible_tools
+        .iter()
+        .any(|tool_name| tool_name == "read_skill");
+    let exposed_agent_overlay = if skills_resolution.agent_overlay_error.is_none()
+        && agent_skill_cards_have_read_path(agent_skill_overlay, read_skill_is_visible)
+    {
+        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling)
+    } else {
+        if skills_resolution.agent_overlay_error.is_none() && !agent_skill_overlay.is_empty() {
+            let base_resolution = skills::resolve_turn_skills_with_explicit_refs(
+                input,
+                normalized_capabilities.skill_refs.as_slice(),
+                skill_catalog,
+                &[],
+                &tool_loop_config.skills,
+                workspace_skill_policies,
+                &projected_mcp_availability,
+            )
+            .map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to rebuild ordinary skills after Agent read_skill was unavailable: \
+                     {error:#}"
+                ))
+            })?;
+            skills_prompt = normalize_optional_prompt(Some(base_resolution.prompt));
+            warn!(
+                workspace_id,
+                thread_id,
+                turn_id,
+                "read_skill was absent from the final native tool plan; Agent cards were removed"
+            );
+        }
+        &[]
+    };
+
+    if recovery.is_some() && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "pinned Agent skills are unavailable in the recovered turn's final tool plan"
+                .to_owned(),
+        ));
+    }
+
+    emit_turn_skills_resolved_event(
+        event_tx.as_ref(),
+        thread_id,
+        turn_id,
+        skills::to_turn_skill_bindings(
+            skills_resolution.result.active.as_slice(),
+            exposed_agent_overlay,
+        ),
+        !agent_skill_overlay.is_empty(),
+    )
+    .await?;
 
     trace_agent_turn_preflight(
         thread_id,
@@ -5561,15 +5676,16 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
-        apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
-        apply_review_required_tools_to_visible_tools, build_user_message,
-        compile_agent_instruction_delivery_plan_with_prompt_root,
+        ExecutedToolResult, TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,
+        append_recovered_tool_llm_context, apply_request_tools_results_to_visible_tools,
+        apply_request_tools_visibility_expansion, apply_review_required_tools_to_visible_tools,
+        build_user_message, compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, materialize_mcp_tooling,
-        normalize_turn_capabilities, resolve_skill_capability_summary,
-        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
-        retain_chat_mode_attachment_messages, review_required_observation_payload,
-        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
+        normalize_turn_capabilities, readable_agent_skill_overlay,
+        resolve_skill_capability_summary, retain_agent_attachment_messages,
+        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
+        review_required_observation_payload, review_required_observation_signature,
+        runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
@@ -5598,9 +5714,9 @@ mod tests {
     use pioneer_skills::compile::CompileSkillInput;
     use pioneer_skills::contract::default_skill_conformance;
     use pioneer_skills::{
-        ExcludedSkill, ResolvedSkill, SkillDependencies, SkillExcludedReason, SkillExplicitRef,
-        SkillResolutionResult, SkillResolvedReason, SkillRuntimePlan, SkillSourceKind,
-        SkillTrustLevel, compile_skill_definition,
+        AgentSkillRuntimeEntry, ExcludedSkill, ResolvedSkill, SkillDependencies,
+        SkillExcludedReason, SkillExplicitRef, SkillResolutionResult, SkillResolvedReason,
+        SkillRuntimePlan, SkillSourceKind, SkillTrustLevel, compile_skill_definition,
     };
     use pioneer_tools::{
         BuiltinToolDomain, ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass,
@@ -5610,6 +5726,43 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn agent_skill_runtime_entry() -> AgentSkillRuntimeEntry {
+        AgentSkillRuntimeEntry {
+            skill_id: pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid Agent skill ID"),
+            slug: "agent-skill".to_owned(),
+            version_id: "VVVVVVVVVVVVVVVVVVVVV".to_owned(),
+            version_number: 1,
+            display_name: "Agent skill".to_owned(),
+            runtime_description: "Use for one learned procedure.".to_owned(),
+            body: "Exact immutable instructions.".to_owned(),
+            fingerprint: "fingerprint".to_owned(),
+        }
+    }
+
+    #[test]
+    fn agent_skill_overlay_requires_provider_tool_calling_support() {
+        let entries = vec![agent_skill_runtime_entry()];
+
+        assert!(
+            readable_agent_skill_overlay(entries.as_slice(), false).is_empty(),
+            "a provider without native tool calling must never receive Agent cards"
+        );
+        assert_eq!(
+            readable_agent_skill_overlay(entries.as_slice(), true),
+            entries.as_slice()
+        );
+    }
+
+    #[test]
+    fn agent_skill_cards_require_materialized_read_skill() {
+        let entries = vec![agent_skill_runtime_entry()];
+
+        assert!(!agent_skill_cards_have_read_path(entries.as_slice(), false));
+        assert!(agent_skill_cards_have_read_path(entries.as_slice(), true));
+        assert!(agent_skill_cards_have_read_path(&[], false));
+    }
 
     #[derive(Default)]
     struct NoopToolHandler;
@@ -6010,6 +6163,7 @@ mod tests {
                 excluded_tools: Vec::new(),
             },
             audit_events: Vec::new(),
+            agent_overlay_error: None,
         }
     }
 

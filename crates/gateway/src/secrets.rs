@@ -876,10 +876,10 @@ fn current_unix_i64() -> Result<i64> {
     i64::try_from(unix_timestamp_secs()?).context("current unix timestamp does not fit into i64")
 }
 
-fn is_local_provider(provider_name: &str) -> bool {
+pub(crate) fn is_local_provider(provider_name: &str) -> bool {
     matches!(
         provider_name,
-        "ollama" | "lmstudio" | "llamacpp" | "sglang" | "vllm" | "osaurus" | "litellm"
+        "local" | "ollama" | "lmstudio" | "llamacpp" | "sglang" | "vllm" | "osaurus" | "litellm"
     )
 }
 

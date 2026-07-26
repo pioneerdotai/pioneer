@@ -773,6 +773,7 @@ description = "管理应用偏好设置。"
 back = "返回"
 general = "通用"
 memory = "记忆"
+self_improvement = "自我改进"
 
 [settings.option.language]
 label = "应用语言"
@@ -873,6 +874,29 @@ description = "在本地调试视图中显示记忆机制诊断。"
 default = "默认"
 select_model = "选择模型"
 dialog_title = "选择记忆模型"
+
+[settings.self_improvement]
+title = "自我改进"
+description = "从已完成工作的有用模式中创建并维护智能体技能。"
+configuration_incomplete = "请先选择默认模型，然后才能运行自我改进。"
+
+[settings.self_improvement.enabled]
+label = "自我改进"
+description = "允许 Pioneer 从已完成的轮次中学习可复用的智能体技能。"
+
+[settings.self_improvement.default_model]
+label = "默认模型"
+description = "用于每日学习和创建技能的必选模型。"
+
+[settings.self_improvement.reviewer_model]
+label = "审核模型"
+description = "可选的独立审核模型。未选择时使用默认模型。"
+
+[settings.self_improvement.model]
+not_selected = "未选择"
+use_default = "使用默认模型"
+select_model = "选择模型"
+dialog_title = "选择自我改进模型"
 
 [settings.memory.vector_search]
 label = "向量搜索"

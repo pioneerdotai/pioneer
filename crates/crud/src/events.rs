@@ -14,8 +14,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnStartedEventPayload {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalTurnStartedEventPayload {
     pub thread: Thread,
     pub sandbox_mode: SandboxMode,
     pub turn: Turn,
@@ -24,10 +24,10 @@ pub struct TurnStartedEventPayload {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
-pub enum TurnEventPayload {
-    TurnStarted(TurnStartedEventPayload),
+pub enum CanonicalTurnEventPayload {
+    TurnStarted(CanonicalTurnStartedEventPayload),
     ItemStarted(ItemStartedNotification),
     ItemCompleted(ItemCompletedNotification),
     ItemUpdated(ItemUpdatedNotification),
@@ -53,7 +53,7 @@ pub enum TurnEventPayload {
     TurnBlocked(TurnBlockedNotification),
 }
 
-impl TurnEventPayload {
+impl CanonicalTurnEventPayload {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::TurnStarted(_) => events::TURN_STARTED,
@@ -112,6 +112,35 @@ impl TurnEventPayload {
         }
     }
 
+    pub fn workspace_id(&self) -> &str {
+        match self {
+            Self::TurnStarted(payload) => payload.thread.workspace_id.as_str(),
+            Self::ItemStarted(payload) => payload.workspace_id.as_str(),
+            Self::ItemCompleted(payload) => payload.workspace_id.as_str(),
+            Self::ItemUpdated(payload) => payload.workspace_id.as_str(),
+            Self::ItemTimeoutDetected(payload) => payload.workspace_id.as_str(),
+            Self::ItemRecoveryOpened(payload) => payload.workspace_id.as_str(),
+            Self::ItemRecoveryAttached(payload) => payload.workspace_id.as_str(),
+            Self::ItemRetryScheduled(payload) => payload.workspace_id.as_str(),
+            Self::ItemRetryAttemptStarted(payload) => payload.workspace_id.as_str(),
+            Self::ItemRecoverySucceeded(payload) => payload.workspace_id.as_str(),
+            Self::ItemRecoveryExhausted(payload) => payload.workspace_id.as_str(),
+            Self::ItemToolRetryScheduled(payload) => payload.workspace_id.as_str(),
+            Self::ItemToolRetryResolved(payload) => payload.workspace_id.as_str(),
+            Self::ItemToolRetryExhausted(payload) => payload.workspace_id.as_str(),
+            Self::TurnToolLoopBudgetExceeded(payload) => payload.workspace_id.as_str(),
+            Self::TurnExecutionWindowStarted(payload) => payload.workspace_id.as_str(),
+            Self::TurnExecutionWindowExhausted(payload) => payload.workspace_id.as_str(),
+            Self::TurnExecutionWindowCheckpointed(payload) => payload.workspace_id.as_str(),
+            Self::TurnExecutionWindowContinued(payload) => payload.workspace_id.as_str(),
+            Self::TurnExecutionWindowBlocked(payload) => payload.workspace_id.as_str(),
+            Self::TurnPermissionAudit(payload) => payload.workspace_id.as_str(),
+            Self::TurnCompleted(payload) => payload.workspace_id.as_str(),
+            Self::TurnFailed(payload) => payload.workspace_id.as_str(),
+            Self::TurnBlocked(payload) => payload.workspace_id.as_str(),
+        }
+    }
+
     pub fn turn_id(&self) -> &str {
         match self {
             Self::TurnStarted(payload) => payload.turn.id.as_str(),
@@ -141,6 +170,9 @@ impl TurnEventPayload {
         }
     }
 }
+
+pub(crate) type TurnEventPayload = CanonicalTurnEventPayload;
+pub(crate) type TurnStartedEventPayload = CanonicalTurnStartedEventPayload;
 
 #[derive(Debug, Clone)]
 pub struct AppendedTurnEvent {

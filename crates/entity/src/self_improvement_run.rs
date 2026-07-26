@@ -1,0 +1,56 @@
+//! Durable state for one logical daily self-improvement run.
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[sea_orm::model]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "self_improvement_run")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
+    #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
+    pub workspace_id: String,
+    #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
+    pub activation_epoch: i64,
+    #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
+    pub scheduled_date_utc: String,
+    pub source_lower_exclusive: i64,
+    pub source_upper_inclusive: i64,
+    pub status: String,
+    pub claim_token: Option<String>,
+    pub claimed_by: Option<String>,
+    pub lease_expires_at: Option<DateTimeWithTimeZone>,
+    pub attempt_count: i32,
+    pub next_attempt_at: Option<DateTimeWithTimeZone>,
+    pub learner_provider: String,
+    pub learner_model: String,
+    pub reviewer_provider: String,
+    pub reviewer_model: String,
+    pub pipeline_contract_version: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub analysis_cursor_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub analysis_digest_json: Option<String>,
+    pub outcome: Option<String>,
+    pub applied_action: Option<String>,
+    pub skill_id: Option<String>,
+    pub previous_version_id: Option<String>,
+    pub resulting_version_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub result_summary: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(
+        belongs_to,
+        from = "workspace_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "Cascade"
+    )]
+    pub workspace: HasOne<super::workspace::Entity>,
+}
+
+impl ActiveModelBehavior for ActiveModel {}

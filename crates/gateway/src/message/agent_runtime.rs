@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 const ACTIVE_TURN_LLM_CONTEXT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
@@ -796,6 +796,22 @@ impl MessageProcessor {
         bindings: Vec<pioneer_protocol::TurnSkillBinding>,
     ) -> MessageFuture<'a, bool> {
         message_future(async move {
+            if let Err(error) = self
+                .reconcile_turn_runtime_snapshot_agent_overlay(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    bindings.as_slice(),
+                )
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to confirm Agent skill exposure before provider execution"
+                );
+                return false;
+            }
             self.persist_turn_skill_bindings(
                 thread_id.as_str(),
                 turn_id.as_str(),
@@ -812,6 +828,92 @@ impl MessageProcessor {
                 .await;
             true
         })
+    }
+
+    async fn reconcile_turn_runtime_snapshot_agent_overlay(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        bindings: &[pioneer_protocol::TurnSkillBinding],
+    ) -> Result<()> {
+        let agent_bindings = bindings
+            .iter()
+            .filter(|binding| binding.source_kind == "agent")
+            .collect::<Vec<_>>();
+        let Some(snapshot) = self
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .context("failed to load the authoritative turn runtime snapshot")?
+        else {
+            if agent_bindings.is_empty() {
+                return Ok(());
+            }
+            bail!("Agent skill exposure has no authoritative turn runtime snapshot");
+        };
+        if snapshot.thread_id != thread_id {
+            bail!("Agent skill exposure does not match the authoritative snapshot thread");
+        }
+
+        let pins = crate::turn_runtime_snapshot::agent_skill_version_pins_from_snapshot(&snapshot)
+            .context("authoritative Agent skill pins are invalid")?;
+        if pins.is_empty() {
+            if agent_bindings.is_empty() {
+                return Ok(());
+            }
+            bail!("Agent skill exposure was not pinned in the authoritative snapshot");
+        }
+
+        if agent_bindings.is_empty() {
+            let expected_json = snapshot
+                .agent_skill_versions_json
+                .as_deref()
+                .context("nonempty Agent skill pins are missing their stored representation")?;
+            let cleared = self
+                .crud_store
+                .clear_turn_runtime_snapshot_agent_skill_versions_if_matches(
+                    thread_id,
+                    turn_id,
+                    expected_json,
+                )
+                .await
+                .context("failed to persist the authoritative base-only runtime snapshot")?;
+            if !cleared {
+                bail!("authoritative Agent skill pins changed before base-only confirmation");
+            }
+            return Ok(());
+        }
+
+        if agent_bindings.iter().any(|binding| {
+            binding.resolved_reason != "agent_catalog"
+                || binding
+                    .skill_version
+                    .as_deref()
+                    .and_then(|version| version.parse::<i64>().ok())
+                    .is_none_or(|version| version <= 0)
+        }) {
+            bail!("Agent skill exposure contains invalid diagnostic metadata");
+        }
+        let mut expected = pins
+            .iter()
+            .map(|pin| (pin.skill_id.as_str().to_owned(), pin.fingerprint.clone()))
+            .collect::<Vec<_>>();
+        expected.sort();
+        let mut actual = agent_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.skill_id.as_str().to_owned(),
+                    binding.fingerprint.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        actual.dedup();
+        if actual.len() != agent_bindings.len() || actual != expected {
+            bail!("Agent skill exposure does not match the authoritative pinned overlay");
+        }
+        Ok(())
     }
 
     async fn persist_turn_skill_bindings(

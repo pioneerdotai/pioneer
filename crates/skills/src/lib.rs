@@ -27,8 +27,9 @@ pub use compile::{
     SkillRuntime, SkillUnavailableReason, compact_skill_label, compile_skill_definition,
 };
 pub use contract::{
-    SkillCatalogSnapshot, SkillDependencies, SkillSourceKind, SkillTrustLevel,
-    normalize_skill_markdown_plain_description, normalize_skill_slug, parse_skill_from_file,
+    SkillCatalogSnapshot, SkillDependencies, SkillMarkdownParseContext, SkillSourceKind,
+    SkillTrustLevel, normalize_skill_markdown_plain_description, normalize_skill_slug,
+    parse_skill_from_file, parse_skill_markdown,
 };
 pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
@@ -63,7 +64,10 @@ pub use policy::{
     EffectiveSkillPolicy, SkillPolicy, SkillPolicyKey, SkillPolicySet, effective_policy_for_skill,
     merge_policy, skill_implicit_invocation_editable,
 };
-pub use prompt::{SkillPromptBudget, SkillPromptBuild, build_skill_prompt};
+pub use prompt::{
+    AGENT_SKILL_PROMPT_BUDGET, MAX_ACTIVE_AGENT_SKILLS, SkillPromptBudget, SkillPromptBuild,
+    build_combined_skill_prompt, build_skill_prompt, ensure_agent_skill_overlay_capacity,
+};
 pub use provenance::{
     SkillLockConversionCandidate, SkillLockEntry, SkillsLock, ensure_skills_lock_v2,
     find_lock_entry, read_skills_lock, remove_lock_entry, upsert_lock_entry,
@@ -75,13 +79,14 @@ pub use resolver::{
     resolve_skills,
 };
 pub use runtime::{
-    DynamicDeltaOutputRequest, DynamicDiagnosticExcerptRequest, DynamicLlmOutputRequest,
-    DynamicLlmRetentionRequest, DynamicRecoveryOutputRequest, DynamicStorageOutputRequest,
-    DynamicTimelineOutputRequest, DynamicToolOutputPolicyDeclaration, ExcludedRuntimeTool,
-    ReadSkillEntry, RuntimeExecutionCheck, RuntimeExecutionClassHint,
-    RuntimeExecutionRecheckPolicy, RuntimeToolExcludedReason, SkillRuntimeBudget,
-    SkillRuntimeDescriptor, SkillRuntimePlan, SkillRuntimeToolDefinition, SkillRuntimeToolKind,
-    build_skill_runtime_plan, recheck_runtime_tool_execution,
+    AgentSkillOverlayError, AgentSkillRuntimeEntry, DynamicDeltaOutputRequest,
+    DynamicDiagnosticExcerptRequest, DynamicLlmOutputRequest, DynamicLlmRetentionRequest,
+    DynamicRecoveryOutputRequest, DynamicStorageOutputRequest, DynamicTimelineOutputRequest,
+    DynamicToolOutputPolicyDeclaration, ExcludedRuntimeTool, ReadSkillEntry, ReadSkillSource,
+    RuntimeExecutionCheck, RuntimeExecutionClassHint, RuntimeExecutionRecheckPolicy,
+    RuntimeToolExcludedReason, SkillRuntimeBudget, SkillRuntimeDescriptor, SkillRuntimePlan,
+    SkillRuntimeToolDefinition, SkillRuntimeToolKind, agent_skill_runtime_description,
+    build_skill_runtime_plan, merge_agent_skill_overlay, recheck_runtime_tool_execution,
 };
 pub use security::{
     SecurityDecision, SecurityFinding, SecurityScanReport, SkillSecurityPolicy,

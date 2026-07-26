@@ -209,6 +209,7 @@ pub fn keepawake_update_plan(
                 preflight_model: None,
             }),
             memory: None,
+            self_improvement: None,
             thread_episodic: None,
             cli_runtimes: None,
             remote_access: None,
@@ -232,6 +233,7 @@ pub fn preflight_model_update_plan(
                 preflight_model: Some(model_selection),
             }),
             memory: None,
+            self_improvement: None,
             thread_episodic: None,
             cli_runtimes: None,
             remote_access: None,
@@ -252,6 +254,7 @@ pub fn thread_episodic_enabled_update_plan(
         update: GatewaySettingsUpdate {
             general: None,
             memory: None,
+            self_improvement: None,
             thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate::enabled(enabled)),
             cli_runtimes: None,
             remote_access: None,
@@ -304,6 +307,7 @@ pub fn thread_episodic_vector_search_update_plan(
         update: GatewaySettingsUpdate {
             general: None,
             memory: None,
+            self_improvement: None,
             thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate {
                 vector_search: Some(GatewayThreadEpisodicVectorSearchSettingsUpdate {
                     enabled: Some(vector_search.enabled),
@@ -358,6 +362,7 @@ pub fn remote_access_update_plan(
         update: GatewaySettingsUpdate {
             general: None,
             memory: None,
+            self_improvement: None,
             thread_episodic: None,
             cli_runtimes: None,
             remote_access: Some(GatewayRemoteAccessSettingsUpdate {
@@ -441,6 +446,7 @@ mod tests {
                 ..Default::default()
             },
             memory: GatewayMemorySettings::default(),
+            self_improvement: Default::default(),
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
             remote_access: Default::default(),

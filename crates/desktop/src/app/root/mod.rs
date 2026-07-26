@@ -142,6 +142,7 @@ pub(super) enum MainContentView {
 pub(super) enum SettingsContentView {
     General,
     Memory,
+    SelfImprovement,
 }
 
 pub(super) struct GatewayCoordinator {

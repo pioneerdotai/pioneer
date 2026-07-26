@@ -111,6 +111,9 @@ impl MessageProcessor {
         if request.method == methods::TURN_START {
             return self.dispatch_turn_start(connection_id, request);
         }
+        if request.method == methods::SETTINGS_UPDATE {
+            return self.dispatch_settings_update(connection_id, request);
+        }
 
         self.process_request_inner(connection_id, request)
     }
@@ -135,6 +138,80 @@ impl MessageProcessor {
                 .await;
             }),
         }
+    }
+
+    fn dispatch_settings_update<'a>(
+        &'a self,
+        connection_id: ConnectionId,
+        request: JsonRpcRequest,
+    ) -> MessageFuture<'a, ()> {
+        let params_value = request.params.unwrap_or_else(empty_object_value);
+        let params = match serde_json::from_value::<GatewaySettingsUpdateParams>(params_value) {
+            Ok(params) => params,
+            Err(error) => {
+                return message_future(async move {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request.id),
+                            INVALID_PARAMS_CODE,
+                            format!("invalid params for `{}`: {error}", methods::SETTINGS_UPDATE),
+                        ),
+                    )
+                    .await;
+                });
+            }
+        };
+
+        message_future(async move {
+            match self
+                .update_gateway_settings(connection_id, params.update)
+                .await
+            {
+                Ok(settings) => {
+                    let result = pioneer_protocol::GatewaySettingsUpdateResponse { settings };
+                    match JsonRpcResponse::from_result(request.id, &result) {
+                        Ok(response) => {
+                            if let Err(error) = self.send_json(connection_id, &response).await {
+                                warn!(
+                                    error = %format!("{error:#}"),
+                                    "failed to send gateway settings update response"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    None,
+                                    INVALID_REQUEST_CODE,
+                                    format!(
+                                        "failed to encode `{}` response: {error}",
+                                        methods::SETTINGS_UPDATE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let response = if error
+                        .downcast_ref::<VoiceReconfigurationBusyError>()
+                        .is_some()
+                    {
+                        voice_reconfiguration_busy_error(Some(request.id))
+                    } else {
+                        JsonRpcErrorResponse::new(
+                            Some(request.id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to update gateway settings: {error:#}"),
+                        )
+                    };
+                    self.send_error(connection_id, response).await;
+                }
+            }
+        })
     }
 
     fn process_request_inner<'a>(
@@ -1441,75 +1518,6 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::SETTINGS_GET
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::SETTINGS_UPDATE => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<GatewaySettingsUpdateParams>(params_value) {
-                        Ok(params) => match self
-                            .update_gateway_settings(connection_id, params.update)
-                            .await
-                        {
-                            Ok(settings) => {
-                                let result =
-                                    pioneer_protocol::GatewaySettingsUpdateResponse { settings };
-                                match JsonRpcResponse::from_result(request.id, &result) {
-                                    Ok(response) => {
-                                        if let Err(error) =
-                                            self.send_json(connection_id, &response).await
-                                        {
-                                            warn!(
-                                                error = %format!("{error:#}"),
-                                                "failed to send gateway settings update response"
-                                            );
-                                        }
-                                    }
-                                    Err(error) => {
-                                        self.send_error(
-                                            connection_id,
-                                            JsonRpcErrorResponse::new(
-                                                None,
-                                                INVALID_REQUEST_CODE,
-                                                format!(
-                                                    "failed to encode `{}` response: {error}",
-                                                    methods::SETTINGS_UPDATE
-                                                ),
-                                            ),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let response = if error
-                                    .downcast_ref::<VoiceReconfigurationBusyError>()
-                                    .is_some()
-                                {
-                                    voice_reconfiguration_busy_error(Some(request.id))
-                                } else {
-                                    JsonRpcErrorResponse::new(
-                                        Some(request.id),
-                                        INVALID_REQUEST_CODE,
-                                        format!("failed to update gateway settings: {error:#}"),
-                                    )
-                                };
-                                self.send_error(connection_id, response).await;
-                            }
-                        },
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::SETTINGS_UPDATE
                                     ),
                                 ),
                             )
@@ -3000,6 +3008,11 @@ impl MessageProcessor {
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
+        if update.self_improvement.is_some() && self.self_improvement_supervisor.is_none() {
+            anyhow::bail!(
+                "self-improvement settings cannot be updated without the runtime supervisor"
+            );
+        }
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
         let settings_file_name = crate::settings::normalize_settings_file_name(
@@ -3027,6 +3040,15 @@ impl MessageProcessor {
             .session_manager
             .connection_workspace_id(connection_id)
             .await;
+        if let Some(self_improvement) = update.self_improvement.as_ref() {
+            let desired =
+                crate::settings::self_improvement_settings_from_protocol(self_improvement.clone())?;
+            crate::self_improvement::settings::validate_authoritative_selections_for_workspace(
+                &desired,
+                self.provider_registry.as_ref(),
+                workspace_id.as_deref(),
+            )?;
+        }
         if update
             .thread_episodic
             .as_ref()
@@ -3095,6 +3117,17 @@ impl MessageProcessor {
                 }
             }
             return Err(error);
+        }
+
+        if changes.self_improvement {
+            if let Some(supervisor) = self.self_improvement_supervisor.as_ref() {
+                Box::pin(supervisor.apply_desired(
+                    settings.effective_self_improvement_settings(&config.gateway.self_improvement),
+                    chrono::Utc::now().timestamp(),
+                ))
+                .await
+                .context("failed to apply Self-improvement settings")?;
+            }
         }
 
         if changes.remote_access.changed {
@@ -3263,6 +3296,15 @@ impl MessageProcessor {
             has_remote_access_key,
             remote_access_status,
         );
+        let desired = settings.effective_self_improvement_settings(&config.self_improvement);
+        let authoritative =
+            crate::self_improvement::settings::resolve_authoritative_settings_for_workspace(
+                &desired,
+                self.provider_registry.as_ref(),
+                workspace_id,
+            );
+        snapshot.self_improvement =
+            crate::settings::self_improvement_settings_to_protocol(&authoritative.desired_config());
         self.apply_vector_provider_key_presence(&mut snapshot, workspace_id)?;
         crate::settings::apply_thread_episodic_vector_search_status(
             &mut snapshot.thread_episodic.vector_search,

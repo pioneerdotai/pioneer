@@ -16,6 +16,7 @@ pub(super) struct PreparedApiProviderTurnStart {
     workspace_skill_policies:
         HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
     skill_catalog: pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: Vec<pioneer_skills::AgentSkillRuntimeEntry>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
@@ -160,6 +161,15 @@ fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
 
 fn cli_runtime_execution_disabled_message() -> String {
     "CLI agent runtime execution is disabled or no CLI runtimes are configured".to_owned()
+}
+
+fn execution_backend_allows_agent_skill_overlay(
+    execution_backend: Option<&AgentExecutionBackend>,
+) -> bool {
+    matches!(
+        execution_backend,
+        None | Some(AgentExecutionBackend::ApiProvider { .. })
+    )
 }
 
 impl MessageProcessor {
@@ -900,6 +910,8 @@ impl MessageProcessor {
         mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
     ) -> Result<PreparedApiProviderTurnStart, String> {
+        let allow_agent_skill_overlay =
+            execution_backend_allows_agent_skill_overlay(params.execution_backend.as_ref());
         let thread = self
             .thread_manager
             .thread_get(params.thread_id.trim())
@@ -980,6 +992,19 @@ impl MessageProcessor {
                     ));
                 }
             };
+        let mut agent_skill_overlay = if allow_agent_skill_overlay
+            && self.native_api_provider_supports_agent_skill_overlay(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.thread.model_provider.as_str(),
+            ) {
+            self.load_agent_skill_overlay_for_new_native_turn(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await
+        } else {
+            Vec::new()
+        };
 
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
             Ok(event) => event,
@@ -1124,8 +1149,8 @@ impl MessageProcessor {
             }
         };
         let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
-        if let Err(error) = self
-            .persist_turn_runtime_snapshot(
+        let snapshot_result = self
+            .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
@@ -1140,9 +1165,10 @@ impl MessageProcessor {
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
                 history.as_slice(),
+                &mut agent_skill_overlay,
             )
-            .await
-        {
+            .await;
+        if let Err(error) = snapshot_result {
             self.report_turn_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
@@ -1176,6 +1202,7 @@ impl MessageProcessor {
             user_message_capability_attachments,
             workspace_skill_policies,
             skill_catalog,
+            agent_skill_overlay,
             resolved_artifacts,
             runtime_environment,
             history,
@@ -1210,7 +1237,7 @@ impl MessageProcessor {
         let outcome = prepared.outcome;
         if let Err(error) = self
             .agent_manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
+            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.thread.mode,
@@ -1218,6 +1245,7 @@ impl MessageProcessor {
                 &outcome.materialization.thread.model_provider,
                 prepared.workspace_skill_policies,
                 prepared.skill_catalog,
+                prepared.agent_skill_overlay,
                 outcome.materialization.input.clone(),
                 outcome.materialization.capabilities.clone(),
                 prepared.resolved_artifacts,
@@ -5878,6 +5906,27 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_skill_overlay_is_native_api_only() {
+        assert!(execution_backend_allows_agent_skill_overlay(None));
+        assert!(execution_backend_allows_agent_skill_overlay(Some(
+            &AgentExecutionBackend::ApiProvider {
+                provider: "openai".to_owned(),
+            },
+        )));
+        assert!(!execution_backend_allows_agent_skill_overlay(Some(
+            &AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+            },
+        )));
+        assert!(!execution_backend_allows_agent_skill_overlay(Some(
+            &AgentExecutionBackend::ACPAgentRuntime {
+                runtime_id: "acp".to_owned(),
+            },
+        )));
+    }
 
     fn reasoning_test_model(
         reasoning: Option<ProviderModelReasoningCapabilities>,

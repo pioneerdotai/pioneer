@@ -259,6 +259,52 @@
         "websocket"
       ]
     },
+    "GatewaySelfImprovementModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "GatewaySelfImprovementSettings": {
+      "type": "object",
+      "properties": {
+        "default_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "reviewer_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "GatewaySettingsSnapshot": {
       "type": "object",
       "properties": {
@@ -306,6 +352,12 @@
               "state": "disabled"
             },
             "transport": "tcp"
+          }
+        },
+        "self_improvement": {
+          "$ref": "#/$defs/GatewaySelfImprovementSettings",
+          "default": {
+            "enabled": false
           }
         },
         "thread_episodic": {

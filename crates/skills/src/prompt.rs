@@ -1,5 +1,15 @@
 use crate::compact_skill_label;
 use crate::resolver::{ResolvedSkill, SkillResolvedReason};
+use crate::runtime::{
+    AgentSkillOverlayError, AgentSkillRuntimeEntry, validate_agent_skill_runtime_entries,
+};
+
+pub const AGENT_SKILL_PROMPT_BUDGET: usize = 8_000;
+pub const MAX_ACTIVE_AGENT_SKILLS: usize = 16;
+
+const SKILLS_HEADER: &str = "[Skills]\nThe following skills are available for this turn:\n";
+const SKILLS_FOOTER: &str = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
+const COMBINED_SKILLS_FOOTER: &str = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns the exact instructions for every skill; package skills additionally return `skill_asset_root` for resolving relative file paths. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPromptBuild {
@@ -15,20 +25,38 @@ pub struct SkillPromptBudget {
     pub include_read_skill_hint: bool,
 }
 
-fn compact_skill_block(skill: &ResolvedSkill) -> String {
-    let label = compact_skill_label(
-        skill.definition.identity.owner.as_deref(),
-        skill.definition.identity.slug.as_str(),
-    );
-    let machine_ref = format!("skill:{}", skill.skill_id);
-    format!(
-        "- {} ({})\n  Exact skill reference for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
-        skill.definition.identity.display_name,
-        label,
-        machine_ref,
-        skill.definition.identity.skill_dir,
-        skill.definition.instructions.description,
-    )
+enum SkillPromptCard<'a> {
+    Package(&'a ResolvedSkill),
+    InlineAgent(&'a AgentSkillRuntimeEntry),
+}
+
+fn compact_skill_block(card: SkillPromptCard<'_>) -> String {
+    match card {
+        SkillPromptCard::Package(skill) => {
+            let label = compact_skill_label(
+                skill.definition.identity.owner.as_deref(),
+                skill.definition.identity.slug.as_str(),
+            );
+            let machine_ref = format!("skill:{}", skill.skill_id);
+            format!(
+                "- {} ({})\n  Exact skill reference for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
+                skill.definition.identity.display_name,
+                label,
+                machine_ref,
+                skill.definition.identity.skill_dir,
+                skill.definition.instructions.description,
+            )
+        }
+        SkillPromptCard::InlineAgent(skill) => format!(
+            "- {} (agent/{})\n  Exact skill reference for read_skill: `skill:{}`\n  Active immutable version: `{}` (version {})\n  Use when: {}\n",
+            skill.display_name,
+            skill.slug,
+            skill.skill_id,
+            skill.version_id,
+            skill.version_number,
+            skill.runtime_description,
+        ),
+    }
 }
 
 fn full_skill_block(skill: &ResolvedSkill) -> String {
@@ -108,9 +136,8 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         if !text.is_empty() {
             text.push('\n');
         }
-        let header = "[Skills]\nThe following skills are available for this turn:\n";
-        if text.len() + header.len() <= max_chars {
-            text.push_str(header);
+        if text.len() + SKILLS_HEADER.len() <= max_chars {
+            text.push_str(SKILLS_HEADER);
             catalog_header_added = true;
         } else {
             omitted_slugs.extend(catalog_skills.iter().map(|skill| skill.slug.clone()));
@@ -122,7 +149,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         .copied()
         .filter(|_| catalog_header_added)
     {
-        let block = compact_skill_block(skill);
+        let block = compact_skill_block(SkillPromptCard::Package(skill));
         if text.len() + block.len() > max_chars {
             omitted_slugs.insert(skill.slug.clone());
             continue;
@@ -156,9 +183,8 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     }
 
     if catalog_header_added && text.len() < max_chars {
-        let footer = "\nWhen a skill is relevant, call `read_skill` with its exact `skill:<skill_id>` reference before executing specialized actions. Never reconstruct the reference from the readable label. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
-        if text.len() + footer.len() <= max_chars {
-            text.push_str(footer);
+        if text.len() + SKILLS_FOOTER.len() <= max_chars {
+            text.push_str(SKILLS_FOOTER);
         }
     }
 
@@ -192,14 +218,95 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     }
 }
 
+pub fn build_combined_skill_prompt(
+    active: &[ResolvedSkill],
+    agent_entries: &[AgentSkillRuntimeEntry],
+    budget: SkillPromptBudget,
+) -> Result<SkillPromptBuild, AgentSkillOverlayError> {
+    let base = build_skill_prompt(active, budget);
+    if agent_entries.is_empty() {
+        return Ok(base);
+    }
+
+    validate_agent_skill_runtime_entries(agent_entries, MAX_ACTIVE_AGENT_SKILLS)?;
+    let mut ordered = agent_entries.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+
+    let mut agent_block = String::from("[Agent Skills]\n");
+    for entry in ordered {
+        agent_block.push_str(compact_skill_block(SkillPromptCard::InlineAgent(entry)).as_str());
+    }
+
+    let base_has_footer = base.text.ends_with(SKILLS_FOOTER);
+    let required_agent_bytes = agent_block.len()
+        + if base.text.is_empty() {
+            SKILLS_HEADER.len()
+        } else {
+            1
+        }
+        + COMBINED_SKILLS_FOOTER.len()
+        - if base_has_footer {
+            SKILLS_FOOTER.len()
+        } else {
+            0
+        };
+    if required_agent_bytes > AGENT_SKILL_PROMPT_BUDGET {
+        return Err(AgentSkillOverlayError::PromptCapacityExceeded {
+            limit: AGENT_SKILL_PROMPT_BUDGET,
+            actual: required_agent_bytes,
+        });
+    }
+
+    let mut text = base.text;
+    if text.is_empty() {
+        text.push_str(SKILLS_HEADER);
+        text.push_str(agent_block.as_str());
+        text.push_str(COMBINED_SKILLS_FOOTER);
+    } else if base_has_footer {
+        text.truncate(text.len() - SKILLS_FOOTER.len());
+        text.push('\n');
+        text.push_str(agent_block.as_str());
+        text.push_str(COMBINED_SKILLS_FOOTER);
+    } else {
+        text.push('\n');
+        text.push_str(agent_block.as_str());
+        text.push_str(COMBINED_SKILLS_FOOTER);
+    }
+
+    Ok(SkillPromptBuild {
+        text,
+        omitted_slugs: base.omitted_slugs,
+        truncated: base.truncated,
+    })
+}
+
+pub fn ensure_agent_skill_overlay_capacity(
+    agent_entries: &[AgentSkillRuntimeEntry],
+) -> Result<(), AgentSkillOverlayError> {
+    build_combined_skill_prompt(
+        &[],
+        agent_entries,
+        SkillPromptBudget {
+            max_chars: 1,
+            compact_mode_threshold: 0,
+            include_read_skill_hint: true,
+        },
+    )
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SkillPromptBudget, build_skill_prompt};
+    use super::{
+        AGENT_SKILL_PROMPT_BUDGET, SkillPromptBudget, build_combined_skill_prompt,
+        build_skill_prompt, ensure_agent_skill_overlay_capacity,
+    };
     use crate::compile::{CompileSkillInput, compile_skill_definition};
     use crate::contract::{
         SkillDependencies, SkillSourceKind, SkillTrustLevel, default_skill_conformance,
     };
     use crate::resolver::{ResolvedSkill, SkillResolvedReason};
+    use crate::runtime::{AgentSkillOverlayError, AgentSkillRuntimeEntry};
     use pioneer_protocol::SkillId;
     use serde_json::json;
 
@@ -528,5 +635,83 @@ mod tests {
         assert!(!built.text.contains("Hidden from prompt catalog."));
         assert!(!built.truncated);
         assert!(built.omitted_slugs.is_empty());
+    }
+
+    fn agent_entry(body: String) -> AgentSkillRuntimeEntry {
+        AgentSkillRuntimeEntry {
+            skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid Agent skill ID"),
+            slug: "stable-procedure".to_owned(),
+            version_id: "111111111111111111111".to_owned(),
+            version_number: 1,
+            display_name: "Stable procedure".to_owned(),
+            runtime_description: "Use for stable procedures. Do not use when: unrelated."
+                .to_owned(),
+            body,
+            fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn empty_agent_overlay_is_byte_identical_to_ordinary_prompt() {
+        let active = vec![resolved("ordinary", "Use the ordinary skill.")];
+        let budget = SkillPromptBudget {
+            max_chars: 2_000,
+            compact_mode_threshold: 6,
+            include_read_skill_hint: true,
+        };
+        assert_eq!(
+            build_combined_skill_prompt(active.as_slice(), &[], budget)
+                .expect("empty overlay must build")
+                .text,
+            build_skill_prompt(active.as_slice(), budget).text
+        );
+    }
+
+    #[test]
+    fn combined_prompt_adds_agent_card_without_inline_body_or_fake_path() {
+        let entry = agent_entry("Secret full body stays behind read_skill.".to_owned());
+        let built = build_combined_skill_prompt(
+            &[],
+            std::slice::from_ref(&entry),
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        )
+        .expect("Agent prompt must fit");
+        assert!(built.text.contains("[Agent Skills]"));
+        assert!(built.text.contains("skill:AAAAAAAAAAAAAAAAAAAAA"));
+        assert!(built.text.contains("111111111111111111111"));
+        assert!(built.text.contains("version 1"));
+        assert!(built.text.contains("Use for stable procedures"));
+        assert!(!built.text.contains("Secret full body"));
+        assert!(!built.text.contains("Skill asset root: ``"));
+        assert!(
+            built
+                .text
+                .contains("package skills additionally return `skill_asset_root`")
+        );
+        assert!(
+            !built
+                .text
+                .contains("`read_skill` returns `skill_asset_root`")
+        );
+    }
+
+    #[test]
+    fn projected_capacity_uses_the_production_renderer_and_never_truncates() {
+        let oversized = agent_entry("body".to_owned());
+        let mut entries = Vec::new();
+        for index in 0..16 {
+            let mut entry = oversized.clone();
+            entry.skill_id = SkillId::new(format!("{index:021}")).expect("valid generated ID");
+            entry.display_name = "x".repeat(AGENT_SKILL_PROMPT_BUDGET);
+            entries.push(entry);
+        }
+        assert!(matches!(
+            ensure_agent_skill_overlay_capacity(entries.as_slice()),
+            Err(AgentSkillOverlayError::PromptCapacityExceeded { .. })
+        ));
     }
 }

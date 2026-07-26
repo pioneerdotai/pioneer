@@ -264,6 +264,9 @@ proactive_writes_model = "thread"
 debug_trace_enabled = false
 strict_diagnostics_enabled = false
 
+[gateway.self_improvement]
+enabled = false
+
 [gateway.thread_episodic]
 enabled = true
 indexing_enabled = true

@@ -104,6 +104,25 @@ struct ParsedSidecarMeta {
     display_name: Option<String>,
 }
 
+/// Source-neutral identity and location data used while parsing one `SKILL.md`.
+///
+/// Filesystem callers populate the override fields from `_meta.json`. Inline
+/// callers leave them empty and provide stable diagnostic labels instead of
+/// synthetic paths.
+#[derive(Debug, Clone)]
+pub struct SkillMarkdownParseContext {
+    pub skill_id: SkillId,
+    pub source_kind: SkillSourceKind,
+    pub source_root: String,
+    pub skill_dir: String,
+    pub skill_file: String,
+    pub parent_directory_name: String,
+    pub identity_owner_override: Option<String>,
+    pub identity_slug_override: Option<String>,
+    pub version_hint_override: Option<String>,
+    pub display_name_override: Option<String>,
+}
+
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
     if !normalized.starts_with("---\n") {
@@ -811,6 +830,107 @@ pub fn default_skill_conformance() -> SkillConformanceReport {
     }
 }
 
+/// Parses in-memory `SKILL.md` content through the same contract used for
+/// filesystem packages.
+pub fn parse_skill_markdown(
+    content: &str,
+    context: SkillMarkdownParseContext,
+) -> Result<SkillDefinition> {
+    let normalized = content.replace("\r\n", "\n");
+    let (frontmatter_block, body_block) = split_frontmatter(normalized.as_str());
+    let mut frontmatter = parse_frontmatter(frontmatter_block)?;
+    normalize_implicit_invocation_policy_for_source(&context.source_kind, &mut frontmatter);
+    let body = body_block.trim().to_owned();
+
+    if body.is_empty() {
+        bail!("skill `{}` has empty body", context.skill_file);
+    }
+
+    let raw_slug = context
+        .identity_slug_override
+        .as_deref()
+        .or(frontmatter.slug.as_deref())
+        .unwrap_or(context.parent_directory_name.as_str());
+    let slug = normalize_skill_slug(raw_slug);
+
+    if slug.is_empty() {
+        bail!(
+            "skill `{}` could not derive a slug from frontmatter `slug`, identity override, or the parent identity",
+            context.skill_file
+        );
+    }
+
+    let owner = context
+        .identity_owner_override
+        .as_deref()
+        .or(frontmatter.owner.as_deref())
+        .map(normalize_owner)
+        .filter(|value| !value.is_empty());
+
+    let name = frontmatter
+        .name
+        .clone()
+        .or(context.display_name_override)
+        .unwrap_or_else(|| slug.clone());
+    let display_name = name.clone();
+    let description = frontmatter
+        .description
+        .clone()
+        .unwrap_or_else(|| fallback_description(body.as_str()));
+    let runtime_tools = frontmatter.runtime_tools.clone();
+    let fingerprint = fingerprint_for_content(normalized.as_str());
+
+    let conformance = build_conformance_report(ValidationInput {
+        name: Some(name.as_str()),
+        description: Some(description.as_str()),
+        license: frontmatter.license.as_deref(),
+        compatibility: frontmatter.compatibility.as_deref(),
+        parent_directory_name: Some(context.parent_directory_name.as_str()),
+        allowed_tools_input_kind: frontmatter.allowed_tools_input_kind,
+        metadata: &frontmatter.metadata,
+        carried_issues: frontmatter.issues.as_slice(),
+    });
+
+    let mut definition = compile_skill_definition(CompileSkillInput {
+        skill_id: context.skill_id,
+        owner,
+        slug: slug.clone(),
+        name: name.clone(),
+        display_name: display_name.clone(),
+        description: description.clone(),
+        body: body.clone(),
+        source_kind: context.source_kind.clone(),
+        source_root: context.source_root,
+        skill_dir: context.skill_dir,
+        skill_file: context.skill_file,
+        version_hint: context
+            .version_hint_override
+            .or(frontmatter.version_hint.clone()),
+        fingerprint: fingerprint.clone(),
+        user_invocable: frontmatter.user_invocable,
+        disable_model_invocation: frontmatter.disable_model_invocation,
+        paths: frontmatter.paths,
+        allowed_tools: frontmatter.allowed_tools,
+        runtime_tools,
+        trust_level: SkillTrustLevel::default(),
+        dependencies: frontmatter.dependencies,
+        license: frontmatter.license.clone(),
+        compatibility: frontmatter.compatibility.clone(),
+        metadata_raw: frontmatter.metadata.clone(),
+        conformance: conformance.clone(),
+    });
+    if matches!(
+        frontmatter.implicit_invocation,
+        SkillImplicitInvocationPolicy::Required
+    ) && matches!(context.source_kind, SkillSourceKind::System)
+    {
+        definition.policy_hints.implicit_invocation = SkillImplicitInvocationPolicy::Required;
+    }
+    definition.policy_hints.catalog_hidden = frontmatter.catalog_hidden;
+
+    Ok(definition)
+}
+
 pub fn parse_skill_from_file(
     skill_id: SkillId,
     skill_file: &Path,
@@ -832,123 +952,40 @@ pub fn parse_skill_from_file(
 
     let raw = fs::read_to_string(skill_file)
         .with_context(|| format!("failed to read skill file `{}`", skill_file.display()))?;
-    let normalized = raw.replace("\r\n", "\n");
-
-    let (frontmatter_block, body_block) = split_frontmatter(normalized.as_str());
-    let mut frontmatter = parse_frontmatter(frontmatter_block)?;
-    normalize_implicit_invocation_policy_for_source(&source_kind, &mut frontmatter);
-    let body = body_block.trim().to_owned();
-
-    if body.is_empty() {
-        bail!("skill `{}` has empty body", skill_file.display());
-    }
 
     let skill_dir = skill_file
         .parent()
         .context("skill file does not have a parent directory")?;
-
     let sidecar_meta = parse_sidecar_meta(skill_dir)?;
-
     let parent_directory_name = skill_dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("skill")
         .to_owned();
 
-    let raw_slug = sidecar_meta
-        .slug
-        .as_deref()
-        .or(frontmatter.slug.as_deref())
-        .unwrap_or(parent_directory_name.as_str());
-    let slug = normalize_skill_slug(raw_slug);
-
-    if slug.is_empty() {
-        bail!(
-            "skill `{}` could not derive a slug from frontmatter `slug`, `_meta.json.slug`, or the skill directory name",
-            skill_file.display()
-        );
-    }
-
-    let owner = sidecar_meta
-        .owner
-        .as_deref()
-        .or(frontmatter.owner.as_deref())
-        .map(normalize_owner)
-        .filter(|value| !value.is_empty());
-
-    let name = frontmatter
-        .name
-        .clone()
-        .or(sidecar_meta.display_name.clone())
-        .unwrap_or_else(|| slug.clone());
-
-    let display_name = name.clone();
-
-    let description = frontmatter
-        .description
-        .clone()
-        .unwrap_or_else(|| fallback_description(body.as_str()));
-
-    let runtime_tools = frontmatter.runtime_tools.clone();
-
-    let fingerprint = fingerprint_for_content(normalized.as_str());
-
-    let conformance = build_conformance_report(ValidationInput {
-        name: Some(name.as_str()),
-        description: Some(description.as_str()),
-        license: frontmatter.license.as_deref(),
-        compatibility: frontmatter.compatibility.as_deref(),
-        parent_directory_name: Some(parent_directory_name.as_str()),
-        allowed_tools_input_kind: frontmatter.allowed_tools_input_kind,
-        metadata: &frontmatter.metadata,
-        carried_issues: frontmatter.issues.as_slice(),
-    });
-
-    let mut definition = compile_skill_definition(CompileSkillInput {
-        skill_id,
-        owner,
-        slug: slug.clone(),
-        name: name.clone(),
-        display_name: display_name.clone(),
-        description: description.clone(),
-        body: body.clone(),
-        source_kind: source_kind.clone(),
-        source_root: source_root.display().to_string(),
-        skill_dir: skill_dir.display().to_string(),
-        skill_file: skill_file.display().to_string(),
-        version_hint: sidecar_meta
-            .version_hint
-            .or(frontmatter.version_hint.clone()),
-        fingerprint: fingerprint.clone(),
-        user_invocable: frontmatter.user_invocable,
-        disable_model_invocation: frontmatter.disable_model_invocation,
-        paths: frontmatter.paths,
-        allowed_tools: frontmatter.allowed_tools,
-        runtime_tools,
-        trust_level: SkillTrustLevel::default(),
-        dependencies: frontmatter.dependencies,
-        license: frontmatter.license.clone(),
-        compatibility: frontmatter.compatibility.clone(),
-        metadata_raw: frontmatter.metadata.clone(),
-        conformance: conformance.clone(),
-    });
-    if matches!(
-        frontmatter.implicit_invocation,
-        SkillImplicitInvocationPolicy::Required
-    ) && matches!(source_kind, SkillSourceKind::System)
-    {
-        definition.policy_hints.implicit_invocation = SkillImplicitInvocationPolicy::Required;
-    }
-    definition.policy_hints.catalog_hidden = frontmatter.catalog_hidden;
-
-    Ok(definition)
+    parse_skill_markdown(
+        raw.as_str(),
+        SkillMarkdownParseContext {
+            skill_id,
+            source_kind,
+            source_root: source_root.display().to_string(),
+            skill_dir: skill_dir.display().to_string(),
+            skill_file: skill_file.display().to_string(),
+            parent_directory_name,
+            identity_owner_override: sidecar_meta.owner,
+            identity_slug_override: sidecar_meta.slug,
+            version_hint_override: sidecar_meta.version_hint,
+            display_name_override: sidecar_meta.display_name,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SkillDefinition, SkillSourceKind, normalize_skill_markdown_plain_description,
-        parse_skill_from_file as parse_skill_with_id,
+        SkillDefinition, SkillMarkdownParseContext, SkillSourceKind,
+        normalize_skill_markdown_plain_description, parse_skill_from_file as parse_skill_with_id,
+        parse_skill_markdown,
     };
     use crate::compile::SkillImplicitInvocationPolicy;
     use crate::runtime::{
@@ -989,6 +1026,55 @@ mod tests {
         fs::create_dir_all(&skill_dir).expect("create skill dir");
         fs::write(skill_dir.join("SKILL.md"), content).expect("write skill file");
         skill_dir.join("SKILL.md")
+    }
+
+    #[test]
+    fn filesystem_parser_delegates_to_source_neutral_markdown_parser() {
+        let dir = temp_case("source-neutral-delegation");
+        let content = concat!(
+            "---\n",
+            "name: delegated-skill\n",
+            "slug: delegated-skill\n",
+            "description: Shared parser behavior\n",
+            "---\n",
+            "Follow the same contract.\n"
+        );
+        let skill_file = write_skill(&dir, "delegated-skill", content);
+        let skill_id =
+            pioneer_protocol::SkillId::new("EEEEEEEEEEEEEEEEEEEEE").expect("valid test skill id");
+        let from_file = parse_skill_with_id(
+            skill_id.clone(),
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("filesystem parser");
+        let from_memory = parse_skill_markdown(
+            content,
+            SkillMarkdownParseContext {
+                skill_id,
+                source_kind: SkillSourceKind::User,
+                source_root: dir.display().to_string(),
+                skill_dir: skill_file
+                    .parent()
+                    .expect("skill parent")
+                    .display()
+                    .to_string(),
+                skill_file: skill_file.display().to_string(),
+                parent_directory_name: "delegated-skill".to_owned(),
+                identity_owner_override: None,
+                identity_slug_override: None,
+                version_hint_override: None,
+                display_name_override: None,
+            },
+        )
+        .expect("source-neutral parser");
+
+        assert_eq!(
+            serde_json::to_value(from_file).expect("serialize filesystem result"),
+            serde_json::to_value(from_memory).expect("serialize in-memory result")
+        );
     }
 
     #[test]

@@ -685,8 +685,25 @@ impl TaskAgentExecutor {
                 .as_str(),
         )
         .await?;
+        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
+            task.workspace_id.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        ) {
+            processor
+                .load_agent_skill_overlay_for_new_native_turn(
+                    task.workspace_id.as_str(),
+                    child_turn_id.as_str(),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
         if let Err(error) = processor
-            .persist_turn_runtime_snapshot(
+            .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 child_thread_id.as_str(),
                 task.workspace_id.as_str(),
                 child_turn_id.as_str(),
@@ -701,6 +718,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
                 history.as_slice(),
+                &mut agent_skill_overlay,
             )
             .await
         {
@@ -717,7 +735,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_reasoning_permission_profile_and_security_snapshot(
+            .start_turn_with_hook_context_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 child_mode,
@@ -726,6 +744,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 skill_catalog,
+                agent_skill_overlay,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -1248,8 +1267,25 @@ impl TaskAgentExecutor {
                 .as_str(),
         )
         .await?;
+        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
+            task.workspace_id.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        ) {
+            processor
+                .load_agent_skill_overlay_for_new_native_turn(
+                    task.workspace_id.as_str(),
+                    child_turn_id.as_str(),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
         if let Err(error) = processor
-            .persist_turn_runtime_snapshot(
+            .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 child_thread_id.as_str(),
                 task.workspace_id.as_str(),
                 child_turn_id.as_str(),
@@ -1264,6 +1300,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
                 history.as_slice(),
+                &mut agent_skill_overlay,
             )
             .await
         {
@@ -1292,7 +1329,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -1301,6 +1338,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 skill_catalog,
+                agent_skill_overlay,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -1685,41 +1723,33 @@ impl TaskAgentExecutor {
             .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id).await?;
-        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
-            processor,
-            task,
-            run,
-            &parent,
-            child_runtime.task_run_turn.kind,
-            child_thread_id,
-            child_turn_id,
-            thread_outcome.started_notification.thread.model.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-        )
-        .await?;
-        processor
-            .persist_turn_runtime_snapshot(
-                child_thread_id,
+        let runtime_snapshot = processor
+            .crud_store
+            .get_turn_runtime_snapshot(child_turn_id)
+            .await
+            .context("failed to load restored task turn runtime snapshot")?
+            .context("restored task turn is missing its authoritative runtime snapshot")?;
+        if runtime_snapshot.thread_id != child_thread_id
+            || runtime_snapshot.workspace_id != task.workspace_id
+            || runtime_snapshot.model != thread_outcome.started_notification.thread.model
+            || runtime_snapshot.provider_name
+                != thread_outcome.started_notification.thread.model_provider
+        {
+            bail!("restored task turn runtime identity does not match its authoritative snapshot");
+        }
+        let (hook_runtime_context, history) =
+            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                &runtime_snapshot,
+            )
+            .context("failed to restore frozen Task conversation scope")?;
+        let agent_skill_overlay =
+            crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+                processor.crud_store.as_ref(),
                 task.workspace_id.as_str(),
-                child_turn_id,
-                ThreadMode::Agent,
-                &hook_runtime_context,
-                &thread_outcome.started_notification.thread.model,
-                &thread_outcome.started_notification.thread.model_provider,
-                None,
-                &workspace_skill_policies,
-                turn_outcome.materialization.input.as_slice(),
-                turn_outcome.materialization.capabilities.as_slice(),
-                resolved_artifacts.as_slice(),
-                &runtime_environment,
-                history.as_slice(),
+                &runtime_snapshot,
             )
             .await
-            .context("failed to persist restored task turn runtime snapshot")?;
+            .context("failed to restore exact pinned Agent skills for task turn")?;
         let runtime_permission_profile = processor
             .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
             .context("failed to resolve restored task permission profile")?;
@@ -1727,7 +1757,7 @@ impl TaskAgentExecutor {
             load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
         processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
@@ -1736,6 +1766,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 skill_catalog,
+                agent_skill_overlay,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,
@@ -2518,8 +2549,25 @@ impl TaskAgentExecutor {
                 .as_str(),
         )
         .await?;
+        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
+            task.workspace_id.as_str(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+        ) {
+            processor
+                .load_agent_skill_overlay_for_new_native_turn(
+                    task.workspace_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
         if let Err(error) = processor
-            .persist_turn_runtime_snapshot(
+            .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 task_run_turn.thread_id.as_str(),
                 task.workspace_id.as_str(),
                 task_run_turn.turn_id.as_str(),
@@ -2534,6 +2582,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts.as_slice(),
                 &runtime_environment,
                 history.as_slice(),
+                &mut agent_skill_overlay,
             )
             .await
         {
@@ -2550,7 +2599,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+            .start_turn_with_hook_context_permission_profile_security_snapshot_and_agent_skill_overlay(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
                 ThreadMode::Agent,
@@ -2559,6 +2608,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 skill_catalog,
+                agent_skill_overlay,
                 turn_outcome.materialization.input,
                 turn_outcome.materialization.capabilities,
                 resolved_artifacts,

@@ -111,6 +111,7 @@ mod tests {
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             skill_catalog: empty_skill_catalog(),
+            agent_skill_overlay: Vec::new(),
             input: vec![UserInput::Text {
                 text: "retry".to_owned(),
                 text_elements: Vec::new(),
@@ -177,6 +178,7 @@ mod tests {
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             skill_catalog: empty_skill_catalog(),
+            agent_skill_overlay: Vec::new(),
             input: vec![UserInput::Text {
                 text: "continue".to_owned(),
                 text_elements: Vec::new(),
@@ -299,6 +301,7 @@ mod tests {
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             skill_catalog: empty_skill_catalog(),
+            agent_skill_overlay: Vec::new(),
             input: vec![
                 UserInput::Text {
                     text: "describe this".to_owned(),

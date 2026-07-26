@@ -6,7 +6,9 @@ use std::pin::Pin;
 
 use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db, turn_status_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
-use crate::repositories::{policy, thread, turn, turn_item_attempt, turn_liveness};
+use crate::repositories::{
+    policy, self_improvement_source_turn, thread, turn, turn_item_attempt, turn_liveness,
+};
 use crate::turn_item_terminal::{
     TurnItemTerminalState, attempt_status_from_payload, terminal_turn_item_status_from_payload,
     terminalize_turn_item_payload,
@@ -108,6 +110,14 @@ impl TurnProjector {
                 )
                 .await?;
 
+                self_improvement_source_turn::project_completed_collaborative_source_exchange(
+                    db,
+                    event.id.as_str(),
+                    created_at,
+                    payload,
+                )
+                .await?;
+
                 Ok(())
             }),
             TurnEventPayload::ItemUpdated(payload) => project_future(async move {
@@ -153,7 +163,15 @@ impl TurnProjector {
                     &payload.turn,
                     created_at,
                 )
-                .await
+                .await?;
+                self_improvement_source_turn::project_completed_source_turn(
+                    db,
+                    event.id.as_str(),
+                    created_at,
+                    payload,
+                )
+                .await?;
+                Ok(())
             }),
             TurnEventPayload::TurnFailed(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(

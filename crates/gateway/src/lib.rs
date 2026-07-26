@@ -29,6 +29,7 @@ mod permissions;
 mod prompt_hooks;
 mod resilience;
 mod secrets;
+mod self_improvement;
 mod session;
 mod settings;
 mod system_skills;
@@ -83,6 +84,7 @@ use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
 use crate::message::{MessageProcessor, MessageProcessorResilienceConfig};
 use crate::secrets::GatewaySecrets;
+use crate::self_improvement::supervisor::SelfImprovementSupervisor;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
 use crate::thread_episodic::{
@@ -523,12 +525,20 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     )
     .context("invalid Gateway CLI MCP runtime limits")?;
 
+    let self_improvement_supervisor = Arc::new(SelfImprovementSupervisor::new(
+        crud_store.clone(),
+        provider_registry.clone(),
+        workspace_manager.clone(),
+        gateway_settings.effective_self_improvement_settings(&config.gateway.self_improvement),
+        config.gateway.skills.max_skill_file_bytes,
+    ));
+
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry.clone(),
         session_manager.clone(),
-        workspace_manager,
-        crud_store,
+        workspace_manager.clone(),
+        crud_store.clone(),
         gateway_secrets.clone(),
         summary_config,
         context_budget,
@@ -561,6 +571,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     );
     message_processor = message_processor.with_voice_input_supervisor(voice_input_supervisor);
     message_processor =
+        message_processor.with_self_improvement_supervisor(self_improvement_supervisor.clone());
+    message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);
     message_processor.start_remote_access_status_notifications();
@@ -585,43 +597,53 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
     let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
-    message_processor.start_skills_watcher().await;
-    // Long-running migrations and backfills start only after the Gateway listener exists.
-    database::startup::spawn(
-        message_processor.clone(),
-        message_processor.crud_store.clone(),
-        thread_episodic_storage_root.clone(),
-        startup_thread_episodic_vector_search_config,
-        thread_episodic_workspace_vector_search_configs.clone(),
-        provider_registry.clone(),
-        runtime_home.clone(),
-        Some(message_processor.thread_episodic_vector_refill_status_sender()),
-        message_processor.thread_episodic_workspace_refill_supervisor(),
-    );
-    database::maintenance::spawn(message_processor.crud_store.clone());
-    remote_access_supervisor
-        .apply(remote_access_desired_state(
-            &remote_access_config,
-            &gateway_settings,
-            gateway_secrets.as_ref(),
-        )?)
-        .await
-        .context("failed to apply initial remote access settings")?;
+    let runtime_result: Result<()> = async {
+        self_improvement_supervisor
+            .start()
+            .await
+            .context("failed to start self-improvement supervisor")?;
+        message_processor.start_skills_watcher().await;
+        // Long-running migrations and backfills start only after the Gateway listener exists.
+        database::startup::spawn(
+            message_processor.clone(),
+            message_processor.crud_store.clone(),
+            thread_episodic_storage_root.clone(),
+            startup_thread_episodic_vector_search_config,
+            thread_episodic_workspace_vector_search_configs.clone(),
+            provider_registry.clone(),
+            runtime_home.clone(),
+            Some(message_processor.thread_episodic_vector_refill_status_sender()),
+            message_processor.thread_episodic_workspace_refill_supervisor(),
+        );
+        database::maintenance::spawn(message_processor.crud_store.clone());
+        remote_access_supervisor
+            .apply(remote_access_desired_state(
+                &remote_access_config,
+                &gateway_settings,
+                gateway_secrets.as_ref(),
+            )?)
+            .await
+            .context("failed to apply initial remote access settings")?;
 
-    info!(listen_addr = %handle.local_addr(), "gateway daemon started");
-
-    wait_for_shutdown_signal().await?;
+        info!(listen_addr = %handle.local_addr(), "gateway daemon started");
+        wait_for_shutdown_signal().await
+    }
+    .await;
 
     info!("gateway daemon stopping with telemetry snapshot");
     message_processor.shutdown_remote_access_supervisor().await;
-    handle.shutdown().await?;
+    let server_shutdown_result = handle.shutdown().await;
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
-    database
+    self_improvement_supervisor.shutdown().await;
+    let database_close_result = database
         .close()
         .await
-        .context("failed to close gateway database connection")?;
+        .context("failed to close gateway database connection");
 
+    runtime_result?;
+    server_shutdown_result?;
+    database_close_result?;
     Ok(())
 }
 

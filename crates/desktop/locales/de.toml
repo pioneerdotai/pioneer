@@ -773,6 +773,7 @@ description = "Verwalten Sie Anwendungseinstellungen."
 back = "Zurück"
 general = "Allgemein"
 memory = "Speicher"
+self_improvement = "Selbstverbesserung"
 
 [settings.option.language]
 label = "App-Sprache"
@@ -873,6 +874,29 @@ description = "Diagnosen der Speichermechanismen in lokalen Fehlerdiagnoseansich
 default = "Standard"
 select_model = "Modell auswählen"
 dialog_title = "Speichermodell auswählen"
+
+[settings.self_improvement]
+title = "Selbstverbesserung"
+description = "Erstellt und pflegt Agent-Fähigkeiten aus nützlichen Mustern abgeschlossener Arbeit."
+configuration_incomplete = "Wählen Sie ein Standardmodell aus, bevor die Selbstverbesserung ausgeführt werden kann."
+
+[settings.self_improvement.enabled]
+label = "Selbstverbesserung"
+description = "Pioneer darf wiederverwendbare Agent-Fähigkeiten aus abgeschlossenen Turns lernen."
+
+[settings.self_improvement.default_model]
+label = "Standardmodell"
+description = "Erforderliches Modell für tägliches Lernen und die Erstellung von Fähigkeiten."
+
+[settings.self_improvement.reviewer_model]
+label = "Prüfmodell"
+description = "Optionale unabhängige Prüfung. Ohne Auswahl wird das Standardmodell verwendet."
+
+[settings.self_improvement.model]
+not_selected = "Nicht ausgewählt"
+use_default = "Standardmodell verwenden"
+select_model = "Modell auswählen"
+dialog_title = "Modell für Selbstverbesserung auswählen"
 
 [settings.memory.vector_search]
 label = "Vektorsuche"

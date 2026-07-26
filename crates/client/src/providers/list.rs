@@ -610,6 +610,7 @@ pub struct ProviderModelSelectorState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderModelSelectorMode {
     Chat,
+    SelfImprovement,
     Embeddings,
     Transcription,
 }
@@ -652,6 +653,9 @@ impl ProviderModelSelectorState {
             .iter()
             .filter(|provider| match self.mode {
                 ProviderModelSelectorMode::Chat => provider.name != "local",
+                ProviderModelSelectorMode::SelfImprovement => {
+                    provider.capabilities.self_improvement
+                }
                 ProviderModelSelectorMode::Embeddings => provider.capabilities.embeddings,
                 ProviderModelSelectorMode::Transcription => {
                     provider.name == "local" && provider.capabilities.transcription
@@ -1489,6 +1493,55 @@ mod tests {
     }
 
     #[test]
+    fn self_improvement_selector_uses_gateway_eligibility_and_never_cli_runtimes() {
+        let mut state = ProviderModelSelectorState::new_with_mode(
+            None,
+            None,
+            ProviderModelSelectorMode::SelfImprovement,
+        );
+        state.mark_providers_loading();
+        assert!(state.loading_providers());
+        state.apply_provider_list_success(ProviderListResponse {
+            providers: vec![
+                ProviderSummary {
+                    name: "openai".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        self_improvement: true,
+                        ..Default::default()
+                    },
+                    api_key_configured: true,
+                    proxy_url: None,
+                },
+                ProviderSummary {
+                    name: "local".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        self_improvement: false,
+                        ..Default::default()
+                    },
+                    api_key_configured: false,
+                    proxy_url: None,
+                },
+            ],
+        });
+        state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
+            runtimes: vec![runtime_summary(
+                "codex_work",
+                "Codex Work",
+                RuntimeStatus::Ready,
+            )],
+        });
+
+        let rows = state.provider_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "openai");
+        assert!(matches!(
+            rows[0].kind,
+            ProviderModelSelectorProviderKind::ApiProvider { .. }
+        ));
+        assert!(!state.loading_providers());
+    }
+
+    #[test]
     fn provider_model_selector_embedding_mode_filters_providers_and_runtimes() {
         let mut state = ProviderModelSelectorState::new_with_mode(
             None,
@@ -1505,6 +1558,7 @@ mod tests {
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: true,
                         transcription: false,
+                        ..Default::default()
                     },
                     api_key_configured: true,
                     proxy_url: None,
@@ -1575,6 +1629,7 @@ mod tests {
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: true,
                         transcription: true,
+                        ..Default::default()
                     },
                     api_key_configured: false,
                     proxy_url: None,
@@ -1584,6 +1639,7 @@ mod tests {
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: false,
                         transcription: true,
+                        ..Default::default()
                     },
                     api_key_configured: true,
                     proxy_url: None,
@@ -1593,6 +1649,7 @@ mod tests {
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: true,
                         transcription: false,
+                        ..Default::default()
                     },
                     api_key_configured: true,
                     proxy_url: None,
@@ -1682,6 +1739,7 @@ mod tests {
                 capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                     embeddings: true,
                     transcription: false,
+                    ..Default::default()
                 },
                 api_key_configured: true,
                 proxy_url: None,
@@ -1691,6 +1749,7 @@ mod tests {
                 capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                     embeddings: true,
                     transcription: false,
+                    ..Default::default()
                 },
                 api_key_configured: false,
                 proxy_url: None,

@@ -1,4 +1,7 @@
-use super::{SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID};
+use super::{
+    SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
+    SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
+};
 use crate::app::root::{PioneerDesktop, SettingsContentView};
 use gpui::{ClickEvent, prelude::*, *};
 use gpui_component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
@@ -114,6 +117,9 @@ fn parse_settings_sidebar_node_key(value: &str) -> SettingsSidebarNodeKey {
     if value == SETTINGS_CONTENT_MEMORY_NODE_ID {
         return SettingsSidebarNodeKey::Content(SettingsContentView::Memory);
     }
+    if value == SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID {
+        return SettingsSidebarNodeKey::Content(SettingsContentView::SelfImprovement);
+    }
 
     SettingsSidebarNodeKey::Unknown
 }
@@ -122,5 +128,19 @@ fn settings_sidebar_content_label(content_view: SettingsContentView) -> String {
     match content_view {
         SettingsContentView::General => t!("settings.sidebar.general").to_string(),
         SettingsContentView::Memory => t!("settings.sidebar.memory").to_string(),
+        SettingsContentView::SelfImprovement => t!("settings.sidebar.self_improvement").to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn self_improvement_has_a_dedicated_sidebar_node() {
+        assert!(matches!(
+            parse_settings_sidebar_node_key(SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID),
+            SettingsSidebarNodeKey::Content(SettingsContentView::SelfImprovement)
+        ));
     }
 }

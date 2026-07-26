@@ -394,6 +394,7 @@ mod tests {
         GatewaySettingsSnapshot {
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
+            self_improvement: Default::default(),
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
             remote_access: Default::default(),

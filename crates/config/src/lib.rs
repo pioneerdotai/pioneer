@@ -64,6 +64,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub memory: GatewayMemoryConfig,
     #[serde(default)]
+    pub self_improvement: GatewaySelfImprovementConfig,
+    #[serde(default)]
     pub thread_episodic: GatewayThreadEpisodicConfig,
     #[serde(default)]
     pub hooks: GatewayHooksConfig,
@@ -533,6 +535,47 @@ impl Serialize for GatewayMemoryModelSelectionConfig {
             map.serialize_entry("model", model)?;
         }
         map.end()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GatewaySelfImprovementConfig {
+    pub enabled: bool,
+    pub default_model: Option<GatewaySelfImprovementModelSelectionConfig>,
+    pub reviewer_model: Option<GatewaySelfImprovementModelSelectionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewaySelfImprovementModelSelectionConfig {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewaySelfImprovementModelSelectionConfigWire {
+    provider: String,
+    model: String,
+}
+
+impl<'de> Deserialize<'de> for GatewaySelfImprovementModelSelectionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewaySelfImprovementModelSelectionConfigWire::deserialize(deserializer)?;
+        let provider = wire.provider.trim();
+        let model = wire.model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return Err(serde::de::Error::custom(
+                "self-improvement model selection requires both provider and model",
+            ));
+        }
+        Ok(Self {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
     }
 }
 
@@ -3050,8 +3093,8 @@ mod tests {
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
         GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
-        InstallManagedBy, InstallState, load_config_from_sources, load_install_state,
-        save_install_state,
+        GatewaySelfImprovementConfig, InstallManagedBy, InstallState, load_config_from_sources,
+        load_install_state, save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -4461,6 +4504,60 @@ capsules_dir = "memory/custom-capsules"
             format!("{error:#}").contains("expected thread|custom"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn gateway_self_improvement_config_is_default_off_when_absent() {
+        let config = toml::from_str::<GatewaySelfImprovementConfig>("")
+            .expect("absent self-improvement fields must use defaults");
+        assert!(!config.enabled);
+        assert!(config.default_model.is_none());
+        assert!(config.reviewer_model.is_none());
+    }
+
+    #[test]
+    fn gateway_self_improvement_config_strict_roundtrip_normalizes_models() {
+        let config = toml::from_str::<GatewaySelfImprovementConfig>(
+            r#"
+enabled = true
+
+[default_model]
+provider = " openai "
+model = " gpt-5.4 "
+
+[reviewer_model]
+provider = " anthropic "
+model = " claude-sonnet "
+"#,
+        )
+        .expect("complete selections must parse");
+
+        assert!(config.enabled);
+        let default_model = config.default_model.as_ref().expect("default model");
+        assert_eq!(default_model.provider, "openai");
+        assert_eq!(default_model.model, "gpt-5.4");
+        let reviewer_model = config.reviewer_model.as_ref().expect("reviewer model");
+        assert_eq!(reviewer_model.provider, "anthropic");
+        assert_eq!(reviewer_model.model, "claude-sonnet");
+
+        let serialized = toml::to_string(&config).expect("config must serialize");
+        let roundtrip = toml::from_str::<GatewaySelfImprovementConfig>(&serialized)
+            .expect("serialized config must parse");
+        assert_eq!(roundtrip, config);
+    }
+
+    #[test]
+    fn gateway_self_improvement_config_rejects_partial_or_unknown_models() {
+        for invalid in [
+            "[default_model]\nprovider = \"openai\"\n",
+            "[default_model]\nprovider = \"openai\"\nmodel = \"  \"\n",
+            "[default_model]\nprovider = \"openai\"\nmodel = \"gpt\"\nsource = \"thread\"\n",
+        ] {
+            assert!(
+                toml::from_str::<GatewaySelfImprovementConfig>(invalid).is_err(),
+                "invalid selection must be rejected: {invalid}"
+            );
+        }
     }
 
     #[test]

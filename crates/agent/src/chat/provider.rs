@@ -711,12 +711,7 @@ pub(super) fn provider_failure_error(
     let http_status = extract_http_status(error_message.as_str());
     let retry_after_ms = extract_retry_after_ms(lower.as_str());
     let provider_code = extract_provider_code(error_message.as_str());
-    let class = classify_provider_failure_class(
-        lower.as_str(),
-        stage,
-        http_status,
-        provider_code.as_deref(),
-    );
+    let class = classify_provider_failure_message(error_message.as_str(), stage);
     let is_recoverable_hint = !matches!(class, ProviderFailureClass::InvalidRequest);
 
     ChatTurnError::ProviderFailure {
@@ -735,6 +730,16 @@ pub(super) fn provider_failure_error(
             message: Some(error_message),
         },
     }
+}
+
+pub(crate) fn classify_provider_failure_message(
+    error_message: &str,
+    stage: ProviderFailureStage,
+) -> ProviderFailureClass {
+    let lower = error_message.to_ascii_lowercase();
+    let http_status = extract_http_status(error_message);
+    let provider_code = extract_provider_code(error_message);
+    classify_provider_failure_class(lower.as_str(), stage, http_status, provider_code.as_deref())
 }
 
 fn classify_provider_failure_class(

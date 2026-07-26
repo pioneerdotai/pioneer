@@ -300,6 +300,42 @@ pub struct SkillRuntimeDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSkillRuntimeEntry {
+    pub skill_id: SkillId,
+    pub slug: String,
+    pub version_id: String,
+    pub version_number: i64,
+    pub display_name: String,
+    pub runtime_description: String,
+    pub body: String,
+    pub fingerprint: String,
+}
+
+pub fn agent_skill_runtime_description(when_to_use: &str, when_not_to_use: &str) -> String {
+    format!("{when_to_use}. Do not use when: {when_not_to_use}.")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadSkillSource {
+    Package { asset_root: String },
+    InlineAgent { version_id: String },
+}
+
+impl ReadSkillSource {
+    pub fn is_inline_agent(&self) -> bool {
+        matches!(self, Self::InlineAgent { .. })
+    }
+
+    pub fn package_asset_root(&self) -> Option<&str> {
+        match self {
+            Self::Package { asset_root } => Some(asset_root.as_str()),
+            Self::InlineAgent { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadSkillEntry {
     pub skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,11 +344,55 @@ pub struct ReadSkillEntry {
     pub name: String,
     pub description: String,
     pub body: String,
-    #[serde(default)]
-    pub skill_asset_root: String,
+    pub source: ReadSkillSource,
     pub fingerprint: String,
     pub source_kind: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSkillOverlayError {
+    TooManyEntries {
+        limit: usize,
+        actual: usize,
+    },
+    PromptCapacityExceeded {
+        limit: usize,
+        actual: usize,
+    },
+    InvalidEntry {
+        skill_id: SkillId,
+        field: &'static str,
+    },
+    SkillIdCollision {
+        skill_id: SkillId,
+    },
+}
+
+impl std::fmt::Display for AgentSkillOverlayError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyEntries { limit, actual } => write!(
+                formatter,
+                "Agent skill overlay contains {actual} entries, exceeding the limit of {limit}"
+            ),
+            Self::PromptCapacityExceeded { limit, actual } => write!(
+                formatter,
+                "Agent skill cards require {actual} bytes, exceeding the prompt budget of {limit}"
+            ),
+            Self::InvalidEntry { skill_id, field } => {
+                write!(formatter, "Agent skill `{skill_id}` has invalid `{field}`")
+            }
+            Self::SkillIdCollision { skill_id } => {
+                write!(
+                    formatter,
+                    "Agent skill overlay collides on SkillId `{skill_id}`"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentSkillOverlayError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeToolExcludedReason {
@@ -530,7 +610,9 @@ pub fn build_skill_runtime_plan(
                 name: skill.definition.identity.display_name.clone(),
                 description: skill.definition.instructions.description.clone(),
                 body: skill.definition.instructions.body.clone(),
-                skill_asset_root: skill.definition.identity.skill_dir.clone(),
+                source: ReadSkillSource::Package {
+                    asset_root: skill.definition.identity.skill_dir.clone(),
+                },
                 fingerprint: skill.definition.identity.fingerprint.clone(),
                 source_kind: skill
                     .definition
@@ -685,12 +767,95 @@ pub fn build_skill_runtime_plan(
     }
 }
 
+pub fn merge_agent_skill_overlay(
+    runtime_plan: &mut SkillRuntimePlan,
+    entries: &[AgentSkillRuntimeEntry],
+    max_active_agent_skills: usize,
+) -> Result<(), AgentSkillOverlayError> {
+    validate_agent_skill_runtime_entries(entries, max_active_agent_skills)?;
+
+    let mut additions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let machine_ref = format!("skill:{}", entry.skill_id);
+        if runtime_plan
+            .read_skill_index
+            .contains_key(machine_ref.as_str())
+        {
+            return Err(AgentSkillOverlayError::SkillIdCollision {
+                skill_id: entry.skill_id.clone(),
+            });
+        }
+        additions.push((
+            machine_ref,
+            ReadSkillEntry {
+                skill_id: entry.skill_id.clone(),
+                owner: None,
+                slug: entry.slug.clone(),
+                name: entry.display_name.clone(),
+                description: entry.runtime_description.clone(),
+                body: entry.body.clone(),
+                source: ReadSkillSource::InlineAgent {
+                    version_id: entry.version_id.clone(),
+                },
+                fingerprint: entry.fingerprint.clone(),
+                source_kind: "agent".to_owned(),
+            },
+        ));
+    }
+    runtime_plan.read_skill_index.extend(additions);
+    Ok(())
+}
+
+pub(crate) fn validate_agent_skill_runtime_entries(
+    entries: &[AgentSkillRuntimeEntry],
+    max_active_agent_skills: usize,
+) -> Result<(), AgentSkillOverlayError> {
+    let limit = max_active_agent_skills.max(1);
+    if entries.len() > limit {
+        return Err(AgentSkillOverlayError::TooManyEntries {
+            limit,
+            actual: entries.len(),
+        });
+    }
+    let mut ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        for (field, value) in [
+            ("slug", entry.slug.as_str()),
+            ("version_id", entry.version_id.as_str()),
+            ("display_name", entry.display_name.as_str()),
+            ("runtime_description", entry.runtime_description.as_str()),
+            ("body", entry.body.as_str()),
+            ("fingerprint", entry.fingerprint.as_str()),
+        ] {
+            if value.trim().is_empty() || value != value.trim() {
+                return Err(AgentSkillOverlayError::InvalidEntry {
+                    skill_id: entry.skill_id.clone(),
+                    field,
+                });
+            }
+        }
+        if entry.version_number < 1 {
+            return Err(AgentSkillOverlayError::InvalidEntry {
+                skill_id: entry.skill_id.clone(),
+                field: "version_number",
+            });
+        }
+        if !ids.insert(entry.skill_id.clone()) {
+            return Err(AgentSkillOverlayError::SkillIdCollision {
+                skill_id: entry.skill_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeExecutionClassHint, RuntimeExecutionRecheckPolicy, RuntimeToolExcludedReason,
-        SkillRuntimeBudget, SkillRuntimeToolDefinition, SkillRuntimeToolKind,
-        build_skill_runtime_plan, recheck_runtime_tool_execution,
+        AgentSkillOverlayError, AgentSkillRuntimeEntry, ReadSkillSource, RuntimeExecutionClassHint,
+        RuntimeExecutionRecheckPolicy, RuntimeToolExcludedReason, SkillRuntimeBudget,
+        SkillRuntimePlan, SkillRuntimeToolDefinition, SkillRuntimeToolKind,
+        build_skill_runtime_plan, merge_agent_skill_overlay, recheck_runtime_tool_execution,
     };
     use crate::compile::{CompileSkillInput, SkillDefinition, compile_skill_definition};
     use crate::contract::{
@@ -705,6 +870,7 @@ mod tests {
     };
     use pioneer_protocol::SkillId;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn skill_with_runtime_tools(
         slug: &str,
@@ -1009,12 +1175,16 @@ mod tests {
         );
 
         assert_eq!(
-            plan.read_skill_index[&format!("skill:{}", active[0].skill_id)].skill_asset_root,
-            "/tmp/system/browser"
+            plan.read_skill_index[&format!("skill:{}", active[0].skill_id)]
+                .source
+                .package_asset_root(),
+            Some("/tmp/system/browser")
         );
         assert_eq!(
-            plan.read_skill_index[&format!("skill:{}", active[1].skill_id)].skill_asset_root,
-            "/tmp/user/browser"
+            plan.read_skill_index[&format!("skill:{}", active[1].skill_id)]
+                .source
+                .package_asset_root(),
+            Some("/tmp/user/browser")
         );
     }
 
@@ -1232,5 +1402,79 @@ mod tests {
             Some("runtime.dependency_missing")
         );
         assert!(!check.dependency_diagnostics.is_empty());
+    }
+
+    fn agent_entry(skill_id: &str, version_id: &str) -> AgentSkillRuntimeEntry {
+        AgentSkillRuntimeEntry {
+            skill_id: SkillId::new(skill_id).expect("valid Agent skill ID"),
+            slug: "stable-procedure".to_owned(),
+            version_id: version_id.to_owned(),
+            version_number: 1,
+            display_name: "Stable procedure".to_owned(),
+            runtime_description: "Use for a stable procedure. Do not use when: it does not apply."
+                .to_owned(),
+            body: "Exact inline instructions.".to_owned(),
+            fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn agent_overlay_checked_merge_adds_exact_inline_read_entry() {
+        let mut plan = SkillRuntimePlan {
+            tools: Vec::new(),
+            read_skill_index: HashMap::new(),
+            excluded_tools: Vec::new(),
+        };
+        let entry = agent_entry("AAAAAAAAAAAAAAAAAAAAA", "111111111111111111111");
+
+        merge_agent_skill_overlay(&mut plan, std::slice::from_ref(&entry), 16)
+            .expect("valid overlay must merge");
+
+        let read = plan
+            .read_skill_index
+            .get("skill:AAAAAAAAAAAAAAAAAAAAA")
+            .expect("inline read entry must exist");
+        assert_eq!(read.body, "Exact inline instructions.");
+        assert_eq!(read.source_kind, "agent");
+        assert_eq!(
+            read.source,
+            ReadSkillSource::InlineAgent {
+                version_id: "111111111111111111111".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_overlay_collision_never_overwrites_existing_read_entry() {
+        let entry = agent_entry("AAAAAAAAAAAAAAAAAAAAA", "111111111111111111111");
+        let mut plan = SkillRuntimePlan {
+            tools: Vec::new(),
+            read_skill_index: HashMap::from([(
+                "skill:AAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                super::ReadSkillEntry {
+                    skill_id: entry.skill_id.clone(),
+                    owner: Some("workspace".to_owned()),
+                    slug: "ordinary".to_owned(),
+                    name: "Ordinary".to_owned(),
+                    description: "Ordinary skill".to_owned(),
+                    body: "Ordinary body".to_owned(),
+                    source: ReadSkillSource::Package {
+                        asset_root: "/tmp/ordinary".to_owned(),
+                    },
+                    fingerprint: "ordinary".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+            )]),
+            excluded_tools: Vec::new(),
+        };
+
+        assert!(matches!(
+            merge_agent_skill_overlay(&mut plan, &[entry], 16),
+            Err(AgentSkillOverlayError::SkillIdCollision { .. })
+        ));
+        assert_eq!(
+            plan.read_skill_index["skill:AAAAAAAAAAAAAAAAAAAAA"].body,
+            "Ordinary body"
+        );
     }
 }

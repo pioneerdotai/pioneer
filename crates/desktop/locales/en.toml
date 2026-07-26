@@ -1065,6 +1065,7 @@ description = "Manage application preferences."
 back = "Back"
 general = "General"
 memory = "Memory"
+self_improvement = "Self-improvement"
 
 [settings.option.language]
 label = "App language"
@@ -1165,6 +1166,29 @@ description = "Show memory hook diagnostics in local debug surfaces."
 default = "Default"
 select_model = "Select model"
 dialog_title = "Select Memory Model"
+
+[settings.self_improvement]
+title = "Self-improvement"
+description = "Create and maintain Agent skills from useful patterns in completed work."
+configuration_incomplete = "Select a default model before Self-improvement can run."
+
+[settings.self_improvement.enabled]
+label = "Self-improvement"
+description = "Allow Pioneer to learn reusable Agent skills from completed turns."
+
+[settings.self_improvement.default_model]
+label = "Default model"
+description = "Required model for daily learning and skill creation."
+
+[settings.self_improvement.reviewer_model]
+label = "Reviewer model"
+description = "Optional independent reviewer. Uses the default model when not selected."
+
+[settings.self_improvement.model]
+not_selected = "Not selected"
+use_default = "Use default model"
+select_model = "Select model"
+dialog_title = "Select Self-improvement Model"
 
 [settings.memory.vector_search]
 label = "Vector search"

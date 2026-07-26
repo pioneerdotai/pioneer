@@ -419,6 +419,7 @@ pub struct MessageProcessor {
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
+    self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
@@ -729,6 +730,7 @@ impl MessageProcessor {
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_input_supervisor: None,
+            self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
@@ -752,6 +754,14 @@ impl MessageProcessor {
         supervisor: Arc<VoiceInputSupervisor>,
     ) -> Self {
         self.voice_input_supervisor = Some(supervisor);
+        self
+    }
+
+    pub(crate) fn with_self_improvement_supervisor(
+        mut self,
+        supervisor: Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>,
+    ) -> Self {
+        self.self_improvement_supervisor = Some(supervisor);
         self
     }
 
@@ -2013,6 +2023,7 @@ impl MessageProcessor {
         resolved_artifacts: &[ResolvedArtifactInput],
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
+        agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     ) -> anyhow::Result<()> {
         let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,
@@ -2029,12 +2040,132 @@ impl MessageProcessor {
             resolved_artifacts,
             runtime_environment,
             history,
+            agent_skill_overlay,
         )?;
         self.crud_store
             .upsert_turn_runtime_snapshot(snapshot)
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_turn_runtime_snapshot_with_optional_agent_overlay(
+        &self,
+        thread_id: &str,
+        workspace_id: &str,
+        turn_id: &str,
+        mode: pioneer_protocol::ThreadMode,
+        hook_runtime_context: &pioneer_agent::AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        reasoning_effort: Option<&str>,
+        workspace_skill_policies: &HashMap<
+            pioneer_skills::SkillPolicyKey,
+            pioneer_agent::WorkspaceSkillPolicy,
+        >,
+        input: &[pioneer_protocol::UserInput],
+        capabilities: &[pioneer_protocol::TurnCapability],
+        resolved_artifacts: &[ResolvedArtifactInput],
+        runtime_environment: &HashMap<String, String>,
+        history: &[ChatMessage],
+        agent_skill_overlay: &mut Vec<pioneer_skills::AgentSkillRuntimeEntry>,
+    ) -> anyhow::Result<()> {
+        match self
+            .persist_turn_runtime_snapshot(
+                thread_id,
+                workspace_id,
+                turn_id,
+                mode,
+                hook_runtime_context,
+                model,
+                provider_name,
+                reasoning_effort,
+                workspace_skill_policies,
+                input,
+                capabilities,
+                resolved_artifacts,
+                runtime_environment,
+                history,
+                agent_skill_overlay.as_slice(),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if !agent_skill_overlay.is_empty() => {
+                warn!(
+                    workspace_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist Agent skill pins; retrying authoritative base-only snapshot"
+                );
+                agent_skill_overlay.clear();
+                self.persist_turn_runtime_snapshot(
+                    thread_id,
+                    workspace_id,
+                    turn_id,
+                    mode,
+                    hook_runtime_context,
+                    model,
+                    provider_name,
+                    reasoning_effort,
+                    workspace_skill_policies,
+                    input,
+                    capabilities,
+                    resolved_artifacts,
+                    runtime_environment,
+                    history,
+                    &[],
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn native_api_provider_supports_agent_skill_overlay(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> bool {
+        match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_name)
+        {
+            Ok(provider) => provider.capabilities().tool_calling,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    provider = provider_name,
+                    error = %format!("{error:#}"),
+                    "failed to resolve native provider capabilities; Agent skill overlay disabled"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) async fn load_agent_skill_overlay_for_new_native_turn(
+        &self,
+        workspace_id: &str,
+        turn_id: &str,
+    ) -> Vec<pioneer_skills::AgentSkillRuntimeEntry> {
+        let Some(supervisor) = self.self_improvement_supervisor.as_ref() else {
+            return Vec::new();
+        };
+        let overlay = supervisor.load_overlay_for_new_turn(workspace_id).await;
+        match overlay {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to materialize Agent skill overlay; continuing without it"
+                );
+                Vec::new()
+            }
+        }
     }
 
     async fn user_message_payload_from_input_resolved(
@@ -2485,6 +2616,7 @@ impl MessageProcessor {
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_input_supervisor: None,
+            self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),

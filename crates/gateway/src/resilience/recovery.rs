@@ -2225,6 +2225,26 @@ impl RecoveryCoordinator {
             ));
         }
 
+        let agent_skill_overlay =
+            match crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+                self.crud_store.as_ref(),
+                workspace_id.as_str(),
+                &snapshot,
+            )
+            .await
+            {
+                Ok(overlay) => overlay,
+                Err(error) => {
+                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                            error: format!(
+                                "failed to restore exact pinned Agent skill versions: {error:#}"
+                            ),
+                        },
+                    ));
+                }
+            };
+
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
                 &snapshot,
@@ -2248,6 +2268,7 @@ impl RecoveryCoordinator {
                         ));
                     }
                 },
+                agent_skill_overlay,
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -2809,7 +2830,7 @@ fn policy_action_name(action: RecoveryAction) -> &'static str {
     }
 }
 
-fn provider_failure_class_name(class: ProviderFailureClass) -> &'static str {
+pub(crate) fn provider_failure_class_name(class: ProviderFailureClass) -> &'static str {
     match class {
         ProviderFailureClass::NetworkTransient => "network_transient",
         ProviderFailureClass::RateLimit => "rate_limit",
@@ -2945,6 +2966,7 @@ mod tests {
         RecoveryJobRecord, SkillInstallationRecord, SkillPackInstallationRecord, TimeoutCandidate,
         TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
     };
+    use pioneer_entity::workspace;
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
         ItemCompletedNotification, ItemStartedNotification, ProviderFailureClass,
@@ -2967,7 +2989,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::Database;
+    use sea_orm::{ActiveModelTrait, Database, Set};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3385,6 +3407,7 @@ mod tests {
             resolved_artifacts.as_slice(),
             &runtime_environment,
             history.as_slice(),
+            &[],
         )
         .expect("runtime snapshot should serialize");
         crud_store
@@ -3870,6 +3893,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
+                agent_skill_versions_json: None,
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
                 input_json: "[]".to_owned(),
@@ -4839,6 +4863,16 @@ mod tests {
     async fn backfill_does_not_enqueue_recovery_for_terminal_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let timestamp = 1_700_000_000;
+        workspace::ActiveModel {
+            id: Set("ws_terminal_backfill".to_owned()),
+            name: Set("Terminal backfill".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            ..Default::default()
+        }
+        .insert(&crud_store.database_connection())
+        .await
+        .expect("workspace should persist");
         let thread = Thread {
             workspace_id: "ws_terminal_backfill".to_owned(),
             id: "thr_terminal_backfill".to_owned(),

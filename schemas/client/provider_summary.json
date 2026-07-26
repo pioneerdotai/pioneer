@@ -11,6 +11,7 @@
       "$ref": "#/$defs/ProviderSummaryCapabilities",
       "default": {
         "embeddings": false,
+        "self_improvement": false,
         "transcription": false
       }
     },
@@ -32,6 +33,11 @@
       "type": "object",
       "properties": {
         "embeddings": {
+          "type": "boolean",
+          "default": false
+        },
+        "self_improvement": {
+          "description": "Gateway-authoritative eligibility for the API-only self-improvement\nmodel selectors.",
           "type": "boolean",
           "default": false
         },

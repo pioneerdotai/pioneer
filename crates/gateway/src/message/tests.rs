@@ -135,7 +135,7 @@ use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderCapabilities, ProviderInputCapabilities,
     ProviderToolCall, StreamChunk,
 };
-use pioneer_skills::SkillTrustLevel;
+use pioneer_skills::{AgentSkillRuntimeEntry, SkillTrustLevel};
 use pioneer_tools::{
     BuiltinTools, ComputerUseToolsConfig, RawToolCall, ToolError, ToolLoopBudgetConfig,
     ToolRetryBudgetConfig, WebToolsConfig, build_tools_with_environment_and_security_snapshot,
@@ -148,7 +148,7 @@ use sea_orm::{
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -488,14 +488,23 @@ struct CliRuntimeSecurityHarness {
     rx: mpsc::Receiver<Message>,
     connection_id: ConnectionId,
     thread_manager: Arc<ThreadManager>,
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
     crud_store: Arc<CrudStore>,
     workspace_id: String,
     cli_session: Arc<RecordingCliRuntimeSession>,
-    processor: MessageProcessor,
+    cli_manager: Arc<CLIAgentRuntimeManager>,
+    self_improvement_supervisor:
+        Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>,
+    processor: Arc<MessageProcessor>,
 }
 
 async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
-    let (tx, rx) = mpsc::channel(16);
+    // Security tests normally consume each response immediately, while the
+    // self-improvement vertical E2E intentionally leaves several real
+    // Composer children running at once. Keep the test transport bounded but
+    // large enough that durable lifecycle notifications cannot deadlock the
+    // producer before the next response drain.
+    let (tx, rx) = mpsc::channel(512);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -504,27 +513,45 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let provider_registry = test_provider();
+    let self_improvement_supervisor = Arc::new(
+        crate::self_improvement::supervisor::SelfImprovementSupervisor::new(
+            crud_store.clone(),
+            provider_registry.clone(),
+            workspace_manager.clone(),
+            pioneer_config::GatewaySelfImprovementConfig::default(),
+            1024 * 1024,
+        ),
+    );
+    let runtime_home = unique_temp_dir("cli_runtime_security");
+    std::fs::create_dir_all(&runtime_home).expect("CLI runtime test home must exist");
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager.clone(),
-        test_provider(),
+        provider_registry.clone(),
         session_manager,
-        workspace_manager,
+        workspace_manager.clone(),
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    .with_cli_runtime_manager_for_tests(cli_manager.clone())
+    .with_runtime_home_for_tests(runtime_home)
+    .with_self_improvement_supervisor(self_improvement_supervisor.clone());
 
     CliRuntimeSecurityHarness {
         rx,
         connection_id,
         thread_manager,
+        provider_registry,
         crud_store,
         workspace_id,
         cli_session,
-        processor,
+        cli_manager,
+        self_improvement_supervisor,
+        processor: Arc::new(processor),
     }
 }
 
@@ -2059,6 +2086,45 @@ async fn seed_cli_runtime_security_thread(
         .expect("thread/start should seed CLI runtime security regression thread");
 }
 
+async fn seed_vertical_self_improvement_thread(
+    harness: &mut CliRuntimeSecurityHarness,
+    thread_id: &str,
+    name: &str,
+    model: &str,
+    model_provider: &str,
+    origin_kind: ThreadOriginKind,
+) {
+    let request_id = generate_test_request_id("verticalthread", thread_id);
+    harness
+        .processor
+        .process_request(
+            harness.connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id.clone(),
+                "method": "thread/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "workspace_id": harness.workspace_id.as_str(),
+                    "name": name,
+                    "model": model,
+                    "model_provider": model_provider,
+                    "sandbox": SandboxMode::FullAccess,
+                    "mode": "Agent",
+                    "origin_kind": origin_kind,
+                    "sidebar_visibility": "visible"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let started: ThreadStartResponse =
+        serde_json::from_value(response.result).expect("vertical thread/start must decode");
+    assert_eq!(started.thread.id, thread_id);
+    assert_eq!(started.thread.origin_kind, origin_kind);
+}
+
 fn cli_runtime_execution_backend(runtime_id: &str, runtime_kind: CLIAgentRuntimeKind) -> JsonValue {
     serde_json::to_value(AgentExecutionBackend::CLIAgentRuntime {
         runtime_id: runtime_id.to_owned(),
@@ -2310,6 +2376,30 @@ struct SequencedToolProvider {
     first_tool_calls: Vec<ProviderToolCall>,
     second_text: String,
     next_index: AtomicUsize,
+}
+
+struct VerticalSelfImprovementProvider {
+    responses: std::sync::Mutex<VecDeque<String>>,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+}
+
+struct VerticalCollaborativeSourceProvider {
+    results: Vec<String>,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    next_round: AtomicUsize,
+    release_result: Notify,
+}
+
+struct VerticalUnfinishedSiblingProvider {
+    child_main_calls: AtomicUsize,
+    child_main_started: Notify,
+}
+
+struct VerticalReadSkillProvider {
+    skill_id: pioneer_protocol::SkillId,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    next_round: AtomicUsize,
+    release_result: Notify,
 }
 
 #[derive(Clone, Copy)]
@@ -3649,6 +3739,216 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
     );
 }
 
+#[tokio::test]
+async fn self_improvement_settings_response_waits_for_durable_live_transition() {
+    let runtime_home = unique_temp_dir("self_improvement_live_settings");
+    std::fs::create_dir_all(&runtime_home).expect("runtime home");
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "learning",
+        Arc::new(EchoProvider::new()),
+    ));
+    let supervisor = Arc::new(
+        crate::self_improvement::supervisor::SelfImprovementSupervisor::new(
+            crud_store.clone(),
+            provider_registry.clone(),
+            workspace_manager.clone(),
+            pioneer_config::GatewaySelfImprovementConfig::default(),
+            1024 * 1024,
+        ),
+    );
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "learning")),
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_self_improvement_supervisor(supervisor);
+
+    let enable_id = generate_test_request_id("settings", "enable_self_improvement");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": enable_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "self_improvement": {
+                            "enabled": true,
+                            "default_model": {
+                                "provider": " learning ",
+                                "model": " learner-model "
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let enable_response = recv_response_by_id(&mut rx, enable_id.as_str()).await;
+    let enabled: pioneer_protocol::GatewaySettingsUpdateResponse =
+        serde_json::from_value(enable_response.result).expect("enabled settings response");
+    assert!(enabled.settings.self_improvement.enabled);
+    assert_eq!(
+        enabled
+            .settings
+            .self_improvement
+            .default_model
+            .as_ref()
+            .map(|selection| (selection.provider.as_str(), selection.model.as_str())),
+        Some(("learning", "learner-model"))
+    );
+    let active = crud_store
+        .get_self_improvement_workspace_state(workspace_id.as_str())
+        .await
+        .expect("active state query")
+        .expect("active state must exist before response");
+    assert_eq!(active.activation_epoch, 1);
+    assert!(active.effective_enabled_at_unix.is_some());
+
+    let disable_id = generate_test_request_id("settings", "disable_self_improvement");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": disable_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "self_improvement": {
+                            "enabled": false
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let disable_response = recv_response_by_id(&mut rx, disable_id.as_str()).await;
+    let disabled: pioneer_protocol::GatewaySettingsUpdateResponse =
+        serde_json::from_value(disable_response.result).expect("disabled settings response");
+    assert!(!disabled.settings.self_improvement.enabled);
+    assert_eq!(
+        disabled
+            .settings
+            .self_improvement
+            .default_model
+            .as_ref()
+            .map(|selection| (selection.provider.as_str(), selection.model.as_str())),
+        Some(("learning", "learner-model")),
+        "disclosure collapse must retain the saved model"
+    );
+    let inactive = crud_store
+        .get_self_improvement_workspace_state(workspace_id.as_str())
+        .await
+        .expect("inactive state query")
+        .expect("inactive state must exist before response");
+    assert_eq!(inactive.activation_epoch, 1);
+    assert!(inactive.effective_enabled_at_unix.is_none());
+
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
+#[tokio::test]
+async fn self_improvement_settings_fail_closed_without_runtime_supervisor() {
+    let runtime_home = unique_temp_dir("self_improvement_missing_supervisor");
+    std::fs::create_dir_all(&runtime_home).expect("runtime home");
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id))
+        .await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "learning",
+        Arc::new(EchoProvider::new()),
+    ));
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "learning")),
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone());
+
+    let update_id = generate_test_request_id("settings", "missing_self_improvement_owner");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": update_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "self_improvement": {
+                            "enabled": true,
+                            "default_model": {
+                                "provider": "learning",
+                                "model": "learner-model"
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let error = recv_error_by_id(&mut rx, update_id.as_str()).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("without the runtime supervisor")
+    );
+
+    let get_id = generate_test_request_id("settings", "missing_owner_snapshot");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": get_id.clone(),
+                "method": "settings/get",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, get_id.as_str()).await;
+    let snapshot: pioneer_protocol::GatewaySettingsGetResponse =
+        serde_json::from_value(response.result).expect("default settings response");
+    assert_eq!(
+        snapshot.settings.self_improvement,
+        pioneer_protocol::GatewaySelfImprovementSettings::default(),
+        "a missing runtime owner must reject the update before persistence"
+    );
+
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
 async fn assert_memory_hook_subscription(
     processor: &MessageProcessor,
     subscription_id: &str,
@@ -3688,6 +3988,326 @@ impl SequencedToolProvider {
             .lock()
             .expect("sequenced tool provider lock poisoned")
             .clone()
+    }
+}
+
+impl VerticalSelfImprovementProvider {
+    fn new() -> Self {
+        Self {
+            responses: std::sync::Mutex::new(VecDeque::new()),
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_responses(&self, responses: impl IntoIterator<Item = String>) {
+        *self
+            .responses
+            .lock()
+            .expect("vertical learner response lock poisoned") = responses.into_iter().collect();
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("vertical learner request lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for VerticalSelfImprovementProvider {
+    fn name(&self) -> &str {
+        "learning"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.requests
+            .lock()
+            .expect("vertical learner request lock poisoned")
+            .push(request);
+        let text = self
+            .responses
+            .lock()
+            .expect("vertical learner response lock poisoned")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("vertical learner response script exhausted"))?;
+        Ok(ChatResponse {
+            text,
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        anyhow::bail!("self-improvement contracts must use non-streaming provider calls")
+    }
+}
+
+impl VerticalCollaborativeSourceProvider {
+    fn new<I, S>(results: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            results: results.into_iter().map(Into::into).collect(),
+            requests: std::sync::Mutex::new(Vec::new()),
+            next_round: AtomicUsize::new(0),
+            release_result: Notify::new(),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("vertical Collaborative source request lock poisoned")
+            .clone()
+    }
+
+    fn release_next_result(&self) {
+        self.release_result.notify_one();
+    }
+}
+
+impl VerticalUnfinishedSiblingProvider {
+    fn new() -> Self {
+        Self {
+            child_main_calls: AtomicUsize::new(0),
+            child_main_started: Notify::new(),
+        }
+    }
+
+    async fn wait_for_child_main(&self) {
+        loop {
+            if self.child_main_calls.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            self.child_main_started.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for VerticalUnfinishedSiblingProvider {
+    fn name(&self) -> &str {
+        "vertical-unfinished-sibling"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
+        if request.compiled_prompt.is_some()
+            && request.messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("UNFINISHED_SIBLING_MUST_NOT_ENTER_SELF_IMPROVEMENT_HISTORY")
+            })
+        {
+            self.child_main_calls.fetch_add(1, Ordering::SeqCst);
+            self.child_main_started.notify_one();
+            return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
+        }
+        Ok(text_response("unexpected vertical sibling request"))
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for VerticalCollaborativeSourceProvider {
+    fn name(&self) -> &str {
+        "source"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
+        self.requests
+            .lock()
+            .expect("vertical Collaborative source request lock poisoned")
+            .push(request);
+        let round = self.next_round.fetch_add(1, Ordering::SeqCst);
+        if round % 2 == 0 {
+            return Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("vertical_source_tool_{}", round / 2),
+                    name: "request_tools".to_owned(),
+                    arguments: json!({
+                        "domains": ["memory"],
+                        "reason": "Record a harmless tool result in the causal source exchange."
+                    })
+                    .to_string(),
+                }],
+            });
+        }
+        let result_index = round / 2;
+        self.release_result.notified().await;
+        let result = self
+            .results
+            .get(result_index)
+            .ok_or_else(|| anyhow::anyhow!("vertical source response script exhausted"))?;
+        Ok(ChatResponse {
+            text: format!(
+                "<task_result>{}</task_result>",
+                json!({
+                    "summary": result,
+                    "data": {"rawText": result},
+                    "artifacts": []
+                })
+            ),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk()));
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+impl VerticalReadSkillProvider {
+    fn new(skill_id: pioneer_protocol::SkillId) -> Self {
+        Self {
+            skill_id,
+            requests: std::sync::Mutex::new(Vec::new()),
+            next_round: AtomicUsize::new(0),
+            release_result: Notify::new(),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("vertical native request lock poisoned")
+            .clone()
+    }
+
+    fn release_result(&self) {
+        self.release_result.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for VerticalReadSkillProvider {
+    fn name(&self) -> &str {
+        "native"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
+        self.requests
+            .lock()
+            .expect("vertical native request lock poisoned")
+            .push(request);
+        if self.next_round.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![ProviderToolCall {
+                    id: "vertical_read_agent_skill".to_owned(),
+                    name: "read_skill".to_owned(),
+                    arguments: json!({
+                        "skill_id": format!("skill:{}", self.skill_id)
+                    })
+                    .to_string(),
+                }],
+            });
+        }
+        self.release_result.notified().await;
+        Ok(ChatResponse {
+            text: "The learned procedure was read.".to_owned(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk()));
+        Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
 
@@ -4296,6 +4916,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let mut settings_snapshot = pioneer_protocol::GatewaySettingsSnapshot {
         general: Default::default(),
         memory: Default::default(),
+        self_improvement: Default::default(),
         thread_episodic: Default::default(),
         cli_runtimes: Default::default(),
         remote_access: Default::default(),
@@ -4388,8 +5009,16 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .find(|provider| provider.name == "local")
         .expect("provider/list should include the built-in local provider");
     assert!(local_provider.capabilities.transcription);
+    assert!(!local_provider.capabilities.self_improvement);
     assert!(!local_provider.api_key_configured);
     assert!(local_provider.proxy_url.is_none());
+    assert!(
+        list_payload
+            .providers
+            .iter()
+            .filter(|provider| provider.name != "local")
+            .all(|provider| provider.capabilities.self_improvement)
+    );
 
     let embedding_models_request_id =
         pioneer_protocol::RequestId::new("provider-embed-models").expect("request id");
@@ -4439,6 +5068,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     assert_eq!(other_local_provider.name, "local");
     assert!(other_local_provider.capabilities.embeddings);
     assert!(other_local_provider.capabilities.transcription);
+    assert!(!other_local_provider.capabilities.self_improvement);
     assert!(!other_local_provider.api_key_configured);
     assert!(other_local_provider.proxy_url.is_none());
 
@@ -6743,6 +7373,90 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 
     let task_a_id = task_a.id.clone();
     let task_b_id = task_b.id.clone();
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            task_b_id.as_str(),
+            TaskStatus::Completed
+        )
+        .await,
+        TaskStatus::Completed,
+        "Task B must complete while the earlier Task A remains blocked"
+    );
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 10)
+        .await
+        .expect("Task B result should deliver before Task A completes");
+    let task_b_deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(task_b_id.clone()),
+            run_id: Some(task_b_run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("Task B deliveries should load");
+    assert_eq!(
+        task_b_deliveries.deliveries.len(),
+        1,
+        "Task B must have one exact owner-thread delivery: {task_b_deliveries:#?}"
+    );
+    assert_eq!(
+        task_b_deliveries.deliveries[0].status,
+        TaskDeliveryStatus::Delivered,
+        "Task B owner-thread delivery must commit before it becomes a source: {task_b_deliveries:#?}"
+    );
+    assert_eq!(
+        task_b_deliveries.deliveries[0].delivered_turn_id.as_deref(),
+        Some(task_b_run.id.as_str()),
+        "Task B delivery must remain on its exact detached occurrence turn"
+    );
+    let first_delivery_sources = crud_store
+        .list_self_improvement_source_turns_after(&workspace_id, 0, 0, 10)
+        .await
+        .expect("first out-of-order source range should load");
+    assert_eq!(first_delivery_sources.len(), 1);
+    assert_eq!(
+        first_delivery_sources[0].turn_id, "turn_concurrent_task_b",
+        "only the causally closed Task B exchange may become a source"
+    );
+    let first_delivery_range = pioneer_crud::SelfImprovementFrozenSourceRange::new(
+        workspace_id.clone(),
+        0,
+        first_delivery_sources[0].id,
+        first_delivery_sources.clone(),
+    )
+    .expect("Task B-only source range should freeze");
+    let first_delivery_history = crud_store
+        .list_canonical_turn_events_for_self_improvement(&first_delivery_range)
+        .await
+        .expect("Task B-only canonical history should load");
+    assert!(
+        first_delivery_history
+            .iter()
+            .any(|event| event.turn_id == "turn_concurrent_task_b")
+    );
+    assert!(first_delivery_history.iter().any(|event| {
+        event.turn_id == task_b_run.id
+            && matches!(
+                &event.payload,
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification)
+                    if notification.item.item_id()
+                        == pioneer_protocol::task_delivery_result_item_id(
+                            task_b_deliveries.deliveries[0].id.as_str()
+                        )
+            )
+    }));
+    assert!(
+        first_delivery_history
+            .iter()
+            .all(|event| event.turn_id != "turn_concurrent_task_a"),
+        "unfinished Task A must be excluded as a whole from Task B's frozen range"
+    );
+
     provider.release_first.notify_one();
     assert_eq!(
         wait_for_task_status(
@@ -6753,19 +7467,53 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
         .await,
         TaskStatus::Completed
     );
-    assert_eq!(
-        wait_for_task_status(
-            crud_store.clone(),
-            task_b_id.as_str(),
-            TaskStatus::Completed
-        )
-        .await,
-        TaskStatus::Completed
-    );
     processor
-        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 10)
         .await
-        .expect("completed Task results should deliver to the parent");
+        .expect("the later Task A result should deliver to the parent");
+    let all_sources = crud_store
+        .list_self_improvement_source_turns_after(&workspace_id, 0, 0, 10)
+        .await
+        .expect("all out-of-order sources should load");
+    assert_eq!(
+        all_sources
+            .iter()
+            .map(|source| source.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn_concurrent_task_b", "turn_concurrent_task_a"],
+        "source ledger order must reflect durable delivery order"
+    );
+    let full_range = pioneer_crud::SelfImprovementFrozenSourceRange::new(
+        workspace_id.clone(),
+        0,
+        all_sources.last().expect("two sources must exist").id,
+        all_sources,
+    )
+    .expect("full out-of-order source range should freeze");
+    assert_eq!(
+        full_range.thread_terminal_boundaries[0].turn_id, "turn_concurrent_task_b",
+        "thread boundary must follow parent-turn order, not out-of-order delivery order"
+    );
+    let full_history = crud_store
+        .list_canonical_turn_events_for_self_improvement(&full_range)
+        .await
+        .expect("full out-of-order canonical history should load");
+    let parent_start_turns = full_history
+        .iter()
+        .filter_map(|event| {
+            (event.thread_id == parent_thread_id
+                && matches!(
+                    &event.payload,
+                    pioneer_crud::CanonicalTurnEventPayload::TurnStarted(_)
+                ))
+            .then_some(event.turn_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent_start_turns,
+        vec!["turn_concurrent_task_a", "turn_concurrent_task_b"],
+        "canonical logical exchanges must retain parent admission order"
+    );
     let mut closed_entries = Vec::new();
     for _ in 0..200 {
         closed_entries = crud_store
@@ -21540,6 +22288,848 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
 }
 
 #[test]
+fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli() {
+    run_large_stack_message_test("production self-improvement vertical E2E", async {
+        timeout(
+            Duration::from_secs(120),
+            production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli_impl(),
+        )
+        .await
+        .expect("production self-improvement vertical E2E must finish within 120 seconds");
+    });
+}
+
+async fn run_vertical_collaborative_source_exchange(
+    harness: &mut CliRuntimeSecurityHarness,
+    source_provider: &VerticalCollaborativeSourceProvider,
+    parent_thread_id: &str,
+    parent_turn_id: &str,
+    text: &str,
+    source_cursor: i64,
+    effective_enabled_at: i64,
+    expected_previous_sources: usize,
+) -> pioneer_crud::SelfImprovementSourceTurnRecord {
+    let request_id = generate_test_request_id("verticalsource", parent_turn_id);
+    harness
+        .processor
+        .process_request(
+            harness.connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": parent_thread_id,
+                    "turn_id": parent_turn_id,
+                    "input": [{"type": "text", "text": text}],
+                    "model": "source-model",
+                    "model_provider": "source",
+                    "mode": "Agent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let started: TurnStartResponse =
+        serde_json::from_value(response.result).expect("Collaborative turn/start must decode");
+    assert_eq!(started.turn.id, parent_turn_id);
+    assert_eq!(
+        harness
+            .crud_store
+            .list_self_improvement_source_turns_after(
+                &harness.workspace_id,
+                source_cursor,
+                effective_enabled_at,
+                20,
+            )
+            .await
+            .expect("source rows after parent admission must load")
+            .len(),
+        expected_previous_sources,
+        "early Collaborative TurnCompleted must not create a source row"
+    );
+    source_provider.release_next_result();
+
+    let tasks = harness
+        .processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: harness.workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.to_owned()),
+            limit: Some(20),
+            ..Default::default()
+        })
+        .await
+        .expect("Collaborative Composer tasks must list");
+    let task = tasks
+        .tasks
+        .iter()
+        .find(|task| {
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_some_and(|work| work.launch.turn_id == parent_turn_id)
+        })
+        .expect("exact Collaborative Composer task must exist")
+        .clone();
+    assert_eq!(
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.id.as_str(),
+            TaskStatus::Completed,
+        )
+        .await,
+        TaskStatus::Completed
+    );
+    harness
+        .processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 20)
+        .await
+        .expect("completed Composer result must deliver to its owner turn");
+
+    let sources = harness
+        .crud_store
+        .list_self_improvement_source_turns_after(
+            &harness.workspace_id,
+            source_cursor,
+            effective_enabled_at,
+            20,
+        )
+        .await
+        .expect("delivered Collaborative source rows must load");
+    assert_eq!(sources.len(), expected_previous_sources + 1);
+    let source = sources
+        .into_iter()
+        .find(|source| source.turn_id == parent_turn_id)
+        .expect("exact delivered parent exchange must become a source");
+    assert!(source.task_delivery_id.is_some());
+    source
+}
+
+async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli_impl() {
+    const FIRST_TEXT: &str = "Always verify the checksum before publishing build one.";
+    const SECOND_TEXT: &str = "Always verify the checksum before publishing build two.";
+    const UNFINISHED_SIBLING_TEXT: &str =
+        "UNFINISHED_SIBLING_MUST_NOT_ENTER_SELF_IMPROVEMENT_HISTORY";
+    const SKILL_BODY: &str =
+        "Before publishing a release, calculate and verify the artifact checksum.";
+
+    let mut harness = setup_cli_runtime_security_harness().await;
+    let learning_provider = Arc::new(VerticalSelfImprovementProvider::new());
+    harness
+        .provider_registry
+        .insert("learning", learning_provider.clone());
+
+    let enable_id = generate_test_request_id("vertical", "enable");
+    harness
+        .processor
+        .process_request(
+            harness.connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": enable_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "self_improvement": {
+                            "enabled": true,
+                            "default_model": {
+                                "provider": "learning",
+                                "model": "learner-model"
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let enabled = recv_response_by_id(&mut harness.rx, enable_id.as_str()).await;
+    let enabled: pioneer_protocol::GatewaySettingsUpdateResponse =
+        serde_json::from_value(enabled.result).expect("enabled Settings response must decode");
+    assert!(enabled.settings.self_improvement.enabled);
+    let baseline = harness
+        .crud_store
+        .get_self_improvement_workspace_state(&harness.workspace_id)
+        .await
+        .expect("baseline state query must succeed")
+        .expect("enabled Settings must establish a durable baseline");
+    let enabled_at = baseline
+        .effective_enabled_at_unix
+        .expect("enabled Settings with an API model must be effective");
+
+    let source_provider = Arc::new(VerticalCollaborativeSourceProvider::new([
+        FIRST_TEXT,
+        SECOND_TEXT,
+    ]));
+    harness
+        .provider_registry
+        .insert("source", source_provider.clone());
+    harness.processor.bind_task_bridge().await;
+    harness.processor.start_task_event_listener().await;
+    let source_parent_thread_id = "thread_agent_skill_source";
+    seed_vertical_self_improvement_thread(
+        &mut harness,
+        source_parent_thread_id,
+        "Collaborative Agent skill sources",
+        "source-model",
+        "source",
+        ThreadOriginKind::Collaborative,
+    )
+    .await;
+
+    let sibling_provider = Arc::new(VerticalUnfinishedSiblingProvider::new());
+    harness
+        .provider_registry
+        .insert("vertical-sibling", sibling_provider.clone());
+    let sibling_turn_id = "turn_agent_skill_unfinished_sibling";
+    let sibling_request_id = generate_test_request_id("vertical", "unfinished-sibling");
+    harness
+        .processor
+        .process_request(
+            harness.connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": sibling_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": source_parent_thread_id,
+                    "turn_id": sibling_turn_id,
+                    "input": [{"type": "text", "text": UNFINISHED_SIBLING_TEXT}],
+                    "model": "sibling-model",
+                    "model_provider": "vertical-sibling",
+                    "mode": "Agent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let sibling_started = recv_response_by_id(&mut harness.rx, sibling_request_id.as_str()).await;
+    let sibling_started: TurnStartResponse = serde_json::from_value(sibling_started.result)
+        .expect("unfinished sibling turn/start must decode");
+    assert_eq!(sibling_started.turn.id, sibling_turn_id);
+    timeout(
+        Duration::from_secs(30),
+        sibling_provider.wait_for_child_main(),
+    )
+    .await
+    .expect("unfinished sibling child must reach its provider and remain in progress");
+    let sibling_tasks = harness
+        .processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: harness.workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(source_parent_thread_id.to_owned()),
+            limit: Some(20),
+            ..Default::default()
+        })
+        .await
+        .expect("unfinished sibling Composer task must list");
+    let sibling_task = sibling_tasks
+        .tasks
+        .iter()
+        .find(|task| {
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_some_and(|work| work.launch.turn_id == sibling_turn_id)
+        })
+        .expect("exact unfinished sibling task must exist")
+        .clone();
+
+    let first_source = run_vertical_collaborative_source_exchange(
+        &mut harness,
+        source_provider.as_ref(),
+        source_parent_thread_id,
+        "turn_agent_skill_source",
+        FIRST_TEXT,
+        baseline.cursor_source_id,
+        enabled_at,
+        0,
+    )
+    .await;
+    let persisted_source_thread = harness
+        .crud_store
+        .get_thread_model(source_parent_thread_id)
+        .await
+        .expect("source parent thread query must succeed")
+        .expect("first Collaborative turn must persist its parent thread");
+    assert_eq!(
+        persisted_source_thread.origin_kind,
+        pioneer_protocol::ThreadOriginKind::Collaborative
+    );
+    let second_source = run_vertical_collaborative_source_exchange(
+        &mut harness,
+        source_provider.as_ref(),
+        source_parent_thread_id,
+        "turn_agent_skill_source_two",
+        SECOND_TEXT,
+        baseline.cursor_source_id,
+        enabled_at,
+        1,
+    )
+    .await;
+    let sources = vec![first_source, second_source];
+    assert!(sources[0].id < sources[1].id);
+    let source_requests = source_provider.snapshot_requests();
+    assert_eq!(
+        source_requests.len(),
+        4,
+        "each real Composer child must make a tool round and a result round"
+    );
+    assert!(source_requests.iter().skip(1).step_by(2).all(|request| {
+        request.messages.iter().any(|message| {
+            message.role == pioneer_provider::Role::Tool
+                && message.name.as_deref() == Some("request_tools")
+        })
+    }));
+    let frozen = pioneer_crud::SelfImprovementFrozenSourceRange::new(
+        &harness.workspace_id,
+        baseline.cursor_source_id,
+        sources[1].id,
+        sources.clone(),
+    )
+    .expect("source range must freeze");
+    let canonical = harness
+        .crud_store
+        .list_canonical_turn_events_for_self_improvement(&frozen)
+        .await
+        .expect("canonical source events must load");
+    assert!(canonical.iter().any(|event| {
+        event.thread_id != source_parent_thread_id
+            && matches!(
+                &event.payload,
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification)
+                    if notification.item.item_type() == pioneer_protocol::TurnItemType::DynamicToolCall
+            )
+    }));
+    let canonical_json = serde_json::to_string(
+        &canonical
+            .iter()
+            .map(|event| {
+                (
+                    &event.event_id,
+                    &event.thread_id,
+                    &event.turn_id,
+                    &event.payload,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("canonical source history projection must serialize");
+    assert!(!canonical_json.contains(sibling_turn_id));
+    assert!(!canonical_json.contains(UNFINISHED_SIBLING_TEXT));
+    let source_event = |turn_id: &str| {
+        canonical
+            .iter()
+            .find(|event| event.turn_id == turn_id)
+            .unwrap_or_else(|| panic!("canonical event for `{turn_id}` must exist"))
+            .event_id
+            .clone()
+    };
+    learning_provider.set_responses([
+        json!({
+            "digestRevision": 1,
+            "observations": [{
+                "observationKey": "verify-checksum",
+                "summary": "Successful releases verify their artifact checksum.",
+                "evidence": [
+                    {
+                        "turnId": "turn_agent_skill_source",
+                        "eventId": source_event("turn_agent_skill_source"),
+                        "excerpt": "Always verify the checksum"
+                    },
+                    {
+                        "turnId": "turn_agent_skill_source_two",
+                        "eventId": source_event("turn_agent_skill_source_two"),
+                        "excerpt": "Always verify the checksum"
+                    }
+                ],
+                "kind": "success_pattern"
+            }]
+        })
+        .to_string(),
+        json!({
+            "candidate": {
+                "action": "create",
+                "candidateKey": "verify-checksum-before-publish",
+                "observationKeys": ["verify-checksum"],
+                "name": "Verify release checksum",
+                "slug": "verify-release-checksum",
+                "whenToUse": "Publishing a release build",
+                "whenNotToUse": "No build artifact is being published",
+                "instructions": SKILL_BODY
+            }
+        })
+        .to_string(),
+        json!({
+            "candidateKey": "candidate-1feca80ff4895b7c3aa4adda2212300c4b88adbe0de96686ab4569c9500b9bd1",
+            "decision": "accept",
+            "reasonCodes": []
+        })
+        .to_string(),
+    ]);
+
+    harness
+        .self_improvement_supervisor
+        .wake_once(enabled_at + 10)
+        .await
+        .expect("real production supervisor cycle must complete");
+
+    let learning_requests = learning_provider.snapshot_requests();
+    assert_eq!(
+        learning_requests.len(),
+        3,
+        "real chunk, synthesis and review calls must reach the provider"
+    );
+    for request in &learning_requests {
+        let request_payload = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_payload.contains("turn_agent_skill_source"));
+        assert!(request_payload.contains("turn_agent_skill_source_two"));
+        assert!(!request_payload.contains(sibling_turn_id));
+        assert!(!request_payload.contains(UNFINISHED_SIBLING_TEXT));
+    }
+
+    cancel_task_for_test(
+        &harness.processor,
+        pioneer_protocol::TaskCancelParams {
+            task_id: sibling_task.id.clone(),
+            reason: Some("finish vertical self-improvement sibling fixture".to_owned()),
+            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+        },
+    )
+    .await
+    .expect("unfinished sibling fixture must cancel cleanly");
+    assert_eq!(
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            sibling_task.id.as_str(),
+            TaskStatus::Cancelled,
+        )
+        .await,
+        TaskStatus::Cancelled
+    );
+
+    let active = harness
+        .crud_store
+        .list_active_agent_skill_versions(&harness.workspace_id)
+        .await
+        .expect("active Agent skill must load");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].version.instruction_body, SKILL_BODY);
+    assert_eq!(
+        active[0].version.source_turn_ids,
+        vec![
+            "turn_agent_skill_source".to_owned(),
+            "turn_agent_skill_source_two".to_owned()
+        ]
+    );
+    let run_id = active[0]
+        .version
+        .source_run_id
+        .as_deref()
+        .expect("accepted immutable version must reference its run");
+    let run = harness
+        .crud_store
+        .get_self_improvement_run(&harness.workspace_id, run_id)
+        .await
+        .expect("completed run query must succeed")
+        .expect("accepted version source run must exist");
+    assert_eq!(run.status, "completed");
+    let state = harness
+        .crud_store
+        .get_self_improvement_workspace_state(&harness.workspace_id)
+        .await
+        .expect("post-run state query must succeed")
+        .expect("post-run workspace state must exist");
+    assert_eq!(state.cursor_source_id, sources[1].id);
+
+    let skill_id = active[0].skill_id.clone();
+    let skill_id_text = skill_id.to_string();
+    let version_id = active[0].version.id.clone();
+    let native_provider = Arc::new(VerticalReadSkillProvider::new(skill_id.clone()));
+    harness
+        .provider_registry
+        .insert("native", native_provider.clone());
+    seed_vertical_self_improvement_thread(
+        &mut harness,
+        "thread_native_agent_skill",
+        "Native Agent skill",
+        "native-model",
+        "native",
+        ThreadOriginKind::Collaborative,
+    )
+    .await;
+    let native_request_id = generate_test_request_id("vertical", "native");
+    harness
+        .processor
+        .process_request(
+            harness.connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": native_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": "thread_native_agent_skill",
+                    "turn_id": "turn_native_agent_skill",
+                    "input": [{
+                        "type": "text",
+                        "text": "Apply the learned release procedure."
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _native_response = recv_response_by_id(&mut harness.rx, native_request_id.as_str()).await;
+    assert!(
+        harness
+            .crud_store
+            .get_turn_runtime_snapshot("turn_native_agent_skill")
+            .await
+            .expect("message-only parent snapshot lookup must succeed")
+            .is_none(),
+        "Collaborative parent admission must not own provider history or Agent-skill pins"
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if native_provider.snapshot_requests().len() >= 2 {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native Agent turn must invoke read_skill and continue");
+    let native_requests = native_provider.snapshot_requests();
+    let first_native = &native_requests[0];
+    let compiled = first_native
+        .compiled_prompt
+        .as_ref()
+        .expect("native request must use the production prompt compiler");
+    let serialized_native_payload = json!({
+        "system": compiled.full_system_text.as_str(),
+        "messages": &first_native.messages,
+        "tools": &first_native.tools,
+    })
+    .to_string();
+    assert!(serialized_native_payload.contains(&format!("skill:{skill_id}")));
+    assert!(serialized_native_payload.contains(version_id.as_str()));
+    assert!(serialized_native_payload.contains("Verify release checksum"));
+    assert!(serialized_native_payload.contains("\"read_skill\""));
+    assert!(
+        !serialized_native_payload.contains(SKILL_BODY),
+        "compact Agent card must not inline the instruction body"
+    );
+    let read_result = native_requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == pioneer_provider::Role::Tool
+                && message.name.as_deref() == Some("read_skill")
+        })
+        .expect("second native provider request must contain actual read_skill output");
+    assert!(read_result.content.contains(SKILL_BODY));
+    assert!(read_result.content.contains(version_id.as_str()));
+    assert!(
+        read_result
+            .content
+            .contains(&format!("\"skill_id\":\"{skill_id}\""))
+    );
+
+    let native_tasks = harness
+        .processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: harness.workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some("thread_native_agent_skill".to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("native Collaborative task must list");
+    let native_task = native_tasks
+        .tasks
+        .iter()
+        .find(|task| {
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_some_and(|work| work.launch.turn_id == "turn_native_agent_skill")
+        })
+        .expect("native Agent work must execute in an exact Composer child")
+        .clone();
+    let native_run_id =
+        wait_for_task_run_id(harness.crud_store.clone(), native_task.id.as_str()).await;
+    let native_child =
+        wait_for_child_lineage_for_run(harness.crud_store.clone(), native_run_id.as_str()).await;
+    assert_eq!(native_child.parent_thread_id, "thread_native_agent_skill");
+    assert_eq!(
+        native_child.created_by_turn_id.as_deref(),
+        Some(native_run_id.as_str()),
+        "the hidden execution child must descend from its durable async occurrence"
+    );
+    let (_, native_occurrence) = harness
+        .crud_store
+        .get_turn("thread_native_agent_skill", native_run_id.as_str())
+        .await
+        .expect("native task occurrence query must succeed")
+        .expect("native task run must own an occurrence turn");
+    assert_eq!(native_occurrence.turn_kind, TurnKind::TaskRun);
+    assert_eq!(native_occurrence.origin, TurnOrigin::DetachedTask);
+    let child_snapshot = harness
+        .crud_store
+        .get_turn_runtime_snapshot(native_child.child_turn_id.as_str())
+        .await
+        .expect("native child runtime snapshot query must succeed")
+        .expect("actual native API child must own its runtime snapshot");
+    let pinned_agent_versions = child_snapshot
+        .agent_skill_versions_json
+        .as_deref()
+        .expect("actual native API child must pin the exposed Agent skill");
+    assert!(pinned_agent_versions.contains(skill_id_text.as_str()));
+    assert!(pinned_agent_versions.contains(version_id.as_str()));
+    assert!(
+        child_snapshot
+            .input_json
+            .contains("Apply the learned release procedure.")
+    );
+    native_provider.release_result();
+    assert_eq!(
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            native_task.id.as_str(),
+            TaskStatus::Completed,
+        )
+        .await,
+        TaskStatus::Completed,
+        "native Agent child task must finish before delivery"
+    );
+
+    harness
+        .processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 20)
+        .await
+        .expect("native child result must deliver to its exact parent turn");
+    let post_native_sources = harness
+        .crud_store
+        .list_self_improvement_source_turns_after(
+            &harness.workspace_id,
+            baseline.cursor_source_id,
+            enabled_at,
+            20,
+        )
+        .await
+        .expect("post-native source rows must load");
+    assert_eq!(post_native_sources.len(), 3);
+    assert!(post_native_sources.iter().any(|source| {
+        source.turn_id == "turn_native_agent_skill" && source.task_delivery_id.is_some()
+    }));
+
+    for (suffix, thread_id, turn_id, native_turn_id, runtime_id, runtime_kind, model) in [
+        (
+            "codex",
+            "thread_codex_agent_skill_isolation",
+            "turn_codex_agent_skill_isolation",
+            "native_codex_agent_skill_isolation",
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "o4-mini",
+        ),
+        (
+            "claude",
+            "thread_claude_agent_skill_isolation",
+            "turn_claude_agent_skill_isolation",
+            "native_claude_agent_skill_isolation",
+            "claude",
+            CLIAgentRuntimeKind::Claude,
+            "claude-sonnet",
+        ),
+    ] {
+        seed_vertical_self_improvement_thread(
+            &mut harness,
+            thread_id,
+            format!("{suffix} Agent skill isolation").as_str(),
+            model,
+            "openai",
+            ThreadOriginKind::Collaborative,
+        )
+        .await;
+        harness
+            .cli_session
+            .set_next_native_turn_id(native_turn_id)
+            .await;
+        let request_id = generate_test_request_id("cliagentskill", suffix);
+        let launch = pioneer_protocol::TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            input: vec![UserInput::Text {
+                text: "Do ordinary CLI work.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: Some(model.to_owned()),
+            model_provider: None,
+            sandbox_policy: Some(pioneer_protocol::SandboxPolicy::from_mode(
+                SandboxMode::FullAccess,
+            )),
+            mode: Some(ThreadMode::Agent),
+            execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: runtime_id.to_owned(),
+                runtime_kind,
+            }),
+            reasoning: None,
+            permission_profile: Some(
+                pioneer_protocol::TurnPermissionProfileSelection::full_access(),
+            ),
+            cli_runtime_options: None,
+        };
+        harness
+            .processor
+            .process_request(
+                harness.connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": serde_json::to_value(&launch)
+                        .expect("CLI isolation launch must serialize")
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+        let started: TurnStartResponse =
+            serde_json::from_value(response.result).expect("CLI isolation turn/start must decode");
+        assert_eq!(started.turn.id, turn_id);
+        assert!(
+            harness
+                .crud_store
+                .get_turn_runtime_snapshot(turn_id)
+                .await
+                .expect("CLI message-only parent snapshot lookup must succeed")
+                .is_none(),
+            "CLI message-only parent must not own Agent-skill pins"
+        );
+
+        let tasks = harness
+            .processor
+            .task_runtime
+            .service()
+            .list_tasks(TaskListParams {
+                workspace_id: harness.workspace_id.clone(),
+                owner_kind: Some(TaskOwnerKind::Thread),
+                owner_id: Some(thread_id.to_owned()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("CLI isolation Composer task must list");
+        let task = tasks
+            .tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.composer_work.as_ref())
+                    .is_some_and(|work| work.launch.turn_id == turn_id)
+            })
+            .expect("exact CLI isolation Composer task must exist")
+            .clone();
+        let run_id = wait_for_task_run_id(harness.crud_store.clone(), task.id.as_str()).await;
+        let child =
+            wait_for_child_lineage_for_run(harness.crud_store.clone(), run_id.as_str()).await;
+        assert_eq!(child.parent_thread_id, thread_id);
+        assert_eq!(
+            child.created_by_turn_id.as_deref(),
+            Some(run_id.as_str()),
+            "the CLI execution child must descend from its durable async occurrence"
+        );
+        let (_, occurrence) = harness
+            .crud_store
+            .get_turn(thread_id, run_id.as_str())
+            .await
+            .expect("CLI task occurrence query must succeed")
+            .expect("CLI task run must own an occurrence turn");
+        assert_eq!(occurrence.turn_kind, TurnKind::TaskRun);
+        assert_eq!(occurrence.origin, TurnOrigin::DetachedTask);
+        assert!(
+            harness
+                .crud_store
+                .get_turn_runtime_snapshot(child.child_turn_id.as_str())
+                .await
+                .expect("CLI child runtime snapshot lookup must succeed")
+                .is_none(),
+            "external CLI child must not persist native API Agent-skill pins"
+        );
+
+        let native_turns = wait_for_cli_runtime_turn_starts(
+            harness.cli_session.as_ref(),
+            if suffix == "codex" { 1 } else { 2 },
+        )
+        .await;
+        let native = native_turns
+            .last()
+            .expect("exact CLI Composer child must reach its native runtime");
+        let serialized_payload =
+            format!("{}\n{}", native.input, native.elevated_instructions.text());
+        for forbidden in [
+            skill_id_text.as_str(),
+            version_id.as_str(),
+            SKILL_BODY,
+            "Verify release checksum",
+        ] {
+            assert!(
+                !serialized_payload.contains(forbidden),
+                "external CLI payload leaked Agent-skill data: {forbidden}"
+            );
+        }
+
+        complete_recorded_cli_task_turn(
+            &harness.processor,
+            &harness.cli_manager,
+            harness.workspace_id.as_str(),
+            runtime_id,
+            thread_id,
+            native.native_thread_id.as_str(),
+            native_turn_id,
+            format!(
+                r#"<task_result>{{"summary":"{suffix} isolation complete","data":{{"runtime":"{runtime_id}"}}}}</task_result>"#
+            )
+            .as_str(),
+        )
+        .await;
+        assert_eq!(
+            wait_for_task_status(
+                harness.crud_store.clone(),
+                task.id.as_str(),
+                TaskStatus::Completed,
+            )
+            .await,
+            TaskStatus::Completed,
+            "external CLI Composer child must complete normally"
+        );
+        harness
+            .processor
+            .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 20)
+            .await
+            .expect("external CLI Composer result must deliver to its parent");
+    }
+}
+
+#[test]
 fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
     run_large_stack_message_test(
         "Codex supervised security test",
@@ -28730,6 +30320,250 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay() {
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let session_manager = Arc::new(SessionManager::new());
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER reject_gateway_agent_pin_snapshot \
+             BEFORE INSERT ON turn_runtime_snapshot \
+             WHEN NEW.agent_skill_versions_json IS NOT NULL \
+             BEGIN SELECT RAISE(ABORT, 'forced Gateway Agent pin failure'); END;",
+        )
+        .await
+        .expect("conditional Agent pin failure trigger must install");
+
+    let turn_id = "turn_agent_pin_fail_soft";
+    let mut overlay = vec![AgentSkillRuntimeEntry {
+        skill_id: pioneer_protocol::SkillId::new("P".repeat(21)).expect("valid Agent SkillId"),
+        slug: "verify-release".to_owned(),
+        version_id: "V".repeat(21),
+        version_number: 1,
+        display_name: "Verify release".to_owned(),
+        runtime_description: "Use before publishing a release.".to_owned(),
+        body: "Verify the artifact checksum before publishing.".to_owned(),
+        fingerprint: "a".repeat(64),
+    }];
+    let workspace_skill_policies =
+        HashMap::<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>::new();
+    let runtime_environment = HashMap::<String, String>::new();
+    let input = vec![UserInput::Text {
+        text: "Publish this release.".to_owned(),
+        text_elements: Vec::new(),
+    }];
+
+    processor
+        .persist_turn_runtime_snapshot_with_optional_agent_overlay(
+            "thread_agent_pin_fail_soft",
+            workspace_id.as_str(),
+            turn_id,
+            ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "o4-mini",
+            "openai",
+            None,
+            &workspace_skill_policies,
+            input.as_slice(),
+            &[],
+            &[],
+            &runtime_environment,
+            &[],
+            &mut overlay,
+        )
+        .await
+        .expect("optional Agent pin failure must preserve the base Gateway turn path");
+
+    assert!(
+        overlay.is_empty(),
+        "the caller must receive the same base-only overlay used by the persisted snapshot"
+    );
+    let snapshot = crud_store
+        .get_turn_runtime_snapshot(turn_id)
+        .await
+        .expect("base-only runtime snapshot lookup must succeed")
+        .expect("base-only runtime snapshot must be authoritative");
+    assert!(
+        snapshot.agent_skill_versions_json.is_none(),
+        "the fail-soft retry must not retain a partial Agent pin"
+    );
+}
+
+async fn persist_agent_skill_snapshot_for_resolution_test(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    entry: &AgentSkillRuntimeEntry,
+) {
+    let mut overlay = vec![entry.clone()];
+    let workspace_skill_policies =
+        HashMap::<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>::new();
+    let runtime_environment = HashMap::<String, String>::new();
+    let input = vec![UserInput::Text {
+        text: "Use the available learned procedure.".to_owned(),
+        text_elements: Vec::new(),
+    }];
+    processor
+        .persist_turn_runtime_snapshot_with_optional_agent_overlay(
+            thread_id,
+            workspace_id,
+            turn_id,
+            ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "o4-mini",
+            "openai",
+            None,
+            &workspace_skill_policies,
+            input.as_slice(),
+            &[],
+            &[],
+            &runtime_environment,
+            &[],
+            &mut overlay,
+        )
+        .await
+        .expect("Agent skill snapshot fixture must persist");
+    assert_eq!(overlay.len(), 1);
+    assert_eq!(overlay[0].skill_id, entry.skill_id);
+}
+
+fn agent_skill_resolution_fixture() -> AgentSkillRuntimeEntry {
+    AgentSkillRuntimeEntry {
+        skill_id: pioneer_protocol::SkillId::new("D".repeat(21))
+            .expect("valid Agent binding SkillId"),
+        slug: "verify-release".to_owned(),
+        version_id: "W".repeat(21),
+        version_number: 1,
+        display_name: "Verify release".to_owned(),
+        runtime_description: "Use before publishing a release.".to_owned(),
+        body: "Verify the artifact checksum before publishing.".to_owned(),
+        fingerprint: "b".repeat(64),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_skill_resolution_event_clears_pins_when_overlay_was_not_exposed() {
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let session_manager = Arc::new(SessionManager::new());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_agent_overlay_not_exposed";
+    let turn_id = "turn_agent_overlay_not_exposed";
+    let entry = agent_skill_resolution_fixture();
+    persist_agent_skill_snapshot_for_resolution_test(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        &entry,
+    )
+    .await;
+
+    let committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnSkillsResolved {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            bindings: Vec::new(),
+        })
+        .await;
+    assert!(
+        committed,
+        "base-only exposure must become authoritative before provider execution"
+    );
+    let snapshot = crud_store
+        .get_turn_runtime_snapshot(turn_id)
+        .await
+        .expect("runtime snapshot lookup must succeed")
+        .expect("runtime snapshot must remain available");
+    assert!(
+        snapshot.agent_skill_versions_json.is_none(),
+        "a version that was not actually exposed must not remain recoverable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_skill_resolution_event_rejects_exposure_that_does_not_match_pins() {
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let session_manager = Arc::new(SessionManager::new());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_agent_overlay_pin_mismatch";
+    let turn_id = "turn_agent_overlay_pin_mismatch";
+    let entry = agent_skill_resolution_fixture();
+    persist_agent_skill_snapshot_for_resolution_test(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        &entry,
+    )
+    .await;
+
+    let committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnSkillsResolved {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            bindings: vec![TurnSkillBinding {
+                skill_id: entry.skill_id.clone(),
+                skill_owner: None,
+                skill_slug: entry.slug.clone(),
+                skill_version: Some(entry.version_number.to_string()),
+                fingerprint: "c".repeat(64),
+                source_kind: "agent".to_owned(),
+                resolved_reason: "agent_catalog".to_owned(),
+            }],
+        })
+        .await;
+    assert!(
+        !committed,
+        "provider execution must not start with exposure that differs from its pins"
+    );
+    let snapshot = crud_store
+        .get_turn_runtime_snapshot(turn_id)
+        .await
+        .expect("runtime snapshot lookup must succeed")
+        .expect("runtime snapshot must remain available");
+    assert!(
+        snapshot.agent_skill_versions_json.is_some(),
+        "a rejected mismatch must not mutate the authoritative pins"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
@@ -28788,6 +30622,74 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
     assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
     assert_eq!(bindings[1].skill_id.as_str(), "TTTTTTTTTTTTTTTTTTTTT");
     assert_eq!(bindings[1].skill_slug, "pioneer/my-skill");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_skill_binding_failure_remains_a_diagnostic_projection() {
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let session_manager = Arc::new(SessionManager::new());
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_agent_binding_fail_soft";
+    let turn_id = "turn_agent_binding_fail_soft";
+    let entry = agent_skill_resolution_fixture();
+    persist_agent_skill_snapshot_for_resolution_test(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        &entry,
+    )
+    .await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER reject_agent_binding_projection \
+             BEFORE INSERT ON turn_skill_binding \
+             BEGIN SELECT RAISE(ABORT, 'forced Agent binding projection failure'); END;",
+        )
+        .await
+        .expect("binding projection failure trigger must install");
+
+    let committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnSkillsResolved {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            bindings: vec![TurnSkillBinding {
+                skill_id: entry.skill_id.clone(),
+                skill_owner: None,
+                skill_slug: entry.slug,
+                skill_version: Some(entry.version_number.to_string()),
+                fingerprint: entry.fingerprint,
+                source_kind: "agent".to_owned(),
+                resolved_reason: "agent_catalog".to_owned(),
+            }],
+        })
+        .await;
+
+    assert!(
+        committed,
+        "diagnostic binding storage must not become native turn authority"
+    );
+    assert!(
+        crud_store
+            .find_turn_skill_bindings(turn_id)
+            .await
+            .expect("binding lookup after diagnostic failure must succeed")
+            .is_empty(),
+        "a failed diagnostic replacement must leave no partial binding rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

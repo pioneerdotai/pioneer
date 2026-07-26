@@ -1846,6 +1846,13 @@
                 "null"
               ]
             },
+            "startedAt": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
             "status": {
               "$ref": "#/$defs/TaskStatus"
             },

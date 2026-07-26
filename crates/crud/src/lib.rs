@@ -12,6 +12,8 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
+pub use events::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
@@ -117,6 +119,379 @@ impl fmt::Display for TurnEventProjectionAfterAppendError {
             )?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementSourceTurnRecord {
+    pub id: i64,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub parent_turn_created_at_unix: i64,
+    pub task_delivery_id: Option<String>,
+    pub terminal_event_id: String,
+    pub terminal_at_unix: i64,
+    pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementThreadTerminalBoundary {
+    pub thread_id: String,
+    pub source_id: i64,
+    pub turn_id: String,
+    pub parent_turn_created_at_unix: i64,
+    pub task_delivery_id: Option<String>,
+    pub terminal_event_id: String,
+    pub terminal_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementFrozenSourceRange {
+    pub workspace_id: String,
+    pub source_lower_exclusive: i64,
+    pub source_upper_inclusive: i64,
+    pub anchors: Vec<SelfImprovementSourceTurnRecord>,
+    pub thread_terminal_boundaries: Vec<SelfImprovementThreadTerminalBoundary>,
+}
+
+impl SelfImprovementFrozenSourceRange {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        source_lower_exclusive: i64,
+        source_upper_inclusive: i64,
+        anchors: Vec<SelfImprovementSourceTurnRecord>,
+    ) -> Result<Self> {
+        let workspace_id = workspace_id.into();
+        if workspace_id.trim().is_empty() {
+            bail!("self-improvement frozen source workspace_id must not be empty");
+        }
+        if source_lower_exclusive < 0 || source_upper_inclusive <= source_lower_exclusive {
+            bail!("self-improvement frozen source range bounds are invalid");
+        }
+        if anchors.is_empty() {
+            bail!("self-improvement frozen source range must contain an anchor");
+        }
+
+        let mut previous_source_id = source_lower_exclusive;
+        let mut boundaries = BTreeMap::<&str, &SelfImprovementSourceTurnRecord>::new();
+        let mut seen_turn_ids = HashSet::new();
+        let mut seen_task_delivery_ids = HashSet::new();
+        let mut seen_terminal_event_ids = HashSet::new();
+        for anchor in &anchors {
+            if anchor.workspace_id != workspace_id
+                || anchor.id <= previous_source_id
+                || anchor.id > source_upper_inclusive
+                || anchor.thread_id.trim().is_empty()
+                || anchor.turn_id.trim().is_empty()
+                || anchor
+                    .task_delivery_id
+                    .as_deref()
+                    .is_some_and(str::is_empty)
+                || anchor.terminal_event_id.trim().is_empty()
+                || !seen_turn_ids.insert(anchor.turn_id.as_str())
+                || anchor
+                    .task_delivery_id
+                    .as_deref()
+                    .is_some_and(|delivery_id| !seen_task_delivery_ids.insert(delivery_id))
+                || !seen_terminal_event_ids.insert(anchor.terminal_event_id.as_str())
+            {
+                bail!("self-improvement frozen source range has an invalid anchor");
+            }
+            previous_source_id = anchor.id;
+            boundaries
+                .entry(anchor.thread_id.as_str())
+                .and_modify(|current| {
+                    if (
+                        current.parent_turn_created_at_unix,
+                        current.turn_id.as_str(),
+                    ) < (anchor.parent_turn_created_at_unix, anchor.turn_id.as_str())
+                    {
+                        *current = anchor;
+                    }
+                })
+                .or_insert(anchor);
+        }
+        if previous_source_id != source_upper_inclusive {
+            bail!("self-improvement frozen source range is incomplete");
+        }
+
+        let thread_terminal_boundaries = boundaries
+            .into_values()
+            .map(|anchor| SelfImprovementThreadTerminalBoundary {
+                thread_id: anchor.thread_id.clone(),
+                source_id: anchor.id,
+                turn_id: anchor.turn_id.clone(),
+                parent_turn_created_at_unix: anchor.parent_turn_created_at_unix,
+                task_delivery_id: anchor.task_delivery_id.clone(),
+                terminal_event_id: anchor.terminal_event_id.clone(),
+                terminal_at_unix: anchor.terminal_at_unix,
+            })
+            .collect();
+
+        Ok(Self {
+            workspace_id,
+            source_lower_exclusive,
+            source_upper_inclusive,
+            anchors,
+            thread_terminal_boundaries,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expected = Self::new(
+            self.workspace_id.clone(),
+            self.source_lower_exclusive,
+            self.source_upper_inclusive,
+            self.anchors.clone(),
+        )?;
+        if &expected != self {
+            bail!("self-improvement frozen source terminal boundaries are invalid");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalTurnEventRecord {
+    pub event_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub sequence: i64,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub payload: CanonicalTurnEventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementWorkspaceStateRecord {
+    pub workspace_id: String,
+    pub activation_epoch: i64,
+    pub cursor_source_id: i64,
+    pub effective_enabled_at_unix: Option<i64>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSelfImprovementRun {
+    pub workspace_id: String,
+    pub activation_epoch: i64,
+    pub scheduled_date_utc: String,
+    pub source_lower_exclusive: i64,
+    pub source_upper_inclusive: i64,
+    pub learner_provider: String,
+    pub learner_model: String,
+    pub reviewer_provider: String,
+    pub reviewer_model: String,
+    pub pipeline_contract_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementRunRecord {
+    pub id: String,
+    pub workspace_id: String,
+    pub activation_epoch: i64,
+    pub scheduled_date_utc: String,
+    pub source_lower_exclusive: i64,
+    pub source_upper_inclusive: i64,
+    pub status: String,
+    pub claim_token: Option<String>,
+    pub claimed_by: Option<String>,
+    pub lease_expires_at_unix: Option<i64>,
+    pub attempt_count: i32,
+    pub next_attempt_at_unix: Option<i64>,
+    pub learner_provider: String,
+    pub learner_model: String,
+    pub reviewer_provider: String,
+    pub reviewer_model: String,
+    pub pipeline_contract_version: String,
+    pub analysis_cursor_json: Option<String>,
+    pub analysis_digest_json: Option<String>,
+    pub outcome: Option<String>,
+    pub applied_action: Option<String>,
+    pub skill_id: Option<String>,
+    pub previous_version_id: Option<String>,
+    pub resulting_version_id: Option<String>,
+    pub result_summary: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementRunFence {
+    pub run_id: String,
+    pub workspace_id: String,
+    pub activation_epoch: i64,
+    pub source_lower_exclusive: i64,
+    pub source_upper_inclusive: i64,
+    pub claim_token: String,
+    pub claimed_by: String,
+    pub learner_provider: String,
+    pub learner_model: String,
+    pub reviewer_provider: String,
+    pub reviewer_model: String,
+    pub pipeline_contract_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfImprovementRunMutationResult {
+    Applied,
+    LostAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementFinalizationAuthority {
+    pub effective_enabled: bool,
+    pub learner_provider: String,
+    pub learner_model: String,
+    pub reviewer_provider: String,
+    pub reviewer_model: String,
+    pub pipeline_contract_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillCreate {
+    pub skill_id: SkillId,
+    pub version_id: String,
+    pub slug: String,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillUpdate {
+    pub skill_id: SkillId,
+    pub expected_active_version_id: String,
+    pub version_id: String,
+    pub version_number: i64,
+    pub slug: String,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillRollback {
+    pub skill_id: SkillId,
+    pub expected_active_version_id: String,
+    pub target_parent_version_id: String,
+    pub candidate_key: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfImprovementNoChangeReason {
+    NoCandidate,
+    ReviewerRejected,
+    HostValidationRejected,
+    ModelContractRejected,
+}
+
+impl SelfImprovementNoChangeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidate => "no_candidate",
+            Self::ReviewerRejected => "reviewer_rejected",
+            Self::HostValidationRejected => "host_validation_rejected",
+            Self::ModelContractRejected => "model_contract_rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfImprovementFinalOutcome {
+    AcceptedCreate(AcceptedAgentSkillCreate),
+    AcceptedUpdate(AcceptedAgentSkillUpdate),
+    AcceptedRollback(AcceptedAgentSkillRollback),
+    NoChange {
+        reason: SelfImprovementNoChangeReason,
+        reason_codes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeSelfImprovementRunInput {
+    pub fence: SelfImprovementRunFence,
+    pub authority: SelfImprovementFinalizationAuthority,
+    pub outcome: SelfImprovementFinalOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfImprovementFinalizationConflict {
+    SkillIdentity,
+    VersionIdentity,
+    Slug,
+    Fingerprint,
+    Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeSelfImprovementRunResult {
+    Applied {
+        skill_id: SkillId,
+        version_id: String,
+    },
+    NoChange {
+        reason: SelfImprovementNoChangeReason,
+    },
+    AlreadyFinalized,
+    Stale,
+    Conflict(SelfImprovementFinalizationConflict),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillVersionRecord {
+    pub id: String,
+    pub version_number: i64,
+    pub source_run_id: Option<String>,
+    pub parent_version_id: Option<String>,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    pub source_turn_ids: Vec<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillVersionSnapshotRecord {
+    pub skill_id: SkillId,
+    pub workspace_id: String,
+    pub slug: String,
+    pub version: AgentSkillVersionRecord,
+}
+
+impl SelfImprovementRunRecord {
+    pub fn fence(&self) -> Option<SelfImprovementRunFence> {
+        Some(SelfImprovementRunFence {
+            run_id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            activation_epoch: self.activation_epoch,
+            source_lower_exclusive: self.source_lower_exclusive,
+            source_upper_inclusive: self.source_upper_inclusive,
+            claim_token: self.claim_token.clone()?,
+            claimed_by: self.claimed_by.clone()?,
+            learner_provider: self.learner_provider.clone(),
+            learner_model: self.learner_model.clone(),
+            reviewer_provider: self.reviewer_provider.clone(),
+            reviewer_model: self.reviewer_model.clone(),
+            pipeline_contract_version: self.pipeline_contract_version.clone(),
+        })
     }
 }
 
@@ -1184,6 +1559,796 @@ fn skill_upload_session_record_from_model(
 }
 
 impl CrudStore {
+    pub async fn list_active_agent_skill_versions(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<AgentSkillVersionSnapshotRecord>> {
+        repositories::agent_skill::list_active_versions(&self.connection, workspace_id).await
+    }
+
+    pub async fn get_agent_skill_version(
+        &self,
+        workspace_id: &str,
+        version_id: &str,
+    ) -> Result<Option<AgentSkillVersionSnapshotRecord>> {
+        repositories::agent_skill::find_exact_version(&self.connection, workspace_id, version_id)
+            .await
+    }
+
+    pub async fn get_next_agent_skill_version_number(
+        &self,
+        workspace_id: &str,
+        skill_id: &SkillId,
+    ) -> Result<Option<i64>> {
+        repositories::agent_skill::find_next_version_number(
+            &self.connection,
+            workspace_id,
+            skill_id,
+        )
+        .await
+    }
+
+    pub async fn list_agent_skill_version_fingerprints(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<String>> {
+        repositories::agent_skill::list_workspace_version_fingerprints(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn get_self_improvement_workspace_state(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<SelfImprovementWorkspaceStateRecord>> {
+        repositories::self_improvement_workspace_state::find(&self.connection, workspace_id)
+            .await
+            .map(|state| {
+                state.map(repositories::self_improvement_workspace_state::record_from_model)
+            })
+    }
+
+    pub async fn get_or_create_self_improvement_workspace_state(
+        &self,
+        workspace_id: &str,
+        now_unix: i64,
+    ) -> Result<SelfImprovementWorkspaceStateRecord> {
+        let workspace_id = workspace_id.to_owned();
+        self.run_serialized_write(|| async {
+            repositories::self_improvement_workspace_state::ensure(
+                &self.connection,
+                workspace_id.as_str(),
+                unix_to_datetime(now_unix),
+            )
+            .await
+            .map(repositories::self_improvement_workspace_state::record_from_model)
+        })
+        .await
+    }
+
+    pub async fn activate_self_improvement_workspace(
+        &self,
+        workspace_id: &str,
+        effective_enabled_at_unix: i64,
+    ) -> Result<SelfImprovementWorkspaceStateRecord> {
+        let workspace_id = workspace_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement activation transaction")?;
+            let effective_enabled_at = unix_to_datetime(effective_enabled_at_unix);
+
+            if let Err(error) = repositories::self_improvement_workspace_state::ensure(
+                &transaction,
+                workspace_id.as_str(),
+                effective_enabled_at,
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            let baseline_source_id = match repositories::self_improvement_source_turn::source_head(
+                &transaction,
+                workspace_id.as_str(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            if let Err(error) =
+                repositories::self_improvement_workspace_state::activate_if_inactive(
+                    &transaction,
+                    workspace_id.as_str(),
+                    baseline_source_id,
+                    effective_enabled_at,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            let state = match repositories::self_improvement_workspace_state::find(
+                &transaction,
+                workspace_id.as_str(),
+            )
+            .await
+            {
+                Ok(Some(state)) => state,
+                Ok(None) => {
+                    let _ = transaction.rollback().await;
+                    bail!(
+                        "self-improvement state disappeared during activation for workspace `{}`",
+                        workspace_id
+                    );
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement activation transaction")?;
+            Ok(repositories::self_improvement_workspace_state::record_from_model(state))
+        })
+        .await
+    }
+
+    pub async fn deactivate_self_improvement_workspace(
+        &self,
+        workspace_id: &str,
+        now_unix: i64,
+    ) -> Result<SelfImprovementWorkspaceStateRecord> {
+        let workspace_id = workspace_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement deactivation transaction")?;
+            let now = unix_to_datetime(now_unix);
+
+            if let Err(error) = repositories::self_improvement_workspace_state::ensure(
+                &transaction,
+                workspace_id.as_str(),
+                now,
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if let Err(error) =
+                repositories::self_improvement_workspace_state::deactivate_if_active(
+                    &transaction,
+                    workspace_id.as_str(),
+                    now,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if let Err(error) = repositories::self_improvement_run::cancel_unfinished_for_workspace(
+                &transaction,
+                workspace_id.as_str(),
+                "self_improvement_disabled",
+                now,
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            let state = match repositories::self_improvement_workspace_state::find(
+                &transaction,
+                workspace_id.as_str(),
+            )
+            .await
+            {
+                Ok(Some(state)) => state,
+                Ok(None) => {
+                    let _ = transaction.rollback().await;
+                    bail!(
+                        "self-improvement state disappeared during deactivation for workspace `{}`",
+                        workspace_id
+                    );
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement deactivation transaction")?;
+            Ok(repositories::self_improvement_workspace_state::record_from_model(state))
+        })
+        .await
+    }
+
+    pub async fn self_improvement_source_head(&self, workspace_id: &str) -> Result<i64> {
+        repositories::self_improvement_source_turn::source_head(&self.connection, workspace_id)
+            .await
+    }
+
+    pub async fn list_self_improvement_source_turns_after(
+        &self,
+        workspace_id: &str,
+        cursor_source_id: i64,
+        effective_enabled_at_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        repositories::self_improvement_source_turn::list_after_cursor(
+            &self.connection,
+            workspace_id,
+            cursor_source_id,
+            effective_enabled_at_unix,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_frozen_self_improvement_source_range(
+        &self,
+        workspace_id: &str,
+        source_lower_exclusive: i64,
+        source_upper_inclusive: i64,
+        effective_enabled_at_unix: i64,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        repositories::self_improvement_source_turn::list_frozen_range(
+            &self.connection,
+            workspace_id,
+            source_lower_exclusive,
+            source_upper_inclusive,
+            effective_enabled_at_unix,
+        )
+        .await
+    }
+
+    pub async fn list_canonical_turn_events_for_self_improvement(
+        &self,
+        frozen_range: &SelfImprovementFrozenSourceRange,
+    ) -> Result<Vec<CanonicalTurnEventRecord>> {
+        repositories::canonical_turn_event::list_for_frozen_range(&self.connection, frozen_range)
+            .await
+    }
+
+    pub async fn get_self_improvement_run(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+    ) -> Result<Option<SelfImprovementRunRecord>> {
+        repositories::self_improvement_run::find_by_id(&self.connection, workspace_id, run_id)
+            .await
+            .map(|run| run.map(repositories::self_improvement_run::record_from_model))
+    }
+
+    pub async fn get_oldest_unresolved_self_improvement_run(
+        &self,
+        workspace_id: &str,
+        activation_epoch: i64,
+    ) -> Result<Option<SelfImprovementRunRecord>> {
+        repositories::self_improvement_run::find_oldest_unresolved(
+            &self.connection,
+            workspace_id,
+            activation_epoch,
+        )
+        .await
+        .map(|run| run.map(repositories::self_improvement_run::record_from_model))
+    }
+
+    pub async fn get_next_self_improvement_retry_at(&self) -> Result<Option<i64>> {
+        repositories::self_improvement_run::find_earliest_retry_at(&self.connection)
+            .await
+            .map(|retry_at| retry_at.map(|retry_at| retry_at.timestamp()))
+    }
+
+    pub async fn create_or_get_self_improvement_run(
+        &self,
+        input: NewSelfImprovementRun,
+        now_unix: i64,
+    ) -> Result<SelfImprovementRunRecord> {
+        repositories::self_improvement_run::validate_new_run(&input)?;
+        let run_id = generate_id(DB_ID_LEN);
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement run creation transaction")?;
+
+            if let Some(existing) = repositories::self_improvement_run::find_daily(
+                &transaction,
+                input.workspace_id.as_str(),
+                input.activation_epoch,
+                input.scheduled_date_utc.as_str(),
+            )
+            .await?
+            {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to close idempotent self-improvement run transaction")?;
+                return Ok(repositories::self_improvement_run::record_from_model(
+                    existing,
+                ));
+            }
+
+            if let Some(unresolved) = repositories::self_improvement_run::find_oldest_unresolved(
+                &transaction,
+                input.workspace_id.as_str(),
+                input.activation_epoch,
+            )
+            .await?
+            {
+                let _ = transaction.rollback().await;
+                bail!(
+                    "self-improvement run `{}` must resolve before workspace `{}` can freeze a \
+                     new source range",
+                    unresolved.id,
+                    input.workspace_id
+                );
+            }
+
+            let state = repositories::self_improvement_workspace_state::find(
+                &transaction,
+                input.workspace_id.as_str(),
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "self-improvement state is missing for workspace `{}`",
+                    input.workspace_id
+                )
+            })?;
+            if state.effective_enabled_at.is_none()
+                || state.activation_epoch != input.activation_epoch
+                || state.cursor_source_id != input.source_lower_exclusive
+            {
+                let _ = transaction.rollback().await;
+                bail!(
+                    "self-improvement run input is stale for workspace `{}`",
+                    input.workspace_id
+                );
+            }
+
+            let source_head = repositories::self_improvement_source_turn::source_head(
+                &transaction,
+                input.workspace_id.as_str(),
+            )
+            .await?;
+            if input.source_upper_inclusive > source_head {
+                let _ = transaction.rollback().await;
+                bail!(
+                    "self-improvement run source upper `{}` exceeds workspace `{}` head `{}`",
+                    input.source_upper_inclusive,
+                    input.workspace_id,
+                    source_head
+                );
+            }
+            if !repositories::self_improvement_source_turn::contains_source_id(
+                &transaction,
+                input.workspace_id.as_str(),
+                input.source_upper_inclusive,
+            )
+            .await?
+            {
+                let _ = transaction.rollback().await;
+                bail!(
+                    "self-improvement run source upper `{}` is not a source in workspace `{}`",
+                    input.source_upper_inclusive,
+                    input.workspace_id
+                );
+            }
+
+            repositories::self_improvement_run::insert_pending(
+                &transaction,
+                run_id.as_str(),
+                &input,
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            let persisted = repositories::self_improvement_run::find_daily(
+                &transaction,
+                input.workspace_id.as_str(),
+                input.activation_epoch,
+                input.scheduled_date_utc.as_str(),
+            )
+            .await?
+            .context("self-improvement run is missing after idempotent insert")?;
+
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement run creation transaction")?;
+            Ok(repositories::self_improvement_run::record_from_model(
+                persisted,
+            ))
+        })
+        .await
+    }
+
+    pub async fn claim_available_self_improvement_run(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+        activation_epoch: i64,
+        claimed_by: &str,
+        now_unix: i64,
+        lease_expires_at_unix: i64,
+    ) -> Result<Option<SelfImprovementRunRecord>> {
+        if claimed_by.trim().is_empty() || claimed_by != claimed_by.trim() {
+            bail!("self-improvement run claim owner must be non-empty and normalized");
+        }
+        if lease_expires_at_unix <= now_unix {
+            bail!("self-improvement run lease must expire after claim time");
+        }
+        let workspace_id = workspace_id.to_owned();
+        let run_id = run_id.to_owned();
+        let claimed_by = claimed_by.to_owned();
+        let claim_token = generate_id(32);
+
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement run claim transaction")?;
+            let run = repositories::self_improvement_run::find_by_id(
+                &transaction,
+                workspace_id.as_str(),
+                run_id.as_str(),
+            )
+            .await?;
+            let Some(run) = run else {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to close missing self-improvement run claim transaction")?;
+                return Ok(None);
+            };
+            let state = repositories::self_improvement_workspace_state::find(
+                &transaction,
+                workspace_id.as_str(),
+            )
+            .await?;
+            let state_matches = state.is_some_and(|state| {
+                state.effective_enabled_at.is_some()
+                    && state.activation_epoch == activation_epoch
+                    && state.cursor_source_id == run.source_lower_exclusive
+            });
+            if !state_matches {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to close stale self-improvement run claim transaction")?;
+                return Ok(None);
+            }
+
+            let claimed = repositories::self_improvement_run::claim_available(
+                &transaction,
+                workspace_id.as_str(),
+                run_id.as_str(),
+                activation_epoch,
+                claim_token.as_str(),
+                claimed_by.as_str(),
+                unix_to_datetime(now_unix),
+                unix_to_datetime(lease_expires_at_unix),
+            )
+            .await?;
+            let claimed_run = if claimed {
+                repositories::self_improvement_run::find_by_id(
+                    &transaction,
+                    workspace_id.as_str(),
+                    run_id.as_str(),
+                )
+                .await?
+                .map(repositories::self_improvement_run::record_from_model)
+            } else {
+                None
+            };
+
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement run claim transaction")?;
+            Ok(claimed_run)
+        })
+        .await
+    }
+
+    pub async fn save_self_improvement_run_checkpoint(
+        &self,
+        fence: &SelfImprovementRunFence,
+        analysis_cursor_json: &str,
+        analysis_digest_json: &str,
+        now_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        let fence = fence.clone();
+        let analysis_cursor_json = analysis_cursor_json.to_owned();
+        let analysis_digest_json = analysis_digest_json.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement checkpoint transaction")?;
+            let applied = repositories::self_improvement_run::save_checkpoint(
+                &transaction,
+                &fence,
+                analysis_cursor_json.as_str(),
+                analysis_digest_json.as_str(),
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement checkpoint transaction")?;
+            Ok(applied)
+        })
+        .await
+    }
+
+    pub async fn heartbeat_self_improvement_run(
+        &self,
+        fence: &SelfImprovementRunFence,
+        now_unix: i64,
+        lease_expires_at_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        if lease_expires_at_unix <= now_unix {
+            bail!("self-improvement heartbeat lease must expire after heartbeat time");
+        }
+        let fence = fence.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement heartbeat transaction")?;
+            let result = repositories::self_improvement_run::heartbeat(
+                &transaction,
+                &fence,
+                unix_to_datetime(now_unix),
+                unix_to_datetime(lease_expires_at_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement heartbeat transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn requeue_failed_self_improvement_run(
+        &self,
+        run: &SelfImprovementRunRecord,
+        now_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        let run = run.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin failed self-improvement run requeue transaction")?;
+            let result = repositories::self_improvement_run::requeue_failed(
+                &transaction,
+                &run,
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit failed self-improvement run requeue transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn reset_unfinished_self_improvement_run_authority(
+        &self,
+        run: &SelfImprovementRunRecord,
+        authority: &SelfImprovementFinalizationAuthority,
+        now_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        let run = run.clone();
+        let authority = authority.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement run authority reset transaction")?;
+            let result = repositories::self_improvement_run::reset_unfinished_authority(
+                &transaction,
+                &run,
+                &authority,
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement run authority reset transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn return_self_improvement_run_to_pending(
+        &self,
+        fence: &SelfImprovementRunFence,
+        now_unix: i64,
+        next_attempt_at_unix: i64,
+        last_error: &str,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        if next_attempt_at_unix <= now_unix {
+            bail!("self-improvement retry must be scheduled after transition time");
+        }
+        self.transition_claimed_self_improvement_run(
+            fence,
+            repositories::self_improvement_run::STATUS_PENDING,
+            Some(next_attempt_at_unix),
+            last_error,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn yield_self_improvement_run_after_budget(
+        &self,
+        fence: &SelfImprovementRunFence,
+        now_unix: i64,
+        next_attempt_at_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        if next_attempt_at_unix <= now_unix {
+            bail!("self-improvement budget yield must schedule a future wake");
+        }
+        let fence = fence.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement budget-yield transaction")?;
+            let result = repositories::self_improvement_run::yield_claimed(
+                &transaction,
+                &fence,
+                unix_to_datetime(next_attempt_at_unix),
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement budget-yield transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn fail_claimed_self_improvement_run(
+        &self,
+        fence: &SelfImprovementRunFence,
+        now_unix: i64,
+        last_error: &str,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        self.transition_claimed_self_improvement_run(
+            fence,
+            repositories::self_improvement_run::STATUS_FAILED,
+            None,
+            last_error,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn cancel_claimed_self_improvement_run(
+        &self,
+        fence: &SelfImprovementRunFence,
+        now_unix: i64,
+        reason: &str,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        self.transition_claimed_self_improvement_run(
+            fence,
+            repositories::self_improvement_run::STATUS_CANCELLED,
+            None,
+            reason,
+            now_unix,
+        )
+        .await
+    }
+
+    async fn transition_claimed_self_improvement_run(
+        &self,
+        fence: &SelfImprovementRunFence,
+        status: &str,
+        next_attempt_at_unix: Option<i64>,
+        last_error: &str,
+        now_unix: i64,
+    ) -> Result<SelfImprovementRunMutationResult> {
+        let fence = fence.clone();
+        let status = status.to_owned();
+        let last_error = last_error.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement run transition transaction")?;
+            let result = repositories::self_improvement_run::transition_claimed(
+                &transaction,
+                &fence,
+                status.as_str(),
+                next_attempt_at_unix.map(unix_to_datetime),
+                last_error.as_str(),
+                unix_to_datetime(now_unix),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement run transition transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn finalize_self_improvement_run(
+        &self,
+        input: FinalizeSelfImprovementRunInput,
+        now_unix: i64,
+    ) -> Result<FinalizeSelfImprovementRunResult> {
+        repositories::self_improvement_finalization::validate_input(&input)?;
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin self-improvement finalization transaction")?;
+            let result = repositories::self_improvement_finalization::finalize(
+                &transaction,
+                &input,
+                unix_to_datetime(now_unix),
+            )
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+            transaction
+                .commit()
+                .await
+                .context("failed to commit self-improvement finalization transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
     pub fn new(connection: DatabaseConnection) -> Self {
         Self {
             connection,
@@ -1254,6 +2419,28 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             turn_runtime_snapshot::find_turn_runtime_snapshot(&self.connection, turn_id.as_str())
                 .await
+        })
+        .await
+    }
+
+    pub async fn clear_turn_runtime_snapshot_agent_skill_versions_if_matches(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expected_agent_skill_versions_json: &str,
+    ) -> Result<bool> {
+        let thread_id = thread_id.to_owned();
+        let turn_id = turn_id.to_owned();
+        let expected_agent_skill_versions_json = expected_agent_skill_versions_json.to_owned();
+        self.run_serialized_write(|| async {
+            turn_runtime_snapshot::clear_agent_skill_versions_if_matches(
+                &self.connection,
+                thread_id.as_str(),
+                turn_id.as_str(),
+                expected_agent_skill_versions_json.as_str(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
         })
         .await
     }
@@ -16550,6 +17737,10 @@ mod tests {
             model: "model-a".to_owned(),
             provider_name: "provider-a".to_owned(),
             reasoning_effort: None,
+            agent_skill_versions_json: Some(
+                r#"[{"skill_id":"AAAAAAAAAAAAAAAAAAAAA","version_id":"111111111111111111111","fingerprint":"fingerprint-a"}]"#
+                    .to_owned(),
+            ),
             hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#.to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: r#"[{"type":"text","text":"hello","textElements":[]}]"#.to_owned(),
@@ -16567,11 +17758,13 @@ mod tests {
             .expect("snapshot insert should succeed");
         assert_eq!(inserted.model, "model-a");
         assert_eq!(inserted.created_at, created_at);
+        assert!(inserted.agent_skill_versions_json.is_some());
 
-        let mut replacement = snapshot;
+        let mut replacement = snapshot.clone();
         replacement.model = "model-b".to_owned();
         replacement.provider_name = "provider-b".to_owned();
         replacement.reasoning_effort = Some("max".to_owned());
+        replacement.agent_skill_versions_json = None;
         replacement.runtime_environment_json =
             r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/b"}"#.to_owned();
         replacement.created_at = updated_at;
@@ -16584,6 +17777,7 @@ mod tests {
         assert_eq!(updated.model, "model-b");
         assert_eq!(updated.provider_name, "provider-b");
         assert_eq!(updated.reasoning_effort.as_deref(), Some("max"));
+        assert!(updated.agent_skill_versions_json.is_none());
         assert_eq!(updated.created_at, created_at);
         assert_eq!(updated.updated_at, updated_at);
 
@@ -16597,6 +17791,32 @@ mod tests {
             updated.runtime_environment_json
         );
         assert_eq!(fetched.reasoning_effort.as_deref(), Some("max"));
+
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_agent_skill_pin_snapshot \
+                 BEFORE INSERT ON turn_runtime_snapshot \
+                 WHEN NEW.agent_skill_versions_json IS NOT NULL \
+                 BEGIN SELECT RAISE(ABORT, 'forced Agent pin failure'); END;",
+            )
+            .await
+            .expect("conditional Agent pin failure trigger must install");
+        let mut base_fallback = snapshot;
+        base_fallback.turn_id = "turn_runtime_base_fallback".to_owned();
+        assert!(
+            store
+                .upsert_turn_runtime_snapshot(base_fallback.clone())
+                .await
+                .is_err(),
+            "conditional storage failure must reject the Agent-pinned snapshot"
+        );
+        base_fallback.agent_skill_versions_json = None;
+        let base_only = store
+            .upsert_turn_runtime_snapshot(base_fallback)
+            .await
+            .expect("the same authoritative snapshot must persist without optional Agent pins");
+        assert!(base_only.agent_skill_versions_json.is_none());
 
         assert_eq!(
             store
@@ -16713,6 +17933,7 @@ mod tests {
                     model: "model-a".to_owned(),
                     provider_name: "provider-a".to_owned(),
                     reasoning_effort: None,
+                    agent_skill_versions_json: None,
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),
@@ -21184,16 +22405,9 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_turn_projection_closes_running_attempts() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_terminal_cleanup";
+        let store = test_store_with_workspace(workspace_id).await;
         let thread_id = "thr_turn_terminal_cleanup";
         let turn_id = "turn_turn_terminal_cleanup";
         let item_id = "item_turn_terminal_cleanup";
@@ -22109,16 +23323,9 @@ mod tests {
 
     #[tokio::test]
     async fn turn_llm_context_repository_round_trips_and_cleans_terminal_turns() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_llm_context";
+        let store = test_store_with_workspace(workspace_id).await;
         let thread_id = "thr_llm_context";
         let active_turn_id = "turn_llm_active";
         let terminal_turn_id = "turn_llm_terminal";
@@ -25185,14 +26392,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_run_occurrence_turn_kind_and_origin_roundtrip() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection.clone());
+        let store = test_store_with_workspace("ws_000000000000000001").await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: "ws_000000000000000001".to_owned(),

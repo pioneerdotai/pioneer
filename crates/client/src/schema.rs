@@ -435,6 +435,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::settings::memory::MemorySettingToggle
         ),
         schema_doc!(
+            "self_improvement_model_setting.json",
+            crate::settings::self_improvement::SelfImprovementModelSetting
+        ),
+        schema_doc!(
             "model_provider_selection_update.json",
             crate::composer::model_selection::ModelProviderSelectionUpdate
         ),

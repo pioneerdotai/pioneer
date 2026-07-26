@@ -1138,6 +1138,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "self_improvement_model_setting.json",
+            crate::settings::self_improvement::SelfImprovementModelSetting,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
             "mcp_capability_selection_toggle.json",
             crate::composer::capabilities::McpCapabilitySelectionToggle,
             Domain::Composer,

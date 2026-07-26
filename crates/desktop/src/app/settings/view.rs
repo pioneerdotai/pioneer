@@ -1,7 +1,10 @@
 use crate::{
     app::{
         root::{PioneerDesktop, SettingsContentView},
-        settings::{MemoryModelSetting, MemorySettingToggle, VoiceInputEnableAction},
+        settings::{
+            MemoryModelSetting, MemorySettingToggle, SelfImprovementModelSetting,
+            VoiceInputEnableAction,
+        },
     },
     assets::PioneerIconName,
     components::{
@@ -23,8 +26,10 @@ use gpui_component::{
 use pioneer_client::providers::list::ProviderModelSelectorMode;
 use pioneer_client::settings::gateway::{self as gateway_settings, ThreadEpisodicSettingToggle};
 use pioneer_client::settings::memory as settings_memory;
+use pioneer_client::settings::self_improvement as settings_self_improvement;
 use pioneer_protocol::{
     GatewayMemoryModelSelection, GatewayMemorySettings, GatewayRemoteAccessSettings,
+    GatewaySelfImprovementModelSelection, GatewaySelfImprovementSettings,
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
     GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
@@ -65,6 +70,9 @@ impl PioneerDesktop {
         match self.settings_content_view {
             SettingsContentView::General => self.render_settings_general(window, cx),
             SettingsContentView::Memory => self.render_settings_memory(window, cx),
+            SettingsContentView::SelfImprovement => {
+                self.render_settings_self_improvement(window, cx)
+            }
         }
     }
 
@@ -211,6 +219,292 @@ impl PioneerDesktop {
                         )
                         .child(memory_settings_panel),
                 ),
+            )
+            .into_any_element()
+    }
+
+    fn render_settings_self_improvement(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let desktop_entity = cx.entity().clone();
+        let panel = match &self.gateway.settings {
+            Some(settings) => Self::render_self_improvement_settings(
+                settings.self_improvement.clone(),
+                desktop_entity,
+                window,
+                cx,
+            ),
+            None => {
+                Self::render_gateway_settings_status(self.gateway_settings_status_message(), cx)
+            }
+        };
+
+        v_flex()
+            .id("settings-self-improvement-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_6()
+            .bg(cx.theme().background)
+            .child(
+                h_flex().w_full().justify_center().child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH_PX))
+                        .gap_6()
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_semibold()
+                                        .child(t!("settings.self_improvement.title").to_string()),
+                                )
+                                .child(div().text_sm().opacity(0.6).child(
+                                    t!("settings.self_improvement.description").to_string(),
+                                )),
+                        )
+                        .child(panel),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_self_improvement_settings(
+        settings: GatewaySelfImprovementSettings,
+        desktop_entity: Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut panel = v_flex()
+            .w_full()
+            .gap_0()
+            .px_4()
+            .py_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(Self::render_self_improvement_toggle(
+                settings.enabled,
+                desktop_entity.clone(),
+            ));
+
+        if settings.enabled {
+            if settings_self_improvement::configuration_is_incomplete(&settings) {
+                panel = panel.child(Self::render_settings_divider(cx)).child(
+                    h_flex().w_full().py_3().child(
+                        div().text_xs().text_color(cx.theme().warning).child(
+                            t!("settings.self_improvement.configuration_incomplete").to_string(),
+                        ),
+                    ),
+                );
+            }
+            panel = panel
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_self_improvement_model_row(
+                    "settings-self-improvement-default-model",
+                    SelfImprovementModelSetting::Default,
+                    settings.default_model,
+                    t!("settings.self_improvement.default_model.label").to_string(),
+                    t!("settings.self_improvement.default_model.description").to_string(),
+                    t!("settings.self_improvement.model.not_selected").to_string(),
+                    false,
+                    desktop_entity.clone(),
+                    window,
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_self_improvement_model_row(
+                    "settings-self-improvement-reviewer-model",
+                    SelfImprovementModelSetting::Reviewer,
+                    settings.reviewer_model,
+                    t!("settings.self_improvement.reviewer_model.label").to_string(),
+                    t!("settings.self_improvement.reviewer_model.description").to_string(),
+                    t!("settings.self_improvement.model.use_default").to_string(),
+                    true,
+                    desktop_entity,
+                    window,
+                    cx,
+                ));
+        }
+
+        panel.into_any_element()
+    }
+
+    fn render_self_improvement_toggle(enabled: bool, desktop_entity: Entity<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.self_improvement.enabled.label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.self_improvement.enabled.description").to_string()),
+                    ),
+            )
+            .child(
+                Switch::new("settings-self-improvement-enabled")
+                    .checked(enabled)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_self_improvement_enabled(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_self_improvement_model_row(
+        id: &'static str,
+        setting: SelfImprovementModelSetting,
+        selection: Option<GatewaySelfImprovementModelSelection>,
+        label: String,
+        description: String,
+        empty_label: String,
+        allow_use_default: bool,
+        desktop_entity: Entity<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_provider = selection
+            .as_ref()
+            .map(|selection| selection.provider.clone());
+        let selected_model = selection.as_ref().map(|selection| selection.model.clone());
+        let has_override = selection.is_some();
+        let selection_label = settings_self_improvement::model_selection_display_label(
+            selection.as_ref(),
+            empty_label,
+        );
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .pt_3()
+            .pb_4()
+            .justify_between()
+            .items_start()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().text_sm().font_semibold().child(label))
+                    .child(div().text_xs().opacity(0.6).child(description)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_6()
+                    .items_center()
+                    .justify_between()
+                    .mt_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .font_medium()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(selection_label),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                small_outline_button((id, 0usize))
+                                    .label(
+                                        t!("settings.self_improvement.model.select_model")
+                                            .to_string(),
+                                    )
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        move |_, window, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                let workspace_id =
+                                                    view.model_selector_workspace_id();
+                                                view.open_model_selector_dialog(
+                                                    ModelSelectorDialogOptions {
+                                                        title: t!(
+                                                            "settings.self_improvement.model.dialog_title"
+                                                        )
+                                                        .to_string(),
+                                                        selected_provider:
+                                                            selected_provider.clone(),
+                                                        selected_model: selected_model.clone(),
+                                                        selected_reasoning_effort: None,
+                                                        mode: ProviderModelSelectorMode::SelfImprovement,
+                                                        workspace_id,
+                                                        ws_sender: view
+                                                            .gateway
+                                                            .ws_command_sender
+                                                            .clone(),
+                                                        on_save: Rc::new(
+                                                            move |view: &mut PioneerDesktop,
+                                                                  selection: ModelSelectorSelection,
+                                                                  cx| {
+                                                                let Some(selection) =
+                                                                    settings_self_improvement::model_selection_from_selector(selection)
+                                                                else {
+                                                                    return false;
+                                                                };
+                                                                view.apply_self_improvement_model_setting(
+                                                                    setting,
+                                                                    Some(selection),
+                                                                    cx,
+                                                                );
+                                                                true
+                                                            },
+                                                        ),
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }),
+                            )
+                            .when(allow_use_default && has_override, |row| {
+                                row.child(div().flex_none().child(
+                                    small_outline_button((id, 1usize))
+                                        .label(
+                                            t!(
+                                                "settings.self_improvement.model.use_default"
+                                            )
+                                            .to_string(),
+                                        )
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.apply_self_improvement_model_setting(
+                                                        setting, None, cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ))
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -1958,6 +2252,30 @@ mod tests {
         assert!(selector.contains("ProviderModelSelectorMode::Transcription"));
         assert!(selector.contains("apply_voice_input_model_selection"));
         assert!(!selector.contains("apply_voice_input_enabled"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn self_improvement_view_has_disclosure_models_and_api_only_selector() {
+        let source = production_view_source();
+        let screen = source
+            .split("fn render_settings_self_improvement")
+            .nth(1)
+            .expect("Self-improvement screen exists")
+            .split("fn render_locale_setting")
+            .next()
+            .expect("Self-improvement screen boundary exists");
+
+        assert!(screen.contains("render_self_improvement_toggle"));
+        assert!(screen.contains("if settings.enabled"));
+        assert!(screen.contains("configuration_is_incomplete"));
+        assert!(screen.contains("SelfImprovementModelSetting::Default"));
+        assert!(screen.contains("SelfImprovementModelSetting::Reviewer"));
+        assert!(screen.contains("ProviderModelSelectorMode::SelfImprovement"));
+        assert!(screen.contains("settings_self_improvement::model_selection_from_selector"));
+        assert!(screen.contains("apply_self_improvement_model_setting"));
+        assert!(screen.contains("settings.self_improvement.model.use_default"));
+        assert!(!screen.contains("ProviderModelSelectorMode::Chat"));
+        assert!(!screen.contains("ProviderModelSelectorMode::Transcription"));
     }
 
     #[::core::prelude::v1::test]

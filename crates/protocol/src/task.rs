@@ -699,6 +699,20 @@ pub struct TaskWriteLockConflict {
 }
 
 pub const TASK_COMPOSER_WORK_VERSION: u32 = 1;
+const TASK_DELIVERY_RESULT_ITEM_ID_PREFIX: &str = "task_delivery_result_";
+
+pub fn task_delivery_result_item_id(delivery_id: &str) -> String {
+    format!("{TASK_DELIVERY_RESULT_ITEM_ID_PREFIX}{delivery_id}")
+}
+
+pub fn task_delivery_id_from_result_item_id(item_id: &str) -> Option<&str> {
+    let delivery_id = item_id.strip_prefix(TASK_DELIVERY_RESULT_ITEM_ID_PREFIX)?;
+    (!delivery_id.is_empty()
+        && delivery_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(delivery_id)
+}
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -2942,6 +2956,24 @@ mod tests {
         assert_eq!(rebound.execution_backend, launch.execution_backend);
         assert_eq!(rebound.reasoning, launch.reasoning);
         assert_eq!(rebound.permission_profile, launch.permission_profile);
+    }
+
+    #[test]
+    fn task_delivery_result_item_identity_round_trips() {
+        let item_id = super::task_delivery_result_item_id("delivery_123");
+        assert_eq!(item_id, "task_delivery_result_delivery_123");
+        assert_eq!(
+            super::task_delivery_id_from_result_item_id(item_id.as_str()),
+            Some("delivery_123")
+        );
+        assert_eq!(
+            super::task_delivery_id_from_result_item_id("task_delivery_result_"),
+            None
+        );
+        assert_eq!(
+            super::task_delivery_id_from_result_item_id("unrelated_item"),
+            None
+        );
     }
 
     #[test]

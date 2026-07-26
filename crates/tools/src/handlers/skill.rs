@@ -17,7 +17,9 @@ use crate::spec::{
 };
 use async_trait::async_trait;
 use pioneer_protocol::SkillId;
-use pioneer_skills::{DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel};
+use pioneer_skills::{
+    DynamicToolOutputPolicyDeclaration, ReadSkillSource, SkillSourceKind, SkillTrustLevel,
+};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,7 +64,7 @@ pub struct SkillReadToolEntry {
     pub name: String,
     pub description: String,
     pub body: String,
-    pub skill_asset_root: String,
+    pub source: ReadSkillSource,
     pub fingerprint: String,
     pub source_kind: String,
 }
@@ -184,7 +186,11 @@ pub fn materialize_skill_runtime_tools(
     }
 
     if let Some(read_skill) = read_skill {
-        bundle.specs.push(read_skill_spec());
+        let contains_inline_agent = read_skill
+            .index
+            .values()
+            .any(|entry| entry.source.is_inline_agent());
+        bundle.specs.push(read_skill_spec(contains_inline_agent));
         bundle.handlers.push((
             READ_SKILL_TOOL_NAME.to_owned(),
             Arc::new(ReadSkillHandler {
@@ -390,11 +396,16 @@ fn runtime_descriptor_to_handler(
     }
 }
 
-fn read_skill_spec() -> ConfiguredToolSpec {
+fn read_skill_spec(contains_inline_agent: bool) -> ConfiguredToolSpec {
+    let description = if contains_inline_agent {
+        "Read full instructions for an active skill by its exact skill:<skill_id> reference. Package skills include skill_asset_root; inline Agent skills include their exact immutable version ID."
+    } else {
+        "Read full instructions and skill_asset_root for an active skill by its exact skill:<skill_id> reference. Relative paths in the returned skill body resolve under skill_asset_root."
+    };
     ConfiguredToolSpec::new(
         ToolSpec::new(
             READ_SKILL_TOOL_NAME,
-            "Read full instructions and skill_asset_root for an active skill by its exact skill:<skill_id> reference. Relative paths in the returned skill body resolve under skill_asset_root.",
+            description,
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -406,7 +417,7 @@ fn read_skill_spec() -> ConfiguredToolSpec {
                     "max_chars": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional maximum number of skill body characters to return."
+                        "description": "Optional maximum number of package-skill body characters to return. Inline Agent skill bodies are always returned exactly."
                     },
                     "include_metadata": {
                         "type": "boolean",
@@ -482,36 +493,54 @@ impl ToolHandler for ReadSkillHandler {
             )));
         };
 
-        let mut body = entry.body.clone();
-        let mut truncated = false;
-        if body.chars().count() > max_chars {
-            body = body.chars().take(max_chars).collect::<String>();
-            truncated = true;
-        }
+        let (body, truncated) = match &entry.source {
+            ReadSkillSource::Package { .. } if entry.body.chars().count() > max_chars => {
+                (entry.body.chars().take(max_chars).collect::<String>(), true)
+            }
+            ReadSkillSource::Package { .. } | ReadSkillSource::InlineAgent { .. } => {
+                (entry.body.clone(), false)
+            }
+        };
 
-        let payload = if include_metadata {
-            serde_json::json!({
+        let payload = match (&entry.source, include_metadata) {
+            (ReadSkillSource::Package { asset_root }, true) => serde_json::json!({
                 "skill_id": entry.skill_id,
                 "owner": entry.owner,
                 "slug": entry.slug,
                 "name": entry.name,
                 "description": entry.description,
-                "skill_asset_root": entry.skill_asset_root,
+                "skill_asset_root": asset_root,
                 "relative_path_resolution": "Resolve relative file paths mentioned by this skill under skill_asset_root. Prefer absolute paths built from skill_asset_root for commands and file operations.",
                 "body": body,
                 "truncated": truncated,
                 "fingerprint": entry.fingerprint,
                 "source_kind": entry.source_kind
-            })
-        } else {
-            serde_json::json!({
+            }),
+            (ReadSkillSource::Package { asset_root }, false) => serde_json::json!({
                 "skill_id": entry.skill_id,
                 "slug": entry.slug,
-                "skill_asset_root": entry.skill_asset_root,
+                "skill_asset_root": asset_root,
                 "relative_path_resolution": "Resolve relative file paths mentioned by this skill under skill_asset_root. Prefer absolute paths built from skill_asset_root for commands and file operations.",
                 "body": body,
                 "truncated": truncated
-            })
+            }),
+            (ReadSkillSource::InlineAgent { version_id }, true) => serde_json::json!({
+                "skill_id": entry.skill_id,
+                "version_id": version_id,
+                "slug": entry.slug,
+                "name": entry.name,
+                "description": entry.description,
+                "body": body,
+                "truncated": truncated,
+                "fingerprint": entry.fingerprint,
+                "source_kind": entry.source_kind
+            }),
+            (ReadSkillSource::InlineAgent { version_id }, false) => serde_json::json!({
+                "skill_id": entry.skill_id,
+                "version_id": version_id,
+                "body": body,
+                "truncated": truncated
+            }),
         };
 
         let text = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
@@ -862,7 +891,7 @@ mod tests {
         SkillId, TurnExecutionSecuritySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
         TurnPermissionProfileSource,
     };
-    use pioneer_skills::{SkillSourceKind, SkillTrustLevel};
+    use pioneer_skills::{ReadSkillSource, SkillSourceKind, SkillTrustLevel};
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -876,7 +905,9 @@ mod tests {
             name: name.to_owned(),
             description: "Skill description".to_owned(),
             body: "Skill body".to_owned(),
-            skill_asset_root: "/tmp/pioneer-skills/user/workspace/weather".to_owned(),
+            source: ReadSkillSource::Package {
+                asset_root: "/tmp/pioneer-skills/user/workspace/weather".to_owned(),
+            },
             fingerprint: "fingerprint".to_owned(),
             source_kind: "user".to_owned(),
         }
@@ -898,6 +929,22 @@ mod tests {
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn inline_agent_read_skill_entry() -> SkillReadToolEntry {
+        SkillReadToolEntry {
+            skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid Agent skill ID"),
+            owner: None,
+            slug: "stable-procedure".to_owned(),
+            name: "Stable procedure".to_owned(),
+            description: "Use for stable procedures.".to_owned(),
+            body: "Exact immutable Agent body.".to_owned(),
+            source: ReadSkillSource::InlineAgent {
+                version_id: "111111111111111111111".to_owned(),
+            },
+            fingerprint: "a".repeat(64),
+            source_kind: "agent".to_owned(),
         }
     }
 
@@ -966,7 +1013,7 @@ mod tests {
 
     #[test]
     fn read_skill_schema_points_model_to_exact_skill_id() {
-        let spec = read_skill_spec();
+        let spec = read_skill_spec(false);
         let skill_id = &spec.spec.parameters["properties"]["skill_id"];
 
         assert_eq!(skill_id["pattern"], r"^skill:[A-Za-z0-9]{21}$");
@@ -983,6 +1030,14 @@ mod tests {
                 .contains("Never reconstruct")
         );
         assert!(spec.spec.description.contains("skill_asset_root"));
+
+        let inline_spec = read_skill_spec(true);
+        assert!(
+            inline_spec.spec.parameters["properties"]["max_chars"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Inline Agent skill bodies are always returned exactly")
+        );
     }
 
     #[tokio::test]
@@ -1155,5 +1210,31 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("not active"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_returns_exact_inline_agent_body_without_filesystem_instructions() {
+        let handler = ReadSkillHandler {
+            read_skill_index: HashMap::from([(
+                "skill:AAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                inline_agent_read_skill_entry(),
+            )]),
+            default_max_chars: 1,
+        };
+
+        let output = handler
+            .handle(
+                read_skill_invocation("skill:AAAAAAAAAAAAAAAAAAAAA"),
+                crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
+            )
+            .await
+            .expect("exact inline Agent skill must resolve");
+
+        assert_eq!(output.raw_json()["body"], "Exact immutable Agent body.");
+        assert_eq!(output.raw_json()["truncated"], false);
+        assert_eq!(output.raw_json()["version_id"], "111111111111111111111");
+        assert_eq!(output.raw_json()["source_kind"], "agent");
+        assert!(output.raw_json().get("skill_asset_root").is_none());
+        assert!(output.raw_json().get("relative_path_resolution").is_none());
     }
 }

@@ -317,6 +317,7 @@ mod tests {
                     model: "model-a".to_owned(),
                     provider_name: "provider-a".to_owned(),
                     reasoning_effort: None,
+                    agent_skill_versions_json: None,
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),
@@ -362,6 +363,9 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_repair_completes_turn_after_final_agent_message() {
         let connection = setup_workspace_database().await;
+        ensure_default_workspace_exists(&connection)
+            .await
+            .expect("default workspace creation should succeed");
         let now = chrono::Utc::now().fixed_offset();
         let thread_id = "thread_final_agent_message";
         let turn_id = "turn_final_agent_message";

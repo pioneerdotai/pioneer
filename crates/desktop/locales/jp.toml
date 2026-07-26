@@ -773,6 +773,7 @@ description = "アプリの設定を管理します。"
 back = "戻る"
 general = "一般"
 memory = "メモリ"
+self_improvement = "自己改善"
 
 [settings.option.language]
 label = "アプリの言語"
@@ -873,6 +874,29 @@ description = "ローカルのデバッグ画面にメモリ機構の診断を�
 default = "デフォルト"
 select_model = "モデルを選択"
 dialog_title = "メモリモデルを選択"
+
+[settings.self_improvement]
+title = "自己改善"
+description = "完了した作業の有用なパターンからエージェントスキルを作成・更新します。"
+configuration_incomplete = "自己改善を実行する前にデフォルトモデルを選択してください。"
+
+[settings.self_improvement.enabled]
+label = "自己改善"
+description = "完了したターンから再利用可能なエージェントスキルを Pioneer が学習できるようにします。"
+
+[settings.self_improvement.default_model]
+label = "デフォルトモデル"
+description = "日次学習とスキル作成に必要なモデルです。"
+
+[settings.self_improvement.reviewer_model]
+label = "レビューモデル"
+description = "任意の独立レビューです。未選択の場合はデフォルトモデルを使用します。"
+
+[settings.self_improvement.model]
+not_selected = "未選択"
+use_default = "デフォルトモデルを使用"
+select_model = "モデルを選択"
+dialog_title = "自己改善モデルを選択"
 
 [settings.memory.vector_search]
 label = "ベクトル検索"

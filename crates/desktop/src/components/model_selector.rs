@@ -85,7 +85,9 @@ enum ApiProviderModelListKind {
 
 fn api_provider_model_list_kind(mode: ProviderModelSelectorMode) -> ApiProviderModelListKind {
     match mode {
-        ProviderModelSelectorMode::Chat => ApiProviderModelListKind::Chat,
+        ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::SelfImprovement => {
+            ApiProviderModelListKind::Chat
+        }
         ProviderModelSelectorMode::Embeddings => ApiProviderModelListKind::Embeddings,
         ProviderModelSelectorMode::Transcription => ApiProviderModelListKind::Transcription,
     }
@@ -533,7 +535,10 @@ impl PioneerDesktop {
     fn reasoning_effort_rows(
         state: &ModelSelectorDialogState,
     ) -> Vec<provider_presentation::ReasoningEffortRow> {
-        if state.mode == ProviderModelSelectorMode::Transcription {
+        if matches!(
+            state.mode,
+            ProviderModelSelectorMode::Transcription | ProviderModelSelectorMode::SelfImprovement
+        ) {
             return Vec::new();
         }
         let selector = state.selector.borrow();
@@ -1362,6 +1367,10 @@ mod tests {
         );
         assert_eq!(
             api_provider_model_list_kind(ProviderModelSelectorMode::Chat),
+            ApiProviderModelListKind::Chat
+        );
+        assert_eq!(
+            api_provider_model_list_kind(ProviderModelSelectorMode::SelfImprovement),
             ApiProviderModelListKind::Chat
         );
         assert_eq!(

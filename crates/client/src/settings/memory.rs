@@ -112,6 +112,7 @@ pub fn gateway_settings_snapshot_with_memory(
     let mut snapshot = current.cloned().unwrap_or_else(|| GatewaySettingsSnapshot {
         general: GatewayGeneralSettings::default(),
         memory: GatewayMemorySettings::default(),
+        self_improvement: Default::default(),
         thread_episodic: Default::default(),
         cli_runtimes: Default::default(),
         remote_access: Default::default(),
@@ -125,6 +126,7 @@ pub fn gateway_settings_update_for_memory(memory: GatewayMemorySettings) -> Gate
     GatewaySettingsUpdate {
         general: None,
         memory: Some(memory),
+        self_improvement: None,
         thread_episodic: None,
         cli_runtimes: None,
         remote_access: None,
@@ -143,6 +145,7 @@ mod tests {
                 ..Default::default()
             },
             memory: GatewayMemorySettings::default(),
+            self_improvement: Default::default(),
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
             remote_access: Default::default(),

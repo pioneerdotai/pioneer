@@ -30,6 +30,10 @@ pub struct ProviderSummaryCapabilities {
     pub embeddings: bool,
     #[serde(default)]
     pub transcription: bool,
+    /// Gateway-authoritative eligibility for the API-only self-improvement
+    /// model selectors.
+    #[serde(default)]
+    pub self_improvement: bool,
 }
 
 // --- Provider list models ---

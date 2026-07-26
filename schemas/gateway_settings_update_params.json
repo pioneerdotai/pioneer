@@ -190,6 +190,52 @@
         }
       }
     },
+    "GatewaySelfImprovementModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "GatewaySelfImprovementSettings": {
+      "type": "object",
+      "properties": {
+        "default_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "reviewer_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "GatewaySettingsUpdate": {
       "type": "object",
       "properties": {
@@ -227,6 +273,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/GatewayRemoteAccessSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "self_improvement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementSettings"
             },
             {
               "type": "null"

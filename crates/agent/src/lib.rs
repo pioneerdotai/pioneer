@@ -14,9 +14,9 @@ mod manager_tests;
 use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ExecutionCheckpointPayload,
-    ExecutionWindowExhaustionReason, McpScopeKind, ProviderFailureDetails, ThreadMode,
-    TurnCapability, TurnExecutionSecuritySnapshot, TurnItemType, TurnPermissionProfileSnapshot,
-    UserInput,
+    ExecutionWindowExhaustionReason, McpScopeKind, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot, TurnItemType,
+    TurnPermissionProfileSnapshot, UserInput,
 };
 #[cfg(test)]
 use pioneer_protocol::{
@@ -31,7 +31,9 @@ use pioneer_provider::{
 };
 #[cfg(test)]
 use pioneer_skills::SkillAuditEvent;
-use pioneer_skills::{SkillCatalogSnapshot, SkillPolicyKey, SkillTrustLevel};
+use pioneer_skills::{
+    AgentSkillRuntimeEntry, SkillCatalogSnapshot, SkillPolicyKey, SkillTrustLevel,
+};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
@@ -64,6 +66,15 @@ use pioneer_tools::{
     ComputerUseToolsConfig, ExecutionWindowsConfig, PermissionApprovalBroker,
     StaticPermissionApprovalBroker, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
+
+/// Classifies an API-provider transport failure without exposing turn-specific
+/// recovery machinery.
+pub fn classify_provider_failure_message(
+    error_message: &str,
+    stage: ProviderFailureStage,
+) -> ProviderFailureClass {
+    chat::classify_provider_failure_message(error_message, stage)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedArtifactInput {
@@ -793,6 +804,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub skill_catalog: SkillCatalogSnapshot,
+    pub agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
     pub input: Vec<UserInput>,
     pub capabilities: Vec<TurnCapability>,
     pub resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -834,6 +846,7 @@ struct ActiveTurnRequest {
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     skill_catalog: SkillCatalogSnapshot,
+    agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
     input: Vec<UserInput>,
     capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -889,6 +902,7 @@ enum AgentCommand {
         reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
         input: Vec<UserInput>,
         capabilities: Vec<TurnCapability>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -1301,6 +1315,47 @@ impl AgentManager {
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            skill_catalog,
+            Vec::new(),
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            reasoning_effort,
+            permission_profile,
+            execution_security_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        reasoning_effort: Option<&str>,
+        permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
+    ) -> Result<(), AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
@@ -1311,6 +1366,7 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             skill_catalog,
+            agent_skill_overlay,
             input,
             capabilities,
             resolved_artifacts,
@@ -1343,7 +1399,7 @@ impl AgentManager {
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context_reasoning_permission_profile_and_security_snapshot(
+        self.start_turn_with_hook_context_permission_profile_security_snapshot_and_agent_skill_overlay(
             thread_id,
             turn_id,
             mode,
@@ -1352,6 +1408,48 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             skill_catalog,
+            Vec::new(),
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            permission_profile,
+            execution_security_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context_permission_profile_security_snapshot_and_agent_skill_overlay(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
+    ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            skill_catalog,
+            agent_skill_overlay,
             input,
             capabilities,
             resolved_artifacts,
@@ -1384,6 +1482,49 @@ impl AgentManager {
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            skill_catalog,
+            Vec::new(),
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            reasoning_effort,
+            permission_profile,
+            execution_security_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        reasoning_effort: Option<&str>,
+        permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
+    ) -> Result<(), AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
@@ -1394,6 +1535,7 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             skill_catalog,
+            agent_skill_overlay,
             input,
             capabilities,
             resolved_artifacts,
@@ -1427,6 +1569,49 @@ impl AgentManager {
         permission_profile: TurnPermissionProfileSnapshot,
         execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            skill_catalog,
+            Vec::new(),
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            execution_checkpoint_context,
+            permission_profile,
+            execution_security_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+        permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
+    ) -> Result<(), AgentStartError> {
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
             turn_id,
@@ -1436,6 +1621,7 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             skill_catalog,
+            agent_skill_overlay,
             input,
             capabilities,
             resolved_artifacts,
@@ -1460,6 +1646,7 @@ impl AgentManager {
         provider_name: &str,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
+        agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
         input: Vec<UserInput>,
         capabilities: Vec<TurnCapability>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -1490,6 +1677,7 @@ impl AgentManager {
                 reasoning,
                 workspace_skill_policies,
                 skill_catalog,
+                agent_skill_overlay,
                 input,
                 capabilities,
                 resolved_artifacts,

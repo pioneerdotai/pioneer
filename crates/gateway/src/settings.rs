@@ -4,7 +4,8 @@ use pioneer_config::{
     GatewayCliAgentRuntimeKindConfig, GatewayConfig, GatewayMemoryConfig,
     GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
-    GatewayRemoteAccessConfig, GatewayThreadEpisodicConfig,
+    GatewayRemoteAccessConfig, GatewaySelfImprovementConfig,
+    GatewaySelfImprovementModelSelectionConfig, GatewayThreadEpisodicConfig,
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
     GatewayVoiceConfig, GatewayVoiceInputProviderConfig,
 };
@@ -26,6 +27,8 @@ pub struct GatewaySettings {
     secrets: GatewaySecretsSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<GatewayMemorySettingsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    self_improvement: Option<GatewaySelfImprovementConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -56,6 +59,8 @@ struct GatewaySettingsWire {
     #[serde(default)]
     memory: Option<GatewayMemorySettingsOverride>,
     #[serde(default)]
+    self_improvement: Option<GatewaySelfImprovementConfig>,
+    #[serde(default)]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(default)]
     workspaces: BTreeMap<String, GatewayWorkspaceSettingsOverride>,
@@ -78,6 +83,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             general: wire.general,
             secrets: wire.secrets,
             memory: wire.memory,
+            self_improvement: wire.self_improvement,
             thread_episodic: wire.thread_episodic,
             workspaces: wire.workspaces,
             cli_runtimes: wire.cli_runtimes,
@@ -505,6 +511,15 @@ impl GatewaySettings {
         }
     }
 
+    pub fn effective_self_improvement_settings(
+        &self,
+        config: &GatewaySelfImprovementConfig,
+    ) -> GatewaySelfImprovementConfig {
+        self.self_improvement
+            .clone()
+            .unwrap_or_else(|| config.clone())
+    }
+
     pub fn effective_thread_episodic_settings(
         &self,
         config: &GatewayThreadEpisodicConfig,
@@ -608,6 +623,24 @@ impl GatewaySettings {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
     }
 
+    fn set_self_improvement_settings(
+        &mut self,
+        settings: pioneer_protocol::GatewaySelfImprovementSettings,
+    ) -> Result<()> {
+        let mut normalized = self_improvement_settings_from_protocol(settings)?;
+        if !normalized.enabled {
+            let stored = self.self_improvement.as_ref();
+            if normalized.default_model.is_none() {
+                normalized.default_model = stored.and_then(|value| value.default_model.clone());
+            }
+            if normalized.reviewer_model.is_none() {
+                normalized.reviewer_model = stored.and_then(|value| value.reviewer_model.clone());
+            }
+        }
+        self.self_improvement = Some(normalized);
+        Ok(())
+    }
+
     pub fn set_thread_episodic_settings(&mut self, thread_episodic: GatewayThreadEpisodicSettings) {
         self.thread_episodic = Some(
             GatewayThreadEpisodicSettingsOverride::from_thread_episodic_settings(thread_episodic),
@@ -665,6 +698,9 @@ impl GatewaySettings {
         pioneer_protocol::GatewaySettingsSnapshot {
             general,
             memory: self.effective_memory_settings(&config.memory).to_protocol(),
+            self_improvement: self_improvement_settings_to_protocol(
+                &self.effective_self_improvement_settings(&config.self_improvement),
+            ),
             thread_episodic: self
                 .effective_thread_episodic_settings_for_workspace(
                     &config.thread_episodic,
@@ -701,6 +737,10 @@ impl GatewaySettings {
             let memory = GatewayMemorySettings::from_protocol(memory);
             self.set_memory_settings(memory);
             changes.memory = true;
+        }
+        if let Some(self_improvement) = update.self_improvement {
+            self.set_self_improvement_settings(self_improvement)?;
+            changes.self_improvement = true;
         }
         if let Some(thread_episodic) = update.thread_episodic {
             let normalized_workspace_id = normalize_workspace_settings_key(workspace_id);
@@ -844,6 +884,8 @@ impl GatewaySettings {
         config.keepawake = general.keepawake;
         config.preflight_model = model_selection_from_protocol(general.preflight_model);
         config.memory = self.apply_to_gateway_memory_config(config.memory);
+        config.self_improvement =
+            self.effective_self_improvement_settings(&config.self_improvement);
         config.thread_episodic =
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
         config.voice = self.effective_voice_input_config(&config.voice);
@@ -1480,6 +1522,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub struct GatewaySettingsChangeSet {
     pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
+    pub self_improvement: bool,
     pub thread_episodic: bool,
     pub thread_episodic_vector_projection_changed: bool,
     pub thread_episodic_vector_projection_workspace_id: Option<String>,
@@ -1933,6 +1976,65 @@ fn model_selection_to_protocol(
     }
 }
 
+pub(crate) fn self_improvement_settings_from_protocol(
+    settings: pioneer_protocol::GatewaySelfImprovementSettings,
+) -> Result<GatewaySelfImprovementConfig> {
+    Ok(GatewaySelfImprovementConfig {
+        enabled: settings.enabled,
+        default_model: settings
+            .default_model
+            .map(|selection| {
+                self_improvement_model_selection_from_protocol("default_model", selection)
+            })
+            .transpose()?,
+        reviewer_model: settings
+            .reviewer_model
+            .map(|selection| {
+                self_improvement_model_selection_from_protocol("reviewer_model", selection)
+            })
+            .transpose()?,
+    })
+}
+
+fn self_improvement_model_selection_from_protocol(
+    field: &str,
+    selection: pioneer_protocol::GatewaySelfImprovementModelSelection,
+) -> Result<GatewaySelfImprovementModelSelectionConfig> {
+    let selection = selection
+        .normalized()
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("invalid self-improvement {field}"))?;
+    Ok(GatewaySelfImprovementModelSelectionConfig {
+        provider: selection.provider,
+        model: selection.model,
+    })
+}
+
+pub(crate) fn self_improvement_settings_to_protocol(
+    settings: &GatewaySelfImprovementConfig,
+) -> pioneer_protocol::GatewaySelfImprovementSettings {
+    pioneer_protocol::GatewaySelfImprovementSettings {
+        enabled: settings.enabled,
+        default_model: settings
+            .default_model
+            .as_ref()
+            .map(self_improvement_model_selection_to_protocol),
+        reviewer_model: settings
+            .reviewer_model
+            .as_ref()
+            .map(self_improvement_model_selection_to_protocol),
+    }
+}
+
+fn self_improvement_model_selection_to_protocol(
+    selection: &GatewaySelfImprovementModelSelectionConfig,
+) -> pioneer_protocol::GatewaySelfImprovementModelSelection {
+    pioneer_protocol::GatewaySelfImprovementModelSelection {
+        provider: selection.provider.clone(),
+        model: selection.model.clone(),
+    }
+}
+
 fn normalize_cli_runtime_instance_id(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2084,6 +2186,7 @@ pub fn load_or_create_gateway_settings(
         general: GatewayGeneralSettings::default(),
         secrets: GatewaySecretsSettings::default(),
         memory: None,
+        self_improvement: None,
         thread_episodic: None,
         workspaces: BTreeMap::new(),
         cli_runtimes: Some(GatewayCliRuntimeSettingsOverride::default_supported()?),
@@ -2202,8 +2305,8 @@ mod tests {
         GatewayArtifactsConfig, GatewayAuthConfig, GatewayCliAgentRuntimeConfig,
         GatewayCliAgentRuntimeInstancesConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig,
-        GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySkillsConfig,
-        GatewayThreadConfig, GatewayThreadEpisodicConfig,
+        GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySelfImprovementConfig,
+        GatewaySkillsConfig, GatewayThreadConfig, GatewayThreadEpisodicConfig,
         GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
         GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
         GatewayWebToolsConfig,
@@ -2693,6 +2796,7 @@ backend = "keystore"
                     )),
                 }),
                 memory: None,
+                self_improvement: None,
                 thread_episodic: None,
                 cli_runtimes: None,
                 remote_access: None,
@@ -2708,6 +2812,189 @@ backend = "keystore"
         assert!(content.contains("model_provider = \"planner-provider\""));
         assert!(content.contains("model = \"planner-model\""));
         assert!(!content.contains("[memory]"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn self_improvement_settings_are_default_off_when_section_is_absent() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("settings without self-improvement must parse");
+
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+        assert_eq!(
+            snapshot.self_improvement,
+            pioneer_protocol::GatewaySelfImprovementSettings::default()
+        );
+    }
+
+    #[test]
+    fn self_improvement_settings_normalize_and_strictly_roundtrip() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                    enabled: true,
+                    default_model: Some(pioneer_protocol::GatewaySelfImprovementModelSelection {
+                        provider: " openai ".to_owned(),
+                        model: " gpt-5.4 ".to_owned(),
+                    }),
+                    reviewer_model: Some(pioneer_protocol::GatewaySelfImprovementModelSelection {
+                        provider: " anthropic ".to_owned(),
+                        model: " claude-sonnet ".to_owned(),
+                    }),
+                }),
+                ..Default::default()
+            })
+            .expect("complete self-improvement settings must apply");
+        assert!(changes.self_improvement);
+
+        save_gateway_settings(&path, &settings).expect("settings should save");
+        let content = fs::read_to_string(&path).expect("settings should be readable");
+        assert!(content.contains("[self_improvement]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("provider = \"openai\""));
+        assert!(content.contains("model = \"gpt-5.4\""));
+        assert!(!content.contains(" openai "));
+
+        let reloaded =
+            super::load_gateway_settings(&path, 1, "gateway-settings.toml").expect("strict reload");
+        let snapshot = reloaded.snapshot(&gateway_config_with_keepawake(false));
+        let persisted = snapshot
+            .self_improvement
+            .default_model
+            .expect("default model must survive");
+        assert_eq!(persisted.provider, "openai");
+        assert_eq!(persisted.model, "gpt-5.4");
+        let reviewer = snapshot
+            .self_improvement
+            .reviewer_model
+            .expect("reviewer model must survive");
+        assert_eq!(reviewer.provider, "anthropic");
+        assert_eq!(reviewer.model, "claude-sonnet");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn disabling_self_improvement_preserves_stored_model_selections() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                    enabled: true,
+                    default_model: Some(pioneer_protocol::GatewaySelfImprovementModelSelection {
+                        provider: "openai".to_owned(),
+                        model: "gpt-5.4".to_owned(),
+                    }),
+                    reviewer_model: Some(pioneer_protocol::GatewaySelfImprovementModelSelection {
+                        provider: "anthropic".to_owned(),
+                        model: "claude-sonnet".to_owned(),
+                    }),
+                }),
+                ..Default::default()
+            })
+            .expect("initial selection must apply");
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                    enabled: false,
+                    default_model: None,
+                    reviewer_model: None,
+                }),
+                ..Default::default()
+            })
+            .expect("disable must apply without clearing selections");
+
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+        assert!(!snapshot.self_improvement.enabled);
+        assert_eq!(
+            snapshot
+                .self_improvement
+                .default_model
+                .as_ref()
+                .map(|selection| selection.model.as_str()),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            snapshot
+                .self_improvement
+                .reviewer_model
+                .as_ref()
+                .map(|selection| selection.model.as_str()),
+            Some("claude-sonnet")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn self_improvement_settings_accept_incomplete_disabled_or_enabled_state_but_not_partial_pair()
+    {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                    enabled: true,
+                    default_model: None,
+                    reviewer_model: None,
+                }),
+                ..Default::default()
+            })
+            .expect("enabled without a model is a valid incomplete configuration");
+
+        let error = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                    enabled: true,
+                    default_model: Some(pioneer_protocol::GatewaySelfImprovementModelSelection {
+                        provider: "openai".to_owned(),
+                        model: "   ".to_owned(),
+                    }),
+                    reviewer_model: None,
+                }),
+                ..Default::default()
+            })
+            .expect_err("half-filled pair must be rejected");
+        assert!(format!("{error:#}").contains("requires both provider and model"));
+
+        let strict_partial = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[self_improvement]
+enabled = true
+
+[self_improvement.default_model]
+provider = "openai"
+"#,
+        );
+        assert!(strict_partial.is_err());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -4224,6 +4511,7 @@ model = "legacy-model"
                 run_migrations_on_startup: true,
             },
             memory: GatewayMemoryConfig::default(),
+            self_improvement: GatewaySelfImprovementConfig::default(),
             thread_episodic: GatewayThreadEpisodicConfig::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),

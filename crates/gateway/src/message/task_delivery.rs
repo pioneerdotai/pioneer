@@ -418,7 +418,7 @@ impl MessageProcessor {
 fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
     if let Some(error) = delivery.error_snapshot.as_ref() {
         return TurnItem::SystemEvent {
-            id: format!("task_delivery_result_{}", delivery.id),
+            id: pioneer_protocol::task_delivery_result_item_id(delivery.id.as_str()),
             level: SystemEventLevel::Error,
             message: error.message.clone(),
             code: Some(error.code.clone()),
@@ -436,7 +436,7 @@ fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "Task completed.".to_owned());
     TurnItem::AgentMessage {
-        id: format!("task_delivery_result_{}", delivery.id),
+        id: pioneer_protocol::task_delivery_result_item_id(delivery.id.as_str()),
         phase: Default::default(),
         markdown: Some(super::markdown::parse_markdown_document(text.as_str())),
         markdown_version: Some(MARKDOWN_AST_VERSION),

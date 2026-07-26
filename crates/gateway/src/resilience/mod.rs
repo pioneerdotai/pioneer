@@ -1,6 +1,7 @@
 mod recovery;
 mod timeout;
 
+pub(crate) use recovery::provider_failure_class_name;
 pub use recovery::{
     CliRuntimeRecoveryAttemptRequest, ProviderFailureCandidate, RecoveryCoordinator,
     RecoveryCoordinatorEvent, RecoveryPolicyRegistry, RecoveryTerminalOutcome,

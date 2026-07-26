@@ -140,7 +140,8 @@ pub use settings::{
     GatewayMemorySettings, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
     GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
-    GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
+    GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
+    GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
     GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
@@ -208,6 +209,7 @@ pub use task::{
     TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction,
     TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict,
     TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
+    task_delivery_id_from_result_item_id, task_delivery_result_item_id,
 };
 pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadComposerExecutionMode,

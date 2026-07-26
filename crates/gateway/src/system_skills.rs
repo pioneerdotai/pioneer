@@ -387,8 +387,9 @@ mod tests {
                 .read_skill_index
                 .get(format!("skill:{}", browser.identity.skill_id).as_str())
                 .expect("system browser read_skill entry")
-                .skill_asset_root,
-            expected_asset_root
+                .source
+                .package_asset_root(),
+            Some(expected_asset_root.as_str())
         );
 
         let subagents = catalog
@@ -466,8 +467,9 @@ mod tests {
                 .read_skill_index
                 .get(format!("skill:{}", subagents.identity.skill_id).as_str())
                 .expect("system subagents read_skill entry")
-                .skill_asset_root,
-            expected_subagents_asset_root
+                .source
+                .package_asset_root(),
+            Some(expected_subagents_asset_root.as_str())
         );
 
         let tasks = catalog
@@ -532,8 +534,9 @@ mod tests {
                 .read_skill_index
                 .get(format!("skill:{}", tasks.identity.skill_id).as_str())
                 .expect("system tasks read_skill entry")
-                .skill_asset_root,
-            expected_tasks_asset_root
+                .source
+                .package_asset_root(),
+            Some(expected_tasks_asset_root.as_str())
         );
 
         let memory = catalog
@@ -598,8 +601,9 @@ mod tests {
                 .read_skill_index
                 .get(format!("skill:{}", memory.identity.skill_id).as_str())
                 .expect("system memory read_skill entry")
-                .skill_asset_root,
-            expected_memory_asset_root
+                .source
+                .package_asset_root(),
+            Some(expected_memory_asset_root.as_str())
         );
     }
 

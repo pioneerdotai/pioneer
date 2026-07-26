@@ -83,6 +83,11 @@ impl MessageProcessor {
                         ProviderSummaryCapabilities {
                             embeddings: capabilities.embeddings,
                             transcription: capabilities.transcription,
+                            self_improvement:
+                                crate::self_improvement::settings::model_provider_is_eligible(
+                                    name.as_str(),
+                                    &capabilities,
+                                ),
                         }
                     })
                     .unwrap_or_default();

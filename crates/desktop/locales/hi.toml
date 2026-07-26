@@ -773,6 +773,7 @@ description = "एप्लिकेशन प्राथमिकताओं 
 back = "वापस"
 general = "सामान्य"
 memory = "मेमोरी"
+self_improvement = "स्व-सुधार"
 
 [settings.option.language]
 label = "ऐप भाषा"
@@ -873,6 +874,29 @@ description = "स्थानीय डीबग दृश्यों मे�
 default = "डिफ़ॉल्ट"
 select_model = "मॉडल चुनें"
 dialog_title = "मेमोरी मॉडल चुनें"
+
+[settings.self_improvement]
+title = "स्व-सुधार"
+description = "पूरे हुए काम के उपयोगी पैटर्न से एजेंट स्किल बनाता और संभालता है।"
+configuration_incomplete = "स्व-सुधार चलाने से पहले डिफ़ॉल्ट मॉडल चुनें।"
+
+[settings.self_improvement.enabled]
+label = "स्व-सुधार"
+description = "Pioneer को पूरे हुए टर्न से दोबारा उपयोग होने वाली एजेंट स्किल सीखने दें।"
+
+[settings.self_improvement.default_model]
+label = "डिफ़ॉल्ट मॉडल"
+description = "रोज़ाना सीखने और स्किल बनाने के लिए आवश्यक मॉडल।"
+
+[settings.self_improvement.reviewer_model]
+label = "समीक्षक मॉडल"
+description = "वैकल्पिक स्वतंत्र समीक्षा। न चुनने पर डिफ़ॉल्ट मॉडल उपयोग होता है।"
+
+[settings.self_improvement.model]
+not_selected = "चुना नहीं गया"
+use_default = "डिफ़ॉल्ट मॉडल उपयोग करें"
+select_model = "मॉडल चुनें"
+dialog_title = "स्व-सुधार मॉडल चुनें"
 
 [settings.memory.vector_search]
 label = "वेक्टर खोज"

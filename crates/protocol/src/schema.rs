@@ -61,7 +61,8 @@ use crate::{
     GatewayMemorySettings, GatewayNotification, GatewayRemoteAccessErrorKind,
     GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
-    GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
+    GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
+    GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
     GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
@@ -1562,6 +1563,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             GatewayMemoryModelSelection
         ),
         schema_doc!("gateway_memory_settings.json", GatewayMemorySettings),
+        schema_doc!(
+            "gateway_self_improvement_model_selection.json",
+            GatewaySelfImprovementModelSelection
+        ),
+        schema_doc!(
+            "gateway_self_improvement_settings.json",
+            GatewaySelfImprovementSettings
+        ),
         schema_doc!(
             "gateway_thread_episodic_settings.json",
             GatewayThreadEpisodicSettings

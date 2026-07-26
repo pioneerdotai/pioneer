@@ -35,6 +35,8 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub reasoning_effort: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub agent_skill_versions_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
