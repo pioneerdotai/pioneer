@@ -2324,7 +2324,23 @@ fn work_item_order_key(
             }
         }
     }
-    format!("{:020}:{}", now_unix_ms.max(0), item_id)
+
+    let next_cached_ordinal = range
+        .into_iter()
+        .flat_map(|range| range.items_by_id.values())
+        .filter_map(|item| {
+            item.order_key
+                .split_once(':')
+                .map(|(ordinal, _)| ordinal)
+                .unwrap_or(item.order_key.as_str())
+                .parse::<i64>()
+                .ok()
+        })
+        .max()
+        .map(|ordinal| ordinal.saturating_add(1))
+        .unwrap_or_default();
+    let ordinal = now_unix_ms.max(0).max(next_cached_ordinal);
+    format!("{ordinal:020}:{item_id}")
 }
 
 fn upsert_top_level_block(thread: &mut ThreadSemanticTimelineState, block: TimelineBlock) {
@@ -3392,6 +3408,62 @@ mod tests {
                 .items_by_id
                 .contains_key("turn:conversation_turn:work:task_anchor")
         }));
+    }
+
+    #[test]
+    fn live_work_items_keep_arrival_order_with_same_or_earlier_client_time() {
+        let mut state = SemanticTimelineState::default();
+
+        for (item_id, now_unix_ms) in [
+            ("z_first", 1_000),
+            ("m_second", 1_000),
+            ("a_third", 1_000),
+            ("b_fourth_after_clock_rollback", 900),
+        ] {
+            assert!(apply_conversation_event_to_semantic_timeline(
+                &mut state,
+                "workspace_a",
+                &ConversationEvent::ItemStarted {
+                    thread_id: "thread_a".to_owned(),
+                    turn_id: "turn_a".to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: item_id.to_owned(),
+                        level: SystemEventLevel::Warning,
+                        message: item_id.to_owned(),
+                        code: None,
+                        details: None,
+                    },
+                },
+                now_unix_ms,
+            ));
+        }
+
+        let range = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .expect("live work range should exist");
+        assert_eq!(
+            range
+                .ordered_items()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "z_first",
+                "m_second",
+                "a_third",
+                "b_fourth_after_clock_rollback",
+            ],
+            "live child work must follow event arrival order until durable sequence arrives",
+        );
+        assert!(
+            range
+                .ordered_items()
+                .map(|item| item.order_key.as_str())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "temporary live order keys must be strictly monotonic",
+        );
     }
 
     #[test]
