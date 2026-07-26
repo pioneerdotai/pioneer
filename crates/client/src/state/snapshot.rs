@@ -281,6 +281,10 @@ mod tests {
                 "thread_b".to_owned(),
                 ThreadCoordinator::new(thread("thread_b", "ws_b", 40)),
             ),
+            (
+                "pending_child".to_owned(),
+                ThreadCoordinator::pending("pending_child", "ws_a"),
+            ),
         ]);
 
         let snapshot = ClientSnapshot::from_parts(ClientSnapshotInput {

@@ -640,7 +640,7 @@ pub fn sorted_thread_ids_from_coordinators(
                 && workspace_id.is_none_or(|workspace_id| coordinator.workspace_id == workspace_id)
                 && coordinator
                     .thread()
-                    .is_none_or(|thread| thread_should_appear_in_sidebar(thread, draft_thread_id))
+                    .is_some_and(|thread| thread_should_appear_in_sidebar(thread, draft_thread_id))
         })
         .map(|(thread_id, _)| thread_id.clone())
         .collect();
@@ -1484,6 +1484,26 @@ mod tests {
                 Some("ws_a"),
             ),
             vec!["thread_a_new".to_owned(), "thread_a_old".to_owned()]
+        );
+    }
+
+    #[test]
+    fn pending_child_coordinator_does_not_leak_into_sidebar_before_snapshot() {
+        let coordinators = HashMap::from([
+            (
+                "visible_parent".to_owned(),
+                coordinator("visible_parent", "ws_a", 10),
+            ),
+            (
+                "pending_child".to_owned(),
+                ThreadCoordinator::pending("pending_child", "ws_a"),
+            ),
+        ]);
+
+        assert_eq!(
+            sorted_thread_ids_from_coordinators(&coordinators, None, Some("ws_a")),
+            vec!["visible_parent".to_owned()],
+            "an event-created coordinator has unknown visibility until its thread snapshot arrives",
         );
     }
 
