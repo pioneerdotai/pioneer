@@ -7,6 +7,8 @@ use std::str::FromStr;
 
 pub const SKILL_ID_LEN: usize = 21;
 pub const SKILL_PACK_ID_LEN: usize = SKILL_ID_LEN;
+pub const GATEWAY_ID_LEN: usize = 21;
+pub const PRINCIPAL_ID_LEN: usize = 21;
 
 const ALPHANUMERIC: [char; 62] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
@@ -247,9 +249,208 @@ impl From<CheckedIdValidationError> for SkillPackIdError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GatewayId(#[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String);
+
+impl GatewayId {
+    pub fn new(value: impl Into<String>) -> Result<Self, GatewayIdError> {
+        validate_checked_id(value.into(), GATEWAY_ID_LEN)
+            .map(Self)
+            .map_err(GatewayIdError::from)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl FromStr for GatewayId {
+    type Err = GatewayIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for GatewayId {
+    type Error = GatewayIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for GatewayId {
+    type Error = GatewayIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for GatewayId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for GatewayId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayIdError {
+    InvalidLength { expected: usize, actual: usize },
+    InvalidCharacter { index: usize, character: char },
+}
+
+impl fmt::Display for GatewayIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { expected, actual } => write!(
+                f,
+                "gateway id must be exactly {expected} characters, got {actual}"
+            ),
+            Self::InvalidCharacter { index, character } => write!(
+                f,
+                "gateway id must contain only ASCII alphanumeric characters; found {character:?} at byte {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GatewayIdError {}
+
+impl From<CheckedIdValidationError> for GatewayIdError {
+    fn from(error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => {
+                Self::InvalidLength { expected, actual }
+            }
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter { index, character }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct PrincipalId(
+    #[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String,
+);
+
+impl PrincipalId {
+    pub fn new(value: impl Into<String>) -> Result<Self, PrincipalIdError> {
+        validate_checked_id(value.into(), PRINCIPAL_ID_LEN)
+            .map(Self)
+            .map_err(PrincipalIdError::from)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl FromStr for PrincipalId {
+    type Err = PrincipalIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for PrincipalId {
+    type Error = PrincipalIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for PrincipalId {
+    type Error = PrincipalIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for PrincipalId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for PrincipalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PrincipalId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrincipalIdError {
+    InvalidLength { expected: usize, actual: usize },
+    InvalidCharacter { index: usize, character: char },
+}
+
+impl fmt::Display for PrincipalIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { expected, actual } => write!(
+                f,
+                "principal id must be exactly {expected} characters, got {actual}"
+            ),
+            Self::InvalidCharacter { index, character } => write!(
+                f,
+                "principal id must contain only ASCII alphanumeric characters; found {character:?} at byte {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrincipalIdError {}
+
+impl From<CheckedIdValidationError> for PrincipalIdError {
+    fn from(error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => {
+                Self::InvalidLength { expected, actual }
+            }
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter { index, character }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        GATEWAY_ID_LEN, GatewayId, GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError,
         SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
         generate_id,
     };
@@ -261,6 +462,79 @@ mod tests {
         assert_eq!(id.len(), SKILL_ID_LEN);
         assert!(id.chars().all(|value| value.is_ascii_alphanumeric()));
         assert!(SkillId::new(id).is_ok());
+    }
+
+    #[test]
+    fn gateway_and_principal_ids_round_trip_as_validated_strings() {
+        let gateway = GatewayId::new("G00000000000000000001").expect("valid gateway id");
+        let principal = PrincipalId::new("P00000000000000000001").expect("valid principal id");
+
+        assert_eq!(gateway.as_str(), "G00000000000000000001");
+        assert_eq!(principal.as_str(), "P00000000000000000001");
+        assert_eq!(
+            "G00000000000000000001".parse::<GatewayId>().unwrap(),
+            gateway
+        );
+        assert_eq!(
+            PrincipalId::try_from("P00000000000000000001").unwrap(),
+            principal
+        );
+        assert_eq!(
+            serde_json::from_value::<GatewayId>(json!("G00000000000000000001")).unwrap(),
+            gateway
+        );
+        assert_eq!(
+            serde_json::from_value::<PrincipalId>(json!("P00000000000000000001")).unwrap(),
+            principal
+        );
+    }
+
+    #[test]
+    fn gateway_and_principal_ids_reject_invalid_lengths_and_characters() {
+        assert_eq!(
+            GatewayId::new("short"),
+            Err(GatewayIdError::InvalidLength {
+                expected: GATEWAY_ID_LEN,
+                actual: 5,
+            })
+        );
+        assert_eq!(
+            PrincipalId::new("short"),
+            Err(PrincipalIdError::InvalidLength {
+                expected: PRINCIPAL_ID_LEN,
+                actual: 5,
+            })
+        );
+
+        for value in [
+            "G0000000000000000000-",
+            "G0000000000000000000 ",
+            "G0000000000000000000é",
+        ] {
+            assert!(GatewayId::new(value).is_err());
+            assert!(serde_json::from_value::<GatewayId>(json!(value)).is_err());
+        }
+        for value in [
+            "P0000000000000000000-",
+            "P0000000000000000000 ",
+            "P0000000000000000000é",
+        ] {
+            assert!(PrincipalId::new(value).is_err());
+            assert!(serde_json::from_value::<PrincipalId>(json!(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn gateway_and_principal_id_schemas_are_constrained_strings() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(GatewayId)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(PrincipalId)).unwrap(),
+        ] {
+            assert_eq!(schema["type"], "string");
+            assert_eq!(schema["minLength"], 21);
+            assert_eq!(schema["maxLength"], 21);
+            assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
+        }
     }
 
     #[test]

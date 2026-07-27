@@ -4,6 +4,7 @@ mod agent_event;
 mod artifact;
 mod cli_runtime;
 mod id;
+mod identity;
 mod jsonrpc;
 mod markdown;
 mod mcp;
@@ -75,9 +76,11 @@ pub use cli_runtime::{
     sanitize_runtime_diagnostic_lines,
 };
 pub use id::{
+    GATEWAY_ID_LEN, GatewayId, GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError,
     SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
     generate_id,
 };
+pub use identity::{PersistedActorRef, PrincipalKind, PrincipalStatus};
 pub use jsonrpc::{
     INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
