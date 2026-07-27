@@ -2312,11 +2312,7 @@ fn timeline_event_block_sort_key(
     format!("{:020}:{turn_id}:{rank:03}:{suffix}", now_unix_ms.max(0))
 }
 
-fn work_item_order_key(
-    range: Option<&TurnWorkRangeCache>,
-    item_id: &str,
-    now_unix_ms: i64,
-) -> String {
+fn work_item_order_key(range: Option<&TurnWorkRangeCache>, item_id: &str) -> String {
     if let Some(range) = range {
         for item in range.items_by_id.values() {
             if item.item_id == item_id {
@@ -2325,21 +2321,29 @@ fn work_item_order_key(
         }
     }
 
-    let next_cached_ordinal = range
-        .into_iter()
-        .flat_map(|range| range.items_by_id.values())
-        .filter_map(|item| {
-            item.order_key
-                .split_once(':')
-                .map(|(ordinal, _)| ordinal)
-                .unwrap_or(item.order_key.as_str())
-                .parse::<i64>()
-                .ok()
+    // Durable work order keys use the turn event sequence. Keep provisional live keys in that
+    // same ordinal domain so a missed or delayed canonical reconciliation cannot leave an older
+    // live item below newer durable items. Wall-clock milliseconds are several orders of
+    // magnitude larger than event sequences and therefore cannot safely be mixed here.
+    let ordinal = range
+        .map(|range| {
+            range
+                .items_by_id
+                .values()
+                .filter_map(|item| {
+                    item.order_key
+                        .split_once(':')
+                        .map(|(ordinal, _)| ordinal)
+                        .unwrap_or(item.order_key.as_str())
+                        .parse::<i64>()
+                        .ok()
+                })
+                .max()
+                .unwrap_or_default()
+                .max(range.source_high_watermark)
+                .saturating_add(1)
         })
-        .max()
-        .map(|ordinal| ordinal.saturating_add(1))
-        .unwrap_or_default();
-    let ordinal = now_unix_ms.max(0).max(next_cached_ordinal);
+        .unwrap_or(1);
     format!("{ordinal:020}:{item_id}")
 }
 
@@ -2414,7 +2418,7 @@ fn upsert_assistant_message_block(
         sort_key: existing
             .map(|block| block.sort_key.clone())
             .unwrap_or_else(|| {
-                let order_key = work_item_order_key(thread.work_range(turn_id), id, now_unix_ms);
+                let order_key = work_item_order_key(thread.work_range(turn_id), id);
                 if thread_has_detached_task_run(thread, turn_id) {
                     timeline_event_block_sort_key(turn_id, 200, order_key.as_str(), now_unix_ms)
                 } else {
@@ -2582,7 +2586,7 @@ fn upsert_turn_work_item(
 ) {
     let item_id = item.item_id().to_owned();
     let work_item_id = work_item_projection_id(turn_id, item_id.as_str());
-    let order_key = work_item_order_key(thread.work_range(turn_id), item_id.as_str(), now_unix_ms);
+    let order_key = work_item_order_key(thread.work_range(turn_id), item_id.as_str());
     let item_type = item.item_type();
     let range = thread.work_range_mut(turn_id.to_owned());
     range.thread_id = thread_id.to_owned();
@@ -3463,6 +3467,84 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1]),
             "temporary live order keys must be strictly monotonic",
+        );
+    }
+
+    #[test]
+    fn unreconciled_live_work_item_stays_before_later_canonical_items() {
+        let mut state = SemanticTimelineState::default();
+        let mut prior = work_item("prior", "00000000000000003651:prior");
+        prior.source_sequence = 3_651;
+        prior.source_updated_at_unix_micros = 3_651;
+        let mut initial = work_page(vec![prior]);
+        initial.source_high_watermark = 3_651;
+        initial.projection_updated_at_unix_micros = 3_651;
+        assert!(apply_turn_work_page(
+            &mut state,
+            initial,
+            WorkPageMergeMode::MergeAfter,
+        ));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item: TurnItem::SystemEvent {
+                    id: "old_live".to_owned(),
+                    level: SystemEventLevel::Warning,
+                    message: "old live item".to_owned(),
+                    code: None,
+                    details: None,
+                },
+            },
+            1_785_154_473_000,
+        ));
+
+        let mut newer = work_item("newer", "00000000000000003895:newer");
+        newer.source_sequence = 3_895;
+        newer.source_updated_at_unix_micros = 3_895;
+        assert!(apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 3_895, vec![newer]),
+        ));
+
+        let range = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .expect("work range should exist");
+        assert_eq!(
+            range
+                .ordered_items()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item_prior", "old_live", "item_newer"],
+            "a live item must not jump below later canonical work while reconciliation is pending",
+        );
+
+        let mut reconciled_old = range
+            .items_by_id
+            .get("turn:turn_a:work:old_live")
+            .cloned()
+            .expect("live work item should be cached");
+        reconciled_old.order_key = "00000000000000003652:old_live".to_owned();
+        reconciled_old.source_sequence = 3_652;
+        reconciled_old.source_updated_at_unix_micros = 3_652;
+        assert!(apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 3_895, vec![reconciled_old]),
+        ));
+        assert_eq!(
+            state
+                .thread("thread_a")
+                .and_then(|thread| thread.work_range("turn_a"))
+                .expect("work range should exist")
+                .ordered_items()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item_prior", "old_live", "item_newer"],
+            "canonical reconciliation must preserve the order already shown live",
         );
     }
 
