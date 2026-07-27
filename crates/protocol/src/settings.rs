@@ -18,6 +18,7 @@ pub struct GatewaySettingsUpdate {
     pub general: Option<GatewayGeneralSettingsUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<GatewayMemorySettings>,
+    /// Self-improvement settings for the workspace bound to this RPC connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_improvement: Option<GatewaySelfImprovementSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +54,7 @@ pub struct GatewaySettingsSnapshot {
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
+    /// Effective Self-improvement settings for the workspace bound to this RPC connection.
     #[serde(default)]
     pub self_improvement: GatewaySelfImprovementSettings,
     #[serde(default)]

@@ -877,12 +877,12 @@ dialog_title = "Speichermodell auswählen"
 
 [settings.self_improvement]
 title = "Selbstverbesserung"
-description = "Erstellt und pflegt Agent-Fähigkeiten aus nützlichen Mustern abgeschlossener Arbeit."
+description = "Erstellt und pflegt Agent-Fähigkeiten aus nützlichen Mustern in diesem Arbeitsbereich."
 configuration_incomplete = "Wählen Sie ein Standardmodell aus, bevor die Selbstverbesserung ausgeführt werden kann."
 
 [settings.self_improvement.enabled]
 label = "Selbstverbesserung"
-description = "Pioneer darf wiederverwendbare Agent-Fähigkeiten aus abgeschlossenen Turns lernen."
+description = "Pioneer darf in diesem Arbeitsbereich wiederverwendbare Agent-Fähigkeiten aus abgeschlossenen Turns lernen."
 
 [settings.self_improvement.default_model]
 label = "Standardmodell"

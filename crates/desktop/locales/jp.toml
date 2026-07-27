@@ -877,12 +877,12 @@ dialog_title = "メモリモデルを選択"
 
 [settings.self_improvement]
 title = "自己改善"
-description = "完了した作業の有用なパターンからエージェントスキルを作成・更新します。"
+description = "このワークスペースの有用なパターンからエージェントスキルを作成・更新します。"
 configuration_incomplete = "自己改善を実行する前にデフォルトモデルを選択してください。"
 
 [settings.self_improvement.enabled]
 label = "自己改善"
-description = "完了したターンから再利用可能なエージェントスキルを Pioneer が学習できるようにします。"
+description = "このワークスペースで完了したターンから再利用可能なエージェントスキルを Pioneer が学習できるようにします。"
 
 [settings.self_improvement.default_model]
 label = "デフォルトモデル"

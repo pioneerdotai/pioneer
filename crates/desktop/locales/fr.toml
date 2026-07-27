@@ -877,12 +877,12 @@ dialog_title = "Sélectionner le modèle de mémoire"
 
 [settings.self_improvement]
 title = "Auto-amélioration"
-description = "Crée et maintient des compétences d’agent à partir de motifs utiles du travail terminé."
+description = "Crée et maintient des compétences d’agent à partir de motifs utiles dans cet espace de travail."
 configuration_incomplete = "Sélectionnez un modèle par défaut avant d’activer l’auto-amélioration."
 
 [settings.self_improvement.enabled]
 label = "Auto-amélioration"
-description = "Autorise Pioneer à apprendre des compétences d’agent réutilisables à partir des tours terminés."
+description = "Autorise Pioneer à apprendre des compétences d’agent réutilisables à partir des tours terminés dans cet espace de travail."
 
 [settings.self_improvement.default_model]
 label = "Modèle par défaut"

@@ -877,12 +877,12 @@ dialog_title = "मेमोरी मॉडल चुनें"
 
 [settings.self_improvement]
 title = "स्व-सुधार"
-description = "पूरे हुए काम के उपयोगी पैटर्न से एजेंट स्किल बनाता और संभालता है।"
+description = "इस वर्कस्पेस के उपयोगी पैटर्न से एजेंट स्किल बनाता और संभालता है।"
 configuration_incomplete = "स्व-सुधार चलाने से पहले डिफ़ॉल्ट मॉडल चुनें।"
 
 [settings.self_improvement.enabled]
 label = "स्व-सुधार"
-description = "Pioneer को पूरे हुए टर्न से दोबारा उपयोग होने वाली एजेंट स्किल सीखने दें।"
+description = "Pioneer को इस वर्कस्पेस के पूरे हुए टर्न से दोबारा उपयोग होने वाली एजेंट स्किल सीखने दें।"
 
 [settings.self_improvement.default_model]
 label = "डिफ़ॉल्ट मॉडल"

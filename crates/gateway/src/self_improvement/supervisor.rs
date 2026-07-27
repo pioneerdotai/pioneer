@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
@@ -246,11 +246,11 @@ pub(crate) struct SelfImprovementSupervisor {
     store: Arc<CrudStore>,
     provider_registry: Arc<ProviderRegistry>,
     workspace_manager: Arc<WorkspaceManager>,
-    desired: StdRwLock<GatewaySelfImprovementConfig>,
+    desired: StdRwLock<BTreeMap<String, GatewaySelfImprovementConfig>>,
     max_skill_markdown_bytes: usize,
     worker_id: String,
     cancellation: CancellationToken,
-    execution_cancellation: StdMutex<CancellationToken>,
+    execution_cancellations: StdMutex<BTreeMap<String, CancellationToken>>,
     transition_gate: RwLock<()>,
     dispatch_gate: Mutex<()>,
     wake: Notify,
@@ -262,18 +262,18 @@ impl SelfImprovementSupervisor {
         store: Arc<CrudStore>,
         provider_registry: Arc<ProviderRegistry>,
         workspace_manager: Arc<WorkspaceManager>,
-        config: GatewaySelfImprovementConfig,
+        workspace_configs: BTreeMap<String, GatewaySelfImprovementConfig>,
         max_skill_markdown_bytes: usize,
     ) -> Self {
         Self {
             store,
             provider_registry,
             workspace_manager,
-            desired: StdRwLock::new(config),
+            desired: StdRwLock::new(workspace_configs),
             max_skill_markdown_bytes: max_skill_markdown_bytes.max(1),
             worker_id: format!("gateway-self-improvement-{}", generate_id(SKILL_ID_LEN)),
             cancellation: CancellationToken::new(),
-            execution_cancellation: StdMutex::new(CancellationToken::new()),
+            execution_cancellations: StdMutex::new(BTreeMap::new()),
             transition_gate: RwLock::new(()),
             dispatch_gate: Mutex::new(()),
             wake: Notify::new(),
@@ -306,7 +306,7 @@ impl SelfImprovementSupervisor {
 
     pub(crate) async fn shutdown(&self) {
         self.cancellation.cancel();
-        self.cancel_current_execution();
+        self.cancel_all_executions();
         if let Some(task) = self.task.lock().await.take() {
             if let Err(error) = task.await {
                 error!(error = %error, "self-improvement supervisor task failed to join");
@@ -347,30 +347,46 @@ impl SelfImprovementSupervisor {
         }
     }
 
-    /// Applies one validated desired Settings snapshot and waits until every
+    /// Applies one validated workspace Settings snapshot and waits until that
     /// workspace has reached the matching durable effective state.
-    pub(crate) async fn apply_desired(
+    pub(crate) async fn apply_desired_for_workspace(
         &self,
+        workspace_id: &str,
         desired: GatewaySelfImprovementConfig,
         now_unix: i64,
     ) -> Result<()> {
+        let workspace_id = self
+            .workspace_manager
+            .validate_workspace_id(workspace_id)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "self-improvement settings workspace `{workspace_id}` is unavailable: {error}"
+                )
+            })?;
         let _transition = self.transition_gate.write().await;
         let invalidates_execution = {
             let mut current = self
                 .desired
                 .write()
                 .expect("self-improvement desired settings lock poisoned");
-            let invalidates_execution = settings_change_invalidates_execution(&current, &desired);
-            *current = desired.clone();
+            let previous = current
+                .get(workspace_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let invalidates_execution = settings_change_invalidates_execution(&previous, &desired);
+            current.insert(workspace_id.clone(), desired.clone());
             invalidates_execution
         };
         if invalidates_execution {
-            self.cancel_current_execution();
+            self.cancel_workspace_execution(workspace_id.as_str());
         }
 
-        let reconciliation = self.reconcile_all_with(&desired, now_unix).await;
+        let reconciliation = self
+            .reconcile_workspace_with(workspace_id.as_str(), &desired, true, now_unix)
+            .await;
         if invalidates_execution {
-            self.replace_execution_cancellation();
+            self.replace_workspace_execution_cancellation(workspace_id.as_str());
         }
         reconciliation?;
         self.wake.notify_one();
@@ -392,7 +408,7 @@ impl SelfImprovementSupervisor {
                     "self-improvement overlay workspace `{workspace_id}` is unavailable: {error}"
                 )
             })?;
-        let desired = self.desired_settings();
+        let desired = self.desired_settings_for_workspace(workspace_id);
         let authoritative = self.authoritative_settings_from(&desired, Some(workspace_id));
         if !authoritative.effective_enabled {
             return Ok(Vec::new());
@@ -418,9 +434,9 @@ impl SelfImprovementSupervisor {
             let _transition = self.transition_gate.read().await;
             self.reconcile_all(now_unix).await?
         };
-        let execution_cancellation = self.execution_cancellation();
         let mut executions = stream::iter(workspaces.into_iter().map(|workspace_id| {
-            let execution_cancellation = execution_cancellation.clone();
+            let execution_cancellation =
+                self.workspace_execution_cancellation(workspace_id.as_str());
             async move {
                 let result = tokio::select! {
                     biased;
@@ -442,7 +458,7 @@ impl SelfImprovementSupervisor {
                     "self-improvement workspace wake failed"
                 );
             }
-            if self.cancellation.is_cancelled() || execution_cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled() {
                 break;
             }
         }
@@ -456,7 +472,7 @@ impl SelfImprovementSupervisor {
 
     async fn reconcile_all_with(
         &self,
-        desired: &GatewaySelfImprovementConfig,
+        desired: &BTreeMap<String, GatewaySelfImprovementConfig>,
         now_unix: i64,
     ) -> Result<Vec<String>> {
         let workspaces = self
@@ -468,40 +484,55 @@ impl SelfImprovementSupervisor {
             })?;
         let mut runnable = Vec::new();
         for workspace in workspaces {
-            let authoritative =
-                self.authoritative_settings_from(desired, Some(workspace.id.as_str()));
-            if authoritative.effective_enabled && workspace.is_active {
-                let state = self
-                    .store
-                    .activate_self_improvement_workspace(workspace.id.as_str(), now_unix)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to reconcile enabled self-improvement workspace `{}`",
-                            workspace.id
-                        )
-                    })?;
-                self.reconcile_unfinished_authority(
+            let workspace_desired = desired
+                .get(workspace.id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if self
+                .reconcile_workspace_with(
                     workspace.id.as_str(),
-                    &state,
-                    &authoritative,
+                    &workspace_desired,
+                    workspace.is_active,
                     now_unix,
                 )
-                .await?;
+                .await?
+            {
                 runnable.push(workspace.id);
-            } else {
-                self.store
-                    .deactivate_self_improvement_workspace(workspace.id.as_str(), now_unix)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to reconcile disabled self-improvement workspace `{}`",
-                            workspace.id
-                        )
-                    })?;
             }
         }
         Ok(runnable)
+    }
+
+    async fn reconcile_workspace_with(
+        &self,
+        workspace_id: &str,
+        desired: &GatewaySelfImprovementConfig,
+        workspace_is_active: bool,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let authoritative = self.authoritative_settings_from(desired, Some(workspace_id));
+        if authoritative.effective_enabled && workspace_is_active {
+            let state = self
+                .store
+                .activate_self_improvement_workspace(workspace_id, now_unix)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconcile enabled self-improvement workspace `{workspace_id}`"
+                    )
+                })?;
+            self.reconcile_unfinished_authority(workspace_id, &state, &authoritative, now_unix)
+                .await?;
+            return Ok(true);
+        }
+
+        self.store
+            .deactivate_self_improvement_workspace(workspace_id, now_unix)
+            .await
+            .with_context(|| {
+                format!("failed to reconcile disabled self-improvement workspace `{workspace_id}`")
+            })?;
+        Ok(false)
     }
 
     async fn reconcile_unfinished_authority(
@@ -580,18 +611,29 @@ impl SelfImprovementSupervisor {
         }
     }
 
-    fn desired_settings(&self) -> GatewaySelfImprovementConfig {
+    fn desired_settings(&self) -> BTreeMap<String, GatewaySelfImprovementConfig> {
         self.desired
             .read()
             .expect("self-improvement desired settings lock poisoned")
             .clone()
     }
 
+    fn desired_settings_for_workspace(&self, workspace_id: &str) -> GatewaySelfImprovementConfig {
+        self.desired
+            .read()
+            .expect("self-improvement desired settings lock poisoned")
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn authoritative_settings(
         &self,
         workspace_id: Option<&str>,
     ) -> AuthoritativeSelfImprovementSettings {
-        let desired = self.desired_settings();
+        let desired = workspace_id
+            .map(|workspace_id| self.desired_settings_for_workspace(workspace_id))
+            .unwrap_or_default();
         self.authoritative_settings_from(&desired, workspace_id)
     }
 
@@ -607,25 +649,41 @@ impl SelfImprovementSupervisor {
         )
     }
 
-    fn cancel_current_execution(&self) {
-        self.execution_cancellation
+    fn cancel_all_executions(&self) {
+        for cancellation in self
+            .execution_cancellations
             .lock()
-            .expect("self-improvement execution cancellation lock poisoned")
-            .cancel();
+            .expect("self-improvement execution cancellations lock poisoned")
+            .values()
+        {
+            cancellation.cancel();
+        }
     }
 
-    fn replace_execution_cancellation(&self) {
-        *self
-            .execution_cancellation
+    fn cancel_workspace_execution(&self, workspace_id: &str) {
+        if let Some(cancellation) = self
+            .execution_cancellations
             .lock()
-            .expect("self-improvement execution cancellation lock poisoned") =
-            CancellationToken::new();
+            .expect("self-improvement execution cancellations lock poisoned")
+            .get(workspace_id)
+        {
+            cancellation.cancel();
+        }
     }
 
-    fn execution_cancellation(&self) -> CancellationToken {
-        self.execution_cancellation
+    fn replace_workspace_execution_cancellation(&self, workspace_id: &str) {
+        self.execution_cancellations
             .lock()
-            .expect("self-improvement execution cancellation lock poisoned")
+            .expect("self-improvement execution cancellations lock poisoned")
+            .insert(workspace_id.to_owned(), CancellationToken::new());
+    }
+
+    fn workspace_execution_cancellation(&self, workspace_id: &str) -> CancellationToken {
+        self.execution_cancellations
+            .lock()
+            .expect("self-improvement execution cancellations lock poisoned")
+            .entry(workspace_id.to_owned())
+            .or_default()
             .clone()
     }
 
@@ -1678,6 +1736,38 @@ mod tests {
     const SKILL_BODY: &str =
         "Before publishing a release, calculate and verify the artifact checksum.";
 
+    trait IntoTestWorkspaceConfigs {
+        fn into_test_workspace_configs(self) -> BTreeMap<String, GatewaySelfImprovementConfig>;
+    }
+
+    impl IntoTestWorkspaceConfigs for GatewaySelfImprovementConfig {
+        fn into_test_workspace_configs(self) -> BTreeMap<String, GatewaySelfImprovementConfig> {
+            BTreeMap::from([(WORKSPACE.to_owned(), self)])
+        }
+    }
+
+    impl IntoTestWorkspaceConfigs for BTreeMap<String, GatewaySelfImprovementConfig> {
+        fn into_test_workspace_configs(self) -> BTreeMap<String, GatewaySelfImprovementConfig> {
+            self
+        }
+    }
+
+    fn test_supervisor(
+        store: Arc<CrudStore>,
+        provider_registry: Arc<ProviderRegistry>,
+        workspace_manager: Arc<WorkspaceManager>,
+        configs: impl IntoTestWorkspaceConfigs,
+        max_skill_markdown_bytes: usize,
+    ) -> SelfImprovementSupervisor {
+        SelfImprovementSupervisor::new(
+            store,
+            provider_registry,
+            workspace_manager,
+            configs.into_test_workspace_configs(),
+            max_skill_markdown_bytes,
+        )
+    }
+
     struct ScriptedLearningProvider {
         responses: StdMutex<VecDeque<String>>,
         requests: StdMutex<Vec<ChatRequest>>,
@@ -2620,13 +2710,12 @@ mod tests {
     #[test]
     fn production_owner_constructs_starts_and_joins_before_database_close() {
         let source = include_str!("../lib.rs");
+        let saved_workspace_settings = source
+            .find("gateway_settings.workspace_self_improvement_configs()")
+            .expect("production supervisor must load workspace-scoped saved Settings");
         let constructed = source
             .find("SelfImprovementSupervisor::new(")
             .expect("production Gateway must construct the supervisor");
-        let effective_saved_settings = source[constructed..]
-            .find(".effective_self_improvement_settings(&config.gateway.self_improvement)")
-            .map(|offset| constructed + offset)
-            .expect("production supervisor must start from saved effective Settings");
         let started = source[constructed..]
             .find(".start()")
             .map(|offset| constructed + offset)
@@ -2640,11 +2729,12 @@ mod tests {
             .map(|offset| shutdown + offset)
             .expect("production Gateway must close the database");
         assert!(
-            constructed < effective_saved_settings
-                && effective_saved_settings < started
+            saved_workspace_settings < constructed
+                && constructed < started
                 && started < shutdown
                 && shutdown < database_close
         );
+        assert!(!source.contains("config.gateway.self_improvement"));
         assert!(!source.contains("database::startup::spawn_self_improvement"));
     }
 
@@ -2653,7 +2743,7 @@ mod tests {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
+        let supervisor = Arc::new(test_supervisor(
             store,
             registry,
             workspace_manager,
@@ -2686,7 +2776,7 @@ mod tests {
             "learning",
             learning_provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry.clone(),
             workspace_manager,
@@ -3034,7 +3124,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -3280,14 +3370,6 @@ mod tests {
             }),
             reviewer_model: None,
         };
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
-            store.clone(),
-            registry,
-            workspace_manager.clone(),
-            enabled.clone(),
-            1024 * 1024,
-        ));
-
         let mut workspace_ids = vec![WORKSPACE.to_owned()];
         for index in 1..(MAX_CONCURRENT_WORKSPACES + 2) {
             let workspace_id = format!("ws_bounded_{index}");
@@ -3298,6 +3380,17 @@ mod tests {
                 .expect("bounded workspace fixture must create");
             workspace_ids.push(workspace.id);
         }
+        let workspace_configs = workspace_ids
+            .iter()
+            .map(|workspace_id| (workspace_id.clone(), enabled.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let supervisor = Arc::new(test_supervisor(
+            store.clone(),
+            registry,
+            workspace_manager.clone(),
+            workspace_configs,
+            1024 * 1024,
+        ));
         supervisor
             .reconcile_all(ENABLED_AT)
             .await
@@ -3335,15 +3428,46 @@ mod tests {
         );
 
         supervisor
-            .apply_desired(
+            .apply_desired_for_workspace(
+                WORKSPACE,
                 GatewaySelfImprovementConfig {
                     enabled: false,
-                    ..enabled
+                    ..enabled.clone()
                 },
                 ENABLED_AT + 3,
             )
             .await
-            .expect("disable must cancel the owned dispatch tree");
+            .expect("one workspace disable must cancel only its dispatch branch");
+        timeout(Duration::from_secs(2), async {
+            while provider.request_count() == MAX_CONCURRENT_WORKSPACES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling one branch must let the next workspace enter the bounded stream");
+        assert_eq!(
+            provider.request_count(),
+            MAX_CONCURRENT_WORKSPACES + 1,
+            "one freed slot must start exactly one queued workspace"
+        );
+        assert!(
+            !wake.is_finished(),
+            "changing one workspace must not cancel peer workspace executions"
+        );
+
+        for workspace_id in workspace_ids.iter().filter(|id| id.as_str() != WORKSPACE) {
+            supervisor
+                .apply_desired_for_workspace(
+                    workspace_id,
+                    GatewaySelfImprovementConfig {
+                        enabled: false,
+                        ..enabled.clone()
+                    },
+                    ENABLED_AT + 3,
+                )
+                .await
+                .expect("workspace disable must cancel its owned dispatch branch");
+        }
         timeout(Duration::from_secs(2), wake)
             .await
             .expect("bounded dispatch must join after cancellation")
@@ -3361,8 +3485,9 @@ mod tests {
             .try_get::<i64>("", "value")
             .expect("cancelled run count must decode");
         assert_eq!(
-            cancelled_count, MAX_CONCURRENT_WORKSPACES as i64,
-            "only owned in-bound executions may have created logical runs"
+            cancelled_count,
+            workspace_ids.len() as i64,
+            "every workspace must own and cancel exactly its logical run as bounded slots drain"
         );
     }
 
@@ -3386,18 +3511,22 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let enabled = GatewaySelfImprovementConfig {
+            enabled: true,
+            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                provider: "learning".to_owned(),
+                model: "learner".to_owned(),
+            }),
+            reviewer_model: None,
+        };
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                }),
-                reviewer_model: None,
-            },
+            BTreeMap::from([
+                (WORKSPACE.to_owned(), enabled.clone()),
+                (other_workspace.id.clone(), enabled),
+            ]),
             1024 * 1024,
         );
         supervisor
@@ -3522,18 +3651,22 @@ mod tests {
             "workspace-selective-learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let enabled = GatewaySelfImprovementConfig {
+            enabled: true,
+            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                provider: "workspace-selective-learning".to_owned(),
+                model: "learner".to_owned(),
+            }),
+            reviewer_model: None,
+        };
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "workspace-selective-learning".to_owned(),
-                    model: "learner".to_owned(),
-                }),
-                reviewer_model: None,
-            },
+            BTreeMap::from([
+                (WORKSPACE.to_owned(), enabled.clone()),
+                (peer.id.clone(), enabled),
+            ]),
             1024 * 1024,
         );
         supervisor
@@ -3659,7 +3792,7 @@ mod tests {
             "releasable-learning",
             provider.clone(),
         ));
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
+        let supervisor = Arc::new(test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -3773,7 +3906,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -3877,7 +4010,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4063,7 +4196,7 @@ mod tests {
             "{malformed".to_owned(),
         ]);
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4148,7 +4281,7 @@ mod tests {
                 "learning",
                 provider.clone(),
             ));
-            let supervisor = SelfImprovementSupervisor::new(
+            let supervisor = test_supervisor(
                 store.clone(),
                 registry,
                 workspace_manager,
@@ -4329,7 +4462,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4538,7 +4671,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4716,12 +4849,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_reconciliation_is_idempotent_and_reenable_baselines_disabled_history() {
+    async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_baselines_disabled_history()
+    {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
         let workspace_manager_for_new_workspace = workspace_manager.clone();
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4759,7 +4893,7 @@ mod tests {
             reviewer_model: None,
         };
         supervisor
-            .apply_desired(enabled.clone(), ENABLED_AT + 1)
+            .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 1)
             .await
             .expect("live activation must reconcile before returning");
         let first_epoch = store
@@ -4782,11 +4916,23 @@ mod tests {
                 .expect("first-turn reconciliation must succeed")
                 .is_empty()
         );
+        assert!(
+            store
+                .get_self_improvement_workspace_state(new_workspace.id.as_str())
+                .await
+                .expect("new workspace state query must succeed")
+                .is_none(),
+            "a workspace without its own setting must remain untouched"
+        );
+        supervisor
+            .apply_desired_for_workspace(new_workspace.id.as_str(), enabled.clone(), ENABLED_AT + 2)
+            .await
+            .expect("the new workspace must be independently activatable");
         let new_workspace_state = store
             .get_self_improvement_workspace_state(new_workspace.id.as_str())
             .await
             .expect("new workspace state query must succeed")
-            .expect("new workspace must activate before its first overlay");
+            .expect("new workspace must activate after its own setting changes");
         assert_eq!(new_workspace_state.activation_epoch, 1);
         assert_eq!(new_workspace_state.cursor_source_id, 0);
         assert!(new_workspace_state.effective_enabled_at_unix.is_some());
@@ -4800,7 +4946,7 @@ mod tests {
         )
         .await;
         supervisor
-            .apply_desired(enabled.clone(), ENABLED_AT + 3)
+            .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 3)
             .await
             .expect("idempotent activation must reconcile");
         let still_first_epoch = store
@@ -4815,7 +4961,8 @@ mod tests {
         );
 
         supervisor
-            .apply_desired(
+            .apply_desired_for_workspace(
+                WORKSPACE,
                 GatewaySelfImprovementConfig {
                     enabled: false,
                     ..enabled.clone()
@@ -4841,7 +4988,7 @@ mod tests {
         )
         .await;
         supervisor
-            .apply_desired(enabled, ENABLED_AT + 6)
+            .apply_desired_for_workspace(WORKSPACE, enabled, ENABLED_AT + 6)
             .await
             .expect("re-enable must reconcile before returning");
         let second_epoch = store
@@ -4880,7 +5027,8 @@ mod tests {
         );
 
         supervisor
-            .apply_desired(
+            .apply_desired_for_workspace(
+                WORKSPACE,
                 GatewaySelfImprovementConfig {
                     enabled: true,
                     default_model: None,
@@ -4915,7 +5063,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -4976,7 +5124,7 @@ mod tests {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
+        let supervisor = Arc::new(test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -5026,7 +5174,7 @@ mod tests {
 
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -5072,7 +5220,7 @@ mod tests {
             }),
             reviewer_model: None,
         };
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
+        let supervisor = Arc::new(test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -5109,7 +5257,8 @@ mod tests {
             .expect("inflight run must expose its old fence");
 
         supervisor
-            .apply_desired(
+            .apply_desired_for_workspace(
+                WORKSPACE,
                 GatewaySelfImprovementConfig {
                     enabled: false,
                     ..enabled
@@ -5235,7 +5384,7 @@ mod tests {
             }),
             reviewer_model: None,
         };
-        let supervisor = Arc::new(SelfImprovementSupervisor::new(
+        let supervisor = Arc::new(test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -5281,7 +5430,8 @@ mod tests {
             .expect("pre-change state must exist");
 
         supervisor
-            .apply_desired(
+            .apply_desired_for_workspace(
+                WORKSPACE,
                 GatewaySelfImprovementConfig {
                     enabled: true,
                     default_model: Some(GatewaySelfImprovementModelSelectionConfig {
@@ -5395,7 +5545,7 @@ mod tests {
             "learning",
             provider.clone(),
         ));
-        let supervisor = SelfImprovementSupervisor::new(
+        let supervisor = test_supervisor(
             store.clone(),
             registry,
             workspace_manager,
@@ -5728,7 +5878,7 @@ mod tests {
                 "learning",
                 provider.clone(),
             ));
-            let supervisor = SelfImprovementSupervisor::new(
+            let supervisor = test_supervisor(
                 store.clone(),
                 registry,
                 workspace_manager,

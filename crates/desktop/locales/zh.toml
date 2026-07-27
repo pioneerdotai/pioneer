@@ -877,12 +877,12 @@ dialog_title = "选择记忆模型"
 
 [settings.self_improvement]
 title = "自我改进"
-description = "从已完成工作的有用模式中创建并维护智能体技能。"
+description = "从此工作区的有用模式中创建并维护智能体技能。"
 configuration_incomplete = "请先选择默认模型，然后才能运行自我改进。"
 
 [settings.self_improvement.enabled]
 label = "自我改进"
-description = "允许 Pioneer 从已完成的轮次中学习可复用的智能体技能。"
+description = "允许 Pioneer 从此工作区已完成的轮次中学习可复用的智能体技能。"
 
 [settings.self_improvement.default_model]
 label = "默认模型"

@@ -64,8 +64,6 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub memory: GatewayMemoryConfig,
     #[serde(default)]
-    pub self_improvement: GatewaySelfImprovementConfig,
-    #[serde(default)]
     pub thread_episodic: GatewayThreadEpisodicConfig,
     #[serde(default)]
     pub hooks: GatewayHooksConfig,
@@ -538,6 +536,10 @@ impl Serialize for GatewayMemoryModelSelectionConfig {
     }
 }
 
+/// Value stored by Gateway Settings for one workspace.
+///
+/// This deliberately is not a field of [`GatewayConfig`]: Self-improvement
+/// activation and model selection are workspace-scoped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GatewaySelfImprovementConfig {

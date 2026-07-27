@@ -66,6 +66,9 @@ pub fn model_update_plan(
     let mut snapshot = current.cloned()?;
     match setting {
         SelfImprovementModelSetting::Default => {
+            if selection.is_some() {
+                snapshot.self_improvement.enabled = true;
+            }
             snapshot.self_improvement.default_model = selection;
         }
         SelfImprovementModelSetting::Reviewer => {
@@ -163,6 +166,10 @@ mod tests {
                 .as_ref()
                 .map(|selection| selection.model.as_str()),
             Some("new-learner")
+        );
+        assert!(
+            updated.snapshot.self_improvement.enabled,
+            "choosing the required model completes the enable flow"
         );
         assert_eq!(
             updated.snapshot.self_improvement.reviewer_model,

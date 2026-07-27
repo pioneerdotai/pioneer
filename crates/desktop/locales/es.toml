@@ -877,12 +877,12 @@ dialog_title = "Seleccionar modelo de memoria"
 
 [settings.self_improvement]
 title = "Auto-mejora"
-description = "Crea y mantiene habilidades del agente a partir de patrones útiles del trabajo completado."
+description = "Crea y mantiene habilidades del agente a partir de patrones útiles de este espacio de trabajo."
 configuration_incomplete = "Selecciona un modelo predeterminado antes de ejecutar la auto-mejora."
 
 [settings.self_improvement.enabled]
 label = "Auto-mejora"
-description = "Permite que Pioneer aprenda habilidades reutilizables del agente a partir de turnos completados."
+description = "Permite que Pioneer aprenda habilidades reutilizables del agente a partir de turnos completados en este espacio de trabajo."
 
 [settings.self_improvement.default_model]
 label = "Modelo predeterminado"

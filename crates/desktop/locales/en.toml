@@ -1169,12 +1169,12 @@ dialog_title = "Select Memory Model"
 
 [settings.self_improvement]
 title = "Self-improvement"
-description = "Create and maintain Agent skills from useful patterns in completed work."
+description = "Create and maintain Agent skills from useful patterns in this workspace."
 configuration_incomplete = "Select a default model before Self-improvement can run."
 
 [settings.self_improvement.enabled]
 label = "Self-improvement"
-description = "Allow Pioneer to learn reusable Agent skills from completed turns."
+description = "Allow Pioneer to learn reusable Agent skills from completed turns in this workspace."
 
 [settings.self_improvement.default_model]
 label = "Default model"

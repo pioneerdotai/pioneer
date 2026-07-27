@@ -519,7 +519,7 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
             crud_store.clone(),
             provider_registry.clone(),
             workspace_manager.clone(),
-            pioneer_config::GatewaySelfImprovementConfig::default(),
+            std::collections::BTreeMap::new(),
             1024 * 1024,
         ),
     );
@@ -3744,11 +3744,23 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
     let runtime_home = unique_temp_dir("self_improvement_live_settings");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
     let (tx, mut rx) = mpsc::channel(16);
+    let (other_tx, mut other_rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
+    let other_connection_id = session_manager.register_connection(other_tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let other_workspace = workspace_manager
+        .create_workspace(
+            "self_improvement_settings_peer",
+            Some("Self-improvement settings peer"),
+        )
+        .await
+        .expect("peer workspace");
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    session_manager
+        .set_connection_workspace(other_connection_id, Some(other_workspace.id.clone()))
         .await;
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "learning",
@@ -3759,7 +3771,7 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
             crud_store.clone(),
             provider_registry.clone(),
             workspace_manager.clone(),
-            pioneer_config::GatewaySelfImprovementConfig::default(),
+            std::collections::BTreeMap::new(),
             1024 * 1024,
         ),
     );
@@ -3820,6 +3832,36 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
         .expect("active state must exist before response");
     assert_eq!(active.activation_epoch, 1);
     assert!(active.effective_enabled_at_unix.is_some());
+
+    let peer_get_id = generate_test_request_id("settings", "peer_self_improvement");
+    processor
+        .process_request(
+            other_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": peer_get_id.clone(),
+                "method": "settings/get",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let peer_response = recv_response_by_id(&mut other_rx, peer_get_id.as_str()).await;
+    let peer: pioneer_protocol::GatewaySettingsGetResponse =
+        serde_json::from_value(peer_response.result).expect("peer settings response");
+    assert_eq!(
+        peer.settings.self_improvement,
+        pioneer_protocol::GatewaySelfImprovementSettings::default(),
+        "enabling one workspace must not alter another workspace snapshot"
+    );
+    assert!(
+        crud_store
+            .get_self_improvement_workspace_state(other_workspace.id.as_str())
+            .await
+            .expect("peer state query")
+            .is_none(),
+        "enabling one workspace must not activate another workspace"
+    );
 
     let disable_id = generate_test_request_id("settings", "disable_self_improvement");
     processor

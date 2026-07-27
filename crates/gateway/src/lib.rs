@@ -509,6 +509,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .resolve_capsules_root(runtime_home.as_path())?;
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
+    let self_improvement_workspace_configs = gateway_settings.workspace_self_improvement_configs();
     let cli_runtime_crud_store = crud_store.clone();
     let cli_mcp_limits = crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(
         config.gateway.cli_agent_runtime.mcp_tools.max_tools,
@@ -529,7 +530,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         crud_store.clone(),
         provider_registry.clone(),
         workspace_manager.clone(),
-        gateway_settings.effective_self_improvement_settings(&config.gateway.self_improvement),
+        self_improvement_workspace_configs,
         config.gateway.skills.max_skill_file_bytes,
     ));
 

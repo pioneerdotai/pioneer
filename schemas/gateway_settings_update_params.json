@@ -280,6 +280,7 @@
           ]
         },
         "self_improvement": {
+          "description": "Self-improvement settings for the workspace bound to this RPC connection.",
           "anyOf": [
             {
               "$ref": "#/$defs/GatewaySelfImprovementSettings"

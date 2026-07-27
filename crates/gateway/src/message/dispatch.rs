@@ -3041,12 +3041,15 @@ impl MessageProcessor {
             .connection_workspace_id(connection_id)
             .await;
         if let Some(self_improvement) = update.self_improvement.as_ref() {
+            let workspace_id = workspace_id
+                .as_deref()
+                .context("workspace context is required to update self-improvement settings")?;
             let desired =
                 crate::settings::self_improvement_settings_from_protocol(self_improvement.clone())?;
             crate::self_improvement::settings::validate_authoritative_selections_for_workspace(
                 &desired,
                 self.provider_registry.as_ref(),
-                workspace_id.as_deref(),
+                Some(workspace_id),
             )?;
         }
         if update
@@ -3121,8 +3124,13 @@ impl MessageProcessor {
 
         if changes.self_improvement {
             if let Some(supervisor) = self.self_improvement_supervisor.as_ref() {
-                Box::pin(supervisor.apply_desired(
-                    settings.effective_self_improvement_settings(&config.gateway.self_improvement),
+                let workspace_id = changes
+                    .self_improvement_workspace_id
+                    .as_deref()
+                    .context("Self-improvement update lost its workspace scope")?;
+                Box::pin(supervisor.apply_desired_for_workspace(
+                    workspace_id,
+                    settings.effective_self_improvement_settings_for_workspace(Some(workspace_id)),
                     chrono::Utc::now().timestamp(),
                 ))
                 .await
@@ -3296,7 +3304,7 @@ impl MessageProcessor {
             has_remote_access_key,
             remote_access_status,
         );
-        let desired = settings.effective_self_improvement_settings(&config.self_improvement);
+        let desired = settings.effective_self_improvement_settings_for_workspace(workspace_id);
         let authoritative =
             crate::self_improvement::settings::resolve_authoritative_settings_for_workspace(
                 &desired,

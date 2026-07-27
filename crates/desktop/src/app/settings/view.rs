@@ -288,7 +288,7 @@ impl PioneerDesktop {
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
             .child(Self::render_self_improvement_toggle(
-                settings.enabled,
+                &settings,
                 desktop_entity.clone(),
             ));
 
@@ -334,7 +334,21 @@ impl PioneerDesktop {
         panel.into_any_element()
     }
 
-    fn render_self_improvement_toggle(enabled: bool, desktop_entity: Entity<Self>) -> AnyElement {
+    fn render_self_improvement_toggle(
+        settings: &GatewaySelfImprovementSettings,
+        desktop_entity: Entity<Self>,
+    ) -> AnyElement {
+        let enabled = settings.enabled;
+        let selected_provider = settings
+            .default_model
+            .as_ref()
+            .map(|selection| selection.provider.clone());
+        let selected_model = settings
+            .default_model
+            .as_ref()
+            .map(|selection| selection.model.clone());
+        let has_saved_model = selected_provider.is_some() && selected_model.is_some();
+
         h_flex()
             .w_full()
             .gap_6()
@@ -361,9 +375,23 @@ impl PioneerDesktop {
             .child(
                 Switch::new("settings-self-improvement-enabled")
                     .checked(enabled)
-                    .on_click(move |enabled, _, cx| {
+                    .on_click(move |enabled, window, cx| {
                         let _ = desktop_entity.update(cx, |view, cx| {
-                            view.apply_self_improvement_enabled(*enabled, cx);
+                            if *enabled {
+                                if has_saved_model {
+                                    view.apply_self_improvement_enabled(true, cx);
+                                } else {
+                                    view.open_self_improvement_model_selector(
+                                        SelfImprovementModelSetting::Default,
+                                        selected_provider.clone(),
+                                        selected_model.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            } else {
+                                view.apply_self_improvement_enabled(false, cx);
+                            }
                             cx.notify();
                         });
                     }),
@@ -439,42 +467,10 @@ impl PioneerDesktop {
                                         let desktop_entity = desktop_entity.clone();
                                         move |_, window, cx| {
                                             let _ = desktop_entity.update(cx, |view, cx| {
-                                                let workspace_id =
-                                                    view.model_selector_workspace_id();
-                                                view.open_model_selector_dialog(
-                                                    ModelSelectorDialogOptions {
-                                                        title: t!(
-                                                            "settings.self_improvement.model.dialog_title"
-                                                        )
-                                                        .to_string(),
-                                                        selected_provider:
-                                                            selected_provider.clone(),
-                                                        selected_model: selected_model.clone(),
-                                                        selected_reasoning_effort: None,
-                                                        mode: ProviderModelSelectorMode::SelfImprovement,
-                                                        workspace_id,
-                                                        ws_sender: view
-                                                            .gateway
-                                                            .ws_command_sender
-                                                            .clone(),
-                                                        on_save: Rc::new(
-                                                            move |view: &mut PioneerDesktop,
-                                                                  selection: ModelSelectorSelection,
-                                                                  cx| {
-                                                                let Some(selection) =
-                                                                    settings_self_improvement::model_selection_from_selector(selection)
-                                                                else {
-                                                                    return false;
-                                                                };
-                                                                view.apply_self_improvement_model_setting(
-                                                                    setting,
-                                                                    Some(selection),
-                                                                    cx,
-                                                                );
-                                                                true
-                                                            },
-                                                        ),
-                                                    },
+                                                view.open_self_improvement_model_selector(
+                                                    setting,
+                                                    selected_provider.clone(),
+                                                    selected_model.clone(),
                                                     window,
                                                     cx,
                                                 );
@@ -483,30 +479,65 @@ impl PioneerDesktop {
                                     }),
                             )
                             .when(allow_use_default && has_override, |row| {
-                                row.child(div().flex_none().child(
-                                    small_outline_button((id, 1usize))
-                                        .label(
-                                            t!(
-                                                "settings.self_improvement.model.use_default"
+                                row.child(
+                                    div().flex_none().child(
+                                        small_outline_button((id, 1usize))
+                                            .label(
+                                                t!("settings.self_improvement.model.use_default")
+                                                    .to_string(),
                                             )
-                                            .to_string(),
-                                        )
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                            .on_click({
+                                                let desktop_entity = desktop_entity.clone();
+                                                move |_, _, cx| {
+                                                    let _ = desktop_entity.update(cx, |view, cx| {
                                                     view.apply_self_improvement_model_setting(
                                                         setting, None, cx,
                                                     );
                                                     cx.notify();
                                                 });
-                                            }
-                                        }),
-                                ))
+                                                }
+                                            }),
+                                    ),
+                                )
                             }),
                     ),
             )
             .into_any_element()
+    }
+
+    fn open_self_improvement_model_selector(
+        &mut self,
+        setting: SelfImprovementModelSetting,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = self.model_selector_workspace_id();
+        self.open_model_selector_dialog(
+            ModelSelectorDialogOptions {
+                title: t!("settings.self_improvement.model.dialog_title").to_string(),
+                selected_provider,
+                selected_model,
+                selected_reasoning_effort: None,
+                mode: ProviderModelSelectorMode::SelfImprovement,
+                workspace_id,
+                ws_sender: self.gateway.ws_command_sender.clone(),
+                on_save: Rc::new(
+                    move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
+                        let Some(selection) =
+                            settings_self_improvement::model_selection_from_selector(selection)
+                        else {
+                            return false;
+                        };
+                        view.apply_self_improvement_model_setting(setting, Some(selection), cx);
+                        true
+                    },
+                ),
+            },
+            window,
+            cx,
+        );
     }
 
     fn render_locale_setting(
@@ -2266,6 +2297,11 @@ mod tests {
             .expect("Self-improvement screen boundary exists");
 
         assert!(screen.contains("render_self_improvement_toggle"));
+        assert!(screen.contains("if *enabled"));
+        assert!(screen.contains("if has_saved_model"));
+        assert!(screen.contains("apply_self_improvement_enabled(true"));
+        assert!(screen.contains("apply_self_improvement_enabled(false"));
+        assert!(screen.contains("open_self_improvement_model_selector"));
         assert!(screen.contains("if settings.enabled"));
         assert!(screen.contains("configuration_is_incomplete"));
         assert!(screen.contains("SelfImprovementModelSetting::Default"));
