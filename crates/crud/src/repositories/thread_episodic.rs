@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    thread, thread_episodic_capsules, thread_episodic_exclusions, thread_episodic_index_jobs,
-    thread_episodic_items, thread_episodic_recall_events, thread_episodic_thread_directory,
+    thread, thread_episodic_capsules, thread_episodic_embedding_artifacts,
+    thread_episodic_exclusions, thread_episodic_index_jobs, thread_episodic_items,
+    thread_episodic_recall_events, thread_episodic_thread_directory,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
@@ -10,11 +11,12 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use std::collections::HashSet;
+use std::mem::size_of;
 
 use crate::convention::DB_ID_LEN;
 use crate::thread_episodic::{
-    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
+    NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
     THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
     ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
@@ -172,6 +174,8 @@ pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
         status: Set(item_status_to_db(item.status).to_owned()),
         text_hash: Set(item.text_hash.clone()),
         source_text_hash: Set(item.source_text_hash),
+        projection_group_id: Set(Some(item.projection_group_id)),
+        embedding_artifact_id: Set(None),
         language_hint: Set(item.language_hint),
         token_estimate: Set(item.token_estimate),
         capsule_id: Set(item.capsule_id),
@@ -203,6 +207,85 @@ pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
     )
     .await?
     .context("upserted thread episodic item missing")
+}
+
+pub async fn find_embedding_artifact_by_id<C: ConnectionTrait>(
+    db: &C,
+    artifact_id: &str,
+) -> Result<Option<thread_episodic_embedding_artifacts::Model>> {
+    thread_episodic_embedding_artifacts::Entity::find_by_id(artifact_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| {
+            format!("failed to find thread episodic embedding artifact `{artifact_id}`")
+        })
+}
+
+pub async fn insert_embedding_artifact_if_absent<C: ConnectionTrait>(
+    db: &C,
+    artifact: NewThreadEpisodicEmbeddingArtifactRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<thread_episodic_embedding_artifacts::Model> {
+    let dimension = i64::try_from(artifact.dimension)
+        .context("thread episodic embedding dimension exceeds i64")?;
+    let vector_bytes = encode_embedding_vector(artifact.vector.as_slice());
+    let artifact_id = artifact.id.clone();
+    thread_episodic_embedding_artifacts::Entity::insert(
+        thread_episodic_embedding_artifacts::ActiveModel {
+            id: Set(artifact.id),
+            workspace_id: Set(artifact.workspace_id),
+            pipeline_identity_hash: Set(artifact.pipeline_identity_hash),
+            input_hash: Set(artifact.input_hash),
+            provider_id: Set(artifact.provider_id),
+            model: Set(artifact.model),
+            dimension: Set(dimension),
+            normalized: Set(artifact.normalized),
+            vector_bytes: Set(vector_bytes),
+            created_at: Set(now),
+            last_used_at: Set(now),
+        },
+    )
+    .on_conflict(
+        OnConflict::column(thread_episodic_embedding_artifacts::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec(db)
+    .await
+    .with_context(|| {
+        format!("failed to insert thread episodic embedding artifact `{artifact_id}`")
+    })?;
+
+    find_embedding_artifact_by_id(db, artifact_id.as_str())
+        .await?
+        .context("thread episodic embedding artifact missing after insert")
+}
+
+pub async fn touch_embedding_artifact<C: ConnectionTrait>(
+    db: &C,
+    artifact_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<thread_episodic_embedding_artifacts::Model>> {
+    let Some(row) = find_embedding_artifact_by_id(db, artifact_id).await? else {
+        return Ok(None);
+    };
+    let mut active = row.into_active_model();
+    active.last_used_at = Set(now);
+    active
+        .update(db)
+        .await
+        .with_context(|| {
+            format!("failed to touch thread episodic embedding artifact `{artifact_id}`")
+        })
+        .map(Some)
+}
+
+fn encode_embedding_vector(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len().saturating_mul(size_of::<f32>()));
+    for value in vector {
+        bytes.extend_from_slice(value.to_le_bytes().as_slice());
+    }
+    bytes
 }
 
 pub async fn find_item_by_source_identity<C: ConnectionTrait>(
@@ -1451,6 +1534,7 @@ pub async fn mark_item_indexed<C: ConnectionTrait>(
     active.segment_index = Set(Some(update.segment_index));
     active.frame_id = Set(Some(update.frame_id));
     active.frame_uri = Set(Some(update.frame_uri));
+    active.embedding_artifact_id = Set(update.embedding_artifact_id);
     active.indexed_at = Set(Some(now));
     active.updated_at = Set(now);
     let row = active.update(db).await.with_context(|| {

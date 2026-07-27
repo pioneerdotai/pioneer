@@ -57,6 +57,7 @@ pub use super::thread_agents_doc::Entity as ThreadAgentsDoc;
 pub use super::thread_agents_doc_revision::Entity as ThreadAgentsDocRevision;
 pub use super::thread_cli_runtime_binding::Entity as ThreadCliRuntimeBinding;
 pub use super::thread_episodic_capsules::Entity as ThreadEpisodicCapsules;
+pub use super::thread_episodic_embedding_artifacts::Entity as ThreadEpisodicEmbeddingArtifacts;
 pub use super::thread_episodic_exclusions::Entity as ThreadEpisodicExclusions;
 pub use super::thread_episodic_index_jobs::Entity as ThreadEpisodicIndexJobs;
 pub use super::thread_episodic_items::Entity as ThreadEpisodicItems;

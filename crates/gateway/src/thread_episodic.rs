@@ -7,11 +7,12 @@ use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
-    CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
-    NewThreadEpisodicItemRecord, NewThreadEpisodicRecallEventRecord,
-    NewThreadEpisodicThreadDirectoryRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    CrudStore, NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicExclusionRecord,
+    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
+    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
     ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
     ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
@@ -33,21 +34,23 @@ use pioneer_memory::{
     ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind, thread_episodic_memvid_metadata,
 };
 use pioneer_protocol::{
-    AgentMessagePhase, TaskStatus, TaskTurnItem, ThreadEpisodicAdaptiveDiagnostics,
-    ThreadEpisodicHit, ThreadEpisodicIndexItemId, ThreadEpisodicItemId,
-    ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput,
-    ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext, ThreadEpisodicSourceActorRole,
-    ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId,
-    ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId, ThreadHistoryEventPayload, TurnItem,
-    TurnItemEventPayload, TurnItemType,
+    AgentMessagePhase, TaskRunTurnKind, TaskStatus, TaskTurnItem,
+    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicHit, ThreadEpisodicIndexItemId,
+    ThreadEpisodicItemId, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
+    ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
+    ThreadEpisodicThreadId, ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId,
+    ThreadHistoryEventPayload, TurnItem, TurnItemEventPayload, TurnItemType,
+    task_delivery_id_from_result_item_id,
 };
 use pioneer_provider::ProviderRegistry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use std::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
 
 const THREAD_EPISODIC_INDEX_ERROR_MAX_CHARS: usize = 512;
 const THREAD_EPISODIC_GRAPH_ENRICHMENT_DISABLED_REASON: &str =
@@ -278,6 +281,7 @@ pub(crate) struct ThreadEpisodicThreadReindexSummary {
 pub(crate) struct ThreadEpisodicResolvedIndexRequest {
     pub request: ThreadEpisodicMemvidIndexRequest,
     pub segment_index: i64,
+    pub embedding_artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +356,8 @@ pub(crate) struct VectorThreadEpisodicIndexPayloadProvider {
 pub(crate) struct RuntimeVectorThreadEpisodicIndexPayloadProvider {
     inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     embedding_provider_resolver: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+    crud_store: Arc<CrudStore>,
+    artifact_locks: StdMutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
 }
 
 #[allow(dead_code)]
@@ -401,11 +407,32 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
     pub(crate) fn new(
         inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
         embedding_provider_resolver: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+        crud_store: Arc<CrudStore>,
     ) -> Self {
         Self {
             inner,
             embedding_provider_resolver,
+            crud_store,
+            artifact_locks: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    fn artifact_lock(
+        &self,
+        artifact_id: &str,
+    ) -> std::result::Result<Arc<AsyncMutex<()>>, ThreadEpisodicIndexResolutionError> {
+        let mut locks = self.artifact_locks.lock().map_err(|_| {
+            ThreadEpisodicIndexResolutionError::retryable(
+                "thread episodic embedding artifact lock registry is poisoned",
+            )
+        })?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(artifact_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(artifact_id.to_owned(), Arc::downgrade(&lock));
+        Ok(lock)
     }
 }
 
@@ -734,9 +761,150 @@ impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayl
         else {
             return Ok(resolved);
         };
-        attach_embedding_to_resolved_request(&mut resolved, embedding_provider.as_ref())?;
+        self.attach_cached_embedding_to_resolved_request(
+            job.workspace_id.as_str(),
+            &mut resolved,
+            embedding_provider.as_ref(),
+        )
+        .await?;
         Ok(resolved)
     }
+}
+
+impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
+    async fn attach_cached_embedding_to_resolved_request(
+        &self,
+        workspace_id: &str,
+        resolved: &mut ThreadEpisodicResolvedIndexRequest,
+        embedding_provider: &dyn ThreadEpisodicEmbeddingProvider,
+    ) -> std::result::Result<(), ThreadEpisodicIndexResolutionError> {
+        if resolved.request.embedding.is_some() {
+            return Ok(());
+        }
+
+        let identity = embedding_provider.identity();
+        let pipeline_identity_hash = stable_text_hash(
+            embedding_provider
+                .document_embedding_pipeline_identity()
+                .as_str(),
+        );
+        let input_hash = stable_text_hash(resolved.request.text.as_str());
+        let artifact_id = embedding_artifact_id(
+            workspace_id,
+            pipeline_identity_hash.as_str(),
+            input_hash.as_str(),
+        );
+        let artifact_lock = self.artifact_lock(artifact_id.as_str())?;
+        let _guard = artifact_lock.lock().await;
+
+        let artifact = match self
+            .crud_store
+            .find_thread_episodic_embedding_artifact(artifact_id.as_str())
+            .await
+            .map_err(|error| {
+                ThreadEpisodicIndexResolutionError::retryable(format!(
+                    "failed to load thread episodic embedding artifact: {error:#}"
+                ))
+            })? {
+            Some(artifact) => {
+                validate_embedding_artifact(
+                    &artifact,
+                    workspace_id,
+                    pipeline_identity_hash.as_str(),
+                    input_hash.as_str(),
+                    &identity,
+                )?;
+                if let Err(error) = self
+                    .crud_store
+                    .touch_thread_episodic_embedding_artifact(
+                        artifact.id.as_str(),
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        artifact_id = %artifact.id,
+                        error = %format!("{error:#}"),
+                        "failed to update thread episodic embedding artifact usage timestamp"
+                    );
+                }
+                artifact
+            }
+            None => {
+                let vector = embedding_provider
+                    .embed_text_checked(resolved.request.text.as_str())
+                    .map_err(embedding_resolution_error)?;
+                self.crud_store
+                    .insert_thread_episodic_embedding_artifact_if_absent(
+                        NewThreadEpisodicEmbeddingArtifactRecord {
+                            id: artifact_id.clone(),
+                            workspace_id: workspace_id.to_owned(),
+                            pipeline_identity_hash: pipeline_identity_hash.clone(),
+                            input_hash: input_hash.clone(),
+                            provider_id: identity.provider_id.clone(),
+                            model: identity.model.clone(),
+                            dimension: identity.dimension,
+                            normalized: identity.normalized,
+                            vector,
+                        },
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        ThreadEpisodicIndexResolutionError::retryable(format!(
+                            "failed to persist thread episodic embedding artifact: {error:#}"
+                        ))
+                    })?
+            }
+        };
+
+        resolved.request.embedding = Some(
+            ThreadEpisodicMemvidIndexEmbedding::new(identity, artifact.vector).map_err(
+                |error| ThreadEpisodicIndexResolutionError::non_retryable(error.message),
+            )?,
+        );
+        resolved.embedding_artifact_id = Some(artifact.id);
+        Ok(())
+    }
+}
+
+fn embedding_artifact_id(
+    workspace_id: &str,
+    pipeline_identity_hash: &str,
+    input_hash: &str,
+) -> String {
+    stable_text_hash(
+        format!(
+            "thread_episodic_embedding_artifact_v1\nworkspace={}\npipeline={}\ninput={}\n",
+            workspace_id.trim(),
+            pipeline_identity_hash.trim(),
+            input_hash.trim()
+        )
+        .as_str(),
+    )
+}
+
+fn validate_embedding_artifact(
+    artifact: &pioneer_crud::ThreadEpisodicEmbeddingArtifactRecord,
+    workspace_id: &str,
+    pipeline_identity_hash: &str,
+    input_hash: &str,
+    identity: &pioneer_memory::ThreadEpisodicEmbeddingIdentity,
+) -> std::result::Result<(), ThreadEpisodicIndexResolutionError> {
+    if artifact.workspace_id != workspace_id
+        || artifact.pipeline_identity_hash != pipeline_identity_hash
+        || artifact.input_hash != input_hash
+        || artifact.provider_id != identity.provider_id
+        || artifact.model != identity.model
+        || artifact.dimension != identity.dimension
+        || artifact.normalized != identity.normalized
+        || artifact.vector.len() != identity.dimension
+    {
+        return Err(ThreadEpisodicIndexResolutionError::non_retryable(
+            "thread episodic embedding artifact identity mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn attach_embedding_to_resolved_request(
@@ -883,6 +1051,7 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
         Ok(ThreadEpisodicResolvedIndexRequest {
             request,
             segment_index: capsule.segment_index,
+            embedding_artifact_id: None,
         })
     }
 }
@@ -1186,6 +1355,14 @@ impl WorkspaceEpisodicRecallService {
             hits.extend(output.hits);
         }
 
+        let (deduplicated_hits, projection_duplicates) =
+            deduplicate_cross_thread_projection_hits(self.crud_store.as_ref(), hits).await;
+        let mut hits = deduplicated_hits;
+        if projection_duplicates > 0 {
+            diagnostics.push(format!(
+                "deduplicated_projection_hits:{projection_duplicates}"
+            ));
+        }
         hits.sort_by(|left, right| {
             right
                 .score
@@ -1286,6 +1463,48 @@ impl WorkspaceEpisodicRecallService {
         ));
         (candidates, diagnostics, suppressed_thread_ids)
     }
+}
+
+async fn deduplicate_cross_thread_projection_hits(
+    crud_store: &CrudStore,
+    hits: Vec<ThreadEpisodicHit>,
+) -> (Vec<ThreadEpisodicHit>, usize) {
+    let mut entries = BTreeMap::<String, ThreadEpisodicHit>::new();
+    let mut dropped = 0usize;
+    for hit in hits {
+        let group_id = match crud_store
+            .find_thread_episodic_item(hit.provenance.index_item_id.0.as_str())
+            .await
+        {
+            Ok(Some(item)) => item.projection_group_id,
+            Ok(None) | Err(_) => format!("source:{}", hit.provenance.source_id),
+        };
+        match entries.get_mut(group_id.as_str()) {
+            Some(existing) => {
+                dropped = dropped.saturating_add(1);
+                if thread_episodic_hit_is_better(&hit, existing) {
+                    *existing = hit;
+                }
+            }
+            None => {
+                entries.insert(group_id, hit);
+            }
+        }
+    }
+    (entries.into_values().collect(), dropped)
+}
+
+fn thread_episodic_hit_is_better(
+    candidate: &ThreadEpisodicHit,
+    existing: &ThreadEpisodicHit,
+) -> bool {
+    candidate
+        .score
+        .partial_cmp(&existing.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        == std::cmp::Ordering::Greater
+        || (candidate.score == existing.score
+            && candidate.created_at.unwrap_or_default() > existing.created_at.unwrap_or_default())
 }
 
 fn workspace_recall_invalid(message: impl Into<String>) -> WorkspaceEpisodicRecallOutput {
@@ -3099,6 +3318,7 @@ impl ThreadEpisodicIndexExecutor {
             segment_index: resolved.segment_index,
             frame_id: output.frame_id,
             frame_uri: frame_uri.clone(),
+            embedding_artifact_id: resolved.embedding_artifact_id.clone(),
         };
         if let Err(error) = self
             .crud_store
@@ -3516,6 +3736,94 @@ impl StoreThreadEpisodicIngestor {
         }
     }
 
+    async fn projection_group_id(
+        &self,
+        item: &ThreadEpisodicCommittedItem,
+        source_text_hash: &str,
+    ) -> String {
+        match self
+            .resolve_task_projection_group_id(item, source_text_hash)
+            .await
+        {
+            Ok(Some(group_id)) => group_id,
+            Ok(None) => occurrence_projection_group_id(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.turn_id.as_str(),
+                item.item_id.as_str(),
+                source_text_hash,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %item.workspace_id,
+                    thread_id = %item.thread_id,
+                    turn_id = %item.turn_id,
+                    item_id = %item.item_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve thread episodic task projection group; using occurrence identity"
+                );
+                occurrence_projection_group_id(
+                    item.workspace_id.as_str(),
+                    item.thread_id.as_str(),
+                    item.turn_id.as_str(),
+                    item.item_id.as_str(),
+                    source_text_hash,
+                )
+            }
+        }
+    }
+
+    async fn resolve_task_projection_group_id(
+        &self,
+        item: &ThreadEpisodicCommittedItem,
+        source_text_hash: &str,
+    ) -> Result<Option<String>> {
+        if let Some(task_run_turn) = self
+            .crud_store
+            .get_task_run_turn_by_turn(item.thread_id.as_str(), item.turn_id.as_str())
+            .await?
+        {
+            if item.item_type == TurnItemType::UserMessage
+                && task_run_turn.kind == TaskRunTurnKind::Initial
+                && let Some(snapshot) = self
+                    .crud_store
+                    .get_task_run_conversation_snapshot(task_run_turn.run_id.as_str())
+                    .await?
+                && let Some(source_turn_id) = snapshot
+                    .source_turn_id
+                    .as_deref()
+                    .filter(|source_turn_id| !source_turn_id.trim().is_empty())
+            {
+                return Ok(Some(occurrence_projection_group_id(
+                    item.workspace_id.as_str(),
+                    snapshot.conversation_thread_id.as_str(),
+                    source_turn_id,
+                    format!("user_{source_turn_id}").as_str(),
+                    source_text_hash,
+                )));
+            }
+            if item.item_type == TurnItemType::AgentMessage {
+                return Ok(Some(task_result_projection_group_id(
+                    item.workspace_id.as_str(),
+                    task_run_turn.run_id.as_str(),
+                    source_text_hash,
+                )));
+            }
+        }
+
+        if item.item_type == TurnItemType::AgentMessage
+            && let Some(delivery_id) = task_delivery_id_from_result_item_id(item.item_id.as_str())
+            && let Some(delivery) = self.crud_store.get_task_delivery(delivery_id).await?
+        {
+            return Ok(Some(task_result_projection_group_id(
+                item.workspace_id.as_str(),
+                delivery.run_id.as_str(),
+                source_text_hash,
+            )));
+        }
+        Ok(None)
+    }
+
     pub(crate) async fn reindex_thread_from_history(
         &self,
         request: ThreadEpisodicThreadReindexRequest,
@@ -3682,6 +3990,9 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
 
         let now_unix = chrono::Utc::now().timestamp();
         let source_text_hash = source_text_hash(source_text);
+        let projection_group_id = self
+            .projection_group_id(&item, source_text_hash.as_str())
+            .await;
         let text_hash = item_text_hash(&item, source_text);
         let item_record = self
             .crud_store
@@ -3699,6 +4010,7 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
                     status: ThreadEpisodicItemStatus::PendingIndex,
                     text_hash,
                     source_text_hash,
+                    projection_group_id,
                     language_hint: None,
                     token_estimate: estimate_tokens(source_text),
                     capsule_id: None,
@@ -3805,6 +4117,42 @@ fn sha256_hex(text: &str) -> String {
 
 fn source_text_hash(text: &str) -> String {
     sha256_hex(normalize_for_thread_episodic_hash(text).as_str())
+}
+
+fn occurrence_projection_group_id(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    source_text_hash: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "thread_episodic_projection_v1\noccurrence\nworkspace={}\nthread={}\nturn={}\nitem={}\nsource_text_hash={}\n",
+            workspace_id.trim(),
+            thread_id.trim(),
+            turn_id.trim(),
+            item_id.trim(),
+            source_text_hash.trim()
+        )
+        .as_str(),
+    )
+}
+
+fn task_result_projection_group_id(
+    workspace_id: &str,
+    run_id: &str,
+    source_text_hash: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "thread_episodic_projection_v1\ntask_result\nworkspace={}\nrun={}\nsource_text_hash={}\n",
+            workspace_id.trim(),
+            run_id.trim(),
+            source_text_hash.trim()
+        )
+        .as_str(),
+    )
 }
 
 fn item_text_hash(item: &ThreadEpisodicCommittedItem, item_text: &str) -> String {
@@ -4634,6 +4982,30 @@ mod tests {
         }
     }
 
+    fn episodic_hit_for_item(
+        item: &ThreadEpisodicItemRecord,
+        text: &str,
+        score: f32,
+    ) -> ThreadEpisodicHit {
+        ThreadEpisodicHit {
+            provenance: provenance_from_item(item),
+            text: text.to_owned(),
+            score,
+            score_breakdown: pioneer_protocol::ThreadEpisodicScoreBreakdown {
+                final_score: score,
+                memvid_score: Some(score),
+                semantic_score: None,
+                lexical_score: Some(score),
+                temporal_score: None,
+                exact_source_boost: None,
+                recency_boost: None,
+                source_role_boost: None,
+            },
+            adaptive_diagnostics: None,
+            created_at: Some(item.created_at.timestamp()),
+        }
+    }
+
     fn recall_input(
         workspace_id: &str,
         thread_id: &str,
@@ -4682,6 +5054,39 @@ mod tests {
         source_text: &str,
         status: ThreadEpisodicItemStatus,
         visibility: ThreadEpisodicItemVisibility,
+    ) -> ThreadEpisodicItemRecord {
+        let source_text_hash = source_text_hash(source_text);
+        let projection_group_id = occurrence_projection_group_id(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            source_text_hash.as_str(),
+        );
+        seed_thread_episodic_item_with_state_and_projection_group(
+            crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            source_text,
+            status,
+            visibility,
+            projection_group_id.as_str(),
+        )
+        .await
+    }
+
+    async fn seed_thread_episodic_item_with_state_and_projection_group(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        source_text: &str,
+        status: ThreadEpisodicItemStatus,
+        visibility: ThreadEpisodicItemVisibility,
+        projection_group_id: &str,
     ) -> ThreadEpisodicItemRecord {
         let capsule = crud_store
             .resolve_thread_episodic_workspace_active_write_segment(
@@ -4733,6 +5138,7 @@ mod tests {
                         source_text,
                     ),
                     source_text_hash: source_text_hash(source_text),
+                    projection_group_id: projection_group_id.to_owned(),
                     language_hint: None,
                     token_estimate: 8,
                     capsule_id: Some(capsule.id),
@@ -6282,6 +6688,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_thread_recall_deduplicates_only_shared_projection_groups() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let parent = seed_thread_episodic_item_with_state_and_projection_group(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_parent_projection",
+            "turn_parent_projection",
+            "item_parent_projection",
+            "same logical event",
+            ThreadEpisodicItemStatus::Active,
+            ThreadEpisodicItemVisibility::UserVisible,
+            "task_projection_group",
+        )
+        .await;
+        let child = seed_thread_episodic_item_with_state_and_projection_group(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_child_projection",
+            "turn_child_projection",
+            "item_child_projection",
+            "same logical event",
+            ThreadEpisodicItemStatus::Active,
+            ThreadEpisodicItemVisibility::UserVisible,
+            "task_projection_group",
+        )
+        .await;
+        let independent = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_independent_projection",
+            "turn_independent_projection",
+            "item_independent_projection",
+            "same logical event",
+        )
+        .await;
+
+        let (hits, dropped) = deduplicate_cross_thread_projection_hits(
+            crud_store.as_ref(),
+            vec![
+                episodic_hit_for_item(&parent, "same logical event", 0.7),
+                episodic_hit_for_item(&child, "same logical event", 0.9),
+                episodic_hit_for_item(&independent, "same logical event", 0.8),
+            ],
+        )
+        .await;
+
+        assert_eq!(dropped, 1);
+        assert_eq!(hits.len(), 2);
+        let mut actual_ids = hits
+            .iter()
+            .map(|hit| hit.provenance.index_item_id.0.clone())
+            .collect::<Vec<_>>();
+        actual_ids.sort();
+        let mut expected_ids = vec![child.id, independent.id];
+        expected_ids.sort();
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[tokio::test]
     async fn thread_episodic_recall_service_caps_prompt_chars_and_fails_safe() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_recall_caps_prompt";
@@ -6435,6 +6900,7 @@ mod tests {
             Ok(ThreadEpisodicResolvedIndexRequest {
                 request: self.request.clone(),
                 segment_index: self.segment_index,
+                embedding_artifact_id: None,
             })
         }
     }
@@ -6739,6 +7205,7 @@ mod tests {
         turn_id: &str,
         item_id: &str,
     ) -> ThreadEpisodicItemRecord {
+        let source_text_hash = "b".repeat(64);
         crud_store
             .upsert_thread_episodic_item(
                 NewThreadEpisodicItemRecord {
@@ -6753,7 +7220,14 @@ mod tests {
                     visibility: ThreadEpisodicItemVisibility::UserVisible,
                     status: ThreadEpisodicItemStatus::PendingIndex,
                     text_hash: "a".repeat(64),
-                    source_text_hash: "b".repeat(64),
+                    projection_group_id: occurrence_projection_group_id(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        source_text_hash.as_str(),
+                    ),
+                    source_text_hash,
                     language_hint: None,
                     token_estimate: 1,
                     capsule_id: None,
@@ -7031,6 +7505,7 @@ mod tests {
                 segment_index: 1,
             }),
             resolver,
+            crud_store.clone(),
         ));
         let executor =
             ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
@@ -7059,6 +7534,115 @@ mod tests {
             .expect("job read")
             .expect("job exists");
         assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Completed);
+        let stored_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("item read")
+            .expect("item exists");
+        let artifact_id = stored_item
+            .embedding_artifact_id
+            .expect("indexed item should reference its embedding artifact");
+        assert!(
+            crud_store
+                .find_thread_episodic_embedding_artifact(artifact_id.as_str())
+                .await
+                .expect("artifact lookup should succeed")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_vector_provider_reuses_embedding_for_distinct_thread_occurrences() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let parent_item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_embedding_parent",
+            "turn_embedding_parent",
+            "item_embedding_parent",
+        )
+        .await;
+        let child_item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_embedding_child",
+            "turn_embedding_child",
+            "item_embedding_child",
+        )
+        .await;
+        let parent_job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            parent_item.thread_id.as_str(),
+            parent_item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let child_job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            child_item.thread_id.as_str(),
+            child_item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.4, 0.5, 0.6,
+        ]));
+        resolver.set_active_provider(Some(embedding_provider.clone()));
+        let parent_provider = RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request: static_index_request(
+                    "file:///tmp/thread-embedding-parent.mv2".to_owned(),
+                    "capsule_embedding_parent",
+                    "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_parent",
+                    parent_item.id.as_str(),
+                ),
+                segment_index: 1,
+            }),
+            resolver.clone(),
+            crud_store.clone(),
+        );
+        let child_provider = RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request: static_index_request(
+                    "file:///tmp/thread-embedding-child.mv2".to_owned(),
+                    "capsule_embedding_child",
+                    "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_child",
+                    child_item.id.as_str(),
+                ),
+                segment_index: 2,
+            }),
+            resolver,
+            crud_store.clone(),
+        );
+
+        let parent = parent_provider
+            .resolve_index_request(&parent_job)
+            .await
+            .expect("parent occurrence should resolve");
+        let child = child_provider
+            .resolve_index_request(&child_job)
+            .await
+            .expect("child occurrence should resolve");
+
+        assert_eq!(embedding_provider.calls(), 1);
+        assert_ne!(parent.request.index_item_id, child.request.index_item_id);
+        assert_ne!(parent.request.frame_uri, child.request.frame_uri);
+        assert_eq!(
+            parent.embedding_artifact_id, child.embedding_artifact_id,
+            "identical embedding input and pipeline should share one artifact"
+        );
+        let artifact_id = parent
+            .embedding_artifact_id
+            .expect("resolved vector request should reference an artifact");
+        let artifact = crud_store
+            .find_thread_episodic_embedding_artifact(artifact_id.as_str())
+            .await
+            .expect("artifact lookup should succeed")
+            .expect("artifact should be persisted");
+        assert_eq!(artifact.vector, vec![0.4, 0.5, 0.6]);
     }
 
     #[tokio::test]
@@ -7103,6 +7687,7 @@ mod tests {
                 segment_index: 1,
             }),
             resolver,
+            crud_store.clone(),
         ));
         let executor =
             ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
@@ -7175,6 +7760,7 @@ mod tests {
                 segment_index: 1,
             }),
             resolver,
+            crud_store.clone(),
         ));
         let executor = ThreadEpisodicIndexExecutor::new(crud_store, backend.clone(), provider);
 
@@ -7316,6 +7902,122 @@ mod tests {
             pioneer_crud::THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID
         );
         assert_eq!(workspace_capsules[0].id, resolved[0].request.capsule_id);
+    }
+
+    #[tokio::test]
+    async fn task_child_initial_input_shares_parent_projection_but_followup_does_not() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let parent_thread_id = "thread_projection_parent";
+        let parent_turn_id = "turn_projection_parent";
+        let parent_item_id = format!("user_{parent_turn_id}");
+        let child_thread_id = "thread_projection_child";
+        let child_turn_id = "turn_projection_child";
+        let child_item_id = format!("user_{child_turn_id}");
+        let run_id = "run_projection_child";
+        let source_text = "shared async task input";
+        crud_store
+            .upsert_task_run_turn(pioneer_protocol::TaskRunTurn {
+                id: "task_run_turn_projection_child".to_owned(),
+                task_id: "task_projection_child".to_owned(),
+                run_id: run_id.to_owned(),
+                execution_id: None,
+                thread_id: child_thread_id.to_owned(),
+                turn_id: child_turn_id.to_owned(),
+                kind: pioneer_protocol::TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: pioneer_protocol::TaskRunTurnStatus::InProgress,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: 1_700_000_000,
+                started_at: Some(1_700_000_000),
+                completed_at: None,
+            })
+            .await
+            .expect("task run turn should insert");
+        crud_store
+            .insert_task_run_conversation_snapshot_if_absent(
+                pioneer_crud::NewTaskRunConversationSnapshot {
+                    run_id: run_id.to_owned(),
+                    task_id: "task_projection_child".to_owned(),
+                    workspace_id: workspace_id.clone(),
+                    conversation_thread_id: parent_thread_id.to_owned(),
+                    source_turn_id: Some(parent_turn_id.to_owned()),
+                    history_json: "{}".to_owned(),
+                    created_at: fixed_datetime_from_unix(1_700_000_000),
+                },
+            )
+            .await
+            .expect("task conversation snapshot should insert");
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        for (thread_id, turn_id, item_id, text) in [
+            (
+                parent_thread_id,
+                parent_turn_id,
+                parent_item_id.as_str(),
+                source_text,
+            ),
+            (
+                child_thread_id,
+                child_turn_id,
+                child_item_id.as_str(),
+                source_text,
+            ),
+            (
+                child_thread_id,
+                "turn_projection_child_followup",
+                "user_turn_projection_child_followup",
+                "why did you implement it this way?",
+            ),
+        ] {
+            ingestor
+                .ingest_committed_item(
+                    committed_item_ingestion_input_from_parts(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        TurnItem::UserMessage {
+                            id: item_id.to_owned(),
+                            text: text.to_owned(),
+                            attachments: Vec::new(),
+                        },
+                    )
+                    .expect("committed item should be valid"),
+                )
+                .await
+                .expect("ingestion should succeed");
+        }
+
+        let parent = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), parent_thread_id, 10)
+            .await
+            .expect("parent items should load")
+            .into_iter()
+            .find(|item| item.item_id == parent_item_id)
+            .expect("parent occurrence should exist");
+        let child_items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), child_thread_id, 10)
+            .await
+            .expect("child items should load");
+        let child_initial = child_items
+            .iter()
+            .find(|item| item.item_id == child_item_id)
+            .expect("child initial occurrence should exist");
+        let child_followup = child_items
+            .iter()
+            .find(|item| item.item_id == "user_turn_projection_child_followup")
+            .expect("child followup occurrence should exist");
+
+        assert_eq!(
+            parent.projection_group_id,
+            child_initial.projection_group_id
+        );
+        assert_ne!(
+            child_followup.projection_group_id,
+            child_initial.projection_group_id
+        );
+        assert_ne!(parent.id, child_initial.id);
     }
 
     #[tokio::test]
@@ -7959,6 +8661,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projection_group_ids_preserve_causal_identity_without_text_merging() {
+        let text_hash = source_text_hash("same text in any language");
+        let parent_occurrence = occurrence_projection_group_id(
+            "workspace",
+            "parent_thread",
+            "parent_turn",
+            "user_parent_turn",
+            text_hash.as_str(),
+        );
+        let independent_occurrence = occurrence_projection_group_id(
+            "workspace",
+            "independent_thread",
+            "independent_turn",
+            "user_independent_turn",
+            text_hash.as_str(),
+        );
+        assert_ne!(parent_occurrence, independent_occurrence);
+        assert_eq!(
+            task_result_projection_group_id("workspace", "run_1", text_hash.as_str()),
+            task_result_projection_group_id("workspace", "run_1", text_hash.as_str())
+        );
+        assert_ne!(
+            task_result_projection_group_id("workspace", "run_1", text_hash.as_str()),
+            task_result_projection_group_id("workspace", "run_2", text_hash.as_str())
+        );
+    }
+
     mod eval {
         use super::*;
         use pioneer_promt::{
@@ -8355,6 +9085,10 @@ mod tests {
                         status: fixture.status,
                         text_hash,
                         source_text_hash: source_text_hash(fixture.text.as_str()),
+                        projection_group_id: format!(
+                            "projection_group_{}_{}",
+                            fixture.turn_id, fixture.item_id
+                        ),
                         language_hint: None,
                         token_estimate: estimate_tokens(fixture.text.as_str()),
                         capsule_id: Some(capsule.id),

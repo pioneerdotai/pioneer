@@ -1463,6 +1463,7 @@ async fn execute_refill_jobs(
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                 base_payload_provider,
                 embedding_provider_resolver,
+                crud_store.clone(),
             ))
         } else {
             base_payload_provider
@@ -1702,6 +1703,7 @@ async fn persist_successful_refill_item(
                 segment_index: resolved.segment_index,
                 frame_id: output.frame_id,
                 frame_uri: output.frame_uri.clone(),
+                embedding_artifact_id: resolved.embedding_artifact_id.clone(),
             },
             now_unix,
         )
@@ -2734,6 +2736,7 @@ mod tests {
                     status: ThreadEpisodicItemStatus::Active,
                     text_hash: "a".repeat(64),
                     source_text_hash: "b".repeat(64),
+                    projection_group_id: "projection_group_cleanup".to_owned(),
                     language_hint: None,
                     token_estimate: 1,
                     capsule_id: Some(old_capsule.id.clone()),
@@ -4270,6 +4273,7 @@ mod tests {
                     status: ThreadEpisodicItemStatus::PendingIndex,
                     text_hash: "a".repeat(64),
                     source_text_hash: "b".repeat(64),
+                    projection_group_id: "projection_group_orphan".to_owned(),
                     language_hint: None,
                     token_estimate: 1,
                     capsule_id: None,

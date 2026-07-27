@@ -836,19 +836,19 @@ pub use crate::repositories::turn_runtime_snapshot::{
     NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord,
 };
 pub use crate::thread_episodic::{
-    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
+    NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
     THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
     ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
     ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
-    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
-    ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
-    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
-    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRecallEventRecord,
-    ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread, ThreadEpisodicRepairStatus,
-    ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
+    ThreadEpisodicEmbeddingArtifactRecord, ThreadEpisodicExclusionReason,
+    ThreadEpisodicExclusionRecord, ThreadEpisodicGraphEnrichmentState,
+    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
+    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
+    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+    ThreadEpisodicRecallEventRecord, ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread,
+    ThreadEpisodicRepairStatus, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
     ThreadEpisodicThreadDirectoryRecord, ThreadEpisodicThreadDirectorySelection,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
     ThreadEpisodicWorkspaceActiveWriteSegmentRequest, deterministic_thread_episodic_capsule_id,
@@ -6374,6 +6374,57 @@ impl CrudStore {
             .await?
             .map(crate::thread_episodic::thread_episodic_item_record_from_model)
             .transpose()
+    }
+
+    pub async fn find_thread_episodic_embedding_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ThreadEpisodicEmbeddingArtifactRecord>> {
+        thread_episodic_repository::find_embedding_artifact_by_id(&self.connection, artifact_id)
+            .await?
+            .map(crate::thread_episodic::thread_episodic_embedding_artifact_record_from_model)
+            .transpose()
+    }
+
+    pub async fn insert_thread_episodic_embedding_artifact_if_absent(
+        &self,
+        artifact: NewThreadEpisodicEmbeddingArtifactRecord,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicEmbeddingArtifactRecord> {
+        self.run_serialized_write(|| {
+            let artifact = artifact.clone();
+            async move {
+                let row = thread_episodic_repository::insert_embedding_artifact_if_absent(
+                    &self.connection,
+                    artifact,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                crate::thread_episodic::thread_episodic_embedding_artifact_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn touch_thread_episodic_embedding_artifact(
+        &self,
+        artifact_id: &str,
+        now_unix: i64,
+    ) -> Result<Option<ThreadEpisodicEmbeddingArtifactRecord>> {
+        self.run_serialized_write(|| {
+            let artifact_id = artifact_id.to_owned();
+            async move {
+                thread_episodic_repository::touch_embedding_artifact(
+                    &self.connection,
+                    artifact_id.as_str(),
+                    unix_to_datetime(now_unix),
+                )
+                .await?
+                .map(crate::thread_episodic::thread_episodic_embedding_artifact_record_from_model)
+                .transpose()
+            }
+        })
+        .await
     }
 
     pub async fn upsert_thread_episodic_item(
@@ -17452,6 +17503,7 @@ mod tests {
             status,
             text_hash: text_hash.to_owned(),
             source_text_hash: "source_hash_1".to_owned(),
+            projection_group_id: "projection_group_1".to_owned(),
             language_hint: Some("ru".to_owned()),
             token_estimate: 12,
             capsule_id: None,

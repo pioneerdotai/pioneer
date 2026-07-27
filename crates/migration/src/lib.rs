@@ -34,6 +34,7 @@ mod m20260721_000001_skill_pack_installation;
 mod m20260724_000001_cli_runtime_continuation_owner;
 mod m20260726_000001_self_improvement_core;
 mod m20260726_000002_gateway_identity_foundation;
+mod m20260727_000001_thread_episodic_projection_embeddings;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -69,6 +70,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260724_000001_cli_runtime_continuation_owner::Migration),
             Box::new(m20260726_000001_self_improvement_core::Migration),
             Box::new(m20260726_000002_gateway_identity_foundation::Migration),
+            Box::new(m20260727_000001_thread_episodic_projection_embeddings::Migration),
         ]
     }
 }

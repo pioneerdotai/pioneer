@@ -250,6 +250,21 @@ pub trait ThreadEpisodicEmbeddingProvider: Send + Sync {
 
     fn normalized(&self) -> bool;
 
+    /// Stable identity for document preprocessing and embedding semantics.
+    ///
+    /// Implementations that chunk, pool, prefix, or otherwise transform document
+    /// input must include those settings here so persisted artifacts are never
+    /// reused across incompatible pipelines.
+    fn document_embedding_pipeline_identity(&self) -> String {
+        format!(
+            "thread_episodic_document_embedding_v1\nprovider={}\nmodel={}\ndimension={}\nnormalized={}\n",
+            self.provider_id(),
+            self.model(),
+            self.dimension(),
+            self.normalized()
+        )
+    }
+
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError>;
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {

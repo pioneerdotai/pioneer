@@ -26,6 +26,8 @@ pub struct Model {
     #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub text_hash: String,
     pub source_text_hash: String,
+    pub projection_group_id: Option<String>,
+    pub embedding_artifact_id: Option<String>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
     pub capsule_id: Option<String>,

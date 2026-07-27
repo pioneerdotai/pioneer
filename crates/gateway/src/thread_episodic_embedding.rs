@@ -42,6 +42,7 @@ const OPENROUTER_FALLBACK_EMBEDDING_MAX_INPUT_TOKENS: usize = 8192;
 const EMBEDDING_INPUT_TOKEN_BUDGET_NUMERATOR: usize = 3;
 const EMBEDDING_INPUT_TOKEN_BUDGET_DENOMINATOR: usize = 4;
 const EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE: usize = 16;
+const DOCUMENT_EMBEDDING_PIPELINE_VERSION: &str = "bounded_weighted_pool_v1";
 pub(crate) const CHUNKED_EMBEDDING_INPUT_ERROR_MARKER: &str = "chunked_embedding_input_v1";
 const THREAD_EPISODIC_PERSONAL_ASSISTANT_QUERY_INSTRUCTION: &str = concat!(
     "Given the user's current message in an ongoing personal assistant conversation, ",
@@ -1362,6 +1363,16 @@ impl ThreadEpisodicEmbeddingProvider for LocalEmbeddingProvider {
         self.normalized
     }
 
+    fn document_embedding_pipeline_identity(&self) -> String {
+        document_embedding_pipeline_identity(
+            self.provider_id(),
+            self.model(),
+            self.dimension(),
+            self.normalized(),
+            self.model_info.max_tokens,
+        )
+    }
+
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
         self.embed_bounded_inputs(&[text], false)
             .and_then(|mut embeddings| {
@@ -1713,6 +1724,16 @@ impl ThreadEpisodicEmbeddingProvider for RemoteEmbeddingProvider {
         self.normalized
     }
 
+    fn document_embedding_pipeline_identity(&self) -> String {
+        document_embedding_pipeline_identity(
+            self.provider_id(),
+            self.model(),
+            self.dimension(),
+            self.normalized(),
+            self.max_input_tokens,
+        )
+    }
+
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
         self.embed_bounded_inputs(&[text], false)
             .and_then(|mut embeddings| {
@@ -1742,6 +1763,18 @@ impl ThreadEpisodicEmbeddingProvider for RemoteEmbeddingProvider {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
         self.embed_bounded_inputs(texts, false)
     }
+}
+
+fn document_embedding_pipeline_identity(
+    provider_id: &str,
+    model: &str,
+    dimension: usize,
+    normalized: bool,
+    max_input_tokens: usize,
+) -> String {
+    format!(
+        "thread_episodic_document_embedding_v1\nprovider={provider_id}\nmodel={model}\ndimension={dimension}\nnormalized={normalized}\nmax_input_tokens={max_input_tokens}\npipeline={DOCUMENT_EMBEDDING_PIPELINE_VERSION}\ntoken_budget={EMBEDDING_INPUT_TOKEN_BUDGET_NUMERATOR}/{EMBEDDING_INPUT_TOKEN_BUDGET_DENOMINATOR}\nspecial_token_reserve={EMBEDDING_INPUT_SPECIAL_TOKEN_RESERVE}\n"
+    )
 }
 
 impl RemoteEmbeddingProvider {

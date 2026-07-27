@@ -631,6 +631,7 @@ impl MessageProcessor {
                     thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
                 )),
                 thread_episodic_embedding_provider_resolver.clone(),
+                crud_store.clone(),
             )),
         ));
         thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
@@ -2514,6 +2515,7 @@ impl MessageProcessor {
                     thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
                 )),
                 thread_episodic_embedding_provider_resolver.clone(),
+                crud_store.clone(),
             )),
         ));
         let thread_episodic_recall_embedding_provider_resolver: Arc<

@@ -59,6 +59,7 @@ pub mod thread_agents_doc;
 pub mod thread_agents_doc_revision;
 pub mod thread_cli_runtime_binding;
 pub mod thread_episodic_capsules;
+pub mod thread_episodic_embedding_artifacts;
 pub mod thread_episodic_exclusions;
 pub mod thread_episodic_index_jobs;
 pub mod thread_episodic_items;
