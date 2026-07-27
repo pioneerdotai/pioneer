@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_entity::thread;
-use pioneer_protocol::{Thread, ThreadStatus};
+use pioneer_protocol::{PersistedActorRef, Thread, ThreadStatus};
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
@@ -12,10 +12,59 @@ use crate::convention::{
     thread_mode_to_db, thread_origin_kind_to_db, thread_sidebar_visibility_to_db,
     thread_status_to_db,
 };
+use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 pub async fn upsert_thread<C: ConnectionTrait>(
     db: &C,
     thread_model: &Thread,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    upsert_thread_with_actor_columns(db, thread_model, None, None, created_at, updated_at).await
+}
+
+pub async fn upsert_thread_with_creator<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &Thread,
+    creator: &PersistedActorRef,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    if let Some(existing) = find_thread_by_id(db, thread_model.id.as_str()).await? {
+        let existing_creator = actor_ref_from_db(
+            existing.created_by_actor_kind.as_deref(),
+            existing.created_by_actor_id.as_deref(),
+        )
+        .with_context(|| {
+            format!(
+                "thread `{}` has an invalid persisted creator pair",
+                thread_model.id
+            )
+        })?;
+        if existing_creator.is_none() {
+            anyhow::bail!(
+                "thread `{}` is missing its persisted creator",
+                thread_model.id
+            );
+        }
+    }
+    let (actor_kind, actor_id) = actor_ref_to_db(creator);
+    upsert_thread_with_actor_columns(
+        db,
+        thread_model,
+        actor_kind,
+        actor_id,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
+async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &Thread,
+    created_by_actor_kind: Option<String>,
+    created_by_actor_id: Option<String>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
@@ -34,6 +83,8 @@ pub async fn upsert_thread<C: ConnectionTrait>(
         ),
         agent_nickname: Set(thread_model.agent_nickname.clone()),
         agent_role: Set(thread_model.agent_role.clone()),
+        created_by_actor_id: Set(created_by_actor_id),
+        created_by_actor_kind: Set(created_by_actor_kind),
         summary: Set(None),
         summary_turn_count: Set(None),
         created_at: Set(created_at),

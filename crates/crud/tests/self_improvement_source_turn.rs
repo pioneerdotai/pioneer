@@ -80,7 +80,13 @@ fn turn(turn_id: &str, turn_kind: TurnKind, origin: TurnOrigin) -> Turn {
 
 async fn start_turn(store: &CrudStore, thread: &Thread, turn: &Turn) {
     store
-        .materialize_turn_start(thread, SandboxMode::FullAccess, turn, &[])
+        .materialize_turn_start(
+            thread,
+            SandboxMode::FullAccess,
+            turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
         .await
         .expect("turn start must project");
 }

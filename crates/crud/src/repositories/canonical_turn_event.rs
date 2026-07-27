@@ -11,6 +11,7 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
 
+use super::identity::actor_ref_from_db;
 use super::self_improvement_source_turn::{
     VerifiedCollaborativeExchange, collaborative_child_lineage_matches,
     verify_collaborative_exchange,
@@ -816,6 +817,23 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<Vec<CanonicalTurnEventRecord>> {
+    let owning_turn = turn::Entity::find_by_id(turn_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to load canonical turn `{turn_id}`"))?
+        .with_context(|| format!("canonical turn `{turn_id}` is missing"))?;
+    if owning_turn.thread_id != thread_id {
+        bail!(
+            "canonical turn `{turn_id}` belongs to thread `{}`, not `{thread_id}`",
+            owning_turn.thread_id
+        );
+    }
+    let owning_actor = actor_ref_from_db(
+        owning_turn.initiated_by_actor_kind.as_deref(),
+        owning_turn.initiated_by_actor_id.as_deref(),
+    )
+    .with_context(|| format!("canonical turn `{turn_id}` has an invalid owning actor"))?;
+
     let mut rows = turn_event::Entity::find()
         .filter(turn_event::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
@@ -828,8 +846,38 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         (left.sequence, left.id.as_str()).cmp(&(right.sequence, right.id.as_str()))
     });
     rows.into_iter()
-        .map(|row| decode_event(row, workspace_id))
+        .map(|row| {
+            let mut record = decode_event(row, workspace_id)?;
+            hydrate_legacy_turn_start_actor(&mut record, owning_actor.as_ref())?;
+            Ok(record)
+        })
         .collect()
+}
+
+fn hydrate_legacy_turn_start_actor(
+    record: &mut CanonicalTurnEventRecord,
+    owning_actor: Option<&pioneer_protocol::PersistedActorRef>,
+) -> Result<()> {
+    let CanonicalTurnEventPayload::TurnStarted(started) = &mut record.payload else {
+        return Ok(());
+    };
+    match (started.actor.as_ref(), owning_actor) {
+        (Some(event_actor), Some(owning_actor)) if event_actor != owning_actor => bail!(
+            "canonical turn-start event `{}` actor does not match owning turn",
+            record.event_id
+        ),
+        (Some(_), Some(_)) | (None, None) => {}
+        (None, Some(owning_actor)) => {
+            // Historical payloads remain append-only. Bootstrap backfills the projection, and
+            // canonical history derives an effective actor only in this decoded in-memory copy.
+            started.actor = Some(owning_actor.clone());
+        }
+        (Some(_), None) => bail!(
+            "canonical turn-start event `{}` has an actor but owning turn does not",
+            record.event_id
+        ),
+    }
+    Ok(())
 }
 
 fn decode_event(row: turn_event::Model, workspace_id: &str) -> Result<CanonicalTurnEventRecord> {

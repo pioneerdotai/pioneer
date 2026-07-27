@@ -11,6 +11,7 @@ pub mod artifact;
 pub(crate) mod canonical_turn_event;
 pub mod cli_runtime_binding;
 pub mod hook_run;
+pub(crate) mod identity;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;

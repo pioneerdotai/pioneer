@@ -1,19 +1,24 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
-    CanonicalTurnEventPayload, CrudStore, SelfImprovementFrozenSourceRange,
-    SelfImprovementSourceTurnRecord,
+    CanonicalTurnEventPayload, CanonicalTurnEventRecord, CrudStore,
+    SelfImprovementFrozenSourceRange, SelfImprovementSourceTurnRecord,
 };
+use pioneer_entity::turn_event;
 use pioneer_protocol::{
-    AgentMessagePhase, ItemCompletedNotification, ItemStartedNotification, SandboxMode,
-    SystemEventLevel, TaskComposerWork, TaskMetadata, Thread, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolStoragePayload, Turn, TurnCompletedNotification,
+    AgentMessagePhase, ItemCompletedNotification, ItemStartedNotification, PersistedActorRef,
+    PrincipalId, SandboxMode, SystemEventLevel, TaskComposerWork, TaskMetadata, Thread, ThreadMode,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
+    ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload, Turn, TurnCompletedNotification,
     TurnFailedNotification, TurnItem, TurnKind, TurnOrigin, TurnStartParams, TurnStatus, UserInput,
     default_turn_permission_profile_snapshot,
 };
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    QueryFilter, Set,
+};
 
 const START_AT: i64 = 1_910_000_000;
+const TEST_PRINCIPAL_ID: &str = "P00000000000000000001";
 
 async fn migrated_store() -> (DatabaseConnection, CrudStore) {
     let database = Database::connect("sqlite::memory:")
@@ -110,6 +115,14 @@ fn tool_item(status: ToolCallStatus, success: Option<bool>) -> TurnItem {
 }
 
 async fn start(store: &CrudStore, thread: &Thread, turn: &Turn, text: &str) {
+    let actor = match thread.origin_kind {
+        ThreadOriginKind::TaskRun | ThreadOriginKind::System => PersistedActorRef::System,
+        ThreadOriginKind::Collaborative
+        | ThreadOriginKind::DirectMessage
+        | ThreadOriginKind::User => PersistedActorRef::Principal(
+            PrincipalId::new(TEST_PRINCIPAL_ID).expect("test principal id should be valid"),
+        ),
+    };
     store
         .materialize_turn_start(
             thread,
@@ -119,6 +132,7 @@ async fn start(store: &CrudStore, thread: &Thread, turn: &Turn, text: &str) {
                 text: text.to_owned(),
                 text_elements: Vec::new(),
             }],
+            actor,
         )
         .await
         .expect("turn start must persist");
@@ -420,6 +434,23 @@ async fn canonical_history_is_exactly_bounded_ordered_and_workspace_scoped() {
         |record| exhaustive_canonical_variant_event_type(&record.payload)
             == record.payload.event_type()
     ));
+    let source_actors = records
+        .iter()
+        .filter_map(|record| record.turn_start_actor())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_actors,
+        vec![
+            PersistedActorRef::Principal(
+                PrincipalId::new(TEST_PRINCIPAL_ID).expect("test principal id should be valid")
+            ),
+            PersistedActorRef::Principal(
+                PrincipalId::new(TEST_PRINCIPAL_ID).expect("test principal id should be valid")
+            ),
+        ],
+        "canonical source history must preserve owning turn actors"
+    );
     let ordered_turns = records
         .iter()
         .map(|record| record.turn_id.as_str())
@@ -485,6 +516,75 @@ async fn canonical_history_is_exactly_bounded_ordered_and_workspace_scoped() {
             .unwrap_err()
             .to_string()
             .contains("invalid anchor")
+    );
+}
+
+#[tokio::test]
+async fn canonical_history_derives_legacy_actor_without_rewriting_event_payload() {
+    let (database, store) = migrated_store().await;
+    let source_thread = thread("ws_history_a", "thread_legacy_actor", START_AT);
+    let source_turn = turn("turn_legacy_actor");
+    start(&store, &source_thread, &source_turn, "legacy source actor").await;
+    complete(&store, &source_thread, source_turn, START_AT + 1).await;
+
+    let start_event = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq("turn_legacy_actor"))
+        .filter(turn_event::Column::EventType.eq("turn/started"))
+        .one(&database)
+        .await
+        .expect("legacy fixture turn/start query must succeed")
+        .expect("legacy fixture turn/start must exist");
+    let mut legacy_payload =
+        serde_json::from_str::<serde_json::Value>(start_event.payload.as_str())
+            .expect("turn/start payload must decode");
+    assert!(
+        legacy_payload
+            .get_mut("payload")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("turn/start event payload must be an object")
+            .remove("actor")
+            .is_some(),
+        "new fixture must initially carry an actor"
+    );
+    let legacy_payload =
+        serde_json::to_string(&legacy_payload).expect("legacy payload must encode");
+    let mut active: turn_event::ActiveModel = start_event.into();
+    active.payload = Set(legacy_payload.clone());
+    active
+        .update(&database)
+        .await
+        .expect("legacy payload fixture must persist");
+
+    let sources = store
+        .list_self_improvement_source_turns_after("ws_history_a", 0, 0, 10)
+        .await
+        .expect("legacy source range must load");
+    let records = store
+        .list_canonical_turn_events_for_self_improvement(&frozen_range("ws_history_a", 0, sources))
+        .await
+        .expect("legacy canonical history must load");
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| matches!(&record.payload, CanonicalTurnEventPayload::TurnStarted(_)))
+            .and_then(CanonicalTurnEventRecord::turn_start_actor),
+        Some(&PersistedActorRef::Principal(
+            PrincipalId::new(TEST_PRINCIPAL_ID).expect("test principal id should be valid")
+        )),
+        "legacy canonical history must derive the owning projection actor"
+    );
+
+    let persisted_payload = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq("turn_legacy_actor"))
+        .filter(turn_event::Column::EventType.eq("turn/started"))
+        .one(&database)
+        .await
+        .expect("persisted legacy turn/start query must succeed")
+        .expect("persisted legacy turn/start must exist")
+        .payload;
+    assert_eq!(
+        persisted_payload, legacy_payload,
+        "canonical history reads must not rewrite append-only legacy payloads"
     );
 }
 
@@ -677,6 +777,7 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
             SandboxMode::FullAccess,
             &occurrence_turn,
             &[],
+            pioneer_protocol::PersistedActorRef::System,
         )
         .await
         .expect("detached occurrence turn must persist");

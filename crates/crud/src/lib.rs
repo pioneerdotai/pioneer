@@ -13,23 +13,33 @@ mod turn_item_terminal;
 mod util;
 
 pub use events::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+pub use repositories::identity::{
+    ActorReferenceRow, ActorResourceKind, GATEWAY_SINGLETON_KEY, GatewayIdentityRecord,
+    GatewayPrincipalRecord, IdentityInvariantRows, LegacyActorBackfillCounts, actor_ref_from_db,
+    actor_ref_to_db, backfill_legacy_actor_references, create_gateway_singleton, create_superuser,
+    gateway_identity_record_from_model, gateway_principal_record_from_model,
+    list_gateway_identities, list_gateway_principals, load_gateway_singleton,
+    load_identity_invariant_rows, load_principal_by_id, load_superusers_for_gateway,
+    principal_kind_from_db, principal_kind_to_db, principal_status_from_db, principal_status_to_db,
+    set_identity_bootstrap_version,
+};
 
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
     ArtifactSummary, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
-    PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, SandboxMode, SkillId, SkillPackId, StorageOutputPolicy, Task, TaskAgendaItem,
-    TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskDependency, TaskError,
-    TaskEventsResponse, TaskExecutorKind, TaskGetResponse, TaskListParams, TaskResult,
-    TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewEvent, TaskRun,
-    TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
-    TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement, ThreadStatus,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
-    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    PersistedActorRef, PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction,
+    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SkillPackId, StorageOutputPolicy,
+    Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind, TaskGetResponse,
+    TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus,
+    TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
+    ThreadStatus, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
+    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
     TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind,
     TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
@@ -262,6 +272,20 @@ pub struct CanonicalTurnEventRecord {
     pub payload: CanonicalTurnEventPayload,
 }
 
+impl CanonicalTurnEventRecord {
+    /// Returns the durable initiator carried by this turn/start event.
+    ///
+    /// Historical turn/start events can legitimately return `None`; callers that
+    /// require attribution must use the projection actor pair after legacy
+    /// bootstrap/backfill.
+    pub fn turn_start_actor(&self) -> Option<&PersistedActorRef> {
+        match &self.payload {
+            CanonicalTurnEventPayload::TurnStarted(started) => started.actor.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfImprovementWorkspaceStateRecord {
     pub workspace_id: String,
@@ -298,7 +322,7 @@ pub struct SelfImprovementRunRecord {
     pub claim_token: Option<String>,
     pub claimed_by: Option<String>,
     pub lease_expires_at_unix: Option<i64>,
-    pub attempt_count: i32,
+    pub attempt_count: i64,
     pub next_attempt_at_unix: Option<i64>,
     pub learner_provider: String,
     pub learner_model: String,
@@ -7476,6 +7500,7 @@ impl CrudStore {
         sandbox_mode: SandboxMode,
         turn_model: &Turn,
         input: &[UserInput],
+        actor: PersistedActorRef,
     ) -> Result<()> {
         self.materialize_turn_start_with_reasoning_effort(
             thread_model,
@@ -7483,6 +7508,7 @@ impl CrudStore {
             turn_model,
             input,
             None,
+            actor,
         )
         .await
     }
@@ -7495,12 +7521,14 @@ impl CrudStore {
         turn_model: &Turn,
         input: &[UserInput],
         reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
     ) -> Result<()> {
         let event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
             turn: turn_model.clone(),
             input: input.to_vec(),
+            actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
         });
 
@@ -7515,6 +7543,7 @@ impl CrudStore {
         sandbox_mode: SandboxMode,
         turn_model: &Turn,
         input: &[UserInput],
+        actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     ) -> Result<()> {
         self.materialize_turn_start_with_reasoning_effort_and_permission_audit(
@@ -7523,6 +7552,7 @@ impl CrudStore {
             turn_model,
             input,
             None,
+            actor,
             audit_event,
         )
         .await
@@ -7536,6 +7566,7 @@ impl CrudStore {
         turn_model: &Turn,
         input: &[UserInput],
         reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     ) -> Result<()> {
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
@@ -7543,6 +7574,7 @@ impl CrudStore {
             sandbox_mode,
             turn: turn_model.clone(),
             input: input.to_vec(),
+            actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
         });
         let audit_event = TurnEventPayload::TurnPermissionAudit(audit_event);
@@ -13089,14 +13121,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         Ok(Some(thread))
     }
 
-    pub async fn upsert_thread_model(&self, thread_model: &Thread) -> Result<()> {
+    /// Persists a thread through the normal write path.
+    ///
+    /// Historical actorless rows are handled only by the projector's explicit
+    /// legacy replay seam; every normal insert must carry a durable creator.
+    pub async fn upsert_thread_model(
+        &self,
+        thread_model: &Thread,
+        creator: PersistedActorRef,
+    ) -> Result<()> {
         let thread_model = thread_model.clone();
+        let creator = creator.clone();
         let created_at = unix_to_datetime(thread_model.created_at);
         let updated_at = unix_to_datetime(thread_model.updated_at);
         self.run_serialized_write(|| {
             let thread_model = thread_model.clone();
+            let creator = creator.clone();
             async move {
-                thread::upsert_thread(&self.connection, &thread_model, created_at, updated_at).await
+                thread::upsert_thread_with_creator(
+                    &self.connection,
+                    &thread_model,
+                    &creator,
+                    created_at,
+                    updated_at,
+                )
+                .await
             }
         })
         .await
@@ -16515,6 +16564,9 @@ fn build_task_tree(
 
 async fn validate_turn_event_for_permanent_storage(event: &TurnEventPayload) -> Result<()> {
     match event {
+        TurnEventPayload::TurnStarted(payload) if payload.actor.is_none() => {
+            anyhow::bail!("new turn/started event is missing its required actor")
+        }
         TurnEventPayload::ItemStarted(notification) => {
             validate_tool_payload_for_permanent_storage(&notification.item)
         }
@@ -17132,19 +17184,19 @@ mod tests {
     use pioneer_protocol::{
         AgentMessagePhase, ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
         ArtifactKind, ArtifactRole, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
-        ItemCompletedNotification, ItemRecoveryAttachedNotification,
+        GatewayId, ItemCompletedNotification, ItemRecoveryAttachedNotification,
         ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
         ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
         ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
         ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
         ItemToolRetryScheduledNotification, ItemUpdatedNotification, PermissionBehavior,
-        PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-        PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
-        PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-        RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SkillPackId,
-        SystemEventLevel, Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat,
-        TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult,
-        TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+        PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
+        PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
+        PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
+        PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
+        SkillId, SkillPackId, SystemEventLevel, Task, TaskAgentPrompt, TaskAgentResultContract,
+        TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind,
+        TaskResult, TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
         TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
         TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
         TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
@@ -17237,11 +17289,17 @@ mod tests {
         };
 
         store
-            .upsert_thread_model(&thread)
+            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
             .await
             .expect("thread should persist");
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn should persist");
 
@@ -17847,6 +17905,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &sample_turn(turn_id),
                 &[],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should persist");
@@ -18805,6 +18864,7 @@ mod tests {
                             pioneer_protocol::default_turn_permission_profile_snapshot(),
                     },
                     &[],
+                    pioneer_protocol::PersistedActorRef::System,
                 )
                 .await
                 .expect("turn start should persist");
@@ -20650,7 +20710,13 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -20819,7 +20885,13 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -20931,7 +21003,13 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21277,7 +21355,13 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21403,7 +21487,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21486,7 +21576,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21608,7 +21704,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21799,7 +21901,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -21969,7 +22077,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -22039,7 +22153,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -22113,7 +22233,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -22224,7 +22350,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -22293,6 +22425,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &sample_turn(turn_id),
                 &[],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should persist");
@@ -22415,7 +22548,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -22494,7 +22633,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -22570,7 +22715,13 @@ mod tests {
         let turn = sample_turn(turn_id);
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 
@@ -23359,7 +23510,13 @@ mod tests {
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             };
             store
-                .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
                 .await
                 .expect("turn start should persist");
         }
@@ -23558,7 +23715,13 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -23810,7 +23973,13 @@ mod tests {
         }];
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
         store
@@ -25631,9 +25800,40 @@ mod tests {
             text: "hello".to_owned(),
             text_elements: Vec::new(),
         }];
+        let principal_actor = PersistedActorRef::Principal(
+            PrincipalId::new("P00000000000000000001").expect("valid principal id"),
+        );
+
+        let missing_actor_error = store
+            .materialize_turn_event(
+                crate::events::TurnEventPayload::TurnStarted(
+                    crate::events::TurnStartedEventPayload {
+                        thread: thread.clone(),
+                        sandbox_mode: SandboxMode::FullAccess,
+                        turn: turn.clone(),
+                        input: input.clone(),
+                        actor: None,
+                        reasoning_effort: None,
+                    },
+                ),
+                timestamp,
+            )
+            .await
+            .expect_err("normal materialization must reject a missing actor");
+        assert!(
+            missing_actor_error
+                .to_string()
+                .contains("missing its required actor")
+        );
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, input.as_slice())
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                input.as_slice(),
+                principal_actor.clone(),
+            )
             .await
             .expect("turn start without manifest should persist");
 
@@ -25674,6 +25874,464 @@ mod tests {
             Some("defaulted")
         );
         assert!(persisted_turn.permission_profile_snapshot_json.is_some());
+        assert_eq!(
+            persisted_turn.initiated_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted_turn.initiated_by_actor_id.as_deref(),
+            Some("P00000000000000000001")
+        );
+
+        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query persisted thread")
+            .expect("persisted thread should exist");
+        assert_eq!(
+            persisted_thread.created_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted_thread.created_by_actor_id.as_deref(),
+            Some("P00000000000000000001")
+        );
+
+        let persisted_event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .one(&connection)
+            .await
+            .expect("must query persisted turn/start event")
+            .expect("turn/start event should exist");
+        let decoded_event: crate::events::TurnEventPayload =
+            serde_json::from_str(persisted_event.payload.as_str())
+                .expect("persisted turn/start event should decode");
+        let crate::events::TurnEventPayload::TurnStarted(decoded_started) = decoded_event else {
+            panic!("expected persisted turn/start event");
+        };
+        assert_eq!(decoded_started.actor, Some(principal_actor));
+
+        let system_turn = Turn {
+            id: "turn_000000000000000002".to_owned(),
+            ..turn.clone()
+        };
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &system_turn,
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("System turn should persist");
+
+        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query persisted thread after second turn")
+            .expect("persisted thread should exist");
+        assert_eq!(
+            persisted_thread.created_by_actor_kind.as_deref(),
+            Some("principal"),
+            "a later turn must not overwrite the existing thread creator"
+        );
+        assert_eq!(
+            persisted_thread.created_by_actor_id.as_deref(),
+            Some("P00000000000000000001")
+        );
+        let persisted_system_turn =
+            pioneer_entity::turn::Entity::find_by_id(system_turn.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query persisted System turn")
+                .expect("persisted System turn should exist");
+        assert_eq!(
+            persisted_system_turn.initiated_by_actor_kind.as_deref(),
+            Some("system")
+        );
+        assert_eq!(persisted_system_turn.initiated_by_actor_id, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_turn_started_projection_accepts_missing_actor_only_without_new_append() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_legacy_actor".to_owned(),
+            id: "thr_legacy_actor".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: "turn_legacy_actor".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        let payload =
+            crate::events::TurnEventPayload::TurnStarted(crate::events::TurnStartedEventPayload {
+                thread: thread.clone(),
+                sandbox_mode: SandboxMode::FullAccess,
+                turn: turn.clone(),
+                input: Vec::new(),
+                actor: None,
+                reasoning_effort: None,
+            });
+        let legacy_event = crate::events::AppendedTurnEvent {
+            id: "event_legacy_actor".to_owned(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            sequence: 1,
+            payload,
+            created_at: unix_to_datetime(timestamp),
+        };
+
+        crate::projector::TurnProjector::new()
+            .project(&connection, &legacy_event)
+            .await
+            .expect("explicit historical projection path should accept a missing actor");
+
+        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query legacy thread")
+            .expect("legacy thread should project");
+        assert_eq!(persisted_thread.created_by_actor_kind, None);
+        assert_eq!(persisted_thread.created_by_actor_id, None);
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query legacy turn")
+            .expect("legacy turn should project");
+        assert_eq!(persisted_turn.initiated_by_actor_kind, None);
+        assert_eq!(persisted_turn.initiated_by_actor_id, None);
+
+        let gateway_id =
+            GatewayId::new("G00000000000000000001").expect("gateway id should be valid");
+        let principal_id =
+            PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
+        crate::create_gateway_singleton(&connection, &gateway_id, 1, unix_to_datetime(timestamp))
+            .await
+            .expect("Gateway identity should persist");
+        crate::create_superuser(
+            &connection,
+            &principal_id,
+            &gateway_id,
+            "Superuser",
+            "superuser",
+            "superuser",
+            unix_to_datetime(timestamp),
+        )
+        .await
+        .expect("Superuser should persist");
+
+        crate::projector::TurnProjector::new()
+            .project(&connection, &legacy_event)
+            .await
+            .expect("legacy replay after identity bootstrap should run the idempotent backfill");
+
+        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id)
+            .one(&connection)
+            .await
+            .expect("must query backfilled legacy thread")
+            .expect("backfilled legacy thread should exist");
+        assert_eq!(
+            persisted_thread.created_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted_thread.created_by_actor_id.as_deref(),
+            Some(principal_id.as_str())
+        );
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id)
+            .one(&connection)
+            .await
+            .expect("must query backfilled legacy turn")
+            .expect("backfilled legacy turn should exist");
+        assert_eq!(
+            persisted_turn.initiated_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted_turn.initiated_by_actor_id.as_deref(),
+            Some(principal_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_projection_rejects_missing_turn_start_without_partial_writes() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let turn_id = "turn_terminal_without_start";
+        let mut terminal_turn = sample_turn(turn_id);
+        terminal_turn.status = TurnStatus::Completed;
+
+        let error = store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: "ws_terminal_without_start".to_owned(),
+                    thread_id: "thr_terminal_without_start".to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp,
+            )
+            .await
+            .expect_err("terminal projection without turn/start must fail closed");
+        assert!(
+            format!("{error:#}").contains("has no preceding turn/start projection"),
+            "unexpected terminal projection error: {error:#}"
+        );
+
+        assert!(
+            pioneer_entity::turn::Entity::find_by_id(turn_id)
+                .one(&connection)
+                .await
+                .expect("turn lookup should succeed")
+                .is_none(),
+            "failed terminal projection must not insert an actorless turn"
+        );
+        let event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+            .one(&connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("failed projection must preserve its append-only event");
+        let projection_state =
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id(event.id)
+                .one(&connection)
+                .await
+                .expect("projection state lookup should succeed")
+                .expect("failed projection must preserve its projection state");
+        assert_eq!(
+            projection_state.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+        assert!(
+            projection_state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("has no preceding turn/start projection")),
+            "projection failure must retain the terminal-without-start diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_writes_refuse_to_repair_actorless_legacy_rows_implicitly() {
+        let store = test_store_with_workspace("ws_actorless_normal_write").await;
+        let timestamp = 1_700_000_000;
+        let created_at = unix_to_datetime(timestamp);
+
+        let actorless_thread = sample_thread(
+            "ws_actorless_normal_write",
+            "thr_actorless_normal",
+            timestamp,
+        );
+        crate::repositories::thread::upsert_thread(
+            &store.connection,
+            &actorless_thread,
+            created_at,
+            created_at,
+        )
+        .await
+        .expect("explicit legacy seam should create actorless thread fixture");
+
+        let thread_error = store
+            .upsert_thread_model(&actorless_thread, PersistedActorRef::System)
+            .await
+            .expect_err("normal thread write must not repair missing creator implicitly");
+        assert!(
+            thread_error
+                .to_string()
+                .contains("is missing its persisted creator")
+        );
+
+        let attributed_thread =
+            sample_thread("ws_actorless_normal_write", "thr_actorless_turn", timestamp);
+        store
+            .upsert_thread_model(&attributed_thread, PersistedActorRef::System)
+            .await
+            .expect("normal thread fixture should carry its creator");
+        let actorless_turn = sample_turn("turn_actorless_normal");
+        crate::repositories::turn::upsert_turn(
+            &store.connection,
+            actorless_turn.id.as_str(),
+            attributed_thread.id.as_str(),
+            &actorless_turn,
+            None,
+            None,
+            created_at,
+            created_at,
+        )
+        .await
+        .expect("explicit legacy seam should create actorless turn fixture");
+
+        let turn_error = store
+            .materialize_turn_start(
+                &attributed_thread,
+                SandboxMode::FullAccess,
+                &actorless_turn,
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect_err("normal turn write must not repair missing initiator implicitly");
+        assert!(
+            turn_error
+                .to_string()
+                .contains("is missing its persisted initiator")
+        );
+        let persisted_actorless_turn =
+            pioneer_entity::turn::Entity::find_by_id(actorless_turn.id.as_str())
+                .one(&store.connection)
+                .await
+                .expect("turn lookup should succeed")
+                .expect("legacy actorless turn fixture should remain present");
+        assert_eq!(persisted_actorless_turn.initiated_by_actor_kind, None);
+        assert_eq!(persisted_actorless_turn.initiated_by_actor_id, None);
+
+        let event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(actorless_turn.id.as_str()))
+            .one(&store.connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("rejected projection must preserve its append-only event");
+        let projection_state =
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id(event.id)
+                .one(&store.connection)
+                .await
+                .expect("projection state lookup should succeed")
+                .expect("rejected projection must preserve its failure state");
+        assert_eq!(
+            projection_state.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+        assert!(
+            projection_state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("is missing its persisted initiator")),
+            "projection failure must retain the actorless legacy-row diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_start_decode_and_replay_preserve_actor_without_rewriting_history() {
+        let principal = PrincipalId::new("P00000000000000000001")
+            .expect("canonical replay principal id should be valid");
+        for (suffix, actor, expected_kind, expected_id) in [
+            (
+                "principal",
+                PersistedActorRef::Principal(principal),
+                "principal",
+                Some("P00000000000000000001"),
+            ),
+            ("system", PersistedActorRef::System, "system", None),
+        ] {
+            let connection = Database::connect("sqlite::memory:")
+                .await
+                .expect("must connect to sqlite memory");
+            Migrator::up(&connection, None)
+                .await
+                .expect("migrations must succeed");
+            let timestamp = 1_700_000_000;
+            let thread_id = format!("thr_replay_actor_{suffix}");
+            let turn_id = format!("turn_replay_actor_{suffix}");
+            let thread = sample_thread("ws_replay_actor", thread_id.as_str(), timestamp);
+            let turn = sample_turn(turn_id.as_str());
+            let payload = crate::events::TurnEventPayload::TurnStarted(
+                crate::events::TurnStartedEventPayload {
+                    thread: thread.clone(),
+                    sandbox_mode: SandboxMode::FullAccess,
+                    turn: turn.clone(),
+                    input: Vec::new(),
+                    actor: Some(actor.clone()),
+                    reasoning_effort: None,
+                },
+            );
+
+            let appended = crate::repositories::turn_event::append_event(
+                &connection,
+                &payload,
+                unix_to_datetime(timestamp),
+            )
+            .await
+            .expect("raw canonical event should append");
+            let raw_before = pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
+                .one(&connection)
+                .await
+                .expect("raw canonical event query should succeed")
+                .expect("raw canonical event should exist");
+            let replayed =
+                crate::repositories::turn_event::appended_event_from_model(raw_before.clone())
+                    .expect("canonical event should decode for replay");
+            let crate::events::TurnEventPayload::TurnStarted(decoded) = &replayed.payload else {
+                panic!("replayed canonical event should be turn/started");
+            };
+            assert_eq!(decoded.actor.as_ref(), Some(&actor));
+
+            crate::projector::TurnProjector::new()
+                .project(&connection, &replayed)
+                .await
+                .expect("decoded canonical event should replay");
+
+            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.as_str())
+                .one(&connection)
+                .await
+                .expect("replayed thread query should succeed")
+                .expect("replayed thread should exist");
+            assert_eq!(
+                persisted_thread.created_by_actor_kind.as_deref(),
+                Some(expected_kind)
+            );
+            assert_eq!(persisted_thread.created_by_actor_id.as_deref(), expected_id);
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.as_str())
+                .one(&connection)
+                .await
+                .expect("replayed turn query should succeed")
+                .expect("replayed turn should exist");
+            assert_eq!(
+                persisted_turn.initiated_by_actor_kind.as_deref(),
+                Some(expected_kind)
+            );
+            assert_eq!(persisted_turn.initiated_by_actor_id.as_deref(), expected_id);
+
+            let raw_after = pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
+                .one(&connection)
+                .await
+                .expect("raw canonical event re-query should succeed")
+                .expect("raw canonical event should remain");
+            assert_eq!(
+                raw_after.payload, raw_before.payload,
+                "projection replay must not rewrite append-only event payloads"
+            );
+        }
     }
 
     #[tokio::test]
@@ -25720,7 +26378,13 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start with profile should persist");
 
@@ -25923,6 +26587,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &turn,
                 &[],
+                pioneer_protocol::PersistedActorRef::System,
                 audit,
             )
             .await
@@ -25991,7 +26656,7 @@ mod tests {
             turns: Vec::new(),
         };
         store
-            .upsert_thread_model(&thread)
+            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
             .await
             .expect("thread should persist");
 
@@ -26052,7 +26717,7 @@ mod tests {
             turns: Vec::new(),
         };
         store
-            .upsert_thread_model(&thread)
+            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
             .await
             .expect("thread should persist");
 
@@ -26237,7 +26902,13 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &complete_turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &complete_turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("second turn should materialize");
         let snapshot =
@@ -26378,6 +27049,7 @@ mod tests {
                 &turn,
                 &[],
                 Some("high"),
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start with reasoning effort should persist");
@@ -26413,7 +27085,7 @@ mod tests {
             turns: Vec::new(),
         };
         store
-            .upsert_thread_model(&thread)
+            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
             .await
             .expect("parent thread should exist before task occurrence");
         let mut stale_task_thread = thread.clone();
@@ -26430,7 +27102,13 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&stale_task_thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &stale_task_thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("task run occurrence turn start should persist");
 
@@ -26485,6 +27163,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &foreground_turn,
                 &[],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("foreground conversation should start");
@@ -26521,7 +27200,10 @@ mod tests {
             .expect("parent should exist");
         stale_idle_parent.status = ThreadStatus::Idle;
         store
-            .upsert_thread_model(&stale_idle_parent)
+            .upsert_thread_model(
+                &stale_idle_parent,
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("stale idle parent should persist");
         assert_eq!(
@@ -26572,7 +27254,10 @@ mod tests {
             .expect("parent should exist");
         stale_active_parent.status = ThreadStatus::Active;
         store
-            .upsert_thread_model(&stale_active_parent)
+            .upsert_thread_model(
+                &stale_active_parent,
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("legacy task-owned active status should persist");
         assert_eq!(
@@ -26642,6 +27327,7 @@ mod tests {
                 &first_turn,
                 &[],
                 Some("low"),
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("first turn start should persist");
@@ -26668,6 +27354,7 @@ mod tests {
                 &second_turn,
                 &[],
                 Some("high"),
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("second turn start should persist");
@@ -26692,6 +27379,7 @@ mod tests {
                 &task_run_turn,
                 &[],
                 None,
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("task run marker should persist");
@@ -26742,6 +27430,7 @@ mod tests {
                 &default_effort_turn,
                 &[],
                 None,
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("default-effort conversation turn should persist");
@@ -26766,6 +27455,7 @@ mod tests {
                 &latest_task_run_turn,
                 &[],
                 None,
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("latest task run marker should persist");
@@ -26824,7 +27514,13 @@ mod tests {
         };
 
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use pioneer_protocol::{ThreadStatus, TurnItemAttemptStatus, TurnKind};
+use pioneer_protocol::{PersistedActorRef, ThreadStatus, TurnItemAttemptStatus, TurnKind};
 use sea_orm::ConnectionTrait;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,7 +7,7 @@ use std::pin::Pin;
 use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db, turn_status_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
 use crate::repositories::{
-    policy, self_improvement_source_turn, thread, turn, turn_item_attempt, turn_liveness,
+    identity, policy, self_improvement_source_turn, thread, turn, turn_item_attempt, turn_liveness,
 };
 use crate::turn_item_terminal::{
     TurnItemTerminalState, attempt_status_from_payload, terminal_turn_item_status_from_payload,
@@ -212,6 +212,45 @@ impl TurnProjector {
         db: &C,
         payload: &TurnStartedEventPayload,
     ) -> Result<()> {
+        match payload.actor.as_ref() {
+            Some(actor) => {
+                self.project_attributed_turn_started(db, payload, actor)
+                    .await
+            }
+            None => self.project_legacy_turn_started(db, payload).await,
+        }
+    }
+
+    async fn project_attributed_turn_started<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        payload: &TurnStartedEventPayload,
+        actor: &PersistedActorRef,
+    ) -> Result<()> {
+        self.project_turn_started_inner(db, payload, Some(actor))
+            .await
+    }
+
+    /// Compatibility seam for append-only turn/start events written before actor attribution.
+    /// Normal materialization rejects this shape before append.
+    async fn project_legacy_turn_started<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        payload: &TurnStartedEventPayload,
+    ) -> Result<()> {
+        self.project_turn_started_inner(db, payload, None).await?;
+        if let Some(superuser_id) = legacy_backfill_superuser_id(db).await? {
+            identity::backfill_legacy_actor_references(db, &superuser_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn project_turn_started_inner<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        payload: &TurnStartedEventPayload,
+        actor: Option<&PersistedActorRef>,
+    ) -> Result<()> {
         let thread_created_at = unix_to_datetime(payload.thread.created_at);
         let thread_updated_at = unix_to_datetime(payload.thread.updated_at);
         let is_task_run_occurrence = payload.turn.turn_kind == TurnKind::TaskRun;
@@ -227,7 +266,22 @@ impl TurnProjector {
             {
                 let mut parent = payload.thread.clone();
                 parent.status = ThreadStatus::Idle;
-                thread::upsert_thread(db, &parent, thread_created_at, thread_updated_at).await?;
+                match actor {
+                    Some(actor) => {
+                        thread::upsert_thread_with_creator(
+                            db,
+                            &parent,
+                            actor,
+                            thread_created_at,
+                            thread_updated_at,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        thread::upsert_thread(db, &parent, thread_created_at, thread_updated_at)
+                            .await?;
+                    }
+                }
                 policy::upsert_thread_sandbox_policy(
                     db,
                     parent.id.as_str(),
@@ -238,8 +292,27 @@ impl TurnProjector {
                 .await?;
             }
         } else {
-            thread::upsert_thread(db, &payload.thread, thread_created_at, thread_updated_at)
-                .await?;
+            match actor {
+                Some(actor) => {
+                    thread::upsert_thread_with_creator(
+                        db,
+                        &payload.thread,
+                        actor,
+                        thread_created_at,
+                        thread_updated_at,
+                    )
+                    .await?;
+                }
+                None => {
+                    thread::upsert_thread(
+                        db,
+                        &payload.thread,
+                        thread_created_at,
+                        thread_updated_at,
+                    )
+                    .await?;
+                }
+            }
             policy::upsert_thread_sandbox_policy(
                 db,
                 payload.thread.id.as_str(),
@@ -254,17 +327,35 @@ impl TurnProjector {
         let turn_status = turn_status_to_db(payload.turn.status).to_owned();
         let turn_error = payload.turn.error.clone();
 
-        turn::upsert_turn(
-            db,
-            payload.turn.id.as_str(),
-            payload.thread.id.as_str(),
-            &payload.turn,
-            None,
-            payload.reasoning_effort.as_deref(),
-            thread_updated_at,
-            thread_updated_at,
-        )
-        .await?;
+        match actor {
+            Some(actor) => {
+                turn::upsert_turn_with_initiator(
+                    db,
+                    payload.turn.id.as_str(),
+                    payload.thread.id.as_str(),
+                    &payload.turn,
+                    None,
+                    payload.reasoning_effort.as_deref(),
+                    actor,
+                    thread_updated_at,
+                    thread_updated_at,
+                )
+                .await?;
+            }
+            None => {
+                turn::upsert_turn(
+                    db,
+                    payload.turn.id.as_str(),
+                    payload.thread.id.as_str(),
+                    &payload.turn,
+                    None,
+                    payload.reasoning_effort.as_deref(),
+                    thread_updated_at,
+                    thread_updated_at,
+                )
+                .await?;
+            }
+        }
 
         turn::replace_turn_input(
             db,
@@ -308,7 +399,12 @@ impl TurnProjector {
         turn_model: &pioneer_protocol::Turn,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<()> {
-        let existing_turn = turn::find_turn_by_id(db, turn_model.id.as_str()).await?;
+        let Some(existing_turn) = turn::find_turn_by_id(db, turn_model.id.as_str()).await? else {
+            anyhow::bail!(
+                "terminal turn event for `{}` has no preceding turn/start projection",
+                turn_model.id
+            );
+        };
         let turn_status = turn_status_to_db(turn_model.status).to_owned();
         let turn_error = turn_model.error.clone();
 
@@ -324,9 +420,8 @@ impl TurnProjector {
         )
         .await?;
 
-        let should_append_status = existing_turn
-            .map(|existing| (existing.status, existing.error))
-            .is_none_or(|existing| existing != (turn_status.clone(), turn_error.clone()));
+        let should_append_status = (existing_turn.status, existing_turn.error)
+            != (turn_status.clone(), turn_error.clone());
 
         if should_append_status {
             turn::append_turn_status_history(
@@ -407,6 +502,45 @@ impl TurnProjector {
         }
         Ok(())
     }
+}
+
+async fn legacy_backfill_superuser_id<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<pioneer_protocol::PrincipalId>> {
+    let principals = identity::list_gateway_principals(db).await?;
+    let gateway = identity::load_gateway_singleton(db).await?;
+    let mut superusers = principals.iter().filter(|principal| {
+        principal.kind == identity::principal_kind_to_db(pioneer_protocol::PrincipalKind::Superuser)
+    });
+    let superuser = superusers.next();
+    match (gateway.as_ref(), superuser) {
+        (None, None) if principals.is_empty() => return Ok(None),
+        (None, _) => anyhow::bail!(
+            "legacy replay found persisted principals without a Gateway identity singleton"
+        ),
+        (Some(_), None) => {
+            anyhow::bail!("legacy replay found a Gateway identity without a Superuser principal")
+        }
+        (Some(_), Some(_)) => {}
+    };
+    if superusers.next().is_some() {
+        anyhow::bail!("legacy replay found multiple persisted Superuser principals");
+    }
+    let gateway =
+        gateway.context("Gateway identity disappeared during legacy replay validation")?;
+    let superuser = superuser.context("Superuser disappeared during legacy replay validation")?;
+    if superuser.gateway_id != gateway.id.as_ref()
+        || superuser.role_key.is_some()
+        || superuser.status
+            != identity::principal_status_to_db(pioneer_protocol::PrincipalStatus::Active)
+        || superuser.removed_at.is_some()
+    {
+        anyhow::bail!("legacy replay found an invalid persisted Superuser principal");
+    }
+    Ok(Some(
+        pioneer_protocol::PrincipalId::new(superuser.id.clone())
+            .context("legacy replay found an invalid persisted Superuser principal id")?,
+    ))
 }
 
 fn liveness_observation_from_event(

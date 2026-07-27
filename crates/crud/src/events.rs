@@ -5,11 +5,12 @@ use pioneer_protocol::{
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    SandboxMode, Thread, Turn, TurnBlockedNotification, TurnCompletedNotification,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnPermissionAuditEvent,
-    TurnToolLoopBudgetExceededNotification, UserInput,
+    PersistedActorRef, SandboxMode, Thread, Turn, TurnBlockedNotification,
+    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnPermissionAuditEvent, TurnToolLoopBudgetExceededNotification,
+    UserInput,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ pub struct CanonicalTurnStartedEventPayload {
     pub sandbox_mode: SandboxMode,
     pub turn: Turn,
     pub input: Vec<UserInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<PersistedActorRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
@@ -182,4 +185,121 @@ pub struct AppendedTurnEvent {
     pub sequence: i64,
     pub payload: TurnEventPayload,
     pub created_at: DateTimeWithTimeZone,
+}
+
+#[cfg(test)]
+mod tests {
+    use pioneer_protocol::{
+        PersistedActorRef, PrincipalId, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput,
+    };
+    use serde_json::json;
+
+    use super::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+
+    const PRINCIPAL_ID: &str = "P00000000000000000001";
+
+    fn started_payload(actor: Option<PersistedActorRef>) -> CanonicalTurnStartedEventPayload {
+        CanonicalTurnStartedEventPayload {
+            thread: Thread {
+                workspace_id: "workspace".to_owned(),
+                id: "thread".to_owned(),
+                name: Some("Thread".to_owned()),
+                preview: String::new(),
+                mode: ThreadMode::Agent,
+                model: "model".to_owned(),
+                model_provider: "provider".to_owned(),
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                turns: Vec::new(),
+            },
+            sandbox_mode: SandboxMode::FullAccess,
+            turn: Turn {
+                id: "turn".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::FullAccess,
+                    TurnPermissionProfileSource::Composer,
+                ),
+            },
+            input: vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            actor,
+            reasoning_effort: Some("high".to_owned()),
+        }
+    }
+
+    #[test]
+    fn historical_turn_started_payload_without_actor_remains_readable() {
+        let historical = serde_json::to_value(CanonicalTurnEventPayload::TurnStarted(
+            started_payload(None),
+        ))
+        .expect("historical fixture should serialize");
+        assert!(
+            historical
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|payload| !payload.contains_key("actor"))
+        );
+
+        let decoded: CanonicalTurnEventPayload =
+            serde_json::from_value(historical).expect("historical fixture should remain readable");
+        let CanonicalTurnEventPayload::TurnStarted(decoded) = decoded else {
+            panic!("expected turn_started event");
+        };
+        assert_eq!(decoded.actor, None);
+    }
+
+    #[test]
+    fn turn_started_actor_round_trips_through_the_canonical_event_envelope() {
+        for actor in [
+            PersistedActorRef::Principal(
+                PrincipalId::new(PRINCIPAL_ID).expect("valid principal id"),
+            ),
+            PersistedActorRef::System,
+        ] {
+            let canonical =
+                CanonicalTurnEventPayload::TurnStarted(started_payload(Some(actor.clone())));
+            let encoded = serde_json::to_value(&canonical).expect("event should serialize");
+            let decoded: CanonicalTurnEventPayload =
+                serde_json::from_value(encoded).expect("event should deserialize");
+
+            let CanonicalTurnEventPayload::TurnStarted(decoded) = decoded else {
+                panic!("expected turn_started event");
+            };
+            assert_eq!(decoded.actor, Some(actor));
+        }
+    }
+
+    #[test]
+    fn turn_started_actor_rejects_malformed_ids_and_unknown_variants() {
+        for actor in [
+            json!({"kind": "principal", "id": "superuser"}),
+            json!({"kind": "unknown"}),
+        ] {
+            let mut fixture = serde_json::to_value(CanonicalTurnEventPayload::TurnStarted(
+                started_payload(None),
+            ))
+            .expect("fixture should serialize");
+            fixture["payload"]["actor"] = actor;
+
+            assert!(
+                serde_json::from_value::<CanonicalTurnEventPayload>(fixture).is_err(),
+                "invalid actor must fail canonical event decoding"
+            );
+        }
+    }
 }

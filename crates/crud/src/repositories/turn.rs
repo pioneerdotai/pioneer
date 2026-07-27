@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_status_history};
 use pioneer_protocol::{
-    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnKind, TurnStatus, UserInput, generate_id,
+    PersistedActorRef, Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnKind, TurnStatus,
+    UserInput, generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
@@ -14,6 +15,7 @@ use crate::convention::{
     input_type_and_text, turn_item_id_and_type_to_db, turn_kind_to_db, turn_origin_to_db,
     turn_permission_mode_to_db, turn_permission_profile_source_to_db, turn_status_to_db,
 };
+use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
 
@@ -89,6 +91,77 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    upsert_turn_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        None,
+        None,
+        false,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
+pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    initiator: &PersistedActorRef,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    if let Some(existing) = find_turn_by_id(db, turn_id).await? {
+        let existing_actor = actor_ref_from_db(
+            existing.initiated_by_actor_kind.as_deref(),
+            existing.initiated_by_actor_id.as_deref(),
+        )
+        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))?;
+        let Some(existing_actor) = existing_actor else {
+            anyhow::bail!("turn `{turn_id}` is missing its persisted initiator");
+        };
+        if &existing_actor != initiator {
+            anyhow::bail!("turn `{turn_id}` already has a different persisted initiator");
+        }
+    }
+    let (actor_kind, actor_id) = actor_ref_to_db(initiator);
+    upsert_turn_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        actor_kind,
+        actor_id,
+        true,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    initiated_by_actor_kind: Option<String>,
+    initiated_by_actor_id: Option<String>,
+    update_initiator: bool,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
     let mut update_columns = vec![
         turn::Column::ThreadId,
         turn::Column::Status,
@@ -102,11 +175,19 @@ pub async fn upsert_turn<C: ConnectionTrait>(
         turn::Column::PermissionProfileSource,
         turn::Column::PermissionProfileSnapshotJson,
     ]);
+    if update_initiator {
+        update_columns.extend([
+            turn::Column::InitiatedByActorKind,
+            turn::Column::InitiatedByActorId,
+        ]);
+    }
     let permission_profile_columns = build_turn_permission_profile_columns(turn_model)?;
 
     turn::Entity::insert(turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
+        initiated_by_actor_id: Set(initiated_by_actor_id),
+        initiated_by_actor_kind: Set(initiated_by_actor_kind),
         status: Set(turn_status_to_db(turn_model.status).to_owned()),
         turn_kind: Set(turn_kind_to_db(turn_model.turn_kind).to_owned()),
         origin: Set(turn_origin_to_db(turn_model.origin).to_owned()),
