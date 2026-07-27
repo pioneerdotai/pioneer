@@ -3,10 +3,11 @@ use super::*;
 impl MessageProcessor {
     pub(crate) async fn skills_update(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: SkillsUpdateParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,

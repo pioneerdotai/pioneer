@@ -1246,12 +1246,12 @@ fn tool(
     metadata: Value,
 ) -> Result<SelfImprovementHistoryContent> {
     let mut arguments = arguments.clone();
-    redact_known_credentials(&mut arguments);
+    redact_sensitive_metadata(&mut arguments);
     let mut stored_result =
         serde_json::to_value(storage).context("failed to encode stored tool result")?;
-    redact_known_credentials(&mut stored_result);
+    redact_sensitive_metadata(&mut stored_result);
     let mut metadata = metadata;
-    redact_known_credentials(&mut metadata);
+    redact_sensitive_metadata(&mut metadata);
     Ok(SelfImprovementHistoryContent::Tool {
         stage,
         item_id: item_id.to_owned(),
@@ -1271,12 +1271,12 @@ fn tool(
 fn safe_attachment_metadata(attachment: &UserMessageAttachment) -> Result<Value> {
     let mut value =
         serde_json::to_value(attachment).context("failed to encode attachment metadata")?;
-    redact_known_credentials(&mut value);
+    redact_sensitive_metadata(&mut value);
     Ok(value)
 }
 
 fn attachment(kind: &str, mut metadata: Value) -> SelfImprovementHistoryContent {
-    redact_known_credentials(&mut metadata);
+    redact_sensitive_metadata(&mut metadata);
     SelfImprovementHistoryContent::Attachment {
         attachment_kind: kind.to_owned(),
         metadata,
@@ -1338,45 +1338,71 @@ fn json_enum<T: Serialize>(value: &T) -> Result<String> {
         .context("canonical enum did not encode as a string")
 }
 
-fn redact_known_credentials(value: &mut Value) {
+fn redact_sensitive_metadata(value: &mut Value) {
     match value {
         Value::Object(map) => redact_object(map),
-        Value::Array(values) => values.iter_mut().for_each(redact_known_credentials),
+        Value::Array(values) => values.iter_mut().for_each(redact_sensitive_metadata),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
 fn redact_object(map: &mut Map<String, Value>) {
     for (key, value) in map {
-        if is_credential_key(key) {
+        if is_sensitive_metadata_key(key) {
             *value = Value::String("[redacted]".to_owned());
         } else {
-            redact_known_credentials(value);
+            redact_sensitive_metadata(value);
         }
     }
 }
 
-fn is_credential_key(key: &str) -> bool {
+fn is_sensitive_metadata_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
     matches!(
-        key.chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-            .as_str(),
+        normalized.as_str(),
         "apikey"
             | "authorization"
             | "accesstoken"
+            | "actorid"
             | "refreshtoken"
             | "bearertoken"
             | "clientsecret"
+            | "connectionid"
             | "cookie"
             | "credential"
+            | "credentialkind"
+            | "credentialmetadata"
             | "credentials"
+            | "gatewayid"
             | "password"
+            | "principalid"
             | "privatekey"
             | "secret"
+            | "sessionid"
             | "token"
-    )
+            | "userid"
+    ) || [
+        "apikey",
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "privatekey",
+        "credential",
+        "credentials",
+        "principalid",
+        "gatewayid",
+        "actorid",
+        "sessionid",
+        "connectionid",
+        "userid",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -1387,17 +1413,29 @@ mod tests {
         SelfImprovementFrozenSourceRange, SelfImprovementSourceTurnRecord,
     };
     use pioneer_protocol::{
-        ItemCompletedNotification, ItemStartedNotification, SandboxMode, SystemEventLevel, Thread,
-        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
-        ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload, Turn,
-        TurnCompletedNotification, TurnFailedNotification, TurnItem, TurnKind, TurnOrigin,
-        TurnPermissionActionKind, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
-        TurnPermissionAuditEventKind, TurnPermissionDecisionReason, TurnPermissionMode,
-        TurnPermissionProfileSource, TurnSkillCapabilitySummary, TurnStatus, UserInput,
-        UserMessageAttachment, default_turn_permission_profile_snapshot,
+        ItemCompletedNotification, ItemStartedNotification, PersistedActorRef, PrincipalId,
+        SandboxMode, SystemEventLevel, Thread, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
+        ToolOutputPolicySnapshot, ToolStoragePayload, Turn, TurnCompletedNotification,
+        TurnFailedNotification, TurnItem, TurnKind, TurnOrigin, TurnPermissionActionKind,
+        TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+        TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
+        TurnSkillCapabilitySummary, TurnStatus, UserInput, UserMessageAttachment,
+        default_turn_permission_profile_snapshot,
     };
 
     use super::*;
+
+    const PRINCIPAL_ID_SENTINEL: &str = "P12345678901234567890";
+    const GATEWAY_ID_SENTINEL: &str = "G12345678901234567890";
+    const SESSION_ID_SENTINEL: &str = "session-identity-sentinel";
+    const CONNECTION_ID_SENTINEL: &str = "connection-identity-sentinel";
+
+    fn principal_actor() -> PersistedActorRef {
+        PersistedActorRef::Principal(
+            PrincipalId::new(PRINCIPAL_ID_SENTINEL).expect("principal sentinel should be valid"),
+        )
+    }
 
     fn source(id: i64, turn_id: &str, terminal_event_id: &str) -> SelfImprovementSourceTurnRecord {
         SelfImprovementSourceTurnRecord {
@@ -1525,6 +1563,7 @@ mod tests {
                         text: "old procedure".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    actor: Some(principal_actor()),
                     reasoning_effort: Some("must-not-leak".to_owned()),
                 }),
             ),
@@ -1560,6 +1599,7 @@ mod tests {
                             version_id: Some("version-a".to_owned()),
                         },
                     ],
+                    actor: Some(principal_actor()),
                     reasoning_effort: Some(secret.to_owned()),
                 }),
             ),
@@ -1606,7 +1646,22 @@ mod tests {
                     item: TurnItem::DynamicToolCall {
                         id: "tool-new".to_owned(),
                         tool_name: "visible_tool".to_owned(),
-                        arguments: json!({"query": "visible", "apiKey": secret}),
+                        arguments: json!({
+                            "query": "visible",
+                            "apiKey": secret,
+                            "principalId": PRINCIPAL_ID_SENTINEL,
+                            "gatewayId": GATEWAY_ID_SENTINEL,
+                            "sessionId": SESSION_ID_SENTINEL,
+                            "connectionId": CONNECTION_ID_SENTINEL,
+                            "ownerPrincipalId": PRINCIPAL_ID_SENTINEL,
+                            "source_gateway_id": GATEWAY_ID_SENTINEL,
+                            "auth_session_id": SESSION_ID_SENTINEL,
+                            "provider_api_key": secret,
+                            "credentialMetadata": {
+                                "kind": "legacy_superuser_jwt",
+                                "token": secret
+                            }
+                        }),
                         status: ToolCallStatus::Completed,
                         recovery_policy: None,
                         output_policy: ToolOutputPolicySnapshot::for_tool_name("visible_tool"),
@@ -1834,6 +1889,7 @@ mod tests {
                         text: "Publish after checksum verification.".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    actor: Some(principal_actor()),
                     reasoning_effort: None,
                 }),
             ),
@@ -1864,6 +1920,7 @@ mod tests {
                         text: "Publish after checksum verification.".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    actor: Some(PersistedActorRef::System),
                     reasoning_effort: None,
                 }),
             ),
@@ -2025,6 +2082,7 @@ mod tests {
                         text: "Attempt the earlier operation.".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    actor: Some(principal_actor()),
                     reasoning_effort: None,
                 }),
             ),
@@ -2064,6 +2122,7 @@ mod tests {
                         text: "Attempt the later operation.".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    actor: Some(principal_actor()),
                     reasoning_effort: None,
                 }),
             ),
@@ -2143,6 +2202,11 @@ mod tests {
         assert!(!encoded.contains("hidden-provider"));
         assert!(!encoded.contains("prompt_manifest"));
         assert!(!encoded.contains("internal_preflight"));
+        assert!(!encoded.contains(PRINCIPAL_ID_SENTINEL));
+        assert!(!encoded.contains(GATEWAY_ID_SENTINEL));
+        assert!(!encoded.contains(SESSION_ID_SENTINEL));
+        assert!(!encoded.contains(CONNECTION_ID_SENTINEL));
+        assert!(!encoded.contains("legacy_superuser_jwt"));
         assert!(encoded.contains("artifact-a"));
         assert!(encoded.contains("visible_tool"));
         assert!(encoded.contains("visible assistant procedure"));

@@ -56,10 +56,11 @@ impl MessageProcessor {
 
     pub(crate) async fn skills_install(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: SkillsInstallParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,

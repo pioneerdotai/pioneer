@@ -50,10 +50,11 @@ struct TurnWorkItemsSnapshot {
 impl MessageProcessor {
     pub(super) async fn thread_timeline_page(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadTimelinePageParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -245,10 +246,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_work_page(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnWorkPageParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -449,10 +451,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_work_items_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnWorkItemsGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty()
             || params.turn_id.trim().is_empty()
             || params.work_item_ids.is_empty()

@@ -7,6 +7,7 @@ use pioneer_protocol::{
     VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError, VoiceErrorKind,
     VoiceFrameDecodeError, decode_voice_chunk_frame, validate_voice_streaming_audio_format,
 };
+use tracing::Instrument as _;
 
 pub(in crate::message) const MAX_GATEWAY_VOICE_CHUNK_BYTES: usize = VOICE_AUDIO_MAX_CHUNK_BYTES;
 pub(in crate::message) const MAX_GATEWAY_VOICE_CHUNK_SEQUENCE: u64 = 1_000_000_000;
@@ -49,46 +50,94 @@ impl GatewayBinaryFrameKind {
 }
 
 impl MessageProcessor {
-    pub(crate) async fn process_binary_frame(&self, connection_id: ConnectionId, payload: &[u8]) {
+    pub(crate) async fn process_binary_frame(
+        &self,
+        connection: &crate::request_context::ConnectionContext,
+        payload: &[u8],
+    ) {
         let Some(kind) = GatewayBinaryFrameKind::from_payload(payload) else {
-            warn!(
-                connection_id,
-                frame_len = payload.len(),
-                "unknown gateway binary frame ignored"
+            let context = crate::request_context::RequestContext::new(
+                connection,
+                None,
+                crate::request_context::CanonicalMethod::binary("binary/unknown"),
             );
+            let span = context.request_span();
+            async {
+                warn!(
+                    rejection_reason = "unknown_binary_frame",
+                    frame_len = payload.len(),
+                    "unknown gateway binary frame ignored"
+                );
+            }
+            .instrument(span)
+            .await;
             return;
         };
-
-        debug!(
-            connection_id,
-            frame_kind = kind.name(),
-            frame_len = payload.len(),
-            "processing gateway binary frame"
+        let context = crate::request_context::RequestContext::new(
+            connection,
+            None,
+            crate::request_context::CanonicalMethod::binary(kind.name()),
         );
+        let authorization_decision = context.authorization_decision();
+        let span = context.request_span();
 
-        match kind {
-            GatewayBinaryFrameKind::ArtifactUploadChunk => {
-                self.process_artifact_upload_chunk_frame(connection_id, payload)
-                    .await;
+        async {
+            if !authorization_decision.is_allowed() {
+                warn!(
+                    rejection_reason = "unsupported_principal",
+                    frame_len = payload.len(),
+                    "authorization denied for gateway binary frame"
+                );
+                return;
             }
-            GatewayBinaryFrameKind::SkillUploadChunk => {
-                self.process_skill_upload_chunk_frame(connection_id, payload)
-                    .await;
-            }
-            GatewayBinaryFrameKind::VoiceChunk => {
-                self.process_voice_chunk_frame(connection_id, payload).await;
+
+            debug!(frame_len = payload.len(), "processing gateway binary frame");
+
+            match kind {
+                GatewayBinaryFrameKind::ArtifactUploadChunk => {
+                    self.process_artifact_upload_chunk_frame(&context, payload)
+                        .await;
+                }
+                GatewayBinaryFrameKind::SkillUploadChunk => {
+                    self.process_skill_upload_chunk_frame(&context, payload)
+                        .await;
+                }
+                GatewayBinaryFrameKind::VoiceChunk => {
+                    self.process_voice_chunk_frame(&context, payload).await;
+                }
             }
         }
+        .instrument(span)
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_binary_frame_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let context = self
+            .session_manager
+            .connection_context(connection_id)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("binary frame rejected for unregistered connection {connection_id}")
+            })?;
+        self.process_binary_frame(&context, payload).await;
+        Ok(())
     }
 
     pub(crate) async fn process_voice_chunk_frame(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         payload: &[u8],
     ) {
+        let connection_id = request_context.connection_id();
         match decode_gateway_voice_chunk_frame(payload) {
             Ok(chunk) => {
-                self.forward_decoded_voice_chunk(connection_id, chunk).await;
+                self.forward_decoded_voice_chunk(request_context, chunk)
+                    .await;
             }
             Err(error) => {
                 warn!(
@@ -103,9 +152,10 @@ impl MessageProcessor {
 
     async fn forward_decoded_voice_chunk(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         chunk: GatewayVoiceChunkFrame,
     ) {
+        let connection_id = request_context.connection_id();
         let session = match self
             .voice_sessions
             .lookup_session(chunk.header.session_id.as_str(), connection_id)

@@ -135,10 +135,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_permission_request_respond(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnPermissionRequestRespondParams,
     ) {
+        let connection_id = request_context.connection_id();
         let pending = self
             .native_permission_pending_requests
             .lock()

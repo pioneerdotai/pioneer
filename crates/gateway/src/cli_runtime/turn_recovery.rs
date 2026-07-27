@@ -390,12 +390,13 @@ mod tests {
     use chrono::{FixedOffset, TimeZone};
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, NewCliRuntimeTurnBinding};
+    use pioneer_entity::turn;
     use pioneer_protocol::{
         RuntimeStatus, SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnStatus, UserInput,
     };
-    use sea_orm::Database;
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
+    use sea_orm::{Database, EntityTrait};
 
     async fn test_store() -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
@@ -464,9 +465,21 @@ mod tests {
                     text: "recover cli runtime turn".to_owned(),
                     text_elements: Vec::new(),
                 }],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn should materialize");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&store.database_connection())
+            .await
+            .expect("recovery fixture turn query should succeed")
+            .expect("recovery fixture turn should exist");
+        assert_eq!(
+            persisted.initiated_by_actor_kind.as_deref(),
+            Some("system"),
+            "CLI recovery fixtures must retain explicit System provenance"
+        );
+        assert_eq!(persisted.initiated_by_actor_id, None);
     }
 
     async fn persist_binding(

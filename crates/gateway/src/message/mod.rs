@@ -173,6 +173,7 @@ use crate::cli_runtime::skills::{
 };
 use crate::mcp_service::McpService;
 use crate::memory_runtime::GatewayMemoryRuntime;
+use crate::request_context::RequestContext;
 use crate::resilience::{
     RecoveryCoordinator, RecoveryPolicyRegistry, RecoveryTerminalOutcome, TimeoutPolicyRegistry,
     TimeoutSupervisor,

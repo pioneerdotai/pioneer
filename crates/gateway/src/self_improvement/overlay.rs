@@ -181,9 +181,11 @@ mod tests {
     #[tokio::test]
     async fn materializes_exact_active_version_only_while_workspace_is_enabled() {
         let store = active_store().await;
-        let entries = load_active_agent_skill_overlay(&store, WORKSPACE)
+        let restarted_store = CrudStore::new(store.database_connection());
+        drop(store);
+        let entries = load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
             .await
-            .expect("overlay must load");
+            .expect("overlay must load after service restart");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].version_id, "111111111111111111111");
         assert_eq!(entries[0].body, "Exact immutable body");
@@ -192,12 +194,12 @@ mod tests {
             "Use for the stable procedure. Do not use when: The procedure does not apply."
         );
 
-        store
+        restarted_store
             .deactivate_self_improvement_workspace(WORKSPACE, NOW + 4)
             .await
             .expect("workspace must deactivate");
         assert!(
-            load_active_agent_skill_overlay(&store, WORKSPACE)
+            load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
                 .await
                 .expect("disabled overlay lookup must succeed")
                 .is_empty()

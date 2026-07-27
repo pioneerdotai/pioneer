@@ -4536,6 +4536,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &turn,
                 &Vec::<UserInput>::new(),
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should materialize");

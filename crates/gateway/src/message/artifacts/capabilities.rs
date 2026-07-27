@@ -15,10 +15,11 @@ pub(in crate::message) const ARTIFACT_DOWNLOAD_MAX_CONCURRENT_DOWNLOADS: u64 = 2
 impl MessageProcessor {
     pub(crate) async fn artifact_capabilities(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactCapabilitiesParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,

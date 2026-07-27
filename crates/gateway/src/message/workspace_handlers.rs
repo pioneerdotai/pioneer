@@ -3,10 +3,11 @@ use super::*;
 impl MessageProcessor {
     pub(super) async fn workspace_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         _params: WorkspaceListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspaces = match self.workspace_manager.list_workspaces().await {
             Ok(workspaces) => workspaces,
             Err(error) => {
@@ -57,10 +58,11 @@ impl MessageProcessor {
 
     pub(super) async fn workspace_create(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: WorkspaceCreateParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace = match self
             .workspace_manager
             .create_workspace(params.workspace_id.as_str(), params.name.as_deref())
@@ -128,10 +130,11 @@ impl MessageProcessor {
 
     pub(super) async fn workspace_default(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         _params: WorkspaceDefaultParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace = match self.workspace_manager.ensure_default_workspace().await {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -188,10 +191,11 @@ impl MessageProcessor {
 
     pub(super) async fn workspace_select(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: WorkspaceSelectParams,
     ) {
+        let connection_id = request_context.connection_id();
         let was_current = if params.make_current {
             self.workspace_manager
                 .select_workspace(params.workspace_id.as_str(), false)
@@ -271,10 +275,11 @@ impl MessageProcessor {
 
     pub(super) async fn workspace_update(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: WorkspaceUpdateParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace = match self
             .workspace_manager
             .update_workspace(params.workspace_id.as_str(), params.name.as_deref())

@@ -390,10 +390,11 @@ impl MessageProcessor {
 
     pub(crate) async fn skills_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: SkillListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -685,10 +686,11 @@ impl MessageProcessor {
 
     pub(crate) async fn skills_health(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: SkillsHealthParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,

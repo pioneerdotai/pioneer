@@ -3,10 +3,11 @@ use super::*;
 impl MessageProcessor {
     pub(crate) async fn mcp_server_restart(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: McpServerRestartParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_mcp_workspace(
                 connection_id,

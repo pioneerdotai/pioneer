@@ -60,7 +60,7 @@ const MAX_OUTPUT_TOKENS_PER_WAKE: u64 =
 const BUDGET_YIELD_RETRY_SECONDS: i64 = 1;
 const OVERDUE_RETRY_POLL_DELAY: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_WORKSPACES: usize = 4;
-const MAX_INFRASTRUCTURE_ATTEMPTS: i32 = 3;
+const MAX_INFRASTRUCTURE_ATTEMPTS: i64 = 3;
 const RETRY_BACKOFF_BASE_SECONDS: i64 = 30;
 const RETRY_BACKOFF_MAX_SECONDS: i64 = 15 * 60;
 
@@ -1629,7 +1629,7 @@ fn provider_stage_reason_code(stage: &str) -> &'static str {
     }
 }
 
-fn retry_backoff_seconds(attempt_count: i32) -> i64 {
+fn retry_backoff_seconds(attempt_count: i64) -> i64 {
     let exponent = u32::try_from(attempt_count.saturating_sub(1).clamp(0, 6)).unwrap_or_default();
     RETRY_BACKOFF_BASE_SECONDS
         .saturating_mul(4_i64.saturating_pow(exponent))
@@ -1706,6 +1706,7 @@ mod tests {
         SkillsRuntimeLoopConfig, SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
         ToolLoopConfig,
     };
+    use pioneer_entity::turn;
     use pioneer_memory::hooks::MemoryLoopConfig;
     use pioneer_protocol::{
         AgentDurableEvent, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
@@ -1722,7 +1723,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
 
@@ -2279,9 +2280,21 @@ mod tests {
                     text: text.to_owned(),
                     text_elements: Vec::new(),
                 }],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("source turn start must project");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&store.database_connection())
+            .await
+            .expect("self-improvement source turn provenance query should succeed")
+            .expect("self-improvement source turn should exist");
+        assert_eq!(
+            persisted.initiated_by_actor_kind.as_deref(),
+            Some("system"),
+            "supervisor work must not be attributed to the settings author"
+        );
+        assert_eq!(persisted.initiated_by_actor_id, None);
         store
             .materialize_turn_completed(
                 TurnCompletedNotification {
@@ -2484,7 +2497,7 @@ mod tests {
         assert_eq!(retry_backoff_seconds(1), 30);
         assert_eq!(retry_backoff_seconds(2), 120);
         assert_eq!(retry_backoff_seconds(3), 480);
-        assert_eq!(retry_backoff_seconds(i32::MAX), 900);
+        assert_eq!(retry_backoff_seconds(i64::MAX), 900);
     }
 
     #[test]

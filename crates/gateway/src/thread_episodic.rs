@@ -4133,6 +4133,7 @@ mod tests {
     use crate::workspace::WorkspaceManager;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, ThreadEpisodicCapsuleWriteState, ThreadEpisodicIndexJobStatus};
+    use pioneer_entity::turn;
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
         PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
@@ -4151,7 +4152,7 @@ mod tests {
         ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
         ToolOutputSummary, ToolStoragePayload, Turn, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
-    use sea_orm::Database;
+    use sea_orm::{Database, EntityTrait};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -6858,9 +6859,17 @@ mod tests {
                 SandboxMode::FullAccess,
                 &turn,
                 &Vec::<UserInput>::new(),
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should materialize");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&crud_store.database_connection())
+            .await
+            .expect("thread-episodic turn provenance query should succeed")
+            .expect("thread-episodic turn should exist");
+        assert_eq!(persisted.initiated_by_actor_kind.as_deref(), Some("system"));
+        assert_eq!(persisted.initiated_by_actor_id, None);
         crud_store
             .materialize_item_completed(
                 ItemCompletedNotification {

@@ -287,10 +287,11 @@ async fn remove_upload_temp(temp_path: PathBuf) {
 impl MessageProcessor {
     pub(crate) async fn artifact_upload_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         mut params: ArtifactUploadStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -364,10 +365,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_upload_finish(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactUploadFinishParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -529,10 +531,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_upload_abort(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactUploadAbortParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -585,9 +588,10 @@ impl MessageProcessor {
 
     pub(crate) async fn process_artifact_upload_chunk_frame(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         frame: &[u8],
     ) {
+        let connection_id = request_context.connection_id();
         let (header, chunk) = match parse_artifact_upload_chunk_frame(frame) {
             Ok(value) => value,
             Err(error) => {

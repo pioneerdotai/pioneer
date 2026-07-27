@@ -302,6 +302,7 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -319,6 +320,7 @@ mod tests {
     };
     use pioneer_keystore::{DbKeyStore, SecretFilter, SecretKind, SecretMeta, SecretStore};
     use pioneer_mcp::McpSecretRef;
+    use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus};
     use sea_orm::ConnectionTrait;
     use tokio_tungstenite::tungstenite::handshake::server::Request;
 
@@ -327,6 +329,9 @@ mod tests {
         initialize as initialize_jwt_auth, issue_superuser_token as issue_superuser_token_internal,
     };
     use crate::database::initialize as initialize_database;
+    use crate::identity::{
+        GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
+    };
 
     #[tokio::test]
     async fn status_counts_secret_kinds_and_reports_disabled_encryption() {
@@ -546,17 +551,18 @@ mod tests {
             .expect("load new material");
         assert_ne!(old_material, new_material);
 
-        let auth = initialize_jwt_auth(&config, new_material.as_slice()).expect("new auth");
+        let auth = initialize_jwt_auth(&config, new_material.as_slice(), test_identity_snapshot())
+            .expect("new auth");
         let old_request = request_with_token(old_token.as_str());
         assert!(
-            auth.authorize_request(&old_request).is_err(),
+            auth.authenticate_request(&old_request).is_err(),
             "old bearer token should be invalid after rotation"
         );
 
         let new_token = issue_superuser_token_internal(&config, new_material.as_slice())
             .expect("issue new token");
         let new_request = request_with_token(new_token.as_str());
-        auth.authorize_request(&new_request)
+        auth.authenticate_request(&new_request)
             .expect("new bearer token should validate");
 
         let serialized = serde_json::to_string(&report).expect("serialize rotation report");
@@ -684,6 +690,25 @@ mod tests {
             .header("authorization", format!("Bearer {token}"))
             .body(())
             .expect("build request")
+    }
+
+    fn test_identity_snapshot() -> Arc<IdentityBootstrapSnapshot> {
+        Arc::new(IdentityBootstrapSnapshot {
+            gateway: GatewayIdentitySnapshot {
+                id: GatewayId::new("G00000000000000000001").unwrap(),
+                identity_bootstrap_version: 1,
+            },
+            superuser: SuperuserIdentitySnapshot {
+                id: PrincipalId::new("P00000000000000000001").unwrap(),
+                gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+                kind: PrincipalKind::Superuser,
+                role_key: None,
+                status: PrincipalStatus::Active,
+                display_name: "Superuser".to_owned(),
+                nickname: "superuser".to_owned(),
+                nickname_key: "superuser".to_owned(),
+            },
+        })
     }
 
     fn test_app_config() -> AppConfig {

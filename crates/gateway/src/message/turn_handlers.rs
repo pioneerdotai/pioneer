@@ -432,10 +432,12 @@ impl MessageProcessor {
 
     pub(super) fn turn_start<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        request_context: &'a RequestContext,
         request_id: RequestId,
         params: TurnStartParams,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = request_context.connection_id();
+        let request_actor = request_context.persisted_actor();
         message_future(async move {
             if params.thread_id.trim().is_empty() {
                 self.send_error(
@@ -493,6 +495,7 @@ impl MessageProcessor {
                 self.composer_detached_task_start(
                     connection_id,
                     request_id,
+                    request_actor.clone(),
                     params,
                     thread,
                     TurnStartSuccessResponse::TurnStart,
@@ -518,6 +521,7 @@ impl MessageProcessor {
                         self.turn_start_cli_runtime(
                             connection_id,
                             request_id,
+                            request_actor,
                             params,
                             runtime_id,
                             runtime_kind,
@@ -545,6 +549,7 @@ impl MessageProcessor {
             let prepared = match self
                 .prepare_api_provider_turn_start(
                     connection_id,
+                    request_actor,
                     params,
                     requested_reasoning_effort.as_deref(),
                 )
@@ -579,6 +584,7 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
+        request_actor: pioneer_protocol::PersistedActorRef,
         mut params: TurnStartParams,
         thread: pioneer_protocol::Thread,
         success_response: TurnStartSuccessResponse,
@@ -705,6 +711,7 @@ impl MessageProcessor {
                 &outcome.materialization.turn,
                 &outcome.materialization.input,
                 requested_reasoning_effort(&launch).as_deref(),
+                request_actor,
                 profile_audit,
             )
             .await
@@ -907,6 +914,7 @@ impl MessageProcessor {
     pub(super) async fn prepare_api_provider_turn_start(
         &self,
         connection_id: ConnectionId,
+        request_actor: pioneer_protocol::PersistedActorRef,
         mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
     ) -> Result<PreparedApiProviderTurnStart, String> {
@@ -1025,6 +1033,7 @@ impl MessageProcessor {
                     &outcome.materialization.turn,
                     &outcome.materialization.input,
                     effective_reasoning_effort.as_deref(),
+                    request_actor,
                     profile_selected_audit,
                 ),
         )
@@ -1340,6 +1349,7 @@ impl MessageProcessor {
             0,
             RequestId::new(generate_id(pioneer_protocol::REQUEST_ID_LEN))
                 .expect("generated request id must have protocol length"),
+            pioneer_protocol::PersistedActorRef::System,
             params,
             runtime_id,
             runtime_kind,
@@ -1394,6 +1404,7 @@ impl MessageProcessor {
         &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
+        request_actor: pioneer_protocol::PersistedActorRef,
         mut params: TurnStartParams,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
@@ -2185,6 +2196,7 @@ impl MessageProcessor {
                             &materialization.turn,
                             &materialization.input,
                             effective_reasoning_effort.as_deref(),
+                            request_actor,
                             profile_selected_audit,
                         )
                         .await
@@ -4390,10 +4402,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_cancel(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnCancelParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -4719,10 +4732,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_resume(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnResumeParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -4939,10 +4953,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -5043,10 +5058,11 @@ impl MessageProcessor {
 
     pub(super) async fn turn_items(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TurnItemsParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,

@@ -6,10 +6,11 @@ const ARTIFACT_JSON_READ_MAX_BYTES: u64 = 1024 * 1024;
 impl MessageProcessor {
     pub(crate) async fn artifact_read(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         mut params: ArtifactReadParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,

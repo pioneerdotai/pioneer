@@ -3,10 +3,11 @@ use super::*;
 impl MessageProcessor {
     pub(super) async fn provider_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -130,10 +131,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_list_models(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderListModelsParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -236,10 +238,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_list_embedding_models(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderListModelsParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -340,10 +343,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_list_transcription_models(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderListModelsParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -444,10 +448,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_configure(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderConfigureParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -702,10 +707,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_set_api_key(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderSetApiKeyParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,
@@ -828,10 +834,11 @@ impl MessageProcessor {
 
     pub(super) async fn provider_delete_api_key(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ProviderDeleteApiKeyParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_provider_workspace(
                 connection_id,

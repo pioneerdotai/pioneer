@@ -261,9 +261,25 @@ mod tests {
             permission_profile: default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn_id)
+            .one(&connection)
+            .await
+            .expect("startup fixture turn provenance query should succeed")
+            .expect("startup fixture turn should exist");
+        assert_eq!(
+            persisted_turn.initiated_by_actor_kind.as_deref(),
+            Some("system")
+        );
+        assert_eq!(persisted_turn.initiated_by_actor_id, None);
 
         for (index, payload) in ["first diff", "second diff", "third diff"]
             .into_iter()

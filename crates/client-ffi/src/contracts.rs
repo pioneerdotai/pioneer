@@ -156,3 +156,87 @@ pub fn reduce_gateway_ws_events_to_client_events(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClientGatewayConnectRequest;
+    use crate::ClientFfiVoiceAudioChunkParams;
+
+    #[test]
+    fn mobile_connect_contract_remains_endpoint_bearer_and_timings_only() {
+        let value = serde_json::json!({
+            "endpoint": {
+                "id": "local-mobile-profile",
+                "name": "Local",
+                "address": "127.0.0.1:17878",
+                "kind": "local",
+                "auth_token_ref": null,
+                "workspace_id": null,
+                "service_name": null
+            },
+            "auth_token": "legacy-superuser-bearer",
+            "timings": {
+                "connect_timeout_ms": 5000,
+                "ping_interval_ms": 15000,
+                "pong_timeout_ms": 10000,
+                "reconnect_initial_ms": 500,
+                "reconnect_max_ms": 30000,
+                "reconnect_jitter_percent": 20
+            }
+        });
+
+        let request: ClientGatewayConnectRequest =
+            serde_json::from_value(value.clone()).expect("existing Pioneer App connect contract");
+        assert_eq!(request.endpoint.address, "127.0.0.1:17878");
+        assert_eq!(
+            request.auth_token.as_deref(),
+            Some("legacy-superuser-bearer")
+        );
+
+        let encoded =
+            serde_json::to_value(&request).expect("connect request should preserve its wire shape");
+        let object = encoded
+            .as_object()
+            .expect("connect request should encode as an object");
+        assert_eq!(object.len(), 3);
+        assert!(object.contains_key("endpoint"));
+        assert!(object.contains_key("auth_token"));
+        assert!(object.contains_key("timings"));
+        assert!(!object.contains_key("gateway_id"));
+        assert!(!object.contains_key("principal_id"));
+        assert_eq!(encoded["endpoint"]["id"], "local-mobile-profile");
+    }
+
+    #[test]
+    fn mobile_nitro_voice_array_buffer_uses_the_shared_binary_frame_contract() {
+        let input = serde_json::json!({
+            "session_id": "voice_mobile_binary_1",
+            "sequence": 7,
+            "audio_format": {
+                "sample_rate_hz": 16000,
+                "channels": 1,
+                "encoding": "pcm_s16_le"
+            },
+            "captured_at_unix_ms": 1_725_000_000_020_u64,
+            "duration_ms": 20
+        });
+        let params: ClientFfiVoiceAudioChunkParams =
+            serde_json::from_value(input).expect("Pioneer App voice JSON contract");
+        let array_buffer_bytes = [0x00, 0x80, 0xff, 0x7f];
+        let frame = pioneer_client::transport::ws::frames::encode_voice_audio_chunk_frame(
+            params.session_id,
+            params.sequence,
+            params.audio_format,
+            params.captured_at_unix_ms,
+            params.duration_ms,
+            array_buffer_bytes.as_slice(),
+        )
+        .expect("Nitro ArrayBuffer bytes should enter the shared voice frame encoder");
+
+        let decoded = pioneer_protocol::decode_voice_chunk_frame(frame.as_slice())
+            .expect("Gateway-compatible voice frame");
+        assert_eq!(decoded.header.session_id, "voice_mobile_binary_1");
+        assert_eq!(decoded.header.sequence, 7);
+        assert_eq!(decoded.audio_payload, array_buffer_bytes);
+    }
+}

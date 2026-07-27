@@ -5,10 +5,11 @@ const THREAD_AGENTS_DOC_MAX_CHARS: usize = 64 * 1024;
 impl MessageProcessor {
     pub(super) async fn thread_agents_doc_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let (workspace_id, folder_id) = match self
             .validate_thread_agents_doc_scope(
                 connection_id,
@@ -58,10 +59,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_agents_doc_save(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocSaveParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.content.chars().count() > THREAD_AGENTS_DOC_MAX_CHARS {
             self.send_error(
                 connection_id,
@@ -141,10 +143,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_agents_doc_archive(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocArchiveParams,
     ) {
+        let connection_id = request_context.connection_id();
         let (workspace_id, folder_id) = match self
             .validate_thread_agents_doc_scope(
                 connection_id,
@@ -219,10 +222,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_agents_doc_resolve_for_thread(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocResolveForThreadParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,

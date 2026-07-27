@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -13,7 +13,7 @@ use tracing::debug;
 
 use pioneer_config::AppConfig;
 
-use crate::auth::JwtAuth;
+use crate::auth::{AuthenticatedPrincipal, JwtAuth};
 use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
@@ -132,16 +132,18 @@ async fn handle_connection(
     message_processor: Arc<MessageProcessor>,
     session_manager: Arc<SessionManager>,
 ) -> Result<()> {
+    let principal_capture = Arc::new(OnceLock::new());
+    let callback_capture = principal_capture.clone();
     let ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
-        if let Err(error) = auth.authorize_request(request) {
-            debug!(error = %format!("{error:#}"), "websocket auth rejected request");
-            return Err(unauthorized_response("missing or invalid bearer token"));
-        }
-
+        capture_authenticated_principal(
+            auth.authenticate_request(request),
+            callback_capture.as_ref(),
+        )?;
         Ok(response)
     })
     .await
     .context("websocket handshake failed")?;
+    let principal = read_captured_principal(principal_capture.as_ref())?;
 
     let (mut ws_writer, mut ws_reader) = ws.split();
 
@@ -150,8 +152,9 @@ async fn handle_connection(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(queue_capacity);
 
     let connection_id = session_manager
-        .register_connection(outbound_tx.clone())
+        .register_connection(outbound_tx.clone(), principal)
         .await;
+    let connection_context = session_manager.connection_context(connection_id).await?;
 
     let writer_task = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
@@ -176,12 +179,12 @@ async fn handle_connection(
             match message {
                 Message::Text(payload) => {
                     message_processor
-                        .process_request(connection_id, payload.as_ref())
+                        .process_request(&connection_context, payload.as_ref())
                         .await;
                 }
                 Message::Binary(payload) => {
                     message_processor
-                        .process_binary_frame(connection_id, payload.as_ref())
+                        .process_binary_frame(&connection_context, payload.as_ref())
                         .await;
                 }
                 Message::Ping(payload) => {
@@ -220,4 +223,155 @@ fn unauthorized_response(message: &str) -> ErrorResponse {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Some(message.to_owned()))
         .expect("failed to build unauthorized websocket handshake response")
+}
+
+fn capture_authenticated_principal(
+    authentication: Result<AuthenticatedPrincipal>,
+    capture: &OnceLock<Arc<AuthenticatedPrincipal>>,
+) -> std::result::Result<(), ErrorResponse> {
+    let principal = match authentication {
+        Ok(principal) => Arc::new(principal),
+        Err(error) => {
+            debug!(error = %format!("{error:#}"), "websocket auth rejected request");
+            return Err(unauthorized_response("missing or invalid bearer token"));
+        }
+    };
+
+    capture.set(principal).map_err(|_| {
+        debug!("websocket authentication attempted duplicate principal capture");
+        internal_error_response("websocket authentication state error")
+    })
+}
+
+fn read_captured_principal(
+    capture: &OnceLock<Arc<AuthenticatedPrincipal>>,
+) -> Result<Arc<AuthenticatedPrincipal>> {
+    capture
+        .get()
+        .cloned()
+        .context("websocket handshake completed without an authenticated principal")
+}
+
+fn internal_error_response(message: &str) -> ErrorResponse {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Some(message.to_owned()))
+        .expect("failed to build internal websocket handshake response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_authenticated_principal, read_captured_principal};
+    use crate::auth::{AuthenticatedPrincipal, CredentialKind};
+    use crate::session::SessionManager;
+    use crate::session::test_support::authenticated_test_superuser;
+    use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind};
+    use std::sync::{Arc, OnceLock};
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+
+    #[tokio::test]
+    async fn failed_authentication_cannot_register_a_connection() {
+        let capture = OnceLock::new();
+        let manager = SessionManager::new();
+
+        let response =
+            capture_authenticated_principal(Err(anyhow::anyhow!("invalid credential")), &capture)
+                .expect_err("invalid auth must reject the handshake");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(capture.get().is_none());
+        assert!(manager.connection_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_capture_registers_the_exact_stable_principal() {
+        let capture = OnceLock::new();
+        let manager = SessionManager::new();
+        let expected = authenticated_test_superuser();
+
+        capture_authenticated_principal(Ok(expected.as_ref().clone()), &capture)
+            .expect("valid authentication must be captured");
+        let captured = read_captured_principal(&capture).expect("captured principal");
+        assert_eq!(captured.as_ref(), expected.as_ref());
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let connection_id = manager.register_connection(sender, captured).await;
+        assert_eq!(manager.connection_ids().await, vec![connection_id]);
+    }
+
+    #[test]
+    fn duplicate_and_missing_capture_fail_closed() {
+        let capture = OnceLock::new();
+        capture_authenticated_principal(
+            Ok(authenticated_test_superuser().as_ref().clone()),
+            &capture,
+        )
+        .unwrap();
+
+        let duplicate =
+            capture_authenticated_principal(Ok(principal("P00000000000000000002")), &capture)
+                .expect_err("duplicate capture must fail");
+        assert_eq!(duplicate.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            read_captured_principal(&capture)
+                .unwrap()
+                .principal_id
+                .as_str(),
+            "P00000000000000000001"
+        );
+
+        assert!(read_captured_principal(&OnceLock::new()).is_err());
+    }
+
+    #[test]
+    fn concurrent_handshakes_use_connection_local_capture_cells() {
+        let capture_a = Arc::new(OnceLock::new());
+        let capture_b = Arc::new(OnceLock::new());
+
+        std::thread::scope(|scope| {
+            let capture_a = capture_a.clone();
+            scope.spawn(move || {
+                capture_authenticated_principal(
+                    Ok(authenticated_test_superuser().as_ref().clone()),
+                    capture_a.as_ref(),
+                )
+                .unwrap();
+            });
+            let capture_b = capture_b.clone();
+            scope.spawn(move || {
+                capture_authenticated_principal(
+                    Ok(principal("P00000000000000000002")),
+                    capture_b.as_ref(),
+                )
+                .unwrap();
+            });
+        });
+
+        assert_eq!(
+            read_captured_principal(capture_a.as_ref())
+                .unwrap()
+                .principal_id
+                .as_str(),
+            "P00000000000000000001"
+        );
+        assert_eq!(
+            read_captured_principal(capture_b.as_ref())
+                .unwrap()
+                .principal_id
+                .as_str(),
+            "P00000000000000000002"
+        );
+    }
+
+    fn principal(principal_id: &str) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+            principal_id: PrincipalId::new(principal_id).unwrap(),
+            kind: PrincipalKind::Superuser,
+            role_key: None,
+            credential_kind: CredentialKind::LegacySuperuserJwt,
+        }
+    }
 }

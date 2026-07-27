@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use pioneer_config::AppConfig;
+use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 
 use crate::helpers::{normalize_non_empty, unix_timestamp_secs};
+use crate::identity::IdentityBootstrapSnapshot;
 use crate::secrets::ensure_jwt_material_len;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +26,21 @@ struct JwtClaims {
 pub struct JwtAuth {
     decoding_key: Arc<DecodingKey>,
     config: Arc<JwtRuntimeConfig>,
+    identity: Arc<IdentityBootstrapSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialKind {
+    LegacySuperuserJwt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthenticatedPrincipal {
+    pub gateway_id: GatewayId,
+    pub principal_id: PrincipalId,
+    pub kind: PrincipalKind,
+    pub role_key: Option<String>,
+    pub credential_kind: CredentialKind,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +91,7 @@ impl JwtRuntimeConfig {
 }
 
 impl JwtAuth {
-    pub fn authorize_request(&self, request: &Request) -> Result<()> {
+    pub(crate) fn authenticate_request(&self, request: &Request) -> Result<AuthenticatedPrincipal> {
         let auth_header = request
             .headers()
             .get("authorization")
@@ -85,9 +102,15 @@ impl JwtAuth {
         let token = extract_bearer_token(auth_header)
             .ok_or_else(|| anyhow!("authorization header must use Bearer token"))?;
 
-        let _ = self.validate_token(token)?;
+        self.validate_token(token)?;
 
-        Ok(())
+        Ok(AuthenticatedPrincipal {
+            gateway_id: self.identity.gateway.id.clone(),
+            principal_id: self.identity.superuser.id.clone(),
+            kind: self.identity.superuser.kind,
+            role_key: self.identity.superuser.role_key.clone(),
+            credential_kind: CredentialKind::LegacySuperuserJwt,
+        })
     }
 
     fn validate_token(&self, token: &str) -> Result<JwtClaims> {
@@ -124,13 +147,18 @@ impl JwtClaims {
     }
 }
 
-pub fn initialize(app_config: &AppConfig, jwt_material: &[u8]) -> Result<JwtAuth> {
+pub fn initialize(
+    app_config: &AppConfig,
+    jwt_material: &[u8],
+    identity: Arc<IdentityBootstrapSnapshot>,
+) -> Result<JwtAuth> {
     let config = JwtRuntimeConfig::from_app_config(app_config)?;
     ensure_jwt_material_len(jwt_material)?;
 
     Ok(JwtAuth {
         decoding_key: Arc::new(DecodingKey::from_secret(jwt_material)),
         config: Arc::new(config),
+        identity,
     })
 }
 
@@ -174,8 +202,14 @@ fn extract_bearer_token(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JwtAuth, extract_bearer_token, initialize, issue_superuser_token};
+    use super::{
+        CredentialKind, JwtAuth, JwtClaims, extract_bearer_token, initialize, issue_superuser_token,
+    };
+    use crate::identity::{
+        GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
+    };
     use crate::secrets::GatewaySecrets;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use pioneer_config::{
         AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
         GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
@@ -188,11 +222,12 @@ mod tests {
     use pioneer_keystore::{
         MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretMeta, SecretStore,
     };
+    use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio_tungstenite::tungstenite::handshake::server::Request;
 
     #[test]
@@ -304,13 +339,16 @@ mod tests {
     fn issue_superuser_token_returns_valid_token() {
         let config = test_app_config();
         let jwt_material = test_jwt_material();
-        let auth = initialize(&config, jwt_material.as_slice()).expect("expected jwt init");
+        let auth = initialize(&config, jwt_material.as_slice(), test_identity_snapshot())
+            .expect("expected jwt init");
         let token = issue_superuser_token(&config, jwt_material.as_slice())
             .expect("token issue should succeed");
 
         let request = request_with_token(Some(token.as_str()));
-        auth.authorize_request(&request)
+        let principal = auth
+            .authenticate_request(&request)
             .expect("expected generated token to be valid");
+        assert_authenticated_superuser(&principal);
     }
 
     #[test]
@@ -333,9 +371,10 @@ mod tests {
         let jwt_material = secrets
             .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)
             .expect("reload jwt material");
-        let auth = initialize(&config, jwt_material.as_slice()).expect("expected jwt init");
+        let auth = initialize(&config, jwt_material.as_slice(), test_identity_snapshot())
+            .expect("expected jwt init");
         let request = request_with_token(Some(token.as_str()));
-        auth.authorize_request(&request)
+        auth.authenticate_request(&request)
             .expect("publicly issued token should validate");
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -345,11 +384,109 @@ mod tests {
     fn authorize_request_rejects_missing_header() {
         let config = test_app_config();
         let jwt_material = test_jwt_material();
-        let auth: JwtAuth =
-            initialize(&config, jwt_material.as_slice()).expect("expected jwt init to succeed");
+        let auth: JwtAuth = initialize(&config, jwt_material.as_slice(), test_identity_snapshot())
+            .expect("expected jwt init to succeed");
         let request = request_with_token(None);
 
-        assert!(auth.authorize_request(&request).is_err());
+        assert!(auth.authenticate_request(&request).is_err());
+    }
+
+    #[test]
+    fn authentication_rejects_malformed_expired_and_not_yet_valid_tokens() {
+        let config = test_app_config();
+        let material = test_jwt_material();
+        let auth = initialize(&config, material.as_slice(), test_identity_snapshot()).unwrap();
+        let runtime = super::JwtRuntimeConfig::from_app_config(&config).unwrap();
+        let now = crate::helpers::unix_timestamp_secs().unwrap();
+
+        assert_auth_rejected_without_token_echo(&auth, "not.a.jwt");
+
+        let mut expired = JwtClaims::new(now.saturating_sub(600), runtime.token_ttl, &runtime)
+            .expect("expired claims");
+        expired.exp = now.saturating_sub(120);
+        let expired = encode_claims(&expired, material.as_slice());
+        assert_auth_rejected_without_token_echo(&auth, expired.as_str());
+
+        let mut future = JwtClaims::new(now, runtime.token_ttl, &runtime).expect("future claims");
+        future.nbf = now + 3_600;
+        future.exp = now + 7_200;
+        let future = encode_claims(&future, material.as_slice());
+        assert_auth_rejected_without_token_echo(&auth, future.as_str());
+    }
+
+    #[test]
+    fn authentication_rejects_wrong_subject_role_issuer_audience_and_signature() {
+        let config = test_app_config();
+        let material = test_jwt_material();
+        let auth = initialize(&config, material.as_slice(), test_identity_snapshot()).unwrap();
+        let runtime = super::JwtRuntimeConfig::from_app_config(&config).unwrap();
+        let now = crate::helpers::unix_timestamp_secs().unwrap();
+
+        let mutations: [fn(&mut JwtClaims); 4] = [
+            |claims: &mut JwtClaims| claims.sub = "not-superuser".to_owned(),
+            |claims: &mut JwtClaims| claims.role = "member".to_owned(),
+            |claims: &mut JwtClaims| claims.iss = "wrong-issuer".to_owned(),
+            |claims: &mut JwtClaims| claims.aud = "wrong-audience".to_owned(),
+        ];
+        for mutate in mutations {
+            let mut claims = JwtClaims::new(now, runtime.token_ttl, &runtime).unwrap();
+            mutate(&mut claims);
+            let token = encode_claims(&claims, material.as_slice());
+            assert_auth_rejected_without_token_echo(&auth, token.as_str());
+        }
+
+        let claims = JwtClaims::new(now, runtime.token_ttl, &runtime).unwrap();
+        let token = encode_claims(&claims, &[99; 64]);
+        assert_auth_rejected_without_token_echo(&auth, token.as_str());
+    }
+
+    #[test]
+    fn reissued_tokens_map_to_the_same_persisted_superuser_identity() {
+        let config = test_app_config();
+        let material = test_jwt_material();
+        let identity = test_identity_snapshot();
+        let auth_before_restart =
+            initialize(&config, material.as_slice(), identity.clone()).unwrap();
+        let auth_after_restart = initialize(&config, material.as_slice(), identity).unwrap();
+        let runtime = super::JwtRuntimeConfig::from_app_config(&config).unwrap();
+        let now = crate::helpers::unix_timestamp_secs().unwrap();
+
+        let first_claims = JwtClaims::new(now, Duration::from_secs(120), &runtime).unwrap();
+        let second_claims = JwtClaims::new(now, Duration::from_secs(240), &runtime).unwrap();
+        let first_token = encode_claims(&first_claims, material.as_slice());
+        let second_token = encode_claims(&second_claims, material.as_slice());
+        assert_ne!(first_token, second_token);
+
+        let first = auth_before_restart
+            .authenticate_request(&request_with_token(Some(first_token.as_str())))
+            .unwrap();
+        let second = auth_after_restart
+            .authenticate_request(&request_with_token(Some(second_token.as_str())))
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_authenticated_superuser(&first);
+        assert_ne!(first.principal_id.as_str(), first_claims.sub);
+    }
+
+    #[test]
+    fn desktop_and_mobile_bearer_vector_maps_without_endpoint_metadata() {
+        let config = test_app_config();
+        let material = test_jwt_material();
+        let token = issue_superuser_token(&config, material.as_slice()).unwrap();
+        let auth = initialize(&config, material.as_slice(), test_identity_snapshot()).unwrap();
+
+        // Both first-party shells pass this exact header through the shared client/FFI path.
+        let request = Request::builder()
+            .method("GET")
+            .uri("wss://gateway.example.test/socket")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-pioneer-endpoint-id", "mobile-local-profile-id")
+            .body(())
+            .unwrap();
+
+        let principal = auth.authenticate_request(&request).unwrap();
+        assert_authenticated_superuser(&principal);
     }
 
     #[test]
@@ -373,6 +510,52 @@ mod tests {
 
     fn test_jwt_material() -> Vec<u8> {
         (0..64).map(|value| value as u8).collect()
+    }
+
+    fn test_identity_snapshot() -> Arc<IdentityBootstrapSnapshot> {
+        Arc::new(IdentityBootstrapSnapshot {
+            gateway: GatewayIdentitySnapshot {
+                id: GatewayId::new("G00000000000000000001").unwrap(),
+                identity_bootstrap_version: 1,
+            },
+            superuser: SuperuserIdentitySnapshot {
+                id: PrincipalId::new("P00000000000000000001").unwrap(),
+                gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+                kind: PrincipalKind::Superuser,
+                role_key: None,
+                status: PrincipalStatus::Active,
+                display_name: "Superuser".to_owned(),
+                nickname: "superuser".to_owned(),
+                nickname_key: "superuser".to_owned(),
+            },
+        })
+    }
+
+    fn encode_claims(claims: &JwtClaims, material: &[u8]) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(material),
+        )
+        .unwrap()
+    }
+
+    fn assert_auth_rejected_without_token_echo(auth: &JwtAuth, token: &str) {
+        let error = auth
+            .authenticate_request(&request_with_token(Some(token)))
+            .expect_err("credential should be rejected");
+        assert!(!format!("{error:#}").contains(token));
+    }
+
+    fn assert_authenticated_superuser(principal: &super::AuthenticatedPrincipal) {
+        assert_eq!(principal.gateway_id.as_str(), "G00000000000000000001");
+        assert_eq!(principal.principal_id.as_str(), "P00000000000000000001");
+        assert_eq!(principal.kind, PrincipalKind::Superuser);
+        assert_eq!(principal.role_key, None);
+        assert_eq!(
+            principal.credential_kind,
+            CredentialKind::LegacySuperuserJwt
+        );
     }
 
     fn test_app_config() -> AppConfig {

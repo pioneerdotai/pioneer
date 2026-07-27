@@ -100,10 +100,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_create(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskCreateParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.task_create_context_for_params(&params).await {
             Ok(context) => context,
             Err(error) => {
@@ -140,10 +141,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task(params).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -165,10 +167,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskListParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self.task_runtime.service().list_tasks(params).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -190,10 +193,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_tree(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskTreeTaskParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task_tree(params).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -215,10 +219,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_events(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskEventsParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task_events(params).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -240,10 +245,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_wait(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskWaitParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self
             .task_runtime
             .service()
@@ -270,10 +276,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_accept(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskAcceptParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context =
             pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
         match message_future(
@@ -303,10 +310,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_revise(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskReviseParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context =
             pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
         let response_payload = match message_future(
@@ -348,10 +356,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_cancel(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskCancelParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
@@ -379,10 +388,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_detach(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskDetachParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
@@ -410,10 +420,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_reschedule(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskRescheduleParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
@@ -441,10 +452,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_pause(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskPauseParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
@@ -472,10 +484,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_resume(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskResumeParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
@@ -503,10 +516,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_agenda(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskAgendaParams,
     ) {
+        let connection_id = request_context.connection_id();
         match message_future(self.task_runtime.service().list_agenda(params)).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -528,10 +542,11 @@ impl MessageProcessor {
 
     pub(super) async fn task_deliveries(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: TaskDeliveriesParams,
     ) {
+        let connection_id = request_context.connection_id();
         match self.task_runtime.service().list_deliveries(params).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)

@@ -2932,6 +2932,7 @@ mod tests {
     use crate::workspace::DEFAULT_WORKSPACE_ID;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CliRuntimeTurnMcpMetadata, NewCliRuntimeTurnBinding};
+    use pioneer_entity::turn;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_protocol::{
         PermissionBehavior, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
@@ -2939,7 +2940,7 @@ mod tests {
         TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
         TurnPermissionProfileSource, TurnStatus,
     };
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::{ConnectionTrait, Database, EntityTrait};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
@@ -3293,13 +3294,26 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         crud_store
-            .upsert_thread_model(&thread)
+            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
             .await
             .expect("test thread should persist");
         crud_store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("test turn should persist before MCP projection");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&crud_store.database_connection())
+            .await
+            .expect("MCP background turn provenance query should succeed")
+            .expect("MCP background turn should exist");
+        assert_eq!(persisted.initiated_by_actor_kind.as_deref(), Some("system"));
+        assert_eq!(persisted.initiated_by_actor_id, None);
     }
 
     async fn seed_mcp_installation(

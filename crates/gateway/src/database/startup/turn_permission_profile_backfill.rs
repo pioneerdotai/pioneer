@@ -728,6 +728,8 @@ mod tests {
             sidebar_visibility: Set("visible".to_owned()),
             agent_nickname: Set(None),
             agent_role: Set(None),
+            created_by_actor_id: Set(None),
+            created_by_actor_kind: Set(None),
             summary: Set(None),
             summary_turn_count: Set(None),
             created_at: Set(now),
@@ -740,6 +742,8 @@ mod tests {
         turn::Entity::insert(turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            initiated_by_actor_id: Set(None),
+            initiated_by_actor_kind: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),
@@ -843,6 +847,8 @@ mod tests {
         turn::Entity::insert(turn::ActiveModel {
             id: Set(synthetic_turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
+            initiated_by_actor_id: Set(None),
+            initiated_by_actor_kind: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),

@@ -25,6 +25,7 @@ use pioneer_protocol::{
     TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
 };
+use tracing::Instrument as _;
 
 // Keep every RPC branch in its own erased future. A single async block around the
 // whole dispatch match makes its generated poll function reserve stack space for
@@ -54,78 +55,156 @@ fn vector_provider_key_name(
 impl MessageProcessor {
     pub fn process_request<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        connection: &'a crate::request_context::ConnectionContext,
         payload: &'a str,
     ) -> MessageFuture<'a, ()> {
+        let authorization_decision =
+            crate::request_context::authorize_principal(connection.principal());
         let request_value = match serde_json::from_str::<JsonValue>(payload) {
             Ok(value) => value,
             Err(_) => {
-                return message_future(async move {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            None,
-                            PARSE_ERROR_CODE,
-                            "failed to parse JSON-RPC payload",
-                        ),
-                    )
-                    .await;
-                });
+                let canonical_method =
+                    crate::request_context::CanonicalMethod::rpc("jsonrpc/parse");
+                let span = crate::request_context::request_span(
+                    connection,
+                    None,
+                    &canonical_method,
+                    authorization_decision,
+                );
+                return instrument_message_future(
+                    message_future(async move {
+                        warn!(
+                            rejection_reason = "parse_error",
+                            "rejected JSON-RPC request"
+                        );
+                        self.send_error(
+                            connection.connection_id(),
+                            JsonRpcErrorResponse::new(
+                                None,
+                                PARSE_ERROR_CODE,
+                                "failed to parse JSON-RPC payload",
+                            ),
+                        )
+                        .await;
+                    }),
+                    span,
+                );
             }
         };
 
         let request_id = parse_request_id(&request_value);
-        let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
-            Ok(request) => request,
-            Err(error) => {
-                return message_future(async move {
+        let canonical_method = request_value
+            .get("method")
+            .and_then(JsonValue::as_str)
+            .map(crate::request_context::CanonicalMethod::rpc)
+            .unwrap_or_else(|| crate::request_context::CanonicalMethod::rpc(""));
+        if !authorization_decision.is_allowed() {
+            let span = crate::request_context::request_span(
+                connection,
+                request_id.as_ref(),
+                &canonical_method,
+                authorization_decision,
+            );
+            return instrument_message_future(
+                message_future(async move {
+                    warn!(
+                        rejection_reason = "unsupported_principal",
+                        "authorization denied for JSON-RPC request"
+                    );
                     self.send_error(
-                        connection_id,
+                        connection.connection_id(),
                         JsonRpcErrorResponse::new(
                             request_id,
                             INVALID_REQUEST_CODE,
-                            format!("invalid JSON-RPC request: {error}"),
+                            "authenticated principal kind is not supported",
                         ),
                     )
                     .await;
-                });
+                }),
+                span,
+            );
+        }
+        let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
+            Ok(request) => request,
+            Err(error) => {
+                let span = crate::request_context::request_span(
+                    connection,
+                    request_id.as_ref(),
+                    &canonical_method,
+                    authorization_decision,
+                );
+                return instrument_message_future(
+                    message_future(async move {
+                        warn!(
+                            rejection_reason = "invalid_request",
+                            "rejected JSON-RPC request"
+                        );
+                        self.send_error(
+                            connection.connection_id(),
+                            JsonRpcErrorResponse::new(
+                                request_id,
+                                INVALID_REQUEST_CODE,
+                                format!("invalid JSON-RPC request: {error}"),
+                            ),
+                        )
+                        .await;
+                    }),
+                    span,
+                );
             }
         };
+        let context = crate::request_context::RequestContext::new(
+            connection,
+            Some(request.id.clone()),
+            crate::request_context::CanonicalMethod::rpc(request.method.as_str()),
+        );
+        let span = context.request_span();
 
         if request.jsonrpc != JSONRPC_VERSION {
-            return message_future(async move {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request.id),
-                        INVALID_REQUEST_CODE,
-                        format!("unsupported jsonrpc version `{}`", request.jsonrpc),
-                    ),
-                )
-                .await;
-            });
+            return instrument_message_future(
+                message_future(async move {
+                    warn!(
+                        rejection_reason = "unsupported_jsonrpc_version",
+                        "rejected JSON-RPC request"
+                    );
+                    self.send_error(
+                        context.connection_id(),
+                        JsonRpcErrorResponse::new(
+                            Some(request.id),
+                            INVALID_REQUEST_CODE,
+                            format!("unsupported jsonrpc version `{}`", request.jsonrpc),
+                        ),
+                    )
+                    .await;
+                }),
+                span,
+            );
         }
 
         // turn/start already exposes its handler future directly, so keep its parsing path
         // synchronous instead of adding an otherwise unnecessary dispatch wrapper.
-        if request.method == methods::TURN_START {
-            return self.dispatch_turn_start(connection_id, request);
-        }
-        if request.method == methods::SETTINGS_UPDATE {
-            return self.dispatch_settings_update(connection_id, request);
-        }
+        let dispatched = if request.method == methods::TURN_START {
+            self.dispatch_turn_start(context, request)
+        } else if request.method == methods::SETTINGS_UPDATE {
+            self.dispatch_settings_update(context, request)
+        } else {
+            self.process_request_inner(context, request)
+        };
 
-        self.process_request_inner(connection_id, request)
+        instrument_message_future(dispatched, span)
     }
 
     fn dispatch_turn_start<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        context: crate::request_context::RequestContext,
         request: JsonRpcRequest,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = context.connection_id();
         let params_value = request.params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<TurnStartParams>(params_value) {
-            Ok(params) => self.turn_start(connection_id, request.id, params),
+            Ok(params) => message_future(async move {
+                self.turn_start(&context, request.id, params).await;
+            }),
             Err(error) => message_future(async move {
                 self.send_error(
                     connection_id,
@@ -142,9 +221,10 @@ impl MessageProcessor {
 
     fn dispatch_settings_update<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        context: crate::request_context::RequestContext,
         request: JsonRpcRequest,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = context.connection_id();
         let params_value = request.params.unwrap_or_else(empty_object_value);
         let params = match serde_json::from_value::<GatewaySettingsUpdateParams>(params_value) {
             Ok(params) => params,
@@ -164,10 +244,7 @@ impl MessageProcessor {
         };
 
         message_future(async move {
-            match self
-                .update_gateway_settings(connection_id, params.update)
-                .await
-            {
+            match self.update_gateway_settings(&context, params.update).await {
                 Ok(settings) => {
                     let result = pioneer_protocol::GatewaySettingsUpdateResponse { settings };
                     match JsonRpcResponse::from_result(request.id, &result) {
@@ -216,9 +293,10 @@ impl MessageProcessor {
 
     fn process_request_inner<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        context: crate::request_context::RequestContext,
         request: JsonRpcRequest,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = context.connection_id();
         let method = request.method.clone();
         dispatch_request_future! {
             method.as_str();
@@ -226,7 +304,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceListParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_list(connection_id, request.id, params).await;
+                            self.workspace_list(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -248,7 +326,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceCreateParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_create(connection_id, request.id, params)
+                            self.workspace_create(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -271,7 +349,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceDefaultParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_default(connection_id, request.id, params)
+                            self.workspace_default(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -294,7 +372,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceSelectParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_select(connection_id, request.id, params)
+                            self.workspace_select(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -317,7 +395,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceUpdateParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_update(connection_id, request.id, params)
+                            self.workspace_update(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -339,7 +417,7 @@ impl MessageProcessor {
                 methods::VOICE_STATUS => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<VoiceStatusParams>(params_value) {
-                        Ok(params) => self.voice_status(connection_id, request.id, params).await,
+                        Ok(params) => self.voice_status(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -360,7 +438,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<VoiceSessionStartParams>(params_value) {
                         Ok(params) => {
-                            self.voice_session_start(connection_id, request.id, params)
+                            self.voice_session_start(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -383,7 +461,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<VoiceSessionFinalizeParams>(params_value) {
                         Ok(params) => {
-                            self.voice_session_finalize(connection_id, request.id, params)
+                            self.voice_session_finalize(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -406,7 +484,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<VoiceSessionCancelParams>(params_value) {
                         Ok(params) => {
-                            self.voice_session_cancel(connection_id, request.id, params)
+                            self.voice_session_cancel(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -428,7 +506,7 @@ impl MessageProcessor {
                 methods::MEMORY_SEARCH => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<MemorySearchParams>(params_value) {
-                        Ok(params) => self.memory_search(connection_id, request.id, params).await,
+                        Ok(params) => self.memory_search(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -448,7 +526,7 @@ impl MessageProcessor {
                 methods::MEMORY_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<MemoryGetParams>(params_value) {
-                        Ok(params) => self.memory_get(connection_id, request.id, params).await,
+                        Ok(params) => self.memory_get(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -468,7 +546,7 @@ impl MessageProcessor {
                 methods::MEMORY_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<MemoryListParams>(params_value) {
-                        Ok(params) => self.memory_list(connection_id, request.id, params).await,
+                        Ok(params) => self.memory_list(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -489,7 +567,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<MemoryRememberParams>(params_value) {
                         Ok(params) => {
-                            self.memory_remember(connection_id, request.id, params)
+                            self.memory_remember(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -511,7 +589,7 @@ impl MessageProcessor {
                 methods::MEMORY_FORGET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<MemoryForgetParams>(params_value) {
-                        Ok(params) => self.memory_forget(connection_id, request.id, params).await,
+                        Ok(params) => self.memory_forget(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -529,56 +607,50 @@ impl MessageProcessor {
                     }
                 }
                 methods::MEMORY_CANDIDATES_LIST => {
-                    self.dispatch_memory_candidates_list(connection_id, request.id, request.params)
+                    self.dispatch_memory_candidates_list(&context, request.id, request.params)
                         .await;
                 }
                 methods::MEMORY_CANDIDATES_GET => {
-                    self.dispatch_memory_candidates_get(connection_id, request.id, request.params)
+                    self.dispatch_memory_candidates_get(&context, request.id, request.params)
                         .await;
                 }
                 methods::MEMORY_CANDIDATES_DECIDE => {
-                    self.dispatch_memory_candidates_decide(
-                        connection_id,
+                    self.dispatch_memory_candidates_decide(&context,
                         request.id,
                         request.params,
                     )
                     .await;
                 }
                 methods::MEMORY_CANDIDATES_APPROVE => {
-                    self.dispatch_memory_candidates_approve(
-                        connection_id,
+                    self.dispatch_memory_candidates_approve(&context,
                         request.id,
                         request.params,
                     )
                     .await;
                 }
                 methods::MEMORY_CANDIDATES_REJECT => {
-                    self.dispatch_memory_candidates_reject(
-                        connection_id,
+                    self.dispatch_memory_candidates_reject(&context,
                         request.id,
                         request.params,
                     )
                     .await;
                 }
                 methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE => {
-                    self.dispatch_memory_candidates_edit_and_approve(
-                        connection_id,
+                    self.dispatch_memory_candidates_edit_and_approve(&context,
                         request.id,
                         request.params,
                     )
                     .await;
                 }
                 methods::MEMORY_CANDIDATES_MERGE => {
-                    self.dispatch_memory_candidates_merge(
-                        connection_id,
+                    self.dispatch_memory_candidates_merge(&context,
                         request.id,
                         request.params,
                     )
                     .await;
                 }
                 methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR => {
-                    self.dispatch_memory_candidates_suppress_similar(
-                        connection_id,
+                    self.dispatch_memory_candidates_suppress_similar(&context,
                         request.id,
                         request.params,
                     )
@@ -588,7 +660,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadStartParams>(params_value) {
                         Ok(params) => {
-                            self.thread_start(connection_id, request.id, params).await;
+                            self.thread_start(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -610,7 +682,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
-                            self.thread_tree(connection_id, request.id, params).await;
+                            self.thread_tree(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -632,7 +704,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadUpdateParams>(params_value) {
                         Ok(params) => {
-                            self.thread_update(connection_id, request.id, params).await;
+                            self.thread_update(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -654,7 +726,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadMoveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_move(connection_id, request.id, params).await;
+                            self.thread_move(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -676,7 +748,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadFolderCreateParams>(params_value) {
                         Ok(params) => {
-                            self.thread_folder_create(connection_id, request.id, params)
+                            self.thread_folder_create(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -699,7 +771,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadFolderMoveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_folder_move(connection_id, request.id, params)
+                            self.thread_folder_move(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -722,7 +794,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadFolderDeleteParams>(params_value) {
                         Ok(params) => {
-                            self.thread_folder_delete(connection_id, request.id, params)
+                            self.thread_folder_delete(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -745,7 +817,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocGetParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_get(connection_id, request.id, params)
+                            self.thread_agents_doc_get(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -768,7 +840,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocSaveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_save(connection_id, request.id, params)
+                            self.thread_agents_doc_save(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -791,7 +863,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocArchiveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_archive(connection_id, request.id, params)
+                            self.thread_agents_doc_archive(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -816,8 +888,7 @@ impl MessageProcessor {
                         params_value,
                     ) {
                         Ok(params) => {
-                            self.thread_agents_doc_resolve_for_thread(
-                                connection_id,
+                            self.thread_agents_doc_resolve_for_thread(&context,
                                 request.id,
                                 params,
                             )
@@ -843,7 +914,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadGetParams>(params_value) {
                         Ok(params) => {
-                            self.thread_get(connection_id, request.id, params).await;
+                            self.thread_get(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -865,7 +936,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTimelinePageParams>(params_value) {
                         Ok(params) => {
-                            self.thread_timeline_page(connection_id, request.id, params)
+                            self.thread_timeline_page(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -888,7 +959,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnWorkPageParams>(params_value) {
                         Ok(params) => {
-                            self.turn_work_page(connection_id, request.id, params).await;
+                            self.turn_work_page(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -910,7 +981,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnWorkItemsGetParams>(params_value) {
                         Ok(params) => {
-                            self.turn_work_items_get(connection_id, request.id, params)
+                            self.turn_work_items_get(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -933,7 +1004,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnCancelParams>(params_value) {
                         Ok(params) => {
-                            self.turn_cancel(connection_id, request.id, params).await;
+                            self.turn_cancel(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -955,7 +1026,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnResumeParams>(params_value) {
                         Ok(params) => {
-                            self.turn_resume(connection_id, request.id, params).await;
+                            self.turn_resume(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -983,7 +1054,7 @@ impl MessageProcessor {
 
                     match params {
                         Ok(params) => {
-                            self.turn_get(connection_id, request.id, params).await;
+                            self.turn_get(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1008,7 +1079,7 @@ impl MessageProcessor {
 
                     match params {
                         Ok(params) => {
-                            self.turn_items(connection_id, request.id, params).await;
+                            self.turn_items(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1031,7 +1102,7 @@ impl MessageProcessor {
                     match serde_json::from_value::<TurnPermissionRequestRespondParams>(params_value)
                     {
                         Ok(params) => {
-                            self.turn_permission_request_respond(connection_id, request.id, params)
+                            self.turn_permission_request_respond(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1054,7 +1125,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadUnsubscribeParams>(params_value) {
                         Ok(params) => {
-                            self.thread_unsubscribe(connection_id, request.id, params)
+                            self.thread_unsubscribe(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1077,7 +1148,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderListParams>(params_value) {
                         Ok(params) => {
-                            self.provider_list(connection_id, request.id, params).await;
+                            self.provider_list(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1099,7 +1170,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderConfigureParams>(params_value) {
                         Ok(params) => {
-                            self.provider_configure(connection_id, request.id, params)
+                            self.provider_configure(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1122,7 +1193,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeListParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_list(connection_id, request.id, params)
+                            self.cli_runtime_list(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1145,7 +1216,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeGetParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_get(connection_id, request.id, params)
+                            self.cli_runtime_get(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1168,7 +1239,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeStatusParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_status(connection_id, request.id, params)
+                            self.cli_runtime_status(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1191,7 +1262,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeRefreshParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_refresh(connection_id, request.id, params)
+                            self.cli_runtime_refresh(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1214,7 +1285,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeListModelsParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_list_models(connection_id, request.id, params)
+                            self.cli_runtime_list_models(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1237,7 +1308,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeThreadBindingGetParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_thread_binding_get(connection_id, request.id, params)
+                            self.cli_runtime_thread_binding_get(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1260,7 +1331,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeThreadCompactParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_thread_compact(connection_id, request.id, params)
+                            self.cli_runtime_thread_compact(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1283,7 +1354,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeThreadForkParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_thread_fork(connection_id, request.id, params)
+                            self.cli_runtime_thread_fork(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1306,7 +1377,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeTurnSteerParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_turn_steer(connection_id, request.id, params)
+                            self.cli_runtime_turn_steer(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1329,7 +1400,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeReviewStartParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_review_start(connection_id, request.id, params)
+                            self.cli_runtime_review_start(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1352,7 +1423,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeLoginStartParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_login_start(connection_id, request.id, params)
+                            self.cli_runtime_login_start(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1375,7 +1446,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeLoginCancelParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_login_cancel(connection_id, request.id, params)
+                            self.cli_runtime_login_cancel(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1398,7 +1469,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeProxySetParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_proxy_set(connection_id, request.id, params)
+                            self.cli_runtime_proxy_set(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1421,7 +1492,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeProxyDeleteParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_proxy_delete(connection_id, request.id, params)
+                            self.cli_runtime_proxy_delete(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1444,7 +1515,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeRequestRespondParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_request_respond(connection_id, request.id, params)
+                            self.cli_runtime_request_respond(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1466,7 +1537,7 @@ impl MessageProcessor {
                 methods::SETTINGS_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<GatewaySettingsGetParams>(params_value) {
-                        Ok(_params) => match self.gateway_settings_snapshot(connection_id).await {
+                        Ok(_params) => match self.gateway_settings_snapshot(&context).await {
                             Ok(settings) => {
                                 let result =
                                     pioneer_protocol::GatewaySettingsGetResponse { settings };
@@ -1529,7 +1600,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderListModelsParams>(params_value) {
                         Ok(params) => {
-                            self.provider_list_models(connection_id, request.id, params)
+                            self.provider_list_models(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1552,7 +1623,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderListModelsParams>(params_value) {
                         Ok(params) => {
-                            self.provider_list_embedding_models(connection_id, request.id, params)
+                            self.provider_list_embedding_models(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1575,8 +1646,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderListModelsParams>(params_value) {
                         Ok(params) => {
-                            self.provider_list_transcription_models(
-                                connection_id,
+                            self.provider_list_transcription_models(&context,
                                 request.id,
                                 params,
                             )
@@ -1602,7 +1672,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderSetApiKeyParams>(params_value) {
                         Ok(params) => {
-                            self.provider_set_api_key(connection_id, request.id, params)
+                            self.provider_set_api_key(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1625,7 +1695,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderDeleteApiKeyParams>(params_value) {
                         Ok(params) => {
-                            self.provider_delete_api_key(connection_id, request.id, params)
+                            self.provider_delete_api_key(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1648,7 +1718,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpListParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_list(connection_id, request.id, params).await;
+                            self.mcp_list(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1667,7 +1737,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpInstallParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_install(connection_id, request.id, params).await;
+                            self.mcp_install(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1689,7 +1759,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpPolicySetParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_policy_set(connection_id, request.id, params).await;
+                            self.mcp_policy_set(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1711,7 +1781,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpServerRestartParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_server_restart(connection_id, request.id, params)
+                            self.mcp_server_restart(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1734,7 +1804,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpUninstallParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_uninstall(connection_id, request.id, params).await;
+                            self.mcp_uninstall(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1756,7 +1826,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpServerDetailsParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_server_details(connection_id, request.id, params)
+                            self.mcp_server_details(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1779,7 +1849,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillListParams>(params_value) {
                         Ok(params) => {
-                            self.skills_list(connection_id, request.id, params).await;
+                            self.skills_list(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1801,7 +1871,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsInstallParams>(params_value) {
                         Ok(params) => {
-                            self.skills_install(connection_id, request.id, params).await;
+                            self.skills_install(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1823,7 +1893,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsPackInstallParams>(params_value) {
                         Ok(params) => {
-                            self.skills_pack_install(connection_id, request.id, params)
+                            self.skills_pack_install(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1846,7 +1916,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsPackUpdateParams>(params_value) {
                         Ok(params) => {
-                            self.skills_pack_update(connection_id, request.id, params)
+                            self.skills_pack_update(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1869,7 +1939,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsPackUninstallParams>(params_value) {
                         Ok(params) => {
-                            self.skills_pack_uninstall(connection_id, request.id, params)
+                            self.skills_pack_uninstall(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1892,7 +1962,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsUpdateParams>(params_value) {
                         Ok(params) => {
-                            self.skills_update(connection_id, request.id, params).await;
+                            self.skills_update(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1914,7 +1984,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsUninstallParams>(params_value) {
                         Ok(params) => {
-                            self.skills_uninstall(connection_id, request.id, params)
+                            self.skills_uninstall(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1937,7 +2007,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsUploadStartParams>(params_value) {
                         Ok(params) => {
-                            self.skills_upload_start(connection_id, request.id, params)
+                            self.skills_upload_start(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1960,7 +2030,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsUploadFinishParams>(params_value) {
                         Ok(params) => {
-                            self.skills_upload_finish(connection_id, request.id, params)
+                            self.skills_upload_finish(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1983,7 +2053,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsUploadAbortParams>(params_value) {
                         Ok(params) => {
-                            self.skills_upload_abort(connection_id, request.id, params)
+                            self.skills_upload_abort(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2006,7 +2076,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactCapabilitiesParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_capabilities(connection_id, request.id, params)
+                            self.artifact_capabilities(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2029,8 +2099,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(
-                                connection_id,
+                            self.artifact_list(&context,
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST,
@@ -2057,8 +2126,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForThreadParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(
-                                connection_id,
+                            self.artifact_list(&context,
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_THREAD,
@@ -2085,8 +2153,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForTurnParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(
-                                connection_id,
+                            self.artifact_list(&context,
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_TURN,
@@ -2113,8 +2180,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForMessageParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(
-                                connection_id,
+                            self.artifact_list(&context,
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_MESSAGE,
@@ -2140,7 +2206,7 @@ impl MessageProcessor {
                 methods::ARTIFACT_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactGetParams>(params_value) {
-                        Ok(params) => self.artifact_get(connection_id, request.id, params).await,
+                        Ok(params) => self.artifact_get(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2160,7 +2226,7 @@ impl MessageProcessor {
                 methods::ARTIFACT_READ => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactReadParams>(params_value) {
-                        Ok(params) => self.artifact_read(connection_id, request.id, params).await,
+                        Ok(params) => self.artifact_read(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2181,7 +2247,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDeleteParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_delete(connection_id, request.id, params)
+                            self.artifact_delete(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -2204,7 +2270,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactRestoreParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_restore(connection_id, request.id, params)
+                            self.artifact_restore(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -2226,7 +2292,7 @@ impl MessageProcessor {
                 methods::ARTIFACT_BIND => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactBindParams>(params_value) {
-                        Ok(params) => self.artifact_bind(connection_id, request.id, params).await,
+                        Ok(params) => self.artifact_bind(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2247,7 +2313,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadStartParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_start(connection_id, request.id, params)
+                            self.artifact_upload_start(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2270,7 +2336,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadFinishParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_finish(connection_id, request.id, params)
+                            self.artifact_upload_finish(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2293,7 +2359,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadAbortParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_abort(connection_id, request.id, params)
+                            self.artifact_upload_abort(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2316,7 +2382,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadStartParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_start(connection_id, request.id, params)
+                            self.artifact_download_start(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2339,7 +2405,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadChunkParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_chunk(connection_id, request.id, params)
+                            self.artifact_download_chunk(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2362,7 +2428,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadFinishParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_finish(connection_id, request.id, params)
+                            self.artifact_download_finish(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2385,7 +2451,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadAbortParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_abort(connection_id, request.id, params)
+                            self.artifact_download_abort(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2408,7 +2474,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsHealthParams>(params_value) {
                         Ok(params) => {
-                            self.skills_health(connection_id, request.id, params).await;
+                            self.skills_health(&context, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2430,7 +2496,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsPolicyListParams>(params_value) {
                         Ok(params) => {
-                            self.skills_policy_list(connection_id, request.id, params)
+                            self.skills_policy_list(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2453,7 +2519,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsPolicySetParams>(params_value) {
                         Ok(params) => {
-                            self.skills_policy_set(connection_id, request.id, params)
+                            self.skills_policy_set(&context, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -2475,7 +2541,7 @@ impl MessageProcessor {
                 methods::TASK_CREATE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskCreateParams>(params_value) {
-                        Ok(params) => self.task_create(connection_id, request.id, params).await,
+                        Ok(params) => self.task_create(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2495,7 +2561,7 @@ impl MessageProcessor {
                 methods::TASK_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskGetParams>(params_value) {
-                        Ok(params) => self.task_get(connection_id, request.id, params).await,
+                        Ok(params) => self.task_get(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2512,7 +2578,7 @@ impl MessageProcessor {
                 methods::TASK_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskListParams>(params_value) {
-                        Ok(params) => self.task_list(connection_id, request.id, params).await,
+                        Ok(params) => self.task_list(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2529,7 +2595,7 @@ impl MessageProcessor {
                 methods::TASK_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskTreeTaskParams>(params_value) {
-                        Ok(params) => self.task_tree(connection_id, request.id, params).await,
+                        Ok(params) => self.task_tree(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2546,7 +2612,7 @@ impl MessageProcessor {
                 methods::TASK_EVENTS => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskEventsParams>(params_value) {
-                        Ok(params) => self.task_events(connection_id, request.id, params).await,
+                        Ok(params) => self.task_events(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2566,7 +2632,7 @@ impl MessageProcessor {
                 methods::TASK_WAIT => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskWaitParams>(params_value) {
-                        Ok(params) => self.task_wait(connection_id, request.id, params).await,
+                        Ok(params) => self.task_wait(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2583,7 +2649,7 @@ impl MessageProcessor {
                 methods::TASK_ACCEPT => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskAcceptParams>(params_value) {
-                        Ok(params) => self.task_accept(connection_id, request.id, params).await,
+                        Ok(params) => self.task_accept(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2604,7 +2670,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskReviseParams>(params_value) {
                         Ok(params) => {
-                            message_future(self.task_revise(connection_id, request.id, params))
+                            message_future(self.task_revise(&context, request.id, params))
                                 .await
                         }
                         Err(error) => {
@@ -2626,7 +2692,7 @@ impl MessageProcessor {
                 methods::TASK_CANCEL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskCancelParams>(params_value) {
-                        Ok(params) => self.task_cancel(connection_id, request.id, params).await,
+                        Ok(params) => self.task_cancel(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2647,7 +2713,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskRescheduleParams>(params_value) {
                         Ok(params) => {
-                            self.task_reschedule(connection_id, request.id, params)
+                            self.task_reschedule(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -2669,7 +2735,7 @@ impl MessageProcessor {
                 methods::TASK_PAUSE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskPauseParams>(params_value) {
-                        Ok(params) => self.task_pause(connection_id, request.id, params).await,
+                        Ok(params) => self.task_pause(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2689,7 +2755,7 @@ impl MessageProcessor {
                 methods::TASK_RESUME => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskResumeParams>(params_value) {
-                        Ok(params) => self.task_resume(connection_id, request.id, params).await,
+                        Ok(params) => self.task_resume(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2709,7 +2775,7 @@ impl MessageProcessor {
                 methods::TASK_AGENDA => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskAgendaParams>(params_value) {
-                        Ok(params) => self.task_agenda(connection_id, request.id, params).await,
+                        Ok(params) => self.task_agenda(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2730,7 +2796,7 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskDeliveriesParams>(params_value) {
                         Ok(params) => {
-                            self.task_deliveries(connection_id, request.id, params)
+                            self.task_deliveries(&context, request.id, params)
                                 .await
                         }
                         Err(error) => {
@@ -2752,7 +2818,7 @@ impl MessageProcessor {
                 methods::TASK_DETACH => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskDetachParams>(params_value) {
-                        Ok(params) => self.task_detach(connection_id, request.id, params).await,
+                        Ok(params) => self.task_detach(&context, request.id, params).await,
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2785,14 +2851,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesListParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_list(connection_id, request_id, params)
+                self.memory_candidates_list(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2809,14 +2876,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesGetParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_get(connection_id, request_id, params)
+                self.memory_candidates_get(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2833,14 +2901,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_decide(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesDecideParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_decide(connection_id, request_id, params)
+                self.memory_candidates_decide(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2857,14 +2926,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_approve(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesApproveParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_approve(connection_id, request_id, params)
+                self.memory_candidates_approve(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2881,14 +2951,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_reject(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesRejectParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_reject(connection_id, request_id, params)
+                self.memory_candidates_reject(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2905,14 +2976,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_edit_and_approve(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesEditAndApproveParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_edit_and_approve(connection_id, request_id, params)
+                self.memory_candidates_edit_and_approve(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2929,14 +3001,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_merge(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesMergeParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_merge(connection_id, request_id, params)
+                self.memory_candidates_merge(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2953,14 +3026,15 @@ impl MessageProcessor {
 
     async fn dispatch_memory_candidates_suppress_similar(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: Option<JsonValue>,
     ) {
+        let connection_id = request_context.connection_id();
         let params_value = params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<MemoryCandidatesSuppressSimilarParams>(params_value) {
             Ok(params) => {
-                self.memory_candidates_suppress_similar(connection_id, request_id, params)
+                self.memory_candidates_suppress_similar(request_context, request_id, params)
                     .await;
             }
             Err(error) => {
@@ -2977,8 +3051,9 @@ impl MessageProcessor {
 
     async fn gateway_settings_snapshot(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let connection_id = request_context.connection_id();
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
         let settings_file_name = crate::settings::normalize_settings_file_name(
@@ -3004,9 +3079,10 @@ impl MessageProcessor {
 
     async fn update_gateway_settings(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let connection_id = request_context.connection_id();
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
         if update.self_improvement.is_some() && self.self_improvement_supervisor.is_none() {
             anyhow::bail!(
@@ -3428,6 +3504,20 @@ impl MessageProcessor {
         .await;
     }
 
+    #[cfg(test)]
+    pub(crate) async fn process_request_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        payload: &str,
+    ) {
+        let context = self
+            .session_manager
+            .connection_context(connection_id)
+            .await
+            .expect("test connection must be registered with a principal");
+        self.process_request(&context, payload).await;
+    }
+
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
         self.artifact_uploads.abort_connection(connection_id).await;
         self.artifact_downloads
@@ -3465,6 +3555,13 @@ impl MessageProcessor {
             "removed detached idle threads after connection closed"
         );
     }
+}
+
+fn instrument_message_future<'a>(
+    future: MessageFuture<'a, ()>,
+    span: tracing::Span,
+) -> MessageFuture<'a, ()> {
+    message_future(future.instrument(span))
 }
 
 const VOICE_RECONFIGURATION_BUSY_CODE: &str = "voice_reconfiguration_busy";

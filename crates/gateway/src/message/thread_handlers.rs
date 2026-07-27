@@ -3,10 +3,11 @@ use super::*;
 impl MessageProcessor {
     pub(super) async fn thread_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -213,10 +214,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_tree(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadTreeParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -379,10 +381,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -523,10 +526,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_update(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadUpdateParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -782,10 +786,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_move(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadMoveParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -958,10 +963,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_folder_create(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadFolderCreateParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -1082,10 +1088,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_folder_move(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadFolderMoveParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -1202,10 +1209,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_folder_delete(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadFolderDeleteParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.workspace_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -1358,10 +1366,11 @@ impl MessageProcessor {
 
     pub(super) async fn thread_unsubscribe(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadUnsubscribeParams,
     ) {
+        let connection_id = request_context.connection_id();
         let outcome = self
             .thread_manager
             .thread_unsubscribe(connection_id, &params.thread_id)

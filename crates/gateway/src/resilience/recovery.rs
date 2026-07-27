@@ -2966,7 +2966,7 @@ mod tests {
         RecoveryJobRecord, SkillInstallationRecord, SkillPackInstallationRecord, TimeoutCandidate,
         TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
     };
-    use pioneer_entity::workspace;
+    use pioneer_entity::{turn, workspace};
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
         ItemCompletedNotification, ItemStartedNotification, ProviderFailureClass,
@@ -2989,7 +2989,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ActiveModelTrait, Database, Set};
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3290,9 +3290,21 @@ mod tests {
                     text: "run tool".to_owned(),
                     text_elements: Vec::new(),
                 }],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should persist");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&crud_store.database_connection())
+            .await
+            .expect("recovery turn provenance query should succeed")
+            .expect("recovery turn should exist");
+        assert_eq!(
+            persisted.initiated_by_actor_kind.as_deref(),
+            Some("system"),
+            "resilience recovery fixtures must not impersonate a principal"
+        );
+        assert_eq!(persisted.initiated_by_actor_id, None);
         crud_store
             .materialize_item_started(
                 ItemStartedNotification {
@@ -4911,6 +4923,7 @@ mod tests {
                     text: "hello".to_owned(),
                     text_elements: Vec::new(),
                 }],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should persist");
@@ -5041,6 +5054,7 @@ mod tests {
                     text: "continue".to_owned(),
                     text_elements: Vec::new(),
                 }],
+                pioneer_protocol::PersistedActorRef::System,
             )
             .await
             .expect("turn start should persist");

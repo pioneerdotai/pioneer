@@ -71,10 +71,11 @@ enum CLIRuntimeAttemptRecoveryState {
 impl MessageProcessor {
     pub(super) async fn cli_runtime_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -114,10 +115,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -153,10 +155,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_status(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeStatusParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -192,10 +195,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_refresh(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeRefreshParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -255,10 +259,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_list_models(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeListModelsParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -348,10 +353,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_thread_binding_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeThreadBindingGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -447,10 +453,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_thread_compact(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeThreadCompactParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(_workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -479,10 +486,11 @@ impl MessageProcessor {
     // decision wires native Codex archive semantics explicitly.
     pub(super) fn cli_runtime_thread_fork<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        request_context: &'a RequestContext,
         request_id: RequestId,
         params: CLIRuntimeThreadForkParams,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = request_context.connection_id();
         message_future(async move {
             let Some(workspace_id) = self
                 .validate_cli_runtime_workspace(
@@ -796,7 +804,7 @@ impl MessageProcessor {
 
             if let Err(error) = self
                 .crud_store
-                .upsert_thread_model(&outcome.response.thread)
+                .upsert_thread_model(&outcome.response.thread, request_context.persisted_actor())
                 .await
             {
                 self.send_error(
@@ -915,10 +923,11 @@ impl MessageProcessor {
 
     pub(super) fn cli_runtime_turn_steer<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        request_context: &'a RequestContext,
         request_id: RequestId,
         params: CLIRuntimeTurnSteerParams,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = request_context.connection_id();
         message_future(async move {
             let Some(workspace_id) = self
                 .validate_cli_runtime_workspace(
@@ -1204,10 +1213,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_review_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeReviewStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(_workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1234,10 +1244,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_login_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeLoginStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1320,10 +1331,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_login_cancel(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeLoginCancelParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1396,10 +1408,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_proxy_set(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeProxySetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1479,10 +1492,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_proxy_delete(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeProxyDeleteParams,
     ) {
+        let connection_id = request_context.connection_id();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1538,10 +1552,11 @@ impl MessageProcessor {
 
     pub(super) async fn cli_runtime_request_respond(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: CLIRuntimeRequestRespondParams,
     ) {
+        let connection_id = request_context.connection_id();
         let resolution = params.resolution.clone();
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(

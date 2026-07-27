@@ -17,6 +17,7 @@ mod database;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod identity;
 mod keep_awake;
 mod mcp_secrets;
 mod mcp_service;
@@ -27,6 +28,7 @@ mod message;
 mod operations;
 mod permissions;
 mod prompt_hooks;
+mod request_context;
 mod resilience;
 mod secrets;
 mod self_improvement;
@@ -78,6 +80,7 @@ use crate::auth::initialize as initialize_jwt_auth;
 use crate::auth::issue_superuser_token as issue_superuser_token_internal;
 use crate::bootstrap::bootstrap as run_bootstrap;
 use crate::database::initialize as initialize_database;
+use crate::identity::bootstrap_identity;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::message::now_timestamp_secs;
@@ -113,12 +116,17 @@ pub use crate::settings::{
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
 
-fn start_voice_input_supervisor(
+fn create_voice_input_supervisor(
     installer: Arc<dyn VoiceModelInstaller>,
     engine_loader: Arc<dyn VoiceEngineLoader>,
+) -> Arc<VoiceInputSupervisor> {
+    Arc::new(VoiceInputSupervisor::new(installer, engine_loader))
+}
+
+fn start_voice_input_supervisor(
+    supervisor: &Arc<VoiceInputSupervisor>,
     desired: VoiceInputDesiredState,
-) -> Result<Arc<VoiceInputSupervisor>> {
-    let supervisor = Arc::new(VoiceInputSupervisor::new(installer, engine_loader));
+) -> Result<()> {
     let applied = supervisor
         .apply_desired(desired, false)
         .context("failed to apply persisted Voice Input settings")?;
@@ -128,7 +136,7 @@ fn start_voice_input_supervisor(
             worker.reconcile(reconcile).await;
         });
     }
-    Ok(supervisor)
+    Ok(())
 }
 
 pub async fn run_gateway_until_shutdown() -> Result<()> {
@@ -153,26 +161,43 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         voice_model_count = voice_models.len(),
         "local voice model catalog is ready"
     );
-    let voice_input_supervisor = start_voice_input_supervisor(
+    let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
+    let jwt_material = gateway_secrets
+        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
+    let database = initialize_database(&runtime_home, &config).await?;
+
+    run_bootstrap(&database).await?;
+    let identity_bootstrap = bootstrap_identity(&database)
+        .await
+        .context("failed to bootstrap stable Gateway identity")?;
+    info!(
+        gateway_created = identity_bootstrap.gateway_created,
+        superuser_created = identity_bootstrap.superuser_created,
+        bootstrap_version = identity_bootstrap
+            .snapshot
+            .gateway
+            .identity_bootstrap_version,
+        principal_threads_backfilled = identity_bootstrap.backfill_counts.principal_threads,
+        system_threads_backfilled = identity_bootstrap.backfill_counts.system_threads,
+        principal_turns_backfilled = identity_bootstrap.backfill_counts.principal_turns,
+        system_turns_backfilled = identity_bootstrap.backfill_counts.system_turns,
+        "stable Gateway identity is ready"
+    );
+    let identity_snapshot = Arc::new(identity_bootstrap.snapshot);
+    let auth = initialize_jwt_auth(&config, jwt_material.as_slice(), identity_snapshot)?;
+
+    let voice_input_desired_state = VoiceInputDesiredState::from_config(&config.gateway.voice);
+    let voice_input_supervisor = create_voice_input_supervisor(
         Arc::new(FilesystemVoiceModelInstaller::new(
             config.clone(),
             runtime_home.clone(),
         )),
         Arc::new(EagerVoiceEngineLoader),
-        VoiceInputDesiredState::from_config(&config.gateway.voice),
-    )?;
-    let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
+    );
     let remote_access_supervisor = Arc::new(RemoteAccessSupervisor::new(
         runtime_home.as_path(),
         config.gateway.remote_access.clone(),
     )?);
-    let jwt_material = gateway_secrets
-        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
-    let auth = initialize_jwt_auth(&config, jwt_material.as_slice())?;
-    let database = initialize_database(&runtime_home, &config).await?;
-
-    run_bootstrap(&database).await?;
-
     let session_manager = Arc::new(SessionManager::new());
     let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
     let crud_store = Arc::new(CrudStore::new(database.clone()));
@@ -570,16 +595,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.apply_thread_episodic_workspace_vector_search_configs(
         thread_episodic_workspace_vector_search_configs.clone(),
     );
-    message_processor = message_processor.with_voice_input_supervisor(voice_input_supervisor);
+    message_processor =
+        message_processor.with_voice_input_supervisor(voice_input_supervisor.clone());
     message_processor =
         message_processor.with_self_improvement_supervisor(self_improvement_supervisor.clone());
     message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);
-    message_processor.start_remote_access_status_notifications();
-    message_processor.start_voice_input_status_notifications();
-    message_processor.start_thread_episodic_vector_refill_status_notifications();
-
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
         .context("failed to apply gateway keepawake setting")?;
@@ -591,18 +613,21 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor
         .cleanup_stale_skill_uploads(now_timestamp_secs())
         .await;
-    message_processor.start_resilience_workers().await;
-    message_processor.start_mcp_workspace_supervisor().await;
-
     let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
     let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
     let runtime_result: Result<()> = async {
+        start_voice_input_supervisor(&voice_input_supervisor, voice_input_desired_state)?;
         self_improvement_supervisor
             .start()
             .await
             .context("failed to start self-improvement supervisor")?;
+        message_processor.start_remote_access_status_notifications();
+        message_processor.start_voice_input_status_notifications();
+        message_processor.start_thread_episodic_vector_refill_status_notifications();
+        message_processor.start_resilience_workers().await;
+        message_processor.start_mcp_workspace_supervisor().await;
         message_processor.start_skills_watcher().await;
         // Long-running migrations and backfills start only after the Gateway listener exists.
         database::startup::spawn(
@@ -1014,9 +1039,10 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execution_windows_config_from_gateway_tools_config, expand_home_directory_templates,
-        memory_loop_config_from_gateway_memory_config, parse_skill_trust_level,
-        start_voice_input_supervisor, task_runtime_config_from_gateway_tasks_config,
+        create_voice_input_supervisor, execution_windows_config_from_gateway_tools_config,
+        expand_home_directory_templates, memory_loop_config_from_gateway_memory_config,
+        parse_skill_trust_level, start_voice_input_supervisor,
+        task_runtime_config_from_gateway_tasks_config,
         thread_episodic_runtime_config_from_gateway_settings,
     };
     use crate::secrets::GatewaySecrets;
@@ -1117,12 +1143,10 @@ mod tests {
     #[tokio::test]
     async fn voice_startup_disabled() {
         let installer = Arc::new(StartupProbeInstaller::new());
-        let supervisor = start_voice_input_supervisor(
-            installer.clone(),
-            Arc::new(StartupProbeEngineLoader),
-            VoiceInputDesiredState::default(),
-        )
-        .expect("disabled startup");
+        let supervisor =
+            create_voice_input_supervisor(installer.clone(), Arc::new(StartupProbeEngineLoader));
+        start_voice_input_supervisor(&supervisor, VoiceInputDesiredState::default())
+            .expect("disabled startup");
 
         tokio::task::yield_now().await;
 
@@ -1136,9 +1160,10 @@ mod tests {
     #[tokio::test]
     async fn voice_startup_selected() {
         let installer = Arc::new(StartupProbeInstaller::new());
-        let supervisor = start_voice_input_supervisor(
-            installer.clone(),
-            Arc::new(StartupProbeEngineLoader),
+        let supervisor =
+            create_voice_input_supervisor(installer.clone(), Arc::new(StartupProbeEngineLoader));
+        start_voice_input_supervisor(
+            &supervisor,
             VoiceInputDesiredState {
                 enabled: true,
                 provider: Some(GatewayVoiceInputProvider::Local),
@@ -1166,12 +1191,10 @@ mod tests {
         std::fs::write(legacy_install.join(".ready"), b"legacy").expect("legacy ready marker");
         let installer = Arc::new(StartupProbeInstaller::new());
 
-        let supervisor = start_voice_input_supervisor(
-            installer.clone(),
-            Arc::new(StartupProbeEngineLoader),
-            VoiceInputDesiredState::default(),
-        )
-        .expect("legacy-disabled startup");
+        let supervisor =
+            create_voice_input_supervisor(installer.clone(), Arc::new(StartupProbeEngineLoader));
+        start_voice_input_supervisor(&supervisor, VoiceInputDesiredState::default())
+            .expect("legacy-disabled startup");
         tokio::task::yield_now().await;
 
         assert!(legacy_install.exists());

@@ -144,10 +144,11 @@ impl ArtifactDownloadSessionManager {
 impl MessageProcessor {
     pub(crate) async fn artifact_download_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactDownloadStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -243,10 +244,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_download_chunk(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactDownloadChunkParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -374,10 +376,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_download_finish(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactDownloadFinishParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -429,10 +432,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_download_abort(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactDownloadAbortParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -694,7 +698,11 @@ mod tests {
     async fn artifact_download_chunk_frame_reaches_registered_connection() {
         let session_manager = SessionManager::new();
         let (tx, mut rx) = mpsc::channel(2);
-        let connection_id = session_manager.register_connection(tx).await;
+        let connection_id = crate::session::test_support::register_authenticated_test_connection(
+            &session_manager,
+            tx,
+        )
+        .await;
         let manager = ArtifactDownloadSessionManager::new();
         let session = manager
             .start(connection_id, snapshot("ws_a", "art_a", 5), 100)

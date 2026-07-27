@@ -235,6 +235,7 @@ impl MessageProcessor {
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
             )
             .await

@@ -2,23 +2,25 @@ use super::*;
 use anyhow::{Result, anyhow};
 use pioneer_memory::MemoryOperationContext;
 use pioneer_protocol::{
-    MemoryActor, MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse,
+    MemoryActor, MemoryActorKind, MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse,
     MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
     MemoryCandidatesEditAndApproveParams, MemoryCandidatesEditAndApproveResponse,
     MemoryCandidatesGetParams, MemoryCandidatesListParams, MemoryCandidatesMergeParams,
     MemoryCandidatesRejectParams, MemoryCandidatesSuppressSimilarParams, MemoryChangeKind,
     MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse,
-    MemoryForgottenNotification, MemoryGetParams, MemoryListParams, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScopeKind, MemorySearchParams, MemorySemanticWriteResponse,
+    MemoryForgottenNotification, MemoryGetParams, MemoryListParams, MemoryProvenance,
+    MemoryRememberParams, MemoryRememberResponse, MemoryScopeKind, MemorySearchParams,
+    MemorySemanticWriteResponse,
 };
 
 impl MessageProcessor {
     pub(super) async fn memory_search(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: MemorySearchParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.memory_context(connection_id, None).await {
             Ok(context) => context,
             Err(error) => {
@@ -58,10 +60,11 @@ impl MessageProcessor {
 
     pub(super) async fn memory_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: MemoryGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.memory_context(connection_id, None).await {
             Ok(context) => context,
             Err(error) => {
@@ -101,10 +104,11 @@ impl MessageProcessor {
 
     pub(super) async fn memory_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: MemoryListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.memory_context(connection_id, None).await {
             Ok(context) => context,
             Err(error) => {
@@ -144,11 +148,14 @@ impl MessageProcessor {
 
     pub(super) async fn memory_remember(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryRememberParams,
+        mut params: MemoryRememberParams,
     ) {
-        let context = match self.memory_context(connection_id, None).await {
+        let connection_id = request_context.connection_id();
+        let actor = authenticated_memory_request_actor(request_context);
+        bind_authenticated_memory_remember_actor(&mut params, actor.clone());
+        let context = match self.memory_context(connection_id, Some(actor)).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -195,10 +202,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_forget(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryForgetParams,
+        mut params: MemoryForgetParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -245,10 +254,11 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: MemoryCandidatesListParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.memory_context(connection_id, None).await {
             Ok(context) => context,
             Err(error) => {
@@ -293,10 +303,11 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: MemoryCandidatesGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let context = match self.memory_context(connection_id, None).await {
             Ok(context) => context,
             Err(error) => {
@@ -341,10 +352,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_decide(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesDecideParams,
+        mut params: MemoryCandidatesDecideParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -395,10 +408,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_approve(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesApproveParams,
+        mut params: MemoryCandidatesApproveParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -449,10 +464,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_reject(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesRejectParams,
+        mut params: MemoryCandidatesRejectParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -500,10 +517,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_edit_and_approve(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesEditAndApproveParams,
+        mut params: MemoryCandidatesEditAndApproveParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -559,10 +578,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_merge(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesMergeParams,
+        mut params: MemoryCandidatesMergeParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -610,10 +631,12 @@ impl MessageProcessor {
 
     pub(super) async fn memory_candidates_suppress_similar(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
-        params: MemoryCandidatesSuppressSimilarParams,
+        mut params: MemoryCandidatesSuppressSimilarParams,
     ) {
+        let connection_id = request_context.connection_id();
+        params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
             .memory_context(connection_id, params.actor.clone())
             .await
@@ -975,6 +998,30 @@ impl MessageProcessor {
     }
 }
 
+fn authenticated_memory_request_actor(_request_context: &RequestContext) -> MemoryActor {
+    // The legacy protocol field remains decodable for compatibility, but an
+    // RPC cannot choose its own actor kind or identifier. Epic 2 intentionally
+    // does not copy the stable PrincipalId into the pre-existing memory rows.
+    MemoryActor {
+        kind: MemoryActorKind::User,
+        id: None,
+    }
+}
+
+fn bind_authenticated_memory_remember_actor(params: &mut MemoryRememberParams, actor: MemoryActor) {
+    match params.provenance.as_mut() {
+        Some(provenance) => provenance.created_by = Some(actor),
+        None => {
+            params.provenance = Some(MemoryProvenance {
+                source_thread_id: None,
+                source_turn_id: None,
+                source_item_id: None,
+                created_by: Some(actor),
+            });
+        }
+    }
+}
+
 fn is_memory_client_error(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("cannot be empty")
@@ -984,4 +1031,75 @@ fn is_memory_client_error(error: &str) -> bool {
         || normalized.contains("not pending")
         || normalized.contains("must not")
         || normalized.contains("must be")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{authenticated_memory_request_actor, bind_authenticated_memory_remember_actor};
+    use crate::request_context::{CanonicalMethod, ConnectionContext, RequestContext};
+    use crate::session::test_support::authenticated_test_superuser;
+    use pioneer_protocol::{
+        MemoryActor, MemoryActorKind, MemoryCategory, MemoryProvenance, MemoryRememberParams,
+        MemoryScope, MemoryScopeKind, RequestId,
+    };
+
+    #[test]
+    fn rpc_memory_actor_is_server_derived_and_contains_no_client_identifier() {
+        let connection = ConnectionContext::new(17, authenticated_test_superuser());
+        let context = RequestContext::new(
+            &connection,
+            Some(RequestId::new("R00000000000000000001").expect("request id")),
+            CanonicalMethod::rpc("memory/candidates/decide"),
+        );
+
+        let actor = authenticated_memory_request_actor(&context);
+
+        assert_eq!(actor.kind, MemoryActorKind::User);
+        assert_eq!(actor.id, None);
+    }
+
+    #[test]
+    fn memory_remember_preserves_source_refs_but_replaces_client_created_by() {
+        let mut params = MemoryRememberParams {
+            scope: MemoryScope {
+                kind: MemoryScopeKind::Workspace,
+                key: "workspace".to_owned(),
+            },
+            category: MemoryCategory::ProjectFact,
+            namespace: None,
+            key: None,
+            content: "remember me".to_owned(),
+            sensitivity: None,
+            confidence: None,
+            importance: None,
+            provenance: Some(MemoryProvenance {
+                source_thread_id: Some("source-thread".to_owned()),
+                source_turn_id: Some("source-turn".to_owned()),
+                source_item_id: Some("source-item".to_owned()),
+                created_by: Some(MemoryActor {
+                    kind: MemoryActorKind::System,
+                    id: Some("client-controlled-id".to_owned()),
+                }),
+            }),
+            source_context_kind: None,
+            idempotency_key: None,
+            supersedes: None,
+            metadata: Default::default(),
+        };
+        let server_actor = MemoryActor {
+            kind: MemoryActorKind::User,
+            id: None,
+        };
+
+        bind_authenticated_memory_remember_actor(&mut params, server_actor.clone());
+
+        let provenance = params.provenance.expect("server-owned provenance");
+        assert_eq!(
+            provenance.source_thread_id.as_deref(),
+            Some("source-thread")
+        );
+        assert_eq!(provenance.source_turn_id.as_deref(), Some("source-turn"));
+        assert_eq!(provenance.source_item_id.as_deref(), Some("source-item"));
+        assert_eq!(provenance.created_by, Some(server_actor));
+    }
 }

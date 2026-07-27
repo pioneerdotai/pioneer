@@ -261,7 +261,13 @@ mod tests {
             permission_profile: default_turn_permission_profile_snapshot(),
         };
         store
-            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
             .expect("turn start should persist");
 

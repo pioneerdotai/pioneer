@@ -14,10 +14,11 @@ const GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR: f32 = 0.02;
 impl MessageProcessor {
     pub(super) async fn voice_status(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: VoiceStatusParams,
     ) {
+        let connection_id = request_context.connection_id();
         if let Some(workspace_id) = params.workspace_id.as_deref()
             && workspace_id.trim().is_empty()
         {
@@ -71,10 +72,11 @@ impl MessageProcessor {
 
     pub(super) async fn voice_session_start(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: VoiceSessionStartParams,
     ) {
+        let connection_id = request_context.connection_id();
         if let Err(message) = validate_voice_start_params(&params) {
             self.send_error(
                 connection_id,
@@ -220,10 +222,12 @@ impl MessageProcessor {
 
     pub(super) async fn voice_session_finalize(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: VoiceSessionFinalizeParams,
     ) {
+        let connection_id = request_context.connection_id();
+        let request_actor = request_context.persisted_actor();
         if let Err(message) = validate_voice_finalize_params(&params) {
             self.send_error(
                 connection_id,
@@ -393,6 +397,7 @@ impl MessageProcessor {
                     self.composer_detached_task_start(
                         connection_id,
                         request_id,
+                        request_actor.clone(),
                         turn_params,
                         thread,
                         super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
@@ -413,6 +418,7 @@ impl MessageProcessor {
                             self.turn_start_cli_runtime(
                                 connection_id,
                                 request_id,
+                                request_actor,
                                 turn_params,
                                 runtime_id,
                                 runtime_kind,
@@ -450,6 +456,7 @@ impl MessageProcessor {
                 let prepared = match self
                     .prepare_api_provider_turn_start(
                         connection_id,
+                        request_actor,
                         turn_params,
                         requested_reasoning_effort.as_deref(),
                     )
@@ -540,10 +547,11 @@ impl MessageProcessor {
 
     pub(super) async fn voice_session_cancel(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: VoiceSessionCancelParams,
     ) {
+        let connection_id = request_context.connection_id();
         if params.session_id.trim().is_empty() {
             self.send_error(
                 connection_id,

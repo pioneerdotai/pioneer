@@ -9,11 +9,12 @@ use pioneer_protocol::{
 impl MessageProcessor {
     pub(crate) async fn artifact_list(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactListParams,
         method: &'static str,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -88,10 +89,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_get(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactGetParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -142,10 +144,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_bind(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactBindParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -211,10 +214,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_delete(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactDeleteParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -263,10 +267,11 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_restore(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         request_id: RequestId,
         params: ArtifactRestoreParams,
     ) {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,

@@ -570,6 +570,7 @@ impl TaskAgentExecutor {
                     &turn_outcome.materialization.turn,
                     &turn_outcome.materialization.input,
                     reasoning_effort.as_deref(),
+                    pioneer_protocol::PersistedActorRef::System,
                     profile_selected_audit,
                 ),
         )
@@ -1155,6 +1156,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
             )
             .await
@@ -2476,6 +2478,7 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
             )
             .await
@@ -3440,6 +3443,7 @@ async fn ensure_task_run_occurrence_turn(
             sandbox_mode,
             &occurrence_turn,
             &[],
+            pioneer_protocol::PersistedActorRef::System,
             profile_selected_audit,
         )
         .await

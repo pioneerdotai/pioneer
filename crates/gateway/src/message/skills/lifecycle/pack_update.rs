@@ -225,10 +225,11 @@ impl MessageProcessor {
 
     pub(crate) fn skills_pack_update<'a>(
         &'a self,
-        connection_id: ConnectionId,
+        request_context: &'a RequestContext,
         request_id: RequestId,
         params: SkillsPackUpdateParams,
     ) -> MessageFuture<'a, ()> {
+        let connection_id = request_context.connection_id();
         Box::pin(async move {
             let workspace_id = match self
                 .validate_skills_workspace(
