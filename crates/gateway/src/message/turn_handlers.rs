@@ -2963,7 +2963,13 @@ impl MessageProcessor {
             request_timeout_ms,
         } = prepared;
         let pioneer_turn_id = outcome.started_notification.turn.id.clone();
-        let mcp_metadata = match cli_session.prepare_mcp_turn(pioneer_turn_id.as_str()).await {
+        let mcp_metadata = match cli_session
+            .prepare_mcp_turn(
+                outcome.started_notification.thread_id.as_str(),
+                pioneer_turn_id.as_str(),
+            )
+            .await
+        {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.mark_turn_blocked(

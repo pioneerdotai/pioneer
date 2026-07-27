@@ -541,6 +541,7 @@ mod tests {
             .reserve_turn(
                 &attachment.bound_grant.grant_ref(),
                 reservation.generation,
+                "thread",
                 "turn",
             )
             .await

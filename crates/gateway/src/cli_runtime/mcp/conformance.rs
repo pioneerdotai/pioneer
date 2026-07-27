@@ -299,6 +299,7 @@ async fn run_single_bridge_conformance(
         .reserve_turn(
             &attachment.bound_grant.grant_ref(),
             reservation.generation,
+            "thread",
             "turn",
         )
         .await

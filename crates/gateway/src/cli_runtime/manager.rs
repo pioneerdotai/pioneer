@@ -244,6 +244,7 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
 
     async fn prepare_mcp_turn(
         &self,
+        _pioneer_thread_id: &str,
         _pioneer_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeMcpTurnMetadata>> {
         Ok(None)

@@ -4,14 +4,15 @@ use super::{
 };
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeManager, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
-    CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadCompactRequest,
-    CLIAgentRuntimeThreadCompactResult, CLIAgentRuntimeThreadForkRequest,
-    CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
-    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeThreadOpenParams,
-    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnObservation,
-    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
-    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeManager, CLIAgentRuntimeMcpTurnMetadata, CLIAgentRuntimeObservedTurnStatus,
+    CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
+    CLIAgentRuntimeThreadCompactRequest, CLIAgentRuntimeThreadCompactResult,
+    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
+    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
+    CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
+    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
+    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeTurnSteerResult,
 };
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
@@ -239,6 +240,7 @@ struct RecordingCliRuntimeSession {
     turn_steers: TokioMutex<Vec<CLIAgentRuntimeTurnSteerRequest>>,
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
+    mcp_preparations: TokioMutex<Vec<(String, String)>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     goal_resets: TokioMutex<Vec<String>>,
     goal_clears: TokioMutex<Vec<String>>,
@@ -339,6 +341,18 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
                 }
             }),
         })
+    }
+
+    async fn prepare_mcp_turn(
+        &self,
+        pioneer_thread_id: &str,
+        pioneer_turn_id: &str,
+    ) -> anyhow::Result<Option<CLIAgentRuntimeMcpTurnMetadata>> {
+        self.mcp_preparations
+            .lock()
+            .await
+            .push((pioneer_thread_id.to_owned(), pioneer_turn_id.to_owned()));
+        Ok(None)
     }
 
     async fn retarget_mcp_turn(
@@ -16505,6 +16519,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
             starts.len(),
             1,
             "{runtime_id} Task must dispatch exactly one native turn"
+        );
+        assert_eq!(
+            cli_session.mcp_preparations.lock().await.as_slice(),
+            [(
+                lineage.child_thread_id.clone(),
+                lineage.child_turn_id.clone()
+            )],
+            "{runtime_id} MCP lease must use the executing child identity, not the parent continuation"
         );
         let native_start = &starts[0];
         assert_eq!(native_start.model.as_deref(), Some(model));

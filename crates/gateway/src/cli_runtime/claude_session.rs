@@ -433,7 +433,11 @@ impl ClaudeRequiredMcpBridge {
         self.supervisor.revoke_session(&self.process_instance).await;
     }
 
-    async fn prepare_turn(&self, pioneer_turn_id: &str) -> Result<CLIAgentRuntimeMcpTurnMetadata> {
+    async fn prepare_turn(
+        &self,
+        pioneer_thread_id: &str,
+        pioneer_turn_id: &str,
+    ) -> Result<CLIAgentRuntimeMcpTurnMetadata> {
         self.ensure_ready(Duration::from_secs(30)).await?;
         let mut state = self.state.lock().await;
         let ClaudeRequiredMcpBridgeState::Ready { active_turn, .. } = &mut *state else {
@@ -448,6 +452,7 @@ impl ClaudeRequiredMcpBridge {
             .reserve_turn(
                 self.launch.grant_ref(),
                 self.projection_generation,
+                pioneer_thread_id,
                 pioneer_turn_id,
             )
             .await
@@ -1736,13 +1741,17 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
 
     async fn prepare_mcp_turn(
         &self,
+        pioneer_thread_id: &str,
         pioneer_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeMcpTurnMetadata>> {
         self.client
             .wait_turn_preparation_barrier(self.request_timeout)
             .await?;
         match self.required_mcp_bridge.as_ref() {
-            Some(bridge) => bridge.prepare_turn(pioneer_turn_id).await.map(Some),
+            Some(bridge) => bridge
+                .prepare_turn(pioneer_thread_id, pioneer_turn_id)
+                .await
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -3815,7 +3824,7 @@ mod tests {
             "one-use bootstrap must be gone before turn preparation"
         );
         required
-            .prepare_turn("pioneer-turn")
+            .prepare_turn("pioneer-thread", "pioneer-turn")
             .await
             .expect("turn reservation after readiness");
         required
@@ -3930,7 +3939,7 @@ mod tests {
         let provider_session_id =
             uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000041").expect("UUID");
         required
-            .prepare_turn("pioneer-turn")
+            .prepare_turn("pioneer-thread", "pioneer-turn")
             .await
             .expect("turn reservation");
         required

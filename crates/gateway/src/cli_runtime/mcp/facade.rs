@@ -920,6 +920,7 @@ impl CliMcpToolFacade {
                 name,
                 arguments,
                 progress_token,
+                authorization.thread_id,
                 authorization.turn_id,
                 cancellation,
             )
@@ -936,6 +937,7 @@ impl CliMcpToolFacade {
         name: &str,
         arguments: JsonValue,
         progress_token: Option<JsonValue>,
+        thread_id: String,
         turn_id: String,
         cancellation: CancellationToken,
     ) -> Result<JsonValue, FacadeProtocolError> {
@@ -971,7 +973,7 @@ impl CliMcpToolFacade {
         let process_instance = &context.bound_grant.scope().process_instance;
         let invocation = TurnMcpInvocation {
             workspace_id: process_instance.key().workspace_id.clone(),
-            thread_id: process_instance.key().thread_id.clone(),
+            thread_id,
             turn_id,
             runtime_id: Some(process_instance.key().runtime_id.clone()),
             session_generation: Some(process_instance.generation()),
@@ -1586,6 +1588,7 @@ mod tests {
 
     struct RecordingInvoker {
         calls: AtomicUsize,
+        invocations: std::sync::Mutex<Vec<TurnMcpInvocation>>,
         result: CanonicalMcpToolResult,
     }
 
@@ -1613,10 +1616,14 @@ mod tests {
     impl TurnMcpInvoker for RecordingInvoker {
         async fn invoke(
             &self,
-            _invocation: TurnMcpInvocation,
+            invocation: TurnMcpInvocation,
             _cancellation: CancellationToken,
         ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.invocations
+                .lock()
+                .expect("recording invoker should not be poisoned")
+                .push(invocation);
             Ok(self.result.clone())
         }
     }
@@ -1663,6 +1670,7 @@ mod tests {
     ) {
         let invoker = Arc::new(RecordingInvoker {
             calls: AtomicUsize::new(0),
+            invocations: std::sync::Mutex::new(Vec::new()),
             result,
         });
         let (facade, context, coordinator) =
@@ -1754,6 +1762,7 @@ mod tests {
             .reserve_turn(
                 &context.bound_grant.grant_ref(),
                 context.projection_generation,
+                "thread",
                 turn_id,
             )
             .await
@@ -1903,6 +1912,7 @@ mod tests {
             .reserve_turn(
                 &context.bound_grant.grant_ref(),
                 context.projection_generation,
+                "thread",
                 "turn",
             )
             .await
@@ -1940,6 +1950,65 @@ mod tests {
             .await
             .expect("active list");
         assert_eq!(active_list["result"], preparing_list["result"]);
+    }
+
+    #[tokio::test]
+    async fn cli_mcp_tools_call_uses_executing_child_thread_not_continuation_session_thread() {
+        let (facade, invoker, mut context, coordinator) = fixture(
+            vec![fixture_tool("read")],
+            basic_result(json!([{"type": "text", "text": "child-ok"}])),
+        )
+        .await;
+        initialize(&facade, &context).await;
+        facade
+            .handle_message(
+                &context,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            )
+            .await
+            .expect("list");
+        let turn = coordinator
+            .reserve_turn(
+                &context.bound_grant.grant_ref(),
+                context.projection_generation,
+                "detached-child-thread",
+                "detached-child-turn",
+            )
+            .await
+            .expect("detached child turn");
+        coordinator
+            .activate_turn(
+                &context.bound_grant,
+                turn.activation_generation,
+                "native-continuation-thread",
+                "native-child-turn",
+            )
+            .await
+            .expect("activate detached child");
+        context.activation_generation = Some(turn.activation_generation);
+
+        let response = facade
+            .handle_message(
+                &context,
+                json!({
+                    "jsonrpc": "2.0", "id": "child-call", "method": "tools/call",
+                    "params": {"name": "read", "arguments": {}}
+                }),
+            )
+            .await
+            .expect("child call");
+        assert_eq!(response["result"]["content"][0]["text"], "child-ok");
+        let invocations = invoker
+            .invocations
+            .lock()
+            .expect("recording invoker should not be poisoned");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].thread_id, "detached-child-thread");
+        assert_eq!(invocations[0].turn_id, "detached-child-turn");
+        assert_ne!(
+            invocations[0].thread_id,
+            context.bound_grant.scope().process_instance.key().thread_id
+        );
     }
 
     #[tokio::test]
@@ -2025,6 +2094,7 @@ mod tests {
     async fn cli_mcp_limits_reject_frame_before_json_allocation() {
         let invoker = Arc::new(RecordingInvoker {
             calls: AtomicUsize::new(0),
+            invocations: std::sync::Mutex::new(Vec::new()),
             result: basic_result(json!([])),
         });
         let mut limits = CliMcpFacadeLimits::default();

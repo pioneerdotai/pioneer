@@ -951,7 +951,11 @@ impl CodexRequiredMcpBridge {
         self.native_items.callable(&key)
     }
 
-    async fn prepare_turn(&self, pioneer_turn_id: &str) -> Result<CLIAgentRuntimeMcpTurnMetadata> {
+    async fn prepare_turn(
+        &self,
+        pioneer_thread_id: &str,
+        pioneer_turn_id: &str,
+    ) -> Result<CLIAgentRuntimeMcpTurnMetadata> {
         self.ensure_ready(Duration::from_secs(30)).await?;
         let mut state = self.state.lock().await;
         let CodexRequiredMcpBridgeState::Ready {
@@ -972,6 +976,7 @@ impl CodexRequiredMcpBridge {
             .reserve_turn(
                 self.launch.grant_ref(),
                 self.projection_generation,
+                pioneer_thread_id,
                 pioneer_turn_id,
             )
             .await
@@ -2092,12 +2097,16 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
 
     async fn prepare_mcp_turn(
         &self,
+        pioneer_thread_id: &str,
         pioneer_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeMcpTurnMetadata>> {
         let Some(bridge) = self.required_mcp_bridge.as_ref() else {
             return Ok(None);
         };
-        bridge.prepare_turn(pioneer_turn_id).await.map(Some)
+        bridge
+            .prepare_turn(pioneer_thread_id, pioneer_turn_id)
+            .await
+            .map(Some)
     }
 
     async fn activate_mcp_turn(
@@ -3203,7 +3212,7 @@ mod tests {
             .expect("exact list and native thread must complete barrier");
 
         required_bridge
-            .prepare_turn("pioneer-turn")
+            .prepare_turn("pioneer-thread", "pioneer-turn")
             .await
             .expect("reserve exact MCP turn");
         required_bridge

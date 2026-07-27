@@ -114,6 +114,7 @@ pub(crate) struct CliMcpCallAuthorization {
     pub(crate) projection_generation: CliMcpProjectionGeneration,
     pub(crate) activation_generation: CliMcpActivationGeneration,
     pub(crate) fingerprint: CliMcpProjectionFingerprint,
+    pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) native_thread_id: String,
     pub(crate) native_turn_id: String,
@@ -128,6 +129,7 @@ impl fmt::Debug for CliMcpCallAuthorization {
             .field("projection_generation", &self.projection_generation)
             .field("activation_generation", &self.activation_generation)
             .field("fingerprint", &self.fingerprint)
+            .field("thread_id", &self.thread_id)
             .field("turn_id", &self.turn_id)
             .field("native_thread_id", &self.native_thread_id)
             .field("native_turn_id", &self.native_turn_id)
@@ -142,6 +144,7 @@ impl PartialEq for CliMcpCallAuthorization {
             && self.projection_generation == other.projection_generation
             && self.activation_generation == other.activation_generation
             && self.fingerprint == other.fingerprint
+            && self.thread_id == other.thread_id
             && self.turn_id == other.turn_id
             && self.native_thread_id == other.native_thread_id
             && self.native_turn_id == other.native_turn_id
@@ -165,6 +168,7 @@ struct CliMcpActiveTurn {
     process_instance: CliSessionInstanceId,
     projection_generation: CliMcpProjectionGeneration,
     activation_generation: CliMcpActivationGeneration,
+    thread_id: String,
     turn_id: String,
     native_thread_id: Option<String>,
     native_turn_id: Option<String>,
@@ -272,8 +276,10 @@ impl CliMcpCoordinator {
         &self,
         grant_ref: &CliMcpGrantRef,
         projection_generation: CliMcpProjectionGeneration,
+        thread_id: impl Into<String>,
         turn_id: impl Into<String>,
     ) -> Result<CliMcpTurnReservation, CliMcpCoordinatorError> {
+        let thread_id = normalize_identity(thread_id.into())?;
         let turn_id = normalize_identity(turn_id.into())?;
         let mut state = self.state.lock().await;
         state.grants.validate_ref(grant_ref, now_unix_ms())?;
@@ -302,6 +308,7 @@ impl CliMcpCoordinator {
                 process_instance: grant_ref.scope().process_instance.clone(),
                 projection_generation,
                 activation_generation,
+                thread_id,
                 turn_id,
                 native_thread_id: None,
                 native_turn_id: None,
@@ -475,6 +482,7 @@ impl CliMcpCoordinator {
             projection_generation: projection.generation,
             activation_generation: turn.activation_generation,
             fingerprint: projection.fingerprint.clone(),
+            thread_id: turn.thread_id.clone(),
             turn_id: turn.turn_id.clone(),
             native_thread_id: turn
                 .native_thread_id
@@ -781,7 +789,12 @@ mod tests {
             .await
             .expect("projection");
         let turn = coordinator
-            .reserve_turn(&grant_ref, projection.generation, "turn-1")
+            .reserve_turn(
+                &grant_ref,
+                projection.generation,
+                "pioneer-thread-1",
+                "turn-1",
+            )
             .await
             .expect("turn");
         let bound = coordinator
@@ -843,6 +856,7 @@ mod tests {
             .authorize_call(&bound, turn.activation_generation)
             .await
             .expect("active call");
+        assert_eq!(authorization.thread_id, "pioneer-thread-1");
         assert_eq!(authorization.turn_id, "turn-1");
         assert_eq!(authorization.native_turn_id, "native-turn-staged");
 
@@ -974,7 +988,12 @@ mod tests {
             .await
             .expect("projection");
         let turn = coordinator
-            .reserve_turn(&grant_ref, projection.generation, "turn-1")
+            .reserve_turn(
+                &grant_ref,
+                projection.generation,
+                "pioneer-thread-1",
+                "turn-1",
+            )
             .await
             .expect("turn");
         let bound = coordinator
