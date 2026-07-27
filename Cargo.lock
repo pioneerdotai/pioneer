@@ -8534,7 +8534,6 @@ version = "0.35.0"
 dependencies = [
  "anyhow",
  "pioneer-entity",
- "pioneer-observability",
  "pioneer-sqlite",
  "sea-orm-migration",
  "tokio",

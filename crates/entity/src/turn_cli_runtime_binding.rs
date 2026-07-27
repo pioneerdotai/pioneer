@@ -10,7 +10,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub turn_id: String,
     pub thread_id: String,
-    pub continuation_thread_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
     pub runtime_kind: String,
@@ -48,6 +47,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub native_goal_turn_id: Option<String>,
     pub native_goal_observed_at: Option<DateTimeWithTimeZone>,
+    pub continuation_thread_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

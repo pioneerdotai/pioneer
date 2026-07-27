@@ -33,6 +33,8 @@ pub struct Model {
     pub execution_security_snapshot_version: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_security_snapshot_json: Option<String>,
+    pub initiated_by_actor_id: Option<String>,
+    pub initiated_by_actor_kind: Option<String>,
     #[sea_orm(has_one)]
     pub turn_cli_runtime_instruction: HasOne<super::turn_cli_runtime_instruction::Entity>,
     #[sea_orm(has_one)]

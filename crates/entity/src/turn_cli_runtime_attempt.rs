@@ -36,6 +36,9 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub recovery_confirmed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(has_many)]
+    pub turn_cli_runtime_execution_segments:
+        HasMany<super::turn_cli_runtime_execution_segment::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

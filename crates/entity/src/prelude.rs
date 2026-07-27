@@ -19,6 +19,8 @@ pub use super::artifact_upload_session::Entity as ArtifactUploadSession;
 pub use super::artifact_version::Entity as ArtifactVersion;
 pub use super::cli_runtime_native_event::Entity as CliRuntimeNativeEvent;
 pub use super::cli_runtime_pending_request::Entity as CliRuntimePendingRequest;
+pub use super::gateway_identity::Entity as GatewayIdentity;
+pub use super::gateway_principal::Entity as GatewayPrincipal;
 pub use super::hook_audit_event::Entity as HookAuditEvent;
 pub use super::hook_run::Entity as HookRun;
 pub use super::hook_run_attempt::Entity as HookRunAttempt;

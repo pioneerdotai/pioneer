@@ -26,6 +26,8 @@ pub struct Model {
     pub summary_turn_count: Option<i64>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub created_by_actor_id: Option<String>,
+    pub created_by_actor_kind: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

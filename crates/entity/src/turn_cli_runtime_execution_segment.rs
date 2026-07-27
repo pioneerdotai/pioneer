@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     #[sea_orm(unique_key = "uidx_turn_cli_runtime_execution_segment_attempt_index")]
     pub attempt_id: String,
+    #[sea_orm(unique)]
     pub turn_id: String,
     #[sea_orm(unique_key = "uidx_turn_cli_runtime_execution_segment_attempt_index")]
     pub segment_index: i64,
@@ -30,6 +31,14 @@ pub struct Model {
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(
+        belongs_to,
+        from = "attempt_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "Cascade"
+    )]
+    pub turn_cli_runtime_attempt: HasOne<super::turn_cli_runtime_attempt::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

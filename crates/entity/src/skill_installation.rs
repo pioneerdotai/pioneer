@@ -22,8 +22,13 @@ pub struct Model {
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(unique_key = "uq_skill_installation_pack_member_key")]
     pub pack_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uq_skill_installation_pack_member_key"
+    )]
     pub pack_member_key: Option<String>,
     #[sea_orm(
         belongs_to,
@@ -32,7 +37,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub pack: HasOne<super::skill_pack_installation::Entity>,
+    pub skill_pack_installation: HasOne<super::skill_pack_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

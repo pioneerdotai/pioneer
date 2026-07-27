@@ -15,6 +15,14 @@ pub struct Model {
     pub is_current: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_many)]
+    pub agent_skills: HasMany<super::agent_skill::Entity>,
+    #[sea_orm(has_many)]
+    pub self_improvement_runs: HasMany<super::self_improvement_run::Entity>,
+    #[sea_orm(has_many)]
+    pub self_improvement_source_turns: HasMany<super::self_improvement_source_turn::Entity>,
+    #[sea_orm(has_one)]
+    pub self_improvement_workspace_state: HasOne<super::self_improvement_workspace_state::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

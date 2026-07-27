@@ -5,20 +5,17 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "skill_pack_installation")]
+#[sea_orm(table_name = "gateway_identity")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub name: String,
-    #[sea_orm(column_type = "Text")]
-    pub scope_key: String,
-    #[sea_orm(column_type = "Text")]
-    pub source_kind: String,
+    #[sea_orm(unique)]
+    pub singleton_key: i64,
+    pub identity_bootstrap_version: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(has_many)]
-    pub skill_installations: HasMany<super::skill_installation::Entity>,
+    #[sea_orm(has_one)]
+    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -5,23 +5,30 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "self_improvement_workspace_state")]
+#[sea_orm(table_name = "gateway_principal")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub workspace_id: String,
-    pub activation_epoch: i64,
-    pub cursor_source_id: i64,
-    pub effective_enabled_at: Option<DateTimeWithTimeZone>,
+    pub id: String,
+    #[sea_orm(unique)]
+    pub gateway_id: String,
+    pub kind: String,
+    pub role_key: Option<String>,
+    pub status: String,
+    pub display_name: String,
+    pub nickname: String,
+    #[sea_orm(unique_key = "idx_gateway_principal_nickname")]
+    pub nickname_key: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub removed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         belongs_to,
-        from = "workspace_id",
+        from = "gateway_id",
         to = "id",
         on_update = "NoAction",
-        on_delete = "Cascade"
+        on_delete = "Restrict"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub gateway_identity: HasOne<super::gateway_identity::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

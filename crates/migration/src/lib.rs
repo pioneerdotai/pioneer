@@ -33,6 +33,7 @@ mod m20260720_000002_stable_skill_id;
 mod m20260721_000001_skill_pack_installation;
 mod m20260724_000001_cli_runtime_continuation_owner;
 mod m20260726_000001_self_improvement_core;
+mod m20260726_000002_gateway_identity_foundation;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -67,6 +68,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260721_000001_skill_pack_installation::Migration),
             Box::new(m20260724_000001_cli_runtime_continuation_owner::Migration),
             Box::new(m20260726_000001_self_improvement_core::Migration),
+            Box::new(m20260726_000002_gateway_identity_foundation::Migration),
         ]
     }
 }

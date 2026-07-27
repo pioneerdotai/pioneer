@@ -21,6 +21,8 @@ pub mod artifact_upload_session;
 pub mod artifact_version;
 pub mod cli_runtime_native_event;
 pub mod cli_runtime_pending_request;
+pub mod gateway_identity;
+pub mod gateway_principal;
 pub mod hook_audit_event;
 pub mod hook_run;
 pub mod hook_run_attempt;
