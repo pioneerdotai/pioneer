@@ -39,6 +39,10 @@ impl ToolRetryBudgetConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolRetryClassBudget {
     pub error_class: ToolErrorClass,
+    /// Maximum retries for one failure signature in this error class.
+    ///
+    /// Different invocations must not exhaust each other's retry budget merely
+    /// because they share a broad error class such as `ExecutionFailed`.
     pub max_retries: u32,
 }
 
@@ -387,7 +391,6 @@ pub struct ToolRetryBudgetSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolRetryEpisodeState {
     pub total_retry_rounds: u32,
-    pub by_class: HashMap<ToolErrorClass, u32>,
     pub by_tool_name: HashMap<String, u32>,
     pub by_failure_signature: HashMap<ToolFailureSignature, u32>,
 }
@@ -469,17 +472,16 @@ impl ToolRetryController {
             return self.exhausted_and_close(entries, reason);
         }
 
-        let mut projected_by_class = episode.by_class.clone();
         let mut projected_by_tool_name = episode.by_tool_name.clone();
         let mut projected_by_failure_signature = episode.by_failure_signature.clone();
 
         for candidate in &candidates {
-            let class_limit = self.class_limit(candidate.error_class);
-            let class_next = projected_by_class
-                .get(&candidate.error_class)
+            let signature_used = projected_by_failure_signature
+                .get(&candidate.signature)
                 .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+                .unwrap_or(0);
+            let class_limit = self.class_limit(candidate.error_class);
+            let class_next = signature_used.saturating_add(1);
             if class_next > class_limit {
                 let reason = ToolRetryExhaustionReason::ErrorClass {
                     error_class: candidate.error_class,
@@ -488,7 +490,6 @@ impl ToolRetryController {
                 };
                 return self.exhausted_and_close(entries, reason);
             }
-            projected_by_class.insert(candidate.error_class, class_next);
 
             let tool_next = projected_by_tool_name
                 .get(candidate.tool_name.as_str())
@@ -505,11 +506,7 @@ impl ToolRetryController {
             }
             projected_by_tool_name.insert(candidate.tool_name.clone(), tool_next);
 
-            let signature_next = projected_by_failure_signature
-                .get(&candidate.signature)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+            let signature_next = signature_used.saturating_add(1);
             if signature_next > self.budget.max_same_tool_error_retries_per_episode {
                 let reason = ToolRetryExhaustionReason::FailureSignature {
                     signature: candidate.signature.clone(),
@@ -528,7 +525,6 @@ impl ToolRetryController {
                 .expect("retry episode must exist before consuming budget");
             episode.total_retry_rounds = episode.total_retry_rounds.saturating_add(1);
             for candidate in &candidates {
-                increment_class(&mut episode.by_class, candidate.error_class);
                 increment_string(&mut episode.by_tool_name, candidate.tool_name.as_str());
                 increment_signature(&mut episode.by_failure_signature, &candidate.signature);
             }
@@ -581,7 +577,7 @@ impl ToolRetryController {
             failure_signature_fingerprint: candidate.signature.arguments_fingerprint.clone(),
             episode_retry_used: episode.total_retry_rounds,
             episode_retry_limit: self.budget.max_recoverable_retry_rounds_per_episode,
-            class_retry_used: self.class_used(episode, candidate.error_class),
+            class_retry_used: self.signature_used(episode, &candidate.signature),
             class_retry_limit: self.class_limit(candidate.error_class),
             tool_retry_used: self.tool_used(episode, candidate.tool_name.as_str()),
             tool_retry_limit: self.budget.max_retries_per_tool_name_per_episode,
@@ -650,10 +646,6 @@ impl ToolRetryController {
 
     fn class_limit(&self, error_class: ToolErrorClass) -> u32 {
         self.class_limits.get(&error_class).copied().unwrap_or(1)
-    }
-
-    fn class_used(&self, episode: &ToolRetryEpisodeState, error_class: ToolErrorClass) -> u32 {
-        episode.by_class.get(&error_class).copied().unwrap_or(0)
     }
 
     fn tool_used(&self, episode: &ToolRetryEpisodeState, tool_name: &str) -> u32 {
@@ -737,11 +729,6 @@ impl RetryCandidate {
             self.attempt_number,
         )
     }
-}
-
-fn increment_class(map: &mut HashMap<ToolErrorClass, u32>, key: ToolErrorClass) {
-    let next = map.get(&key).copied().unwrap_or(0).saturating_add(1);
-    map.insert(key, next);
 }
 
 fn increment_string(map: &mut HashMap<String, u32>, key: &str) {
@@ -898,13 +885,6 @@ mod tests {
 
         let snapshot = active_episode(&controller);
         assert_eq!(snapshot.total_retry_rounds, 1);
-        assert_eq!(
-            snapshot
-                .by_class
-                .get(&ToolErrorClass::ExecutionFailed)
-                .copied(),
-            Some(1)
-        );
         assert_eq!(snapshot.by_tool_name.get("exec_command").copied(), Some(1));
         assert_eq!(snapshot.by_failure_signature.len(), 1);
     }
@@ -1174,16 +1154,11 @@ mod tests {
 
         let episode = active_episode(&controller);
         assert_eq!(episode.total_retry_rounds, 1);
-        assert!(
-            !episode
-                .by_class
-                .contains_key(&ToolErrorClass::PermissionDenied)
-        );
         assert!(!episode.by_tool_name.contains_key("read_file"));
     }
 
     #[test]
-    fn class_budget_exhaustion_returns_exhausted() {
+    fn class_budget_is_scoped_to_one_failure_signature() {
         let mut controller = ToolRetryController::with_class_budgets(
             ToolRetryBudgetConfig::default(),
             [ToolRetryClassBudget {
@@ -1192,15 +1167,31 @@ mod tests {
             }],
         );
 
-        retry_decision(&mut controller, ToolErrorClass::ExecutionFailed);
-        let decision = controller.decide(&[observation(
+        let first = controller.decide(&[observation(
+            "exec_command",
+            r#"{"command":["false"]}"#,
+            recoverable(ToolErrorClass::ExecutionFailed),
+        )]);
+        assert!(matches!(first, ToolRetryDecision::Retry { .. }));
+
+        let different_signature = controller.decide(&[observation(
+            "exec_command",
+            r#"{"command":["du","-sh","missing"]}"#,
+            recoverable(ToolErrorClass::ExecutionFailed),
+        )]);
+        assert!(
+            matches!(different_signature, ToolRetryDecision::Retry { .. }),
+            "an unrelated invocation must have its own class-specific retry budget"
+        );
+
+        let repeated_signature = controller.decide(&[observation(
             "exec_command",
             r#"{"command":["false"]}"#,
             recoverable(ToolErrorClass::ExecutionFailed),
         )]);
 
         assert!(matches!(
-            decision,
+            repeated_signature,
             ToolRetryDecision::Exhausted {
                 reason: ToolRetryExhaustionReason::ErrorClass {
                     error_class: ToolErrorClass::ExecutionFailed,
@@ -1211,6 +1202,44 @@ mod tests {
             }
         ));
         assert!(controller.state_snapshot().active_episode.is_none());
+    }
+
+    #[test]
+    fn production_regression_distinct_shell_failures_do_not_share_execution_failed_budget() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let commands = [
+            r#"{"command":["grep","-rn","debug","Cargo.toml"]}"#,
+            r#"{"command":["du","-sh","target"]}"#,
+            r#"{"command":["cargo","config","get","profile.dev.debug"]}"#,
+            r#"{"command":["cargo","config","get","profile.release.debug"]}"#,
+        ];
+
+        for (index, arguments) in commands.into_iter().enumerate() {
+            let decision = controller.decide(&[ToolRetryObservation::from_tool_outcome(
+                format!("shell_failure_{index}"),
+                "command_execution",
+                1,
+                "exec_command",
+                arguments,
+                false,
+                recoverable(ToolErrorClass::ExecutionFailed),
+            )]);
+            let ToolRetryDecision::Retry { prompt, .. } = decision else {
+                panic!("distinct shell failure {index} must remain retryable");
+            };
+            let ToolRetryPrompt::Retry { entries } = prompt else {
+                panic!("expected retry prompt for shell failure {index}");
+            };
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].class_retry_used, 1);
+            assert_eq!(entries[0].class_retry_limit, 2);
+            assert_eq!(entries[0].signature_retry_used, 1);
+        }
+
+        let episode = active_episode(&controller);
+        assert_eq!(episode.total_retry_rounds, 4);
+        assert_eq!(episode.by_failure_signature.len(), 4);
+        assert_eq!(episode.by_tool_name.get("exec_command"), Some(&4));
     }
 
     #[test]
@@ -1468,10 +1497,6 @@ mod tests {
         assert_eq!(entries[0].signature_retry_used, 1);
         let fresh_episode = active_episode(&controller);
         assert_eq!(fresh_episode.total_retry_rounds, 1);
-        assert_eq!(
-            fresh_episode.by_class.get(&ToolErrorClass::ExecutionFailed),
-            Some(&1)
-        );
         assert_eq!(fresh_episode.by_tool_name.get("web_fetch"), Some(&1));
         assert_eq!(fresh_episode.by_failure_signature.len(), 1);
     }

@@ -1999,6 +1999,7 @@ enum LoopBudgetProviderMode {
     TooManyToolsThenFinal,
     RepeatedMissingToolThenFinal,
     RepeatedMissingToolThenEmptyThenFinal,
+    DistinctMissingToolsThenFinal,
     RetryEpisodeResetThenFinal,
 }
 
@@ -2057,6 +2058,14 @@ impl LoopBudgetProvider {
             id: format!("call_loop_budget_{id}"),
             name: "missing_loop_budget_tool".to_owned(),
             arguments: r#"{"same":true}"#.to_owned(),
+        }
+    }
+
+    fn distinct_missing_tool_call(id: usize) -> ProviderToolCall {
+        ProviderToolCall {
+            id: format!("call_loop_budget_distinct_{id}"),
+            name: "missing_loop_budget_tool".to_owned(),
+            arguments: serde_json::json!({ "round": id }).to_string(),
         }
     }
 
@@ -2769,6 +2778,11 @@ impl Provider for LoopBudgetProvider {
             }
             LoopBudgetProviderMode::RepeatedMissingToolThenEmptyThenFinal if tools_available => {
                 vec![Self::missing_tool_call(round_index)]
+            }
+            LoopBudgetProviderMode::DistinctMissingToolsThenFinal
+                if tools_available && round_index < 3 =>
+            {
+                vec![Self::distinct_missing_tool_call(round_index)]
             }
             LoopBudgetProviderMode::RetryEpisodeResetThenFinal if tools_available => {
                 match round_index {
@@ -10613,6 +10627,48 @@ async fn tool_loop_same_failure_signature_is_bounded() {
     assert_eq!(requests.len(), 3);
     assert!(requests[2].tools.is_none());
     assert_eq!(tool_result_message_count(&requests[2]), 2);
+}
+
+#[tokio::test]
+async fn tool_loop_distinct_failure_signatures_keep_tools_available() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::DistinctMissingToolsThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 8, 8);
+    config.retry.max_recoverable_retry_rounds_per_episode = 8;
+    config.retry.max_same_tool_error_retries_per_episode = 3;
+    config.retry.max_retries_per_tool_name_per_episode = 8;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let mut events = start_loop_budget_turn(
+        &manager,
+        "thr_distinct_tool_failures",
+        "turn_distinct_tool_failures",
+    )
+    .await;
+
+    let observed_events = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed_events);
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ItemToolRetryExhausted(_))),
+        "distinct tool invocations must not exhaust a shared error-class budget: {observed_events:?}"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert!(
+        requests.len() >= 4,
+        "three distinct failing calls and at least one normal final round are expected: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|request| request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())),
+        "tools must remain available while failure signatures keep changing"
+    );
 }
 
 #[tokio::test]
