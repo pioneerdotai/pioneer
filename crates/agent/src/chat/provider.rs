@@ -7,7 +7,8 @@ use pioneer_protocol::{
     ProviderTransportKind, TurnItem, TurnItemType,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk, TokenUsage,
+    ChatRequest, Provider, ProviderFailureClassification, ProviderTimeoutPolicy, ProviderToolCall,
+    StreamChunk, TokenUsage,
 };
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -55,12 +56,14 @@ pub(super) async fn request_agent_round(
 
         let target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
         let mut stream = provider.stream_chat(request).await.map_err(|error| {
-            stream_error_for_target(
+            adapter_error_for_target(
                 target,
-                provider_name.as_str(),
+                provider.as_ref(),
                 model_name.as_str(),
+                ProviderTransportKind::Stream,
                 ProviderFailureStage::Connect,
-                format!("provider stream error: {error}"),
+                "provider stream error",
+                &error,
             )
         })?;
 
@@ -75,7 +78,7 @@ pub(super) async fn request_agent_round(
             &mut stream,
             &mut seen_any_chunk,
             target,
-            provider_name.as_str(),
+            provider,
             model_name.as_str(),
             provider_timeout_policy,
         )
@@ -140,18 +143,17 @@ pub(super) async fn request_agent_round(
         });
     }
 
-    let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
     let response = provider.chat(request).await.map_err(|error| {
-        provider_failure_error(
-            thinking_item_id,
-            TurnItemType::Reasoning,
-            provider_name.as_str(),
+        adapter_error_for_target(
+            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+            provider.as_ref(),
             model_name.as_str(),
             ProviderTransportKind::NonStream,
             ProviderFailureStage::Connect,
-            format!("provider chat error: {error}"),
+            "provider chat error",
+            &error,
         )
     })?;
 
@@ -202,13 +204,15 @@ pub(super) async fn stream_provider_response(
     let model_name = request.model.clone();
 
     let connect_target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
-    let mut stream = provider.stream_chat(request).await.map_err(|e| {
-        stream_error_for_target(
+    let mut stream = provider.stream_chat(request).await.map_err(|error| {
+        adapter_error_for_target(
             connect_target,
-            provider_name.as_str(),
+            provider.as_ref(),
             model_name.as_str(),
+            ProviderTransportKind::Stream,
             ProviderFailureStage::Connect,
-            format!("provider stream error: {e}"),
+            "provider stream error",
+            &error,
         )
     })?;
 
@@ -223,7 +227,7 @@ pub(super) async fn stream_provider_response(
         &mut stream,
         &mut seen_any_chunk,
         response_stream_target(message_started, thinking_item_id, message_item_id),
-        provider_name.as_str(),
+        provider,
         model_name.as_str(),
         provider_timeout_policy,
     )
@@ -467,18 +471,17 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
-    let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
-    let response = provider.chat(request).await.map_err(|e| {
-        provider_failure_error(
-            thinking_item_id,
-            TurnItemType::Reasoning,
-            provider_name.as_str(),
+    let response = provider.chat(request).await.map_err(|error| {
+        adapter_error_for_target(
+            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+            provider.as_ref(),
             model_name.as_str(),
             ProviderTransportKind::NonStream,
             ProviderFailureStage::Connect,
-            format!("provider error: {e}"),
+            "provider error",
+            &error,
         )
     })?;
 
@@ -597,6 +600,27 @@ fn stream_error_for_target(
     )
 }
 
+fn adapter_error_for_target(
+    target: FailureTarget<'_>,
+    provider: &dyn Provider,
+    model: &str,
+    transport: ProviderTransportKind,
+    stage: ProviderFailureStage,
+    prefix: &str,
+    error: &anyhow::Error,
+) -> ChatTurnError {
+    provider_failure_error_with_classification(
+        target.item_id,
+        target.item_type,
+        provider.name(),
+        model,
+        transport,
+        stage,
+        format!("{prefix}: {error}"),
+        provider.classify_failure(error),
+    )
+}
+
 fn upsert_tool_call(tool_calls: &mut Vec<ProviderToolCall>, incoming: ProviderToolCall) {
     if incoming.id.is_empty() {
         if !tool_calls.iter().any(|existing| {
@@ -657,7 +681,7 @@ async fn read_next_stream_chunk<S>(
     stream: &mut S,
     seen_any_chunk: &mut bool,
     target: FailureTarget<'_>,
-    provider_name: &str,
+    provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
@@ -679,7 +703,7 @@ where
     let next_chunk = timeout(wait, stream.next()).await.map_err(|_| {
         stream_error_for_target(
             target,
-            provider_name,
+            provider.name(),
             model_name,
             stage,
             "stream stall: chunk timeout exceeded".to_owned(),
@@ -693,12 +717,14 @@ where
     *seen_any_chunk = true;
 
     let chunk = chunk_result.map_err(|error| {
-        stream_error_for_target(
+        adapter_error_for_target(
             target,
-            provider_name,
+            provider.as_ref(),
             model_name,
+            ProviderTransportKind::Stream,
             ProviderFailureStage::MidStream,
-            format!("stream chunk error: {error}"),
+            "stream chunk error",
+            &error,
         )
     })?;
 
@@ -714,12 +740,48 @@ pub(super) fn provider_failure_error(
     stage: ProviderFailureStage,
     error_message: String,
 ) -> ChatTurnError {
+    provider_failure_error_with_classification(
+        item_id,
+        item_type,
+        provider,
+        model,
+        transport,
+        stage,
+        error_message,
+        None,
+    )
+}
+
+fn provider_failure_error_with_classification(
+    item_id: &str,
+    item_type: TurnItemType,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+    stage: ProviderFailureStage,
+    error_message: String,
+    classification: Option<ProviderFailureClassification>,
+) -> ChatTurnError {
     let lower = error_message.to_ascii_lowercase();
-    let http_status = extract_http_status(error_message.as_str());
-    let retry_after_ms = extract_retry_after_ms(lower.as_str());
-    let provider_code = extract_provider_code(error_message.as_str());
-    let class = classify_provider_failure_message(error_message.as_str(), stage);
-    let is_recoverable_hint = !matches!(class, ProviderFailureClass::InvalidRequest);
+    let inferred_http_status = extract_http_status(error_message.as_str());
+    let inferred_retry_after_ms = extract_retry_after_ms(lower.as_str());
+    let inferred_provider_code = extract_provider_code(error_message.as_str());
+    let inferred_class = classify_provider_failure_message(error_message.as_str(), stage);
+    let (class, http_status, provider_code, retry_after_ms) = match classification {
+        Some(classification) => (
+            classification.class,
+            classification.http_status.or(inferred_http_status),
+            classification.provider_code.or(inferred_provider_code),
+            classification.retry_after_ms.or(inferred_retry_after_ms),
+        ),
+        None => (
+            inferred_class,
+            inferred_http_status,
+            inferred_provider_code,
+            inferred_retry_after_ms,
+        ),
+    };
+    let is_recoverable_hint = provider_failure_class_is_recoverable(class);
 
     ChatTurnError::ProviderFailure {
         item_id: item_id.to_owned(),
@@ -737,6 +799,28 @@ pub(super) fn provider_failure_error(
             message: Some(error_message),
         },
     }
+}
+
+fn provider_failure_class_is_recoverable(class: ProviderFailureClass) -> bool {
+    matches!(
+        class,
+        ProviderFailureClass::NetworkTransient
+            | ProviderFailureClass::RateLimit
+            | ProviderFailureClass::Provider5xx
+            | ProviderFailureClass::AuthExpired
+            | ProviderFailureClass::AuthOrPermission
+            | ProviderFailureClass::ModelNotFound
+            | ProviderFailureClass::PromptTooLong
+            | ProviderFailureClass::ContextTooLarge
+            | ProviderFailureClass::MaxOutputTokens
+            | ProviderFailureClass::StreamStall
+            | ProviderFailureClass::StreamTruncated
+            | ProviderFailureClass::EmptyResponse
+            | ProviderFailureClass::UnsupportedImageInput
+            | ProviderFailureClass::UnsupportedToolCalling
+            | ProviderFailureClass::UnsupportedStreaming
+            | ProviderFailureClass::PermissionDenied
+    )
 }
 
 pub(crate) fn classify_provider_failure_message(
@@ -996,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_400_bad_request_is_recoverable_provider_rejection() {
+    fn provider_400_bad_request_is_non_retryable_provider_rejection() {
         let error = r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#;
 
         let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
@@ -1013,7 +1097,7 @@ mod tests {
 
         assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
         assert_eq!(failure.http_status, Some(400));
-        assert!(failure.is_recoverable_hint);
+        assert!(!failure.is_recoverable_hint);
     }
 
     #[test]
@@ -1060,6 +1144,37 @@ mod tests {
 
         assert_eq!(failure.class, ProviderFailureClass::UnsupportedParameter);
         assert_eq!(failure.message.as_deref(), Some(message.as_str()));
+        assert!(!failure.is_recoverable_hint);
+    }
+
+    #[test]
+    fn adapter_classification_overrides_provider_neutral_fallback() {
+        let ChatTurnError::ProviderFailure { failure, .. } =
+            provider_failure_error_with_classification(
+                "reasoning_item",
+                TurnItemType::Reasoning,
+                "future-provider",
+                "future-model",
+                ProviderTransportKind::Stream,
+                ProviderFailureStage::Connect,
+                "provider error: HTTP 400 opaque rejection".to_owned(),
+                Some(ProviderFailureClassification {
+                    class: ProviderFailureClass::UnsupportedStreaming,
+                    http_status: Some(400),
+                    provider_code: Some("streaming_not_supported".to_owned()),
+                    retry_after_ms: None,
+                }),
+            )
+        else {
+            panic!("expected provider failure");
+        };
+
+        assert_eq!(failure.class, ProviderFailureClass::UnsupportedStreaming);
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("streaming_not_supported")
+        );
+        assert!(failure.is_recoverable_hint);
     }
 
     #[test]

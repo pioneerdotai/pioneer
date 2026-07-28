@@ -1,8 +1,33 @@
+use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::time::Duration;
 
 pub use pioneer_protocol::ReasoningEffort;
+
+/// Optional provider-adapter classification for a concrete transport error.
+///
+/// Adapters only need to return this when they can map their own structured
+/// error to Pioneer semantics. Unknown errors deliberately fall back to the
+/// conservative provider-neutral classifier in the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailureClassification {
+    pub class: ProviderFailureClass,
+    pub http_status: Option<u16>,
+    pub provider_code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+}
+
+impl ProviderFailureClassification {
+    pub fn new(class: ProviderFailureClass) -> Self {
+        Self {
+            class,
+            http_status: None,
+            provider_code: None,
+            retry_after_ms: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

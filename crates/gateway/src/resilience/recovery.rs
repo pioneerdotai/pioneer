@@ -89,6 +89,16 @@ pub struct ProviderRecoveryPolicy {
     pub no_progress_limit: i64,
 }
 
+const fn non_retryable_provider_failure_policy() -> ProviderRecoveryPolicy {
+    ProviderRecoveryPolicy {
+        action: RecoveryAction::MarkFailed,
+        max_attempts: 0,
+        base_backoff_secs: 0,
+        max_wall_clock_secs: 10,
+        no_progress_limit: 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecoveryPolicyRegistry {
     by_item_type: HashMap<TurnItemType, RecoveryPolicy>,
@@ -238,10 +248,10 @@ impl Default for RecoveryPolicyRegistry {
             ProviderFailureClass::AuthExpired,
             ProviderRecoveryPolicy {
                 action: RefreshProviderAuth,
-                max_attempts: 2,
+                max_attempts: 1,
                 base_backoff_secs: 2,
                 max_wall_clock_secs: 120,
-                no_progress_limit: 2,
+                no_progress_limit: 1,
             },
         );
         by_provider_failure_class.insert(
@@ -268,51 +278,39 @@ impl Default for RecoveryPolicyRegistry {
             ProviderFailureClass::PromptTooLong,
             ProviderRecoveryPolicy {
                 action: CompactHistory,
-                max_attempts: 2,
+                max_attempts: 1,
                 base_backoff_secs: 1,
                 max_wall_clock_secs: 120,
-                no_progress_limit: 2,
+                no_progress_limit: 1,
             },
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::ContextTooLarge,
             ProviderRecoveryPolicy {
                 action: CompactHistory,
-                max_attempts: 2,
+                max_attempts: 1,
                 base_backoff_secs: 1,
                 max_wall_clock_secs: 120,
-                no_progress_limit: 2,
+                no_progress_limit: 1,
             },
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::UnsupportedStreaming,
             ProviderRecoveryPolicy {
                 action: DisableStreaming,
-                max_attempts: 2,
+                max_attempts: 1,
                 base_backoff_secs: 1,
                 max_wall_clock_secs: 120,
-                no_progress_limit: 2,
+                no_progress_limit: 1,
             },
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::UnsupportedParameter,
-            ProviderRecoveryPolicy {
-                action: AdaptProviderRequest,
-                max_attempts: 2,
-                base_backoff_secs: 1,
-                max_wall_clock_secs: 120,
-                no_progress_limit: 2,
-            },
+            non_retryable_provider_failure_policy(),
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::UnsupportedCapability,
-            ProviderRecoveryPolicy {
-                action: DisableUnsupportedCapability,
-                max_attempts: 1,
-                base_backoff_secs: 1,
-                max_wall_clock_secs: 60,
-                no_progress_limit: 1,
-            },
+            non_retryable_provider_failure_policy(),
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::UnsupportedImageInput,
@@ -336,13 +334,7 @@ impl Default for RecoveryPolicyRegistry {
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::MalformedProviderRequest,
-            ProviderRecoveryPolicy {
-                action: AdaptProviderRequest,
-                max_attempts: 1,
-                base_backoff_secs: 1,
-                max_wall_clock_secs: 60,
-                no_progress_limit: 1,
-            },
+            non_retryable_provider_failure_policy(),
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::MaxOutputTokens,
@@ -386,23 +378,11 @@ impl Default for RecoveryPolicyRegistry {
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::ProviderRejected,
-            ProviderRecoveryPolicy {
-                action: RetryWithBackoff,
-                max_attempts: 2,
-                base_backoff_secs: 2,
-                max_wall_clock_secs: 120,
-                no_progress_limit: 2,
-            },
+            non_retryable_provider_failure_policy(),
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::InvalidRequest,
-            ProviderRecoveryPolicy {
-                action: RetryWithBackoff,
-                max_attempts: 2,
-                base_backoff_secs: 2,
-                max_wall_clock_secs: 120,
-                no_progress_limit: 2,
-            },
+            non_retryable_provider_failure_policy(),
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::PermissionDenied,
@@ -416,13 +396,7 @@ impl Default for RecoveryPolicyRegistry {
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::Unknown,
-            ProviderRecoveryPolicy {
-                action: RetryWithBackoff,
-                max_attempts: 1,
-                base_backoff_secs: 2,
-                max_wall_clock_secs: 60,
-                no_progress_limit: 1,
-            },
+            non_retryable_provider_failure_policy(),
         );
 
         Self {
@@ -468,13 +442,7 @@ impl RecoveryPolicyRegistry {
         self.by_provider_failure_class
             .get(&class)
             .copied()
-            .unwrap_or(ProviderRecoveryPolicy {
-                action: RecoveryAction::RetryWithBackoff,
-                max_attempts: 1,
-                base_backoff_secs: 2,
-                max_wall_clock_secs: 60,
-                no_progress_limit: 1,
-            })
+            .unwrap_or_else(non_retryable_provider_failure_policy)
     }
 }
 
@@ -713,6 +681,14 @@ impl RecoveryCoordinator {
         }
     }
 
+    fn provider_recovery_policy(&self, failure: &ProviderFailureDetails) -> ProviderRecoveryPolicy {
+        if !failure.is_recoverable_hint {
+            return non_retryable_provider_failure_policy();
+        }
+        self.policy_registry
+            .policy_for_provider_failure(failure.class)
+    }
+
     pub async fn enqueue_timeout_job(
         &self,
         candidate: &TimeoutCandidate,
@@ -802,9 +778,7 @@ impl RecoveryCoordinator {
             return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
         }
 
-        let provider_policy = self
-            .policy_registry
-            .policy_for_provider_failure(candidate.failure.class);
+        let provider_policy = self.provider_recovery_policy(&candidate.failure);
 
         // TODO(fallback_model): persist configured fallback model into provider snapshot,
         // so model-not-found recovery can use deterministic provider-specific fallback first.
@@ -914,6 +888,17 @@ impl RecoveryCoordinator {
             return Ok(Vec::new());
         }
 
+        if self.provider_recovery_policy(&failure).action == RecoveryAction::MarkFailed {
+            return self
+                .terminalize_active_non_retryable_provider_failure(
+                    job,
+                    recovery_attempt_id,
+                    failure,
+                    now_unix,
+                )
+                .await;
+        }
+
         self.record_active_recovery_failure(
             job,
             recovery_attempt_id,
@@ -922,6 +907,56 @@ impl RecoveryCoordinator {
             now_unix,
         )
         .await
+    }
+
+    async fn terminalize_active_non_retryable_provider_failure(
+        &self,
+        job: RecoveryJobRecord,
+        recovery_attempt_id: &str,
+        failure: ProviderFailureDetails,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let attempt_number = attempt_number_for_job(&job);
+        let detail = failure
+            .message
+            .unwrap_or_else(|| "provider rejected the request".to_owned());
+        let message = format!(
+            "non-retryable provider request ({:?}); unchanged request will not be sent again: {detail}",
+            failure.class
+        );
+
+        if !self
+            .crud_store
+            .mark_recovery_job_terminal_after_attempt(
+                job.id.as_str(),
+                recovery_attempt_id,
+                RecoveryJobStatus::Failed,
+                Some(message.clone()),
+                now_unix,
+            )
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+
+        self.cancel_other_open_jobs_after_terminal_recovery(
+            job.turn_id.as_str(),
+            job.id.as_str(),
+            now_unix,
+        )
+        .await?;
+
+        Ok(vec![RecoveryCoordinatorEvent::RecoveryExhausted(
+            RecoveryTerminalOutcome {
+                job_id: job.id,
+                turn_id: job.turn_id,
+                item_id: job.item_id,
+                item_type: job.item_type,
+                attempt_number,
+                status: RecoveryJobStatus::Failed,
+                error_message: message,
+            },
+        )])
     }
 
     pub async fn record_cli_runtime_attempt_failure(
@@ -3135,7 +3170,14 @@ impl RecoveryCoordinator {
                 }
             }
             ProviderFailureClass::UnsupportedStreaming => {
-                plan.force_non_stream = true;
+                if provider_snapshot_field(job, "transport") == Some("stream") {
+                    plan.force_non_stream = true;
+                } else {
+                    plan.terminal_reason = Some(
+                        "provider rejected a non-stream request as unsupported streaming; no deterministic request change is available"
+                            .to_owned(),
+                    );
+                }
             }
             ProviderFailureClass::AuthExpired
             | ProviderFailureClass::AuthOrPermission
@@ -3155,18 +3197,27 @@ impl RecoveryCoordinator {
             ProviderFailureClass::MaxOutputTokens => {
                 plan.continue_generation = true;
             }
-            ProviderFailureClass::UnsupportedParameter
-            | ProviderFailureClass::MalformedProviderRequest
+            ProviderFailureClass::UnsupportedParameter => {
+                plan.terminal_reason = Some(
+                    "provider rejected an unsupported parameter, but no adapter-supplied deterministic parameter removal is available"
+                        .to_owned(),
+                );
+            }
+            ProviderFailureClass::MalformedProviderRequest
             | ProviderFailureClass::ProviderRejected
             | ProviderFailureClass::InvalidRequest => {
-                if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT
-                    && provider_snapshot_field(job, "transport") == Some("stream")
-                {
-                    plan.force_non_stream = true;
-                }
+                plan.terminal_reason = Some(
+                    "provider rejected the request; unchanged invalid request will not be sent again"
+                        .to_owned(),
+                );
             }
-            ProviderFailureClass::UnsupportedCapability
-            | ProviderFailureClass::UnsupportedToolCalling => {
+            ProviderFailureClass::UnsupportedCapability => {
+                plan.terminal_reason = Some(
+                    "provider rejected an unspecified capability; no deterministic request change is available"
+                        .to_owned(),
+                );
+            }
+            ProviderFailureClass::UnsupportedToolCalling => {
                 if provider_snapshot_field(job, "transport") == Some("stream") {
                     plan.force_non_stream = true;
                 }
@@ -3179,11 +3230,10 @@ impl RecoveryCoordinator {
                 plan.disable_image_input = true;
             }
             ProviderFailureClass::Unknown => {
-                if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT
-                    && provider_snapshot_field(job, "transport") == Some("stream")
-                {
-                    plan.force_non_stream = true;
-                }
+                plan.terminal_reason = Some(
+                    "provider failure is not classified as transient and has no deterministic recovery action"
+                        .to_owned(),
+                );
             }
         }
 
@@ -7441,7 +7491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_recovery_uses_persisted_policy_snapshot() {
+    async fn active_transient_recovery_uses_persisted_policy_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_persisted_policy_snapshot";
         let job = crud_store
@@ -7453,7 +7503,7 @@ mod tests {
                 RecoveryTrigger::ProviderError,
                 RecoveryAction::RetryWithBackoff,
                 Some("persisted policy regression".to_owned()),
-                Some(ProviderFailureClass::InvalidRequest),
+                Some(ProviderFailureClass::NetworkTransient),
                 None,
                 None,
                 0,
@@ -7480,7 +7530,7 @@ mod tests {
             .record_recovery_provider_failure(
                 job.id.as_str(),
                 active_attempt_id.as_str(),
-                provider_failure(ProviderFailureClass::InvalidRequest, "bad request"),
+                provider_failure(ProviderFailureClass::NetworkTransient, "connection reset"),
                 1_700_000_002,
             )
             .await
@@ -7500,7 +7550,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_request_provider_policy_retries_instead_of_marking_failed() {
+    async fn non_retryable_provider_failure_inside_active_recovery_is_not_rescheduled() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_active_then_invalid".to_owned(),
+                    item_id: "reasoning_1".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(
+                        ProviderFailureClass::NetworkTransient,
+                        "connection reset",
+                    ),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("transient provider failure should enqueue")
+            .into_job();
+        let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
+
+        let events = coordinator
+            .record_recovery_provider_failure(
+                job.id.as_str(),
+                active_attempt_id.as_str(),
+                provider_failure(
+                    ProviderFailureClass::ProviderRejected,
+                    "HTTP 400 unchanged request",
+                ),
+                1_700_000_002,
+            )
+            .await
+            .expect("request rejection should terminalize active recovery");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+                if outcome.job_id == job.id
+                    && outcome.status == RecoveryJobStatus::Failed
+                    && outcome.error_message.contains("will not be sent again")
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
+        assert_eq!(reloaded.run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_request_provider_policy_marks_failed_without_retry() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
             .enqueue_provider_failure_job(
@@ -7515,8 +7615,8 @@ mod tests {
             .await
             .expect("initial provider failure should enqueue")
             .into_job();
-        assert_eq!(job.action, RecoveryAction::RetryWithBackoff);
-        assert_eq!(job.max_attempts, 2);
+        assert_eq!(job.action, RecoveryAction::MarkFailed);
+        assert_eq!(job.max_attempts, 0);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_001, 1)
@@ -7525,20 +7625,20 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }]
-                if job_id == &job.id
+            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+                if outcome.job_id == job.id && outcome.status == RecoveryJobStatus::Failed
         ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
-        assert_eq!(reloaded.run_count, 1);
+        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
+        assert_eq!(reloaded.run_count, 0);
     }
 
     #[tokio::test]
-    async fn provider_rejected_policy_retries_instead_of_marking_failed() {
+    async fn provider_rejected_policy_marks_failed_without_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
             .enqueue_provider_failure_job(
@@ -7554,12 +7654,106 @@ mod tests {
                 1_700_000_000,
             )
             .await
-            .expect("provider rejection should enqueue retry recovery")
+            .expect("provider rejection should enqueue terminal recovery")
             .into_job();
 
-        assert_eq!(job.action, RecoveryAction::RetryWithBackoff);
-        assert_eq!(job.max_attempts, 2);
+        assert_eq!(job.action, RecoveryAction::MarkFailed);
+        assert_eq!(job.max_attempts, 0);
         assert_eq!(job.status, RecoveryJobStatus::Pending);
+    }
+
+    #[test]
+    fn request_rejections_without_deterministic_mutation_are_non_retryable() {
+        let registry = RecoveryPolicyRegistry::default();
+
+        for class in [
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::UnsupportedParameter,
+            ProviderFailureClass::UnsupportedCapability,
+            ProviderFailureClass::Unknown,
+        ] {
+            let policy = registry.policy_for_provider_failure(class);
+            assert_eq!(policy.action, RecoveryAction::MarkFailed);
+            assert_eq!(policy.max_attempts, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_legacy_retry_policy_cannot_replay_rejected_request() {
+        let (_crud_store, coordinator) = setup_coordinator().await;
+
+        for class in [
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::UnsupportedParameter,
+            ProviderFailureClass::UnsupportedCapability,
+            ProviderFailureClass::Unknown,
+        ] {
+            let job = provider_plan_job(class, "stream");
+            let plan = coordinator
+                .build_attempt_plan(&job, 1)
+                .await
+                .expect("legacy provider plan should build");
+            assert!(
+                plan.terminal_reason.is_some(),
+                "{class:?} must stop before provider execution"
+            );
+            assert!(!plan.force_non_stream);
+            assert!(!plan.disable_tool_calling);
+            assert!(!plan.disable_image_input);
+            assert!(!plan.compact_history);
+        }
+    }
+
+    #[test]
+    fn deterministic_request_remediations_allow_only_one_attempt() {
+        let registry = RecoveryPolicyRegistry::default();
+
+        for class in [
+            ProviderFailureClass::AuthExpired,
+            ProviderFailureClass::AuthOrPermission,
+            ProviderFailureClass::PromptTooLong,
+            ProviderFailureClass::ContextTooLarge,
+            ProviderFailureClass::UnsupportedStreaming,
+            ProviderFailureClass::UnsupportedImageInput,
+            ProviderFailureClass::UnsupportedToolCalling,
+            ProviderFailureClass::PermissionDenied,
+        ] {
+            let policy = registry.policy_for_provider_failure(class);
+            assert_ne!(policy.action, RecoveryAction::MarkFailed);
+            assert_eq!(
+                policy.max_attempts, 1,
+                "{class:?} must get exactly one changed-request attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_streaming_requires_an_actual_transport_change() {
+        let (_crud_store, coordinator) = setup_coordinator().await;
+
+        let stream_plan = coordinator
+            .build_attempt_plan(
+                &provider_plan_job(ProviderFailureClass::UnsupportedStreaming, "stream"),
+                1,
+            )
+            .await
+            .expect("stream remediation plan should build");
+        assert!(stream_plan.force_non_stream);
+        assert!(stream_plan.terminal_reason.is_none());
+
+        let non_stream_plan = coordinator
+            .build_attempt_plan(
+                &provider_plan_job(ProviderFailureClass::UnsupportedStreaming, "non_stream"),
+                1,
+            )
+            .await
+            .expect("non-stream remediation plan should build");
+        assert!(!non_stream_plan.force_non_stream);
+        assert!(non_stream_plan.terminal_reason.is_some());
     }
 
     #[tokio::test]
@@ -7795,7 +7989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_pending_mark_failed_repair_fails_without_claim() {
+    async fn due_pending_mark_failed_repair_terminalizes_without_claim() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
             .enqueue_provider_failure_job(
@@ -7824,13 +8018,21 @@ mod tests {
             .await
             .expect("terminal repair should run");
 
-        assert!(events.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+                if outcome.job_id == job.id
+                    && outcome.status == RecoveryJobStatus::Failed
+                    && outcome
+                        .error_message
+                        .contains("recovery policy marks this failure as terminal")
+        ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
+        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
         assert_eq!(reloaded.run_count, 0);
         assert!(reloaded.claim_token.is_none());
     }

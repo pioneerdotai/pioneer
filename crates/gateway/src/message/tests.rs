@@ -21695,7 +21695,7 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invalid_request_provider_failure_opens_retry_recovery_without_polling() {
+async fn invalid_request_provider_failure_is_terminal_without_retry() {
     let thread_id = "thr_provider_terminal_sync";
     let turn_id = "turn_provider_terminal_sync";
     let item_id = "reasoning_provider_terminal_sync";
@@ -21733,19 +21733,19 @@ async fn invalid_request_provider_failure_opens_retry_recovery_without_polling()
         )
         .await;
 
-    let pending_jobs = crud_store
-        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+    let failed_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Failed)
         .await
-        .expect("pending recovery jobs should load");
-    assert_eq!(pending_jobs.len(), 1);
-    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::ProviderError);
-    assert_eq!(pending_jobs[0].action, RecoveryAction::RetryWithBackoff);
+        .expect("failed recovery jobs should load");
+    assert_eq!(failed_jobs.len(), 1);
+    assert_eq!(failed_jobs[0].trigger, RecoveryTrigger::ProviderError);
+    assert_eq!(failed_jobs[0].action, RecoveryAction::MarkFailed);
     assert_eq!(
-        pending_jobs[0].error_class,
+        failed_jobs[0].error_class,
         Some(ProviderFailureClass::InvalidRequest)
     );
     assert!(
-        pending_jobs[0]
+        failed_jobs[0]
             .reason
             .as_deref()
             .unwrap_or("")
@@ -21757,15 +21757,20 @@ async fn invalid_request_provider_failure_opens_retry_recovery_without_polling()
         .await
         .expect("latest window should load")
         .expect("window should exist");
-    assert_eq!(window.status, ExecutionWindowStatus::Running);
+    assert_eq!(window.status, ExecutionWindowStatus::Failed);
 
     let (_workspace_id, turn) = crud_store
         .get_turn(thread_id, turn_id)
         .await
         .expect("turn should load")
         .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::InProgress);
-    assert!(turn.error.is_none());
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        turn.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bad request")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

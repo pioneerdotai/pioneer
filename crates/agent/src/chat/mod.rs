@@ -4695,6 +4695,7 @@ async fn execute_agent_provider_response(
                     if consecutive_rejected_no_tool_rounds
                         >= MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS
                     {
+                        let provider_failure_class = rejection.provider_failure_class();
                         return Err((
                             ChatTurnError::ProviderFailure {
                                 item_id: current_thinking_id.clone(),
@@ -4709,12 +4710,15 @@ async fn execute_agent_provider_response(
                                     } else {
                                         ProviderTransportKind::NonStream
                                     },
-                                    class: rejection.provider_failure_class(),
+                                    class: provider_failure_class,
                                     stage: ProviderFailureStage::Finalize,
                                     http_status: None,
                                     provider_code: Some(rejection.provider_code().to_owned()),
                                     retry_after_ms: None,
-                                    is_recoverable_hint: true,
+                                    is_recoverable_hint: !matches!(
+                                        provider_failure_class,
+                                        pioneer_protocol::ProviderFailureClass::Unknown
+                                    ),
                                     message: Some(rejection.provider_message().to_owned()),
                                 },
                             },

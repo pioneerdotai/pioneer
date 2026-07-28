@@ -33,6 +33,7 @@ pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse,
     CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse, InputContentType, InputTypeSupport,
     MessageAttachment, MessageContentPart, ModelInputItem, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
-    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderFailureClassification, ProviderInputCapabilities, ProviderReplayState,
+    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
+    TokenUsage, ToolChoice, ToolDefinition,
 };

@@ -7,8 +7,9 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
-        ProviderCapabilities, ProviderInputCapabilities, ProviderTimeoutPolicy, Role, StreamChunk,
-        TokenUsage, ToolChoice, ToolDefinition,
+        ProviderCapabilities, ProviderFailureClassification, ProviderInputCapabilities,
+        ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice,
+        ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -19,9 +20,11 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
-use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
+use pioneer_protocol::{
+    ProviderFailureClass, ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
+};
 
 /// How to pass the credential in HTTP requests.
 #[derive(Debug, Clone)]
@@ -51,6 +54,23 @@ pub struct OpenAiCompatibleProvider {
     extra_headers: HashMap<String, String>,
     client: Client,
 }
+
+#[derive(Debug)]
+struct MissingDeepSeekReasoningReplay {
+    model: String,
+}
+
+impl fmt::Display for MissingDeepSeekReasoningReplay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "DeepSeek thinking replay for model `{}` is missing required `reasoning_content` on an assistant tool-call round",
+            self.model
+        )
+    }
+}
+
+impl std::error::Error for MissingDeepSeekReasoningReplay {}
 
 // ── OpenAI-compatible API request types ─────────────────────────────────────
 
@@ -857,7 +877,47 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    fn validate_provider_replay_contract(&self, request: &ChatRequest) -> Result<()> {
+        if self.name != "deepseek" || !self.deepseek_thinking_replay_required(request) {
+            return Ok(());
+        }
+
+        let missing_reasoning = request.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|tool_calls| !tool_calls.is_empty())
+                && message
+                    .reasoning_content
+                    .as_deref()
+                    .is_none_or(|reasoning| reasoning.trim().is_empty())
+        });
+        if missing_reasoning {
+            return Err(anyhow!(MissingDeepSeekReasoningReplay {
+                model: request.model.clone(),
+            }));
+        }
+
+        Ok(())
+    }
+
+    fn deepseek_thinking_replay_required(&self, request: &ChatRequest) -> bool {
+        let model_is_reasoner = request.model.to_ascii_lowercase().contains("reasoner");
+        let reasoning_is_enabled = matches!(request.reasoning, Some(ReasoningConfig::Effort(_)));
+        let history_contains_reasoning = request.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        });
+
+        model_is_reasoner || reasoning_is_enabled || history_contains_reasoning
+    }
+
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
+        self.validate_provider_replay_contract(&request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_provider(
@@ -908,6 +968,12 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             transcription: false,
             input_types: self.input_types.clone(),
         }
+    }
+
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        error
+            .downcast_ref::<MissingDeepSeekReasoningReplay>()
+            .map(|_| ProviderFailureClassification::new(ProviderFailureClass::InvalidRequest))
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
@@ -1312,6 +1378,94 @@ mod tests {
         let api_messages = provider.convert_messages(&prepared).unwrap();
 
         assert!(api_messages[0].reasoning_content.is_none());
+    }
+
+    fn deepseek_replay_request(model: &str, reasoning_content: Option<&str>) -> ChatRequest {
+        ChatRequest {
+            model: model.to_owned(),
+            messages: vec![ChatMessage::assistant_tool_calls_with_reasoning(
+                None::<String>,
+                reasoning_content.map(str::to_owned),
+                vec![ProviderToolCall {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"README.md\"}".to_owned(),
+                }],
+            )],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+
+    #[test]
+    fn deepseek_reasoner_replay_missing_reasoning_is_rejected_before_http() {
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://api.deepseek.com",
+            "key",
+            AuthStyle::Bearer,
+        );
+
+        let error = provider
+            .build_chat_request(deepseek_replay_request("deepseek-reasoner", None), false)
+            .expect_err("incomplete DeepSeek replay must fail locally");
+
+        assert!(
+            error
+                .downcast_ref::<MissingDeepSeekReasoningReplay>()
+                .is_some()
+        );
+        assert_eq!(
+            provider
+                .classify_failure(&error)
+                .expect("adapter should classify its replay error")
+                .class,
+            ProviderFailureClass::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn deepseek_reasoner_replay_with_reasoning_is_rendered_losslessly() {
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://api.deepseek.com",
+            "key",
+            AuthStyle::Bearer,
+        );
+
+        let rendered = provider
+            .build_chat_request(
+                deepseek_replay_request(
+                    "deepseek-reasoner",
+                    Some("reasoning that produced call_1"),
+                ),
+                false,
+            )
+            .expect("complete DeepSeek replay should render");
+
+        assert_eq!(
+            rendered.messages[0].reasoning_content.as_deref(),
+            Some("reasoning that produced call_1")
+        );
+    }
+
+    #[test]
+    fn deepseek_non_thinking_chat_is_not_subject_to_reasoner_replay_contract() {
+        let provider = OpenAiCompatibleProvider::new(
+            "deepseek",
+            "https://api.deepseek.com",
+            "key",
+            AuthStyle::Bearer,
+        );
+
+        provider
+            .build_chat_request(deepseek_replay_request("deepseek-chat", None), false)
+            .expect("non-thinking DeepSeek replay should remain supported");
     }
 
     #[test]

@@ -4589,7 +4589,7 @@ async fn third_consecutive_tool_schema_dump_no_tool_round_surfaces_provider_fail
                     failure.provider_code.as_deref(),
                     Some("tool_schema_dump_response")
                 );
-                assert!(failure.is_recoverable_hint);
+                assert!(!failure.is_recoverable_hint);
                 assert_eq!(
                     failure.message.as_deref(),
                     Some("model returned tool schema definitions instead of a final answer")

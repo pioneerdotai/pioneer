@@ -1,6 +1,6 @@
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
-    StreamChunk,
+    ProviderFailureClassification, StreamChunk,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,6 +16,16 @@ pub trait Provider: Send + Sync {
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Classify a provider-owned error when the adapter has structured
+    /// knowledge that the provider-neutral fallback cannot have.
+    ///
+    /// Returning `None` is always safe: unknown request rejections are not
+    /// retried, while transport/HTTP transient failures are classified by the
+    /// agent's provider-neutral fallback.
+    fn classify_failure(&self, _error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        None
     }
 
     /// Send a chat request and receive the complete response.
@@ -135,6 +145,13 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(!caps.vision);
+    }
+
+    #[test]
+    fn provider_failure_classification_is_optional_and_conservative() {
+        let provider = MockProvider;
+        let error = anyhow::anyhow!("opaque provider rejection");
+        assert!(provider.classify_failure(&error).is_none());
     }
 
     #[tokio::test]
