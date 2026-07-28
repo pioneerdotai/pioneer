@@ -18,6 +18,42 @@ pub trait ErrorClassifier: Send + Sync {
 #[derive(Default)]
 pub struct DefaultErrorClassifier;
 
+const PERMISSION_DENIED_HINT: &str = "The requested operation is not permitted in the current execution context. Do not retry the same denied operation; continue with another permitted path or tool.";
+
+fn permission_denied_outcome() -> ToolOutcome {
+    ToolOutcome::fatal(
+        ToolErrorClass::PermissionDenied,
+        Some(PERMISSION_DENIED_HINT.to_owned()),
+    )
+}
+
+fn partial_permission_denied_outcome(reason: impl Into<String>) -> ToolOutcome {
+    ToolOutcome {
+        status: ToolOutcomeStatus::PartialSuccess,
+        error_class: Some(ToolErrorClass::PermissionDenied),
+        should_retry: false,
+        retry_hint: Some(PERMISSION_DENIED_HINT.to_owned()),
+        incomplete: true,
+        incomplete_reason: Some(reason.into()),
+    }
+}
+
+fn message_indicates_permission_denied(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("access denied")
+        || lower.contains("access is denied")
+}
+
+fn error_is_permission_denied(error: &ToolError) -> bool {
+    match error {
+        ToolError::Rejected(_) => true,
+        ToolError::ExecutionFailed(message) => message_indicates_permission_denied(message),
+        _ => false,
+    }
+}
+
 impl ErrorClassifier for DefaultErrorClassifier {
     fn classify_result(
         &self,
@@ -89,6 +125,10 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if error_is_permission_denied(error) {
+            return permission_denied_outcome();
+        }
+
         if is_shell_tool(invocation.tool_name.as_str()) {
             return classify_shell_error(error);
         }
@@ -142,10 +182,7 @@ impl ErrorClassifier for DefaultErrorClassifier {
                 false,
                 None,
             ),
-            ToolError::Rejected(_) => ToolOutcome::fatal(
-                ToolErrorClass::Unknown,
-                Some("Tool call was rejected by policy.".to_owned()),
-            ),
+            ToolError::Rejected(_) => permission_denied_outcome(),
             ToolError::Internal(_) => ToolOutcome::fatal(
                 ToolErrorClass::Internal,
                 Some("Tool failed with an internal error.".to_owned()),
@@ -319,10 +356,7 @@ fn classify_mcp_error(invocation: &ToolInvocation, error: &ToolError) -> ToolOut
             false,
             None,
         ),
-        ToolError::Rejected(_) => ToolOutcome::fatal(
-            ToolErrorClass::PermissionDenied,
-            Some("MCP tool call was rejected before execution.".to_owned()),
-        ),
+        ToolError::Rejected(_) => permission_denied_outcome(),
         ToolError::Cancelled(_) => ToolOutcome::fatal(
             ToolErrorClass::Cancelled,
             Some("MCP tool call was cancelled.".to_owned()),
@@ -370,6 +404,19 @@ fn classify_shell_result(raw_output_json: &JsonValue, success: bool) -> ToolOutc
         }
     };
 
+    let stderr_lower = payload.stderr.to_lowercase();
+    let stdout_empty = payload.stdout.trim().is_empty();
+    let exit_code = payload.exit_code.unwrap_or(0);
+    let has_error_stderr = looks_like_shell_error(stderr_lower.as_str());
+    let error_class = classify_shell_error_class(stderr_lower.as_str());
+
+    if has_error_stderr && error_class == ToolErrorClass::PermissionDenied {
+        if stdout_empty {
+            return permission_denied_outcome();
+        }
+        return partial_permission_denied_outcome("stderr_contains_permission_denied");
+    }
+
     if payload.timed_out {
         return ToolOutcome::recoverable(
             ToolErrorClass::Timeout,
@@ -386,14 +433,9 @@ fn classify_shell_result(raw_output_json: &JsonValue, success: bool) -> ToolOutc
         );
     }
 
-    let stderr_lower = payload.stderr.to_lowercase();
-    let stdout_empty = payload.stdout.trim().is_empty();
-    let exit_code = payload.exit_code.unwrap_or(0);
-    let has_error_stderr = looks_like_shell_error(stderr_lower.as_str());
-
     if exit_code != 0 {
         return ToolOutcome::recoverable(
-            classify_shell_error_class(stderr_lower.as_str()),
+            error_class,
             "Command failed. Diagnose stderr and run a corrected shell command.",
             false,
             None,
@@ -402,7 +444,7 @@ fn classify_shell_result(raw_output_json: &JsonValue, success: bool) -> ToolOutc
 
     if has_error_stderr && stdout_empty {
         return ToolOutcome::recoverable(
-            classify_shell_error_class(stderr_lower.as_str()),
+            error_class,
             "stderr indicates command failure despite zero exit code. Run corrected command and re-check output.",
             false,
             None,
@@ -412,7 +454,7 @@ fn classify_shell_result(raw_output_json: &JsonValue, success: bool) -> ToolOutc
     if has_error_stderr {
         return ToolOutcome {
             status: ToolOutcomeStatus::PartialSuccess,
-            error_class: Some(classify_shell_error_class(stderr_lower.as_str())),
+            error_class: Some(error_class),
             should_retry: true,
             retry_hint: Some(
                 "Command produced suspicious stderr. Verify results and run follow-up shell command if needed."
@@ -533,6 +575,9 @@ fn classify_status_code(status_code: u16, success: bool) -> ToolOutcome {
             false,
             None,
         );
+    }
+    if matches!(status_code, 401 | 403) {
+        return permission_denied_outcome();
     }
     if status_code == 404 {
         return ToolOutcome::recoverable(
@@ -725,10 +770,7 @@ fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
             false,
             None,
         ),
-        ToolError::Rejected(_) => ToolOutcome::fatal(
-            ToolErrorClass::Unknown,
-            Some("computer_use call was rejected by policy.".to_owned()),
-        ),
+        ToolError::Rejected(_) => permission_denied_outcome(),
         ToolError::Internal(_) => ToolOutcome::fatal(
             ToolErrorClass::Internal,
             Some("computer_use failed with an internal error.".to_owned()),
@@ -818,13 +860,7 @@ fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> T
             true,
             Some(failure_class.to_owned()),
         ),
-        "permission_denied" | "accessibility_not_enabled" => ToolOutcome::fatal(
-            ToolErrorClass::PermissionDenied,
-            Some(
-                "computer_use requires OS accessibility/screen permissions before retrying."
-                    .to_owned(),
-            ),
-        ),
+        "permission_denied" | "accessibility_not_enabled" => permission_denied_outcome(),
         "accessibility_unavailable" => ToolOutcome::fatal(
             ToolErrorClass::ExecutionFailed,
             Some("computer_use accessibility backend is unavailable on this host.".to_owned()),
@@ -916,10 +952,7 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
                 None,
             )
         }
-        ToolError::Rejected(_) => ToolOutcome::fatal(
-            ToolErrorClass::Unknown,
-            Some("Shell tool call was rejected by policy.".to_owned()),
-        ),
+        ToolError::Rejected(_) => permission_denied_outcome(),
         ToolError::Internal(_) => ToolOutcome::fatal(
             ToolErrorClass::Internal,
             Some("Shell tool failed with internal error.".to_owned()),
@@ -978,10 +1011,7 @@ fn classify_web_error(error: &ToolError) -> ToolOutcome {
                 None,
             )
         }
-        ToolError::Rejected(_) => ToolOutcome::fatal(
-            ToolErrorClass::Unknown,
-            Some("Web tool call was rejected by policy.".to_owned()),
-        ),
+        ToolError::Rejected(_) => permission_denied_outcome(),
         ToolError::Internal(_) => ToolOutcome::fatal(
             ToolErrorClass::Internal,
             Some("Web tool failed with internal error.".to_owned()),
@@ -1025,6 +1055,8 @@ fn classify_shell_error_class(stderr_lower: &str) -> ToolErrorClass {
     }
     if stderr_lower.contains("permission denied")
         || stderr_lower.contains("operation not permitted")
+        || stderr_lower.contains("access denied")
+        || stderr_lower.contains("access is denied")
     {
         return ToolErrorClass::PermissionDenied;
     }
@@ -1038,6 +1070,25 @@ fn classify_shell_error_class(stderr_lower: &str) -> ToolErrorClass {
 mod tests {
     use super::*;
     use crate::shell_format::{ExecPayloadInput, build_exec_model_payload};
+
+    fn invocation_for(tool_name: &str) -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call".to_owned(),
+            tool_name: tool_name.to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: crate::context::ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+            workdir: std::path::PathBuf::from("."),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
 
     fn computer_use_invocation() -> ToolInvocation {
         ToolInvocation {
@@ -1341,6 +1392,94 @@ mod tests {
         let outcome = classifier.classify_result(&invocation, &serde_json::json!(payload), true);
         assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn rejected_tool_error_is_a_local_non_retryable_permission_denial() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("read_file"),
+            &ToolError::Rejected("path is outside allowed roots".to_owned()),
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+        assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn wrapped_filesystem_permission_error_is_not_retryable() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("read_file"),
+            &ToolError::ExecutionFailed(
+                "failed to read `/restricted`: Permission denied (os error 13)".to_owned(),
+            ),
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+        assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn shell_permission_denial_is_not_retryable() {
+        let payload = build_exec_model_payload(ExecPayloadInput {
+            exit_code: Some(1),
+            timed_out: false,
+            duration_ms: 12,
+            stdout: String::new(),
+            stderr: "cat: /restricted: Permission denied".to_owned(),
+            session_id: None,
+            command: vec!["cat".to_owned(), "/restricted".to_owned()],
+            max_output_tokens: None,
+            force_truncated_stdout: false,
+            force_truncated_stderr: false,
+        });
+
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("exec_command"),
+            &serde_json::json!(payload),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+        assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn shell_partial_output_with_permission_denial_keeps_output_without_retrying() {
+        let payload = build_exec_model_payload(ExecPayloadInput {
+            exit_code: Some(1),
+            timed_out: false,
+            duration_ms: 12,
+            stdout: "/allowed/result\n".to_owned(),
+            stderr: "find: /restricted: Operation not permitted".to_owned(),
+            session_id: None,
+            command: vec!["find".to_owned(), "/".to_owned()],
+            max_output_tokens: None,
+            force_truncated_stdout: false,
+            force_truncated_stderr: false,
+        });
+
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("exec_command"),
+            &serde_json::json!(payload),
+            true,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::PartialSuccess);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+        assert!(!outcome.should_retry);
+        assert!(outcome.incomplete);
+    }
+
+    #[test]
+    fn web_forbidden_response_is_not_retryable() {
+        let outcome = classify_status_code(403, false);
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+        assert!(!outcome.should_retry);
     }
 
     #[test]

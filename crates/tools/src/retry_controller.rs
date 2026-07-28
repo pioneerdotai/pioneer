@@ -57,10 +57,6 @@ pub fn default_tool_retry_class_budgets() -> Vec<ToolRetryClassBudget> {
             max_retries: 1,
         },
         ToolRetryClassBudget {
-            error_class: ToolErrorClass::PermissionDenied,
-            max_retries: 1,
-        },
-        ToolRetryClassBudget {
             error_class: ToolErrorClass::CommandNotFound,
             max_retries: 2,
         },
@@ -690,8 +686,17 @@ struct RetryCandidate {
 
 impl RetryCandidate {
     fn from_observation(observation: &ToolRetryObservation) -> Option<Self> {
+        let error_class = observation
+            .outcome
+            .error_class
+            .unwrap_or(ToolErrorClass::Unknown);
+
         if observation.success
             || !observation.outcome.should_retry
+            // A denied operation is terminal for that invocation, not for the
+            // whole tool loop. Enrolling it in the shared retry episode can
+            // exhaust the budget and incorrectly disable every other tool.
+            || error_class == ToolErrorClass::PermissionDenied
             || !matches!(
                 observation.outcome.status,
                 ToolOutcomeStatus::RecoverableError | ToolOutcomeStatus::PartialSuccess
@@ -700,10 +705,6 @@ impl RetryCandidate {
             return None;
         }
 
-        let error_class = observation
-            .outcome
-            .error_class
-            .unwrap_or(ToolErrorClass::Unknown);
         let signature = ToolFailureSignature::from_arguments(
             observation.tool_name.clone(),
             observation.arguments.as_str(),
@@ -1130,6 +1131,55 @@ mod tests {
 
         assert!(matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()));
         assert!(controller.state_snapshot().active_episode.is_none());
+    }
+
+    #[test]
+    fn permission_denied_never_enters_the_global_retry_episode() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let decision = controller.decide(&[observation(
+            "read_file",
+            r#"{"path":"/restricted"}"#,
+            recoverable(ToolErrorClass::PermissionDenied),
+        )]);
+
+        assert!(matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()));
+        assert!(controller.state_snapshot().active_episode.is_none());
+    }
+
+    #[test]
+    fn permission_denied_does_not_consume_budget_for_other_failures() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let decision = controller.decide(&[
+            observation(
+                "read_file",
+                r#"{"path":"/restricted"}"#,
+                recoverable(ToolErrorClass::PermissionDenied),
+            ),
+            observation(
+                "web_fetch",
+                r#"{"url":"https://example.com"}"#,
+                recoverable(ToolErrorClass::ExecutionFailed),
+            ),
+        ]);
+
+        let ToolRetryDecision::Retry { prompt, .. } = decision else {
+            panic!("the unrelated recoverable failure should still be retryable");
+        };
+        let ToolRetryPrompt::Retry { entries } = prompt else {
+            panic!("expected a retry prompt");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tool_name, "web_fetch");
+        assert_eq!(entries[0].error_class, ToolErrorClass::ExecutionFailed);
+
+        let episode = active_episode(&controller);
+        assert_eq!(episode.total_retry_rounds, 1);
+        assert!(
+            !episode
+                .by_class
+                .contains_key(&ToolErrorClass::PermissionDenied)
+        );
+        assert!(!episode.by_tool_name.contains_key("read_file"));
     }
 
     #[test]
