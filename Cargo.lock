@@ -596,7 +596,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
@@ -713,7 +713,7 @@ version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "pin-project-lite",
 ]
@@ -742,7 +742,7 @@ dependencies = [
  "async-task",
  "blocking",
  "cfg-if",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-lite 2.6.1",
  "rustix 1.1.4",
 ]
@@ -3497,11 +3497,10 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3512,7 +3511,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "pin-project-lite",
 ]
 
@@ -4401,7 +4400,7 @@ dependencies = [
  "rand 0.9.5",
  "raw-window-handle",
  "resvg",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "seahash",
  "serde",
  "serde_json",
@@ -4458,7 +4457,7 @@ dependencies = [
  "regex",
  "ropey 2.0.0-beta.1",
  "rust-i18n 3.1.5",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_repr",
@@ -4648,7 +4647,7 @@ dependencies = [
  "nix 0.29.0",
  "regex",
  "rust-embed",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -5831,9 +5830,9 @@ dependencies = [
 
 [[package]]
 name = "landlock"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa9b598524037d06d8466ec364866121281a2398c343ae8640b28bbe7be50cdb"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
 dependencies = [
  "enumflags2",
  "libc",
@@ -8156,7 +8155,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8181,7 +8180,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -8196,7 +8195,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8210,7 +8209,7 @@ dependencies = [
  "pioneer-protocol",
  "pioneer-provider",
  "pioneer-tools",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "sea-orm",
  "serde",
  "serde_json",
@@ -8222,7 +8221,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -8246,7 +8245,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -8264,7 +8263,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -8278,7 +8277,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8288,7 +8287,7 @@ dependencies = [
  "mime_guess",
  "pioneer-protocol",
  "pioneer-skills",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -8302,13 +8301,13 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "pioneer-client",
  "pioneer-protocol",
  "rustls",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "url",
@@ -8316,7 +8315,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "config",
@@ -8327,7 +8326,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8348,7 +8347,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8389,7 +8388,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "sea-orm",
  "serde",
@@ -8397,7 +8396,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8436,7 +8435,7 @@ dependencies = [
  "pioneer-tunnel",
  "rand 0.10.2",
  "reqwest",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "sea-orm",
  "serde",
  "serde_json",
@@ -8457,7 +8456,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -8472,7 +8471,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -8485,7 +8484,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8495,7 +8494,7 @@ dependencies = [
  "process-wrap",
  "reqwest",
  "rmcp",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -8507,7 +8506,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8530,7 +8529,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -8542,7 +8541,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -8553,7 +8552,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8572,11 +8571,11 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "hex",
  "nanoid",
- "schemars 1.2.1",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -8584,7 +8583,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8607,7 +8606,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -8617,7 +8616,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -8635,7 +8634,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8657,7 +8656,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8678,7 +8677,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8709,7 +8708,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.35.1"
+version = "0.35.2"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -10368,14 +10367,14 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
  "indexmap 2.14.0",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive 1.2.2",
  "serde",
  "serde_json",
 ]
@@ -10388,20 +10387,20 @@ checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals",
+ "serde_derive_internals 0.29.1",
  "syn 2.0.119",
 ]
 
 [[package]]
 name = "schemars_derive"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals",
- "syn 2.0.119",
+ "serde_derive_internals 0.30.0",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -10921,6 +10920,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -11661,7 +11671,7 @@ dependencies = [
  "crc",
  "crossbeam-queue",
  "either",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-core",
  "futures-intrusive",
  "futures-io",
@@ -12052,34 +12062,35 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sval"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fb9efbae90f97301f4d25f3be63dfd99d6b7af9d088228a52ec960d649b2e7d"
+checksum = "ba3a370f3cd0422964fd9a19b6516f048527738e6ec50b1b0ff79b460b468390"
 
 [[package]]
 name = "sval_buffer"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff5c0280ea0af40b3a1fd0b532680b5067482ffb81412ee66ec04b1d9952b49a"
+checksum = "111e6e2dab25782acb41b281263f5f60d6f56a2ba0b3b076187ad23a1552544d"
 dependencies = [
  "sval",
  "sval_ref",
+ "zerocopy",
 ]
 
 [[package]]
 name = "sval_dynamic"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59b9067f2e68f58e110cf8019a268057e3791cf74b0fdb1b3c7c6e49104f44e6"
+checksum = "590ac4ebd299740eac453162302a494e6d5b3be243feab8bf07d0d4331b6b2b3"
 dependencies = [
  "sval",
 ]
 
 [[package]]
 name = "sval_fmt"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96ebdbf0e4b175884aa587fcf551c16dabe245ea04235abdd8cbbd160b27ed5a"
+checksum = "4b964d6d917267355d7f343c515b908586e5b4aeeada328738f703452f9412d6"
 dependencies = [
  "itoa",
  "ryu",
@@ -12088,9 +12099,9 @@ dependencies = [
 
 [[package]]
 name = "sval_json"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e448d9fa216a6c16670b28d624fbbcf5c04e41eb187bd7c52e01222ffa72a12"
+checksum = "dea35e4d6b997acc7dc4786ab782f6a6c5000efe4ae93a2db89cf350775fe5fe"
 dependencies = [
  "itoa",
  "ryu",
@@ -12099,9 +12110,9 @@ dependencies = [
 
 [[package]]
 name = "sval_nested"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "021de5b5c26efd544c694cef9b8a9abe8633481bf3be1ea145a18a740818b291"
+checksum = "a73195ebd4b3e5866db2e1b75f3f383657ad5abc600c646d69b4f064fee89154"
 dependencies = [
  "sval",
  "sval_buffer",
@@ -12110,18 +12121,18 @@ dependencies = [
 
 [[package]]
 name = "sval_ref"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ef5ffec8bc52ded04ee424ab8d959e25e64fd40a48a16d21f8991ce824c1bb"
+checksum = "c0ef28df9d586bfd15115286651337cb5645f8c203160d22d2d1a20cf13c428c"
 dependencies = [
  "sval",
 ]
 
 [[package]]
 name = "sval_serde"
-version = "2.20.0"
+version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b983833a8a2390f89ebcf9b9acd06883017014b4ffd72ee28e0c9de6852039f5"
+checksum = "d72fbe6537e88878f10237bde71ae4a1b65b2bf54bdf274abc566fc696334c92"
 dependencies = [
  "serde_core",
  "sval",
@@ -12955,9 +12966,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.2+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow 1.0.4",
 ]
@@ -15358,7 +15369,7 @@ dependencies = [
  "async-trait",
  "blocking",
  "enumflags2",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-core",
  "futures-lite 2.6.1",
  "hex",
