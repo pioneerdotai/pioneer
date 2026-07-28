@@ -131,6 +131,8 @@ fn protocol_loop_limit_kind(reason: ToolLoopBudgetReason) -> ToolLoopBudgetLimit
     match reason {
         ToolLoopBudgetReason::AgentRoundsExceeded => ToolLoopBudgetLimitKind::AgentRounds,
         ToolLoopBudgetReason::ToolCallsExceeded => ToolLoopBudgetLimitKind::ToolCalls,
+        ToolLoopBudgetReason::WallClockExceeded => ToolLoopBudgetLimitKind::WallClockMs,
+        ToolLoopBudgetReason::ProviderTokensExceeded => ToolLoopBudgetLimitKind::ProviderTokens,
         ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled => {
             ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
         }

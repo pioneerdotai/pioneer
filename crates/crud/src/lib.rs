@@ -4096,6 +4096,19 @@ impl CrudStore {
             .await
     }
 
+    pub async fn count_turn_execution_window_terminal_items_since(
+        &self,
+        turn_id: &str,
+        started_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+        turn_execution_window::count_turn_execution_window_terminal_items_since(
+            &self.connection,
+            turn_id,
+            started_at,
+        )
+        .await
+    }
+
     pub async fn list_turn_execution_window_items(
         &self,
         turn_id: &str,
@@ -23342,11 +23355,14 @@ mod tests {
             aggregate,
             TurnExecutionWindowUsageAggregateRecord {
                 total_windows: 2,
+                latest_window_index: 2,
                 total_agent_rounds: 10,
                 total_tool_calls: 16,
                 total_wall_clock_ms: 12_000,
                 wall_clock_window_count: 2,
                 total_provider_tokens: 21,
+                provider_token_usage_unknown: false,
+                consecutive_no_progress_windows: 0,
             }
         );
 
@@ -23378,11 +23394,14 @@ mod tests {
             missing_token_aggregate,
             TurnExecutionWindowUsageAggregateRecord {
                 total_windows: 1,
+                latest_window_index: 1,
                 total_agent_rounds: 2,
                 total_tool_calls: 4,
                 total_wall_clock_ms: 0,
                 wall_clock_window_count: 0,
                 total_provider_tokens: 0,
+                provider_token_usage_unknown: true,
+                consecutive_no_progress_windows: 0,
             }
         );
 
@@ -23680,10 +23699,11 @@ mod tests {
                 .iter()
                 .map(|entry| entry.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1, 2, 3]
         );
         assert_eq!(active_rows[0].tool_name.as_deref(), Some("exec_command"));
         assert_eq!(active_rows[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(active_rows[2].item_id.as_deref(), Some("item_expired"));
 
         let deleted_expired = store
             .delete_expired_turn_llm_context()

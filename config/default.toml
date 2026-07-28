@@ -113,18 +113,16 @@ max_recovery_attempts_per_step = 2
 max_recovery_attempts_per_run = 12
 
 [gateway.tools.budget]
-max_agent_rounds_per_turn = 512
-max_tool_calls_per_turn = 2048
+max_agent_rounds_per_turn = 32
+max_tool_calls_per_turn = 128
 
 [gateway.tools.execution_windows]
-max_agent_rounds_per_window = 512
-max_tool_calls_per_window = 2048
+max_agent_rounds_per_window = 32
+max_tool_calls_per_window = 128
+max_wall_clock_ms_per_window = 1800000
 
 [gateway.tools.execution_windows.total]
-max_windows_per_turn = 16
-max_tool_calls_per_turn = 4096
-max_wall_clock_ms_per_turn = 86400000
-max_consecutive_failed_windows = 3
+max_consecutive_no_progress_windows = 3
 
 [gateway.tools.retry]
 max_recoverable_retry_rounds_per_episode = 32

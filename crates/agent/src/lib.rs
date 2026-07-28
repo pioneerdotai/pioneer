@@ -674,6 +674,7 @@ pub enum AgentControlError {
     TurnMismatch,
     TurnAlreadyRunning,
     AttemptNotRunning,
+    ExecutionWindowContinuationBlocked { reason: String },
     Internal(String),
 }
 
@@ -685,6 +686,7 @@ impl Display for AgentControlError {
             Self::TurnMismatch => write!(f, "active turn does not match the requested turn"),
             Self::TurnAlreadyRunning => write!(f, "thread already has an active turn"),
             Self::AttemptNotRunning => write!(f, "turn item attempt is not running"),
+            Self::ExecutionWindowContinuationBlocked { reason } => write!(f, "{reason}"),
             Self::Internal(error) => write!(f, "internal agent control error: {error}"),
         }
     }
@@ -723,6 +725,7 @@ pub struct ExecutionCheckpointContext {
     pub checkpoint_id: String,
     pub checkpoint_kind: String,
     pub payload: ExecutionCheckpointPayload,
+    pub usage: ExecutionWindowUsageSnapshot,
 }
 
 impl ExecutionCheckpointContext {
@@ -732,16 +735,48 @@ impl ExecutionCheckpointContext {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionWindowUsageSnapshot {
+    pub total_windows: u32,
+    pub total_tool_calls: u64,
+    pub total_wall_clock_ms: u64,
+    pub total_provider_tokens: u64,
+    pub provider_token_usage_unknown: bool,
+    pub consecutive_no_progress_windows: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TurnExecutionUsageCounters {
     total_windows: u32,
     total_tool_calls: u64,
     total_wall_clock_ms: u64,
     total_provider_tokens: u64,
     provider_token_usage_unknown: bool,
-    consecutive_failed_windows: u32,
+    consecutive_no_progress_windows: u32,
 }
 
 impl TurnExecutionUsageCounters {
+    fn from_snapshot(snapshot: ExecutionWindowUsageSnapshot) -> Self {
+        Self {
+            total_windows: snapshot.total_windows,
+            total_tool_calls: snapshot.total_tool_calls,
+            total_wall_clock_ms: snapshot.total_wall_clock_ms,
+            total_provider_tokens: snapshot.total_provider_tokens,
+            provider_token_usage_unknown: snapshot.provider_token_usage_unknown,
+            consecutive_no_progress_windows: snapshot.consecutive_no_progress_windows,
+        }
+    }
+
+    fn snapshot(self) -> ExecutionWindowUsageSnapshot {
+        ExecutionWindowUsageSnapshot {
+            total_windows: self.total_windows,
+            total_tool_calls: self.total_tool_calls,
+            total_wall_clock_ms: self.total_wall_clock_ms,
+            total_provider_tokens: self.total_provider_tokens,
+            provider_token_usage_unknown: self.provider_token_usage_unknown,
+            consecutive_no_progress_windows: self.consecutive_no_progress_windows,
+        }
+    }
+
     fn observe_checkpoint_payload(&mut self, payload: &ExecutionCheckpointPayload) {
         if payload.window.window_index <= self.total_windows {
             return;
@@ -777,16 +812,27 @@ impl TurnExecutionUsageCounters {
             }
         }
 
-        if execution_checkpoint_payload_is_failure_heavy(payload) {
-            self.consecutive_failed_windows = self.consecutive_failed_windows.saturating_add(1);
+        if execution_checkpoint_payload_is_no_progress_recovery(payload) {
+            self.consecutive_no_progress_windows =
+                self.consecutive_no_progress_windows.saturating_add(1);
         } else {
-            self.consecutive_failed_windows = 0;
+            self.consecutive_no_progress_windows = 0;
         }
     }
 }
 
-fn execution_checkpoint_payload_is_failure_heavy(payload: &ExecutionCheckpointPayload) -> bool {
-    payload.tools.executed_count > 0 && payload.tools.failed_count > payload.tools.succeeded_count
+fn execution_checkpoint_payload_is_no_progress_recovery(
+    payload: &ExecutionCheckpointPayload,
+) -> bool {
+    payload.window.agent_round_count == 0
+        && payload.tools.executed_count == 0
+        && matches!(
+            payload.window.exhaustion_reason,
+            Some(
+                ExecutionWindowExhaustionReason::ProviderFailureContinuation
+                    | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
+            )
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -873,6 +919,7 @@ struct ExecutionWindowContinuation {
     exhausted_window_id: String,
     checkpoint_id: String,
     checkpoint_payload: ExecutionCheckpointPayload,
+    provider_history: Vec<RetainedProviderHistoryMessage>,
     exhausted_limit: Option<u64>,
     exhausted_observed: Option<u64>,
     reason_code: String,

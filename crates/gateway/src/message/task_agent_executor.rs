@@ -3845,6 +3845,11 @@ async fn load_execution_checkpoint_context_for_turn(
         checkpoint_id: checkpoint.id,
         checkpoint_kind: task_execution_checkpoint_kind_label(checkpoint.checkpoint_kind),
         payload,
+        usage: crate::turn_runtime_snapshot::execution_window_usage_snapshot(
+            processor.crud_store.as_ref(),
+            turn_id,
+        )
+        .await?,
     }))
 }
 

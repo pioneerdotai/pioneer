@@ -73,11 +73,14 @@ pub struct TurnExecutionWindowStatsRecord {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnExecutionWindowUsageAggregateRecord {
     pub total_windows: u32,
+    pub latest_window_index: u32,
     pub total_agent_rounds: u64,
     pub total_tool_calls: u64,
     pub total_wall_clock_ms: u64,
     pub wall_clock_window_count: u32,
     pub total_provider_tokens: u64,
+    pub provider_token_usage_unknown: bool,
+    pub consecutive_no_progress_windows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -312,6 +315,7 @@ pub fn aggregate_turn_execution_window_records(
     };
 
     for window in windows {
+        aggregate.latest_window_index = aggregate.latest_window_index.max(window.window_index);
         aggregate.total_agent_rounds = aggregate
             .total_agent_rounds
             .saturating_add(u64::from(window.agent_round_count));
@@ -321,6 +325,25 @@ pub fn aggregate_turn_execution_window_records(
         aggregate.total_provider_tokens = aggregate
             .total_provider_tokens
             .saturating_add(window.provider_token_count);
+        if window.agent_round_count > 0 && window.provider_token_count == 0 {
+            aggregate.provider_token_usage_unknown = true;
+        }
+
+        let no_progress_recovery = window.agent_round_count == 0
+            && window.tool_call_count == 0
+            && matches!(
+                window.exhaustion_reason,
+                Some(
+                    ExecutionWindowExhaustionReason::ProviderFailureContinuation
+                        | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
+                )
+            );
+        if no_progress_recovery {
+            aggregate.consecutive_no_progress_windows =
+                aggregate.consecutive_no_progress_windows.saturating_add(1);
+        } else {
+            aggregate.consecutive_no_progress_windows = 0;
+        }
 
         if let Some(completed_at) = window.completed_at.as_ref() {
             let duration_ms = completed_at
@@ -471,14 +494,18 @@ pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrai
             continue;
         };
 
-        let counts = count_turn_execution_window_terminal_items(db, window.turn_id.as_str())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to count terminal items for execution-window repair on turn `{}`",
-                    window.turn_id
-                )
-            })?;
+        let counts = count_turn_execution_window_terminal_items_since(
+            db,
+            window.turn_id.as_str(),
+            window.started_at.clone(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to count terminal items for execution-window repair on turn `{}`",
+                window.turn_id
+            )
+        })?;
         let metadata_json = repaired_terminal_turn_window_metadata(
             &window.metadata_json,
             window_status,
@@ -515,8 +542,32 @@ pub async fn count_turn_execution_window_terminal_items<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
-    let rows = turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+    count_turn_execution_window_terminal_items_query(
+        turn_item::Entity::find().filter(turn_item::Column::TurnId.eq(turn_id.to_owned())),
+        db,
+    )
+    .await
+}
+
+pub async fn count_turn_execution_window_terminal_items_since<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    started_at: DateTimeWithTimeZone,
+) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+    count_turn_execution_window_terminal_items_query(
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_item::Column::CreatedAt.gte(started_at)),
+        db,
+    )
+    .await
+}
+
+async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
+    query: sea_orm::Select<turn_item::Entity>,
+    db: &C,
+) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+    let rows = query
         .all(db)
         .await
         .context("failed to list turn_item rows for execution-window terminal stats")?;

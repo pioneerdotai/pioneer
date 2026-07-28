@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use pioneer_agent::{
-    AgentTurnHookRuntimeContext, ResolvedArtifactInput, RestoredRecoveryTurnRequest,
-    WorkspaceSkillPolicy,
+    AgentTurnHookRuntimeContext, ExecutionWindowUsageSnapshot, ResolvedArtifactInput,
+    RestoredRecoveryTurnRequest, WorkspaceSkillPolicy,
 };
-use pioneer_crud::{NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
+use pioneer_crud::{CrudStore, NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
 use pioneer_protocol::ReasoningEffort;
 use pioneer_protocol::{
     SkillId, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
@@ -19,6 +19,21 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_AGENT_SKILL_PINS_JSON_BYTES: usize = 16 * 1024;
 const MAX_AGENT_SKILL_FINGERPRINT_CHARS: usize = 128;
+
+pub(crate) async fn execution_window_usage_snapshot(
+    store: &CrudStore,
+    turn_id: &str,
+) -> Result<ExecutionWindowUsageSnapshot> {
+    let usage = store.aggregate_turn_execution_window_usage(turn_id).await?;
+    Ok(ExecutionWindowUsageSnapshot {
+        total_windows: usage.latest_window_index.max(usage.total_windows),
+        total_tool_calls: usage.total_tool_calls,
+        total_wall_clock_ms: usage.total_wall_clock_ms,
+        total_provider_tokens: usage.total_provider_tokens,
+        provider_token_usage_unknown: usage.provider_token_usage_unknown,
+        consecutive_no_progress_windows: usage.consecutive_no_progress_windows,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredWorkspaceSkillPolicy {

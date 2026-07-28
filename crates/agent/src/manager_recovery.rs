@@ -43,9 +43,8 @@ pub(super) fn apply_recovery_adjustments(
         turn_request.execution_window_index = turn_request
             .execution_window_index
             .max(context.next_window_index());
-        turn_request
-            .execution_usage
-            .observe_checkpoint_payload(&context.payload);
+        turn_request.execution_usage =
+            super::TurnExecutionUsageCounters::from_snapshot(context.usage);
     }
 }
 
@@ -242,6 +241,11 @@ mod tests {
             checkpoint_id: "checkpoint_4".to_owned(),
             checkpoint_kind: "window_exhausted".to_owned(),
             payload,
+            usage: crate::ExecutionWindowUsageSnapshot {
+                total_windows: 4,
+                total_tool_calls: 11,
+                ..crate::ExecutionWindowUsageSnapshot::default()
+            },
         };
         let request = RecoveryAttemptRequest {
             recovery_job_id: "job_checkpoint".to_owned(),
@@ -267,11 +271,11 @@ mod tests {
             turn_request.execution_usage,
             TurnExecutionUsageCounters {
                 total_windows: 4,
-                total_tool_calls: 2,
-                total_wall_clock_ms: 1,
-                total_provider_tokens: 3,
+                total_tool_calls: 11,
+                total_wall_clock_ms: 0,
+                total_provider_tokens: 0,
                 provider_token_usage_unknown: false,
-                consecutive_failed_windows: 0,
+                consecutive_no_progress_windows: 0,
             }
         );
         assert!(turn_request.execution_options.continue_generation_hint);

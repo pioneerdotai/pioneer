@@ -3207,6 +3207,8 @@ pub enum ToolRetryExhaustionKind {
 pub enum ToolLoopBudgetLimitKind {
     AgentRounds,
     ToolCalls,
+    WallClockMs,
+    ProviderTokens,
     ProviderReturnedToolsAfterToolsDisabled,
 }
 

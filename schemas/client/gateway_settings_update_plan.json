@@ -409,6 +409,7 @@
           }
         },
         "self_improvement": {
+          "description": "Effective Self-improvement settings for the workspace bound to this RPC connection.",
           "$ref": "#/$defs/GatewaySelfImprovementSettings",
           "default": {
             "enabled": false
@@ -506,6 +507,7 @@
           ]
         },
         "self_improvement": {
+          "description": "Self-improvement settings for the workspace bound to this RPC connection.",
           "anyOf": [
             {
               "$ref": "#/$defs/GatewaySelfImprovementSettings"

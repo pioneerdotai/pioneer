@@ -1783,6 +1783,8 @@ fn tool_loop_budget_limit_kind_label(limit_kind: ToolLoopBudgetLimitKind) -> &'s
     match limit_kind {
         ToolLoopBudgetLimitKind::AgentRounds => "agent_rounds",
         ToolLoopBudgetLimitKind::ToolCalls => "tool_calls",
+        ToolLoopBudgetLimitKind::WallClockMs => "wall_clock_ms",
+        ToolLoopBudgetLimitKind::ProviderTokens => "provider_tokens",
         ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled => {
             "provider_returned_tools_after_tools_disabled"
         }

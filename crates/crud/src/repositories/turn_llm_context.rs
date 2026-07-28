@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_llm_context};
 use pioneer_protocol::{TurnStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
 use crate::convention::turn_status_to_db;
 
@@ -72,11 +72,6 @@ pub async fn list_turn_llm_context<C: ConnectionTrait>(
 ) -> Result<Vec<TurnLlmContextEntry>> {
     let rows = turn_llm_context::Entity::find()
         .filter(turn_llm_context::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(
-            Condition::any()
-                .add(turn_llm_context::Column::ExpiresAt.is_null())
-                .add(turn_llm_context::Column::ExpiresAt.gt(chrono::Utc::now().fixed_offset())),
-        )
         .order_by_asc(turn_llm_context::Column::Sequence)
         .all(db)
         .await

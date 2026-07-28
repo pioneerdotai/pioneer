@@ -1,7 +1,5 @@
 use super::*;
 use anyhow::{Context, Result, bail};
-
-const ACTIVE_TURN_LLM_CONTEXT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
@@ -61,12 +59,6 @@ fn db_timestamp_from_unix_ms(value: i64) -> sea_orm::entity::prelude::DateTimeWi
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
         .map(|timestamp| timestamp.fixed_offset())
         .unwrap_or_else(now_db_timestamp)
-}
-
-fn llm_context_expires_at(
-    created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
-) -> sea_orm::entity::prelude::DateTimeWithTimeZone {
-    created_at + chrono::Duration::seconds(ACTIVE_TURN_LLM_CONTEXT_TTL_SECS)
 }
 
 fn execution_window_started_metadata(runtime_window_id: &str) -> serde_json::Value {
@@ -317,7 +309,7 @@ impl MessageProcessor {
 
         let counts = self
             .crud_store
-            .count_turn_execution_window_terminal_items(turn_id)
+            .count_turn_execution_window_terminal_items_since(turn_id, window.started_at.clone())
             .await?;
         let now = now_db_timestamp();
         let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
@@ -1271,7 +1263,7 @@ impl MessageProcessor {
                     output_policy_snapshot: serde_json::to_string(&output_policy_snapshot)
                         .unwrap_or_else(|_| serde_json::json!({}).to_string()),
                     created_at,
-                    expires_at: Some(llm_context_expires_at(created_at)),
+                    expires_at: None,
                 };
                 if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
                     self.report_legacy_turn_failure(
@@ -1316,7 +1308,7 @@ impl MessageProcessor {
                     payload,
                     output_policy_snapshot: serde_json::json!({}).to_string(),
                     created_at,
-                    expires_at: Some(llm_context_expires_at(created_at)),
+                    expires_at: None,
                 };
                 if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
                     self.report_legacy_turn_failure(

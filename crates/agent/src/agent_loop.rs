@@ -18,6 +18,7 @@ use pioneer_protocol::{
     TurnExecutionWindowContinuedNotification, TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
+use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -32,18 +33,12 @@ const TURN_CANCEL_GRACE_MS: u64 = 750;
 type TurnFlowFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecutionWindowMaxWindowsDecision {
-    Continue { next_window_index: u32 },
-    Block { total_windows: u32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionWindowTotalBudgetBlockKind {
     MaxWindows,
     MaxToolCalls,
     MaxWallClockMs,
     MaxProviderTokens,
-    MaxConsecutiveFailedWindows,
+    MaxConsecutiveNoProgressWindows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,47 +55,34 @@ enum ExecutionWindowTotalBudgetDecision {
     Block(ExecutionWindowTotalBudgetBlock),
 }
 
-fn decide_execution_window_max_windows(
-    current_window_count: u32,
-    max_windows_per_turn: u32,
-) -> ExecutionWindowMaxWindowsDecision {
-    let current_window_count = current_window_count.max(1);
-    let max_windows_per_turn = max_windows_per_turn.max(1);
-    if current_window_count >= max_windows_per_turn {
-        return ExecutionWindowMaxWindowsDecision::Block {
-            total_windows: current_window_count,
-        };
-    }
-
-    ExecutionWindowMaxWindowsDecision::Continue {
-        next_window_index: current_window_count.saturating_add(1).max(2),
-    }
-}
-
 fn decide_execution_window_total_budget(
     usage: &TurnExecutionUsageCounters,
     total_budget: &pioneer_tools::ExecutionWindowTotalBudgetConfig,
 ) -> ExecutionWindowTotalBudgetDecision {
-    let next_window_index = match decide_execution_window_max_windows(
-        usage.total_windows,
+    let next_window_index = match decide_execution_window_admission(
+        Some(usage.total_windows.max(1)),
         total_budget.max_windows_per_turn,
     ) {
-        ExecutionWindowMaxWindowsDecision::Continue { next_window_index } => next_window_index,
-        ExecutionWindowMaxWindowsDecision::Block { total_windows } => {
+        ExecutionWindowAdmissionDecision::Open { window_index } => window_index,
+        ExecutionWindowAdmissionDecision::Block {
+            total_windows,
+            max_windows_per_turn,
+        } => {
             return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
                 kind: ExecutionWindowTotalBudgetBlockKind::MaxWindows,
                 total_windows,
                 total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
                 reason: format!(
                     "max execution windows per turn reached: limit={}, observed={total_windows}",
-                    total_budget.max_windows_per_turn
+                    max_windows_per_turn
                 ),
             });
         }
     };
 
-    let max_tool_calls = u64::from(total_budget.max_tool_calls_per_turn.max(1));
-    if usage.total_tool_calls >= max_tool_calls {
+    if let Some(max_tool_calls) = total_budget.max_tool_calls_per_turn.map(u64::from)
+        && usage.total_tool_calls >= max_tool_calls
+    {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
             kind: ExecutionWindowTotalBudgetBlockKind::MaxToolCalls,
             total_windows: usage.total_windows,
@@ -141,15 +123,16 @@ fn decide_execution_window_total_budget(
         });
     }
 
-    let max_consecutive_failed_windows = total_budget.max_consecutive_failed_windows.max(1);
-    if usage.consecutive_failed_windows >= max_consecutive_failed_windows {
+    let max_consecutive_no_progress_windows =
+        total_budget.max_consecutive_no_progress_windows.max(1);
+    if usage.consecutive_no_progress_windows >= max_consecutive_no_progress_windows {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
-            kind: ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows,
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows,
             total_windows: usage.total_windows,
             total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
             reason: format!(
-                "max_consecutive_failed_windows reached: limit={max_consecutive_failed_windows}, observed={}",
-                usage.consecutive_failed_windows
+                "max_consecutive_no_progress_windows reached: limit={max_consecutive_no_progress_windows}, observed={}",
+                usage.consecutive_no_progress_windows
             ),
         });
     }
@@ -172,12 +155,30 @@ fn total_budget_block_exhaustion_reason(
         ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens => {
             pioneer_protocol::ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow
         }
-        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows => fallback,
+        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows => fallback,
     }
 }
 
 fn saturating_u32_from_u64(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn recovery_execution_window_admission_error(
+    turn_request: &ActiveTurnRequest,
+    tool_loop_config: &ToolLoopConfig,
+) -> Option<super::AgentControlError> {
+    turn_request.execution_checkpoint_context.as_ref()?;
+    match decide_execution_window_total_budget(
+        &turn_request.execution_usage,
+        &tool_loop_config.execution_windows.total.normalized(),
+    ) {
+        ExecutionWindowTotalBudgetDecision::Continue { .. } => None,
+        ExecutionWindowTotalBudgetDecision::Block(block) => Some(
+            super::AgentControlError::ExecutionWindowContinuationBlocked {
+                reason: block.reason,
+            },
+        ),
+    }
 }
 
 // Agent turn execution composes prompt, hook, provider, and tool-loop futures; keep it off worker stacks.
@@ -247,10 +248,10 @@ pub(super) async fn run_agent_loop(
                     .as_ref()
                     .map(ExecutionCheckpointContext::next_window_index)
                     .unwrap_or(1);
-                let mut execution_usage = super::TurnExecutionUsageCounters::default();
-                if let Some(context) = execution_checkpoint_context.as_ref() {
-                    execution_usage.observe_checkpoint_payload(&context.payload);
-                }
+                let execution_usage = execution_checkpoint_context
+                    .as_ref()
+                    .map(|context| super::TurnExecutionUsageCounters::from_snapshot(context.usage))
+                    .unwrap_or_default();
 
                 let turn_request = ActiveTurnRequest {
                     turn_id: turn_id.clone(),
@@ -511,6 +512,8 @@ pub(super) async fn run_agent_loop(
                             }
                         };
                         next_turn_request.execution_window_index = next_window_index;
+                        next_turn_request.retained_provider_history =
+                            continuation.provider_history.clone();
                         next_turn_request.execution_options.continue_generation_hint = true;
                         next_turn_request.execution_checkpoint_context =
                             Some(ExecutionCheckpointContext {
@@ -519,6 +522,7 @@ pub(super) async fn run_agent_loop(
                                 checkpoint_id: continuation.checkpoint_id.clone(),
                                 checkpoint_kind: "execution_window_exhausted".to_owned(),
                                 payload: continuation.checkpoint_payload.clone(),
+                                usage: next_turn_request.execution_usage.snapshot(),
                             });
 
                         let provider = match provider_registry.get_or_create_for_workspace(
@@ -903,6 +907,12 @@ pub(super) async fn run_agent_loop(
                     let mut turn_request = turn_request;
 
                     super::apply_recovery_adjustments(&mut turn_request, &request);
+                    if let Some(error) =
+                        recovery_execution_window_admission_error(&turn_request, &tool_loop_config)
+                    {
+                        let _ = ack.send(Err(error));
+                        continue;
+                    }
 
                     if request.refresh_provider_auth {
                         provider_registry.invalidate(turn_request.provider_name.as_str());
@@ -1009,6 +1019,12 @@ pub(super) async fn run_agent_loop(
                 let mut turn_request = turn_request;
 
                 super::apply_recovery_adjustments(&mut turn_request, &request);
+                if let Some(error) =
+                    recovery_execution_window_admission_error(&turn_request, &tool_loop_config)
+                {
+                    let _ = ack.send(Err(error));
+                    continue;
+                }
 
                 if let Some(task) = active_turn_task.take() {
                     task.abort();
@@ -1122,6 +1138,12 @@ pub(super) async fn run_agent_loop(
                 };
 
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
+                if let Some(error) =
+                    recovery_execution_window_admission_error(&active_request, &tool_loop_config)
+                {
+                    let _ = ack.send(Err(error));
+                    continue;
+                }
 
                 if recovery_request.refresh_provider_auth {
                     provider_registry.invalidate(active_request.provider_name.as_str());
@@ -1550,9 +1572,8 @@ async fn cleanup_attached_tasks(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionWindowMaxWindowsDecision, ExecutionWindowTotalBudgetBlockKind,
-        ExecutionWindowTotalBudgetDecision, TurnExecutionUsageCounters,
-        decide_execution_window_max_windows, decide_execution_window_total_budget,
+        ExecutionWindowTotalBudgetBlockKind, ExecutionWindowTotalBudgetDecision,
+        TurnExecutionUsageCounters, decide_execution_window_total_budget,
     };
 
     fn total_budget(
@@ -1562,18 +1583,20 @@ mod tests {
         max_provider_tokens_per_turn: Option<u64>,
     ) -> pioneer_tools::ExecutionWindowTotalBudgetConfig {
         pioneer_tools::ExecutionWindowTotalBudgetConfig {
-            max_windows_per_turn,
-            max_tool_calls_per_turn,
+            max_windows_per_turn: Some(max_windows_per_turn),
+            max_tool_calls_per_turn: Some(max_tool_calls_per_turn),
             max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn,
-            max_consecutive_failed_windows: 3,
+            max_consecutive_no_progress_windows: 3,
         }
     }
 
-    fn checkpoint_payload_with_tool_counts(
+    fn checkpoint_payload(
         window_index: u32,
+        agent_round_count: u32,
         succeeded_count: u32,
         failed_count: u32,
+        exhaustion_reason: pioneer_protocol::ExecutionWindowExhaustionReason,
     ) -> pioneer_protocol::ExecutionCheckpointPayload {
         let executed_count = succeeded_count.saturating_add(failed_count);
         pioneer_protocol::build_execution_checkpoint_payload(
@@ -1592,23 +1615,19 @@ mod tests {
                 window_index,
                 started_at_unix_ms: Some(i64::from(window_index) * 1_000),
                 completed_at_unix_ms: Some(i64::from(window_index) * 1_000 + 100),
-                agent_round_count: 1,
+                agent_round_count,
                 tool_call_count: executed_count,
                 provider_token_count: Some(10),
-                exhaustion_reason: Some(
-                    pioneer_protocol::ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
-                ),
+                exhaustion_reason: Some(exhaustion_reason),
             },
             pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
                 model: Some("model".to_owned()),
                 model_provider: Some("provider".to_owned()),
-                agent_round_count: 1,
+                agent_round_count,
                 tool_call_count: executed_count,
                 provider_token_count: Some(10),
                 provider_usage_available: true,
-                exhaustion_reason: Some(
-                    pioneer_protocol::ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
-                ),
+                exhaustion_reason: Some(exhaustion_reason),
                 exhausted_limit: Some(u64::from(executed_count)),
                 exhausted_observed: Some(u64::from(executed_count)),
             },
@@ -1629,29 +1648,25 @@ mod tests {
     }
 
     #[test]
-    fn max_windows_decision_allows_continuation_below_limit() {
-        assert_eq!(
-            decide_execution_window_max_windows(1, 3),
-            ExecutionWindowMaxWindowsDecision::Continue {
-                next_window_index: 2
-            }
-        );
-    }
+    fn total_budget_decision_blocks_at_max_windows() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 3,
+            total_tool_calls: 2,
+            total_wall_clock_ms: 100,
+            total_provider_tokens: 0,
+            provider_token_usage_unknown: false,
+            consecutive_no_progress_windows: 0,
+        };
 
-    #[test]
-    fn max_windows_decision_blocks_at_exact_limit() {
-        assert_eq!(
-            decide_execution_window_max_windows(3, 3),
-            ExecutionWindowMaxWindowsDecision::Block { total_windows: 3 }
-        );
-    }
+        let decision =
+            decide_execution_window_total_budget(&usage, &total_budget(3, 12, Some(10_000), None));
 
-    #[test]
-    fn max_windows_decision_blocks_above_limit() {
-        assert_eq!(
-            decide_execution_window_max_windows(4, 3),
-            ExecutionWindowMaxWindowsDecision::Block { total_windows: 4 }
-        );
+        let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
+            panic!("total window budget should block continuation");
+        };
+        assert_eq!(block.kind, ExecutionWindowTotalBudgetBlockKind::MaxWindows);
+        assert_eq!(block.total_windows, 3);
+        assert!(block.reason.contains("limit=3, observed=3"));
     }
 
     #[test]
@@ -1662,7 +1677,7 @@ mod tests {
             total_wall_clock_ms: 100,
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
-            consecutive_failed_windows: 0,
+            consecutive_no_progress_windows: 0,
         };
 
         let decision =
@@ -1688,7 +1703,7 @@ mod tests {
             total_wall_clock_ms: 5_000,
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
-            consecutive_failed_windows: 0,
+            consecutive_no_progress_windows: 0,
         };
 
         let decision =
@@ -1714,7 +1729,7 @@ mod tests {
             total_wall_clock_ms: 500,
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: false,
-            consecutive_failed_windows: 0,
+            consecutive_no_progress_windows: 0,
         };
 
         let decision = decide_execution_window_total_budget(
@@ -1742,7 +1757,7 @@ mod tests {
             total_wall_clock_ms: 500,
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: true,
-            consecutive_failed_windows: 0,
+            consecutive_no_progress_windows: 0,
         };
 
         assert_eq!(
@@ -1757,50 +1772,90 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failed_window_accounting_increments_on_failure_heavy_windows() {
+    fn default_total_budget_allows_long_running_turns() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 96,
+            total_tool_calls: 12_000,
+            total_wall_clock_ms: 259_200_000,
+            total_provider_tokens: 2_000_000,
+            provider_token_usage_unknown: false,
+            consecutive_no_progress_windows: 0,
+        };
+
+        assert_eq!(
+            decide_execution_window_total_budget(
+                &usage,
+                &pioneer_tools::ExecutionWindowTotalBudgetConfig::default()
+            ),
+            ExecutionWindowTotalBudgetDecision::Continue {
+                next_window_index: 97
+            }
+        );
+    }
+
+    #[test]
+    fn no_progress_accounting_increments_only_for_empty_recovery_windows() {
         let mut usage = TurnExecutionUsageCounters::default();
 
-        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(1, 1, 3));
+        usage.observe_checkpoint_payload(&checkpoint_payload(
+            1,
+            0,
+            0,
+            0,
+            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+        ));
 
         assert_eq!(usage.total_windows, 1);
-        assert_eq!(usage.consecutive_failed_windows, 1);
+        assert_eq!(usage.consecutive_no_progress_windows, 1);
     }
 
     #[test]
-    fn consecutive_failed_window_accounting_resets_on_non_failure_heavy_window() {
+    fn durable_progress_resets_no_progress_accounting_even_when_tools_fail() {
         let mut usage = TurnExecutionUsageCounters::default();
 
-        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(1, 0, 2));
-        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(2, 2, 1));
+        usage.observe_checkpoint_payload(&checkpoint_payload(
+            1,
+            0,
+            0,
+            0,
+            pioneer_protocol::ExecutionWindowExhaustionReason::ProviderFailureContinuation,
+        ));
+        usage.observe_checkpoint_payload(&checkpoint_payload(
+            2,
+            1,
+            0,
+            3,
+            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+        ));
 
         assert_eq!(usage.total_windows, 2);
-        assert_eq!(usage.consecutive_failed_windows, 0);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
     }
 
     #[test]
-    fn total_budget_decision_blocks_on_consecutive_failed_windows() {
+    fn total_budget_decision_blocks_on_consecutive_no_progress_windows() {
         let usage = TurnExecutionUsageCounters {
             total_windows: 3,
-            total_tool_calls: 9,
+            total_tool_calls: 0,
             total_wall_clock_ms: 300,
-            total_provider_tokens: 30,
-            provider_token_usage_unknown: false,
-            consecutive_failed_windows: 3,
+            total_provider_tokens: 0,
+            provider_token_usage_unknown: true,
+            consecutive_no_progress_windows: 3,
         };
 
         let mut budget = total_budget(8, 100, Some(10_000), None);
-        budget.max_consecutive_failed_windows = 3;
+        budget.max_consecutive_no_progress_windows = 3;
         let decision = decide_execution_window_total_budget(&usage, &budget);
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
-            panic!("consecutive failed-window budget should block continuation");
+            panic!("consecutive no-progress budget should block continuation");
         };
         assert_eq!(
             block.kind,
-            ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows
+            ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows
         );
         assert_eq!(block.total_windows, 3);
-        assert_eq!(block.total_tool_calls, 9);
-        assert!(block.reason.contains("max_consecutive_failed_windows"));
+        assert_eq!(block.total_tool_calls, 0);
+        assert!(block.reason.contains("max_consecutive_no_progress_windows"));
     }
 }

@@ -681,6 +681,12 @@ fn execution_window_exhaustion_reason(
         ToolLoopBudgetReason::ToolCallsExceeded => {
             ExecutionWindowExhaustionReason::MaxToolCallsPerWindow
         }
+        ToolLoopBudgetReason::WallClockExceeded => {
+            ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow
+        }
+        ToolLoopBudgetReason::ProviderTokensExceeded => {
+            ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow
+        }
         ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled => {
             ExecutionWindowExhaustionReason::ProviderFailureContinuation
         }
@@ -724,6 +730,7 @@ fn build_execution_window_continuation(
         exhausted_window_id,
         checkpoint_id,
         checkpoint_payload: payload,
+        provider_history: Vec::new(),
         exhausted_limit,
         exhausted_observed,
         reason_code: reason_code.to_owned(),
@@ -2065,6 +2072,28 @@ fn append_recovered_provider_history(
 ) {
     retained_context.sort_by_key(|context| context.sequence);
     messages.extend(retained_context.into_iter().map(|context| context.message));
+}
+
+fn next_retained_provider_history_sequence(
+    retained_context: &[RetainedProviderHistoryMessage],
+) -> i64 {
+    retained_context
+        .iter()
+        .map(|context| context.sequence)
+        .max()
+        .map_or(0, |sequence| sequence.saturating_add(1))
+}
+
+fn retain_provider_history_message(
+    retained_context: &mut Vec<RetainedProviderHistoryMessage>,
+    next_sequence: &mut i64,
+    message: &ChatMessage,
+) {
+    retained_context.push(RetainedProviderHistoryMessage {
+        sequence: *next_sequence,
+        message: message.clone(),
+    });
+    *next_sequence = next_sequence.saturating_add(1);
 }
 
 fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
@@ -3928,18 +3957,18 @@ async fn execute_agent_provider_response(
     ));
 
     messages.push(user_message);
-    append_recovered_provider_history(&mut messages, retained_provider_history);
+    let mut continuation_provider_history = retained_provider_history;
+    let mut next_provider_history_sequence =
+        next_retained_provider_history_sequence(&continuation_provider_history);
+    append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
 
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
     let mut observed_review_required_signatures = BTreeSet::<String>::new();
     let mut observed_terminal_task_ids = BTreeSet::<String>::new();
     let window_budget = &tool_loop_config.execution_windows.window;
-    let mut tool_loop_guard = ToolLoopGuard::new(
-        pioneer_tools::ToolLoopBudgetConfig {
-            max_agent_rounds_per_turn: window_budget.max_agent_rounds_per_window,
-            max_tool_calls_per_turn: window_budget.max_tool_calls_per_window,
-        },
+    let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
+        window_budget.clone(),
         tool_loop_final_answer_instruction(),
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
@@ -4356,9 +4385,11 @@ async fn execute_agent_provider_response(
                 return Ok(AgentProviderLoopOutcome::Completed);
             }
 
-            match tool_loop_guard
-                .after_provider_round(round_plan.tools_enabled, round.tool_calls.len())
-            {
+            match tool_loop_guard.after_provider_round_with_usage(
+                round_plan.tools_enabled,
+                round.tool_calls.len(),
+                round.provider_token_count,
+            ) {
                 ToolLoopGuardDecision::Continue => {}
                 ToolLoopGuardDecision::RequestContinuation { budget_exceeded } => {
                     emit_tool_loop_budget_exceeded(
@@ -4876,6 +4907,11 @@ async fn execute_agent_provider_response(
             )
             .await
             .map_err(|error| (error, current_thinking_id.clone()))?;
+            retain_provider_history_message(
+                &mut continuation_provider_history,
+                &mut next_provider_history_sequence,
+                &assistant_round,
+            );
             messages.push(assistant_round);
 
             let tool_tasks = round
@@ -5250,7 +5286,11 @@ async fn execute_agent_provider_response(
 
             let parallel_tool_calls = tool_tasks.len().max(1);
             let executed_results = stream::iter(tool_tasks)
-                .map(|task| async move {
+                .map(|task| {
+                    let event_tx = event_tx.clone();
+                    let thread_id = thread_id.to_owned();
+                    let turn_id = turn_id.to_owned();
+                    async move {
                     let SpawnedToolTask {
                         item_id,
                         item_type,
@@ -5258,26 +5298,28 @@ async fn execute_agent_provider_response(
                         arguments,
                         handle,
                     } = task;
-                    match handle.join().await {
+                    let result = match handle.join().await {
                         Ok(result) => result,
                         Err(error) => joined_tool_task_failure_result(
                             item_id, item_type, tool_name, arguments, error,
                         ),
-                    }
+                    };
+                    persist_retained_tool_result(
+                        event_tx.as_ref(),
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        &result,
+                    )
+                    .await?;
+                    Ok::<ExecutedToolResult, ChatTurnError>(result)
+                }
                 })
                 .buffer_unordered(parallel_tool_calls)
                 .collect::<Vec<_>>()
-                .await;
-            for result in &executed_results {
-                persist_retained_tool_result(
-                    event_tx.as_ref(),
-                    thread_id,
-                    turn_id,
-                    result,
-                )
                 .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-            }
             window_stats.record_executed_tools(&executed_results);
 
             apply_request_tools_results_to_visible_tools(
@@ -5411,6 +5453,13 @@ async fn execute_agent_provider_response(
                 applied_retry_instruction = next_retry_instruction;
             }
 
+            for result in &executed_results {
+                retain_provider_history_message(
+                    &mut continuation_provider_history,
+                    &mut next_provider_history_sequence,
+                    &result.message,
+                );
+            }
             messages.extend(executed_results.into_iter().map(|result| result.message));
 
             current_thinking_id = start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
@@ -5447,7 +5496,8 @@ async fn execute_agent_provider_response(
                 )),
             })
         }
-        Ok(AgentProviderLoopOutcome::NeedsContinuation(continuation)) => {
+        Ok(AgentProviderLoopOutcome::NeedsContinuation(mut continuation)) => {
+            continuation.provider_history = continuation_provider_history;
             Ok(ChatTurnOutcome::NeedsContinuation(continuation))
         }
         Err((error, thinking_id)) => {
@@ -6013,6 +6063,7 @@ mod tests {
             window_index: 1,
             checkpoint_id: "checkpoint_1".to_owned(),
             checkpoint_kind: "execution_window_exhausted".to_owned(),
+            usage: crate::ExecutionWindowUsageSnapshot::default(),
             payload: ExecutionCheckpointPayload {
                 schema_version: 1,
                 workspace_id: "workspace_1".to_owned(),

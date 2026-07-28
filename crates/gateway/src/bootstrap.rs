@@ -49,11 +49,10 @@ async fn cleanup_turn_llm_context(connection: &DatabaseConnection) -> Result<(u6
         .delete_turn_llm_context_for_terminal_turns()
         .await
         .context("failed to cleanup terminal turn_llm_context rows during bootstrap")?;
-    let expired = store
-        .delete_expired_turn_llm_context()
-        .await
-        .context("failed to cleanup expired turn_llm_context rows during bootstrap")?;
-    Ok((terminal, expired))
+    // Active turns may run indefinitely. Historical rows can carry the legacy seven-day
+    // expires_at value, but they remain part of the only lossless provider replay journal until
+    // the turn reaches a terminal state.
+    Ok((terminal, 0))
 }
 
 async fn repair_turns_completed_after_final_agent_message(
@@ -255,7 +254,7 @@ mod tests {
             .await
             .expect("cleanup should succeed");
         assert_eq!(deleted_terminal, 1);
-        assert_eq!(deleted_expired, 1);
+        assert_eq!(deleted_expired, 0);
         assert!(
             store
                 .list_turn_llm_context("terminal_turn")
@@ -263,13 +262,12 @@ mod tests {
                 .expect("context list should succeed")
                 .is_empty()
         );
-        assert!(
-            store
-                .list_turn_llm_context("active_turn")
-                .await
-                .expect("active context list should succeed")
-                .is_empty()
-        );
+        let active_context = store
+            .list_turn_llm_context("active_turn")
+            .await
+            .expect("active context list should succeed");
+        assert_eq!(active_context.len(), 1);
+        assert_eq!(active_context[0].item_id.as_deref(), Some("item_2"));
     }
 
     #[tokio::test]

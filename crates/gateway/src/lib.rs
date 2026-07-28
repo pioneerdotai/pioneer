@@ -844,7 +844,7 @@ fn execution_windows_config_from_gateway_execution_windows_config(
             max_tool_calls_per_turn: config.total.max_tool_calls_per_turn,
             max_wall_clock_ms_per_turn: config.total.max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn: config.total.max_provider_tokens_per_turn,
-            max_consecutive_failed_windows: config.total.max_consecutive_failed_windows,
+            max_consecutive_no_progress_windows: config.total.max_consecutive_no_progress_windows,
         },
     }
     .normalized()
@@ -853,20 +853,16 @@ fn execution_windows_config_from_gateway_execution_windows_config(
 fn legacy_execution_windows_config_from_gateway_budget_config(
     config: &GatewayToolLoopBudgetConfig,
 ) -> ExecutionWindowsConfig {
+    let window_default = ExecutionWindowBudgetConfig::default();
     let total_default = ExecutionWindowTotalBudgetConfig::default();
     ExecutionWindowsConfig {
         window: ExecutionWindowBudgetConfig {
             max_agent_rounds_per_window: config.max_agent_rounds_per_turn,
             max_tool_calls_per_window: config.max_tool_calls_per_turn,
-            max_wall_clock_ms_per_window: None,
+            max_wall_clock_ms_per_window: window_default.max_wall_clock_ms_per_window,
             max_provider_tokens_per_window: None,
         },
-        total: ExecutionWindowTotalBudgetConfig {
-            max_tool_calls_per_turn: total_default
-                .max_tool_calls_per_turn
-                .max(config.max_tool_calls_per_turn),
-            ..total_default
-        },
+        total: ExecutionWindowTotalBudgetConfig { ..total_default },
     }
     .normalized()
 }
@@ -1312,7 +1308,8 @@ mod tests {
 
         assert_eq!(config.window.max_agent_rounds_per_window, 17);
         assert_eq!(config.window.max_tool_calls_per_window, 23);
-        assert_eq!(config.total.max_tool_calls_per_turn, 4096);
+        assert_eq!(config.window.max_wall_clock_ms_per_window, Some(1_800_000));
+        assert_eq!(config.total.max_tool_calls_per_turn, None);
     }
 
     #[test]
@@ -1330,11 +1327,11 @@ mod tests {
                     max_provider_tokens_per_window: Some(2_000),
                 },
                 total: GatewayExecutionWindowTotalBudgetConfig {
-                    max_windows_per_turn: 5,
-                    max_tool_calls_per_turn: 41,
+                    max_windows_per_turn: Some(5),
+                    max_tool_calls_per_turn: Some(41),
                     max_wall_clock_ms_per_turn: Some(3_000),
                     max_provider_tokens_per_turn: Some(4_000),
-                    max_consecutive_failed_windows: 2,
+                    max_consecutive_no_progress_windows: 2,
                 },
             }),
             retry: GatewayToolRetryBudgetConfig::default(),
@@ -1345,11 +1342,11 @@ mod tests {
         assert_eq!(config.window.max_tool_calls_per_window, 37);
         assert_eq!(config.window.max_wall_clock_ms_per_window, Some(1_000));
         assert_eq!(config.window.max_provider_tokens_per_window, Some(2_000));
-        assert_eq!(config.total.max_windows_per_turn, 5);
-        assert_eq!(config.total.max_tool_calls_per_turn, 41);
+        assert_eq!(config.total.max_windows_per_turn, Some(5));
+        assert_eq!(config.total.max_tool_calls_per_turn, Some(41));
         assert_eq!(config.total.max_wall_clock_ms_per_turn, Some(3_000));
         assert_eq!(config.total.max_provider_tokens_per_turn, Some(4_000));
-        assert_eq!(config.total.max_consecutive_failed_windows, 2);
+        assert_eq!(config.total.max_consecutive_no_progress_windows, 2);
     }
 
     #[test]

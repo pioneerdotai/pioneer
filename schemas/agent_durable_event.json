@@ -188,6 +188,38 @@
       ]
     },
     {
+      "description": "Exact provider-facing assistant message retained for crash recovery.\nThe payload is owned by the provider boundary and must be replayed\nunchanged; protocol and gateway code only persist it.",
+      "type": "object",
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "turn_provider_history_appended"
+        },
+        "payload": true,
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "sequence",
+        "payload"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -7183,6 +7215,8 @@
       "enum": [
         "agent_rounds",
         "tool_calls",
+        "wall_clock_ms",
+        "provider_tokens",
         "provider_returned_tools_after_tools_disabled"
       ]
     },

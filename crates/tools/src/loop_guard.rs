@@ -7,8 +7,8 @@ pub struct ToolLoopBudgetConfig {
 impl Default for ToolLoopBudgetConfig {
     fn default() -> Self {
         Self {
-            max_agent_rounds_per_turn: 512,
-            max_tool_calls_per_turn: 2048,
+            max_agent_rounds_per_turn: 32,
+            max_tool_calls_per_turn: 128,
         }
     }
 }
@@ -33,9 +33,9 @@ pub struct ExecutionWindowBudgetConfig {
 impl Default for ExecutionWindowBudgetConfig {
     fn default() -> Self {
         Self {
-            max_agent_rounds_per_window: 512,
-            max_tool_calls_per_window: 2048,
-            max_wall_clock_ms_per_window: None,
+            max_agent_rounds_per_window: 32,
+            max_tool_calls_per_window: 128,
+            max_wall_clock_ms_per_window: Some(1_800_000),
             max_provider_tokens_per_window: None,
         }
     }
@@ -69,21 +69,21 @@ impl From<ToolLoopBudgetConfig> for ExecutionWindowBudgetConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionWindowTotalBudgetConfig {
-    pub max_windows_per_turn: u32,
-    pub max_tool_calls_per_turn: u32,
+    pub max_windows_per_turn: Option<u32>,
+    pub max_tool_calls_per_turn: Option<u32>,
     pub max_wall_clock_ms_per_turn: Option<u64>,
     pub max_provider_tokens_per_turn: Option<u64>,
-    pub max_consecutive_failed_windows: u32,
+    pub max_consecutive_no_progress_windows: u32,
 }
 
 impl Default for ExecutionWindowTotalBudgetConfig {
     fn default() -> Self {
         Self {
-            max_windows_per_turn: 16,
-            max_tool_calls_per_turn: 4096,
-            max_wall_clock_ms_per_turn: Some(86_400_000),
+            max_windows_per_turn: None,
+            max_tool_calls_per_turn: None,
+            max_wall_clock_ms_per_turn: None,
             max_provider_tokens_per_turn: None,
-            max_consecutive_failed_windows: 3,
+            max_consecutive_no_progress_windows: 3,
         }
     }
 }
@@ -91,13 +91,13 @@ impl Default for ExecutionWindowTotalBudgetConfig {
 impl ExecutionWindowTotalBudgetConfig {
     pub fn normalized(&self) -> Self {
         Self {
-            max_windows_per_turn: self.max_windows_per_turn.max(1),
-            max_tool_calls_per_turn: self.max_tool_calls_per_turn.max(1),
+            max_windows_per_turn: self.max_windows_per_turn.map(|value| value.max(1)),
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn.map(|value| value.max(1)),
             max_wall_clock_ms_per_turn: self.max_wall_clock_ms_per_turn.map(|value| value.max(1)),
             max_provider_tokens_per_turn: self
                 .max_provider_tokens_per_turn
                 .map(|value| value.max(1)),
-            max_consecutive_failed_windows: self.max_consecutive_failed_windows.max(1),
+            max_consecutive_no_progress_windows: self.max_consecutive_no_progress_windows.max(1),
         }
     }
 }
@@ -118,9 +118,50 @@ impl ExecutionWindowsConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionWindowAdmissionDecision {
+    Open {
+        window_index: u32,
+    },
+    Block {
+        total_windows: u32,
+        max_windows_per_turn: u32,
+    },
+}
+
+pub fn decide_execution_window_admission(
+    latest_window_index: Option<u32>,
+    max_windows_per_turn: Option<u32>,
+) -> ExecutionWindowAdmissionDecision {
+    let latest_window_index = latest_window_index.unwrap_or_default();
+    if latest_window_index == 0 {
+        return ExecutionWindowAdmissionDecision::Open { window_index: 1 };
+    }
+    if let Some(max_windows_per_turn) = max_windows_per_turn.map(|value| value.max(1))
+        && latest_window_index >= max_windows_per_turn
+    {
+        return ExecutionWindowAdmissionDecision::Block {
+            total_windows: latest_window_index,
+            max_windows_per_turn,
+        };
+    }
+    if latest_window_index == u32::MAX {
+        return ExecutionWindowAdmissionDecision::Block {
+            total_windows: latest_window_index,
+            max_windows_per_turn: u32::MAX,
+        };
+    }
+
+    ExecutionWindowAdmissionDecision::Open {
+        window_index: latest_window_index + 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolLoopBudgetReason {
     AgentRoundsExceeded,
     ToolCallsExceeded,
+    WallClockExceeded,
+    ProviderTokensExceeded,
     ProviderReturnedToolsAfterToolsDisabled,
 }
 
@@ -129,6 +170,8 @@ impl ToolLoopBudgetReason {
         match self {
             Self::AgentRoundsExceeded => "max_agent_rounds_per_window",
             Self::ToolCallsExceeded => "max_tool_calls_per_window",
+            Self::WallClockExceeded => "max_wall_clock_ms_per_window",
+            Self::ProviderTokensExceeded => "max_provider_tokens_per_window",
             Self::ProviderReturnedToolsAfterToolsDisabled => {
                 "provider_returned_tools_after_tools_disabled"
             }
@@ -177,9 +220,12 @@ pub struct ToolLoopBudgetExceeded {
 
 #[derive(Debug)]
 pub struct ToolLoopGuard {
-    budget: ToolLoopBudgetConfig,
+    budget: ExecutionWindowBudgetConfig,
     tool_capable_rounds: u32,
     total_tool_calls: u32,
+    provider_token_count: u64,
+    provider_token_usage_unknown: bool,
+    started_at: std::time::Instant,
     final_no_tools_mode: bool,
     final_no_tools_instruction: String,
 }
@@ -189,16 +235,31 @@ impl ToolLoopGuard {
         budget: ToolLoopBudgetConfig,
         final_no_tools_instruction: impl Into<String>,
     ) -> Self {
+        Self::new_execution_window(budget.into(), final_no_tools_instruction)
+    }
+
+    pub fn new_execution_window(
+        budget: ExecutionWindowBudgetConfig,
+        final_no_tools_instruction: impl Into<String>,
+    ) -> Self {
         Self {
             budget: budget.normalized(),
             tool_capable_rounds: 0,
             total_tool_calls: 0,
+            provider_token_count: 0,
+            provider_token_usage_unknown: false,
+            started_at: std::time::Instant::now(),
             final_no_tools_mode: false,
             final_no_tools_instruction: final_no_tools_instruction.into(),
         }
     }
 
     pub fn begin_provider_round(&mut self) -> Result<ToolLoopRoundPlan, String> {
+        let elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.begin_provider_round_at(elapsed_ms)
+    }
+
+    fn begin_provider_round_at(&mut self, elapsed_ms: u64) -> Result<ToolLoopRoundPlan, String> {
         if self.final_no_tools_mode {
             // The guard owns capability mode, not response validation. A validator may reject
             // a no-tools response and request another provider round; its own bounded policy
@@ -211,10 +272,19 @@ impl ToolLoopGuard {
             });
         }
 
-        if self.tool_capable_rounds >= self.budget.max_agent_rounds_per_turn {
+        if let Some(budget_exceeded) = self.periodic_budget_exceeded(elapsed_ms) {
+            return Ok(ToolLoopRoundPlan {
+                action: ToolLoopRoundAction::RequestContinuation,
+                tools_enabled: false,
+                final_instruction: None,
+                budget_exceeded: Some(budget_exceeded),
+            });
+        }
+
+        if self.tool_capable_rounds >= self.budget.max_agent_rounds_per_window {
             let budget_exceeded = ToolLoopBudgetExceeded {
                 reason: ToolLoopBudgetReason::AgentRoundsExceeded,
-                limit: self.budget.max_agent_rounds_per_turn,
+                limit: self.budget.max_agent_rounds_per_window,
                 observed: self.tool_capable_rounds,
                 action: ToolLoopBudgetAction::ContinueInNextWindow,
             };
@@ -240,6 +310,41 @@ impl ToolLoopGuard {
         tools_enabled: bool,
         tool_call_count: usize,
     ) -> ToolLoopGuardDecision {
+        self.after_provider_round_with_usage(tools_enabled, tool_call_count, None)
+    }
+
+    pub fn after_provider_round_with_usage(
+        &mut self,
+        tools_enabled: bool,
+        tool_call_count: usize,
+        provider_token_count: Option<u64>,
+    ) -> ToolLoopGuardDecision {
+        let elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.after_provider_round_at(
+            tools_enabled,
+            tool_call_count,
+            provider_token_count,
+            elapsed_ms,
+        )
+    }
+
+    fn after_provider_round_at(
+        &mut self,
+        tools_enabled: bool,
+        tool_call_count: usize,
+        provider_token_count: Option<u64>,
+        elapsed_ms: u64,
+    ) -> ToolLoopGuardDecision {
+        match provider_token_count {
+            Some(provider_token_count) if !self.provider_token_usage_unknown => {
+                self.provider_token_count = self
+                    .provider_token_count
+                    .saturating_add(provider_token_count);
+            }
+            None => self.provider_token_usage_unknown = true,
+            Some(_) => {}
+        }
+
         if !tools_enabled {
             if tool_call_count > 0 {
                 let observed = u32::try_from(tool_call_count).unwrap_or(u32::MAX);
@@ -258,11 +363,11 @@ impl ToolLoopGuard {
 
         let tool_call_count = u32::try_from(tool_call_count).unwrap_or(u32::MAX);
         let next_total = self.total_tool_calls.saturating_add(tool_call_count);
-        if next_total > self.budget.max_tool_calls_per_turn {
+        if next_total > self.budget.max_tool_calls_per_window {
             return ToolLoopGuardDecision::RequestContinuation {
                 budget_exceeded: ToolLoopBudgetExceeded {
                     reason: ToolLoopBudgetReason::ToolCallsExceeded,
-                    limit: self.budget.max_tool_calls_per_turn,
+                    limit: self.budget.max_tool_calls_per_window,
                     observed: next_total,
                     action: ToolLoopBudgetAction::ContinueInNextWindow,
                 },
@@ -270,7 +375,40 @@ impl ToolLoopGuard {
         }
 
         self.total_tool_calls = next_total;
+        if tool_call_count > 0
+            && let Some(budget_exceeded) = self.periodic_budget_exceeded(elapsed_ms)
+        {
+            return ToolLoopGuardDecision::RequestContinuation { budget_exceeded };
+        }
+
         ToolLoopGuardDecision::Continue
+    }
+
+    fn periodic_budget_exceeded(&self, elapsed_ms: u64) -> Option<ToolLoopBudgetExceeded> {
+        if let Some(limit) = self.budget.max_wall_clock_ms_per_window
+            && elapsed_ms >= limit
+        {
+            return Some(ToolLoopBudgetExceeded {
+                reason: ToolLoopBudgetReason::WallClockExceeded,
+                limit: u32::try_from(limit).unwrap_or(u32::MAX),
+                observed: u32::try_from(elapsed_ms).unwrap_or(u32::MAX),
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
+            });
+        }
+
+        if let Some(limit) = self.budget.max_provider_tokens_per_window
+            && !self.provider_token_usage_unknown
+            && self.provider_token_count >= limit
+        {
+            return Some(ToolLoopBudgetExceeded {
+                reason: ToolLoopBudgetReason::ProviderTokensExceeded,
+                limit: u32::try_from(limit).unwrap_or(u32::MAX),
+                observed: u32::try_from(self.provider_token_count).unwrap_or(u32::MAX),
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
+            });
+        }
+
+        None
     }
 
     pub fn request_final_answer_with_instruction(
@@ -312,9 +450,200 @@ mod tests {
             "max_tool_calls_per_window"
         );
         assert_eq!(
+            ToolLoopBudgetReason::WallClockExceeded.code(),
+            "max_wall_clock_ms_per_window"
+        );
+        assert_eq!(
+            ToolLoopBudgetReason::ProviderTokensExceeded.code(),
+            "max_provider_tokens_per_window"
+        );
+        assert_eq!(
             ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled.code(),
             "provider_returned_tools_after_tools_disabled"
         );
+    }
+
+    #[test]
+    fn default_window_budget_creates_periodic_checkpoint_boundaries() {
+        let budget = ExecutionWindowBudgetConfig::default();
+
+        assert_eq!(budget.max_agent_rounds_per_window, 32);
+        assert_eq!(budget.max_tool_calls_per_window, 128);
+        assert_eq!(budget.max_wall_clock_ms_per_window, Some(1_800_000));
+        assert_eq!(budget.max_provider_tokens_per_window, None);
+    }
+
+    #[test]
+    fn execution_window_admission_opens_first_window_without_history() {
+        assert_eq!(
+            decide_execution_window_admission(None, None),
+            ExecutionWindowAdmissionDecision::Open { window_index: 1 }
+        );
+    }
+
+    #[test]
+    fn execution_window_admission_increments_the_latest_index() {
+        assert_eq!(
+            decide_execution_window_admission(Some(7), None),
+            ExecutionWindowAdmissionDecision::Open { window_index: 8 }
+        );
+    }
+
+    #[test]
+    fn execution_window_admission_has_no_default_lifetime_cap() {
+        assert_eq!(
+            decide_execution_window_admission(Some(44), None),
+            ExecutionWindowAdmissionDecision::Open { window_index: 45 }
+        );
+    }
+
+    #[test]
+    fn execution_window_admission_honors_an_explicit_administrative_limit() {
+        for total_windows in [16, 44] {
+            assert_eq!(
+                decide_execution_window_admission(Some(total_windows), Some(16)),
+                ExecutionWindowAdmissionDecision::Block {
+                    total_windows,
+                    max_windows_per_turn: 16,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn elapsed_window_requests_continuation_before_next_provider_round() {
+        let mut guard = ToolLoopGuard::new_execution_window(
+            ExecutionWindowBudgetConfig {
+                max_agent_rounds_per_window: 8,
+                max_tool_calls_per_window: 8,
+                max_wall_clock_ms_per_window: Some(100),
+                max_provider_tokens_per_window: None,
+            },
+            "final answer only",
+        );
+
+        let continuation = guard
+            .begin_provider_round_at(100)
+            .expect("elapsed window should request continuation");
+
+        assert_eq!(
+            continuation.action,
+            ToolLoopRoundAction::RequestContinuation
+        );
+        assert!(matches!(
+            continuation.budget_exceeded,
+            Some(ToolLoopBudgetExceeded {
+                reason: ToolLoopBudgetReason::WallClockExceeded,
+                limit: 100,
+                observed: 100,
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
+            })
+        ));
+    }
+
+    #[test]
+    fn elapsed_window_does_not_discard_a_valid_final_response() {
+        let mut guard = ToolLoopGuard::new_execution_window(
+            ExecutionWindowBudgetConfig {
+                max_agent_rounds_per_window: 8,
+                max_tool_calls_per_window: 8,
+                max_wall_clock_ms_per_window: Some(100),
+                max_provider_tokens_per_window: None,
+            },
+            "final answer only",
+        );
+        let round = guard
+            .begin_provider_round_at(0)
+            .expect("provider round should start");
+
+        assert!(matches!(
+            guard.after_provider_round_at(round.tools_enabled, 0, Some(10), 100),
+            ToolLoopGuardDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn elapsed_window_checkpoints_before_executing_a_new_tool_batch() {
+        let mut guard = ToolLoopGuard::new_execution_window(
+            ExecutionWindowBudgetConfig {
+                max_agent_rounds_per_window: 8,
+                max_tool_calls_per_window: 8,
+                max_wall_clock_ms_per_window: Some(100),
+                max_provider_tokens_per_window: None,
+            },
+            "final answer only",
+        );
+        let round = guard
+            .begin_provider_round_at(0)
+            .expect("provider round should start");
+
+        assert!(matches!(
+            guard.after_provider_round_at(round.tools_enabled, 1, Some(10), 100),
+            ToolLoopGuardDecision::RequestContinuation {
+                budget_exceeded: ToolLoopBudgetExceeded {
+                    reason: ToolLoopBudgetReason::WallClockExceeded,
+                    limit: 100,
+                    observed: 100,
+                    action: ToolLoopBudgetAction::ContinueInNextWindow,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_token_window_checkpoints_before_executing_a_new_tool_batch() {
+        let mut guard = ToolLoopGuard::new_execution_window(
+            ExecutionWindowBudgetConfig {
+                max_agent_rounds_per_window: 8,
+                max_tool_calls_per_window: 8,
+                max_wall_clock_ms_per_window: None,
+                max_provider_tokens_per_window: Some(100),
+            },
+            "final answer only",
+        );
+        let round = guard
+            .begin_provider_round_at(0)
+            .expect("provider round should start");
+
+        assert!(matches!(
+            guard.after_provider_round_at(round.tools_enabled, 1, Some(100), 0),
+            ToolLoopGuardDecision::RequestContinuation {
+                budget_exceeded: ToolLoopBudgetExceeded {
+                    reason: ToolLoopBudgetReason::ProviderTokensExceeded,
+                    limit: 100,
+                    observed: 100,
+                    action: ToolLoopBudgetAction::ContinueInNextWindow,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_provider_usage_does_not_guess_a_token_budget() {
+        let mut guard = ToolLoopGuard::new_execution_window(
+            ExecutionWindowBudgetConfig {
+                max_agent_rounds_per_window: 8,
+                max_tool_calls_per_window: 8,
+                max_wall_clock_ms_per_window: None,
+                max_provider_tokens_per_window: Some(100),
+            },
+            "final answer only",
+        );
+        let first = guard
+            .begin_provider_round_at(0)
+            .expect("first provider round should start");
+        assert!(matches!(
+            guard.after_provider_round_at(first.tools_enabled, 1, None, 0),
+            ToolLoopGuardDecision::Continue
+        ));
+        let second = guard
+            .begin_provider_round_at(0)
+            .expect("second provider round should start");
+
+        assert!(matches!(
+            guard.after_provider_round_at(second.tools_enabled, 1, Some(100), 0),
+            ToolLoopGuardDecision::Continue
+        ));
     }
 
     #[test]

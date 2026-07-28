@@ -64,9 +64,11 @@ pub use handlers::{
     materialize_skill_runtime_tools,
 };
 pub use loop_guard::{
-    ExecutionWindowBudgetConfig, ExecutionWindowTotalBudgetConfig, ExecutionWindowsConfig,
-    ToolLoopBudgetAction, ToolLoopBudgetConfig, ToolLoopBudgetExceeded, ToolLoopBudgetReason,
-    ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction, ToolLoopRoundPlan,
+    ExecutionWindowAdmissionDecision, ExecutionWindowBudgetConfig,
+    ExecutionWindowTotalBudgetConfig, ExecutionWindowsConfig, ToolLoopBudgetAction,
+    ToolLoopBudgetConfig, ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard,
+    ToolLoopGuardDecision, ToolLoopRoundAction, ToolLoopRoundPlan,
+    decide_execution_window_admission,
 };
 pub use mcp_policy::{enforce_mcp_network_policy, mcp_policy_classification_metadata};
 pub use network_policy::{

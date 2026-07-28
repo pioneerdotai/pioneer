@@ -1513,6 +1513,7 @@ struct SequencedToolProvider {
     first_tool_calls: Vec<pioneer_provider::ProviderToolCall>,
     second_text: String,
     preflight_response_text: String,
+    first_response_delay: Duration,
     next_index: AtomicUsize,
 }
 
@@ -1526,6 +1527,7 @@ impl SequencedToolProvider {
             first_tool_calls,
             second_text: second_text.into(),
             preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            first_response_delay: Duration::ZERO,
             next_index: AtomicUsize::new(0),
         }
     }
@@ -1540,8 +1542,14 @@ impl SequencedToolProvider {
             first_tool_calls,
             second_text: second_text.into(),
             preflight_response_text: preflight_response_text.into(),
+            first_response_delay: Duration::ZERO,
             next_index: AtomicUsize::new(0),
         }
+    }
+
+    fn with_first_response_delay(mut self, delay: Duration) -> Self {
+        self.first_response_delay = delay;
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -1588,6 +1596,11 @@ struct StaticTurnToolProvider {
 
 struct RetainingTraceHandler {
     retained_traces: Arc<std::sync::Mutex<Vec<ToolEventTrace>>>,
+}
+
+struct BatchJournalHandler {
+    slow_tool_name: String,
+    slow_release: Arc<tokio::sync::Semaphore>,
 }
 
 struct ReviewGuardProvider {
@@ -2343,6 +2356,30 @@ impl ToolHandler for RetainingTraceHandler {
     }
 }
 
+#[async_trait::async_trait]
+impl ToolHandler for BatchJournalHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        if invocation.tool_name == self.slow_tool_name {
+            let release = self.slow_release.clone();
+            tokio::select! {
+                permit = release.acquire_owned() => {
+                    permit.expect("slow tool release semaphore should stay open").forget();
+                }
+                _ = sleep(Duration::from_millis(500)) => {}
+            }
+        }
+
+        Ok(Box::new(FunctionToolOutput::new(
+            format!("{}-ok", invocation.tool_name),
+            true,
+        )))
+    }
+}
+
 fn fake_memory_tool_spec(name: &str) -> ConfiguredToolSpec {
     ConfiguredToolSpec::new(
         ToolSpec::new(
@@ -2697,6 +2734,9 @@ impl Provider for SequencedToolProvider {
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         if index == 0 {
+            if !self.first_response_delay.is_zero() {
+                sleep(self.first_response_delay).await;
+            }
             return Ok(ChatResponse {
                 text: String::new(),
                 usage: None,
@@ -4347,6 +4387,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     checkpoint_id: notification.checkpoint_id,
                     checkpoint_kind: notification.checkpoint_kind,
                     payload,
+                    usage: crate::ExecutionWindowUsageSnapshot::default(),
                 });
             }
             AgentDurableEvent::ProviderFailureDetected { .. } => {
@@ -9752,6 +9793,189 @@ async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_
 }
 
 #[tokio::test]
+async fn wall_clock_window_checkpoints_before_executing_the_next_tool_batch() {
+    let provider = Arc::new(
+        SequencedToolProvider::new(
+            vec![ProviderToolCall {
+                id: "call_after_elapsed_window".to_owned(),
+                name: "must_not_execute_after_elapsed_window".to_owned(),
+                arguments: serde_json::json!({}).to_string(),
+            }],
+            "final after time checkpoint",
+        )
+        .with_first_response_delay(Duration::from_millis(30)),
+    );
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 8, 8);
+    config.execution_windows.window.max_wall_clock_ms_per_window = Some(10);
+    let manager = AgentManager::new(registry, config);
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_wall_clock_window",
+        "ws_wall_clock_window",
+        "turn_wall_clock_window",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "test the elapsed execution window",
+    )
+    .await;
+
+    assert_turn_completed(&observed);
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnToolLoopBudgetExceeded(notification)
+            if notification.limit_kind == ToolLoopBudgetLimitKind::WallClockMs
+                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
+                && notification.limit == 10
+                && notification.observed >= 10
+    )));
+    assert!(
+        !observed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemStarted(ItemStartedNotification { item, .. })
+                | AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. })
+                if item.item_id() == "call_after_elapsed_window"
+        )),
+        "a tool batch returned after the wall-clock boundary must continue in a new window before execution"
+    );
+    assert_eq!(
+        completed_agent_message_text(&observed).as_deref(),
+        Some("final after time checkpoint")
+    );
+    assert_eq!(provider.snapshot_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes() {
+    let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler: Arc<dyn ToolHandler> = Arc::new(BatchJournalHandler {
+        slow_tool_name: "batch_slow".to_owned(),
+        slow_release: slow_release.clone(),
+    });
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![
+            ProviderToolCall {
+                id: "call_batch_fast".to_owned(),
+                name: "batch_fast".to_owned(),
+                arguments: serde_json::json!({}).to_string(),
+            },
+            ProviderToolCall {
+                id: "call_batch_slow".to_owned(),
+                name: "batch_slow".to_owned(),
+                arguments: serde_json::json!({}).to_string(),
+            },
+        ],
+        "final after parallel batch",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("sequenced-tools", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(&["batch_fast", "batch_slow"], handler),
+        })))
+        .await;
+    let thread_id = "thr_parallel_tool_journal";
+    let turn_id = "turn_parallel_tool_journal";
+    manager
+        .ensure_thread(thread_id, "ws_parallel_tool_journal")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run both batch tools".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut observed = Vec::new();
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("timed out waiting for parallel tool journal event")
+            .expect("agent event channel should stay open");
+        if matches!(
+            &event,
+            AgentEvent::TurnLlmContextAppended { item_id, .. }
+                if item_id == "call_batch_fast"
+        ) {
+            slow_release.add_permits(1);
+        }
+        let terminal = matches!(
+            event,
+            AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnFailed { .. }
+                | AgentEvent::TurnBlocked { .. }
+        );
+        observed.push(event);
+        if terminal {
+            break;
+        }
+    }
+
+    assert_turn_completed(&observed);
+    let fast_completion_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. })
+                    if item.item_id() == "call_batch_fast"
+            )
+        })
+        .expect("fast tool should complete");
+    let fast_journal_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnLlmContextAppended { item_id, .. }
+                    if item_id == "call_batch_fast"
+            )
+        })
+        .expect("fast tool result should be durably journaled");
+    let slow_completion_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. })
+                    if item.item_id() == "call_batch_slow"
+            )
+        })
+        .expect("slow tool should complete");
+    assert!(
+        fast_completion_index < fast_journal_index,
+        "tool completion must remain durable before its provider-replay result"
+    );
+    assert!(
+        fast_journal_index < slow_completion_index,
+        "a completed tool result must be durable before waiting for the rest of its parallel batch"
+    );
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnLlmContextAppended { item_id, .. }
+            if item_id == "call_batch_slow"
+    )));
+}
+
+#[tokio::test]
 async fn production_regression_repeated_failed_tools_continue_without_final_no_tools_failure() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
@@ -9957,8 +10181,55 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     );
     assert_eq!(
         tool_result_message_count(&requests[2]),
-        0,
-        "same-turn continuation should not synthesize unanswered excess tool history"
+        2,
+        "same-turn continuation must replay every completed tool result from the prior window"
+    );
+    assert!(
+        requests[2].messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message.tool_calls.as_ref().is_some_and(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .any(|tool_call| tool_call.id == "call_loop_budget_0")
+                })
+        }),
+        "same-turn continuation must replay the exact assistant tool-call round"
+    );
+    assert!(
+        requests[2].messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.tool_call_id.as_deref() == Some("call_loop_budget_0")
+        }),
+        "same-turn continuation must pair the assistant tool call with its result"
+    );
+    assert!(
+        requests[2].messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message.tool_calls.as_ref().is_some_and(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .any(|tool_call| tool_call.id == "call_loop_budget_1")
+                })
+        }),
+        "same-turn continuation must retain all completed assistant rounds"
+    );
+    assert!(
+        requests[2].messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.tool_call_id.as_deref() == Some("call_loop_budget_1")
+        }),
+        "each retained assistant tool call must have its completed result"
+    );
+    assert!(
+        !requests[2].messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("call_loop_budget_2")
+                || message.tool_calls.as_ref().is_some_and(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .any(|tool_call| tool_call.id == "call_loop_budget_2")
+                })
+        }),
+        "continuation must not synthesize provider history that never executed"
     );
 }
 
@@ -10090,7 +10361,7 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
     ));
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
-    config.execution_windows.total.max_windows_per_turn = 1;
+    config.execution_windows.total.max_windows_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -10193,7 +10464,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
     ));
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
-    config.execution_windows.total.max_tool_calls_per_turn = 1;
+    config.execution_windows.total.max_tool_calls_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -10268,7 +10539,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
 }
 
 #[tokio::test]
-async fn consecutive_failed_window_cap_blocks_continuation_without_turn_failed() {
+async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_breaker() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
@@ -10278,77 +10549,28 @@ async fn consecutive_failed_window_cap_blocks_continuation_without_turn_failed()
     config
         .execution_windows
         .total
-        .max_consecutive_failed_windows = 1;
+        .max_consecutive_no_progress_windows = 1;
+    config.execution_windows.total.max_windows_per_turn = Some(3);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
     let thread_id = "thr_loop_budget_failed_windows";
     let turn_id = "turn_loop_budget_failed_windows";
-    manager
-        .ensure_thread(thread_id, "ws_loop_budget")
-        .await
-        .expect("thread should be created");
-    let mut durable_events = manager
-        .take_durable_receiver(thread_id)
-        .await
-        .expect("thread should expose one durable receiver");
+    let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
+    let observed = recv_events_until_terminal(&mut events).await;
 
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
-            thread_id,
-            turn_id,
-            ThreadMode::Agent,
-            "test-model",
-            "loop-budget",
-            HashMap::new(),
-            vec![UserInput::Text {
-                text: "run consecutive failed windows cap test".to_owned(),
-                text_elements: Vec::new(),
-            }],
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .expect("turn should start");
-
-    let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
-    let blocked = observed_events
-        .iter()
-        .find_map(|event| {
-            if let AgentDurableEvent::TurnExecutionWindowBlocked { notification } = event {
-                Some(notification)
-            } else {
-                None
-            }
-        })
-        .expect("blocked event should be observed");
-    assert_eq!(blocked.thread_id, thread_id);
-    assert_eq!(blocked.turn_id, turn_id);
-    assert!(blocked.reason.contains("max_consecutive_failed_windows"));
-    let checkpoint_id = blocked
-        .checkpoint_id
-        .as_deref()
-        .expect("blocked event should reference checkpoint");
+    let Some(AgentEvent::TurnBlocked { reason, .. }) = observed.last() else {
+        panic!(
+            "the explicit administrative window cap should terminate the test turn: {observed:#?}"
+        );
+    };
     assert!(
-        observed_events.iter().any(|event| matches!(
-            event,
-            AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. }
-                if notification.checkpoint_id == checkpoint_id
-        )),
-        "consecutive failed-window block should be preceded by checkpointed event"
+        reason.contains("max execution windows per turn reached"),
+        "failed tool results are durable progress, so only the explicit administrative cap may block: {reason}"
     );
     assert!(
-        !observed_events.iter().any(|event| matches!(
-            event,
-            AgentDurableEvent::TurnExecutionWindowContinued { .. }
-        )),
-        "consecutive failed-window cap must not schedule another execution window"
-    );
-    assert!(
-        !observed_events
-            .iter()
-            .any(|event| matches!(event, AgentDurableEvent::TurnFailed { .. })),
-        "consecutive failed-window cap should be controlled blocked state, not failed"
+        !reason.contains("max_consecutive_no_progress_windows"),
+        "durable progress must reset the recovery circuit breaker: {reason}"
     );
 }
 

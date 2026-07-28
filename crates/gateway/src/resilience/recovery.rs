@@ -6,8 +6,8 @@ use pioneer_agent::{
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
     BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
-    NewTurnExecutionCheckpointRecord, RecoveryJobRecord, TimeoutCandidate,
-    TurnExecutionCheckpointKind,
+    NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
+    TimeoutCandidate, TurnExecutionCheckpointKind,
 };
 use pioneer_protocol::{
     EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, ExecutionCheckpointPayload,
@@ -21,6 +21,7 @@ use pioneer_protocol::{
     generate_id,
 };
 use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
+use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
@@ -651,6 +652,13 @@ enum RestoredRecoveryTurnUnavailable {
     MissingExecutionSecuritySnapshot,
     SnapshotMismatch,
     SnapshotInvalid { error: String },
+    ExecutionWindowContinuationBlocked { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionWindowContinuationAdmission {
+    Open { window_index: u32 },
+    Block { total_windows: u32, reason: String },
 }
 
 impl RestoredRecoveryTurnUnavailable {
@@ -671,9 +679,22 @@ impl RestoredRecoveryTurnUnavailable {
             Self::SnapshotInvalid { error } => Some(format!(
                 "cannot restore recovery after agent loop loss because durable turn runtime snapshot is invalid: {error}"
             )),
+            Self::ExecutionWindowContinuationBlocked { reason } => Some(reason.clone()),
             Self::TurnNotFound | Self::TurnNotInProgress => None,
         }
     }
+}
+
+fn execution_window_limit_reason(total_windows: u32, max_windows_per_turn: u32) -> String {
+    format!(
+        "max execution windows per turn reached: limit={max_windows_per_turn}, observed={total_windows}"
+    )
+}
+
+fn execution_window_no_progress_reason(limit: u32, observed: u32) -> String {
+    format!(
+        "max_consecutive_no_progress_windows reached: limit={limit}, observed={observed}; automatic recovery stopped because consecutive execution windows produced no durable agent round or tool result"
+    )
 }
 
 impl RecoveryCoordinator {
@@ -1874,7 +1895,7 @@ impl RecoveryCoordinator {
 
         if let Some(binding) = cli_runtime_binding {
             let execution_window_index = match self
-                .next_recovery_execution_window_index(
+                .prepare_recovery_execution_window(
                     job.turn_id.as_str(),
                     now_unix,
                     "cli_runtime_recovery",
@@ -1882,7 +1903,12 @@ impl RecoveryCoordinator {
                 )
                 .await
             {
-                Ok(index) => index,
+                Ok(ExecutionWindowContinuationAdmission::Open { window_index }) => window_index,
+                Ok(ExecutionWindowContinuationAdmission::Block { reason, .. }) => {
+                    return self
+                        .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                        .await;
+                }
                 Err(error) => {
                     return self
                         .record_active_recovery_failure(
@@ -1916,9 +1942,24 @@ impl RecoveryCoordinator {
             return Ok(events);
         }
 
-        let retained_provider_history = self
+        let retained_provider_history = match self
             .retained_provider_history_for_turn(job.turn_id.as_str())
-            .await?;
+            .await
+        {
+            Ok(history) => history,
+            Err(error) => {
+                return self
+                    .block_active_recovery(
+                        job,
+                        active_attempt_id,
+                        format!(
+                            "automatic recovery cannot safely replay the provider history: {error:#}"
+                        ),
+                        now_unix,
+                    )
+                    .await;
+            }
+        };
         let execution_checkpoint_context = self
             .prepare_execution_checkpoint_for_recovery(
                 workspace_id.as_str(),
@@ -1927,6 +1968,18 @@ impl RecoveryCoordinator {
                 now_unix,
             )
             .await?;
+        if let Some(context) = execution_checkpoint_context.as_ref()
+            && let ExecutionWindowContinuationAdmission::Block { reason, .. } = self
+                .execution_window_continuation_admission_for_turn(
+                    job.turn_id.as_str(),
+                    Some(context.window_index),
+                )
+                .await?
+        {
+            return self
+                .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                .await;
+        }
         let continue_generation =
             execution_plan.continue_generation || execution_checkpoint_context.is_some();
 
@@ -2020,12 +2073,7 @@ impl RecoveryCoordinator {
                         RestoredRecoveryTurnRequestLookup::Unavailable(unavailable) => {
                             if let Some(reason) = unavailable.lost_loop_block_reason() {
                                 return self
-                                    .block_recovery_without_restorable_runtime_snapshot(
-                                        job,
-                                        active_attempt_id,
-                                        reason,
-                                        now_unix,
-                                    )
+                                    .block_active_recovery(job, active_attempt_id, reason, now_unix)
                                     .await;
                             }
                         }
@@ -2048,7 +2096,7 @@ impl RecoveryCoordinator {
         Ok(events)
     }
 
-    async fn block_recovery_without_restorable_runtime_snapshot(
+    async fn block_active_recovery(
         &self,
         job: RecoveryJobRecord,
         active_attempt_id: String,
@@ -2092,6 +2140,12 @@ impl RecoveryCoordinator {
         attempt_number: u32,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        if let AgentControlError::ExecutionWindowContinuationBlocked { reason } = &error {
+            return self
+                .block_active_recovery(job, active_attempt_id, reason.clone(), now_unix)
+                .await;
+        }
+
         let mut events = Vec::new();
         let terminal = matches!(
             &error,
@@ -2214,6 +2268,11 @@ impl RecoveryCoordinator {
             checkpoint_id: checkpoint.id,
             checkpoint_kind: checkpoint_kind_label(checkpoint.checkpoint_kind),
             payload,
+            usage: crate::turn_runtime_snapshot::execution_window_usage_snapshot(
+                self.crud_store.as_ref(),
+                turn_id,
+            )
+            .await?,
         }))
     }
 
@@ -2408,22 +2467,36 @@ impl RecoveryCoordinator {
                     ));
                 }
             };
-        let execution_window_index = self
-            .checkpoint_running_execution_window(
-                workspace_id.as_str(),
-                thread_id,
+        self.checkpoint_running_execution_window(
+            workspace_id.as_str(),
+            thread_id,
+            request.turn_id.as_str(),
+            request.input.as_slice(),
+            request.model.as_str(),
+            request.provider_name.as_str(),
+            now_unix,
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+            TurnExecutionCheckpointKind::StartupRecovery,
+            "startup_recovery",
+            "agent loop was restored after process loss",
+        )
+        .await?;
+        match self
+            .execution_window_continuation_admission_for_turn(
                 request.turn_id.as_str(),
-                request.input.as_slice(),
-                request.model.as_str(),
-                request.provider_name.as_str(),
-                now_unix,
-                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-                TurnExecutionCheckpointKind::StartupRecovery,
-                "startup_recovery",
-                "agent loop was restored after process loss",
+                Some(request.execution_window_index),
             )
-            .await?;
-        request.execution_window_index = execution_window_index;
+            .await?
+        {
+            ExecutionWindowContinuationAdmission::Open { window_index } => {
+                request.execution_window_index = window_index;
+            }
+            ExecutionWindowContinuationAdmission::Block { reason, .. } => {
+                return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked { reason },
+                ));
+            }
+        }
         Ok(RestoredRecoveryTurnRequestLookup::Available(request))
     }
 
@@ -2441,48 +2514,57 @@ impl RecoveryCoordinator {
         checkpoint_kind: TurnExecutionCheckpointKind,
         interrupted_by: &str,
         terminal_reason: &str,
-    ) -> Result<u32> {
-        let Some(window) = self
-            .crud_store
-            .latest_turn_execution_window(turn_id)
-            .await?
-        else {
-            return Ok(1);
-        };
-
-        if window.status != ExecutionWindowStatus::Running {
-            return Ok(window.window_index.saturating_add(1).max(1));
-        }
-
+    ) -> Result<()> {
         let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
             .map(|timestamp| timestamp.fixed_offset())
             .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+        let window = match self
+            .crud_store
+            .latest_turn_execution_window(turn_id)
+            .await?
+        {
+            Some(window) => window,
+            None => {
+                self.crud_store
+                    .create_turn_execution_window(
+                        NewTurnExecutionWindowRecord {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            window_index: 1,
+                            status: ExecutionWindowStatus::Running,
+                            exhaustion_reason: None,
+                            agent_round_count: 0,
+                            tool_call_count: 0,
+                            provider_token_count: 0,
+                            metadata_json: serde_json::json!({
+                                "runtimeWindowId": format!("{turn_id}:window:1"),
+                                "recoveredFromMissingWindow": true,
+                            }),
+                            started_at: completed_at,
+                        },
+                        completed_at,
+                        completed_at,
+                    )
+                    .await?
+            }
+        };
+
+        if window.status != ExecutionWindowStatus::Running {
+            return Ok(());
+        }
+
         let window_items = self
             .crud_store
             .list_turn_execution_window_items(turn_id, window.started_at.clone())
             .await?;
         let terminal_counts = self
             .crud_store
-            .count_turn_execution_window_terminal_items(turn_id)
+            .count_turn_execution_window_terminal_items_since(turn_id, window.started_at.clone())
             .await?;
-        let prior_windows = self.crud_store.list_turn_execution_windows(turn_id).await?;
-        let prior_agent_round_count = prior_windows
-            .iter()
-            .filter(|prior| prior.window_index < window.window_index)
-            .fold(0u32, |total, prior| {
-                total.saturating_add(prior.agent_round_count)
-            });
-        let prior_tool_call_count = prior_windows
-            .iter()
-            .filter(|prior| prior.window_index < window.window_index)
-            .fold(0u32, |total, prior| {
-                total.saturating_add(prior.tool_call_count)
-            });
-        let agent_round_count = window.agent_round_count.max(
-            terminal_counts
-                .agent_round_count
-                .saturating_sub(prior_agent_round_count),
-        );
+        let agent_round_count = window
+            .agent_round_count
+            .max(terminal_counts.agent_round_count);
         let tool_summary = build_execution_checkpoint_tool_summary(
             window_items.as_slice(),
             EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
@@ -2490,7 +2572,6 @@ impl RecoveryCoordinator {
         let tool_call_count = window.tool_call_count.max(
             terminal_counts
                 .tool_call_count
-                .saturating_sub(prior_tool_call_count)
                 .max(tool_summary.requested_count),
         );
         let provider_token_count =
@@ -2582,67 +2663,238 @@ impl RecoveryCoordinator {
             .mark_turn_execution_window_checkpointed(window.id.as_str(), completed_at)
             .await?;
 
-        Ok(window.window_index.saturating_add(1).max(1))
+        Ok(())
     }
 
-    async fn next_recovery_execution_window_index(
+    async fn execution_window_admission_for_turn(
+        &self,
+        turn_id: &str,
+        observed_window_index: Option<u32>,
+    ) -> Result<ExecutionWindowAdmissionDecision> {
+        let stored_window_index = self
+            .crud_store
+            .latest_turn_execution_window(turn_id)
+            .await?
+            .map(|window| window.window_index);
+        let legacy_cli_window_index =
+            if stored_window_index.is_none() && observed_window_index.is_none() {
+                let has_cli_execution = self
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(turn_id)
+                    .await?
+                    .is_some()
+                    || self
+                        .crud_store
+                        .get_cli_runtime_turn_binding(turn_id)
+                        .await?
+                        .is_some();
+                has_cli_execution.then_some(1)
+            } else {
+                None
+            };
+        let latest_window_index = [
+            observed_window_index,
+            stored_window_index,
+            legacy_cli_window_index,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|index| *index > 0)
+        .max();
+
+        Ok(decide_execution_window_admission(
+            latest_window_index,
+            self.tool_loop_config
+                .execution_windows
+                .total
+                .max_windows_per_turn,
+        ))
+    }
+
+    async fn execution_window_continuation_admission_for_turn(
+        &self,
+        turn_id: &str,
+        observed_window_index: Option<u32>,
+    ) -> Result<ExecutionWindowContinuationAdmission> {
+        match self
+            .execution_window_admission_for_turn(turn_id, observed_window_index)
+            .await?
+        {
+            ExecutionWindowAdmissionDecision::Open { window_index } => {
+                let usage = crate::turn_runtime_snapshot::execution_window_usage_snapshot(
+                    self.crud_store.as_ref(),
+                    turn_id,
+                )
+                .await?;
+                let total_budget = &self.tool_loop_config.execution_windows.total;
+                if let Some(limit) = total_budget.max_tool_calls_per_turn
+                    && usage.total_tool_calls >= u64::from(limit)
+                {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        total_windows: usage.total_windows,
+                        reason: format!(
+                            "max_total_tool_calls_per_turn reached: limit={limit}, observed={}",
+                            usage.total_tool_calls
+                        ),
+                    });
+                }
+                if let Some(limit) = total_budget.max_wall_clock_ms_per_turn
+                    && usage.total_wall_clock_ms >= limit
+                {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        total_windows: usage.total_windows,
+                        reason: format!(
+                            "max_total_wall_clock_ms_per_turn reached: limit={limit}, observed={}",
+                            usage.total_wall_clock_ms
+                        ),
+                    });
+                }
+                if let Some(limit) = total_budget.max_provider_tokens_per_turn
+                    && !usage.provider_token_usage_unknown
+                    && usage.total_provider_tokens >= limit
+                {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        total_windows: usage.total_windows,
+                        reason: format!(
+                            "max_total_provider_tokens_per_turn reached: limit={limit}, observed={}",
+                            usage.total_provider_tokens
+                        ),
+                    });
+                }
+                let limit = self
+                    .tool_loop_config
+                    .execution_windows
+                    .total
+                    .max_consecutive_no_progress_windows
+                    .max(1);
+                if usage.consecutive_no_progress_windows >= limit {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        total_windows: usage.total_windows,
+                        reason: execution_window_no_progress_reason(
+                            limit,
+                            usage.consecutive_no_progress_windows,
+                        ),
+                    });
+                }
+                Ok(ExecutionWindowContinuationAdmission::Open { window_index })
+            }
+            ExecutionWindowAdmissionDecision::Block {
+                total_windows,
+                max_windows_per_turn,
+            } => Ok(ExecutionWindowContinuationAdmission::Block {
+                total_windows,
+                reason: execution_window_limit_reason(total_windows, max_windows_per_turn),
+            }),
+        }
+    }
+
+    async fn prepare_recovery_execution_window(
         &self,
         turn_id: &str,
         now_unix: i64,
         interrupted_by: &str,
         terminal_reason: &str,
-    ) -> Result<u32> {
-        let Some(window) = self
+    ) -> Result<ExecutionWindowContinuationAdmission> {
+        let mut window = self
             .crud_store
             .latest_turn_execution_window(turn_id)
-            .await?
-        else {
-            return Ok(1);
-        };
-
-        if window.status == ExecutionWindowStatus::Running {
-            let counts = self
+            .await?;
+        if window.is_none() {
+            let has_cli_execution = self
                 .crud_store
-                .count_turn_execution_window_terminal_items(turn_id)
-                .await?;
-            let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
-                .map(|timestamp| timestamp.fixed_offset())
-                .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
-            let mut metadata_json = window.metadata_json.clone();
-            match metadata_json.as_object_mut() {
-                Some(metadata) => {
-                    metadata.insert(
-                        "interruptedBy".to_owned(),
-                        serde_json::Value::String(interrupted_by.to_owned()),
-                    );
-                    metadata.insert(
-                        "terminalReason".to_owned(),
-                        serde_json::Value::String(terminal_reason.to_owned()),
-                    );
-                }
-                None => {
-                    metadata_json = serde_json::json!({
-                        "interruptedBy": interrupted_by,
-                        "terminalReason": terminal_reason,
-                    });
-                }
+                .latest_cli_runtime_turn_attempt(turn_id)
+                .await?
+                .is_some()
+                || self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(turn_id)
+                    .await?
+                    .is_some();
+            if has_cli_execution
+                && let Some((thread_id, workspace_id)) =
+                    self.crud_store.get_turn_location(turn_id).await?
+            {
+                let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
+                    .map(|timestamp| timestamp.fixed_offset())
+                    .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+                window = Some(
+                    self.crud_store
+                        .create_turn_execution_window(
+                            NewTurnExecutionWindowRecord {
+                                workspace_id,
+                                thread_id,
+                                turn_id: turn_id.to_owned(),
+                                window_index: 1,
+                                status: ExecutionWindowStatus::Running,
+                                exhaustion_reason: None,
+                                agent_round_count: 0,
+                                tool_call_count: 0,
+                                provider_token_count: 0,
+                                metadata_json: serde_json::json!({
+                                    "interruptedBy": interrupted_by,
+                                    "terminalReason": terminal_reason,
+                                    "recoveredFromMissingWindow": true,
+                                }),
+                                started_at: completed_at,
+                            },
+                            completed_at,
+                            completed_at,
+                        )
+                        .await?,
+                );
             }
-            self.crud_store
-                .mark_turn_execution_window_interrupted(
-                    window.id.as_str(),
-                    pioneer_crud::TurnExecutionWindowStatsRecord {
-                        agent_round_count: window.agent_round_count.max(counts.agent_round_count),
-                        tool_call_count: window.tool_call_count.max(counts.tool_call_count),
-                        provider_token_count: window.provider_token_count,
-                        metadata_json,
-                        completed_at,
-                        updated_at: completed_at,
-                    },
-                )
-                .await?;
         }
 
-        Ok(window.window_index.saturating_add(1).max(1))
+        if let Some(window) = window
+            && window.status == ExecutionWindowStatus::Running
+        {
+            let Some((thread_id, workspace_id)) =
+                self.crud_store.get_turn_location(turn_id).await?
+            else {
+                return self
+                    .execution_window_continuation_admission_for_turn(turn_id, None)
+                    .await;
+            };
+            let snapshot = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
+            let binding = self
+                .crud_store
+                .get_cli_runtime_turn_binding(turn_id)
+                .await?;
+            let input = snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    serde_json::from_str::<Vec<UserInput>>(snapshot.input_json.as_str()).ok()
+                })
+                .unwrap_or_default();
+            let model = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.model.clone())
+                .or_else(|| binding.as_ref().and_then(|binding| binding.model.clone()))
+                .unwrap_or_else(|| "native-cli".to_owned());
+            let provider_name = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.provider_name.clone())
+                .or_else(|| binding.as_ref().map(|binding| binding.runtime_kind.clone()))
+                .unwrap_or_else(|| "native-cli".to_owned());
+
+            self.checkpoint_running_execution_window(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id,
+                input.as_slice(),
+                model.as_str(),
+                provider_name.as_str(),
+                now_unix,
+                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                TurnExecutionCheckpointKind::WindowExhausted,
+                interrupted_by,
+                terminal_reason,
+            )
+            .await?;
+        }
+
+        self.execution_window_continuation_admission_for_turn(turn_id, None)
+            .await
     }
 }
 
@@ -3342,9 +3594,10 @@ mod tests {
     };
     use pioneer_crud::{
         ClaimedRecoveryActivation, CrudStore, NewCliRuntimeTurnBinding,
-        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot,
-        RecoveryJobRecord, SkillInstallationRecord, SkillPackInstallationRecord, TimeoutCandidate,
-        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
+        NewTurnRuntimeSnapshot, RecoveryJobRecord, SkillInstallationRecord,
+        SkillPackInstallationRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord,
     };
     use pioneer_entity::{turn, workspace};
     use pioneer_protocol::{
@@ -3631,8 +3884,9 @@ mod tests {
         }
     }
 
-    async fn setup_coordinator_with_agent()
-    -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
+    async fn setup_coordinator_with_tool_loop_config(
+        tool_loop_config: ToolLoopConfig,
+    ) -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
@@ -3646,16 +3900,21 @@ mod tests {
         ));
         let agent_manager = Arc::new(AgentManager::new(
             provider_registry.clone(),
-            test_tool_loop_config(),
+            tool_loop_config.clone(),
         ));
         let coordinator = RecoveryCoordinator::new(
             crud_store.clone(),
             agent_manager.clone(),
             provider_registry,
             RecoveryPolicyRegistry::default(),
-            test_tool_loop_config().normalized(),
+            tool_loop_config.normalized(),
         );
         (crud_store, agent_manager, coordinator)
+    }
+
+    async fn setup_coordinator_with_agent()
+    -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
+        setup_coordinator_with_tool_loop_config(test_tool_loop_config()).await
     }
 
     async fn setup_coordinator() -> (Arc<CrudStore>, RecoveryCoordinator) {
@@ -4110,7 +4369,7 @@ mod tests {
             .expect("runtime snapshot should be restorable");
 
         assert_eq!(restored.turn_id, turn_id);
-        assert_eq!(restored.execution_window_index, 1);
+        assert_eq!(restored.execution_window_index, 2);
         assert_eq!(restored.provider_name, "echo");
         assert_eq!(
             restored.hook_runtime_context.task_id.as_deref(),
@@ -4304,18 +4563,26 @@ mod tests {
             active_job.active_attempt_id.as_deref(),
             Some(request.recovery_attempt_id.as_str())
         );
-        let interrupted = crud_store
+        let checkpointed = crud_store
             .get_turn_execution_window(first_window.id.as_str())
             .await
             .expect("first execution window should load")
             .expect("first execution window should exist");
-        assert_eq!(interrupted.status, ExecutionWindowStatus::Interrupted);
+        assert_eq!(checkpointed.status, ExecutionWindowStatus::Checkpointed);
         assert_eq!(
-            interrupted
+            checkpointed
                 .metadata_json
                 .get("interruptedBy")
                 .and_then(serde_json::Value::as_str),
             Some("cli_runtime_recovery")
+        );
+        assert_eq!(
+            crud_store
+                .list_turn_execution_checkpoints_for_window(first_window.id.as_str())
+                .await
+                .expect("CLI recovery checkpoint should load")
+                .len(),
+            1
         );
 
         let failure_events = coordinator
@@ -4338,6 +4605,568 @@ mod tests {
             .expect("retrying recovery job should exist");
         assert_eq!(pending_job.status, RecoveryJobStatus::Pending);
         assert_eq!(pending_job.run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_cli_recovery_backfills_window_one_before_opening_window_two() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_cli_legacy_window";
+        let thread_id = "thr_cli_legacy_window";
+        let turn_id = "turn_cli_legacy_window";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_cli_legacy_window",
+            None,
+        )
+        .await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-cli-legacy".to_owned(),
+                native_turn_id: Some("native-turn-cli-legacy".to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("legacy CLI binding should persist");
+
+        let admission = coordinator
+            .prepare_recovery_execution_window(
+                turn_id,
+                1_700_000_010,
+                "cli_runtime_recovery",
+                "legacy native CLI turn was replaced",
+            )
+            .await
+            .expect("legacy CLI recovery window should be prepared");
+
+        assert_eq!(
+            admission,
+            super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+        );
+        let windows = crud_store
+            .list_turn_execution_windows(turn_id)
+            .await
+            .expect("backfilled execution window should load");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].window_index, 1);
+        assert_eq!(windows[0].status, ExecutionWindowStatus::Checkpointed);
+        assert_eq!(
+            windows[0]
+                .metadata_json
+                .get("recoveredFromMissingWindow")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            crud_store
+                .list_turn_execution_checkpoints_for_window(windows[0].id.as_str())
+                .await
+                .expect("backfilled CLI recovery checkpoint should load")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_recovery_checkpoint_counts_progress_only_in_the_current_window() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_cli_current_window_progress";
+        let thread_id = "thr_cli_current_window_progress";
+        let turn_id = "turn_cli_current_window_progress";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_before_current_window",
+            None,
+        )
+        .await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "claude".to_owned(),
+                runtime_kind: "claude".to_owned(),
+                native_thread_id: "native-thread-current-window".to_owned(),
+                native_turn_id: Some("native-turn-current-window".to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("claude-sonnet".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("CLI runtime binding should persist");
+        crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Checkpointed,
+                    exhaustion_reason: Some(
+                        ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow,
+                    ),
+                    agent_round_count: 5,
+                    tool_call_count: 7,
+                    provider_token_count: 100,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp - chrono::Duration::hours(1),
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("prior progress window should persist");
+        let current = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 2,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp + chrono::Duration::seconds(1),
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("current empty window should persist");
+
+        assert_eq!(
+            coordinator
+                .prepare_recovery_execution_window(
+                    turn_id,
+                    timestamp.timestamp().saturating_add(2),
+                    "cli_runtime_recovery",
+                    "runtime exited before producing progress",
+                )
+                .await
+                .expect("current CLI window should checkpoint"),
+            super::ExecutionWindowContinuationAdmission::Open { window_index: 3 }
+        );
+
+        let current = crud_store
+            .get_turn_execution_window(current.id.as_str())
+            .await
+            .expect("current window should load")
+            .expect("current window should exist");
+        assert_eq!(current.status, ExecutionWindowStatus::Checkpointed);
+        assert_eq!(current.agent_round_count, 0);
+        assert_eq!(current.tool_call_count, 0);
+        let usage = crud_store
+            .aggregate_turn_execution_window_usage(turn_id)
+            .await
+            .expect("window usage should aggregate");
+        assert_eq!(usage.total_agent_rounds, 5);
+        assert_eq!(usage.total_tool_calls, 7);
+        assert_eq!(usage.consecutive_no_progress_windows, 1);
+    }
+
+    #[tokio::test]
+    async fn default_window_policy_allows_healthy_turns_past_the_former_limit() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let turn_id = "turn_unbounded_healthy_windows";
+        for window_index in 1..=44 {
+            crud_store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_unbounded_healthy_windows".to_owned(),
+                        thread_id: "thr_unbounded_healthy_windows".to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index,
+                        status: ExecutionWindowStatus::Checkpointed,
+                        exhaustion_reason: Some(
+                            ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow,
+                        ),
+                        agent_round_count: 1,
+                        tool_call_count: 1,
+                        provider_token_count: 10,
+                        metadata_json: serde_json::json!({
+                            "runtimeWindowId": format!("{turn_id}:window:{window_index}"),
+                        }),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await
+                .expect("healthy execution window should persist");
+        }
+
+        assert_eq!(
+            coordinator
+                .execution_window_continuation_admission_for_turn(turn_id, None)
+                .await
+                .expect("healthy long-running turn should be admitted"),
+            super::ExecutionWindowContinuationAdmission::Open { window_index: 45 }
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_no_progress_windows_trip_recovery_circuit_breaker() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let turn_id = "turn_recovery_no_progress";
+        for window_index in 1..=3 {
+            crud_store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_recovery_no_progress".to_owned(),
+                        thread_id: "thr_recovery_no_progress".to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index,
+                        status: ExecutionWindowStatus::Interrupted,
+                        exhaustion_reason: Some(
+                            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                        ),
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({
+                            "interruptedBy": "cli_runtime_recovery",
+                            "terminalReason": "native runtime exited before producing output",
+                        }),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await
+                .expect("no-progress execution window should persist");
+        }
+
+        let admission = coordinator
+            .execution_window_continuation_admission_for_turn(turn_id, None)
+            .await
+            .expect("no-progress admission should be evaluated");
+        assert!(matches!(
+            admission,
+            super::ExecutionWindowContinuationAdmission::Block {
+                total_windows: 3,
+                ref reason,
+            } if reason.contains("max_consecutive_no_progress_windows")
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_progress_resets_persisted_recovery_circuit_breaker() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let turn_id = "turn_recovery_progress_reset";
+        for window_index in 1..=2 {
+            crud_store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_recovery_progress_reset".to_owned(),
+                        thread_id: "thr_recovery_progress_reset".to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index,
+                        status: ExecutionWindowStatus::Interrupted,
+                        exhaustion_reason: Some(
+                            ExecutionWindowExhaustionReason::ProviderFailureContinuation,
+                        ),
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await
+                .expect("no-progress execution window should persist");
+        }
+        crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_recovery_progress_reset".to_owned(),
+                    thread_id: "thr_recovery_progress_reset".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 3,
+                    status: ExecutionWindowStatus::Interrupted,
+                    exhaustion_reason: Some(
+                        ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                    ),
+                    agent_round_count: 1,
+                    tool_call_count: 0,
+                    provider_token_count: 10,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("progress execution window should persist");
+
+        assert_eq!(
+            coordinator
+                .execution_window_continuation_admission_for_turn(turn_id, None)
+                .await
+                .expect("progress should reset the recovery circuit breaker"),
+            super::ExecutionWindowContinuationAdmission::Open { window_index: 4 }
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_recovery_blocks_before_exceeding_the_shared_window_limit() {
+        let mut tool_loop_config = test_tool_loop_config();
+        tool_loop_config
+            .execution_windows
+            .total
+            .max_windows_per_turn = Some(1);
+        let (crud_store, _agent_manager, coordinator) =
+            setup_coordinator_with_tool_loop_config(tool_loop_config).await;
+        let workspace_id = "ws_cli_window_limit";
+        let thread_id = "thr_cli_window_limit";
+        let turn_id = "turn_cli_window_limit";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_cli_window_limit",
+            None,
+        )
+        .await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-cli-window-limit".to_owned(),
+                native_turn_id: Some("native-turn-cli-window-limit".to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("CLI runtime binding should persist");
+        let first_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "cli_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("initial CLI execution window should persist");
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "runtime:cli_window_limit".to_owned(),
+                    item_type: TurnItemType::SystemEvent,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "native CLI turn interrupted".to_owned(),
+                    base_backoff_secs: 0,
+                    max_attempts: 3,
+                    max_wall_clock_secs: 180,
+                    no_progress_limit: 3,
+                    metadata: pioneer_protocol::ToolMetadata::default(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .expect("CLI runtime recovery job should enqueue")
+            .into_job();
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("CLI runtime recovery limit should be evaluated");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id,
+                turn_id: event_turn_id,
+                reason,
+            }] if job_id == &job.id
+                && event_turn_id == turn_id
+                && reason.contains("limit=1, observed=1")
+        ));
+        let blocked_job = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("blocked recovery job should load")
+            .expect("blocked recovery job should exist");
+        assert_eq!(blocked_job.status, RecoveryJobStatus::Blocked);
+        let checkpointed_window = crud_store
+            .get_turn_execution_window(first_window.id.as_str())
+            .await
+            .expect("first window should load")
+            .expect("first window should exist");
+        assert_eq!(
+            checkpointed_window.status,
+            ExecutionWindowStatus::Checkpointed
+        );
+        assert_eq!(
+            crud_store
+                .list_turn_execution_windows(turn_id)
+                .await
+                .expect("execution windows should load")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_recovery_blocks_before_exceeding_the_shared_window_limit() {
+        let mut tool_loop_config = test_tool_loop_config();
+        tool_loop_config
+            .execution_windows
+            .total
+            .max_windows_per_turn = Some(1);
+        let (crud_store, _agent_manager, coordinator) =
+            setup_coordinator_with_tool_loop_config(tool_loop_config).await;
+        let workspace_id = "ws_native_window_limit";
+        let thread_id = "thr_native_window_limit";
+        let turn_id = "turn_native_window_limit";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_native_window_limit",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let first_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "native_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("initial native execution window should persist");
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "runtime:native_window_limit".to_owned(),
+                    item_type: TurnItemType::SystemEvent,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "native API turn interrupted".to_owned(),
+                    base_backoff_secs: 0,
+                    max_attempts: 3,
+                    max_wall_clock_secs: 180,
+                    no_progress_limit: 3,
+                    metadata: pioneer_protocol::ToolMetadata::default(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .expect("native recovery job should enqueue")
+            .into_job();
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("native recovery limit should be evaluated");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id,
+                turn_id: event_turn_id,
+                reason,
+            }] if job_id == &job.id
+                && event_turn_id == turn_id
+                && reason.contains("limit=1, observed=1")
+        ));
+        let checkpointed_window = crud_store
+            .get_turn_execution_window(first_window.id.as_str())
+            .await
+            .expect("first window should load")
+            .expect("first window should exist");
+        assert_eq!(
+            checkpointed_window.status,
+            ExecutionWindowStatus::Checkpointed
+        );
+        assert_eq!(
+            crud_store
+                .list_turn_execution_windows(turn_id)
+                .await
+                .expect("execution windows should load")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4422,6 +5251,73 @@ mod tests {
         );
         assert_eq!(payload.provider_budget.exhausted_limit, None);
         assert_eq!(payload.provider_budget.exhausted_observed, None);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_refuses_to_create_a_window_past_the_shared_limit() {
+        let mut tool_loop_config = test_tool_loop_config();
+        tool_loop_config
+            .execution_windows
+            .total
+            .max_windows_per_turn = Some(1);
+        let (crud_store, _agent_manager, coordinator) =
+            setup_coordinator_with_tool_loop_config(tool_loop_config).await;
+        let workspace_id = "ws_startup_window_limit";
+        let thread_id = "thr_startup_window_limit";
+        let turn_id = "turn_startup_window_limit";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_startup_window_limit",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "startup_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("initial startup execution window should persist");
+
+        let restored = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
+            .await
+            .expect("startup recovery lookup should succeed");
+
+        assert!(matches!(
+            restored,
+            super::RestoredRecoveryTurnRequestLookup::Unavailable(
+                super::RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked {
+                    ref reason,
+                }
+            ) if reason.contains("limit=1, observed=1")
+        ));
+        assert_eq!(
+            crud_store
+                .list_turn_execution_windows(turn_id)
+                .await
+                .expect("execution windows should load")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4776,6 +5672,106 @@ mod tests {
             .expect("job should reload")
             .expect("job should exist");
         assert_eq!(reloaded.status, RecoveryJobStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn incomplete_in_flight_tool_history_blocks_before_restored_provider_execution() {
+        let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
+        let workspace_id = "ws_tool_uncertain";
+        let thread_id = "thr_tool_uncertain";
+        let turn_id = "turn_tool_uncertain";
+        let item_id = "tool_uncertain";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+
+        let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            Some("reasoning that produced the side effect"),
+            vec![ProviderToolCall {
+                id: item_id.to_owned(),
+                name: "web_fetch".to_owned(),
+                arguments: r#"{"url":"https://example.com"}"#.to_owned(),
+            }],
+            Some(ProviderReplayState::new(
+                "deepseek",
+                serde_json::json!({"reasoning_content": "reasoning that produced the side effect"}),
+            )),
+        );
+        crud_store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn_id.to_owned(),
+                item_id: Some("reasoning_uncertain".to_owned()),
+                attempt_id: None,
+                sequence: 1,
+                source: "assistant_round".to_owned(),
+                tool_name: None,
+                payload: serde_json::to_string(&assistant_round).unwrap(),
+                output_policy_snapshot: serde_json::json!({}).to_string(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .expect("in-flight assistant round should persist");
+
+        let job = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::RetryAttempt,
+                Some("tool outcome became uncertain during process loss".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 60,
+                    "no_progress_limit": 3,
+                }),
+                1_700_000_010,
+            )
+            .await
+            .expect("tool recovery job should enqueue");
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("unsafe recovery should be handled deterministically");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id,
+                turn_id: event_turn_id,
+                reason,
+            }] if job_id == &job.id
+                && event_turn_id == turn_id
+                && reason.contains("provider history")
+                && reason.contains("incomplete")
+        ));
+        assert!(
+            !agent_manager.has_thread(thread_id).await,
+            "an incomplete in-flight tool round must be blocked before a provider loop can restart it"
+        );
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("job should reload")
+            .expect("job should exist");
+        assert_eq!(reloaded.status, RecoveryJobStatus::Blocked);
     }
 
     #[tokio::test]

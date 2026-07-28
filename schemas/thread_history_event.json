@@ -2359,6 +2359,8 @@
       "enum": [
         "agent_rounds",
         "tool_calls",
+        "wall_clock_ms",
+        "provider_tokens",
         "provider_returned_tools_after_tools_disabled"
       ]
     },

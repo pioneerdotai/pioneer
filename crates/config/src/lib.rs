@@ -1413,7 +1413,7 @@ pub struct GatewayExecutionWindowBudgetConfig {
     pub max_agent_rounds_per_window: u32,
     #[serde(default = "default_execution_window_max_tool_calls_per_window")]
     pub max_tool_calls_per_window: u32,
-    #[serde(default)]
+    #[serde(default = "default_execution_window_max_wall_clock_ms_per_window")]
     pub max_wall_clock_ms_per_window: Option<u64>,
     #[serde(default)]
     pub max_provider_tokens_per_window: Option<u64>,
@@ -1424,7 +1424,7 @@ impl Default for GatewayExecutionWindowBudgetConfig {
         Self {
             max_agent_rounds_per_window: default_execution_window_max_agent_rounds_per_window(),
             max_tool_calls_per_window: default_execution_window_max_tool_calls_per_window(),
-            max_wall_clock_ms_per_window: None,
+            max_wall_clock_ms_per_window: default_execution_window_max_wall_clock_ms_per_window(),
             max_provider_tokens_per_window: None,
         }
     }
@@ -1432,27 +1432,30 @@ impl Default for GatewayExecutionWindowBudgetConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GatewayExecutionWindowTotalBudgetConfig {
-    #[serde(default = "default_execution_window_total_max_windows_per_turn")]
-    pub max_windows_per_turn: u32,
-    #[serde(default = "default_execution_window_total_max_tool_calls_per_turn")]
-    pub max_tool_calls_per_turn: u32,
-    #[serde(default = "default_execution_window_total_max_wall_clock_ms_per_turn")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_windows_per_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wall_clock_ms_per_turn: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_provider_tokens_per_turn: Option<u64>,
-    #[serde(default = "default_execution_window_total_max_consecutive_failed_windows")]
-    pub max_consecutive_failed_windows: u32,
+    #[serde(
+        default = "default_execution_window_total_max_consecutive_no_progress_windows",
+        alias = "max_consecutive_failed_windows"
+    )]
+    pub max_consecutive_no_progress_windows: u32,
 }
 
 impl Default for GatewayExecutionWindowTotalBudgetConfig {
     fn default() -> Self {
         Self {
-            max_windows_per_turn: default_execution_window_total_max_windows_per_turn(),
-            max_tool_calls_per_turn: default_execution_window_total_max_tool_calls_per_turn(),
-            max_wall_clock_ms_per_turn: default_execution_window_total_max_wall_clock_ms_per_turn(),
+            max_windows_per_turn: None,
+            max_tool_calls_per_turn: None,
+            max_wall_clock_ms_per_turn: None,
             max_provider_tokens_per_turn: None,
-            max_consecutive_failed_windows:
-                default_execution_window_total_max_consecutive_failed_windows(),
+            max_consecutive_no_progress_windows:
+                default_execution_window_total_max_consecutive_no_progress_windows(),
         }
     }
 }
@@ -1869,34 +1872,26 @@ fn default_web_tool_user_agent() -> String {
 }
 
 const fn default_tool_loop_max_agent_rounds_per_turn() -> u32 {
-    512
+    32
 }
 
 const fn default_tool_loop_max_tool_calls_per_turn() -> u32 {
-    2048
+    128
 }
 
 const fn default_execution_window_max_agent_rounds_per_window() -> u32 {
-    512
+    32
 }
 
 const fn default_execution_window_max_tool_calls_per_window() -> u32 {
-    2048
+    128
 }
 
-const fn default_execution_window_total_max_windows_per_turn() -> u32 {
-    16
+const fn default_execution_window_max_wall_clock_ms_per_window() -> Option<u64> {
+    Some(1_800_000)
 }
 
-const fn default_execution_window_total_max_tool_calls_per_turn() -> u32 {
-    4096
-}
-
-const fn default_execution_window_total_max_wall_clock_ms_per_turn() -> Option<u64> {
-    Some(86_400_000)
-}
-
-const fn default_execution_window_total_max_consecutive_failed_windows() -> u32 {
+const fn default_execution_window_total_max_consecutive_no_progress_windows() -> u32 {
     3
 }
 
@@ -3994,10 +3989,14 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             .execution_windows
             .as_ref()
             .expect("default config should include execution_windows");
-        assert_eq!(execution_windows.window.max_agent_rounds_per_window, 512);
-        assert_eq!(execution_windows.window.max_tool_calls_per_window, 2048);
-        assert_eq!(execution_windows.total.max_windows_per_turn, 16);
-        assert_eq!(execution_windows.total.max_tool_calls_per_turn, 4096);
+        assert_eq!(execution_windows.window.max_agent_rounds_per_window, 32);
+        assert_eq!(execution_windows.window.max_tool_calls_per_window, 128);
+        assert_eq!(
+            execution_windows.window.max_wall_clock_ms_per_window,
+            Some(1_800_000)
+        );
+        assert_eq!(execution_windows.total.max_windows_per_turn, None);
+        assert_eq!(execution_windows.total.max_tool_calls_per_turn, None);
         assert!(config.gateway.memory.enabled);
         assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
@@ -4285,15 +4284,15 @@ embedding_dimension = 384
     fn gateway_execution_windows_config_defaults_are_deterministic() {
         let config = super::GatewayExecutionWindowsConfig::default();
 
-        assert_eq!(config.window.max_agent_rounds_per_window, 512);
-        assert_eq!(config.window.max_tool_calls_per_window, 2048);
-        assert_eq!(config.window.max_wall_clock_ms_per_window, None);
+        assert_eq!(config.window.max_agent_rounds_per_window, 32);
+        assert_eq!(config.window.max_tool_calls_per_window, 128);
+        assert_eq!(config.window.max_wall_clock_ms_per_window, Some(1_800_000));
         assert_eq!(config.window.max_provider_tokens_per_window, None);
-        assert_eq!(config.total.max_windows_per_turn, 16);
-        assert_eq!(config.total.max_tool_calls_per_turn, 4096);
-        assert_eq!(config.total.max_wall_clock_ms_per_turn, Some(86_400_000));
+        assert_eq!(config.total.max_windows_per_turn, None);
+        assert_eq!(config.total.max_tool_calls_per_turn, None);
+        assert_eq!(config.total.max_wall_clock_ms_per_turn, None);
         assert_eq!(config.total.max_provider_tokens_per_turn, None);
-        assert_eq!(config.total.max_consecutive_failed_windows, 3);
+        assert_eq!(config.total.max_consecutive_no_progress_windows, 3);
     }
 
     #[test]
@@ -4322,11 +4321,11 @@ max_tool_calls_per_turn = 11
                 max_provider_tokens_per_window: Some(2_000),
             },
             total: super::GatewayExecutionWindowTotalBudgetConfig {
-                max_windows_per_turn: 5,
-                max_tool_calls_per_turn: 41,
+                max_windows_per_turn: Some(5),
+                max_tool_calls_per_turn: Some(41),
                 max_wall_clock_ms_per_turn: Some(3_000),
                 max_provider_tokens_per_turn: Some(4_000),
-                max_consecutive_failed_windows: 2,
+                max_consecutive_no_progress_windows: 2,
             },
         };
 
@@ -4342,7 +4341,7 @@ max_tool_calls_per_turn = 11
         assert!(serialized.contains("max_tool_calls_per_turn = 41"));
         assert!(serialized.contains("max_wall_clock_ms_per_turn = 3000"));
         assert!(serialized.contains("max_provider_tokens_per_turn = 4000"));
-        assert!(serialized.contains("max_consecutive_failed_windows = 2"));
+        assert!(serialized.contains("max_consecutive_no_progress_windows = 2"));
 
         let roundtrip = toml::from_str::<super::GatewayExecutionWindowsConfig>(&serialized)
             .expect("execution windows config should deserialize");
@@ -4364,7 +4363,7 @@ max_windows_per_turn = 5
 max_tool_calls_per_turn = 41
 max_wall_clock_ms_per_turn = 3000
 max_provider_tokens_per_turn = 4000
-max_consecutive_failed_windows = 2
+max_consecutive_no_progress_windows = 2
 "#,
         )
         .expect("gateway tools config should deserialize with execution_windows");
@@ -4382,8 +4381,8 @@ max_consecutive_failed_windows = 2
             execution_windows.window.max_provider_tokens_per_window,
             Some(2_000)
         );
-        assert_eq!(execution_windows.total.max_windows_per_turn, 5);
-        assert_eq!(execution_windows.total.max_tool_calls_per_turn, 41);
+        assert_eq!(execution_windows.total.max_windows_per_turn, Some(5));
+        assert_eq!(execution_windows.total.max_tool_calls_per_turn, Some(41));
         assert_eq!(
             execution_windows.total.max_wall_clock_ms_per_turn,
             Some(3_000)
@@ -4392,7 +4391,26 @@ max_consecutive_failed_windows = 2
             execution_windows.total.max_provider_tokens_per_turn,
             Some(4_000)
         );
-        assert_eq!(execution_windows.total.max_consecutive_failed_windows, 2);
+        assert_eq!(
+            execution_windows.total.max_consecutive_no_progress_windows,
+            2
+        );
+    }
+
+    #[test]
+    fn gateway_execution_windows_accepts_legacy_failed_window_breaker_name() {
+        let config = toml::from_str::<super::GatewayExecutionWindowsConfig>(
+            r#"
+[total]
+max_consecutive_failed_windows = 7
+"#,
+        )
+        .expect("legacy failed-window breaker name should remain compatible");
+
+        assert_eq!(config.total.max_consecutive_no_progress_windows, 7);
+        assert_eq!(config.total.max_windows_per_turn, None);
+        assert_eq!(config.total.max_tool_calls_per_turn, None);
+        assert_eq!(config.total.max_wall_clock_ms_per_turn, None);
     }
 
     #[test]

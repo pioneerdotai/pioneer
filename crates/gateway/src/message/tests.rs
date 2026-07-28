@@ -20007,6 +20007,10 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
     assert!(rows[0].payload.contains("SECRET_REASONING_SENTINEL"));
     assert_eq!(rows[1].source, "tool_result");
     assert!(rows[1].payload.contains("SECRET_LLM_CONTEXT_SENTINEL"));
+    assert!(
+        rows.iter().all(|row| row.expires_at.is_none()),
+        "active-turn provider history must remain recoverable for the entire turn lifetime"
+    );
 
     let unexpected = timeout(Duration::from_millis(100), rx.recv()).await;
     assert!(
