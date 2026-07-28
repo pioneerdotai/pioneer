@@ -67,6 +67,16 @@ pub enum AgentDurableEvent {
         payload: ToolResultView,
         output_policy_snapshot: ToolOutputPolicySnapshot,
     },
+    /// Exact provider-facing assistant message retained for crash recovery.
+    /// The payload is owned by the provider boundary and must be replayed
+    /// unchanged; protocol and gateway code only persist it.
+    TurnProviderHistoryAppended {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        sequence: i64,
+        payload: JsonValue,
+    },
     ItemStarted {
         notification: ItemStartedNotification,
     },
@@ -323,6 +333,7 @@ impl AgentDurableEvent {
             | Self::TurnCapabilitiesResolved { turn_id, .. }
             | Self::SkillAuditEvents { turn_id, .. }
             | Self::TurnLlmContextAppended { turn_id, .. }
+            | Self::TurnProviderHistoryAppended { turn_id, .. }
             | Self::ProviderFailureDetected { turn_id, .. }
             | Self::RecoveryAttemptSucceeded { turn_id, .. }
             | Self::TurnCompleted { turn_id, .. }
@@ -391,6 +402,7 @@ impl AgentDurableEvent {
             | Self::SkillAuditEvents { .. }
             | Self::TurnPermissionAudit { .. }
             | Self::TurnLlmContextAppended { .. }
+            | Self::TurnProviderHistoryAppended { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }

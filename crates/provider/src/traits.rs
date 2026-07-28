@@ -106,6 +106,7 @@ mod tests {
                 }),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             })
         }
 

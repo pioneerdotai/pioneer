@@ -7,9 +7,9 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
-        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderTimeoutPolicy,
-        ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
-        ToolDefinition,
+        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
+        ProviderTimeoutPolicy, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -69,6 +69,10 @@ struct ApiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<ApiMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +191,8 @@ struct ApiResponseMessage {
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
+    reasoning_details: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
     tool_calls: Option<serde_json::Value>,
     #[serde(default)]
     function_call: Option<serde_json::Value>,
@@ -251,6 +257,8 @@ struct StreamDelta {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_details: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[serde(default)]
@@ -538,6 +546,10 @@ impl OpenRouterProvider {
                         Role::Tool => "tool".into(),
                     },
                     content,
+                    reasoning_content: (message.role == Role::Assistant)
+                        .then(|| message.reasoning_content.clone())
+                        .flatten(),
+                    reasoning_details: Self::replay_reasoning_details(message)?,
                     tool_calls,
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
@@ -554,6 +566,8 @@ impl OpenRouterProvider {
                 rendered.push(ApiMessage {
                     role: "tool".to_owned(),
                     content: Some(ApiMessageContent::Text(tool_content)),
+                    reasoning_content: None,
+                    reasoning_details: None,
                     tool_calls,
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
@@ -570,6 +584,8 @@ impl OpenRouterProvider {
                 rendered.push(ApiMessage {
                     role: "user".to_owned(),
                     content: Some(ApiMessageContent::Parts(parts)),
+                    reasoning_content: None,
+                    reasoning_details: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -586,6 +602,10 @@ impl OpenRouterProvider {
                     Role::Tool => "tool".into(),
                 },
                 content: Some(ApiMessageContent::Parts(parts)),
+                reasoning_content: (message.role == Role::Assistant)
+                    .then(|| message.reasoning_content.clone())
+                    .flatten(),
+                reasoning_details: Self::replay_reasoning_details(message)?,
                 tool_calls,
                 tool_call_id: message.tool_call_id.clone(),
                 name: message.name.clone(),
@@ -593,6 +613,42 @@ impl OpenRouterProvider {
         }
 
         Ok(rendered)
+    }
+
+    fn replay_reasoning_details(
+        message: &crate::types::ChatMessage,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        if message.role != Role::Assistant {
+            return Ok(None);
+        }
+        let Some(state) = message.provider_replay_state.as_ref() else {
+            return Ok(None);
+        };
+        let payload = state.payload_for("openrouter").ok_or_else(|| {
+            anyhow!(
+                "provider replay state `{}` cannot be rendered by `openrouter`",
+                state.provider
+            )
+        })?;
+        serde_json::from_value(
+            payload
+                .get("reasoning_details")
+                .cloned()
+                .ok_or_else(|| anyhow!("openrouter replay state is missing `reasoning_details`"))?,
+        )
+        .map(Some)
+        .map_err(|error| anyhow!("invalid openrouter replay state: {error}"))
+    }
+
+    fn reasoning_details_state(
+        reasoning_details: Vec<serde_json::Value>,
+    ) -> Option<ProviderReplayState> {
+        (!reasoning_details.is_empty()).then(|| {
+            ProviderReplayState::new(
+                "openrouter",
+                serde_json::json!({ "reasoning_details": reasoning_details }),
+            )
+        })
     }
 
     fn convert_tools(tools: &[ToolDefinition]) -> Vec<ApiToolDefinition> {
@@ -782,6 +838,8 @@ impl crate::traits::Provider for OpenRouterProvider {
             .ok_or_else(|| anyhow!("no response from OpenRouter"))?;
 
         let raw_content = message.content.clone();
+        let provider_replay_state =
+            Self::reasoning_details_state(message.reasoning_details.clone().unwrap_or_default());
         let mut text = message.effective_content();
         let mut tool_calls =
             parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref());
@@ -811,6 +869,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state,
         })
     }
 
@@ -862,6 +921,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         tokio::spawn(async move {
             let mut buffer = String::new();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut reasoning_details = Vec::new();
 
             tokio::pin!(byte_stream);
 
@@ -890,6 +950,11 @@ impl crate::traits::Provider for OpenRouterProvider {
                     };
 
                     if data.trim() == "[DONE]" {
+                        if let Some(state) =
+                            OpenRouterProvider::reasoning_details_state(reasoning_details)
+                        {
+                            let _ = tx.send(Ok(StreamChunk::provider_replay_state(state))).await;
+                        }
                         let tool_calls = tool_call_accumulator.take_tool_calls();
                         if !tool_calls.is_empty() {
                             let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
@@ -918,6 +983,9 @@ impl crate::traits::Provider for OpenRouterProvider {
                                         .await;
                                     return;
                                 }
+                                if let Some(details) = choice.delta.reasoning_details {
+                                    reasoning_details.extend(details);
+                                }
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
@@ -943,6 +1011,13 @@ impl crate::traits::Provider for OpenRouterProvider {
                                     }]);
                                 }
                                 if choice.finish_reason.is_some() {
+                                    if let Some(state) = OpenRouterProvider::reasoning_details_state(
+                                        reasoning_details,
+                                    ) {
+                                        let _ = tx
+                                            .send(Ok(StreamChunk::provider_replay_state(state)))
+                                            .await;
+                                    }
                                     let tool_calls = tool_call_accumulator.take_tool_calls();
                                     if !tool_calls.is_empty() {
                                         let _ =
@@ -960,6 +1035,9 @@ impl crate::traits::Provider for OpenRouterProvider {
                 }
             }
 
+            if let Some(state) = OpenRouterProvider::reasoning_details_state(reasoning_details) {
+                let _ = tx.send(Ok(StreamChunk::provider_replay_state(state))).await;
+            }
             let tool_calls = tool_call_accumulator.take_tool_calls();
             if !tool_calls.is_empty() {
                 let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
@@ -1129,8 +1207,8 @@ mod tests {
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
     use crate::types::{
-        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ReasoningConfig,
-        ReasoningEffort,
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ProviderToolCall,
+        ReasoningConfig, ReasoningEffort,
     };
 
     fn model_from_json(json: &str) -> ProviderModelInfo {
@@ -1338,10 +1416,12 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_roles() {
+        let mut assistant = ChatMessage::assistant("Hi!");
+        assistant.reasoning_content = Some("signed reasoning".to_owned());
         let messages = vec![
             ChatMessage::system("Be helpful"),
             ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
+            assistant,
         ];
 
         let provider = OpenRouterProvider::new("test-key");
@@ -1361,6 +1441,52 @@ mod tests {
         ));
         assert_eq!(api_messages[1].role, "user");
         assert_eq!(api_messages[2].role, "assistant");
+        assert_eq!(
+            api_messages[2].reasoning_content.as_deref(),
+            Some("signed reasoning")
+        );
+    }
+
+    #[test]
+    fn convert_messages_replays_openrouter_reasoning_details_unchanged() {
+        let reasoning_details = serde_json::json!([
+            {
+                "type": "reasoning.encrypted",
+                "data": "opaque-encrypted-state",
+                "id": "reasoning-1",
+                "format": "unknown"
+            },
+            {
+                "type": "reasoning.summary",
+                "summary": "provider-generated summary",
+                "id": "reasoning-2",
+                "format": "unknown"
+            }
+        ]);
+        let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            Some("visible reasoning"),
+            vec![ProviderToolCall {
+                id: "call_1".to_owned(),
+                name: "inspect".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            Some(ProviderReplayState::new(
+                "openrouter",
+                serde_json::json!({ "reasoning_details": reasoning_details.clone() }),
+            )),
+        );
+
+        let provider = OpenRouterProvider::new("test-key");
+        let prepared =
+            prepare_messages_for_provider(provider.name(), &provider.capabilities(), &[assistant])
+                .unwrap();
+        let api_messages = OpenRouterProvider::convert_messages(&prepared).unwrap();
+
+        assert_eq!(
+            api_messages[0].reasoning_details,
+            serde_json::from_value::<Vec<serde_json::Value>>(reasoning_details).ok()
+        );
     }
 
     #[test]
@@ -1416,6 +1542,8 @@ mod tests {
                 ApiMessage {
                     role: "system".into(),
                     content: Some(ApiMessageContent::Text("You are helpful".into())),
+                    reasoning_content: None,
+                    reasoning_details: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -1423,6 +1551,8 @@ mod tests {
                 ApiMessage {
                     role: "user".into(),
                     content: Some(ApiMessageContent::Text("Hello".into())),
+                    reasoning_content: None,
+                    reasoning_details: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -1454,6 +1584,8 @@ mod tests {
             messages: vec![ApiMessage {
                 role: "user".into(),
                 content: Some(ApiMessageContent::Text("Hello".into())),
+                reasoning_content: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1493,6 +1625,8 @@ mod tests {
             messages: vec![ApiMessage {
                 role: "user".into(),
                 content: Some(ApiMessageContent::Text("Hello".into())),
+                reasoning_content: None,
+                reasoning_details: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1531,6 +1665,38 @@ mod tests {
         assert_eq!(
             response.choices[0].message.reasoning.as_deref(),
             Some("thinking")
+        );
+    }
+
+    #[test]
+    fn api_response_preserves_structured_reasoning_details() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_details": [
+                        {"type":"reasoning.encrypted","data":"opaque","id":"r1","format":"unknown"},
+                        {"type":"reasoning.summary","summary":"summary","id":"r2","format":"unknown"}
+                    ],
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"}
+                    }]
+                }
+            }]
+        }"#;
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let details = response.choices[0]
+            .message
+            .reasoning_details
+            .clone()
+            .unwrap();
+        let state = OpenRouterProvider::reasoning_details_state(details.clone()).unwrap();
+
+        assert_eq!(
+            state.payload_for("openrouter"),
+            Some(&serde_json::json!({ "reasoning_details": details }))
         );
     }
 
@@ -1589,6 +1755,28 @@ mod tests {
         assert_eq!(
             response.choices[0].delta.reasoning.as_deref(),
             Some("trace")
+        );
+    }
+
+    #[test]
+    fn stream_response_preserves_reasoning_detail_chunks_in_order() {
+        let first: StreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"first"}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        let second: StreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"second"}]},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+        let mut details = first.choices[0].delta.reasoning_details.clone().unwrap();
+        details.extend(second.choices[0].delta.reasoning_details.clone().unwrap());
+
+        assert_eq!(
+            details,
+            vec![
+                serde_json::json!({"type":"reasoning.encrypted","data":"first"}),
+                serde_json::json!({"type":"reasoning.summary","summary":"second"}),
+            ]
         );
     }
 

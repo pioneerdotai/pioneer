@@ -55,6 +55,8 @@ struct ApiMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<ApiMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -426,6 +428,9 @@ impl CopilotProvider {
                         Role::Tool => "tool".into(),
                     },
                     content,
+                    reasoning_content: (m.role == Role::Assistant)
+                        .then(|| m.reasoning_content.clone())
+                        .flatten(),
                     tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
                         tool_calls
                             .iter()
@@ -595,6 +600,7 @@ impl crate::traits::Provider for CopilotProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 
@@ -814,10 +820,12 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_roles() {
+        let mut assistant = ChatMessage::assistant("Hi!");
+        assistant.reasoning_content = Some("signed reasoning".to_owned());
         let messages = vec![
             ChatMessage::system("Be helpful"),
             ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
+            assistant,
         ];
 
         let provider = CopilotProvider::new("key");
@@ -833,6 +841,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "system");
         assert_eq!(api_messages[1].role, "user");
         assert_eq!(api_messages[2].role, "assistant");
+        assert_eq!(
+            api_messages[2].reasoning_content.as_deref(),
+            Some("signed reasoning")
+        );
     }
 
     #[test]

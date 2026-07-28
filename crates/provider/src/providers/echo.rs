@@ -56,6 +56,7 @@ impl crate::traits::Provider for EchoProvider {
             usage: None,
             reasoning_content,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 

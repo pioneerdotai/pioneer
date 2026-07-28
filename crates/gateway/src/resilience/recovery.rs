@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
-    RestoredRecoveryTurnRequest, RetainedToolLlmContext, ToolLoopConfig,
+    RestoredRecoveryTurnRequest, RetainedProviderHistoryMessage, ToolLoopConfig,
 };
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
@@ -12,10 +12,10 @@ use pioneer_protocol::{
     ExecutionCheckpointPayload, ExecutionWindowStatus, ProviderFailureClass,
     ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus,
     RecoveryTrigger, ToolMetadata, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-    ToolRecoveryRetryClass, TurnItem, TurnItemType, TurnStatus, generate_id,
+    ToolRecoveryRetryClass, TurnItemType, TurnStatus, generate_id,
 };
-use pioneer_provider::ProviderRegistry;
-use std::collections::HashMap;
+use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -45,6 +45,15 @@ struct TimeoutRecoveryPolicyDecision {
     policy: RecoveryPolicy,
     policy_source: TimeoutRecoveryPolicySource,
     tool_snapshot: Option<ToolRecoveryPolicySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedProviderHistoryRow {
+    sequence: i64,
+    source: String,
+    item_id: Option<String>,
+    tool_name: Option<String>,
+    payload: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1901,8 +1910,8 @@ impl RecoveryCoordinator {
             return Ok(events);
         }
 
-        let retained_llm_context = self
-            .retained_llm_context_for_turn(job.turn_id.as_str())
+        let retained_provider_history = self
+            .retained_provider_history_for_turn(job.turn_id.as_str())
             .await?;
         let execution_checkpoint_context = self
             .execution_checkpoint_context_for_turn(thread_id.as_str(), job.turn_id.as_str())
@@ -1923,7 +1932,7 @@ impl RecoveryCoordinator {
             compact_history: execution_plan.compact_history,
             continue_generation,
             model_override: execution_plan.model_override,
-            retained_llm_context,
+            retained_provider_history,
             execution_checkpoint_context,
         };
 
@@ -2503,42 +2512,24 @@ impl RecoveryCoordinator {
         })
     }
 
-    async fn retained_llm_context_for_turn(
+    async fn retained_provider_history_for_turn(
         &self,
         turn_id: &str,
-    ) -> Result<Vec<RetainedToolLlmContext>> {
-        let rows = self.crud_store.list_turn_llm_context(turn_id).await?;
-        let mut retained = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let Some(item_id) = row.item_id else {
-                continue;
-            };
-            let Some(tool_name) = row.tool_name else {
-                continue;
-            };
-            let payload = serde_json::from_str::<serde_json::Value>(row.payload.as_str())?;
-            let Some(item) = self
-                .crud_store
-                .get_turn_item(turn_id, item_id.as_str())
-                .await?
-            else {
-                bail!(
-                    "retained llm_view exists for turn `{turn_id}` item `{item_id}`, but persisted turn item is missing"
-                );
-            };
-
-            retained.push(RetainedToolLlmContext {
-                item_id,
-                tool_name,
-                arguments: turn_item_arguments_json(&item),
+    ) -> Result<Vec<RetainedProviderHistoryMessage>> {
+        let rows = self
+            .crud_store
+            .list_turn_llm_context(turn_id)
+            .await?
+            .into_iter()
+            .map(|row| RetainedProviderHistoryRow {
                 sequence: row.sequence,
-                payload,
-            });
-        }
-
-        retained.sort_by_key(|entry| entry.sequence);
-        Ok(retained)
+                source: row.source,
+                item_id: row.item_id,
+                tool_name: row.tool_name,
+                payload: row.payload,
+            })
+            .collect();
+        assemble_retained_provider_history(turn_id, rows)
     }
 
     async fn cancel_other_open_jobs_after_terminal_recovery(
@@ -2708,21 +2699,155 @@ fn provider_snapshot_field<'a>(job: &'a RecoveryJobRecord, key: &str) -> Option<
     job.policy_snapshot.get(key)?.as_str()
 }
 
-fn turn_item_arguments_json(item: &TurnItem) -> String {
-    let arguments = match item {
-        TurnItem::CommandExecution { arguments, .. }
-        | TurnItem::FileChange { arguments, .. }
-        | TurnItem::WebSearch { arguments, .. }
-        | TurnItem::WebFetch { arguments, .. }
-        | TurnItem::Download { arguments, .. }
-        | TurnItem::DynamicToolCall { arguments, .. } => arguments,
-        TurnItem::UserMessage { .. }
-        | TurnItem::AgentMessage { .. }
-        | TurnItem::Reasoning { .. }
-        | TurnItem::SystemEvent { .. }
-        | TurnItem::Task { .. } => return "{}".to_owned(),
+fn assemble_retained_provider_history(
+    turn_id: &str,
+    mut rows: Vec<RetainedProviderHistoryRow>,
+) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    rows.sort_by_key(|row| row.sequence);
+
+    let mut retained = Vec::with_capacity(rows.len());
+    let mut pending_tool_calls = HashSet::<String>::new();
+    let mut answered_tool_calls = HashSet::<String>::new();
+
+    for row in rows {
+        match row.source.as_str() {
+            "assistant_round" => {
+                if pending_tool_calls
+                    .iter()
+                    .any(|call_id| !answered_tool_calls.contains(call_id))
+                {
+                    bail!(
+                        "retained provider history for turn `{turn_id}` starts a new assistant round before every prior tool call has a retained result"
+                    );
+                }
+
+                let message =
+                    serde_json::from_str::<ChatMessage>(row.payload.as_str()).map_err(|error| {
+                        anyhow::anyhow!(
+                            "invalid retained assistant round for turn `{turn_id}`: {error}"
+                        )
+                    })?;
+                if message.role != Role::Assistant {
+                    bail!(
+                        "retained provider history for turn `{turn_id}` contains a non-assistant round"
+                    );
+                }
+                let tool_calls = message.tool_calls.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "retained assistant round for turn `{turn_id}` has no tool calls"
+                    )
+                })?;
+                if tool_calls.is_empty() {
+                    bail!(
+                        "retained assistant round for turn `{turn_id}` has an empty tool-call list"
+                    );
+                }
+
+                pending_tool_calls.clear();
+                answered_tool_calls.clear();
+                for call in tool_calls {
+                    if !pending_tool_calls.insert(call.id.clone()) {
+                        bail!(
+                            "retained assistant round for turn `{turn_id}` contains duplicate tool call `{}`",
+                            call.id
+                        );
+                    }
+                }
+                retained.push(RetainedProviderHistoryMessage {
+                    sequence: row.sequence,
+                    message,
+                });
+            }
+            "tool_result" => {
+                let item_id = row.item_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "retained tool result for turn `{turn_id}` is missing its call id"
+                    )
+                })?;
+                let tool_name = row.tool_name.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "retained tool result for turn `{turn_id}` call `{item_id}` is missing its tool name"
+                    )
+                })?;
+                if !pending_tool_calls.contains(item_id.as_str()) {
+                    bail!(
+                        "retained tool result for turn `{turn_id}` call `{item_id}` has no preceding complete assistant round"
+                    );
+                }
+                if !answered_tool_calls.insert(item_id.clone()) {
+                    bail!(
+                        "retained provider history for turn `{turn_id}` contains duplicate result for tool call `{item_id}`"
+                    );
+                }
+                let view =
+                    serde_json::from_str::<pioneer_tools::ToolResultView>(row.payload.as_str())?;
+                retained.push(RetainedProviderHistoryMessage {
+                    sequence: row.sequence,
+                    message: recovered_tool_result_message(item_id, tool_name, view),
+                });
+            }
+            source => {
+                bail!(
+                    "retained provider history for turn `{turn_id}` contains unsupported source `{source}`"
+                );
+            }
+        }
+    }
+
+    if pending_tool_calls
+        .iter()
+        .any(|call_id| !answered_tool_calls.contains(call_id))
+    {
+        bail!(
+            "retained provider history for turn `{turn_id}` is incomplete; refusing to send a malformed provider request"
+        );
+    }
+
+    Ok(retained)
+}
+
+fn recovered_tool_result_message(
+    item_id: String,
+    tool_name: String,
+    view: pioneer_tools::ToolResultView,
+) -> ChatMessage {
+    let (content, payload) = match view {
+        pioneer_tools::ToolResultView::Text { text, truncated } => (
+            text.clone(),
+            serde_json::json!({
+                "output": text,
+                "truncated": truncated,
+                "recovered_from_turn_llm_context": true,
+            }),
+        ),
+        pioneer_tools::ToolResultView::Json {
+            mut value,
+            truncated,
+        } => {
+            if !value.is_object() {
+                value = serde_json::json!({ "value": value });
+            }
+            if let Some(map) = value.as_object_mut() {
+                map.entry("truncated".to_owned())
+                    .or_insert(serde_json::Value::Bool(truncated));
+                map.insert(
+                    "recovered_from_turn_llm_context".to_owned(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            let content =
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+            (content, value)
+        }
+        pioneer_tools::ToolResultView::Empty => (
+            String::new(),
+            serde_json::json!({
+                "recovered_from_turn_llm_context": true
+            }),
+        ),
     };
-    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_owned())
+
+    ModelInputItem::tool_result(item_id, tool_name, content, Some(payload)).into_chat_message()
 }
 
 fn policy_snapshot_i64(job: &RecoveryJobRecord, key: &str) -> Option<i64> {
@@ -2951,8 +3076,9 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RuntimeFailureCandidate,
-        TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
+        RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+        assemble_retained_provider_history,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -2982,7 +3108,8 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
-        ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, providers::EchoProvider,
+        ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, ProviderReplayState,
+        ProviderToolCall, providers::EchoProvider,
     };
     use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
     use pioneer_tools::{
@@ -2992,6 +3119,148 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn retained_history_row(
+        sequence: i64,
+        source: &str,
+        item_id: Option<&str>,
+        tool_name: Option<&str>,
+        payload: String,
+    ) -> RetainedProviderHistoryRow {
+        RetainedProviderHistoryRow {
+            sequence,
+            source: source.to_owned(),
+            item_id: item_id.map(str::to_owned),
+            tool_name: tool_name.map(str::to_owned),
+            payload,
+        }
+    }
+
+    #[test]
+    fn retained_provider_history_replays_complete_assistant_round_losslessly() {
+        let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some("working"),
+            Some("private reasoning"),
+            vec![
+                ProviderToolCall {
+                    id: "call_a".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"a"}"#.to_owned(),
+                },
+                ProviderToolCall {
+                    id: "call_b".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"b"}"#.to_owned(),
+                },
+            ],
+            Some(ProviderReplayState::new(
+                "anthropic",
+                serde_json::json!({
+                    "blocks": [{
+                        "type": "thinking",
+                        "thinking": "private reasoning",
+                        "signature": "signed-state"
+                    }]
+                }),
+            )),
+        );
+        let rows = vec![
+            retained_history_row(
+                12,
+                "tool_result",
+                Some("call_a"),
+                Some("read_file"),
+                serde_json::to_string(&pioneer_tools::ToolResultView::Text {
+                    text: "a result".to_owned(),
+                    truncated: false,
+                })
+                .unwrap(),
+            ),
+            retained_history_row(
+                10,
+                "assistant_round",
+                None,
+                None,
+                serde_json::to_string(&assistant).unwrap(),
+            ),
+            retained_history_row(
+                11,
+                "tool_result",
+                Some("call_b"),
+                Some("read_file"),
+                serde_json::to_string(&pioneer_tools::ToolResultView::Text {
+                    text: "b result".to_owned(),
+                    truncated: false,
+                })
+                .unwrap(),
+            ),
+        ];
+
+        let retained = assemble_retained_provider_history("turn_lossless", rows).unwrap();
+
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0].message, assistant);
+        assert_eq!(retained[1].message.tool_call_id.as_deref(), Some("call_b"));
+        assert_eq!(retained[2].message.tool_call_id.as_deref(), Some("call_a"));
+    }
+
+    #[test]
+    fn retained_provider_history_rejects_legacy_tool_result_without_assistant_round() {
+        let rows = vec![retained_history_row(
+            1,
+            "tool_result",
+            Some("call_legacy"),
+            Some("read_file"),
+            serde_json::to_string(&pioneer_tools::ToolResultView::Empty).unwrap(),
+        )];
+
+        let error = assemble_retained_provider_history("turn_legacy", rows).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no preceding complete assistant round")
+        );
+    }
+
+    #[test]
+    fn retained_provider_history_rejects_incomplete_parallel_tool_results() {
+        let assistant = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![
+                ProviderToolCall {
+                    id: "call_a".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                ProviderToolCall {
+                    id: "call_b".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ],
+        );
+        let rows = vec![
+            retained_history_row(
+                1,
+                "assistant_round",
+                None,
+                None,
+                serde_json::to_string(&assistant).unwrap(),
+            ),
+            retained_history_row(
+                2,
+                "tool_result",
+                Some("call_a"),
+                Some("read_file"),
+                serde_json::to_string(&pioneer_tools::ToolResultView::Empty).unwrap(),
+            ),
+        ];
+
+        let error = assemble_retained_provider_history("turn_incomplete", rows).unwrap_err();
+
+        assert!(error.to_string().contains("is incomplete"));
+    }
 
     #[test]
     fn command_execution_recovery_wall_clock_uses_config() {

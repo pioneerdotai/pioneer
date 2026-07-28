@@ -5,8 +5,8 @@ use crate::attachments::{
 use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, Role,
-    StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -62,6 +62,8 @@ struct BedrockContentBlock {
     tool_use: Option<BedrockToolUse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_result: Option<BedrockToolResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<BedrockReasoningContent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,16 +172,20 @@ struct BedrockResponseContent {
     tool_use: Option<BedrockToolUse>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockReasoningContent {
     #[serde(default)]
     reasoning_text: Option<BedrockReasoningText>,
+    #[serde(default)]
+    redacted_content: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BedrockReasoningText {
     text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +496,7 @@ impl BedrockProvider {
                 video: None,
                 tool_use: None,
                 tool_result: None,
+                reasoning_content: None,
             }),
             InputContentType::File => Ok(BedrockContentBlock {
                 text: None,
@@ -503,6 +510,7 @@ impl BedrockProvider {
                 video: None,
                 tool_use: None,
                 tool_result: None,
+                reasoning_content: None,
             }),
             InputContentType::Audio => Ok(BedrockContentBlock {
                 text: None,
@@ -515,6 +523,7 @@ impl BedrockProvider {
                 video: None,
                 tool_use: None,
                 tool_result: None,
+                reasoning_content: None,
             }),
             InputContentType::Video => Ok(BedrockContentBlock {
                 text: None,
@@ -527,6 +536,7 @@ impl BedrockProvider {
                 }),
                 tool_use: None,
                 tool_result: None,
+                reasoning_content: None,
             }),
             _ => Err(anyhow!(
                 "provider `bedrock` does not support {:?} attachments",
@@ -579,9 +589,40 @@ impl BedrockProvider {
                                     }],
                                     status: None,
                                 }),
+                                reasoning_content: None,
                             });
                         }
                         _ => {
+                            if msg.role == Role::Assistant
+                                && let Some(state) = msg.provider_replay_state.as_ref()
+                            {
+                                let payload = state.payload_for("bedrock").ok_or_else(|| {
+                                    anyhow!(
+                                        "provider replay state `{}` cannot be rendered by `bedrock`",
+                                        state.provider
+                                    )
+                                })?;
+                                let blocks = payload.get("blocks").cloned().ok_or_else(|| {
+                                    anyhow!("bedrock replay state is missing `blocks`")
+                                })?;
+                                for reasoning_content in serde_json::from_value::<
+                                    Vec<BedrockReasoningContent>,
+                                >(blocks)
+                                .map_err(|error| anyhow!("invalid bedrock replay state: {error}"))?
+                                {
+                                    content.push(BedrockContentBlock {
+                                        text: None,
+                                        image: None,
+                                        document: None,
+                                        audio: None,
+                                        video: None,
+                                        tool_use: None,
+                                        tool_result: None,
+                                        reasoning_content: Some(reasoning_content),
+                                    });
+                                }
+                            }
+
                             if !msg.content.is_empty() {
                                 content.push(BedrockContentBlock {
                                     text: Some(msg.content.clone()),
@@ -591,6 +632,7 @@ impl BedrockProvider {
                                     video: None,
                                     tool_use: None,
                                     tool_result: None,
+                                    reasoning_content: None,
                                 });
                             }
 
@@ -608,6 +650,7 @@ impl BedrockProvider {
                                             input: parse_json_or_string(call.arguments.as_str()),
                                         }),
                                         tool_result: None,
+                                        reasoning_content: None,
                                     });
                                 }
                             }
@@ -865,17 +908,19 @@ impl crate::traits::Provider for BedrockProvider {
         let mut text_parts = Vec::new();
         let mut reasoning_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
 
         for block in api_response.output.message.content {
             if let Some(t) = block.text {
                 text_parts.push(t);
             }
             if let Some(rc) = block.reasoning_content {
-                if let Some(rt) = rc.reasoning_text {
+                if let Some(rt) = rc.reasoning_text.as_ref() {
                     if !rt.text.is_empty() {
-                        reasoning_parts.push(rt.text);
+                        reasoning_parts.push(rt.text.clone());
                     }
                 }
+                replay_blocks.push(rc);
             }
             if let Some(tool_use) = block.tool_use {
                 tool_calls.push(ProviderToolCall {
@@ -893,6 +938,14 @@ impl crate::traits::Provider for BedrockProvider {
         } else {
             Some(reasoning_parts.join(""))
         };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "bedrock",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -906,6 +959,7 @@ impl crate::traits::Provider for BedrockProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state,
         })
     }
 
@@ -927,6 +981,9 @@ impl crate::traits::Provider for BedrockProvider {
         }
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        if let Some(state) = response.provider_replay_state {
+            chunks.push(Ok(StreamChunk::provider_replay_state(state)));
         }
         chunks.push(Ok(StreamChunk::final_chunk()));
         Ok(Box::pin(futures_util::stream::iter(chunks)))
@@ -1232,6 +1289,48 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_replays_signed_reasoning_blocks_before_tool_calls() {
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            Some("summary"),
+            vec![ProviderToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            Some(ProviderReplayState::new(
+                "bedrock",
+                serde_json::json!({
+                    "blocks": [{
+                        "reasoningText": {
+                            "text": "summary",
+                            "signature": "opaque-signature"
+                        }
+                    }]
+                }),
+            )),
+        );
+
+        let prepared = prepared_for(&[message]);
+        let (messages, _) = BedrockProvider::convert_messages(&prepared).unwrap();
+
+        let replay = messages[0].content[0]
+            .reasoning_content
+            .as_ref()
+            .and_then(|content| content.reasoning_text.as_ref())
+            .expect("signed reasoning block");
+        assert_eq!(replay.text, "summary");
+        assert_eq!(replay.signature.as_deref(), Some("opaque-signature"));
+        assert_eq!(
+            messages[0].content[1]
+                .tool_use
+                .as_ref()
+                .map(|tool| tool.tool_use_id.as_str()),
+            Some("call_1")
+        );
+    }
+
+    #[test]
     fn convert_messages_no_system() {
         let messages = vec![ChatMessage::user("Hello")];
 
@@ -1287,6 +1386,7 @@ mod tests {
                     video: None,
                     tool_use: None,
                     tool_result: None,
+                    reasoning_content: None,
                 }],
             }],
             system: vec![BedrockSystemBlock {
@@ -1322,6 +1422,7 @@ mod tests {
                     video: None,
                     tool_use: None,
                     tool_result: None,
+                    reasoning_content: None,
                 }],
             }],
             system: vec![],

@@ -5,8 +5,8 @@ use crate::attachments::{
 use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, Role,
-    StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -65,6 +65,13 @@ struct ApiMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiMessageContentBlock {
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
     Text {
         text: String,
     },
@@ -125,6 +132,12 @@ struct ContentBlock {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
@@ -163,6 +176,10 @@ struct StreamDelta {
     /// Present on thinking block deltas.
     #[serde(default)]
     thinking: Option<String>,
+    /// Anthropic sends the opaque thinking signature immediately before the
+    /// corresponding thinking block stops.
+    #[serde(default)]
+    signature: Option<String>,
     /// Present on tool use deltas (`input_json_delta`).
     #[serde(default)]
     partial_json: Option<String>,
@@ -178,6 +195,12 @@ struct StreamContentBlock {
     name: Option<String>,
     #[serde(default)]
     input: Option<serde_json::Value>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 // ── List models response types ─────────────────────────────────────────────
@@ -292,6 +315,26 @@ impl AnthropicProvider {
                     });
                 }
                 _ => {
+                    if m.role == Role::Assistant
+                        && let Some(state) = m.provider_replay_state.as_ref()
+                    {
+                        let payload = state.payload_for("anthropic").ok_or_else(|| {
+                            anyhow!(
+                                "provider replay state `{}` cannot be rendered by `anthropic`",
+                                state.provider
+                            )
+                        })?;
+                        let blocks = payload
+                            .get("blocks")
+                            .cloned()
+                            .ok_or_else(|| anyhow!("anthropic replay state is missing `blocks`"))?;
+                        content.extend(
+                            serde_json::from_value::<Vec<ApiMessageContentBlock>>(blocks).map_err(
+                                |error| anyhow!("invalid anthropic replay state: {error}"),
+                            )?,
+                        );
+                    }
+
                     if !m.content.is_empty() {
                         content.push(ApiMessageContentBlock::Text {
                             text: m.content.clone(),
@@ -493,6 +536,7 @@ impl crate::traits::Provider for AnthropicProvider {
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut replay_blocks = Vec::new();
 
         for block in api_response.content {
             match block.block_type.as_str() {
@@ -502,8 +546,20 @@ impl crate::traits::Provider for AnthropicProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(t) = block.text {
-                        thinking_parts.push(t);
+                    let thinking = block.thinking.or(block.text).unwrap_or_default();
+                    if !thinking.is_empty() {
+                        thinking_parts.push(thinking.clone());
+                    }
+                    if let Some(signature) = block.signature {
+                        replay_blocks.push(ApiMessageContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        });
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(data) = block.data {
+                        replay_blocks.push(ApiMessageContentBlock::RedactedThinking { data });
                     }
                 }
                 "tool_use" => {
@@ -527,6 +583,14 @@ impl crate::traits::Provider for AnthropicProvider {
         } else {
             Some(thinking_parts.join(""))
         };
+        let provider_replay_state = if replay_blocks.is_empty() {
+            None
+        } else {
+            Some(ProviderReplayState::new(
+                "anthropic",
+                serde_json::json!({ "blocks": replay_blocks }),
+            ))
+        };
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -540,6 +604,7 @@ impl crate::traits::Provider for AnthropicProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state,
         })
     }
 
@@ -589,10 +654,12 @@ impl crate::traits::Provider for AnthropicProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
-            use std::collections::{HashMap, HashSet};
+            use std::collections::{BTreeMap, HashMap, HashSet};
 
             let mut buffer = String::new();
             let mut thinking_blocks = HashSet::new();
+            let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
+                BTreeMap::new();
             let mut pending_tool_uses: HashMap<usize, PendingToolUse> = HashMap::new();
 
             tokio::pin!(byte_stream);
@@ -632,6 +699,18 @@ impl crate::traits::Provider for AnthropicProvider {
                                     let _ =
                                         tx.send(Ok(StreamChunk::tool_calls(remaining_calls))).await;
                                 }
+                                if !replay_thinking_blocks.is_empty() {
+                                    let blocks =
+                                        replay_thinking_blocks.into_values().collect::<Vec<_>>();
+                                    let _ = tx
+                                        .send(Ok(StreamChunk::provider_replay_state(
+                                            ProviderReplayState::new(
+                                                "anthropic",
+                                                serde_json::json!({ "blocks": blocks }),
+                                            ),
+                                        )))
+                                        .await;
+                                }
                                 let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                                 return;
                             }
@@ -642,6 +721,30 @@ impl crate::traits::Provider for AnthropicProvider {
                                     match block.block_type.as_str() {
                                         "thinking" => {
                                             thinking_blocks.insert(index);
+                                            replay_thinking_blocks.insert(
+                                                index,
+                                                ApiMessageContentBlock::Thinking {
+                                                    thinking: block
+                                                        .thinking
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    signature: block
+                                                        .signature
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                },
+                                            );
+                                        }
+                                        "redacted_thinking" => {
+                                            thinking_blocks.remove(&index);
+                                            if let Some(data) = block.data.clone() {
+                                                replay_thinking_blocks.insert(
+                                                    index,
+                                                    ApiMessageContentBlock::RedactedThinking {
+                                                        data,
+                                                    },
+                                                );
+                                            }
                                         }
                                         "tool_use" => {
                                             thinking_blocks.remove(&index);
@@ -692,10 +795,25 @@ impl crate::traits::Provider for AnthropicProvider {
                                     if thinking_blocks.contains(&index) {
                                         if let Some(thinking) = delta.thinking {
                                             if !thinking.is_empty() {
+                                                if let Some(ApiMessageContentBlock::Thinking {
+                                                    thinking: replay_thinking,
+                                                    ..
+                                                }) = replay_thinking_blocks.get_mut(&index)
+                                                {
+                                                    replay_thinking.push_str(&thinking);
+                                                }
                                                 let _ = tx
                                                     .send(Ok(StreamChunk::reasoning(thinking)))
                                                     .await;
                                             }
+                                        }
+                                        if let Some(signature) = delta.signature
+                                            && let Some(ApiMessageContentBlock::Thinking {
+                                                signature: replay_signature,
+                                                ..
+                                            }) = replay_thinking_blocks.get_mut(&index)
+                                        {
+                                            replay_signature.push_str(&signature);
                                         }
                                     } else if let Some(partial_json) = delta.partial_json {
                                         if let Some(call) = pending_tool_uses.get_mut(&index) {
@@ -726,6 +844,17 @@ impl crate::traits::Provider for AnthropicProvider {
                 .collect::<Vec<_>>();
             if !remaining_calls.is_empty() {
                 let _ = tx.send(Ok(StreamChunk::tool_calls(remaining_calls))).await;
+            }
+            if !replay_thinking_blocks.is_empty() {
+                let blocks = replay_thinking_blocks.into_values().collect::<Vec<_>>();
+                let _ = tx
+                    .send(Ok(StreamChunk::provider_replay_state(
+                        ProviderReplayState::new(
+                            "anthropic",
+                            serde_json::json!({ "blocks": blocks }),
+                        ),
+                    )))
+                    .await;
             }
             let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
         });
@@ -954,6 +1083,41 @@ mod tests {
 
         assert!(system.is_none());
         assert_eq!(api_messages.len(), 1);
+    }
+
+    #[test]
+    fn prepare_messages_replays_signed_thinking_blocks_before_tool_calls() {
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            Some("summary"),
+            vec![ProviderToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            Some(ProviderReplayState::new(
+                "anthropic",
+                serde_json::json!({
+                    "blocks": [{
+                        "type": "thinking",
+                        "thinking": "summary",
+                        "signature": "opaque-signature"
+                    }]
+                }),
+            )),
+        );
+
+        let (_, messages) = render_messages(&[message]);
+
+        assert!(matches!(
+            &messages[0].content[0],
+            ApiMessageContentBlock::Thinking { thinking, signature }
+                if thinking == "summary" && signature == "opaque-signature"
+        ));
+        assert!(matches!(
+            &messages[0].content[1],
+            ApiMessageContentBlock::ToolUse { id, .. } if id == "call_1"
+        ));
     }
 
     #[test]

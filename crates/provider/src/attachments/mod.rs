@@ -350,6 +350,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         };
 
         let prepared =

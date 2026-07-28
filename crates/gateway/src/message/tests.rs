@@ -137,8 +137,8 @@ use pioneer_protocol::{
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
-    ChatRequest, ChatResponse, Provider, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderToolCall, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities,
+    ProviderInputCapabilities, ProviderToolCall, StreamChunk,
 };
 use pioneer_skills::{AgentSkillRuntimeEntry, SkillTrustLevel};
 use pioneer_tools::{
@@ -2544,6 +2544,7 @@ impl Provider for DelayedProvider {
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -2600,6 +2601,7 @@ impl Provider for RevisionProvider {
             text: text.to_owned(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -2675,6 +2677,7 @@ impl Provider for RevisionHangingProvider {
             text: text.to_owned(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -2744,6 +2747,7 @@ impl Provider for CountingDelayedProvider {
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -2891,6 +2895,7 @@ impl Provider for CaptureSummaryProvider {
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -3166,6 +3171,7 @@ impl Provider for FlakyTitleProvider {
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -3224,6 +3230,7 @@ impl Provider for GuardAwareProvider {
                 text: "slow child".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -3238,6 +3245,7 @@ impl Provider for GuardAwareProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_guard_create".to_owned(),
                     name: "task_create".to_owned(),
@@ -3252,6 +3260,7 @@ impl Provider for GuardAwareProvider {
                 text: "premature final".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             },
             2 => {
@@ -3261,6 +3270,7 @@ impl Provider for GuardAwareProvider {
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: vec![ProviderToolCall {
                         id: "call_guard_detach".to_owned(),
                         name: "task_detach".to_owned(),
@@ -3272,6 +3282,7 @@ impl Provider for GuardAwareProvider {
                 text: "detached and done".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             },
         };
@@ -3334,6 +3345,7 @@ impl Provider for CreateThenHangProvider {
                 text: "slow child".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -3344,6 +3356,7 @@ impl Provider for CreateThenHangProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_cancel_create".to_owned(),
                     name: "task_create".to_owned(),
@@ -3360,6 +3373,7 @@ impl Provider for CreateThenHangProvider {
             text: "should not complete".to_owned(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -4117,6 +4131,7 @@ impl Provider for VerticalSelfImprovementProvider {
             text,
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -4252,6 +4267,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: vec![ProviderToolCall {
                     id: format!("vertical_source_tool_{}", round / 2),
                     name: "request_tools".to_owned(),
@@ -4280,6 +4296,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
             ),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -4353,6 +4370,7 @@ impl Provider for VerticalReadSkillProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: vec![ProviderToolCall {
                     id: "vertical_read_agent_skill".to_owned(),
                     name: "read_skill".to_owned(),
@@ -4368,6 +4386,7 @@ impl Provider for VerticalReadSkillProvider {
             text: "The learned procedure was read.".to_owned(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -4442,6 +4461,7 @@ impl Provider for MemoryAgentE2eProvider {
                 text: memory_policy_json_for_script(self.script),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -4705,6 +4725,7 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
         text: text.into(),
         usage: None,
         reasoning_content: None,
+        provider_replay_state: None,
         tool_calls: Vec::new(),
     }
 }
@@ -4839,6 +4860,7 @@ impl Provider for SequencedToolProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: self.first_tool_calls.clone(),
             });
         }
@@ -4847,6 +4869,7 @@ impl Provider for SequencedToolProvider {
             text: self.second_text.clone(),
             usage: None,
             reasoning_content: None,
+            provider_replay_state: None,
             tool_calls: Vec::new(),
         })
     }
@@ -19937,6 +19960,25 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
         crud_store.clone(),
     );
 
+    let assistant_round = ChatMessage::assistant_tool_calls_with_reasoning(
+        None::<String>,
+        Some("SECRET_REASONING_SENTINEL"),
+        vec![ProviderToolCall {
+            id: "item_llm_ctx".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+    );
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnProviderHistoryAppended {
+            thread_id: "thread_llm_ctx".to_owned(),
+            turn_id: "turn_llm_ctx".to_owned(),
+            item_id: "reasoning_llm_ctx".to_owned(),
+            sequence: 0,
+            payload: serde_json::to_value(assistant_round).unwrap(),
+        })
+        .await;
+
     processor
         .handle_durable_agent_event(AgentDurableEvent::TurnLlmContextAppended {
             thread_id: "thread_llm_ctx".to_owned(),
@@ -19960,8 +20002,11 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
         .list_turn_llm_context("turn_llm_ctx")
         .await
         .expect("llm context rows should be readable");
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].payload.contains("SECRET_LLM_CONTEXT_SENTINEL"));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].source, "assistant_round");
+    assert!(rows[0].payload.contains("SECRET_REASONING_SENTINEL"));
+    assert_eq!(rows[1].source, "tool_result");
+    assert!(rows[1].payload.contains("SECRET_LLM_CONTEXT_SENTINEL"));
 
     let unexpected = timeout(Duration::from_millis(100), rx.recv()).await;
     assert!(

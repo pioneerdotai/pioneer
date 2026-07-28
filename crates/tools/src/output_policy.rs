@@ -119,6 +119,7 @@ impl ToolResultEnvelope {
                 tool_call_id: Some(call_id.to_owned()),
                 name: Some(tool_name.to_owned()),
                 tool_calls: None,
+                provider_replay_state: None,
             });
         }
 

@@ -5,8 +5,8 @@ use crate::attachments::{
 use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig,
-    ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -72,6 +72,12 @@ struct ApiPart {
     function_call: Option<ApiFunctionCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     function_response: Option<ApiFunctionResponse>,
+    #[serde(
+        default,
+        rename = "thoughtSignature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -286,6 +292,7 @@ impl GeminiProvider {
             thought: None,
             function_call: None,
             function_response: None,
+            thought_signature: None,
         })
     }
 
@@ -306,6 +313,7 @@ impl GeminiProvider {
                         thought: None,
                         function_call: None,
                         function_response: None,
+                        thought_signature: None,
                     });
                 }
                 _ => {
@@ -334,6 +342,7 @@ impl GeminiProvider {
                                 name,
                                 response: response_payload,
                             }),
+                            thought_signature: None,
                         });
                     } else if !msg.content.is_empty() {
                         parts.push(ApiPart {
@@ -343,11 +352,43 @@ impl GeminiProvider {
                             thought: None,
                             function_call: None,
                             function_response: None,
+                            thought_signature: None,
                         });
                     }
 
+                    let function_call_signatures = if msg.role == Role::Assistant {
+                        msg.provider_replay_state
+                            .as_ref()
+                            .map(|state| {
+                                let payload =
+                                    state.payload_for("gemini").ok_or_else(|| {
+                                        anyhow!(
+                                            "provider replay state `{}` cannot be rendered by `gemini`",
+                                            state.provider
+                                        )
+                                    })?;
+                                serde_json::from_value::<Vec<Option<String>>>(
+                                    payload
+                                        .get("function_call_signatures")
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "gemini replay state is missing `function_call_signatures`"
+                                            )
+                                        })?,
+                                )
+                                .map_err(|error| {
+                                    anyhow!("invalid gemini replay state: {error}")
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
                     if let Some(tool_calls) = msg.tool_calls.as_ref() {
-                        for call in tool_calls {
+                        for (call_index, call) in tool_calls.iter().enumerate() {
                             parts.push(ApiPart {
                                 text: None,
                                 inline_data: None,
@@ -358,6 +399,10 @@ impl GeminiProvider {
                                     args: parse_json_or_string(call.arguments.as_str()),
                                 }),
                                 function_response: None,
+                                thought_signature: function_call_signatures
+                                    .get(call_index)
+                                    .cloned()
+                                    .flatten(),
                             });
                         }
                     }
@@ -558,6 +603,27 @@ impl GeminiProvider {
             .collect()
     }
 
+    fn extract_provider_replay_state(
+        response: &ApiGenerateResponse,
+    ) -> Option<ProviderReplayState> {
+        let parts = response
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.content.as_ref())
+            .map(|content| &content.parts)?;
+        let signatures = parts
+            .iter()
+            .filter(|part| part.function_call.is_some())
+            .map(|part| part.thought_signature.clone())
+            .collect::<Vec<_>>();
+        signatures.iter().any(Option::is_some).then(|| {
+            ProviderReplayState::new(
+                "gemini",
+                serde_json::json!({ "function_call_signatures": signatures }),
+            )
+        })
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = response
@@ -626,6 +692,7 @@ impl crate::traits::Provider for GeminiProvider {
         let text = Self::extract_text(&api_response).unwrap_or_default();
         let reasoning_content = Self::extract_reasoning(&api_response);
         let tool_calls = Self::extract_tool_calls(&api_response);
+        let provider_replay_state = Self::extract_provider_replay_state(&api_response);
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -639,6 +706,7 @@ impl crate::traits::Provider for GeminiProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state,
         })
     }
 
@@ -675,6 +743,7 @@ impl crate::traits::Provider for GeminiProvider {
         tokio::spawn(async move {
             let mut buffer = String::new();
             let mut last_tool_calls: Vec<ProviderToolCall> = Vec::new();
+            let mut provider_replay_state = None;
 
             tokio::pin!(byte_stream);
 
@@ -704,6 +773,9 @@ impl crate::traits::Provider for GeminiProvider {
 
                     match serde_json::from_str::<ApiGenerateResponse>(data) {
                         Ok(resp) => {
+                            if let Some(state) = Self::extract_provider_replay_state(&resp) {
+                                provider_replay_state = Some(state);
+                            }
                             if let Some(reasoning) = Self::extract_reasoning(&resp) {
                                 if !reasoning.is_empty() {
                                     let _ = tx.send(Ok(StreamChunk::reasoning(reasoning))).await;
@@ -727,6 +799,9 @@ impl crate::traits::Provider for GeminiProvider {
                 }
             }
 
+            if let Some(state) = provider_replay_state {
+                let _ = tx.send(Ok(StreamChunk::provider_replay_state(state))).await;
+            }
             let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
         });
 
@@ -838,6 +913,7 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::Provider;
     use crate::types::{ChatMessage, CompiledPromptPayload, ReasoningConfig, ReasoningEffort};
 
     #[test]
@@ -864,6 +940,57 @@ mod tests {
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=my-key"
         );
+    }
+
+    #[test]
+    fn build_request_replays_thought_signature_on_original_function_call() {
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            Some("summary"),
+            vec![
+                ProviderToolCall {
+                    id: "call_1".to_owned(),
+                    name: "first".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                ProviderToolCall {
+                    id: "call_2".to_owned(),
+                    name: "second".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ],
+            Some(ProviderReplayState::new(
+                "gemini",
+                serde_json::json!({
+                    "function_call_signatures": ["opaque-signature", null]
+                }),
+            )),
+        );
+        let request = ChatRequest {
+            model: "gemini-3-flash-preview".to_owned(),
+            messages: vec![message],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let provider = GeminiProvider::new("key");
+        let prepared = prepare_messages_for_provider(
+            provider.name(),
+            &provider.capabilities(),
+            request.messages.as_slice(),
+        )
+        .unwrap();
+        let rendered = GeminiProvider::build_request_from_prepared(&request, &prepared).unwrap();
+
+        assert_eq!(
+            rendered.contents[0].parts[0].thought_signature.as_deref(),
+            Some("opaque-signature")
+        );
+        assert!(rendered.contents[0].parts[1].thought_signature.is_none());
     }
 
     #[test]

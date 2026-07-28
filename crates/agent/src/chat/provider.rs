@@ -67,6 +67,7 @@ pub(super) async fn request_agent_round(
         let mut full_text = String::new();
         let mut full_reasoning = String::new();
         let mut tool_calls = Vec::new();
+        let mut provider_replay_state = None;
         let mut saw_final = false;
         let mut seen_any_chunk = false;
 
@@ -115,6 +116,9 @@ pub(super) async fn request_agent_round(
             for tool_call in chunk.tool_calls {
                 upsert_tool_call(&mut tool_calls, tool_call);
             }
+            if chunk.provider_replay_state.is_some() {
+                provider_replay_state = chunk.provider_replay_state;
+            }
         }
 
         if !saw_final && seen_any_chunk {
@@ -131,6 +135,7 @@ pub(super) async fn request_agent_round(
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
+            provider_replay_state,
             provider_token_count: None,
         });
     }
@@ -177,6 +182,7 @@ pub(super) async fn request_agent_round(
         text: response.text,
         reasoning,
         tool_calls: response.tool_calls,
+        provider_replay_state: response.provider_replay_state,
         provider_token_count,
     })
 }
@@ -228,6 +234,7 @@ pub(super) async fn stream_provider_response(
             reasoning_delta,
             tool_calls,
             is_final,
+            provider_replay_state: _,
         } = chunk;
 
         if is_final {

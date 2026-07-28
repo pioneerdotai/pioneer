@@ -347,6 +347,7 @@ mod tests {
                     text: "{}".to_owned(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: Vec::new(),
                 })
             }
@@ -441,6 +442,7 @@ mod tests {
                     .to_owned(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: Vec::new(),
                 })
             }

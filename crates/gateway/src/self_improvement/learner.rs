@@ -1421,6 +1421,7 @@ mod tests {
                     output_tokens: Some(5),
                 }),
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }

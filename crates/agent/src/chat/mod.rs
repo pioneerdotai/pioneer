@@ -35,7 +35,7 @@ use crate::{
     AgentMcpMaterializationError, AgentMcpMaterializationFailureReason,
     AgentMcpMaterializationRequest, AgentMcpResolutionDiagnostic, AgentMcpServerRef,
     AgentMcpToolProvider, AgentMcpToolRef, AgentTurnHookRuntimeContext, ExecutionCheckpointContext,
-    ExecutionWindowContinuation, ResolvedArtifactInput, RetainedToolLlmContext,
+    ExecutionWindowContinuation, ResolvedArtifactInput, RetainedProviderHistoryMessage,
     ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
     TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext,
     TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization,
@@ -84,9 +84,8 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
-    MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderRegistry,
-    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
-    infer_mime_from_reference,
+    MessageAttachment, MessageContentPart, Provider, ProviderRegistry, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -197,6 +196,7 @@ struct AgentRoundResponse {
     text: String,
     reasoning: String,
     tool_calls: Vec<ProviderToolCall>,
+    provider_replay_state: Option<pioneer_provider::ProviderReplayState>,
     provider_token_count: Option<u64>,
 }
 
@@ -211,6 +211,7 @@ struct ExecutedToolResult {
     success: bool,
     outcome: ToolOutcome,
     recovery_view: Option<ToolRecoveryView>,
+    retained_llm_context: Option<(ToolResultView, pioneer_protocol::ToolOutputPolicySnapshot)>,
     request_tools_result: Option<RequestToolsResult>,
     message: ChatMessage,
 }
@@ -270,6 +271,7 @@ fn joined_tool_task_failure_result(
         success: false,
         outcome: outcome.clone(),
         recovery_view: None,
+        retained_llm_context: None,
         request_tools_result: None,
         message: tooling::build_tool_error_message(item_id, tool_name, error_text, outcome),
     }
@@ -889,6 +891,55 @@ async fn emit_durable_event(
 ) -> Result<(), ChatTurnError> {
     event_tx
         .publish_durable(event)
+        .await
+        .map_err(agent_event_error)
+}
+
+async fn persist_provider_history_message(
+    event_tx: &AgentEventHub,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    message: &ChatMessage,
+) -> Result<(), ChatTurnError> {
+    let payload = serde_json::to_value(message).map_err(|error| {
+        ChatTurnError::Terminal(format!(
+            "failed to serialize provider history before tool execution: {error}"
+        ))
+    })?;
+    event_tx
+        .publish_durable_and_wait(AgentDurableEvent::TurnProviderHistoryAppended {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            sequence: 0,
+            payload,
+        })
+        .await
+        .map_err(agent_event_error)
+}
+
+async fn persist_retained_tool_result(
+    event_tx: &AgentEventHub,
+    thread_id: &str,
+    turn_id: &str,
+    result: &ExecutedToolResult,
+) -> Result<(), ChatTurnError> {
+    let Some((view, output_policy_snapshot)) = result.retained_llm_context.as_ref() else {
+        return Ok(());
+    };
+    event_tx
+        .publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: result.item_id.clone(),
+            attempt_id: None,
+            sequence: 0,
+            source: "tool_result".to_owned(),
+            tool_name: result.tool_name.clone(),
+            payload: tooling::protocol_tool_result_view(view.clone()),
+            output_policy_snapshot: output_policy_snapshot.clone(),
+        })
         .await
         .map_err(agent_event_error)
 }
@@ -1923,75 +1974,12 @@ fn compiled_prompt_payload_from_delivery_plan(
     }
 }
 
-fn append_recovered_tool_llm_context(
+fn append_recovered_provider_history(
     messages: &mut Vec<ChatMessage>,
-    mut retained_context: Vec<RetainedToolLlmContext>,
+    mut retained_context: Vec<RetainedProviderHistoryMessage>,
 ) {
     retained_context.sort_by_key(|context| context.sequence);
-    for context in retained_context {
-        messages.push(ChatMessage::assistant_tool_calls(
-            None::<String>,
-            vec![ProviderToolCall {
-                id: context.item_id.clone(),
-                name: context.tool_name.clone(),
-                arguments: context.arguments.clone(),
-            }],
-        ));
-
-        if let Some(message) = recovered_tool_result_message(&context) {
-            messages.push(message);
-        }
-    }
-}
-
-fn recovered_tool_result_message(context: &RetainedToolLlmContext) -> Option<ChatMessage> {
-    let view =
-        serde_json::from_value::<pioneer_tools::ToolResultView>(context.payload.clone()).ok()?;
-    let (content, payload) = match view {
-        pioneer_tools::ToolResultView::Text { text, truncated } => (
-            text.clone(),
-            serde_json::json!({
-                "output": text,
-                "truncated": truncated,
-                "recovered_from_turn_llm_context": true,
-            }),
-        ),
-        pioneer_tools::ToolResultView::Json {
-            mut value,
-            truncated,
-        } => {
-            if !value.is_object() {
-                value = serde_json::json!({ "value": value });
-            }
-            if let Some(map) = value.as_object_mut() {
-                map.entry("truncated".to_owned())
-                    .or_insert(JsonValue::Bool(truncated));
-                map.insert(
-                    "recovered_from_turn_llm_context".to_owned(),
-                    JsonValue::Bool(true),
-                );
-            }
-            let content =
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-            (content, value)
-        }
-        pioneer_tools::ToolResultView::Empty => (
-            String::new(),
-            serde_json::json!({
-                "recovered_from_turn_llm_context": true
-            }),
-        ),
-    };
-
-    Some(
-        ModelInputItem::tool_result(
-            context.item_id.clone(),
-            context.tool_name.clone(),
-            content,
-            Some(payload),
-        )
-        .into_chat_message(),
-    )
+    messages.extend(retained_context.into_iter().map(|context| context.message));
 }
 
 fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
@@ -2277,7 +2265,7 @@ pub(super) async fn execute_chat_turn_flow(
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
-    retained_llm_context: Vec<RetainedToolLlmContext>,
+    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
@@ -2341,7 +2329,7 @@ pub(super) async fn execute_chat_turn_flow(
                 &skill_catalog,
                 &agent_skill_overlay,
                 runtime_environment,
-                retained_llm_context,
+                retained_provider_history,
                 execution_window_index,
                 execution_checkpoint_context,
                 permission_profile,
@@ -2904,7 +2892,7 @@ async fn execute_agent_provider_response(
     skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     runtime_environment: HashMap<String, String>,
-    retained_llm_context: Vec<RetainedToolLlmContext>,
+    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
@@ -3855,7 +3843,7 @@ async fn execute_agent_provider_response(
     ));
 
     messages.push(user_message);
-    append_recovered_tool_llm_context(&mut messages, retained_llm_context);
+    append_recovered_provider_history(&mut messages, retained_provider_history);
 
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
@@ -4790,11 +4778,22 @@ async fn execute_agent_provider_response(
             .await
             .map_err(|error| (error, current_thinking_id.clone()))?;
 
-            messages.push(ChatMessage::assistant_tool_calls_with_reasoning(
+            let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
                 (!round.text.is_empty()).then_some(round.text.clone()),
                 (!round.reasoning.is_empty()).then_some(round.reasoning.clone()),
                 round.tool_calls.clone(),
-            ));
+                round.provider_replay_state.clone(),
+            );
+            persist_provider_history_message(
+                event_tx.as_ref(),
+                thread_id,
+                turn_id,
+                current_thinking_id.as_str(),
+                &assistant_round,
+            )
+            .await
+            .map_err(|error| (error, current_thinking_id.clone()))?;
+            messages.push(assistant_round);
 
             let tool_tasks = round
                 .tool_calls
@@ -4957,6 +4956,7 @@ async fn execute_agent_provider_response(
                                     success: false,
                                     outcome: outcome.clone(),
                                     recovery_view: None,
+                                    retained_llm_context: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         model_tool_call.id,
@@ -5035,6 +5035,7 @@ async fn execute_agent_provider_response(
                                     success: false,
                                     outcome: outcome.clone(),
                                     recovery_view: None,
+                                    retained_llm_context: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         model_tool_call.id,
@@ -5095,6 +5096,7 @@ async fn execute_agent_provider_response(
                             success,
                             outcome,
                             recovery_view,
+                            retained_llm_context,
                             request_tools_result,
                             message,
                         ) =
@@ -5102,6 +5104,13 @@ async fn execute_agent_provider_response(
                                 Ok(result) => {
                                     let success = result.success();
                                     let projection = result.projection();
+                                    let retained_llm_context = projection.and_then(|projection| {
+                                        tooling::retained_llm_context_view(
+                                            &projection.output_policy,
+                                            &projection.llm_view,
+                                        )
+                                        .map(|view| (view, projection.output_policy.clone()))
+                                    });
                                     let request_tools_result = extract_request_tools_result(
                                         tool_name.as_str(),
                                         success,
@@ -5112,6 +5121,7 @@ async fn execute_agent_provider_response(
                                         success,
                                         result.outcome.clone(),
                                         projection.and_then(|projection| projection.recovery.clone()),
+                                        retained_llm_context,
                                         request_tools_result,
                                         result.to_model_input_item().into_chat_message(),
                                     )
@@ -5125,7 +5135,7 @@ async fn execute_agent_provider_response(
                                         output.clone(),
                                         outcome.clone(),
                                     );
-                                    (output, false, outcome, None, None, message)
+                                    (output, false, outcome, None, None, None, message)
                                 }
                             };
 
@@ -5139,6 +5149,7 @@ async fn execute_agent_provider_response(
                             success,
                             outcome,
                             recovery_view,
+                            retained_llm_context,
                             request_tools_result,
                             message,
                         }
@@ -5174,6 +5185,16 @@ async fn execute_agent_provider_response(
                 .buffer_unordered(parallel_tool_calls)
                 .collect::<Vec<_>>()
                 .await;
+            for result in &executed_results {
+                persist_retained_tool_result(
+                    event_tx.as_ref(),
+                    thread_id,
+                    turn_id,
+                    result,
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            }
             window_stats.record_executed_tools(&executed_results);
 
             apply_request_tools_results_to_visible_tools(
@@ -5677,7 +5698,7 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 mod tests {
     use super::{
         ExecutedToolResult, TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,
-        append_recovered_tool_llm_context, apply_request_tools_results_to_visible_tools,
+        append_recovered_provider_history, apply_request_tools_results_to_visible_tools,
         apply_request_tools_visibility_expansion, apply_review_required_tools_to_visible_tools,
         build_user_message, compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, materialize_mcp_tooling,
@@ -5693,7 +5714,7 @@ mod tests {
         AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
         AgentMcpMaterializationFailureReason, AgentMcpMaterializationRequest,
         AgentMcpResolutionDiagnostic, AgentMcpServerRef, AgentMcpToolProvider,
-        ExecutionCheckpointContext, ResolvedArtifactInput, RetainedToolLlmContext,
+        ExecutionCheckpointContext, ResolvedArtifactInput, RetainedProviderHistoryMessage,
         ReviewRequiredTaskObservation,
     };
     use pioneer_promt::{
@@ -5709,7 +5730,7 @@ mod tests {
     };
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
-        Role,
+        ProviderToolCall, Role,
     };
     use pioneer_skills::compile::CompileSkillInput;
     use pioneer_skills::contract::default_skill_conformance;
@@ -6428,6 +6449,7 @@ mod tests {
                 ToolOutcome::fatal(ToolErrorClass::InvalidArguments, Some(text.to_owned()))
             },
             recovery_view: None,
+            retained_llm_context: None,
             request_tools_result: None,
             message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
         }
@@ -7558,6 +7580,7 @@ mod tests {
             tool_call_id: Some(call_id.to_owned()),
             name: Some("computer_use".to_owned()),
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -7784,48 +7807,53 @@ mod tests {
     }
 
     #[test]
-    fn recovery_context_reconstructs_tool_messages_in_sequence_order() {
+    fn recovery_context_replays_exact_provider_messages_in_sequence_order() {
         let mut messages = vec![ChatMessage::user("retry the turn")];
+        let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some("working"),
+            Some("opaque reasoning"),
+            vec![
+                ProviderToolCall {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"/tmp/a\"}".to_owned(),
+                },
+                ProviderToolCall {
+                    id: "call_2".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"/tmp/b\"}".to_owned(),
+                },
+            ],
+            Some(pioneer_provider::ProviderReplayState::new(
+                "test",
+                serde_json::json!({"signature": "SIGNED_SENTINEL"}),
+            )),
+        );
 
-        append_recovered_tool_llm_context(
+        append_recovered_provider_history(
             &mut messages,
             vec![
-                RetainedToolLlmContext {
-                    item_id: "call_2".to_owned(),
-                    tool_name: "read_file".to_owned(),
-                    arguments: "{\"path\":\"/tmp/b\"}".to_owned(),
-                    sequence: 2,
-                    payload: serde_json::json!({
-                        "kind": "json",
-                        "value": {
-                            "output": "SECOND_SENTINEL"
-                        },
-                        "truncated": false
-                    }),
+                RetainedProviderHistoryMessage {
+                    sequence: 3,
+                    message: ChatMessage::tool_result("call_2", "read_file", "SECOND_SENTINEL"),
                 },
-                RetainedToolLlmContext {
-                    item_id: "call_1".to_owned(),
-                    tool_name: "read_file".to_owned(),
-                    arguments: "{\"path\":\"/tmp/a\"}".to_owned(),
+                RetainedProviderHistoryMessage {
                     sequence: 1,
-                    payload: serde_json::json!({
-                        "kind": "json",
-                        "value": {
-                            "output": "FIRST_SENTINEL"
-                        },
-                        "truncated": false
-                    }),
+                    message: assistant_round.clone(),
+                },
+                RetainedProviderHistoryMessage {
+                    sequence: 2,
+                    message: ChatMessage::tool_result("call_1", "read_file", "FIRST_SENTINEL"),
                 },
             ],
         );
 
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1], assistant_round);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert!(messages[2].content.contains("FIRST_SENTINEL"));
-        assert_eq!(messages[3].tool_calls.as_ref().unwrap()[0].id, "call_2");
-        assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_2"));
-        assert!(messages[4].content.contains("SECOND_SENTINEL"));
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert!(messages[3].content.contains("SECOND_SENTINEL"));
     }
 
     #[test]
@@ -7839,6 +7867,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                provider_replay_state: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
@@ -7864,6 +7893,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                provider_replay_state: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
@@ -7889,6 +7919,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                provider_replay_state: None,
             },
             ChatMessage {
                 role: pioneer_provider::Role::Tool,
@@ -7898,6 +7929,7 @@ mod tests {
                 tool_call_id: Some("call_1".to_owned()),
                 name: Some("computer_use".to_owned()),
                 tool_calls: None,
+                provider_replay_state: None,
             },
             ChatMessage {
                 role: pioneer_provider::Role::User,
@@ -7907,6 +7939,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                provider_replay_state: None,
             },
         ];
 

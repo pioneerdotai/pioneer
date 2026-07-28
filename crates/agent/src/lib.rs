@@ -34,7 +34,6 @@ use pioneer_skills::SkillAuditEvent;
 use pioneer_skills::{
     AgentSkillRuntimeEntry, SkillCatalogSnapshot, SkillPolicyKey, SkillTrustLevel,
 };
-use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -693,13 +692,10 @@ impl Display for AgentControlError {
 
 impl Error for AgentControlError {}
 
-#[derive(Debug, Clone)]
-pub struct RetainedToolLlmContext {
-    pub item_id: String,
-    pub tool_name: String,
-    pub arguments: String,
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetainedProviderHistoryMessage {
     pub sequence: i64,
-    pub payload: JsonValue,
+    pub message: ChatMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -716,7 +712,7 @@ pub struct RecoveryAttemptRequest {
     pub compact_history: bool,
     pub continue_generation: bool,
     pub model_override: Option<String>,
-    pub retained_llm_context: Vec<RetainedToolLlmContext>,
+    pub retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     pub execution_checkpoint_context: Option<ExecutionCheckpointContext>,
 }
 
@@ -852,7 +848,7 @@ struct ActiveTurnRequest {
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
-    retained_llm_context: Vec<RetainedToolLlmContext>,
+    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     execution_usage: TurnExecutionUsageCounters,
     execution_options: TurnExecutionOptions,
@@ -2164,7 +2160,7 @@ mod event_class_tests {
                 .payload
                 .as_ref()
                 .and_then(|payload| payload.get("truncated"))
-                .and_then(JsonValue::as_bool)
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         );
         assert!(

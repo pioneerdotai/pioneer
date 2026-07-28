@@ -176,6 +176,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { thread_id, .. }
         | AgentDurableEvent::SkillAuditEvents { thread_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { thread_id, .. }
+        | AgentDurableEvent::TurnProviderHistoryAppended { thread_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
         | AgentDurableEvent::TurnCompleted { thread_id, .. }
@@ -1277,6 +1278,51 @@ impl MessageProcessor {
                         thread_id,
                         turn_id,
                         format!("failed to persist turn llm context: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+            }
+            AgentDurableEvent::TurnProviderHistoryAppended {
+                thread_id,
+                turn_id,
+                item_id,
+                sequence,
+                payload,
+            } => {
+                let sequence = self
+                    .next_turn_llm_context_sequence(turn_id.as_str(), sequence)
+                    .await;
+                let created_at = now_db_timestamp();
+                let payload = match serde_json::to_string(&payload) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        self.report_legacy_turn_failure(
+                            thread_id,
+                            turn_id,
+                            format!("failed to serialize retained provider history: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                let entry = pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: turn_id.clone(),
+                    item_id: Some(item_id),
+                    attempt_id: None,
+                    sequence,
+                    source: "assistant_round".to_owned(),
+                    tool_name: None,
+                    payload,
+                    output_policy_snapshot: serde_json::json!({}).to_string(),
+                    created_at,
+                    expires_at: Some(llm_context_expires_at(created_at)),
+                };
+                if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
+                    self.report_legacy_turn_failure(
+                        thread_id,
+                        turn_id,
+                        format!("failed to persist retained provider history: {error:#}"),
                     )
                     .await;
                     return false;

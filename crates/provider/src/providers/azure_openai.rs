@@ -60,6 +60,8 @@ struct ApiMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<ApiMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -491,6 +493,9 @@ impl AzureOpenAiProvider {
                         Role::Tool => "tool".into(),
                     },
                     content,
+                    reasoning_content: (message.role == Role::Assistant)
+                        .then(|| message.reasoning_content.clone())
+                        .flatten(),
                     tool_calls,
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
@@ -507,6 +512,7 @@ impl AzureOpenAiProvider {
                 rendered.push(ApiMessage {
                     role: "tool".to_owned(),
                     content: Some(ApiMessageContent::Text(tool_content)),
+                    reasoning_content: None,
                     tool_calls,
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
@@ -523,6 +529,7 @@ impl AzureOpenAiProvider {
                 rendered.push(ApiMessage {
                     role: "user".to_owned(),
                     content: Some(ApiMessageContent::Parts(parts)),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -539,6 +546,9 @@ impl AzureOpenAiProvider {
                     Role::Tool => "tool".into(),
                 },
                 content: Some(ApiMessageContent::Parts(parts)),
+                reasoning_content: (message.role == Role::Assistant)
+                    .then(|| message.reasoning_content.clone())
+                    .flatten(),
                 tool_calls,
                 tool_call_id: message.tool_call_id.clone(),
                 name: message.name.clone(),
@@ -709,6 +719,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 
@@ -985,10 +996,12 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_roles() {
+        let mut assistant = ChatMessage::assistant("Hi!");
+        assistant.reasoning_content = Some("signed reasoning".to_owned());
         let messages = vec![
             ChatMessage::system("Be helpful"),
             ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
+            assistant,
         ];
 
         let provider = AzureOpenAiProvider::new("key", "res", "deploy");
@@ -1004,6 +1017,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "system");
         assert_eq!(api_messages[1].role, "user");
         assert_eq!(api_messages[2].role, "assistant");
+        assert_eq!(
+            api_messages[2].reasoning_content.as_deref(),
+            Some("signed reasoning")
+        );
     }
 
     #[test]

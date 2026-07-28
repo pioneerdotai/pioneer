@@ -860,6 +860,7 @@ impl crate::traits::Provider for OpenAiProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 

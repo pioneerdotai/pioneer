@@ -214,30 +214,6 @@ pub(super) async fn forward_tool_event_to_agent(
                     .await?;
             }
 
-            if let Some(retained_view) =
-                retained_llm_context_view(&completed.output_policy, &completed.llm_view)
-            {
-                let sequence = state_observation
-                    .as_ref()
-                    .and_then(|observation| i64::try_from(observation.event_seq).ok())
-                    .unwrap_or_default();
-                let attempt_id = state_observation
-                    .as_ref()
-                    .map(|observation| observation.attempt_id.to_string());
-                event_tx
-                    .publish_durable(AgentDurableEvent::TurnLlmContextAppended {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: event.call_id.clone(),
-                        attempt_id,
-                        sequence,
-                        source: "tool_result".to_owned(),
-                        tool_name: tool_name.clone(),
-                        payload: protocol_tool_result_view(retained_view),
-                        output_policy_snapshot: completed.output_policy.clone(),
-                    })
-                    .await?;
-            }
             let outcome = protocol_outcome_from_tool_outcome(&completed.outcome);
 
             event_tx
@@ -307,31 +283,6 @@ pub(super) async fn forward_tool_event_to_agent(
                     .await?;
             }
 
-            if let Some(llm_view) = failed.llm_view.as_ref()
-                && let Some(retained_view) =
-                    retained_llm_context_view(&failed.output_policy, llm_view)
-            {
-                let sequence = state_observation
-                    .as_ref()
-                    .and_then(|observation| i64::try_from(observation.event_seq).ok())
-                    .unwrap_or_default();
-                let attempt_id = state_observation
-                    .as_ref()
-                    .map(|observation| observation.attempt_id.to_string());
-                event_tx
-                    .publish_durable(AgentDurableEvent::TurnLlmContextAppended {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: event.call_id.clone(),
-                        attempt_id,
-                        sequence,
-                        source: "tool_result".to_owned(),
-                        tool_name: tool_name.clone(),
-                        payload: protocol_tool_result_view(retained_view),
-                        output_policy_snapshot: failed.output_policy.clone(),
-                    })
-                    .await?;
-            }
             let outcome = protocol_outcome_from_tool_outcome(&failed.outcome);
 
             event_tx
@@ -608,7 +559,7 @@ fn recovery_view_from_outcome(
     })
 }
 
-fn retained_llm_context_view(
+pub(super) fn retained_llm_context_view(
     policy: &ToolOutputPolicySnapshot,
     llm_view: &ToolResultView,
 ) -> Option<ToolResultView> {
@@ -620,7 +571,9 @@ fn retained_llm_context_view(
     }
 }
 
-fn protocol_tool_result_view(payload: ToolResultView) -> pioneer_protocol::ToolResultView {
+pub(super) fn protocol_tool_result_view(
+    payload: ToolResultView,
+) -> pioneer_protocol::ToolResultView {
     match payload {
         ToolResultView::Text { text, truncated } => {
             pioneer_protocol::ToolResultView::Text { text, truncated }
@@ -1432,7 +1385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_tool_event_emits_llm_context_without_leaking_to_turn_item() {
+    async fn completed_tool_event_keeps_llm_context_out_of_async_event_forwarder() {
         let event_tx = AgentEventHub::with_capacity(8, 8);
         let mut durable_rx = event_tx
             .take_durable_receiver()
@@ -1497,22 +1450,15 @@ mod tests {
         .await
         .expect("tool event should publish");
 
-        let mut saw_llm_context = false;
         let mut saw_completed = false;
-        for _ in 0..3 {
-            match durable_rx
-                .recv()
+        for _ in 0..2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), durable_rx.recv())
                 .await
-                .expect("agent event should be emitted")
+                .expect("agent event should be emitted before timeout")
+                .expect("durable lane should stay open")
             {
-                AgentDurableEvent::TurnLlmContextAppended { payload, .. } => {
-                    saw_llm_context = true;
-                    assert!(serde_json::to_vec(&payload).unwrap().len() <= 256);
-                    assert!(
-                        serde_json::to_string(&payload)
-                            .unwrap()
-                            .contains("SECRET_LLM_ONLY_SENTINEL")
-                    );
+                AgentDurableEvent::TurnLlmContextAppended { .. } => {
+                    panic!("async tool forwarding must not race provider-history persistence");
                 }
                 AgentDurableEvent::ItemCompleted { notification } => {
                     saw_completed = true;
@@ -1524,8 +1470,13 @@ mod tests {
             }
         }
 
-        assert!(saw_llm_context);
         assert!(saw_completed);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), durable_rx.recv())
+                .await
+                .is_err(),
+            "tool event forwarder must not publish retained provider history"
+        );
     }
 
     #[test]

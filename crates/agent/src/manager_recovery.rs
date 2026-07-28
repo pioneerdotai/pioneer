@@ -37,7 +37,7 @@ pub(super) fn apply_recovery_adjustments(
     turn_request.execution_options.force_non_stream = request.force_non_stream;
     turn_request.execution_options.disable_tool_calling = request.disable_tool_calling;
     turn_request.execution_options.continue_generation_hint = request.continue_generation;
-    turn_request.retained_llm_context = request.retained_llm_context.clone();
+    turn_request.retained_provider_history = request.retained_provider_history.clone();
     turn_request.execution_checkpoint_context = request.execution_checkpoint_context.clone();
     if let Some(context) = request.execution_checkpoint_context.as_ref() {
         turn_request.execution_window_index = turn_request
@@ -87,7 +87,6 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::MessageAttachment;
-    use serde_json::json;
     use std::collections::HashMap;
 
     fn empty_skill_catalog() -> pioneer_skills::SkillCatalogSnapshot {
@@ -120,7 +119,7 @@ mod tests {
             resolved_artifacts: Vec::<ResolvedArtifactInput>::new(),
             runtime_environment: HashMap::new(),
             history: vec![ChatMessage::user("retry")],
-            retained_llm_context: Vec::new(),
+            retained_provider_history: Vec::new(),
             execution_checkpoint_context: None,
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
@@ -140,12 +139,9 @@ mod tests {
             compact_history: true,
             continue_generation: true,
             model_override: Some("recovery-model".to_owned()),
-            retained_llm_context: vec![crate::RetainedToolLlmContext {
-                item_id: "tool_1".to_owned(),
-                tool_name: "read_file".to_owned(),
-                arguments: "{}".to_owned(),
+            retained_provider_history: vec![crate::RetainedProviderHistoryMessage {
                 sequence: 1,
-                payload: json!({"kind": "empty"}),
+                message: ChatMessage::tool_result("tool_1", "read_file", "{}"),
             }],
             execution_checkpoint_context: None,
         };
@@ -187,7 +183,7 @@ mod tests {
             resolved_artifacts: Vec::<ResolvedArtifactInput>::new(),
             runtime_environment: HashMap::new(),
             history: Vec::new(),
-            retained_llm_context: Vec::new(),
+            retained_provider_history: Vec::new(),
             execution_checkpoint_context: None,
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
@@ -260,7 +256,7 @@ mod tests {
             compact_history: false,
             continue_generation: true,
             model_override: None,
-            retained_llm_context: Vec::new(),
+            retained_provider_history: Vec::new(),
             execution_checkpoint_context: Some(context),
         };
 
@@ -364,7 +360,7 @@ mod tests {
             ],
             runtime_environment: HashMap::new(),
             history: vec![ChatMessage::user("describe this")],
-            retained_llm_context: Vec::new(),
+            retained_provider_history: Vec::new(),
             execution_checkpoint_context: None,
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
@@ -384,7 +380,7 @@ mod tests {
             compact_history: false,
             continue_generation: false,
             model_override: None,
-            retained_llm_context: Vec::new(),
+            retained_provider_history: Vec::new(),
             execution_checkpoint_context: None,
         };
 

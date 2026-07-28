@@ -45,6 +45,8 @@ struct OllamaMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
@@ -202,6 +204,9 @@ impl OllamaProvider {
                     } else {
                         Some(m.content.clone())
                     },
+                    thinking: (m.role == Role::Assistant)
+                        .then(|| m.reasoning_content.clone())
+                        .flatten(),
                     images: (!images.is_empty()).then_some(images),
                     tool_calls: m.tool_calls.as_ref().map(|tool_calls| {
                         tool_calls
@@ -376,6 +381,7 @@ impl crate::traits::Provider for OllamaProvider {
             usage,
             reasoning_content,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 
@@ -607,10 +613,12 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_roles() {
+        let mut assistant = ChatMessage::assistant("Hi!");
+        assistant.reasoning_content = Some("local thinking".to_owned());
         let messages = vec![
             ChatMessage::system("Be helpful"),
             ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
+            assistant,
         ];
 
         let provider = OllamaProvider::new();
@@ -627,6 +635,7 @@ mod tests {
         assert_eq!(api_messages[0].content.as_deref(), Some("Be helpful"));
         assert_eq!(api_messages[1].role, "user");
         assert_eq!(api_messages[2].role, "assistant");
+        assert_eq!(api_messages[2].thinking.as_deref(), Some("local thinking"));
     }
 
     #[test]
@@ -636,6 +645,7 @@ mod tests {
             messages: vec![OllamaMessage {
                 role: "user".into(),
                 content: Some("Hello".into()),
+                thinking: None,
                 images: None,
                 tool_calls: None,
             }],
@@ -657,6 +667,7 @@ mod tests {
             messages: vec![OllamaMessage {
                 role: "user".into(),
                 content: Some("Hello".into()),
+                thinking: None,
                 images: None,
                 tool_calls: None,
             }],

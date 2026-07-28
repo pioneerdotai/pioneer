@@ -1882,6 +1882,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             })
         }
 

@@ -302,7 +302,28 @@ impl MessageContentPart {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Provider-owned state that must be replayed unchanged with an assistant
+/// message. The common agent stores this value but never interprets it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderReplayState {
+    pub provider: String,
+    pub payload: JsonValue,
+}
+
+impl ProviderReplayState {
+    pub fn new(provider: impl Into<String>, payload: JsonValue) -> Self {
+        Self {
+            provider: provider.into(),
+            payload,
+        }
+    }
+
+    pub fn payload_for(&self, provider: &str) -> Option<&JsonValue> {
+        (self.provider == provider).then_some(&self.payload)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
@@ -316,6 +337,8 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ProviderToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay_state: Option<ProviderReplayState>,
 }
 
 impl ChatMessage {
@@ -328,6 +351,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -340,6 +364,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -352,6 +377,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -364,6 +390,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -379,6 +406,15 @@ impl ChatMessage {
         reasoning_content: Option<impl Into<String>>,
         tool_calls: Vec<ProviderToolCall>,
     ) -> Self {
+        Self::assistant_tool_calls_with_provider_state(content, reasoning_content, tool_calls, None)
+    }
+
+    pub fn assistant_tool_calls_with_provider_state(
+        content: Option<impl Into<String>>,
+        reasoning_content: Option<impl Into<String>>,
+        tool_calls: Vec<ProviderToolCall>,
+        provider_replay_state: Option<ProviderReplayState>,
+    ) -> Self {
         Self {
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
@@ -387,6 +423,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: Some(tool_calls),
+            provider_replay_state,
         }
     }
 
@@ -403,6 +440,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -415,6 +453,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            provider_replay_state: None,
         }
     }
 
@@ -712,6 +751,9 @@ pub struct ChatResponse {
     /// that omits this field.
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ProviderToolCall>,
+    /// Opaque provider-native state (for example signed thinking blocks) that
+    /// must be attached to the replayed assistant message unchanged.
+    pub provider_replay_state: Option<ProviderReplayState>,
 }
 
 #[derive(Debug, Clone)]
@@ -719,6 +761,9 @@ pub struct StreamChunk {
     pub delta: String,
     pub reasoning_delta: Option<String>,
     pub tool_calls: Vec<ProviderToolCall>,
+    /// A complete provider replay state snapshot. When present more than once,
+    /// the latest snapshot replaces the previous one.
+    pub provider_replay_state: Option<ProviderReplayState>,
     pub is_final: bool,
 }
 
@@ -728,6 +773,7 @@ impl StreamChunk {
             delta: text.into(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
             is_final: false,
         }
     }
@@ -737,6 +783,7 @@ impl StreamChunk {
             delta: String::new(),
             reasoning_delta: Some(text.into()),
             tool_calls: Vec::new(),
+            provider_replay_state: None,
             is_final: false,
         }
     }
@@ -746,6 +793,17 @@ impl StreamChunk {
             delta: String::new(),
             reasoning_delta: None,
             tool_calls,
+            provider_replay_state: None,
+            is_final: false,
+        }
+    }
+
+    pub fn provider_replay_state(state: ProviderReplayState) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning_delta: None,
+            tool_calls: Vec::new(),
+            provider_replay_state: Some(state),
             is_final: false,
         }
     }
@@ -755,6 +813,7 @@ impl StreamChunk {
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
             is_final: true,
         }
     }
@@ -812,6 +871,36 @@ mod tests {
         assert_eq!(tool_result.role, Role::Tool);
         assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(tool_result.name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn assistant_round_serialization_preserves_reasoning_calls_and_provider_state() {
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some("working"),
+            Some("provider reasoning"),
+            vec![
+                ProviderToolCall {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"a\"}".to_owned(),
+                },
+                ProviderToolCall {
+                    id: "call_2".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"b\"}".to_owned(),
+                },
+            ],
+            Some(ProviderReplayState::new(
+                "test-provider",
+                serde_json::json!({"signature": "opaque-signature"}),
+            )),
+        );
+
+        let encoded = serde_json::to_string(&message).expect("assistant round serializes");
+        let decoded =
+            serde_json::from_str::<ChatMessage>(&encoded).expect("assistant round deserializes");
+
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -887,6 +976,7 @@ mod tests {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         };
         assert!(resp.usage.is_none());
         assert!(resp.reasoning_content.is_none());

@@ -1909,6 +1909,7 @@ mod tests {
                 text,
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -1951,6 +1952,7 @@ mod tests {
                 .to_string(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -2015,6 +2017,7 @@ mod tests {
                 .to_string(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -2055,6 +2058,7 @@ mod tests {
                     text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: Vec::new(),
                 });
             }
@@ -2065,6 +2069,7 @@ mod tests {
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: vec![ProviderToolCall {
                         id: "read_pinned_agent_skill".to_owned(),
                         name: "read_skill".to_owned(),
@@ -2076,6 +2081,7 @@ mod tests {
                 text: "The pinned learned procedure was read.".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -2145,6 +2151,7 @@ mod tests {
                     text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: Vec::new(),
                 });
             }
@@ -2153,6 +2160,7 @@ mod tests {
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
+                    provider_replay_state: None,
                     tool_calls: vec![ProviderToolCall {
                         id: "read_active_agent_skill".to_owned(),
                         name: "read_skill".to_owned(),
@@ -2164,6 +2172,7 @@ mod tests {
                 text: "The learned procedure was read.".to_owned(),
                 usage: None,
                 reasoning_content: None,
+                provider_replay_state: None,
                 tool_calls: Vec::new(),
             })
         }

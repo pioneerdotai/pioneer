@@ -1478,6 +1478,7 @@ fn test_preflight_response() -> ChatResponse {
         usage: None,
         reasoning_content: None,
         tool_calls: Vec::new(),
+        provider_replay_state: None,
     }
 }
 
@@ -2631,6 +2632,7 @@ impl Provider for CaptureStandardProvider {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         })
     }
 
@@ -2676,6 +2678,7 @@ impl Provider for SequencedToolProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             });
         }
 
@@ -2686,6 +2689,7 @@ impl Provider for SequencedToolProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: self.first_tool_calls.clone(),
+                provider_replay_state: None,
             });
         }
 
@@ -2694,6 +2698,7 @@ impl Provider for SequencedToolProvider {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         })
     }
 
@@ -2740,6 +2745,7 @@ impl Provider for LoopBudgetProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             });
         }
 
@@ -2779,6 +2785,7 @@ impl Provider for LoopBudgetProvider {
             usage: None,
             reasoning_content: None,
             tool_calls,
+            provider_replay_state: None,
         })
     }
 
@@ -2837,6 +2844,7 @@ impl Provider for AlwaysTaskCreateProvider {
                 })
                 .to_string(),
             }],
+            provider_replay_state: None,
         })
     }
 
@@ -2891,6 +2899,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
                     name: "missing_tool_for_boundary".to_owned(),
                     arguments: "{}".to_owned(),
                 }],
+                provider_replay_state: None,
             }),
             _ => Err(anyhow::anyhow!(
                 "late provider failure after recovery success"
@@ -2940,6 +2949,7 @@ impl Provider for CaptureAgentProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             });
         }
         Ok(ChatResponse {
@@ -2947,6 +2957,7 @@ impl Provider for CaptureAgentProvider {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         })
     }
 
@@ -3002,6 +3013,7 @@ impl Provider for ReviewGuardProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             },
             ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
                 text: String::new(),
@@ -3012,6 +3024,7 @@ impl Provider for ReviewGuardProvider {
                     name,
                     arguments: arguments.to_string(),
                 }],
+                provider_replay_state: None,
             },
         };
         Ok(response)
@@ -3070,6 +3083,7 @@ impl Provider for EmptyNoToolRoundProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: vec![first_tool_call],
+                provider_replay_state: None,
             });
         }
 
@@ -3080,6 +3094,7 @@ impl Provider for EmptyNoToolRoundProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
+                provider_replay_state: None,
             });
         }
 
@@ -3088,6 +3103,7 @@ impl Provider for EmptyNoToolRoundProvider {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         })
     }
 
@@ -3143,6 +3159,7 @@ impl Provider for SequencedTextProvider {
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
+            provider_replay_state: None,
         })
     }
 
@@ -3370,6 +3387,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowCheckpointed { .. }
         | AgentDurableEvent::TurnExecutionWindowContinued { .. }
         | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
+        | AgentDurableEvent::TurnProviderHistoryAppended { .. }
         | AgentDurableEvent::TurnPermissionAudit { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
             thread_id,
@@ -3550,6 +3568,7 @@ async fn recv_durable_events_until_turn_blocked(
         );
         let blocked = matches!(&event, AgentDurableEvent::TurnBlocked { .. });
         observed.push(event);
+        events.acknowledge_last(Ok(()));
         if blocked {
             return observed;
         }
@@ -9724,7 +9743,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
-                retained_llm_context: Vec::new(),
+                retained_provider_history: Vec::new(),
                 execution_checkpoint_context: None,
             },
         )
@@ -10983,7 +11002,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
                 compact_history: false,
                 continue_generation: false,
                 model_override: None,
-                retained_llm_context: Vec::new(),
+                retained_provider_history: Vec::new(),
                 execution_checkpoint_context: None,
             },
         )
@@ -11082,7 +11101,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
-                retained_llm_context: Vec::new(),
+                retained_provider_history: Vec::new(),
                 execution_checkpoint_context: None,
             },
         )
@@ -11213,7 +11232,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 compact_history: false,
                 continue_generation: false,
                 model_override: None,
-                retained_llm_context: Vec::new(),
+                retained_provider_history: Vec::new(),
                 execution_checkpoint_context: None,
             },
         )
@@ -12451,7 +12470,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
                         compact_history: false,
                         continue_generation: false,
                         model_override: None,
-                        retained_llm_context: Vec::new(),
+                        retained_provider_history: Vec::new(),
                         execution_checkpoint_context: None,
                     },
                 )
@@ -12549,6 +12568,7 @@ runtime:
         .ensure_thread(thread_id, "ws_000000000000000121a")
         .await
         .expect("thread should be created");
+    let _events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
         .start_test_turn_with_default_profile_and_capabilities(
