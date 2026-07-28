@@ -180,8 +180,7 @@ pub struct ToolLoopGuard {
     budget: ToolLoopBudgetConfig,
     tool_capable_rounds: u32,
     total_tool_calls: u32,
-    final_no_tools_round_requested: bool,
-    final_no_tools_round_started: bool,
+    final_no_tools_mode: bool,
     final_no_tools_instruction: String,
 }
 
@@ -194,22 +193,16 @@ impl ToolLoopGuard {
             budget: budget.normalized(),
             tool_capable_rounds: 0,
             total_tool_calls: 0,
-            final_no_tools_round_requested: false,
-            final_no_tools_round_started: false,
+            final_no_tools_mode: false,
             final_no_tools_instruction: final_no_tools_instruction.into(),
         }
     }
 
     pub fn begin_provider_round(&mut self) -> Result<ToolLoopRoundPlan, String> {
-        if self.final_no_tools_round_requested {
-            if self.final_no_tools_round_started {
-                return Err(Self::terminal_message(
-                    ToolLoopBudgetReason::AgentRoundsExceeded,
-                    "final_no_tools_round_already_used",
-                ));
-            }
-
-            self.final_no_tools_round_started = true;
+        if self.final_no_tools_mode {
+            // The guard owns capability mode, not response validation. A validator may reject
+            // a no-tools response and request another provider round; its own bounded policy
+            // decides when repeated invalid responses become a provider failure.
             return Ok(ToolLoopRoundPlan {
                 action: ToolLoopRoundAction::StartProviderRound,
                 tools_enabled: false,
@@ -288,36 +281,9 @@ impl ToolLoopGuard {
     }
 
     fn request_final_answer_override(&mut self, instruction: String) -> Result<String, String> {
-        self.request_final_answer_override_for_reason(
-            ToolLoopBudgetReason::AgentRoundsExceeded,
-            instruction,
-        )
-    }
-
-    fn request_final_answer_override_for_reason(
-        &mut self,
-        reason: ToolLoopBudgetReason,
-        instruction: String,
-    ) -> Result<String, String> {
-        if self.final_no_tools_round_started {
-            return Err(Self::terminal_message(
-                reason,
-                "final_no_tools_round_already_used",
-            ));
-        }
-
-        self.final_no_tools_round_requested = true;
+        self.final_no_tools_mode = true;
         self.final_no_tools_instruction = instruction.clone();
         Ok(instruction)
-    }
-
-    fn terminal_message(reason: ToolLoopBudgetReason, detail: impl AsRef<str>) -> String {
-        let detail = detail.as_ref();
-        if detail.is_empty() {
-            format!("tool_loop_budget_exceeded: {}", reason.code())
-        } else {
-            format!("tool_loop_budget_exceeded: {} ({detail})", reason.code())
-        }
     }
 }
 
@@ -444,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_final_no_tools_api_is_preserved_for_non_budget_finalization() {
+    fn explicit_final_no_tools_mode_is_preserved_for_validator_retries() {
         let mut guard = guard(8, 8);
         let instruction = guard
             .request_final_answer_with_instruction("wrap up without tools")
@@ -462,12 +428,16 @@ mod tests {
         );
         assert!(final_round.budget_exceeded.is_none());
 
-        let err = guard
+        let retry_round = guard
             .begin_provider_round()
-            .expect_err("a second final no-tools round must fail");
-        assert!(err.contains("tool_loop_budget_exceeded"));
-        assert!(err.contains("max_agent_rounds_per_window"));
-        assert!(err.contains("final_no_tools_round_already_used"));
+            .expect("a validator-authorized retry must remain in no-tools mode");
+        assert_eq!(retry_round.action, ToolLoopRoundAction::StartProviderRound);
+        assert!(!retry_round.tools_enabled);
+        assert_eq!(
+            retry_round.final_instruction.as_deref(),
+            Some("wrap up without tools")
+        );
+        assert!(retry_round.budget_exceeded.is_none());
     }
 
     #[test]

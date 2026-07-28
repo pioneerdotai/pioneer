@@ -1998,6 +1998,7 @@ enum LoopBudgetProviderMode {
     AlwaysTools,
     TooManyToolsThenFinal,
     RepeatedMissingToolThenFinal,
+    RepeatedMissingToolThenEmptyThenFinal,
     RetryEpisodeResetThenFinal,
 }
 
@@ -2766,6 +2767,9 @@ impl Provider for LoopBudgetProvider {
             LoopBudgetProviderMode::RepeatedMissingToolThenFinal if tools_available => {
                 vec![Self::missing_tool_call(round_index)]
             }
+            LoopBudgetProviderMode::RepeatedMissingToolThenEmptyThenFinal if tools_available => {
+                vec![Self::missing_tool_call(round_index)]
+            }
             LoopBudgetProviderMode::RetryEpisodeResetThenFinal if tools_available => {
                 match round_index {
                     0 | 2 => vec![Self::missing_tool_call(round_index)],
@@ -2778,7 +2782,15 @@ impl Provider for LoopBudgetProvider {
 
         Ok(ChatResponse {
             text: if tool_calls.is_empty() {
-                "final without tools".to_owned()
+                if matches!(
+                    self.mode,
+                    LoopBudgetProviderMode::RepeatedMissingToolThenEmptyThenFinal
+                ) && round_index == 2
+                {
+                    String::new()
+                } else {
+                    "final without tools".to_owned()
+                }
             } else {
                 String::new()
             },
@@ -10510,6 +10522,57 @@ async fn tool_loop_recoverable_retry_rounds_are_bounded() {
     assert_eq!(requests.len(), 3);
     assert!(requests[2].tools.is_none());
     assert_eq!(tool_result_message_count(&requests[2]), 2);
+}
+
+#[tokio::test]
+async fn empty_response_after_retry_exhaustion_retries_in_no_tools_mode() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::RepeatedMissingToolThenEmptyThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 8, 8);
+    config.retry.max_recoverable_retry_rounds_per_episode = 1;
+    config.retry.max_same_tool_error_retries_per_episode = 8;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let mut events = start_loop_budget_turn(
+        &manager,
+        "thr_empty_after_retry_exhaustion",
+        "turn_empty_after_retry_exhaustion",
+    )
+    .await;
+
+    let observed_events = recv_events_until_terminal(&mut events).await;
+    assert!(
+        matches!(
+            observed_events.last(),
+            Some(AgentEvent::TurnCompleted { turn_id, .. })
+                if turn_id == "turn_empty_after_retry_exhaustion"
+        ),
+        "an empty final response should be corrected without failing the turn: {observed_events:?}"
+    );
+    assert_eq!(
+        completed_agent_message_text(&observed_events).as_deref(),
+        Some("final without tools")
+    );
+    assert!(
+        !format!("{observed_events:#?}").contains("final_no_tools_round_already_used"),
+        "validator retries must not conflict with the no-tools guard"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "two tool rounds, one empty no-tools round, and one corrected no-tools round are expected"
+    );
+    assert!(requests[..2].iter().all(|request| request.tools.is_some()));
+    assert!(requests[2..].iter().all(|request| request.tools.is_none()));
+    assert!(requests[3].messages.iter().any(|message| {
+        message
+            .content
+            .contains("Your previous response was empty and was not accepted")
+    }));
 }
 
 #[tokio::test]
