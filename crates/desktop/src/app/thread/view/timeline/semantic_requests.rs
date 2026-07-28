@@ -385,7 +385,9 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(SemanticTimelinePageResult::Thread { page, merge_mode }) => {
-                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            view.capture_timeline_scroll_anchor_before_semantic_update(
+                                top_level_page_preserves_near_bottom_anchor(merge_mode),
+                            );
                             if semantic::apply_thread_timeline_page(
                                 &mut view.semantic_timelines,
                                 page,
@@ -396,7 +398,9 @@ impl PioneerDesktop {
                             }
                         }
                         Ok(SemanticTimelinePageResult::TurnWork { page, merge_mode }) => {
-                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            view.capture_timeline_scroll_anchor_before_semantic_update(
+                                work_page_preserves_near_bottom_anchor(merge_mode),
+                            );
                             if semantic::apply_turn_work_page(
                                 &mut view.semantic_timelines,
                                 page,
@@ -407,7 +411,7 @@ impl PioneerDesktop {
                             }
                         }
                         Ok(SemanticTimelinePageResult::TurnWorkItems { response }) => {
-                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            view.capture_timeline_scroll_anchor_before_semantic_update(false);
                             if semantic::apply_turn_work_items_get_response(
                                 &mut view.semantic_timelines,
                                 response,
@@ -424,6 +428,9 @@ impl PioneerDesktop {
                             );
                             view.mark_semantic_timeline_request_failed(&key, format!("{error:#}"));
                         }
+                    }
+                    if semantic_request_key_requires_scroll_intent(&key) {
+                        view.consume_all_semantic_prefetch_scroll_intents();
                     }
                     if let Some(pending_action) = pending_action {
                         view.execute_semantic_timeline_action(pending_action, cx);
@@ -545,6 +552,14 @@ fn turn_work_page_merge_mode(key: &SemanticTimelineRequestKey) -> WorkPageMergeM
     }
 }
 
+fn top_level_page_preserves_near_bottom_anchor(merge_mode: TopLevelPageMergeMode) -> bool {
+    matches!(merge_mode, TopLevelPageMergeMode::MergeBefore)
+}
+
+fn work_page_preserves_near_bottom_anchor(merge_mode: WorkPageMergeMode) -> bool {
+    matches!(merge_mode, WorkPageMergeMode::MergeBefore)
+}
+
 fn semantic_action_allowed_by_scroll(
     action: &SemanticTimelineRequestAction,
     allow_thread_before: bool,
@@ -577,6 +592,18 @@ fn semantic_action_requires_scroll_intent(action: &SemanticTimelineRequestAction
     }
 }
 
+fn semantic_request_key_requires_scroll_intent(key: &SemanticTimelineRequestKey) -> bool {
+    match key {
+        SemanticTimelineRequestKey::ThreadBefore { .. }
+        | SemanticTimelineRequestKey::ThreadAfter { .. }
+        | SemanticTimelineRequestKey::TurnWorkBefore { .. }
+        | SemanticTimelineRequestKey::TurnWorkAfter { .. } => true,
+        SemanticTimelineRequestKey::ThreadNewest { .. }
+        | SemanticTimelineRequestKey::TurnWorkInitial { .. }
+        | SemanticTimelineRequestKey::TurnWorkItems { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +617,21 @@ mod tests {
             }),
             WorkPageMergeMode::MergeAfter
         );
+    }
+
+    #[test]
+    fn prepend_pages_preserve_scroll_anchor_even_near_bottom() {
+        assert!(top_level_page_preserves_near_bottom_anchor(
+            TopLevelPageMergeMode::MergeBefore
+        ));
+        assert!(work_page_preserves_near_bottom_anchor(
+            WorkPageMergeMode::MergeBefore
+        ));
+        assert!(!top_level_page_preserves_near_bottom_anchor(
+            TopLevelPageMergeMode::MergeAfter
+        ));
+        assert!(!work_page_preserves_near_bottom_anchor(
+            WorkPageMergeMode::MergeAfter
+        ));
     }
 }

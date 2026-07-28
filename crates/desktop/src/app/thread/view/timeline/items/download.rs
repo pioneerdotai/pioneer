@@ -1,4 +1,4 @@
-use super::{format_elapsed, format_elapsed_ms, host_from_url, now_unix_ms};
+use super::{format_running_elapsed, host_from_url};
 use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
@@ -64,10 +64,7 @@ impl PioneerDesktop {
         let host_with_favicon_collapsed =
             self.timeline_host_with_favicon(host_label.as_str(), favicon_url.clone(), cx);
 
-        let elapsed_label = format_elapsed(item_view);
-        let running_elapsed_label = item_view
-            .started_at_unix_ms
-            .map(|started| format_elapsed_ms(now_unix_ms().saturating_sub(started) as u64));
+        let running_elapsed_label = format_running_elapsed(item_view);
 
         let open = self
             .thread_timeline_item_expanded
@@ -209,21 +206,14 @@ impl PioneerDesktop {
                                 .gap_3()
                                 .child(host_with_favicon_collapsed)
                                 .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_sm()
-                                        .when_some(elapsed_label, |this, elapsed| {
-                                            this.child(elapsed)
+                                    h_flex().items_center().gap_2().text_sm().child(
+                                        Icon::new(if open {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
                                         })
-                                        .child(
-                                            Icon::new(if open {
-                                                IconName::ChevronUp
-                                            } else {
-                                                IconName::ChevronDown
-                                            })
-                                            .size_4(),
-                                        ),
+                                        .size_4(),
+                                    ),
                                 ),
                         )
                         .on_click({

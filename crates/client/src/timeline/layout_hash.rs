@@ -77,13 +77,10 @@ pub fn timeline_row_layout_hash(
         }
         TimelineRowKind::Item { timeline_index } => {
             0u8.hash(&mut hasher);
-            timeline_index.hash(&mut hasher);
 
             if let Some(entry) = projection.timeline.get(*timeline_index) {
                 entry.id.hash(&mut hasher);
                 entry.turn_id.hash(&mut hasher);
-                entry.item_id.hash(&mut hasher);
-                entry.item_index.hash(&mut hasher);
                 projection
                     .turn_permission_profile(entry.turn_id.as_str())
                     .map(|profile| profile.mode)
@@ -92,7 +89,6 @@ pub fn timeline_row_layout_hash(
                 if let Some(item_view) = projection.item_for_timeline_entry(entry) {
                     item_view.item_type.hash(&mut hasher);
                     item_view.status.hash(&mut hasher);
-                    item_view.updated_at_unix_ms.hash(&mut hasher);
 
                     let text = timeline_entry_text(item_view);
                     let text_bytes = text.as_bytes();
@@ -208,6 +204,116 @@ fn coalesced_tools_text_len_estimate(group: &TimelineCoalescedToolsRow) -> usize
         TimelineCoalescedToolsKind::RepeatedTaskWait => 24,
     };
     count_len.saturating_add(1).saturating_add(label_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeline_row_layout_hash;
+    use crate::{
+        conversation::{ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus},
+        timeline::rows::{TimelineRow, TimelineRowKind},
+    };
+    use pioneer_protocol::TurnItem;
+    use std::collections::HashSet;
+
+    #[test]
+    fn item_layout_hash_is_stable_when_history_is_prepended() {
+        let (projection_before, row_before) = projection_with_target_item(false);
+        let (projection_after, row_after) = projection_with_target_item(true);
+        let expanded = HashSet::new();
+
+        assert_eq!(
+            timeline_row_layout_hash(&projection_before, &row_before, &expanded),
+            timeline_row_layout_hash(&projection_after, &row_after, &expanded)
+        );
+    }
+
+    #[test]
+    fn item_layout_hash_ignores_durable_identity_and_timestamp_reconciliation() {
+        let (optimistic, optimistic_row) = projection_with_target_item(false);
+        let (mut durable, durable_row) = projection_with_target_item(false);
+        durable.timeline[0].item_id = "durable-item".to_owned();
+        durable.items[0].id = "durable-item".to_owned();
+        durable.items[0].updated_at_unix_ms = Some(2);
+        durable.items[0].completed_at_unix_ms = Some(2);
+        durable.items[0].item = TurnItem::UserMessage {
+            id: "durable-item".to_owned(),
+            text: "Target message".to_owned(),
+            attachments: Vec::new(),
+        };
+        let expanded = HashSet::new();
+
+        assert_eq!(
+            timeline_row_layout_hash(&optimistic, &optimistic_row, &expanded),
+            timeline_row_layout_hash(&durable, &durable_row, &expanded)
+        );
+    }
+
+    fn projection_with_target_item(prepend_item: bool) -> (ConversationViewState, TimelineRow) {
+        let mut projection = ConversationViewState::default();
+        if prepend_item {
+            push_user_item(
+                &mut projection,
+                "older-entry",
+                "older-item",
+                "older-turn",
+                "Older message",
+            );
+        }
+
+        let timeline_index = projection.timeline.len();
+        push_user_item(
+            &mut projection,
+            "target-entry",
+            "target-item",
+            "target-turn",
+            "Target message",
+        );
+
+        (
+            projection,
+            TimelineRow {
+                key: "target-entry".to_owned(),
+                kind: TimelineRowKind::Item { timeline_index },
+            },
+        )
+    }
+
+    fn push_user_item(
+        projection: &mut ConversationViewState,
+        entry_id: &str,
+        item_id: &str,
+        turn_id: &str,
+        text: &str,
+    ) {
+        let item_index = projection.items.len();
+        projection.items.push(ItemView {
+            id: item_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_type: "user_message".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: Some(1),
+            updated_at_unix_ms: Some(1),
+            completed_at_unix_ms: Some(1),
+            partial_text: text.to_owned(),
+            final_text: Some(text.to_owned()),
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            },
+            timeline_origin: None,
+            opaque_meta: None,
+        });
+        projection.timeline.push(TimelineEntry {
+            id: entry_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            item_index,
+        });
+    }
 }
 
 pub fn timeline_row_toggle_key(row: &TimelineRow) -> Option<&str> {

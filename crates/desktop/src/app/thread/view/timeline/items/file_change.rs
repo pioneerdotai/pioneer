@@ -1,4 +1,4 @@
-use super::{format_elapsed, format_elapsed_ms, now_unix_ms};
+use super::format_running_elapsed;
 use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
@@ -88,10 +88,7 @@ impl PioneerDesktop {
                 .into_any_element()
         };
 
-        let elapsed_label = format_elapsed(item_view);
-        let running_elapsed_label = item_view
-            .started_at_unix_ms
-            .map(|started| format_elapsed_ms(now_unix_ms().saturating_sub(started) as u64));
+        let running_elapsed_label = format_running_elapsed(item_view);
 
         let open = self
             .thread_timeline_item_expanded
@@ -197,9 +194,6 @@ impl PioneerDesktop {
                                                 .text_ellipsis()
                                                 .child(final_status),
                                         )
-                                        .when_some(elapsed_label, |this, elapsed| {
-                                            this.child(elapsed)
-                                        })
                                         .child(
                                             Icon::new(if open {
                                                 IconName::ChevronUp

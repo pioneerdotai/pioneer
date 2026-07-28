@@ -1,5 +1,4 @@
 use super::super::markdown::CodeHighlightPolicy;
-use super::format_elapsed;
 use crate::{
     app::{
         conversation::{ItemView, TimelineEntry},
@@ -68,7 +67,6 @@ impl PioneerDesktop {
                 } else {
                     self.render_markdown_auto(text, None, CodeHighlightPolicy::Disabled, cx)
                 };
-            let elapsed_label = format_elapsed(item_view);
             let open = self
                 .thread_timeline_item_expanded
                 .borrow()
@@ -124,9 +122,6 @@ impl PioneerDesktop {
                                         .flex_none()
                                         .items_center()
                                         .gap_2()
-                                        .when_some(elapsed_label, |this, elapsed| {
-                                            this.child(elapsed)
-                                        })
                                         .child(
                                             Clipboard::new((
                                                 "copy-subagent-message",

@@ -10,7 +10,7 @@ mod web_fetch;
 mod web_search;
 
 use crate::app::{
-    conversation::{ItemView, TimelineEntry},
+    conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
 };
 use crate::assets::PioneerIconName;
@@ -59,14 +59,25 @@ pub(super) fn now_unix_ms() -> i64 {
     timeline_labels::now_unix_ms()
 }
 
-pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
-    let started = item_view.started_at_unix_ms?;
-    let ended = item_view
-        .completed_at_unix_ms
-        .or(item_view.updated_at_unix_ms)
-        .unwrap_or(started);
+pub(super) fn format_running_elapsed(item_view: &ItemView) -> Option<String> {
+    running_elapsed_ms(
+        item_view.status,
+        item_view.started_at_unix_ms,
+        now_unix_ms(),
+    )
+    .map(format_elapsed_ms)
+}
 
-    Some(format_elapsed_ms(ended.saturating_sub(started) as u64))
+fn running_elapsed_ms(
+    status: TimelineEntryStatus,
+    started_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> Option<u64> {
+    if status != TimelineEntryStatus::Running {
+        return None;
+    }
+    let started_at_unix_ms = started_at_unix_ms?;
+    Some(now_unix_ms.saturating_sub(started_at_unix_ms).max(0) as u64)
 }
 
 pub(super) fn host_from_url(url: &str) -> Option<String> {
@@ -524,7 +535,8 @@ fn task_uses_stable_card_shell(
 
 #[cfg(test)]
 mod tests {
-    use super::task_uses_stable_card_shell;
+    use super::{running_elapsed_ms, task_uses_stable_card_shell};
+    use crate::app::conversation::TimelineEntryStatus;
     use pioneer_protocol::TaskAttachmentMode;
 
     #[test]
@@ -541,5 +553,22 @@ mod tests {
             TaskAttachmentMode::Attached,
             None
         ));
+    }
+
+    #[test]
+    fn work_item_elapsed_is_visible_only_while_running() {
+        assert_eq!(
+            running_elapsed_ms(TimelineEntryStatus::Running, Some(1_000), 3_500),
+            Some(2_500)
+        );
+
+        for status in [
+            TimelineEntryStatus::Completed,
+            TimelineEntryStatus::Blocked,
+            TimelineEntryStatus::Failed,
+            TimelineEntryStatus::Cancelled,
+        ] {
+            assert_eq!(running_elapsed_ms(status, Some(1_000), 3_500), None);
+        }
     }
 }

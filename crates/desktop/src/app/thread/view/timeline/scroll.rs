@@ -1,7 +1,18 @@
 use super::*;
 impl PioneerDesktop {
-    pub(super) fn capture_timeline_scroll_anchor_before_semantic_update(&self) {
-        if self.timeline_is_near_bottom() {
+    pub(super) fn capture_timeline_scroll_anchor_before_semantic_update(
+        &self,
+        preserve_near_bottom: bool,
+    ) {
+        if self
+            .thread_timeline_view_state
+            .borrow()
+            .pending_scroll_anchor
+            .is_some()
+        {
+            return;
+        }
+        if !preserve_near_bottom && self.timeline_is_near_bottom() {
             self.thread_timeline_view_state
                 .borrow_mut()
                 .pending_scroll_anchor = None;
@@ -74,7 +85,10 @@ impl PioneerDesktop {
         for (index, row) in rows.iter().enumerate() {
             if row.key() == anchor.row_key {
                 let desired_viewport_top = row_top - anchor.row_top_offset_px;
-                let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+                let max_offset = timeline_max_offset_for_item_sizes(
+                    item_sizes,
+                    self.thread_timeline_scroll_handle.bounds().size.height,
+                );
                 let min_offset = px(0.) - max_offset;
                 let next_offset = (px(0.) - desired_viewport_top).clamp(min_offset, px(0.));
                 let mut offset = self.thread_timeline_scroll_handle.offset();
@@ -126,7 +140,9 @@ impl PioneerDesktop {
             state.autoscroll_paused_by_user = false;
         }
 
-        let should_follow = if force_follow {
+        let should_follow = if state.pending_scroll_anchor.is_some() {
+            false
+        } else if force_follow {
             item_count > 0 && !state.autoscroll_paused_by_user
         } else if thread_changed {
             item_count > 0
@@ -191,10 +207,7 @@ impl PioneerDesktop {
             return;
         }
 
-        let content_height = item_sizes
-            .iter()
-            .fold(px(0.), |height, size| height + size.height);
-        let max_offset = (content_height - viewport_height).max(px(0.));
+        let max_offset = timeline_max_offset_for_item_sizes(item_sizes, viewport_height);
         let mut offset = self.thread_timeline_scroll_handle.offset();
         offset.y = px(0.) - max_offset;
         self.thread_timeline_scroll_handle.set_offset(offset);
@@ -220,8 +233,7 @@ impl PioneerDesktop {
         let delta_y = event.delta.pixel_delta(window.line_height()).y;
         if delta_y != px(0.) {
             let mut state = self.thread_timeline_view_state.borrow_mut();
-            state.semantic_prefetch_scroll_generation =
-                state.semantic_prefetch_scroll_generation.saturating_add(1);
+            record_semantic_prefetch_scroll_intent(&mut state);
         }
 
         let force_follow_active = self.semantic_timeline_has_running_turn_row()
@@ -256,5 +268,76 @@ impl PioneerDesktop {
             .clamp(px(0.) - max_offset, px(0.));
         let bottom_offset = px(0.) - max_offset;
         (next_offset - bottom_offset).abs() <= px(24.)
+    }
+
+    pub(super) fn consume_all_semantic_prefetch_scroll_intents(&self) {
+        let mut state = self.thread_timeline_view_state.borrow_mut();
+        consume_semantic_prefetch_scroll_intents(&mut state);
+    }
+}
+
+fn record_semantic_prefetch_scroll_intent(state: &mut ThreadTimelineViewState) {
+    if state.semantic_prefetch_scroll_generation
+        == state.semantic_prefetch_consumed_scroll_generation
+    {
+        state.semantic_prefetch_scroll_generation =
+            state.semantic_prefetch_scroll_generation.saturating_add(1);
+    }
+}
+
+fn consume_semantic_prefetch_scroll_intents(state: &mut ThreadTimelineViewState) {
+    state.semantic_prefetch_consumed_scroll_generation = state.semantic_prefetch_scroll_generation;
+}
+
+fn timeline_max_offset_for_item_sizes(
+    item_sizes: &[Size<Pixels>],
+    viewport_height: Pixels,
+) -> Pixels {
+    let content_height = item_sizes
+        .iter()
+        .fold(px(0.), |height, size| height + size.height);
+    (content_height - viewport_height).max(px(0.))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ThreadTimelineViewState, consume_semantic_prefetch_scroll_intents,
+        record_semantic_prefetch_scroll_intent, timeline_max_offset_for_item_sizes,
+    };
+    use gpui::{px, size};
+
+    #[test]
+    fn scroll_events_coalesce_until_prefetch_intent_is_consumed() {
+        let mut state = ThreadTimelineViewState::default();
+
+        record_semantic_prefetch_scroll_intent(&mut state);
+        record_semantic_prefetch_scroll_intent(&mut state);
+        assert_eq!(state.semantic_prefetch_scroll_generation, 1);
+
+        state.semantic_prefetch_consumed_scroll_generation =
+            state.semantic_prefetch_scroll_generation;
+        record_semantic_prefetch_scroll_intent(&mut state);
+        assert_eq!(state.semantic_prefetch_scroll_generation, 2);
+
+        consume_semantic_prefetch_scroll_intents(&mut state);
+        assert_eq!(
+            state.semantic_prefetch_consumed_scroll_generation,
+            state.semantic_prefetch_scroll_generation
+        );
+    }
+
+    #[test]
+    fn anchor_clamp_uses_new_item_sizes_after_prepend() {
+        let item_sizes = vec![
+            size(px(100.), px(40.)),
+            size(px(100.), px(50.)),
+            size(px(100.), px(60.)),
+        ];
+
+        assert_eq!(
+            timeline_max_offset_for_item_sizes(&item_sizes, px(80.)),
+            px(70.)
+        );
     }
 }

@@ -3023,6 +3023,9 @@ fn push_turn_work_rows_and_hints(
         });
     }
     for item in work_range.ordered_items() {
+        if !work_item_is_visible_in_timeline(item) {
+            continue;
+        }
         rows.push(SemanticTimelineRow {
             id: SemanticTimelineRowId::TurnWorkItem {
                 turn_id: item.turn_id.clone(),
@@ -3039,6 +3042,22 @@ fn push_turn_work_rows_and_hints(
             turn_id: work.turn_id.clone(),
             cursor,
         });
+    }
+}
+
+fn work_item_is_visible_in_timeline(item: &TurnWorkItem) -> bool {
+    if item.status == TurnWorkItemStatus::Running {
+        return true;
+    }
+
+    match &item.item {
+        TurnItem::Reasoning {
+            summary, content, ..
+        } => summary
+            .iter()
+            .chain(content)
+            .any(|part| !part.trim().is_empty()),
+        _ => true,
     }
 }
 
@@ -4811,6 +4830,71 @@ mod tests {
     }
 
     #[test]
+    fn empty_terminal_reasoning_is_hidden_but_running_and_contentful_reasoning_remain() {
+        let mut top_work = turn_work_block("thread_a", "block_work", "002");
+        if let TimelineBlockKind::TurnWork { work } = &mut top_work.kind {
+            work.work_count = 3;
+            work.visible_work_count = 3;
+        }
+        let mut page_work = work_block("turn_a");
+        page_work.work_count = 3;
+        page_work.visible_work_count = 3;
+
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![top_work]),
+            TopLevelPageMergeMode::Reset
+        ));
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page_with_work(
+                page_work,
+                vec![
+                    reasoning_work_item(
+                        "work_completed_empty",
+                        "001",
+                        TurnWorkItemStatus::Completed,
+                        vec!["  "],
+                        Vec::new(),
+                    ),
+                    reasoning_work_item(
+                        "work_running_empty",
+                        "002",
+                        TurnWorkItemStatus::Running,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    reasoning_work_item(
+                        "work_completed_content",
+                        "003",
+                        TurnWorkItemStatus::Completed,
+                        Vec::new(),
+                        vec!["analysis"],
+                    ),
+                ],
+            ),
+            WorkPageMergeMode::Reset
+        ));
+
+        let flattened =
+            flatten_semantic_timeline(&state, "thread_a").expect("flattened rows should exist");
+        let visible_work_item_ids = flattened
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                SemanticTimelineRowKind::WorkItem { item } => Some(item.work_item_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible_work_item_ids,
+            vec!["work_running_empty", "work_completed_content"]
+        );
+    }
+
+    #[test]
     fn prepending_older_top_level_page_preserves_visible_anchor_identity() {
         let mut state = SemanticTimelineState::default();
         assert!(apply_thread_timeline_page(
@@ -5244,6 +5328,33 @@ mod tests {
                 success: Some(true),
                 outcome: None,
                 observation: None,
+            },
+            metadata: None,
+        }
+    }
+
+    fn reasoning_work_item(
+        work_item_id: &str,
+        order_key: &str,
+        status: TurnWorkItemStatus,
+        summary: Vec<&str>,
+        content: Vec<&str>,
+    ) -> TurnWorkItem {
+        TurnWorkItem {
+            work_item_id: work_item_id.to_owned(),
+            item_id: format!("item_{work_item_id}"),
+            turn_id: "turn_a".to_owned(),
+            order_key: order_key.to_owned(),
+            source_sequence: 1,
+            source_updated_at_unix_micros: 1,
+            item_type: TurnItemType::Reasoning,
+            status,
+            started_at_unix_ms: Some(1),
+            completed_at_unix_ms: (status != TurnWorkItemStatus::Running).then_some(2),
+            item: TurnItem::Reasoning {
+                id: format!("item_{work_item_id}"),
+                summary: summary.into_iter().map(str::to_owned).collect(),
+                content: content.into_iter().map(str::to_owned).collect(),
             },
             metadata: None,
         }

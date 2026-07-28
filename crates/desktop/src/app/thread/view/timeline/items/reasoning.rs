@@ -1,5 +1,5 @@
 use super::super::markdown::CodeHighlightPolicy;
-use super::{format_elapsed, format_elapsed_ms, now_unix_ms};
+use super::format_running_elapsed;
 use crate::{
     app::{
         conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
@@ -41,10 +41,7 @@ impl PioneerDesktop {
             cx,
         );
 
-        let elapsed_label = format_elapsed(item_view);
-        let running_elapsed_label = item_view
-            .started_at_unix_ms
-            .map(|started| format_elapsed_ms(now_unix_ms().saturating_sub(started) as u64));
+        let running_elapsed_label = format_running_elapsed(item_view);
 
         let open = self
             .thread_timeline_item_expanded
@@ -172,21 +169,14 @@ impl PioneerDesktop {
                                         ),
                                 )
                                 .child(
-                                    h_flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .gap_2()
-                                        .when_some(elapsed_label, |this, elapsed| {
-                                            this.child(elapsed)
+                                    h_flex().flex_none().items_center().gap_2().child(
+                                        Icon::new(if open {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
                                         })
-                                        .child(
-                                            Icon::new(if open {
-                                                IconName::ChevronUp
-                                            } else {
-                                                IconName::ChevronDown
-                                            })
-                                            .size_4(),
-                                        ),
+                                        .size_4(),
+                                    ),
                                 ),
                         )
                         .on_click({
@@ -225,13 +215,6 @@ impl PioneerDesktop {
                                         .text_ellipsis()
                                         .child(t!("timeline.reasoning.completed").to_string()),
                                 ),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .items_center()
-                                .gap_2()
-                                .when_some(elapsed_label, |this, elapsed| this.child(elapsed)),
                         ),
                 )
                 .into_any_element()

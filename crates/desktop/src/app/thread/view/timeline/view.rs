@@ -45,18 +45,13 @@ impl PioneerDesktop {
         let list_width = self.timeline_content_width(window);
         let content_width = self.timeline_entry_content_width(list_width);
         let semantic_row_ids = model.semantic_row_ids.clone();
-        let expanded_revision = self.thread_timeline_view_state.borrow().expanded_revision;
-        let model_signature_hash = Self::timeline_model_signature_hash(
-            active_thread_id,
-            projection.revision,
-            expanded_revision,
-        );
 
         self.ensure_running_task_indicator_timer(projection.as_ref(), cx);
         let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
         let rows = Rc::new(merge_pending_timeline_render_rows(rows, pending_requests));
+        let expanded = self.thread_timeline_item_expanded.borrow().clone();
         let rows_layout_hash =
-            model_signature_hash ^ timeline_render_rows_layout_hash(rows.as_ref());
+            timeline_render_rows_layout_hash(projection.as_ref(), rows.as_ref(), &expanded);
 
         let should_follow_bottom =
             self.sync_timeline_scroll(active_thread_id, projection.as_ref(), rows.as_ref());
@@ -79,7 +74,6 @@ impl PioneerDesktop {
             if can_reuse && let Some(sizes) = state.cached_item_sizes.as_ref() {
                 sizes.clone()
             } else {
-                let expanded = self.thread_timeline_item_expanded.borrow().clone();
                 let item_sizes = self.compute_timeline_item_sizes(
                     &mut state,
                     projection.as_ref(),
@@ -356,18 +350,6 @@ impl PioneerDesktop {
             toggle.into_any_element(),
         )
     }
-
-    fn timeline_model_signature_hash(
-        active_thread_id: Option<&str>,
-        projection_revision: u64,
-        expanded_revision: u64,
-    ) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        active_thread_id.hash(&mut hasher);
-        projection_revision.hash(&mut hasher);
-        expanded_revision.hash(&mut hasher);
-        hasher.finish()
-    }
 }
 
 fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
@@ -454,18 +436,67 @@ impl PioneerDesktop {
     }
 }
 
-fn timeline_render_rows_layout_hash(rows: &[TimelineRenderRow]) -> u64 {
+fn timeline_render_rows_layout_hash(
+    projection: &ConversationViewState,
+    rows: &[TimelineRenderRow],
+    expanded: &HashSet<String>,
+) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows.len().hash(&mut hasher);
     for row in rows {
         row.key().hash(&mut hasher);
-        if let TimelineRenderRow::PendingRequest(row) = row {
-            row.request.request_id.hash(&mut hasher);
-            row.request.title.hash(&mut hasher);
-            row.request.message.hash(&mut hasher);
-            format!("{:?}", row.request.origin).hash(&mut hasher);
-            format!("{:?}", row.request.kind).hash(&mut hasher);
-            format!("{:?}", row.request.payload).hash(&mut hasher);
+        match row {
+            TimelineRenderRow::Timeline(row) => {
+                super::model::timeline_row_layout_hash(projection, row, expanded).hash(&mut hasher);
+            }
+            TimelineRenderRow::PendingRequest(row) => {
+                super::timeline_pending_request_layout_hash(row).hash(&mut hasher);
+            }
         }
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ConversationViewState, HashSet, TimelineRenderRow, TimelineRow, TimelineRowKind,
+        TurnWorkGroupRow, timeline_render_rows_layout_hash,
+    };
+
+    #[test]
+    fn render_layout_hash_ignores_projection_revision_but_tracks_row_layout() {
+        let mut projection = ConversationViewState::default();
+        projection.revision = 1;
+        let mut rows = vec![TimelineRenderRow::Timeline(TimelineRow {
+            key: "work-toggle".to_owned(),
+            kind: TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow {
+                toggle_key: "work-toggle".to_owned(),
+                anchor_entry_id: "work-block".to_owned(),
+                elapsed_ms: Some(1_000),
+                is_open: false,
+            }),
+        })];
+        let expanded = HashSet::new();
+        let initial = timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded);
+
+        projection.revision = 2;
+        assert_eq!(
+            initial,
+            timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded)
+        );
+
+        let TimelineRenderRow::Timeline(TimelineRow {
+            kind: TimelineRowKind::TurnWorkToggle(group),
+            ..
+        }) = &mut rows[0]
+        else {
+            unreachable!("fixture should remain a work toggle");
+        };
+        group.elapsed_ms = Some(2_000);
+        assert_ne!(
+            initial,
+            timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded)
+        );
+    }
 }
