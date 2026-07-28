@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_execution_checkpoint, turn_execution_window, turn_item};
 use pioneer_protocol::{
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus, TurnStatus, generate_id,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, TurnItem, TurnStatus, generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -535,6 +535,32 @@ pub async fn count_turn_execution_window_terminal_items<C: ConnectionTrait>(
     }
 
     Ok(counts)
+}
+
+pub async fn list_turn_execution_window_items<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    started_at: DateTimeWithTimeZone,
+) -> Result<Vec<TurnItem>> {
+    let rows = turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::CreatedAt.gte(started_at))
+        .order_by_asc(turn_item::Column::CreatedAt)
+        .order_by_asc(turn_item::Column::ItemId)
+        .all(db)
+        .await
+        .context("failed to list turn_item rows for execution-window checkpoint")?;
+
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_str::<TurnItem>(row.payload.as_str()).with_context(|| {
+                format!(
+                    "failed to decode turn_item payload for execution-window checkpoint on turn `{turn_id}` item `{}`",
+                    row.item_id
+                )
+            })
+        })
+        .collect()
 }
 
 pub async fn save_turn_execution_checkpoint<C: ConnectionTrait>(

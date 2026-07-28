@@ -627,8 +627,9 @@ impl ChatExecutionWindowStats {
         &self,
         model: &str,
         model_provider: &str,
-        budget_exceeded: &ToolLoopBudgetExceeded,
         reason: ExecutionWindowExhaustionReason,
+        exhausted_limit: Option<u64>,
+        exhausted_observed: Option<u64>,
     ) -> ExecutionCheckpointProviderBudgetSummary {
         build_execution_checkpoint_provider_budget_summary(ExecutionCheckpointProviderBudgetInput {
             model: Some(model.to_owned()),
@@ -637,8 +638,8 @@ impl ChatExecutionWindowStats {
             tool_call_count: self.requested_tool_call_count,
             provider_token_count: self.provider_token_count,
             exhaustion_reason: Some(reason),
-            exhausted_limit: Some(u64::from(budget_exceeded.limit)),
-            exhausted_observed: Some(u64::from(budget_exceeded.observed)),
+            exhausted_limit,
+            exhausted_observed,
         })
     }
 
@@ -694,9 +695,11 @@ fn build_execution_window_continuation(
     model: &str,
     model_provider: &str,
     stats: &ChatExecutionWindowStats,
-    budget_exceeded: &ToolLoopBudgetExceeded,
+    reason: ExecutionWindowExhaustionReason,
+    exhausted_limit: Option<u64>,
+    exhausted_observed: Option<u64>,
+    reason_code: &str,
 ) -> ExecutionWindowContinuation {
-    let reason = execution_window_exhaustion_reason(budget_exceeded.reason);
     let exhausted_window_id = execution_window_runtime_id(turn_id, stats.window_index);
     let checkpoint_id = execution_window_checkpoint_runtime_id(exhausted_window_id.as_str());
     let payload = build_execution_checkpoint_payload(
@@ -705,7 +708,13 @@ fn build_execution_window_continuation(
         turn_id,
         build_execution_checkpoint_original_request_summary(input),
         stats.checkpoint_window_summary(reason),
-        stats.checkpoint_provider_budget_summary(model, model_provider, budget_exceeded, reason),
+        stats.checkpoint_provider_budget_summary(
+            model,
+            model_provider,
+            reason,
+            exhausted_limit,
+            exhausted_observed,
+        ),
         stats.checkpoint_tool_summary(),
         Vec::new(),
     );
@@ -715,7 +724,84 @@ fn build_execution_window_continuation(
         exhausted_window_id,
         checkpoint_id,
         checkpoint_payload: payload,
+        exhausted_limit,
+        exhausted_observed,
+        reason_code: reason_code.to_owned(),
     }
+}
+
+fn build_budget_execution_window_continuation(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+    model: &str,
+    model_provider: &str,
+    stats: &ChatExecutionWindowStats,
+    budget_exceeded: &ToolLoopBudgetExceeded,
+) -> ExecutionWindowContinuation {
+    build_execution_window_continuation(
+        workspace_id,
+        thread_id,
+        turn_id,
+        input,
+        model,
+        model_provider,
+        stats,
+        execution_window_exhaustion_reason(budget_exceeded.reason),
+        Some(u64::from(budget_exceeded.limit)),
+        Some(u64::from(budget_exceeded.observed)),
+        budget_exceeded.reason.code(),
+    )
+}
+
+fn build_failure_execution_window_continuation(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+    model: &str,
+    model_provider: &str,
+    stats: &ChatExecutionWindowStats,
+    error: &ChatTurnError,
+) -> Option<ExecutionWindowContinuation> {
+    let (reason, reason_code) = match error {
+        ChatTurnError::ProviderFailure { .. } => (
+            ExecutionWindowExhaustionReason::ProviderFailureContinuation,
+            "provider_failure_continuation",
+        ),
+        ChatTurnError::Terminal(_) => (
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+            "runtime_shutdown_continuation",
+        ),
+        ChatTurnError::Blocked(_) => return None,
+        ChatTurnError::WithPostTurnDispatch { error, .. } => {
+            return build_failure_execution_window_continuation(
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                model,
+                model_provider,
+                stats,
+                error,
+            );
+        }
+    };
+
+    Some(build_execution_window_continuation(
+        workspace_id,
+        thread_id,
+        turn_id,
+        input,
+        model,
+        model_provider,
+        stats,
+        reason,
+        None,
+        None,
+        reason_code,
+    ))
 }
 
 fn execution_window_runtime_id(turn_id: &str, window_index: u32) -> String {
@@ -755,7 +841,6 @@ async fn emit_execution_window_exhausted_and_checkpointed(
     thread_id: &str,
     turn_id: &str,
     stats: &ChatExecutionWindowStats,
-    budget_exceeded: &ToolLoopBudgetExceeded,
     continuation: &ExecutionWindowContinuation,
     event_tx: &AgentEventHub,
 ) -> Result<(), ChatTurnError> {
@@ -775,14 +860,14 @@ async fn emit_execution_window_exhausted_and_checkpointed(
                 window_index: stats.window_index,
                 status: ExecutionWindowStatus::Exhausted,
                 exhaustion_reason: continuation.reason,
-                limit: u64::from(budget_exceeded.limit),
-                observed: u64::from(budget_exceeded.observed),
+                limit: continuation.exhausted_limit.unwrap_or_default(),
+                observed: continuation.exhausted_observed.unwrap_or_default(),
                 agent_round_count: stats.agent_round_count,
                 tool_call_count: stats.requested_tool_call_count,
                 provider_token_count: stats.provider_token_count,
                 started_at_unix_ms: stats.started_at_unix_ms,
                 exhausted_at_unix_ms: completed_at_unix_ms,
-                reason: budget_exceeded.reason.code().to_owned(),
+                reason: continuation.reason_code.clone(),
             },
         },
     )
@@ -3999,7 +4084,7 @@ async fn execute_agent_provider_response(
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let continuation = build_execution_window_continuation(
+                let continuation = build_budget_execution_window_continuation(
                     workspace_id,
                     thread_id,
                     turn_id,
@@ -4014,7 +4099,6 @@ async fn execute_agent_provider_response(
                     thread_id,
                     turn_id,
                     &window_stats,
-                    &budget_exceeded,
                     &continuation,
                     event_tx.as_ref(),
                 )
@@ -4296,7 +4380,7 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let continuation = build_execution_window_continuation(
+                    let continuation = build_budget_execution_window_continuation(
                         workspace_id,
                         thread_id,
                         turn_id,
@@ -4311,7 +4395,6 @@ async fn execute_agent_provider_response(
                         thread_id,
                         turn_id,
                         &window_stats,
-                        &budget_exceeded,
                         &continuation,
                         event_tx.as_ref(),
                     )
@@ -5400,6 +5483,26 @@ async fn execute_agent_provider_response(
                 },
                 other => other,
             };
+            if let Some(continuation) = build_failure_execution_window_continuation(
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                post_turn_model.as_str(),
+                post_turn_model_provider.as_str(),
+                &window_stats,
+                &error,
+            ) {
+                emit_execution_window_exhausted_and_checkpointed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &window_stats,
+                    &continuation,
+                    event_tx.as_ref(),
+                )
+                .await?;
+            }
             Err(with_post_turn_failure_dispatch(
                 error,
                 hook_context,

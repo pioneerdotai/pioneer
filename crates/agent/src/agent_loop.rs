@@ -921,6 +921,17 @@ pub(super) async fn run_agent_loop(
                             continue;
                         }
                     };
+                    if let Err(error) = publish_recovery_execution_window_continued(
+                        event_hub.as_ref(),
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        &turn_request,
+                    )
+                    .await
+                    {
+                        let _ = ack.send(Err(error));
+                        continue;
+                    }
 
                     let run_id = next_turn_run_id;
                     next_turn_run_id = next_turn_run_id.saturating_add(1);
@@ -1020,6 +1031,22 @@ pub(super) async fn run_agent_loop(
                         continue;
                     }
                 };
+                if let Err(error) = publish_recovery_execution_window_continued(
+                    event_hub.as_ref(),
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    &turn_request,
+                )
+                .await
+                {
+                    active_turn_id = None;
+                    active_turn_run_id = None;
+                    active_turn_control = None;
+                    active_turn_request = None;
+                    active_recovery = None;
+                    let _ = ack.send(Err(error));
+                    continue;
+                }
 
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);
@@ -1113,6 +1140,17 @@ pub(super) async fn run_agent_loop(
                         continue;
                     }
                 };
+                if let Err(error) = publish_recovery_execution_window_continued(
+                    event_hub.as_ref(),
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    &active_request,
+                )
+                .await
+                {
+                    let _ = ack.send(Err(error));
+                    continue;
+                }
 
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);
@@ -1384,6 +1422,42 @@ async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurab
     if let Err(error) = event_hub.publish_durable(event).await {
         error!(error = %error, "failed to publish durable agent loop event");
     }
+}
+
+async fn publish_recovery_execution_window_continued(
+    event_hub: &AgentEventHub,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_request: &ActiveTurnRequest,
+) -> Result<(), super::AgentControlError> {
+    let Some(context) = turn_request.execution_checkpoint_context.as_ref() else {
+        return Ok(());
+    };
+    let next_window_index = turn_request
+        .execution_window_index
+        .max(context.next_window_index());
+
+    event_hub
+        .publish_durable(AgentDurableEvent::TurnExecutionWindowContinued {
+            notification: TurnExecutionWindowContinuedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_request.turn_id.clone(),
+                window_id: format!("{}:window:{next_window_index}", turn_request.turn_id),
+                window_index: next_window_index,
+                status: ExecutionWindowStatus::Continued,
+                previous_window_id: context.window_id.clone(),
+                previous_window_index: context.window_index,
+                checkpoint_id: context.checkpoint_id.clone(),
+                continued_at_unix_ms: chrono::Local::now().timestamp_millis(),
+            },
+        })
+        .await
+        .map_err(|error| {
+            super::AgentControlError::Internal(format!(
+                "failed to publish execution window continuation for recovery: {error}"
+            ))
+        })
 }
 
 async fn maybe_dispatch_post_turn_hook(

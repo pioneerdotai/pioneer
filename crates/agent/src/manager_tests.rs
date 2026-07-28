@@ -4,14 +4,14 @@ use super::{
     AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
     AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
-    AgentTurnHookRuntimeContext, DurableEventReceiver, ExecutionTurnStatus, MemoryExtractionPolicy,
-    MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization,
-    MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest,
-    PendingAttachedTask, RecoveryAttemptRequest, ResolvedArtifactInput,
-    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
-    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
-    WorkspaceSkillPolicy,
+    AgentTurnHookRuntimeContext, DurableEventReceiver, ExecutionCheckpointContext,
+    ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
+    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
+    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskToolMaterialization,
+    TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
+    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
+    TurnToolMaterialization, TurnToolProvider, WorkspaceSkillPolicy,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -30,14 +30,15 @@ use pioneer_memory::hooks::{
 };
 use pioneer_memory::{MemoryModeRecallParams, MemoryRecallMode};
 use pioneer_protocol::{
-    AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, McpScopeKind,
-    McpTurnBindingSummary, MemoryCategory, MemoryScope, MemoryScopeKind,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookTruncation, ProviderFailureClass, RecoveryAction, RecoveryAttemptContext,
-    StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolCallStatus, ToolLoopBudgetAction,
-    ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
-    ToolRetryResolution, ToolStoragePayload, TurnCapability, TurnCapabilityAcceptedReason,
-    TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem, TurnItemType, UserInput,
+    AgentDurableEvent, ExecutionWindowExhaustionReason, ItemCompletedNotification,
+    ItemStartedNotification, McpScopeKind, McpTurnBindingSummary, MemoryCategory, MemoryScope,
+    MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookTruncation, ProviderFailureClass, RecoveryAction,
+    RecoveryAttemptContext, StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolCallStatus,
+    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode,
+    ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload, TurnCapability,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem,
+    TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -537,6 +538,8 @@ struct RetryOnceFinalizationProvider {
     contexts: std::sync::Mutex<Vec<TurnFinalizationContext>>,
     next_index: AtomicUsize,
 }
+
+struct FailFinalizationProvider;
 
 impl Default for CaptureAgentProvider {
     fn default() -> Self {
@@ -3224,6 +3227,18 @@ impl TurnFinalizationProvider for RetryOnceFinalizationProvider {
 }
 
 #[async_trait::async_trait]
+impl TurnFinalizationProvider for FailFinalizationProvider {
+    async fn check_turn_finalization(
+        &self,
+        _context: TurnFinalizationContext,
+    ) -> Result<TurnFinalizationDecision, String> {
+        Ok(TurnFinalizationDecision::Fail {
+            message: "finalization rejected the turn".to_owned(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for TextOnlyAgentProvider {
     fn name(&self) -> &str {
         "text-only"
@@ -4250,6 +4265,231 @@ async fn third_consecutive_empty_no_tool_round_surfaces_provider_failure() {
     }
 
     panic!("provider failure was not emitted for repeated empty no-tool rounds")
+}
+
+#[tokio::test]
+async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_window() {
+    let provider = Arc::new(EmptyNoToolRoundProvider::new(usize::MAX));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "empty-no-tool-round",
+        provider,
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let workspace_id = "provider_failure_window_workspace";
+    let thread_id = "provider_failure_window_thread";
+    let turn_id = "provider_failure_window_turn";
+
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "empty-no-tool-round",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "return a final answer".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut exhausted_window_id = None;
+    let mut checkpoint_context = None;
+    let mut saw_provider_failure = false;
+    for _ in 0..80 {
+        let event = timeout(Duration::from_secs(2), durable_events.recv())
+            .await
+            .expect("provider failure lifecycle event should arrive")
+            .expect("durable receiver should stay open");
+        durable_events.acknowledge_last(Ok(()));
+        match event {
+            AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+                assert_eq!(notification.window_index, 1);
+                assert_eq!(
+                    notification.exhaustion_reason,
+                    ExecutionWindowExhaustionReason::ProviderFailureContinuation
+                );
+                assert_eq!(notification.limit, 0);
+                assert_eq!(notification.observed, 0);
+                assert_eq!(notification.reason, "provider_failure_continuation");
+                exhausted_window_id = Some(notification.window_id);
+            }
+            AgentDurableEvent::TurnExecutionWindowCheckpointed {
+                notification,
+                payload,
+            } => {
+                assert_eq!(
+                    exhausted_window_id.as_deref(),
+                    Some(notification.window_id.as_str()),
+                    "provider failure must exhaust the window before checkpointing it"
+                );
+                assert_eq!(
+                    payload.window.exhaustion_reason,
+                    Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
+                );
+                assert_eq!(payload.provider_budget.exhausted_limit, None);
+                assert_eq!(payload.provider_budget.exhausted_observed, None);
+                checkpoint_context = Some(ExecutionCheckpointContext {
+                    window_id: notification.window_id,
+                    window_index: notification.window_index,
+                    checkpoint_id: notification.checkpoint_id,
+                    checkpoint_kind: notification.checkpoint_kind,
+                    payload,
+                });
+            }
+            AgentDurableEvent::ProviderFailureDetected { .. } => {
+                assert!(
+                    checkpoint_context.is_some(),
+                    "provider failure must be published only after its checkpoint"
+                );
+                saw_provider_failure = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_provider_failure, "provider failure should be emitted");
+
+    manager
+        .start_recovery_attempt(
+            thread_id,
+            RecoveryAttemptRequest {
+                recovery_job_id: "provider_failure_window_job".to_owned(),
+                recovery_attempt_id: "provider_failure_window_attempt".to_owned(),
+                turn_id: turn_id.to_owned(),
+                item_id: "provider_failure_window_reasoning".to_owned(),
+                item_type: TurnItemType::Reasoning,
+                force_non_stream: false,
+                disable_tool_calling: false,
+                disable_image_input: false,
+                refresh_provider_auth: false,
+                compact_history: false,
+                continue_generation: true,
+                model_override: None,
+                retained_provider_history: Vec::new(),
+                execution_checkpoint_context: checkpoint_context,
+            },
+        )
+        .await
+        .expect("provider recovery should start from the checkpoint");
+
+    let mut saw_continued = false;
+    for _ in 0..40 {
+        let event = timeout(Duration::from_secs(2), durable_events.recv())
+            .await
+            .expect("recovery window event should arrive")
+            .expect("durable receiver should stay open");
+        durable_events.acknowledge_last(Ok(()));
+        match event {
+            AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
+                assert_eq!(notification.previous_window_index, 1);
+                assert_eq!(notification.window_index, 2);
+                saw_continued = true;
+            }
+            AgentDurableEvent::TurnExecutionWindowStarted { notification }
+                if notification.window_index == 2 =>
+            {
+                assert!(
+                    saw_continued,
+                    "recovery must mark the previous window continued before starting the next one"
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    panic!("recovery did not start execution window 2")
+}
+
+#[tokio::test]
+async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_finalization_provider(Some(Arc::new(FailFinalizationProvider)))
+        .await;
+    let workspace_id = "runtime_failure_window_workspace";
+    let thread_id = "runtime_failure_window_thread";
+    let turn_id = "runtime_failure_window_turn";
+
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "finish the turn".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut saw_exhausted = false;
+    let mut saw_checkpoint = false;
+    for _ in 0..80 {
+        let event = timeout(Duration::from_secs(2), durable_events.recv())
+            .await
+            .expect("runtime failure lifecycle event should arrive")
+            .expect("durable receiver should stay open");
+        durable_events.acknowledge_last(Ok(()));
+        match event {
+            AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+                assert_eq!(
+                    notification.exhaustion_reason,
+                    ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
+                );
+                assert_eq!(notification.reason, "runtime_shutdown_continuation");
+                saw_exhausted = true;
+            }
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
+                assert!(saw_exhausted);
+                assert_eq!(
+                    payload.window.exhaustion_reason,
+                    Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation)
+                );
+                saw_checkpoint = true;
+            }
+            AgentDurableEvent::TurnFailed { error, .. } => {
+                assert_eq!(error, "finalization rejected the turn");
+                assert!(
+                    saw_checkpoint,
+                    "runtime failure must be published only after its checkpoint"
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    panic!("terminal runtime failure was not emitted")
 }
 
 #[tokio::test]

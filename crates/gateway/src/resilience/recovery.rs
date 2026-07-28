@@ -5,14 +5,20 @@ use pioneer_agent::{
 };
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
-    BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore, RecoveryJobRecord,
-    TimeoutCandidate,
+    BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
+    NewTurnExecutionCheckpointRecord, RecoveryJobRecord, TimeoutCandidate,
+    TurnExecutionCheckpointKind,
 };
 use pioneer_protocol::{
-    ExecutionCheckpointPayload, ExecutionWindowStatus, ProviderFailureClass,
+    EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, ExecutionCheckpointPayload,
+    ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointWindowSummary,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, ProviderFailureClass,
     ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus,
     RecoveryTrigger, ToolMetadata, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-    ToolRecoveryRetryClass, TurnItemType, TurnStatus, generate_id,
+    ToolRecoveryRetryClass, TurnItemType, TurnStatus, UserInput,
+    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
+    build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
+    generate_id,
 };
 use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use std::collections::{HashMap, HashSet};
@@ -1914,12 +1920,17 @@ impl RecoveryCoordinator {
             .retained_provider_history_for_turn(job.turn_id.as_str())
             .await?;
         let execution_checkpoint_context = self
-            .execution_checkpoint_context_for_turn(thread_id.as_str(), job.turn_id.as_str())
+            .prepare_execution_checkpoint_for_recovery(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                &job,
+                now_unix,
+            )
             .await?;
         let continue_generation =
             execution_plan.continue_generation || execution_checkpoint_context.is_some();
 
-        let request = RecoveryAttemptRequest {
+        let mut request = RecoveryAttemptRequest {
             recovery_job_id: job.id.clone(),
             recovery_attempt_id: active_attempt_id.clone(),
             turn_id: job.turn_id.clone(),
@@ -1964,6 +1975,14 @@ impl RecoveryCoordinator {
                         .await?
                     {
                         RestoredRecoveryTurnRequestLookup::Available(restored_turn_request) => {
+                            request.execution_checkpoint_context = self
+                                .execution_checkpoint_context_for_turn(
+                                    thread_id.as_str(),
+                                    job.turn_id.as_str(),
+                                )
+                                .await?;
+                            request.continue_generation = request.continue_generation
+                                || request.execution_checkpoint_context.is_some();
                             match self
                                 .agent_manager
                                 .start_restored_recovery_turn(
@@ -2198,6 +2217,76 @@ impl RecoveryCoordinator {
         }))
     }
 
+    async fn prepare_execution_checkpoint_for_recovery(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        job: &RecoveryJobRecord,
+        now_unix: i64,
+    ) -> Result<Option<ExecutionCheckpointContext>> {
+        let existing = self
+            .execution_checkpoint_context_for_turn(thread_id, job.turn_id.as_str())
+            .await?;
+        if existing.is_some()
+            || job.item_type.is_tool_item()
+            || !matches!(
+                job.trigger,
+                RecoveryTrigger::Timeout
+                    | RecoveryTrigger::ProviderError
+                    | RecoveryTrigger::ExecutionWindowContinuation
+                    | RecoveryTrigger::RuntimeFailure
+            )
+        {
+            return Ok(existing);
+        }
+
+        let Some(snapshot) = self
+            .crud_store
+            .get_turn_runtime_snapshot(job.turn_id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if snapshot.workspace_id != workspace_id || snapshot.thread_id != thread_id {
+            return Ok(None);
+        }
+        let input = serde_json::from_str::<Vec<UserInput>>(snapshot.input_json.as_str())?;
+        let reason = if job.trigger == RecoveryTrigger::ProviderError {
+            ExecutionWindowExhaustionReason::ProviderFailureContinuation
+        } else {
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
+        };
+        let interrupted_by =
+            if reason == ExecutionWindowExhaustionReason::ProviderFailureContinuation {
+                "provider_failure_recovery"
+            } else {
+                "runtime_failure_recovery"
+            };
+        let terminal_reason = job
+            .last_error
+            .as_deref()
+            .or(job.reason.as_deref())
+            .unwrap_or("recoverable turn execution failure");
+
+        self.checkpoint_running_execution_window(
+            workspace_id,
+            thread_id,
+            job.turn_id.as_str(),
+            input.as_slice(),
+            snapshot.model.as_str(),
+            snapshot.provider_name.as_str(),
+            now_unix,
+            reason,
+            TurnExecutionCheckpointKind::WindowExhausted,
+            interrupted_by,
+            terminal_reason,
+        )
+        .await?;
+
+        self.execution_checkpoint_context_for_turn(thread_id, job.turn_id.as_str())
+            .await
+    }
+
     async fn restored_recovery_turn_request(
         &self,
         thread_id: &str,
@@ -2320,15 +2409,180 @@ impl RecoveryCoordinator {
                 }
             };
         let execution_window_index = self
-            .next_recovery_execution_window_index(
-                turn_id,
+            .checkpoint_running_execution_window(
+                workspace_id.as_str(),
+                thread_id,
+                request.turn_id.as_str(),
+                request.input.as_slice(),
+                request.model.as_str(),
+                request.provider_name.as_str(),
                 now_unix,
+                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                TurnExecutionCheckpointKind::StartupRecovery,
                 "startup_recovery",
                 "agent loop was restored after process loss",
             )
             .await?;
         request.execution_window_index = execution_window_index;
         Ok(RestoredRecoveryTurnRequestLookup::Available(request))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn checkpoint_running_execution_window(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        input: &[UserInput],
+        model: &str,
+        provider_name: &str,
+        now_unix: i64,
+        reason: ExecutionWindowExhaustionReason,
+        checkpoint_kind: TurnExecutionCheckpointKind,
+        interrupted_by: &str,
+        terminal_reason: &str,
+    ) -> Result<u32> {
+        let Some(window) = self
+            .crud_store
+            .latest_turn_execution_window(turn_id)
+            .await?
+        else {
+            return Ok(1);
+        };
+
+        if window.status != ExecutionWindowStatus::Running {
+            return Ok(window.window_index.saturating_add(1).max(1));
+        }
+
+        let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
+            .map(|timestamp| timestamp.fixed_offset())
+            .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+        let window_items = self
+            .crud_store
+            .list_turn_execution_window_items(turn_id, window.started_at.clone())
+            .await?;
+        let terminal_counts = self
+            .crud_store
+            .count_turn_execution_window_terminal_items(turn_id)
+            .await?;
+        let prior_windows = self.crud_store.list_turn_execution_windows(turn_id).await?;
+        let prior_agent_round_count = prior_windows
+            .iter()
+            .filter(|prior| prior.window_index < window.window_index)
+            .fold(0u32, |total, prior| {
+                total.saturating_add(prior.agent_round_count)
+            });
+        let prior_tool_call_count = prior_windows
+            .iter()
+            .filter(|prior| prior.window_index < window.window_index)
+            .fold(0u32, |total, prior| {
+                total.saturating_add(prior.tool_call_count)
+            });
+        let agent_round_count = window.agent_round_count.max(
+            terminal_counts
+                .agent_round_count
+                .saturating_sub(prior_agent_round_count),
+        );
+        let tool_summary = build_execution_checkpoint_tool_summary(
+            window_items.as_slice(),
+            EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
+        );
+        let tool_call_count = window.tool_call_count.max(
+            terminal_counts
+                .tool_call_count
+                .saturating_sub(prior_tool_call_count)
+                .max(tool_summary.requested_count),
+        );
+        let provider_token_count =
+            (window.provider_token_count > 0).then_some(window.provider_token_count);
+        let payload = build_execution_checkpoint_payload(
+            workspace_id,
+            thread_id,
+            turn_id,
+            build_execution_checkpoint_original_request_summary(input),
+            ExecutionCheckpointWindowSummary {
+                window_id: Some(window.id.clone()),
+                window_index: window.window_index,
+                started_at_unix_ms: Some(window.started_at.timestamp_millis()),
+                completed_at_unix_ms: Some(completed_at.timestamp_millis()),
+                agent_round_count,
+                tool_call_count,
+                provider_token_count,
+                exhaustion_reason: Some(reason),
+            },
+            build_execution_checkpoint_provider_budget_summary(
+                ExecutionCheckpointProviderBudgetInput {
+                    model: Some(model.to_owned()),
+                    model_provider: Some(provider_name.to_owned()),
+                    agent_round_count,
+                    tool_call_count,
+                    provider_token_count,
+                    exhaustion_reason: Some(reason),
+                    exhausted_limit: None,
+                    exhausted_observed: None,
+                },
+            ),
+            tool_summary,
+            Vec::new(),
+        );
+        let mut metadata_json = window.metadata_json.clone();
+        match metadata_json.as_object_mut() {
+            Some(metadata) => {
+                metadata.insert(
+                    "interruptedBy".to_owned(),
+                    serde_json::Value::String(interrupted_by.to_owned()),
+                );
+                metadata.insert(
+                    "terminalReason".to_owned(),
+                    serde_json::Value::String(terminal_reason.to_owned()),
+                );
+            }
+            None => {
+                metadata_json = serde_json::json!({
+                    "interruptedBy": interrupted_by,
+                    "terminalReason": terminal_reason,
+                });
+            }
+        }
+
+        let checkpoint_exists = self
+            .crud_store
+            .list_turn_execution_checkpoints_for_window(window.id.as_str())
+            .await?
+            .iter()
+            .any(|checkpoint| checkpoint.checkpoint_kind == checkpoint_kind);
+        if !checkpoint_exists {
+            self.crud_store
+                .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                    window_id: window.id.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    checkpoint_kind,
+                    payload_json: serde_json::to_value(payload)?,
+                    created_at: completed_at.clone(),
+                })
+                .await?;
+        }
+        self.crud_store
+            .mark_turn_execution_window_exhausted(
+                window.id.as_str(),
+                reason,
+                pioneer_crud::TurnExecutionWindowStatsRecord {
+                    agent_round_count,
+                    tool_call_count,
+                    provider_token_count: window.provider_token_count,
+                    metadata_json,
+                    completed_at: completed_at.clone(),
+                    updated_at: completed_at.clone(),
+                },
+            )
+            .await?;
+        self.crud_store
+            .mark_turn_execution_window_checkpointed(window.id.as_str(), completed_at)
+            .await?;
+
+        Ok(window.window_index.saturating_add(1).max(1))
     }
 
     async fn next_recovery_execution_window_index(
@@ -4087,7 +4341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_recovery_turn_request_closes_stale_running_window_and_advances_index() {
+    async fn restored_recovery_turn_request_checkpoints_stale_window_and_advances_index() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_restore_running_window";
         let thread_id = "thr_restore_running_window";
@@ -4133,18 +4387,186 @@ mod tests {
             .expect("runtime snapshot should be restorable");
         assert_eq!(restored.execution_window_index, 2);
 
-        let interrupted = crud_store
+        let checkpointed = crud_store
             .get_turn_execution_window(window.id.as_str())
             .await
             .expect("window read should succeed")
             .expect("window should exist");
-        assert_eq!(interrupted.status, ExecutionWindowStatus::Interrupted);
+        assert_eq!(checkpointed.status, ExecutionWindowStatus::Checkpointed);
         assert_eq!(
-            interrupted
+            checkpointed.exhaustion_reason,
+            Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation)
+        );
+        assert_eq!(
+            checkpointed
                 .metadata_json
                 .get("interruptedBy")
                 .and_then(serde_json::Value::as_str),
             Some("startup_recovery")
+        );
+        let checkpoints = crud_store
+            .list_turn_execution_checkpoints_for_window(window.id.as_str())
+            .await
+            .expect("startup checkpoint should load");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0].checkpoint_kind,
+            TurnExecutionCheckpointKind::StartupRecovery
+        );
+        let payload: pioneer_protocol::ExecutionCheckpointPayload =
+            serde_json::from_value(checkpoints[0].payload_json.clone())
+                .expect("startup checkpoint payload should decode");
+        assert_eq!(
+            payload.window.exhaustion_reason,
+            Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation)
+        );
+        assert_eq!(payload.provider_budget.exhausted_limit, None);
+        assert_eq!(payload.provider_budget.exhausted_observed, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_recovery_checkpoints_running_window_before_restart() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_runtime_checkpoint";
+        let thread_id = "thr_runtime_checkpoint";
+        let turn_id = "turn_runtime_checkpoint";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_runtime_checkpoint",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("running window should persist");
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "runtime:panic".to_owned(),
+                    item_type: TurnItemType::SystemEvent,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "agent turn task panicked".to_owned(),
+                    base_backoff_secs: 0,
+                    max_attempts: 3,
+                    max_wall_clock_secs: 180,
+                    no_progress_limit: 3,
+                    metadata: pioneer_protocol::ToolMetadata::default(),
+                },
+                timestamp.timestamp(),
+            )
+            .await
+            .expect("runtime recovery job should enqueue")
+            .into_job();
+
+        let context = coordinator
+            .prepare_execution_checkpoint_for_recovery(
+                workspace_id,
+                thread_id,
+                &job,
+                timestamp.timestamp().saturating_add(1),
+            )
+            .await
+            .expect("runtime checkpoint preparation should succeed")
+            .expect("runtime recovery should receive a checkpoint");
+        assert_eq!(context.window_id, window.id);
+        assert_eq!(context.window_index, 1);
+        assert_eq!(context.next_window_index(), 2);
+        assert_eq!(context.checkpoint_kind, "window_exhausted");
+        assert_eq!(
+            context.payload.window.exhaustion_reason,
+            Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation)
+        );
+
+        let checkpointed = crud_store
+            .get_turn_execution_window(window.id.as_str())
+            .await
+            .expect("window read should succeed")
+            .expect("window should exist");
+        assert_eq!(checkpointed.status, ExecutionWindowStatus::Checkpointed);
+        assert_eq!(
+            checkpointed
+                .metadata_json
+                .get("interruptedBy")
+                .and_then(serde_json::Value::as_str),
+            Some("runtime_failure_recovery")
+        );
+        let checkpoints = crud_store
+            .list_turn_execution_checkpoints_for_window(window.id.as_str())
+            .await
+            .expect("runtime checkpoint should load");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0].checkpoint_kind,
+            TurnExecutionCheckpointKind::WindowExhausted
+        );
+
+        let second_timestamp = timestamp + chrono::Duration::seconds(2);
+        let second_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 2,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_2"}),
+                    started_at: second_timestamp,
+                },
+                second_timestamp,
+                second_timestamp,
+            )
+            .await
+            .expect("second running window should persist");
+        let second_context = coordinator
+            .prepare_execution_checkpoint_for_recovery(
+                workspace_id,
+                thread_id,
+                &job,
+                second_timestamp.timestamp().saturating_add(1),
+            )
+            .await
+            .expect("second runtime checkpoint preparation should succeed")
+            .expect("second runtime recovery should receive the current checkpoint");
+        assert_eq!(second_context.window_id, second_window.id);
+        assert_eq!(second_context.window_index, 2);
+        assert_eq!(second_context.next_window_index(), 3);
+        assert_eq!(
+            crud_store
+                .get_turn_execution_window(second_window.id.as_str())
+                .await
+                .expect("second window read should succeed")
+                .expect("second window should exist")
+                .status,
+            ExecutionWindowStatus::Checkpointed
         );
     }
 

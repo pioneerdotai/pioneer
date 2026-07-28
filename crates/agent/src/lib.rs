@@ -873,6 +873,9 @@ struct ExecutionWindowContinuation {
     exhausted_window_id: String,
     checkpoint_id: String,
     checkpoint_payload: ExecutionCheckpointPayload,
+    exhausted_limit: Option<u64>,
+    exhausted_observed: Option<u64>,
+    reason_code: String,
 }
 
 #[derive(Debug, Clone)]

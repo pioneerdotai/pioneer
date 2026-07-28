@@ -4096,6 +4096,19 @@ impl CrudStore {
             .await
     }
 
+    pub async fn list_turn_execution_window_items(
+        &self,
+        turn_id: &str,
+        started_at: DateTimeWithTimeZone,
+    ) -> Result<Vec<pioneer_protocol::TurnItem>> {
+        turn_execution_window::list_turn_execution_window_items(
+            &self.connection,
+            turn_id,
+            started_at,
+        )
+        .await
+    }
+
     pub async fn save_turn_execution_checkpoint(
         &self,
         record: NewTurnExecutionCheckpointRecord,
