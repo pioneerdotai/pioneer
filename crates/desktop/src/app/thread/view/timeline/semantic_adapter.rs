@@ -59,6 +59,7 @@ impl PioneerDesktop {
         let model = TimelineRenderModel {
             projection: Rc::new(projection),
             rows: Rc::new(rows),
+            row_render_fingerprints: Rc::new(render_model.row_render_fingerprints),
             semantic_row_ids: Rc::new(render_model.semantic_row_ids),
             semantic_rows,
         };

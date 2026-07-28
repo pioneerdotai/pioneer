@@ -45,13 +45,18 @@ impl PioneerDesktop {
         let list_width = self.timeline_content_width(window);
         let content_width = self.timeline_entry_content_width(list_width);
         let semantic_row_ids = model.semantic_row_ids.clone();
+        let row_render_fingerprints = model.row_render_fingerprints.clone();
 
         self.ensure_running_task_indicator_timer(projection.as_ref(), cx);
         let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
         let rows = Rc::new(merge_pending_timeline_render_rows(rows, pending_requests));
         let expanded = self.thread_timeline_item_expanded.borrow().clone();
-        let rows_layout_hash =
-            timeline_render_rows_layout_hash(projection.as_ref(), rows.as_ref(), &expanded);
+        let rows_render_fingerprint = timeline_render_rows_fingerprint(
+            projection.as_ref(),
+            rows.as_ref(),
+            row_render_fingerprints.as_ref(),
+            &expanded,
+        );
 
         let should_follow_bottom =
             self.sync_timeline_scroll(active_thread_id, projection.as_ref(), rows.as_ref());
@@ -69,7 +74,7 @@ impl PioneerDesktop {
             let can_reuse = state.cached_render_active_thread_id.as_deref() == active_thread_id
                 && state.cached_render_width_px == width_px
                 && state.cached_render_item_count == rows.len()
-                && state.cached_render_model_layout_hash == rows_layout_hash;
+                && state.cached_render_model_fingerprint == rows_render_fingerprint;
 
             if can_reuse && let Some(sizes) = state.cached_item_sizes.as_ref() {
                 sizes.clone()
@@ -80,6 +85,7 @@ impl PioneerDesktop {
                     rows.as_ref(),
                     list_width,
                     content_width,
+                    row_render_fingerprints.as_ref(),
                     &expanded,
                     window,
                     cx,
@@ -89,8 +95,8 @@ impl PioneerDesktop {
                 state.cached_render_width_px = width_px;
                 state.cached_render_item_count = rows.len();
                 state.cached_render_tail_entry_id = tail_row_key.map(str::to_owned);
-                state.cached_render_tail_layout_hash = rows_layout_hash;
-                state.cached_render_model_layout_hash = rows_layout_hash;
+                state.cached_render_tail_fingerprint = rows_render_fingerprint;
+                state.cached_render_model_fingerprint = rows_render_fingerprint;
                 state.cached_item_sizes = Some(item_sizes.clone());
 
                 item_sizes
@@ -436,9 +442,10 @@ impl PioneerDesktop {
     }
 }
 
-fn timeline_render_rows_layout_hash(
+fn timeline_render_rows_fingerprint(
     projection: &ConversationViewState,
     rows: &[TimelineRenderRow],
+    row_render_fingerprints: &std::collections::HashMap<String, u64>,
     expanded: &HashSet<String>,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -447,10 +454,21 @@ fn timeline_render_rows_layout_hash(
         row.key().hash(&mut hasher);
         match row {
             TimelineRenderRow::Timeline(row) => {
-                super::model::timeline_row_layout_hash(projection, row, expanded).hash(&mut hasher);
+                super::model::timeline_row_render_fingerprint_from_content(
+                    row_render_fingerprints
+                        .get(row.key.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            super::model::timeline_row_content_fingerprint(projection, row)
+                        }),
+                    projection,
+                    row,
+                    expanded,
+                )
+                .hash(&mut hasher);
             }
             TimelineRenderRow::PendingRequest(row) => {
-                super::timeline_pending_request_layout_hash(row).hash(&mut hasher);
+                super::timeline_pending_request_render_fingerprint(row).hash(&mut hasher);
             }
         }
     }
@@ -461,11 +479,12 @@ fn timeline_render_rows_layout_hash(
 mod tests {
     use super::{
         ConversationViewState, HashSet, TimelineRenderRow, TimelineRow, TimelineRowKind,
-        TurnWorkGroupRow, timeline_render_rows_layout_hash,
+        TurnWorkGroupRow, timeline_render_rows_fingerprint,
     };
+    use std::collections::HashMap;
 
     #[test]
-    fn render_layout_hash_ignores_projection_revision_but_tracks_row_layout() {
+    fn render_fingerprint_ignores_projection_revision_but_tracks_row_content() {
         let mut projection = ConversationViewState::default();
         projection.revision = 1;
         let mut rows = vec![TimelineRenderRow::Timeline(TimelineRow {
@@ -478,12 +497,23 @@ mod tests {
             }),
         })];
         let expanded = HashSet::new();
-        let initial = timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded);
+        let fingerprints = HashMap::new();
+        let initial = timeline_render_rows_fingerprint(
+            &projection,
+            rows.as_slice(),
+            &fingerprints,
+            &expanded,
+        );
 
         projection.revision = 2;
         assert_eq!(
             initial,
-            timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded)
+            timeline_render_rows_fingerprint(
+                &projection,
+                rows.as_slice(),
+                &fingerprints,
+                &expanded
+            )
         );
 
         let TimelineRenderRow::Timeline(TimelineRow {
@@ -496,7 +526,12 @@ mod tests {
         group.elapsed_ms = Some(2_000);
         assert_ne!(
             initial,
-            timeline_render_rows_layout_hash(&projection, rows.as_slice(), &expanded)
+            timeline_render_rows_fingerprint(
+                &projection,
+                rows.as_slice(),
+                &fingerprints,
+                &expanded
+            )
         );
     }
 }

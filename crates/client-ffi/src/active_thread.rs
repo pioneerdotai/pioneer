@@ -28,6 +28,7 @@ use pioneer_client::{
     threads::{coordinator::ThreadCoordinator, session as thread_session, start as thread_start},
     timeline::{
         labels::now_unix_ms,
+        render_fingerprint::render_fingerprint_hex,
         rows::TimelineRow,
         semantic::{
             SemanticTimelineCachePatch, SemanticTimelineState, TopLevelPageMergeMode,
@@ -250,6 +251,8 @@ pub struct ClientActiveThreadSnapshot {
     pub history_loading: bool,
     pub projection: ConversationViewState,
     pub rows: Vec<TimelineRow>,
+    #[serde(default)]
+    pub row_render_fingerprints: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_security_summary: Option<ClientTurnSecuritySummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1383,7 +1386,7 @@ fn snapshot_from_inner(
         &workspace_id,
     )
     .map(str::to_owned);
-    let (projection, rows) =
+    let (projection, rows, row_render_fingerprints) =
         render_active_thread_timeline(inner, thread_id, coordinator, expanded_keys);
     let active_turn_security_summary = active_turn_security_summary(&projection);
     let active_turn_security_diagnostics = active_turn_security_summary
@@ -1403,6 +1406,7 @@ fn snapshot_from_inner(
         history_loading: coordinator.history_loading,
         projection,
         rows,
+        row_render_fingerprints,
         active_turn_security_summary,
         active_turn_security_diagnostics,
         pending_requests: inner
@@ -1425,7 +1429,11 @@ fn render_active_thread_timeline(
     thread_id: &str,
     coordinator: &ThreadCoordinator,
     expanded_keys: &[String],
-) -> (ConversationViewState, Vec<TimelineRow>) {
+) -> (
+    ConversationViewState,
+    Vec<TimelineRow>,
+    HashMap<String, String>,
+) {
     let mut projection = coordinator.conversation.projection().clone();
     projection.items.clear();
     projection.timeline.clear();
@@ -1440,11 +1448,19 @@ fn render_active_thread_timeline(
     apply_expanded_turn_work_keys(&mut semantic_timelines, thread_id, expanded_keys);
 
     let Some(semantic_rows) = flatten_semantic_timeline(&semantic_timelines, thread_id) else {
-        return (projection, Vec::new());
+        return (projection, Vec::new(), HashMap::new());
     };
 
     let model = render_semantic_timeline_rows(semantic_rows.rows.as_slice(), projection);
-    (model.projection, model.rows)
+    (
+        model.projection,
+        model.rows,
+        model
+            .row_render_fingerprints
+            .into_iter()
+            .map(|(key, fingerprint)| (key, render_fingerprint_hex(fingerprint)))
+            .collect(),
+    )
 }
 
 fn apply_expanded_turn_work_keys(
@@ -2323,6 +2339,13 @@ mod tests {
         );
 
         let snapshot = snapshot_from_inner(&inner, &[]);
+        assert_eq!(snapshot.row_render_fingerprints.len(), snapshot.rows.len());
+        assert!(
+            snapshot
+                .row_render_fingerprints
+                .values()
+                .all(|fingerprint| fingerprint.len() == 16)
+        );
         assert!(
             snapshot.rows.iter().all(|row| !matches!(
                 &row.kind,

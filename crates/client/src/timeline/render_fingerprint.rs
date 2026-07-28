@@ -1,4 +1,4 @@
-//! Stable timeline layout hash helpers.
+//! Stable timeline render fingerprint helpers.
 
 use super::{
     labels::{display_name_from_attachment, format_elapsed_ms, timeline_entry_text},
@@ -7,12 +7,13 @@ use super::{
 use crate::conversation::ConversationViewState;
 use crate::security::security_summary_label;
 use pioneer_protocol::TurnItem;
+use serde::Serialize;
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
 };
 
-pub fn timeline_rows_layout_hash(
+pub fn timeline_rows_render_fingerprint(
     projection: &ConversationViewState,
     rows: &[TimelineRow],
     expanded: &HashSet<String>,
@@ -21,23 +22,46 @@ pub fn timeline_rows_layout_hash(
     rows.len().hash(&mut hasher);
     for row in rows {
         row.key.hash(&mut hasher);
-        timeline_row_layout_hash(projection, row, expanded).hash(&mut hasher);
+        timeline_row_render_fingerprint(projection, row, expanded).hash(&mut hasher);
     }
     hasher.finish()
 }
 
-pub fn timeline_row_layout_hash(
+pub fn timeline_row_render_fingerprint(
+    projection: &ConversationViewState,
+    row: &TimelineRow,
+    expanded: &HashSet<String>,
+) -> u64 {
+    timeline_row_render_fingerprint_from_content(
+        timeline_row_content_fingerprint(projection, row),
+        projection,
+        row,
+        expanded,
+    )
+}
+
+pub fn timeline_row_render_fingerprint_from_content(
+    content_fingerprint: u64,
     projection: &ConversationViewState,
     row: &TimelineRow,
     expanded: &HashSet<String>,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    row.key.hash(&mut hasher);
+    content_fingerprint.hash(&mut hasher);
+    timeline_row_is_expanded(projection, row, expanded).hash(&mut hasher);
+    hasher.finish()
+}
 
+pub fn timeline_row_content_fingerprint(
+    projection: &ConversationViewState,
+    row: &TimelineRow,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.key.hash(&mut hasher);
     match &row.kind {
         TimelineRowKind::TurnWorkToggle(group) => {
             1u8.hash(&mut hasher);
-            group.anchor_entry_id.hash(&mut hasher);
+            group.toggle_key.hash(&mut hasher);
             group.elapsed_ms.hash(&mut hasher);
             group.is_open.hash(&mut hasher);
         }
@@ -51,7 +75,6 @@ pub fn timeline_row_layout_hash(
         TimelineRowKind::RunningTurn(running_turn) => {
             3u8.hash(&mut hasher);
             running_turn.turn_id.hash(&mut hasher);
-            running_turn.started_at_unix_ms.hash(&mut hasher);
             running_turn.state.hash(&mut hasher);
             running_turn.message.hash(&mut hasher);
             running_turn
@@ -80,7 +103,6 @@ pub fn timeline_row_layout_hash(
 
             if let Some(entry) = projection.timeline.get(*timeline_index) {
                 entry.id.hash(&mut hasher);
-                entry.turn_id.hash(&mut hasher);
                 projection
                     .turn_permission_profile(entry.turn_id.as_str())
                     .map(|profile| profile.mode)
@@ -89,42 +111,60 @@ pub fn timeline_row_layout_hash(
                 if let Some(item_view) = projection.item_for_timeline_entry(entry) {
                     item_view.item_type.hash(&mut hasher);
                     item_view.status.hash(&mut hasher);
-
-                    let text = timeline_entry_text(item_view);
-                    let text_bytes = text.as_bytes();
-                    text_bytes.len().hash(&mut hasher);
-                    text_bytes
-                        .first()
-                        .copied()
-                        .unwrap_or_default()
-                        .hash(&mut hasher);
-                    text_bytes
-                        .last()
-                        .copied()
-                        .unwrap_or_default()
-                        .hash(&mut hasher);
-
-                    if let Some(markdown) = &item_view.partial_markdown {
-                        markdown.blocks.len().hash(&mut hasher);
-                    }
-                    if let Some(markdown) = &item_view.final_markdown {
-                        markdown.blocks.len().hash(&mut hasher);
-                    }
-
-                    if let TurnItem::UserMessage { attachments, .. } = &item_view.item {
-                        attachments.len().hash(&mut hasher);
-                        for attachment in attachments {
-                            display_name_from_attachment(attachment).hash(&mut hasher);
-                        }
-                    }
+                    item_view.partial_text.hash(&mut hasher);
+                    item_view.final_text.hash(&mut hasher);
+                    hash_serializable(&item_view.partial_markdown, &mut hasher);
+                    hash_serializable(&item_view.final_markdown, &mut hasher);
+                    hash_turn_item_without_identity(&item_view.item, &mut hasher);
+                    hash_serializable(&item_view.timeline_origin, &mut hasher);
+                    hash_serializable(&item_view.opaque_meta, &mut hasher);
                 }
-
-                expanded.contains(entry.id.as_str()).hash(&mut hasher);
             }
         }
     }
 
     hasher.finish()
+}
+
+pub fn render_fingerprint_hex(fingerprint: u64) -> String {
+    format!("{fingerprint:016x}")
+}
+
+fn timeline_row_is_expanded(
+    projection: &ConversationViewState,
+    row: &TimelineRow,
+    expanded: &HashSet<String>,
+) -> bool {
+    let TimelineRowKind::Item { timeline_index } = &row.kind else {
+        return false;
+    };
+
+    projection
+        .timeline
+        .get(*timeline_index)
+        .is_some_and(|entry| expanded.contains(entry.id.as_str()))
+}
+
+fn hash_turn_item_without_identity(
+    item: &TurnItem,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) {
+    let Ok(mut value) = serde_json::to_value(item) else {
+        return;
+    };
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.remove("id");
+    }
+    hash_serializable(&value, hasher);
+}
+
+fn hash_serializable(
+    value: &impl Serialize,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) {
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        bytes.hash(hasher);
+    }
 }
 
 pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineRow) -> usize {
@@ -208,7 +248,7 @@ fn coalesced_tools_text_len_estimate(group: &TimelineCoalescedToolsRow) -> usize
 
 #[cfg(test)]
 mod tests {
-    use super::timeline_row_layout_hash;
+    use super::timeline_row_render_fingerprint;
     use crate::{
         conversation::{ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus},
         timeline::rows::{TimelineRow, TimelineRowKind},
@@ -217,19 +257,19 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn item_layout_hash_is_stable_when_history_is_prepended() {
+    fn item_render_fingerprint_is_stable_when_history_is_prepended() {
         let (projection_before, row_before) = projection_with_target_item(false);
         let (projection_after, row_after) = projection_with_target_item(true);
         let expanded = HashSet::new();
 
         assert_eq!(
-            timeline_row_layout_hash(&projection_before, &row_before, &expanded),
-            timeline_row_layout_hash(&projection_after, &row_after, &expanded)
+            timeline_row_render_fingerprint(&projection_before, &row_before, &expanded),
+            timeline_row_render_fingerprint(&projection_after, &row_after, &expanded)
         );
     }
 
     #[test]
-    fn item_layout_hash_ignores_durable_identity_and_timestamp_reconciliation() {
+    fn item_render_fingerprint_ignores_durable_identity_and_timestamp_reconciliation() {
         let (optimistic, optimistic_row) = projection_with_target_item(false);
         let (mut durable, durable_row) = projection_with_target_item(false);
         durable.timeline[0].item_id = "durable-item".to_owned();
@@ -244,8 +284,27 @@ mod tests {
         let expanded = HashSet::new();
 
         assert_eq!(
-            timeline_row_layout_hash(&optimistic, &optimistic_row, &expanded),
-            timeline_row_layout_hash(&durable, &durable_row, &expanded)
+            timeline_row_render_fingerprint(&optimistic, &optimistic_row, &expanded),
+            timeline_row_render_fingerprint(&durable, &durable_row, &expanded)
+        );
+    }
+
+    #[test]
+    fn item_render_fingerprint_tracks_exact_content() {
+        let (projection, row) = projection_with_target_item(false);
+        let mut changed = projection.clone();
+        changed.items[0].partial_text = "Target massage".to_owned();
+        changed.items[0].final_text = Some("Target massage".to_owned());
+        changed.items[0].item = TurnItem::UserMessage {
+            id: "target-item".to_owned(),
+            text: "Target massage".to_owned(),
+            attachments: Vec::new(),
+        };
+        let expanded = HashSet::new();
+
+        assert_ne!(
+            timeline_row_render_fingerprint(&projection, &row, &expanded),
+            timeline_row_render_fingerprint(&changed, &row, &expanded)
         );
     }
 

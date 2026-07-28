@@ -178,8 +178,8 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_render_width_px: i32,
     pub(super) cached_render_item_count: usize,
     pub(super) cached_render_tail_entry_id: Option<String>,
-    pub(super) cached_render_tail_layout_hash: u64,
-    pub(super) cached_render_model_layout_hash: u64,
+    pub(super) cached_render_tail_fingerprint: u64,
+    pub(super) cached_render_model_fingerprint: u64,
     pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
     pub(super) cached_semantic_model_active_thread_id: Option<String>,
     pub(super) cached_semantic_model_revision: u64,
@@ -201,7 +201,7 @@ pub(super) struct TimelineScrollAnchor {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CachedTimelineEntryLayout {
-    pub(super) layout_hash: u64,
+    pub(super) render_fingerprint: u64,
     pub(super) height: Pixels,
 }
 

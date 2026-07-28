@@ -48,6 +48,7 @@ impl TimelineRenderRow {
 pub(crate) struct TimelineRenderModel {
     pub projection: Rc<ConversationViewState>,
     pub rows: Rc<Vec<TimelineRenderRow>>,
+    pub row_render_fingerprints: Rc<HashMap<String, u64>>,
     pub semantic_row_ids:
         Rc<HashMap<String, pioneer_client::timeline::semantic::SemanticTimelineRowId>>,
     pub semantic_rows: Rc<pioneer_client::timeline::semantic::SemanticTimelineRows>,
@@ -58,6 +59,7 @@ impl TimelineRenderModel {
         Self {
             projection: Rc::new(ConversationViewState::default()),
             rows: Rc::new(Vec::new()),
+            row_render_fingerprints: Rc::new(HashMap::new()),
             semantic_row_ids: Rc::new(HashMap::new()),
             semantic_rows: Rc::new(
                 pioneer_client::timeline::semantic::SemanticTimelineRows::default(),
@@ -99,17 +101,30 @@ impl PioneerDesktop {
         pioneer_client::timeline::labels::timeline_entry_text(item_view)
     }
 
-    fn timeline_row_layout_hash(
+    fn timeline_row_render_fingerprint(
         &self,
         projection: &ConversationViewState,
         row: &TimelineRenderRow,
+        row_render_fingerprints: &HashMap<String, u64>,
         expanded: &HashSet<String>,
     ) -> u64 {
         match row {
             TimelineRenderRow::Timeline(row) => {
-                model::timeline_row_layout_hash(projection, row, expanded)
+                model::timeline_row_render_fingerprint_from_content(
+                    row_render_fingerprints
+                        .get(row.key.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            model::timeline_row_content_fingerprint(projection, row)
+                        }),
+                    projection,
+                    row,
+                    expanded,
+                )
             }
-            TimelineRenderRow::PendingRequest(row) => timeline_pending_request_layout_hash(row),
+            TimelineRenderRow::PendingRequest(row) => {
+                timeline_pending_request_render_fingerprint(row)
+            }
         }
     }
 
@@ -180,6 +195,7 @@ impl PioneerDesktop {
         is_last_row: bool,
         row_width: Pixels,
         content_width: Pixels,
+        row_render_fingerprints: &HashMap<String, u64>,
         expanded: &HashSet<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -194,16 +210,15 @@ impl PioneerDesktop {
             return self.running_turn_row_size(is_first_row, is_last_row);
         }
 
-        let mut layout_hash = self.timeline_row_layout_hash(projection, row, expanded);
-        if is_first_row {
-            layout_hash = layout_hash.wrapping_add(1);
-        }
-        if is_last_row {
-            layout_hash = layout_hash.wrapping_add(2);
-        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.timeline_row_render_fingerprint(projection, row, row_render_fingerprints, expanded)
+            .hash(&mut hasher);
+        is_first_row.hash(&mut hasher);
+        is_last_row.hash(&mut hasher);
+        let render_fingerprint = hasher.finish();
 
         if let Some(cached) = state.entry_layout_cache.get(row.key())
-            && cached.layout_hash == layout_hash
+            && cached.render_fingerprint == render_fingerprint
         {
             return size(px(0.), cached.height.max(px(1.)));
         }
@@ -221,7 +236,7 @@ impl PioneerDesktop {
         state.entry_layout_cache.insert(
             row.key().to_owned(),
             CachedTimelineEntryLayout {
-                layout_hash,
+                render_fingerprint,
                 height: measured.height,
             },
         );
@@ -235,6 +250,7 @@ impl PioneerDesktop {
         rows: &[TimelineRenderRow],
         row_width: Pixels,
         content_width: Pixels,
+        row_render_fingerprints: &HashMap<String, u64>,
         expanded: &HashSet<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -252,6 +268,7 @@ impl PioneerDesktop {
                         ix + 1 == row_len,
                         row_width,
                         content_width,
+                        row_render_fingerprints,
                         expanded,
                         window,
                         cx,
@@ -283,7 +300,7 @@ impl PioneerDesktop {
     }
 }
 
-fn timeline_pending_request_layout_hash(row: &TimelinePendingRequestRow) -> u64 {
+fn timeline_pending_request_render_fingerprint(row: &TimelinePendingRequestRow) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     row.request.workspace_id.hash(&mut hasher);
     row.request.request_id.hash(&mut hasher);
