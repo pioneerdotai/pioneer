@@ -40,6 +40,7 @@ tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true
+libc.workspace = true
 memvid-core.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

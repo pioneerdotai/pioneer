@@ -8408,6 +8408,7 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "keepawake",
+ "libc",
  "markdown",
  "memvid-core",
  "mime_guess",

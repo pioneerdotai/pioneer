@@ -10,9 +10,17 @@ use pioneer_cli_mcp_bridge::{
     bind_private_endpoint, create_private_session_directory,
 };
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fmt;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -22,14 +30,100 @@ use tokio_util::sync::CancellationToken;
 const BOOTSTRAP_CONSUME_POLL: Duration = Duration::from_millis(5);
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(unix)]
+const PRIVATE_ENDPOINT_ROOT_PREFIX: &str = "pioneer-mcp-";
+#[cfg(unix)]
+static STALE_PRIVATE_ENDPOINT_ROOT_SCAVENGE: Once = Once::new();
 
 #[cfg(unix)]
 fn private_endpoint_root(_artifact_root: &Path) -> PathBuf {
+    STALE_PRIVATE_ENDPOINT_ROOT_SCAVENGE.call_once(|| {
+        let _ = scavenge_stale_private_endpoint_roots(
+            Path::new("/tmp"),
+            current_effective_uid(),
+            process_is_running,
+        );
+    });
     let supervisor_id = NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed);
     PathBuf::from("/tmp").join(format!(
-        "pioneer-mcp-{}-{supervisor_id}",
+        "{PRIVATE_ENDPOINT_ROOT_PREFIX}{}-{supervisor_id}",
         std::process::id()
     ))
+}
+
+#[cfg(unix)]
+fn private_endpoint_root_identity(name: &OsStr) -> Option<(u32, u64)> {
+    let value = name.to_str()?.strip_prefix(PRIVATE_ENDPOINT_ROOT_PREFIX)?;
+    let (pid, supervisor_id) = value.split_once('-')?;
+    let pid = pid.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+    let supervisor_id = supervisor_id
+        .parse::<u64>()
+        .ok()
+        .filter(|supervisor_id| *supervisor_id > 0)?;
+    Some((pid, supervisor_id))
+}
+
+#[cfg(unix)]
+fn current_effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 performs an existence/permission check and sends no
+    // signal. The PID was range-checked above.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
+}
+
+#[cfg(unix)]
+fn remove_owned_private_endpoint_root(path: &Path, owner_uid: u32) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o077 != 0
+    {
+        return false;
+    }
+    fs::remove_dir_all(path).is_ok()
+}
+
+#[cfg(unix)]
+fn scavenge_stale_private_endpoint_roots(
+    temp_root: &Path,
+    owner_uid: u32,
+    process_is_running: impl Fn(u32) -> bool,
+) -> usize {
+    let Ok(entries) = fs::read_dir(temp_root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some((pid, _supervisor_id)) = private_endpoint_root_identity(&entry.file_name()) else {
+            continue;
+        };
+        if process_is_running(pid) {
+            continue;
+        }
+        if remove_owned_private_endpoint_root(entry.path().as_path(), owner_uid) {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[cfg(windows)]
@@ -604,6 +698,12 @@ impl CliMcpBridgeSupervisor {
         }
         self.coordinator.shutdown().await;
         if self.endpoint_root != self.artifact_root {
+            #[cfg(unix)]
+            let _ = remove_owned_private_endpoint_root(
+                self.endpoint_root.as_path(),
+                current_effective_uid(),
+            );
+            #[cfg(windows)]
             let _ = std::fs::remove_dir(self.endpoint_root.as_path());
         }
     }
@@ -618,6 +718,27 @@ impl CliMcpBridgeSupervisor {
             .await
             .get(process_instance)
             .map(|session| session.state)
+    }
+}
+
+impl Drop for CliMcpBridgeSupervisor {
+    fn drop(&mut self) {
+        // Async shutdown is authoritative while the runtime is alive. This is
+        // the fail-safe for early returns, test teardown, and owners that drop
+        // the supervisor without calling `shutdown`: close session resources
+        // synchronously before removing their short Unix endpoint root.
+        let sessions = self.sessions.get_mut();
+        for session in sessions.values_mut() {
+            session.cancellation.cancel();
+        }
+        sessions.clear();
+        #[cfg(unix)]
+        if self.endpoint_root != self.artifact_root {
+            let _ = remove_owned_private_endpoint_root(
+                self.endpoint_root.as_path(),
+                current_effective_uid(),
+            );
+        }
     }
 }
 
@@ -730,6 +851,8 @@ mod tests {
         BootstrapNonce, connect_private_endpoint, helper::run_hidden_helper_with_io,
     };
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn instance_for(thread_id: &str, generation: u64) -> CliSessionInstanceId {
@@ -773,6 +896,65 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_private_endpoint_scavenger_is_pid_and_ownership_bounded() {
+        let root = tempfile::tempdir_in("/tmp").expect("root");
+        let private_dir = |name: &str| {
+            let path = root.path().join(name);
+            fs::create_dir(&path).expect("create fixture directory");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("secure fixture permissions");
+            path
+        };
+        let stale_empty = private_dir("pioneer-mcp-101-1");
+        let stale_nonempty = private_dir("pioneer-mcp-101-2");
+        fs::write(stale_nonempty.join("orphaned.socket"), b"stale").expect("orphaned fixture");
+        let live = private_dir("pioneer-mcp-202-1");
+        let insecure = private_dir("pioneer-mcp-303-1");
+        fs::set_permissions(&insecure, fs::Permissions::from_mode(0o755))
+            .expect("insecure fixture permissions");
+        let malformed = private_dir("pioneer-mcp-not-a-pid-1");
+        let outside = private_dir("outside");
+        let linked = root.path().join("pioneer-mcp-404-1");
+        symlink(&outside, &linked).expect("symlink fixture");
+
+        let removed =
+            scavenge_stale_private_endpoint_roots(root.path(), current_effective_uid(), |pid| {
+                pid == 202
+            });
+
+        assert_eq!(removed, 2);
+        assert!(!stale_empty.exists());
+        assert!(!stale_nonempty.exists());
+        assert!(live.exists());
+        assert!(insecure.exists());
+        assert!(malformed.exists());
+        assert!(linked.is_symlink());
+        assert!(outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_mcp_supervisor_drop_removes_endpoint_root_without_shutdown() {
+        let root = temporary_root();
+        let (endpoint_root, bootstrap_path) = {
+            let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+            let launch = supervisor
+                .prepare(scope(1), expiry())
+                .await
+                .expect("prepare");
+            let endpoint_root = supervisor.endpoint_root.clone();
+            let bootstrap_path = launch.bootstrap_path().to_path_buf();
+            assert!(endpoint_root.exists());
+            assert!(bootstrap_path.exists());
+            (endpoint_root, bootstrap_path)
+        };
+
+        assert!(!bootstrap_path.exists());
+        assert!(!endpoint_root.exists());
+    }
+
     #[tokio::test]
     async fn cli_mcp_supervisor_paused_attach_is_bounded_and_cleans_artifacts() {
         let root = temporary_root();
@@ -799,6 +981,7 @@ mod tests {
     async fn cli_mcp_shutdown_revokes_prepared_generation_and_is_idempotent() {
         let root = temporary_root();
         let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+        let endpoint_root = supervisor.endpoint_root.clone();
         let launch = supervisor
             .prepare(scope(1), expiry())
             .await
@@ -807,6 +990,8 @@ mod tests {
         supervisor.shutdown().await;
         assert!(launch.cancellation().is_cancelled());
         assert!(!launch.bootstrap_path().exists());
+        #[cfg(unix)]
+        assert!(!endpoint_root.exists());
         assert!(matches!(
             supervisor.prepare(scope(2), expiry()).await,
             Err(CliMcpBridgeSupervisorError::ShuttingDown)
