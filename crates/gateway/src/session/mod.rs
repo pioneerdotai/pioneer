@@ -1,11 +1,16 @@
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use pioneer_protocol::{
+    AuthSessionId, AuthSessionRevokedNotification, AuthSessionTerminationReason,
+    JsonRpcNotification, constants::events,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{RwLock, mpsc};
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::auth::AuthenticatedSessionPrincipal;
 use crate::request_context::ConnectionContext;
 
 #[cfg(test)]
@@ -13,17 +18,34 @@ pub(crate) mod test_support;
 
 pub type ConnectionId = u64;
 
+// Keep a terminal marker for the full maximum access-token lifetime. A
+// handshake can authenticate immediately before revocation and be descheduled
+// before registration; pruning sooner than the token validity bound could let
+// that stale handshake register after the disconnect sweep. Session lease
+// validation remains the durable authority after this in-memory race window.
+const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone)]
 struct SessionConnection {
     sender: mpsc::Sender<Message>,
+    termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
     workspace_id: Option<String>,
-    principal: Arc<AuthenticatedPrincipal>,
+    principal: Arc<AuthenticatedSessionPrincipal>,
+}
+
+#[derive(Clone, Copy)]
+struct TerminatedSessionTombstone {
+    reason: AuthSessionTerminationReason,
+    recorded_at: Instant,
 }
 
 #[derive(Default)]
 pub struct SessionManager {
     next_connection_id: AtomicU64,
     connections: RwLock<HashMap<ConnectionId, SessionConnection>>,
+    session_connections: RwLock<HashMap<String, HashSet<ConnectionId>>>,
+    device_sessions: RwLock<HashMap<String, HashSet<String>>>,
+    terminated_sessions: RwLock<HashMap<String, TerminatedSessionTombstone>>,
 }
 
 impl SessionManager {
@@ -34,22 +56,71 @@ impl SessionManager {
     pub async fn register_connection(
         &self,
         sender: mpsc::Sender<Message>,
-        principal: Arc<AuthenticatedPrincipal>,
-    ) -> ConnectionId {
+        principal: Arc<AuthenticatedSessionPrincipal>,
+    ) -> Result<ConnectionId> {
+        // Serialize registration against post-commit revocation. Without this
+        // gate a handshake that authenticated immediately before a revoke
+        // could register after the disconnect sweep and leave a stale socket
+        // open until its next request.
+        let mut terminated_sessions = self.terminated_sessions.write().await;
+        prune_terminated_session_tombstones(&mut terminated_sessions);
+        if let Some(tombstone) = terminated_sessions.get(principal.session_id.as_str()) {
+            return Err(anyhow!(
+                "auth session `{}` is terminal ({})",
+                principal.session_id,
+                tombstone.reason.as_str()
+            ));
+        }
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_id = principal.session_id.to_string();
+        let device_id = principal.device_id.to_string();
+        let (termination_tx, _) = watch::channel(None);
         self.connections.write().await.insert(
             connection_id,
             SessionConnection {
                 sender,
+                termination_tx,
                 workspace_id: None,
                 principal,
             },
         );
-        connection_id
+        self.session_connections
+            .write()
+            .await
+            .entry(session_id.clone())
+            .or_default()
+            .insert(connection_id);
+        self.device_sessions
+            .write()
+            .await
+            .entry(device_id)
+            .or_default()
+            .insert(session_id);
+        drop(terminated_sessions);
+        Ok(connection_id)
     }
 
     pub async fn unregister_connection(&self, connection_id: ConnectionId) {
-        self.connections.write().await.remove(&connection_id);
+        let removed = self.connections.write().await.remove(&connection_id);
+        let Some(removed) = removed else {
+            return;
+        };
+        let session_id = removed.principal.session_id.to_string();
+        let device_id = removed.principal.device_id.to_string();
+        let mut session_connections = self.session_connections.write().await;
+        if let Some(ids) = session_connections.get_mut(&session_id) {
+            ids.remove(&connection_id);
+            if ids.is_empty() {
+                session_connections.remove(&session_id);
+                let mut device_sessions = self.device_sessions.write().await;
+                if let Some(sessions) = device_sessions.get_mut(&device_id) {
+                    sessions.remove(&session_id);
+                    if sessions.is_empty() {
+                        device_sessions.remove(&device_id);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn connection_ids(&self) -> Vec<ConnectionId> {
@@ -87,7 +158,7 @@ impl SessionManager {
     pub(crate) async fn connection_principal(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<Arc<AuthenticatedPrincipal>> {
+    ) -> Result<Arc<AuthenticatedSessionPrincipal>> {
         self.connections
             .read()
             .await
@@ -103,6 +174,18 @@ impl SessionManager {
         self.connection_principal(connection_id)
             .await
             .map(|principal| ConnectionContext::new(connection_id, principal))
+    }
+
+    pub(crate) async fn connection_termination_receiver(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<watch::Receiver<Option<AuthSessionTerminationReason>>> {
+        self.connections
+            .read()
+            .await
+            .get(&connection_id)
+            .map(|connection| connection.termination_tx.subscribe())
+            .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
     }
 
     pub async fn set_connection_workspace(
@@ -156,18 +239,124 @@ impl SessionManager {
 
         Ok(())
     }
+
+    pub async fn connection_ids_for_session(
+        &self,
+        session_id: &AuthSessionId,
+    ) -> Vec<ConnectionId> {
+        let mut ids = self
+            .session_connections
+            .read()
+            .await
+            .get(session_id.as_str())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[cfg(test)]
+    async fn session_ids_for_device(&self, device_id: &pioneer_protocol::DeviceId) -> Vec<String> {
+        let mut ids = self
+            .device_sessions
+            .read()
+            .await
+            .get(device_id.as_str())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub async fn disconnect_session(
+        &self,
+        session_id: &AuthSessionId,
+        reason: AuthSessionTerminationReason,
+    ) {
+        let mut terminated_sessions = self.terminated_sessions.write().await;
+        prune_terminated_session_tombstones(&mut terminated_sessions);
+        terminated_sessions.insert(
+            session_id.to_string(),
+            TerminatedSessionTombstone {
+                reason,
+                recorded_at: Instant::now(),
+            },
+        );
+        let ids = self.connection_ids_for_session(session_id).await;
+        drop(terminated_sessions);
+        for connection_id in ids {
+            let notification = JsonRpcNotification::from_params(
+                events::AUTH_SESSION_REVOKED,
+                &AuthSessionRevokedNotification {
+                    session_id: session_id.clone(),
+                    reason,
+                },
+            )
+            .and_then(|notification| serde_json::to_string(&notification));
+            let connection = self
+                .connections
+                .read()
+                .await
+                .get(&connection_id)
+                .map(|connection| (connection.sender.clone(), connection.termination_tx.clone()));
+            if let Some((sender, termination_tx)) = connection {
+                if let Ok(notification) = notification {
+                    let _ = sender.try_send(Message::Text(notification.into()));
+                }
+                let _ = sender.try_send(Message::Close(Some(
+                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4403),
+                            reason: reason.as_str().into(),
+                        },
+                    )));
+                let _ = termination_tx.send(Some(reason));
+            }
+            self.unregister_connection(connection_id).await;
+        }
+    }
+}
+
+fn prune_terminated_session_tombstones(
+    tombstones: &mut HashMap<String, TerminatedSessionTombstone>,
+) {
+    tombstones
+        .retain(|_, tombstone| tombstone.recorded_at.elapsed() < TERMINATED_SESSION_TOMBSTONE_TTL);
+}
+
+#[async_trait::async_trait]
+impl crate::auth::AuthSessionDisconnectHook for SessionManager {
+    async fn disconnect_session(
+        &self,
+        session_id: &AuthSessionId,
+        reason: AuthSessionTerminationReason,
+    ) {
+        SessionManager::disconnect_session(self, session_id, reason).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SessionManager;
     use super::test_support::{
         TEST_SUPERUSER_PRINCIPAL_ID, authenticated_test_superuser,
         register_authenticated_test_connection,
     };
+    use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Message;
+
+    fn peer_session_principal() -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
+        let mut principal = (*authenticated_test_superuser()).clone();
+        principal.device_id = pioneer_protocol::DeviceId::new("D00000000000000000002").unwrap();
+        principal.session_id =
+            pioneer_protocol::AuthSessionId::new("S00000000000000000002").unwrap();
+        principal.access_jti = "J00000000000000000002".to_owned();
+        Arc::new(principal)
+    }
 
     #[tokio::test]
     async fn send_text_reaches_registered_connection() {
@@ -358,5 +547,201 @@ mod tests {
             Some(Message::Text("only-a".to_owned().into()))
         );
         assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnect_session_closes_every_matching_connection_only() {
+        let manager = SessionManager::new();
+        let (tx_a1, mut rx_a1) = mpsc::channel(4);
+        let (tx_a2, mut rx_a2) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let session_a = authenticated_test_superuser();
+        let session_b = peer_session_principal();
+        let a1 = manager
+            .register_connection(tx_a1, session_a.clone())
+            .await
+            .unwrap();
+        let a2 = manager
+            .register_connection(tx_a2, session_a.clone())
+            .await
+            .unwrap();
+        let b = manager
+            .register_connection(tx_b, session_b.clone())
+            .await
+            .unwrap();
+
+        manager
+            .disconnect_session(
+                &session_a.session_id,
+                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+            )
+            .await;
+
+        for receiver in [&mut rx_a1, &mut rx_a2] {
+            let event = receiver.recv().await.expect("revocation event");
+            assert!(event.into_text().unwrap().contains("auth/session_revoked"));
+            assert!(matches!(receiver.recv().await, Some(Message::Close(_))));
+        }
+        assert!(manager.connection_principal(a1).await.is_err());
+        assert!(manager.connection_principal(a2).await.is_err());
+        assert!(manager.connection_principal(b).await.is_ok());
+        assert!(rx_b.try_recv().is_err());
+        assert_eq!(
+            manager
+                .connection_ids_for_session(&session_b.session_id)
+                .await,
+            vec![b]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_revoke_response_precedes_notification_and_close() {
+        let manager = SessionManager::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let principal = authenticated_test_superuser();
+        let connection_id = manager
+            .register_connection(tx, principal.clone())
+            .await
+            .unwrap();
+
+        manager
+            .send_text(connection_id, "revoke-response".to_owned())
+            .await
+            .unwrap();
+        manager
+            .disconnect_session(
+                &principal.session_id,
+                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+            )
+            .await;
+
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Text("revoke-response".to_owned().into()))
+        );
+        let notification = rx.recv().await.expect("revocation notification");
+        assert!(
+            notification
+                .into_text()
+                .unwrap()
+                .contains("auth/session_revoked")
+        );
+        assert!(matches!(rx.recv().await, Some(Message::Close(_))));
+    }
+
+    #[tokio::test]
+    async fn runtime_indexes_are_derived_from_live_registration_after_restart() {
+        let before_restart = SessionManager::new();
+        let (tx, _rx) = mpsc::channel(2);
+        let principal = peer_session_principal();
+        before_restart
+            .register_connection(tx, principal.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            before_restart
+                .connection_ids_for_session(&principal.session_id)
+                .await
+                .len(),
+            1
+        );
+
+        let after_restart = SessionManager::new();
+        assert!(
+            after_restart
+                .connection_ids_for_session(&principal.session_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            after_restart
+                .session_ids_for_device(&principal.device_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_disconnect_rejects_late_registration() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        manager
+            .disconnect_session(
+                &principal.session_id,
+                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+            )
+            .await;
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let error = manager
+            .register_connection(sender, principal.clone())
+            .await
+            .expect_err("terminal session must reject a late connection");
+        assert!(error.to_string().contains("session_revoked"));
+        assert!(
+            manager
+                .connection_ids_for_session(&principal.session_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_registration_tombstones_are_short_lived_and_bounded() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        manager
+            .disconnect_session(
+                &principal.session_id,
+                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+            )
+            .await;
+        {
+            let mut tombstones = manager.terminated_sessions.write().await;
+            let tombstone = tombstones
+                .get_mut(principal.session_id.as_str())
+                .expect("terminal tombstone");
+            tombstone.recorded_at = std::time::Instant::now() - TERMINATED_SESSION_TOMBSTONE_TTL;
+        }
+
+        let (sender, _receiver) = mpsc::channel(1);
+        manager
+            .register_connection(sender, principal)
+            .await
+            .expect("persisted admission owns rejection after the race window");
+        assert!(manager.terminated_sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_signal_is_delivered_even_when_outbound_queue_is_full() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (sender, _receiver) = mpsc::channel(1);
+        let connection_id = manager
+            .register_connection(sender, principal.clone())
+            .await
+            .unwrap();
+        let mut termination = manager
+            .connection_termination_receiver(connection_id)
+            .await
+            .unwrap();
+        manager
+            .send_text(connection_id, "occupy-queue".to_owned())
+            .await
+            .unwrap();
+
+        manager
+            .disconnect_session(
+                &principal.session_id,
+                pioneer_protocol::AuthSessionTerminationReason::SessionRevoked,
+            )
+            .await;
+
+        termination.changed().await.unwrap();
+        assert_eq!(
+            *termination.borrow(),
+            Some(pioneer_protocol::AuthSessionTerminationReason::SessionRevoked)
+        );
+        assert!(manager.connection_principal(connection_id).await.is_err());
     }
 }

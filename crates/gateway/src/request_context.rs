@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pioneer_protocol::{PersistedActorRef, PrincipalKind, RequestId};
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::auth::AuthenticatedSessionPrincipal;
 use crate::session::ConnectionId;
 
 const UNKNOWN_RPC_METHOD: &str = "rpc/unknown";
@@ -27,7 +27,9 @@ impl AuthorizationDecision {
     }
 }
 
-pub(crate) fn authorize_principal(principal: &AuthenticatedPrincipal) -> AuthorizationDecision {
+pub(crate) fn authorize_principal(
+    principal: &AuthenticatedSessionPrincipal,
+) -> AuthorizationDecision {
     match principal.kind {
         PrincipalKind::Superuser => AuthorizationDecision::AllowSuperuser,
         _ => AuthorizationDecision::DenyUnsupportedPrincipal,
@@ -37,11 +39,14 @@ pub(crate) fn authorize_principal(principal: &AuthenticatedPrincipal) -> Authori
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionContext {
     connection_id: ConnectionId,
-    principal: Arc<AuthenticatedPrincipal>,
+    principal: Arc<AuthenticatedSessionPrincipal>,
 }
 
 impl ConnectionContext {
-    pub(crate) fn new(connection_id: ConnectionId, principal: Arc<AuthenticatedPrincipal>) -> Self {
+    pub(crate) fn new(
+        connection_id: ConnectionId,
+        principal: Arc<AuthenticatedSessionPrincipal>,
+    ) -> Self {
         Self {
             connection_id,
             principal,
@@ -52,12 +57,12 @@ impl ConnectionContext {
         self.connection_id
     }
 
-    pub(crate) fn principal(&self) -> &AuthenticatedPrincipal {
+    pub(crate) fn principal(&self) -> &AuthenticatedSessionPrincipal {
         self.principal.as_ref()
     }
 
     #[cfg(test)]
-    pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedPrincipal> {
+    pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedSessionPrincipal> {
         &self.principal
     }
 }
@@ -111,12 +116,12 @@ impl RequestContext {
         &self.connection
     }
 
-    pub(crate) fn principal(&self) -> &AuthenticatedPrincipal {
+    pub(crate) fn principal(&self) -> &AuthenticatedSessionPrincipal {
         self.connection.principal()
     }
 
     #[cfg(test)]
-    pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedPrincipal> {
+    pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedSessionPrincipal> {
         self.connection.principal_arc()
     }
 
@@ -158,7 +163,8 @@ pub(crate) fn request_span(
         gateway_id = %principal.gateway_id,
         principal_id = %principal.principal_id,
         principal_kind = ?principal.kind,
-        credential_kind = ?principal.credential_kind,
+        device_id = %principal.device_id,
+        auth_session_id = %principal.session_id,
         connection_id = connection.connection_id(),
         canonical_method = canonical_method.as_str(),
         request_id = request_id.map(RequestId::as_str).unwrap_or("unavailable"),
@@ -182,8 +188,11 @@ mod tests {
         AuthorizationDecision, CanonicalMethod, ConnectionContext, RequestContext,
         authorize_principal,
     };
-    use crate::auth::{AuthenticatedPrincipal, CredentialKind};
-    use pioneer_protocol::{GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, RequestId};
+    use crate::auth::AuthenticatedSessionPrincipal;
+    use pioneer_protocol::{
+        AuthSessionId, DeviceId, GatewayId, PersistedActorRef, PrincipalId, PrincipalKind,
+        RequestId,
+    };
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -213,13 +222,16 @@ mod tests {
         }
     }
 
-    fn principal(id_byte: char) -> Arc<AuthenticatedPrincipal> {
-        Arc::new(AuthenticatedPrincipal {
+    fn principal(id_byte: char) -> Arc<AuthenticatedSessionPrincipal> {
+        Arc::new(AuthenticatedSessionPrincipal {
             gateway_id: GatewayId::new("G".repeat(21)).expect("gateway id"),
             principal_id: PrincipalId::new(id_byte.to_string().repeat(21)).expect("principal id"),
             kind: PrincipalKind::Superuser,
             role_key: None,
-            credential_kind: CredentialKind::LegacySuperuserJwt,
+            device_id: DeviceId::new("D".repeat(21)).expect("device id"),
+            session_id: AuthSessionId::new("S".repeat(21)).expect("session id"),
+            access_jti: "J".repeat(21),
+            access_expires_at_unix: u64::MAX,
         })
     }
 
@@ -352,7 +364,8 @@ mod tests {
             "gateway_id=G",
             "principal_id=P",
             "principal_kind=Superuser",
-            "credential_kind=LegacySuperuserJwt",
+            "device_id=D",
+            "auth_session_id=S",
             "connection_id=42",
             "canonical_method=\"workspace/list\"",
             "request_id=\"RRRRRRRRRRRRRRRRRRRRR\"",

@@ -61,9 +61,11 @@ tar.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 hex.workspace = true
+hmac.workspace = true
 fs4.workspace = true
 transcribe-rs.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]

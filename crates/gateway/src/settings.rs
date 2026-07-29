@@ -4674,11 +4674,9 @@ model = "legacy-model"
             auth: GatewayAuthConfig {
                 jwt_issuer: "pioneer".to_owned(),
                 jwt_audience: "pioneer-clients".to_owned(),
-                superuser_subject: "superuser".to_owned(),
-                superuser_role: "superuser".to_owned(),
                 secret_size_bytes: 64,
-                token_ttl_seconds: 31_536_000,
-                token_refresh_leeway_seconds: 86_400,
+                device_activation_code_ttl_seconds: 600,
+                ..GatewayAuthConfig::default()
             },
         }
     }

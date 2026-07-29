@@ -3,6 +3,7 @@ mod artifact_finalization_diagnostics;
 mod artifact_registration;
 mod artifact_tools;
 mod artifacts;
+mod auth_handlers;
 mod binary;
 #[path = "../cli_runtime/handlers.rs"]
 mod cli_runtime;
@@ -166,6 +167,7 @@ use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+use crate::auth::GatewayAuthService;
 use crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatTracker;
 use crate::cli_runtime::manager::{CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager};
 use crate::cli_runtime::skills::{
@@ -340,6 +342,7 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    auth_service: Option<Arc<GatewayAuthService>>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
     thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
@@ -658,6 +661,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            auth_service: None,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,
@@ -955,6 +959,11 @@ impl MessageProcessor {
 
     pub(crate) fn with_cli_runtime_manager(mut self, manager: Arc<CLIAgentRuntimeManager>) -> Self {
         self.cli_runtime_manager = Some(manager);
+        self
+    }
+
+    pub(crate) fn with_auth_service(mut self, service: Arc<GatewayAuthService>) -> Self {
+        self.auth_service = Some(service);
         self
     }
 
@@ -2536,6 +2545,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            auth_service: None,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,

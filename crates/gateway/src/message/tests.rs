@@ -10941,7 +10941,8 @@ async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dis
     user_principal.kind = pioneer_protocol::PrincipalKind::User;
     let user_connection_id = session_manager
         .register_connection(user_tx, Arc::new(user_principal))
-        .await;
+        .await
+        .unwrap();
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = MessageProcessor::new(

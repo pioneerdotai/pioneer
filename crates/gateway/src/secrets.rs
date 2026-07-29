@@ -1,18 +1,28 @@
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
+use fs4::FileExt as Fs4FileExt;
 use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
-    SecretStore,
+    SecretStore, ensure_private_file,
 };
 use tracing::warn;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
 
 const WORKSPACE_PROVIDER_API_KEY_PREFIX: &str = "workspace:";
+const AUTH_KEY_INITIALIZATION_LOCK_FILE_NAME: &str = ".gateway-auth-key-init.lock";
+
 #[derive(Clone)]
 pub(crate) struct GatewaySecrets {
     store: Arc<dyn SecretStore>,
+    auth_key_initialization_lock_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +39,30 @@ pub(crate) struct McpSecretDeleteFailure {
     pub error: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SuperuserJwtMaterialRotation {
-    pub material_existed: bool,
-    pub rotated_at_unix: i64,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AuthKeyMaterial(Vec<u8>);
+
+impl AuthKeyMaterial {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_bytes(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl std::fmt::Debug for AuthKeyMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthKeyMaterial([redacted])")
+    }
+}
+
+impl Drop for AuthKeyMaterial {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,11 +78,20 @@ impl GatewaySecrets {
     pub(crate) fn open(runtime_home: &Path) -> Result<Self> {
         let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(runtime_home))
             .context("failed to open gateway keystore")?;
-        Ok(Self::new(Arc::new(store)))
+        Ok(Self {
+            store: Arc::new(store),
+            auth_key_initialization_lock_path: Some(
+                runtime_home.join(AUTH_KEY_INITIALIZATION_LOCK_FILE_NAME),
+            ),
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn new(store: Arc<dyn SecretStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            auth_key_initialization_lock_path: None,
+        }
     }
 
     pub(crate) fn normalize_provider_name(&self, provider: &str) -> Result<String> {
@@ -563,91 +602,99 @@ impl GatewaySecrets {
             .map(|(_, runtime_id)| runtime_id.to_owned())
     }
 
-    pub(crate) fn load_or_create_superuser_jwt_material(
+    pub(crate) fn load_or_create_access_jwt_signing_key(
         &self,
         size_bytes: usize,
-    ) -> Result<Vec<u8>> {
-        if size_bytes < 32 {
-            bail!("gateway.auth.secret_size_bytes must be at least 32 bytes");
-        }
+    ) -> Result<AuthKeyMaterial> {
+        self.load_or_create_auth_key(
+            SecretId::gateway_access_jwt_signing_key(),
+            SecretKind::GatewayAccessJwtSigningKey,
+            "Gateway access JWT signing key",
+            size_bytes,
+        )
+    }
 
-        let id = SecretId::superuser_jwt_token();
+    pub(crate) fn load_or_create_auth_credential_hmac_key(
+        &self,
+        size_bytes: usize,
+    ) -> Result<AuthKeyMaterial> {
+        self.load_or_create_auth_key(
+            SecretId::gateway_auth_credential_hmac_key(),
+            SecretKind::GatewayAuthCredentialHmacKey,
+            "Gateway auth credential HMAC key",
+            size_bytes,
+        )
+    }
+
+    fn load_or_create_auth_key(
+        &self,
+        id: SecretId,
+        kind: SecretKind,
+        label: &str,
+        size_bytes: usize,
+    ) -> Result<AuthKeyMaterial> {
+        if size_bytes < 32 {
+            bail!("Gateway auth key material must be at least 32 bytes");
+        }
+        // The Gateway service and `pioneer device create` can legitimately access
+        // the same runtime concurrently. Serialize the read-or-create section
+        // across processes so they can never generate and retain different
+        // keys for the same stable SecretId on a fresh installation.
+        let _initialization_lock = self.acquire_auth_key_initialization_lock()?;
         if let Some(stored_hex) = self
             .store
             .get_string(&id)
-            .context("failed to read superuser jwt material from keystore")?
+            .context("failed to read Gateway auth key material from keystore")?
         {
+            let stored_hex = Zeroizing::new(stored_hex);
             let material = decode_hex(stored_hex.trim())
-                .context("failed to decode superuser jwt material from keystore")?;
+                .context("failed to decode Gateway auth key material from keystore")?;
             ensure_jwt_material_len(material.as_slice())?;
-            return Ok(material);
+            return Ok(AuthKeyMaterial(material));
         }
 
-        let mut material = vec![0u8; size_bytes];
-        rand::fill(material.as_mut_slice());
-
+        let mut material = AuthKeyMaterial(vec![0u8; size_bytes]);
+        rand::fill(material.0.as_mut_slice());
         let now = current_unix_i64()?;
+        let encoded = Zeroizing::new(encode_hex(material.as_bytes()));
         self.store
             .put_string(
                 &id,
-                encode_hex(material.as_slice()).as_str(),
-                SecretMeta::new(
-                    SecretKind::SuperuserJwtToken,
-                    Some("superuser".to_owned()),
-                    now,
-                ),
+                encoded.as_str(),
+                SecretMeta::new(kind, Some(label.to_owned()), now),
             )
-            .context("failed to write superuser jwt material to keystore")?;
-
+            .context("failed to persist Gateway auth key material")?;
         Ok(material)
     }
 
-    pub(crate) fn rotate_superuser_jwt_material(
-        &self,
-        size_bytes: usize,
-    ) -> Result<SuperuserJwtMaterialRotation> {
-        if size_bytes < 32 {
-            bail!("gateway.auth.secret_size_bytes must be at least 32 bytes");
-        }
-
-        let id = SecretId::superuser_jwt_token();
-        let material_existed = self
-            .store
-            .exists(&id)
-            .context("failed to check superuser jwt material in keystore")?;
-        let now = current_unix_i64()?;
-        let created_at = match self.existing_superuser_jwt_meta(&id) {
-            Ok(Some(entry)) => entry.created_at_unix.unwrap_or(now),
-            Ok(None) => now,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to read superuser jwt metadata before rotation; replacing metadata"
-                );
-                now
-            }
+    fn acquire_auth_key_initialization_lock(&self) -> Result<Option<AuthKeyInitializationLock>> {
+        let Some(lock_path) = self.auth_key_initialization_lock_path.as_deref() else {
+            return Ok(None);
         };
-
-        let mut material = vec![0u8; size_bytes];
-        rand::fill(material.as_mut_slice());
-
-        self.store
-            .put_string(
-                &id,
-                encode_hex(material.as_slice()).as_str(),
-                SecretMeta {
-                    kind: SecretKind::SuperuserJwtToken,
-                    label: Some("superuser".to_owned()),
-                    created_at_unix: created_at,
-                    updated_at_unix: now.max(created_at),
-                },
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open Gateway auth key initialization lock `{}`",
+                    lock_path.display()
+                )
+            })?;
+        ensure_private_file(lock_path).with_context(|| {
+            format!(
+                "failed to secure Gateway auth key initialization lock `{}`",
+                lock_path.display()
             )
-            .context("failed to rotate superuser jwt material in keystore")?;
-
-        Ok(SuperuserJwtMaterialRotation {
-            material_existed,
-            rotated_at_unix: now,
-        })
+        })?;
+        Fs4FileExt::lock(&file).with_context(|| {
+            format!(
+                "failed to acquire Gateway auth key initialization lock `{}`",
+                lock_path.display()
+            )
+        })?;
+        Ok(Some(AuthKeyInitializationLock { file }))
     }
 
     pub(crate) fn list_secret_entries(&self) -> Result<Vec<SecretEntryMeta>> {
@@ -854,13 +901,15 @@ impl GatewaySecrets {
             .context("failed to read gateway remote access secret metadata from keystore")?;
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
+}
 
-    fn existing_superuser_jwt_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
-        let entries = self
-            .store
-            .list(SecretFilter::Kind(SecretKind::SuperuserJwtToken))
-            .context("failed to read superuser jwt metadata from keystore")?;
-        Ok(entries.into_iter().find(|entry| entry.id == *id))
+struct AuthKeyInitializationLock {
+    file: File,
+}
+
+impl Drop for AuthKeyInitializationLock {
+    fn drop(&mut self) {
+        let _ = Fs4FileExt::unlock(&self.file);
     }
 }
 
@@ -889,6 +938,91 @@ mod tests {
     use pioneer_keystore::{
         KeystoreError, MemorySecretStore, Result as KeystoreResult, SecretEntryMeta,
     };
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    #[test]
+    fn auth_key_domains_are_distinct_redacted_and_restart_stable() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        let access = secrets
+            .load_or_create_access_jwt_signing_key(64)
+            .expect("access key");
+        let hmac = secrets
+            .load_or_create_auth_credential_hmac_key(64)
+            .expect("HMAC key");
+
+        assert_ne!(access.as_bytes(), hmac.as_bytes());
+        assert_eq!(format!("{access:?}"), "AuthKeyMaterial([redacted])");
+
+        let restarted = GatewaySecrets::new(store);
+        assert_eq!(
+            restarted.load_or_create_access_jwt_signing_key(64).unwrap(),
+            access
+        );
+        assert_eq!(
+            restarted
+                .load_or_create_auth_credential_hmac_key(64)
+                .unwrap(),
+            hmac
+        );
+        assert_eq!(
+            restarted.load_or_create_access_jwt_signing_key(64).unwrap(),
+            access
+        );
+        assert_eq!(
+            restarted
+                .load_or_create_auth_credential_hmac_key(64)
+                .unwrap(),
+            hmac
+        );
+    }
+
+    #[test]
+    fn concurrent_runtime_openers_share_the_same_auth_keys() {
+        const WORKERS: usize = 12;
+
+        let runtime_home = tempfile::tempdir().expect("runtime home");
+        GatewaySecrets::open(runtime_home.path()).expect("initialize shared keystore");
+
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let handles = (0..WORKERS)
+            .map(|_| {
+                let runtime_home = runtime_home.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let secrets =
+                        GatewaySecrets::open(&runtime_home).expect("open shared Gateway secrets");
+                    barrier.wait();
+                    let access = secrets
+                        .load_or_create_access_jwt_signing_key(64)
+                        .expect("load or create access key");
+                    let hmac = secrets
+                        .load_or_create_auth_credential_hmac_key(64)
+                        .expect("load or create HMAC key");
+                    (access.as_bytes().to_vec(), hmac.as_bytes().to_vec())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("auth key worker"))
+            .collect::<Vec<_>>();
+        let (expected_access, expected_hmac) = results.first().expect("worker result");
+
+        assert_ne!(expected_access, expected_hmac);
+        assert!(results.iter().all(|(access, _)| access == expected_access));
+        assert!(results.iter().all(|(_, hmac)| hmac == expected_hmac));
+        assert!(
+            runtime_home
+                .path()
+                .join(AUTH_KEY_INITIALIZATION_LOCK_FILE_NAME)
+                .is_file()
+        );
+    }
 
     #[test]
     fn provider_methods_write_list_read_and_delete_key() {

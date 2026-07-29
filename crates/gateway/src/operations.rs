@@ -8,8 +8,10 @@ use pioneer_artifacts::{
 };
 use pioneer_config::AppConfig;
 use pioneer_crud::CrudStore;
+#[cfg(test)]
+use pioneer_keystore::SecretId;
 use pioneer_keystore::{
-    DbKeyStoreConfig, SecretEntryMeta, SecretId, SecretKind, inspect_keystore_sqlite_files,
+    DbKeyStoreConfig, SecretEntryMeta, SecretKind, inspect_keystore_sqlite_files,
     inspect_private_runtime_dir,
 };
 use serde::Serialize;
@@ -42,10 +44,11 @@ pub struct SecretKindCounts {
     pub provider_proxy: usize,
     pub cli_runtime_proxy: usize,
     pub mcp_secret: usize,
-    pub superuser_jwt_token: usize,
+    pub gateway_access_jwt_signing_key: usize,
+    pub gateway_auth_credential_hmac_key: usize,
     pub user_jwt_token: usize,
     pub gateway_remote_access_secret: usize,
-    pub desktop_gateway_auth_token: usize,
+    pub desktop_gateway_session: usize,
     pub unknown: usize,
 }
 
@@ -73,16 +76,6 @@ pub struct McpSecretGarbageCollectionReport {
 pub struct McpSecretGarbageCollectionFailure {
     pub ref_id: String,
     pub error: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SuperuserJwtRotationReport {
-    pub token_kind: String,
-    pub storage_service: String,
-    pub storage_user: String,
-    pub material_existed: bool,
-    pub rotated_at_unix: i64,
-    pub existing_bearer_tokens_invalidated: bool,
 }
 
 pub async fn secrets_status(
@@ -244,25 +237,6 @@ async fn open_artifact_service_for_operations(
     ))
 }
 
-pub fn rotate_superuser_jwt_token(
-    config: &AppConfig,
-    runtime_home: &Path,
-) -> Result<SuperuserJwtRotationReport> {
-    let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let rotation =
-        gateway_secrets.rotate_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
-    let id = SecretId::superuser_jwt_token();
-
-    Ok(SuperuserJwtRotationReport {
-        token_kind: "superuser".to_owned(),
-        storage_service: id.service().to_owned(),
-        storage_user: id.user().to_owned(),
-        material_existed: rotation.material_existed,
-        rotated_at_unix: rotation.rotated_at_unix,
-        existing_bearer_tokens_invalidated: rotation.material_existed,
-    })
-}
-
 fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
     let mut counts = SecretKindCounts::default();
     for entry in entries {
@@ -280,8 +254,13 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
                 counts.cli_runtime_proxy = counts.cli_runtime_proxy.saturating_add(1)
             }
             Some(SecretKind::McpSecret) => counts.mcp_secret = counts.mcp_secret.saturating_add(1),
-            Some(SecretKind::SuperuserJwtToken) => {
-                counts.superuser_jwt_token = counts.superuser_jwt_token.saturating_add(1)
+            Some(SecretKind::GatewayAccessJwtSigningKey) => {
+                counts.gateway_access_jwt_signing_key =
+                    counts.gateway_access_jwt_signing_key.saturating_add(1)
+            }
+            Some(SecretKind::GatewayAuthCredentialHmacKey) => {
+                counts.gateway_auth_credential_hmac_key =
+                    counts.gateway_auth_credential_hmac_key.saturating_add(1)
             }
             Some(SecretKind::UserJwtToken) => {
                 counts.user_jwt_token = counts.user_jwt_token.saturating_add(1)
@@ -290,9 +269,8 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
                 counts.gateway_remote_access_secret =
                     counts.gateway_remote_access_secret.saturating_add(1)
             }
-            Some(SecretKind::DesktopGatewayAuthToken) => {
-                counts.desktop_gateway_auth_token =
-                    counts.desktop_gateway_auth_token.saturating_add(1)
+            Some(SecretKind::DesktopGatewaySession) => {
+                counts.desktop_gateway_session = counts.desktop_gateway_session.saturating_add(1)
             }
             None => counts.unknown = counts.unknown.saturating_add(1),
         }
@@ -302,7 +280,6 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -320,18 +297,10 @@ mod tests {
     };
     use pioneer_keystore::{DbKeyStore, SecretFilter, SecretKind, SecretMeta, SecretStore};
     use pioneer_mcp::McpSecretRef;
-    use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus};
     use sea_orm::ConnectionTrait;
-    use tokio_tungstenite::tungstenite::handshake::server::Request;
 
     use super::*;
-    use crate::auth::{
-        initialize as initialize_jwt_auth, issue_superuser_token as issue_superuser_token_internal,
-    };
     use crate::database::initialize as initialize_database;
-    use crate::identity::{
-        GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
-    };
 
     #[tokio::test]
     async fn status_counts_secret_kinds_and_reports_disabled_encryption() {
@@ -349,10 +318,9 @@ mod tests {
         assert_eq!(report.encryption.mode, "disabled");
         assert_eq!(report.counts.provider_api_key, 1);
         assert_eq!(report.counts.mcp_secret, 2);
-        assert_eq!(report.counts.superuser_jwt_token, 1);
         assert_eq!(report.counts.user_jwt_token, 1);
-        assert_eq!(report.counts.desktop_gateway_auth_token, 1);
-        assert_eq!(report.total_entries, 6);
+        assert_eq!(report.counts.desktop_gateway_session, 1);
+        assert_eq!(report.total_entries, 5);
         assert!(report.mcp_orphans.available);
         assert_eq!(report.mcp_orphans.active_refs, Some(1));
         assert_eq!(report.mcp_orphans.stored_refs, Some(2));
@@ -361,7 +329,7 @@ mod tests {
         let serialized = serde_json::to_string(&report).expect("serialize report");
         assert!(!serialized.contains("sk-provider-secret"));
         assert!(!serialized.contains("mcp-active-secret"));
-        assert!(!serialized.contains("desktop-bearer-secret"));
+        assert!(!serialized.contains("desktop-refresh-secret"));
     }
 
     #[tokio::test]
@@ -431,15 +399,8 @@ mod tests {
             .expect("open raw store");
         assert_eq!(
             store
-                .list(SecretFilter::Kind(SecretKind::SuperuserJwtToken))
-                .expect("list superuser material")
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .list(SecretFilter::Kind(SecretKind::DesktopGatewayAuthToken))
-                .expect("list desktop tokens")
+                .list(SecretFilter::Kind(SecretKind::DesktopGatewaySession))
+                .expect("list desktop sessions")
                 .len(),
             1
         );
@@ -523,71 +484,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rotate_superuser_jwt_token_replaces_material_and_invalidates_old_token() {
-        let runtime_home = unique_temp_dir("rotate");
-        let config = test_app_config();
-        let secrets = GatewaySecrets::open(&runtime_home).expect("open secrets");
-        let old_material = secrets
-            .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)
-            .expect("create old material");
-        let old_token = issue_superuser_token_internal(&config, old_material.as_slice())
-            .expect("issue old token");
-
-        let report = rotate_superuser_jwt_token(&config, &runtime_home).expect("rotate token");
-
-        assert_eq!(report.token_kind, "superuser");
-        assert_eq!(
-            report.storage_service,
-            "pioneer.gateway.superuser_jwt_token"
-        );
-        assert_eq!(report.storage_user, "superuser");
-        assert!(report.material_existed);
-        assert!(report.existing_bearer_tokens_invalidated);
-
-        let new_material = GatewaySecrets::open(&runtime_home)
-            .expect("reopen secrets")
-            .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)
-            .expect("load new material");
-        assert_ne!(old_material, new_material);
-
-        let auth = initialize_jwt_auth(&config, new_material.as_slice(), test_identity_snapshot())
-            .expect("new auth");
-        let old_request = request_with_token(old_token.as_str());
-        assert!(
-            auth.authenticate_request(&old_request).is_err(),
-            "old bearer token should be invalid after rotation"
-        );
-
-        let new_token = issue_superuser_token_internal(&config, new_material.as_slice())
-            .expect("issue new token");
-        let new_request = request_with_token(new_token.as_str());
-        auth.authenticate_request(&new_request)
-            .expect("new bearer token should validate");
-
-        let serialized = serde_json::to_string(&report).expect("serialize rotation report");
-        assert!(!serialized.contains(old_token.as_str()));
-        assert!(!serialized.contains(&crate::helpers::encode_hex(new_material.as_slice())));
-    }
-
-    #[test]
-    fn rotate_superuser_jwt_token_creates_material_when_missing() {
-        let runtime_home = unique_temp_dir("rotate-missing");
-        let config = test_app_config();
-
-        let report =
-            rotate_superuser_jwt_token(&config, &runtime_home).expect("rotate missing material");
-
-        assert!(!report.material_existed);
-        assert!(!report.existing_bearer_tokens_invalidated);
-        let entries = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(&runtime_home))
-            .expect("open store")
-            .list(SecretFilter::Kind(SecretKind::SuperuserJwtToken))
-            .expect("list superuser material");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, SecretId::superuser_jwt_token());
-    }
-
     fn seed_all_secret_kinds(runtime_home: &Path, secrets: &GatewaySecrets) {
         secrets
             .set_provider_api_key("openrouter", "sk-provider-secret")
@@ -603,17 +499,6 @@ mod tests {
             .expect("open raw store");
         raw_store
             .put_string(
-                &SecretId::superuser_jwt_token(),
-                &crate::helpers::encode_hex(&[1u8; 64]),
-                SecretMeta::new(
-                    SecretKind::SuperuserJwtToken,
-                    Some("superuser".to_owned()),
-                    1,
-                ),
-            )
-            .expect("put superuser material");
-        raw_store
-            .put_string(
                 &SecretId::user_jwt_token("future-user").expect("user token id"),
                 "future-user-token-material",
                 SecretMeta::new(SecretKind::UserJwtToken, Some("future-user".to_owned()), 1),
@@ -621,15 +506,15 @@ mod tests {
             .expect("put future user token");
         raw_store
             .put_string(
-                &SecretId::desktop_gateway_auth_token("local").expect("desktop token id"),
-                "desktop-bearer-secret",
+                &SecretId::desktop_gateway_session("local-session").expect("desktop session id"),
+                "desktop-refresh-secret",
                 SecretMeta::new(
-                    SecretKind::DesktopGatewayAuthToken,
-                    Some("local".to_owned()),
+                    SecretKind::DesktopGatewaySession,
+                    Some("local session".to_owned()),
                     1,
                 ),
             )
-            .expect("put desktop token");
+            .expect("put desktop session");
     }
 
     async fn seed_active_mcp_installation(
@@ -681,34 +566,6 @@ mod tests {
             .upsert_mcp_server_installation_with_audit(&record, &audit, 1_700_000_000)
             .await
             .expect("persist active MCP installation");
-    }
-
-    fn request_with_token(token: &str) -> Request {
-        Request::builder()
-            .method("GET")
-            .uri("ws://0.0.0.0:17878")
-            .header("authorization", format!("Bearer {token}"))
-            .body(())
-            .expect("build request")
-    }
-
-    fn test_identity_snapshot() -> Arc<IdentityBootstrapSnapshot> {
-        Arc::new(IdentityBootstrapSnapshot {
-            gateway: GatewayIdentitySnapshot {
-                id: GatewayId::new("G00000000000000000001").unwrap(),
-                identity_bootstrap_version: 1,
-            },
-            superuser: SuperuserIdentitySnapshot {
-                id: PrincipalId::new("P00000000000000000001").unwrap(),
-                gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
-                kind: PrincipalKind::Superuser,
-                role_key: None,
-                status: PrincipalStatus::Active,
-                display_name: "Superuser".to_owned(),
-                nickname: "superuser".to_owned(),
-                nickname_key: "superuser".to_owned(),
-            },
-        })
     }
 
     fn test_app_config() -> AppConfig {
@@ -775,11 +632,9 @@ mod tests {
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),
-                    superuser_subject: "superuser".to_owned(),
-                    superuser_role: "superuser".to_owned(),
                     secret_size_bytes: 64,
-                    token_ttl_seconds: 60 * 60,
                     token_refresh_leeway_seconds: 60,
+                    ..GatewayAuthConfig::default()
                 },
             },
             desktop: DesktopConfig {
@@ -794,7 +649,7 @@ mod tests {
                     ws_reconnect_jitter_percent: 20,
                     registry_file_name: "gateway_registry.toml".to_owned(),
                     local_gateway_id: "local".to_owned(),
-                    registry_version: 1,
+                    registry_version: 2,
                 },
             },
         }

@@ -58,6 +58,7 @@ use pioneer_config::{
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
 use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
+use pioneer_protocol::AuthDeviceCreateResponse;
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
@@ -76,8 +77,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::auth::initialize as initialize_jwt_auth;
-use crate::auth::issue_superuser_token as issue_superuser_token_internal;
+use crate::auth::{AuthAdmissionService, GatewayAuthService, ensure_auth_readiness};
 use crate::bootstrap::bootstrap as run_bootstrap;
 use crate::database::initialize as initialize_database;
 use crate::identity::bootstrap_identity;
@@ -105,9 +105,8 @@ use crate::workspace::WorkspaceManager;
 pub use crate::operations::{
     KeystoreEncryptionReport, McpSecretGarbageCollectionFailure, McpSecretGarbageCollectionReport,
     McpSecretOrphanStatusReport, SecretKindCounts, SecretPermissionHealthReport,
-    SecretPermissionHealthStatus, SecretsStatusReport, SuperuserJwtRotationReport,
-    artifact_gc_dry_run, artifact_gc_execute, artifact_storage_usage, rotate_superuser_jwt_token,
-    secrets_garbage_collection, secrets_status,
+    SecretPermissionHealthStatus, SecretsStatusReport, artifact_gc_dry_run, artifact_gc_execute,
+    artifact_storage_usage, secrets_garbage_collection, secrets_status,
 };
 pub use crate::settings::{
     GatewayMemorySettings, GatewaySettings, GatewayThreadEpisodicSettings,
@@ -156,14 +155,17 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
     config = gateway_settings.apply_to_app_config(config);
+    config
+        .gateway
+        .auth
+        .validate_session_security()
+        .context("invalid Gateway session security configuration")?;
     let voice_models = voice_model_catalog();
     info!(
         voice_model_count = voice_models.len(),
         "local voice model catalog is ready"
     );
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
-    let jwt_material = gateway_secrets
-        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
     let database = initialize_database(&runtime_home, &config).await?;
 
     run_bootstrap(&database).await?;
@@ -184,7 +186,65 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         "stable Gateway identity is ready"
     );
     let identity_snapshot = Arc::new(identity_bootstrap.snapshot);
-    let auth = initialize_jwt_auth(&config, jwt_material.as_slice(), identity_snapshot)?;
+    let access_jwt_material = gateway_secrets
+        .load_or_create_access_jwt_signing_key(config.gateway.auth.secret_size_bytes)?;
+    let credential_hmac_material = gateway_secrets
+        .load_or_create_auth_credential_hmac_key(config.gateway.auth.secret_size_bytes)?;
+    let auth = AuthAdmissionService::new(&config, &access_jwt_material, identity_snapshot.as_ref())
+        .context("failed to initialize Gateway auth admission")?;
+    let auth_service = Arc::new(
+        GatewayAuthService::new(
+            database.clone(),
+            config.gateway.auth.clone(),
+            identity_snapshot.clone(),
+            &access_jwt_material,
+            &credential_hmac_material,
+        )
+        .context("failed to initialize Gateway auth service")?,
+    );
+    const AUTH_STARTUP_EXPIRY_BATCH_SIZE: u64 = 256;
+    let auth_startup_now = crate::helpers::unix_timestamp_secs()?;
+    let mut expired_sessions = 0_u64;
+    loop {
+        let expired_batch = auth_service
+            .expire_stale_sessions(auth_startup_now, AUTH_STARTUP_EXPIRY_BATCH_SIZE)
+            .await
+            .context("failed to expire stale auth sessions")?;
+        expired_sessions = expired_sessions.saturating_add(expired_batch);
+        if expired_batch < AUTH_STARTUP_EXPIRY_BATCH_SIZE {
+            break;
+        }
+    }
+    if expired_sessions != 0 {
+        info!(
+            expired_sessions,
+            "stale auth sessions were expired before auth readiness"
+        );
+    }
+    ensure_auth_readiness(&database, identity_snapshot.as_ref())
+        .await
+        .context("Gateway auth readiness failed")?;
+    let cleaned_refresh_evidence = auth_service
+        .cleanup_refresh_evidence(crate::helpers::unix_timestamp_secs()?, 256)
+        .await
+        .context("failed to clean expired refresh evidence")?;
+    if cleaned_refresh_evidence > 0 {
+        info!(
+            deleted_rows = cleaned_refresh_evidence,
+            "expired refresh evidence cleanup completed"
+        );
+    }
+    let expired_pending_sessions = auth_service
+        .expire_pending_device_sessions(crate::helpers::unix_timestamp_secs()?, 256)
+        .await
+        .context("failed to expire pending device sessions")?;
+    if expired_pending_sessions > 0 {
+        info!(
+            expired_sessions = expired_pending_sessions,
+            "expired pending device sessions marked terminal"
+        );
+    }
+    auth_service.spawn_evidence_maintenance();
 
     let voice_input_desired_state = VoiceInputDesiredState::from_config(&config.gateway.voice);
     let voice_input_supervisor = create_voice_input_supervisor(
@@ -199,6 +259,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.remote_access.clone(),
     )?);
     let session_manager = Arc::new(SessionManager::new());
+    auth_service.set_disconnect_hook(session_manager.clone());
     let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
     let crud_store = Arc::new(CrudStore::new(database.clone()));
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
@@ -601,6 +662,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor.with_self_improvement_supervisor(self_improvement_supervisor.clone());
     message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
+    message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
@@ -616,7 +678,14 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
-    let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
+    let handle = spawn_server(
+        config,
+        auth,
+        auth_service,
+        message_processor.clone(),
+        session_manager,
+    )
+    .await?;
     let runtime_result: Result<()> = async {
         start_voice_input_supervisor(&voice_input_supervisor, voice_input_desired_state)?;
         self_improvement_supervisor
@@ -722,11 +791,36 @@ async fn migrate_legacy_provider_api_keys_to_current_workspace(
     }
 }
 
-pub fn issue_superuser_token(config: &AppConfig, runtime_home: &Path) -> Result<String> {
+pub async fn create_device(
+    config: &AppConfig,
+    runtime_home: &Path,
+) -> Result<AuthDeviceCreateResponse> {
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let jwt_material = gateway_secrets
-        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
-    issue_superuser_token_internal(config, jwt_material.as_slice())
+    let database = database::initialize_existing_for_operations(runtime_home, config)
+        .await?
+        .context("Gateway database must exist before creating a device")?;
+    let identity = Arc::new(
+        bootstrap_identity(&database)
+            .await
+            .context("failed to load stable Gateway identity")?
+            .snapshot,
+    );
+    ensure_auth_readiness(&database, identity.as_ref())
+        .await
+        .context("Gateway auth readiness failed")?;
+    let access_key = gateway_secrets
+        .load_or_create_access_jwt_signing_key(config.gateway.auth.secret_size_bytes)?;
+    let credential_hmac_key = gateway_secrets
+        .load_or_create_auth_credential_hmac_key(config.gateway.auth.secret_size_bytes)?;
+    let service = GatewayAuthService::new(
+        database,
+        config.gateway.auth.clone(),
+        identity,
+        &access_key,
+        &credential_hmac_key,
+    )
+    .context("failed to initialize Gateway auth service")?;
+    service.create_local_device().await.map_err(Into::into)
 }
 
 fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<GatewaySettings> {

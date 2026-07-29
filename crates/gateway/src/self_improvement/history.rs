@@ -1658,7 +1658,7 @@ mod tests {
                             "auth_session_id": SESSION_ID_SENTINEL,
                             "provider_api_key": secret,
                             "credentialMetadata": {
-                                "kind": "legacy_superuser_jwt",
+                                "kind": "bootstrap_credential",
                                 "token": secret
                             }
                         }),
@@ -2206,7 +2206,7 @@ mod tests {
         assert!(!encoded.contains(GATEWAY_ID_SENTINEL));
         assert!(!encoded.contains(SESSION_ID_SENTINEL));
         assert!(!encoded.contains(CONNECTION_ID_SENTINEL));
-        assert!(!encoded.contains("legacy_superuser_jwt"));
+        assert!(!encoded.contains("bootstrap_credential"));
         assert!(encoded.contains("artifact-a"));
         assert!(encoded.contains("visible_tool"));
         assert!(encoded.contains("visible assistant procedure"));

@@ -274,6 +274,8 @@ mod tests {
                 id: GATEWAY_ID.to_owned(),
                 singleton_key: 1,
                 identity_bootstrap_version: 0,
+                auth_schema_version: 0,
+                auth_ready_at: None,
                 created_at: now,
                 updated_at: now,
             }],

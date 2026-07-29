@@ -5,11 +5,11 @@ use pioneer_protocol::{
     ArtifactDownloadStartParams, ArtifactGetParams, ArtifactListForMessageParams,
     ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
     ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
-    ArtifactUploadStartParams, CLIRuntimeGetParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
-    CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams,
-    CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams, GatewaySettingsGetParams,
-    GatewaySettingsUpdateParams, McpInstallParams, McpListParams, McpPolicySetParams,
-    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
+    ArtifactUploadStartParams, AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams,
+    CLIRuntimeRefreshParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
+    GatewaySettingsGetParams, GatewaySettingsUpdateParams, McpInstallParams, McpListParams,
+    McpPolicySetParams, MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
     MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
     MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
@@ -300,6 +300,96 @@ impl MessageProcessor {
         let method = request.method.clone();
         dispatch_request_future! {
             method.as_str();
+                methods::AUTH_ME => {
+                    if request.params.as_ref().is_some_and(|params| {
+                        params.as_object().is_none_or(|value| !value.is_empty())
+                    }) {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "auth/me does not accept params",
+                            ),
+                        )
+                        .await;
+                    } else {
+                        self.auth_me(&context, request.id).await;
+                    }
+                }
+                methods::AUTH_SESSION_LIST => {
+                    if request.params.as_ref().is_some_and(|params| {
+                        params.as_object().is_none_or(|value| !value.is_empty())
+                    }) {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "auth/session/list does not accept params",
+                            ),
+                        )
+                        .await;
+                    } else {
+                        self.auth_session_list(&context, request.id).await;
+                    }
+                }
+                methods::AUTH_SESSION_REVOKE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AuthSessionRevokeParams>(params_value) {
+                        Ok(params) => {
+                            self.auth_session_revoke(&context, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::AUTH_SESSION_REVOKE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::AUTH_LOGOUT => {
+                    if request.params.as_ref().is_some_and(|params| {
+                        params.as_object().is_none_or(|value| !value.is_empty())
+                    }) {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "auth/logout does not accept params",
+                            ),
+                        )
+                        .await;
+                    } else {
+                        self.auth_logout(&context, request.id).await;
+                    }
+                }
+                methods::AUTH_DEVICE_CREATE => {
+                    if request.params.as_ref().is_some_and(|params| {
+                        params.as_object().is_none_or(|value| !value.is_empty())
+                    }) {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "auth/device/create does not accept params",
+                            ),
+                        )
+                        .await;
+                    } else {
+                        self.auth_device_create(&context, request.id).await;
+                    }
+                }
                 methods::WORKSPACE_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceListParams>(params_value) {
