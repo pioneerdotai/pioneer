@@ -70,15 +70,10 @@ pub fn stop_gateway_service() -> Result<()> {
     save_install_state_from_current_context(&config)
 }
 
-pub fn issue_superuser_token() -> Result<()> {
-    let config = AppConfig::load().context("failed to load app config")?;
-    let runtime_home = config
-        .ensure_runtime_home_dir()
-        .context("failed to prepare runtime home directory")?;
-    let token = pioneer_gateway::issue_superuser_token(&config, &runtime_home)
-        .context("failed to issue superuser token")?;
-    println!("{token}");
-    Ok(())
+pub fn create_device() -> Result<pioneer_protocol::AuthDeviceCreateResponse> {
+    let (config, runtime_home) = load_config_and_runtime_home()?;
+    block_on_gateway_operation(pioneer_gateway::create_device(&config, &runtime_home))
+        .context("failed to create pending device session")
 }
 
 pub fn secrets_status() -> Result<pioneer_gateway::SecretsStatusReport> {
@@ -95,11 +90,6 @@ pub fn secrets_garbage_collection(
         &runtime_home,
         dry_run,
     ))
-}
-
-pub fn rotate_superuser_jwt_token() -> Result<pioneer_gateway::SuperuserJwtRotationReport> {
-    let (config, runtime_home) = load_config_and_runtime_home()?;
-    pioneer_gateway::rotate_superuser_jwt_token(&config, &runtime_home)
 }
 
 pub fn gateway_service_status() -> Result<GatewayServiceStatus> {

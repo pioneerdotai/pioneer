@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use pioneer_gateway::{
     McpSecretGarbageCollectionReport, SecretPermissionHealthReport, SecretPermissionHealthStatus,
-    SecretsStatusReport, SuperuserJwtRotationReport,
+    SecretsStatusReport,
 };
 
 use crate::service;
@@ -13,7 +13,6 @@ use crate::usage_error;
 pub(crate) enum SecretsCommand {
     Status { json: bool },
     Gc { dry_run: bool, json: bool },
-    RotateJwtToken { json: bool },
 }
 
 pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<()> {
@@ -26,10 +25,6 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<()> {
             let report = service::secrets_garbage_collection(dry_run)?;
             print_garbage_collection_report(&report, json)
         }
-        SecretsCommand::RotateJwtToken { json } => {
-            let report = service::rotate_superuser_jwt_token()?;
-            print_rotation_report(&report, json)
-        }
     }
 }
 
@@ -39,7 +34,6 @@ pub(crate) fn parse_secrets_command(
     match args.next().as_deref() {
         Some("status") => parse_status_command(args),
         Some("garbage-collection") => parse_garbage_collection_command(args),
-        Some("rotate-jwt-token") => parse_rotate_jwt_token_command(args),
         Some("help") | Some("--help") | Some("-h") => Err(usage_error(secrets_help_text())),
         Some(command) => Err(usage_error(format!(
             "unknown secrets command: {command}\n\n{}",
@@ -84,35 +78,6 @@ fn parse_garbage_collection_command(args: impl Iterator<Item = String>) -> Resul
     Ok(SecretsCommand::Gc { dry_run, json })
 }
 
-fn parse_rotate_jwt_token_command(
-    mut args: impl Iterator<Item = String>,
-) -> Result<SecretsCommand> {
-    let Some(target) = args.next() else {
-        return Err(usage_error(
-            "secrets rotate-jwt-token requires a target: superuser",
-        ));
-    };
-    if target.as_str() != "superuser" {
-        return Err(usage_error(format!(
-            "unsupported jwt token rotation target: {target}; expected superuser"
-        )));
-    }
-
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            flag => {
-                return Err(usage_error(format!(
-                    "unexpected argument for secrets rotate-jwt-token: {flag}"
-                )));
-            }
-        }
-    }
-
-    Ok(SecretsCommand::RotateJwtToken { json })
-}
-
 fn print_status_report(report: &SecretsStatusReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
@@ -134,15 +99,6 @@ fn print_garbage_collection_report(
     Ok(())
 }
 
-fn print_rotation_report(report: &SuperuserJwtRotationReport, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-    } else {
-        print!("{}", format_rotation_human(report));
-    }
-    Ok(())
-}
-
 pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "Keystore: {}", report.storage_path.display());
@@ -160,16 +116,11 @@ pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
         report.counts.cli_runtime_proxy
     );
     let _ = writeln!(output, "MCP secrets: {}", report.counts.mcp_secret);
-    let _ = writeln!(
-        output,
-        "Superuser JWT material: {}",
-        report.counts.superuser_jwt_token
-    );
     let _ = writeln!(output, "User JWT tokens: {}", report.counts.user_jwt_token);
     let _ = writeln!(
         output,
-        "Desktop gateway auth tokens: {}",
-        report.counts.desktop_gateway_auth_token
+        "Desktop gateway sessions: {}",
+        report.counts.desktop_gateway_session
     );
     let _ = writeln!(output, "Unknown entries: {}", report.counts.unknown);
     let _ = writeln!(output, "Permissions:");
@@ -213,25 +164,6 @@ pub(crate) fn format_garbage_collection_human(report: &McpSecretGarbageCollectio
     output
 }
 
-pub(crate) fn format_rotation_human(report: &SuperuserJwtRotationReport) -> String {
-    let mut output = String::new();
-    if report.material_existed {
-        let _ = writeln!(output, "Rotated superuser JWT signing material.");
-        let _ = writeln!(output, "Existing superuser bearer tokens are now invalid.");
-        let _ = writeln!(
-            output,
-            "Run `pioneer issue-superuser-token` to issue a bearer token from the new material."
-        );
-    } else {
-        let _ = writeln!(output, "Created superuser JWT signing material.");
-        let _ = writeln!(
-            output,
-            "No existing superuser bearer tokens were invalidated."
-        );
-    }
-    output
-}
-
 fn write_permission_line(output: &mut String, permission: &SecretPermissionHealthReport) {
     let actual = permission
         .actual
@@ -270,8 +202,7 @@ fn permission_status_label(status: SecretPermissionHealthStatus) -> &'static str
 fn secrets_help_text() -> &'static str {
     "Usage:
   pioneer secrets status [--json]
-  pioneer secrets garbage-collection [--dry-run] [--json]
-  pioneer secrets rotate-jwt-token superuser [--json]"
+  pioneer secrets garbage-collection [--dry-run] [--json]"
 }
 
 #[cfg(test)]
@@ -281,7 +212,7 @@ mod tests {
     use pioneer_gateway::{
         KeystoreEncryptionReport, McpSecretGarbageCollectionFailure,
         McpSecretGarbageCollectionReport, McpSecretOrphanStatusReport, SecretKindCounts,
-        SecretsStatusReport, SuperuserJwtRotationReport,
+        SecretsStatusReport,
     };
 
     use super::*;
@@ -332,31 +263,6 @@ mod tests {
                 dry_run: true,
                 json: true,
             }
-        );
-    }
-
-    #[test]
-    fn parses_rotate_superuser_only() {
-        assert_eq!(
-            parse_secrets_command(
-                ["rotate-jwt-token", "superuser", "--json"]
-                    .into_iter()
-                    .map(str::to_owned)
-            )
-            .expect("parse"),
-            SecretsCommand::RotateJwtToken { json: true }
-        );
-
-        assert!(
-            parse_secrets_command(
-                ["rotate-jwt-token", "user-123"]
-                    .into_iter()
-                    .map(str::to_owned)
-            )
-            .is_err()
-        );
-        assert!(
-            parse_secrets_command(["rotate-jwt-token"].into_iter().map(str::to_owned)).is_err()
         );
     }
 
@@ -426,25 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn rotation_human_output_never_prints_token_or_material() {
-        let report = SuperuserJwtRotationReport {
-            token_kind: "superuser".to_owned(),
-            storage_service: "pioneer.gateway.superuser_jwt_token".to_owned(),
-            storage_user: "superuser".to_owned(),
-            material_existed: true,
-            rotated_at_unix: 1_700_000_000,
-            existing_bearer_tokens_invalidated: true,
-        };
-
-        let output = format_rotation_human(&report);
-
-        assert!(output.contains("Rotated superuser JWT signing material."));
-        assert!(output.contains("issue-superuser-token"));
-        assert!(!output.contains("eyJ"));
-        assert!(!output.contains("0123456789abcdef"));
-    }
-
-    #[test]
     fn json_reports_serialize_expected_keys() {
         let status_json = serde_json::to_string(&status_fixture()).expect("status json");
         assert!(status_json.contains("storage_path"));
@@ -461,18 +348,6 @@ mod tests {
         })
         .expect("gc json");
         assert!(gc_json.contains("dry_run"));
-
-        let rotation_json = serde_json::to_string(&SuperuserJwtRotationReport {
-            token_kind: "superuser".to_owned(),
-            storage_service: "pioneer.gateway.superuser_jwt_token".to_owned(),
-            storage_user: "superuser".to_owned(),
-            material_existed: true,
-            rotated_at_unix: 1_700_000_000,
-            existing_bearer_tokens_invalidated: true,
-        })
-        .expect("rotation json");
-        assert!(rotation_json.contains("existing_bearer_tokens_invalidated"));
-        assert!(!rotation_json.contains("eyJ"));
     }
 
     fn status_fixture() -> SecretsStatusReport {
@@ -487,13 +362,14 @@ mod tests {
                 provider_proxy: 1,
                 cli_runtime_proxy: 1,
                 mcp_secret: 2,
-                superuser_jwt_token: 1,
                 user_jwt_token: 0,
-                desktop_gateway_auth_token: 1,
+                gateway_access_jwt_signing_key: 1,
+                gateway_auth_credential_hmac_key: 1,
                 gateway_remote_access_secret: 0,
+                desktop_gateway_session: 1,
                 unknown: 0,
             },
-            total_entries: 7,
+            total_entries: 8,
             permissions: vec![SecretPermissionHealthReport {
                 path: PathBuf::from("/tmp/pioneer"),
                 target: "runtime_home".to_owned(),

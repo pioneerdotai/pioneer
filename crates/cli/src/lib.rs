@@ -144,10 +144,22 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
                 Ok(())
             }
         }
-        Some("issue-superuser-token") => {
-            ensure_no_extra_args(args)?;
-            service::issue_superuser_token()
-        }
+        Some("device") => match args.next().as_deref() {
+            Some("create") => {
+                let json_output = parse_optional_json_flag(args)?;
+                let device = service::create_device()?;
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&device)?);
+                } else {
+                    println!("{}", device.activation_code.expose_secret());
+                }
+                Ok(())
+            }
+            Some(command) => Err(usage_error(format!(
+                "unknown device command: {command}; expected `create`"
+            ))),
+            None => Err(usage_error("missing device command; expected `create`")),
+        },
         Some("task-invariants") => task_invariants::run(args),
         Some("secrets") => secrets::run(args),
         Some("status") => {
@@ -541,12 +553,11 @@ fn help_text() -> String {
   {command} self-update (alias of `update`)
   {command} start [--json]      Install and start the persistent gateway service
   {command} status [--json]     Show gateway service status
-  {command} issue-superuser-token  Generate a superuser JWT and print it
+  {command} device create [--json]  Create a pending device session and one-time activation code
   {command} task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]
                                 Scan task/subagent runtime invariants in a SQLite gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
-  {command} secrets rotate-jwt-token superuser [--json]  Rotate superuser JWT signing material
   {command} stop                Stop and uninstall the persistent gateway service
   {command} version [--json]    Show {command} version
   {command} help                Show this help"
