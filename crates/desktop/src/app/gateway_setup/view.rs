@@ -206,6 +206,7 @@ pub(crate) fn render_gateway_setup_form(
 ) -> AnyElement {
     let snapshot = form_state.read(cx).snapshot();
     let status = render_gateway_setup_status(&snapshot, cx);
+    let activation_cell_size = activation_code_cell_size(&mode);
 
     let mut form = v_form();
     if let GatewaySetupFormMode::ReauthenticateGateway { name, address, .. } = &mode {
@@ -250,6 +251,7 @@ pub(crate) fn render_gateway_setup_form(
                         .child(
                             OtpInput::new(&snapshot.activation_input_state)
                                 .groups(2)
+                                .with_size(activation_cell_size)
                                 .disabled(snapshot.connecting),
                         ),
                 ),
@@ -271,6 +273,28 @@ pub(crate) fn render_gateway_setup_form(
     }
 
     form.into_any_element()
+}
+
+fn activation_code_cell_size(mode: &GatewaySetupFormMode) -> Pixels {
+    // gpui-component's OtpInput has fixed 4 px gaps inside each four-cell
+    // group and a fixed 20 px gap between the groups. The surrounding forms
+    // have fixed widths, so size the eight cells to consume the remaining
+    // width exactly instead of leaving the OTP row narrower than other inputs.
+    // The values below are the 384 px initial card/dialog widths after their
+    // respective border and horizontal padding have been accounted for.
+    match mode {
+        GatewaySetupFormMode::Initial { .. }
+        | GatewaySetupFormMode::ReauthenticateGateway {
+            close_dialog_on_success: false,
+            ..
+        } => px(38.25), // 8 * 38.25 + 6 * 4 + 20 = 350 px.
+        GatewaySetupFormMode::AddGateway { .. }
+        | GatewaySetupFormMode::ReauthenticateGateway {
+            close_dialog_on_success: true,
+            ..
+        } => px(36.25), // 8 * 36.25 + 6 * 4 + 20 = 334 px.
+        GatewaySetupFormMode::EditGateway { .. } => px(32.),
+    }
 }
 
 fn handle_alphanumeric_otp_key_down(

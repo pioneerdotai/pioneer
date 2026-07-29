@@ -1,7 +1,6 @@
 //! WebSocket JSON-RPC primitives.
 
 use anyhow::{Result, anyhow};
-use std::net::IpAddr;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
 use url::Url;
@@ -12,9 +11,9 @@ pub fn build_ws_request(url: &str, token: Option<&str>) -> Result<Request<()>> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then_some(trimmed)
     });
-    if token.is_some() && !authenticated_ws_url_is_allowed(url) {
+    if token.is_some() && !authenticated_ws_url_is_valid(url) {
         return Err(anyhow!(
-            "plaintext authenticated transport is allowed only for loopback endpoints"
+            "authenticated transport requires a valid ws or wss endpoint without user credentials or a fragment"
         ));
     }
     let mut request = url
@@ -31,7 +30,7 @@ pub fn build_ws_request(url: &str, token: Option<&str>) -> Result<Request<()>> {
     Ok(request)
 }
 
-pub(crate) fn authenticated_ws_url_is_allowed(value: &str) -> bool {
+pub(crate) fn authenticated_ws_url_is_valid(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
@@ -42,16 +41,7 @@ pub(crate) fn authenticated_ws_url_is_allowed(value: &str) -> bool {
     {
         return false;
     }
-    match url.scheme() {
-        "wss" => true,
-        "ws" => url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        }),
-        _ => false,
-    }
+    matches!(url.scheme(), "ws" | "wss")
 }
 
 pub fn normalize_ws_url(address: &str) -> String {
@@ -109,11 +99,8 @@ mod tests {
     }
 
     #[test]
-    fn transport_ws_rejects_remote_plaintext_before_building_authorization() {
-        let error = build_ws_request("ws://192.0.2.1:17878", Some("access-secret"))
-            .expect_err("remote plaintext auth must fail");
-        assert!(error.to_string().contains("loopback"));
-        assert!(!error.to_string().contains("access-secret"));
+    fn transport_ws_allows_remote_plaintext_authenticated_requests() {
+        assert!(build_ws_request("ws://192.0.2.1:17878", Some("access-secret")).is_ok());
         assert!(build_ws_request("wss://gateway.example", Some("access-secret")).is_ok());
         assert!(build_ws_request("ws://localhost:17878", Some("access-secret")).is_ok());
         assert!(
@@ -126,6 +113,5 @@ mod tests {
             )
             .is_err()
         );
-        assert!(build_ws_request("ws://192.0.2.1:17878", None).is_ok());
     }
 }

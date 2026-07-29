@@ -13,7 +13,7 @@ use pioneer_protocol::{
     MIN_OPAQUE_CREDENTIAL_BODY_LEN, RequestId, constants::methods,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{fmt, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{
@@ -289,7 +289,7 @@ pub fn normalize_auth_ws_url(address: &str) -> Result<String, AuthExchangeError>
             "Gateway endpoint is invalid",
         )
     })?;
-    let host = parsed.host_str().ok_or_else(|| {
+    parsed.host_str().ok_or_else(|| {
         AuthExchangeError::new(
             AuthExchangeErrorKind::InvalidEndpoint,
             "Gateway endpoint has no host",
@@ -302,12 +302,7 @@ pub fn normalize_auth_ws_url(address: &str) -> Result<String, AuthExchangeError>
         ));
     }
     match parsed.scheme() {
-        "wss" => Ok(normalized),
-        "ws" if is_loopback_host(host) => Ok(normalized),
-        "ws" => Err(AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "plaintext auth transport is allowed only for loopback endpoints",
-        )),
+        "ws" | "wss" => Ok(normalized),
         _ => Err(AuthExchangeError::new(
             AuthExchangeErrorKind::InvalidEndpoint,
             "auth transport requires ws or wss",
@@ -358,17 +353,6 @@ fn classify_jwt_credential(value: &str) -> Option<JwtCredentialClass> {
         (Some(2), Some("access"), Some("gateway_access")) => Some(JwtCredentialClass::AccessV2),
         _ => None,
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 async fn exchange_over_stream<S, P, R>(
@@ -855,23 +839,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_endpoint_security_rejects_plaintext_remote_before_handshake() {
+    fn auth_endpoint_accepts_plaintext_remote_and_rejects_credential_bearing_urls() {
         assert!(normalize_auth_ws_url("ws://127.0.0.1:17878").is_ok());
         assert!(normalize_auth_ws_url("ws://[::1]:17878").is_ok());
         assert!(normalize_auth_ws_url("localhost:17878").is_ok());
         assert!(normalize_auth_ws_url("wss://gateway.example.test/ws").is_ok());
-        assert_eq!(
-            normalize_auth_ws_url("ws://192.0.2.10:17878")
-                .unwrap_err()
-                .kind,
-            AuthExchangeErrorKind::InvalidEndpoint
-        );
-        assert_eq!(
-            normalize_auth_ws_url("gateway.example.test:17878")
-                .unwrap_err()
-                .kind,
-            AuthExchangeErrorKind::InvalidEndpoint
-        );
+        assert!(normalize_auth_ws_url("ws://192.0.2.10:17878").is_ok());
+        assert!(normalize_auth_ws_url("gateway.example.test:17878").is_ok());
         assert_eq!(
             normalize_auth_ws_url("wss://user:password@gateway.example.test/ws")
                 .unwrap_err()

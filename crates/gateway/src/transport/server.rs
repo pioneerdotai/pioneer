@@ -289,7 +289,6 @@ async fn handle_connection(
     session_manager: Arc<SessionManager>,
     auth_abuse_limiter: Arc<AuthAbuseLimiter>,
 ) -> Result<()> {
-    ensure_plaintext_peer_is_loopback(peer_addr)?;
     let (stream, shutdown_handle) = duplicate_shutdown_handle(stream)?;
     let auth_attempt = auth_abuse_limiter
         .try_acquire(peer_addr.ip())
@@ -728,13 +727,6 @@ fn read_captured_admission(capture: Arc<OnceLock<CapturedAdmission>>) -> Result<
         .context("websocket handshake completed without an auth admission")
 }
 
-fn ensure_plaintext_peer_is_loopback(peer_addr: SocketAddr) -> Result<()> {
-    if !peer_addr.ip().is_loopback() {
-        anyhow::bail!("plaintext Gateway WebSocket connections require a loopback peer");
-    }
-    Ok(())
-}
-
 fn internal_error_response(message: &str) -> ErrorResponse {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -748,7 +740,7 @@ mod tests {
     use super::{
         AUTH_FAILURE_STATE_TTL, AuthAbuseLimiter, MAX_AUTH_IN_FLIGHT_PER_ADDRESS,
         capture_admission, duplicate_shutdown_handle, enforce_access_lease,
-        ensure_plaintext_peer_is_loopback, read_captured_admission, remaining_access_duration,
+        read_captured_admission, remaining_access_duration,
     };
     use crate::auth::{
         AccessCredential, AccessJwtSubject, AuthError, AuthErrorCode,
@@ -757,7 +749,7 @@ mod tests {
     };
     use crate::session::SessionManager;
     use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
     use tokio::io::AsyncReadExt;
@@ -832,31 +824,6 @@ mod tests {
         assert_eq!(
             access_b.subject.principal_id.as_str(),
             "P00000000000000000002"
-        );
-    }
-
-    #[test]
-    fn plaintext_transport_accepts_only_loopback_peers() {
-        assert!(
-            ensure_plaintext_peer_is_loopback(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                1234,
-            ))
-            .is_ok()
-        );
-        assert!(
-            ensure_plaintext_peer_is_loopback(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                1234,
-            ))
-            .is_ok()
-        );
-        assert!(
-            ensure_plaintext_peer_is_loopback(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-                1234,
-            ))
-            .is_err()
         );
     }
 

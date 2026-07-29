@@ -278,13 +278,54 @@ impl GatewayRuntime {
             change.rollback_commit(&mut self.registry, &commit);
             return Err(error);
         }
-        if commit.endpoint.session_ref.is_none() {
+        let provisioning_result = if commit.endpoint.session_ref.is_none() {
             let activation_code = activation_code
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .context("a Superuser device activation code is required for a new Gateway")?;
-            self.provision_gateway_session(commit.endpoint.id.as_str(), activation_code)?;
+                .context("a Superuser device activation code is required for a new Gateway");
+            activation_code.and_then(|activation_code| {
+                self.provision_gateway_session(commit.endpoint.id.as_str(), activation_code)
+            })
+        } else {
+            Ok(())
+        };
+
+        self.finish_remote_gateway_add(change, commit, provisioning_result)
+    }
+
+    fn finish_remote_gateway_add(
+        &mut self,
+        change: client_gateway_setup::AddRemoteGatewayChange,
+        commit: client_gateway_setup::AddRemoteGatewayCommit,
+        provisioning_result: Result<()>,
+    ) -> Result<GatewayEndpoint> {
+        if let Err(provisioning_error) = provisioning_result {
+            let endpoint_id = commit.endpoint.id.as_str();
+            let rollback_result = self
+                .secrets
+                .has_gateway_session(endpoint_id)
+                .context("failed to inspect the staged desktop Gateway session")
+                .and_then(|has_durable_session| {
+                    if has_durable_session {
+                        return Ok(());
+                    }
+
+                    let mut rollback_registry = self.registry.clone();
+                    change.rollback_commit(&mut rollback_registry, &commit);
+                    save_registry(&self.registry_path, &rollback_registry)
+                        .context("failed to roll back the unprovisioned remote Gateway")?;
+                    self.registry = rollback_registry;
+                    Ok(())
+                });
+
+            return match rollback_result {
+                Ok(()) => Err(provisioning_error),
+                Err(rollback_error) => Err(rollback_error.context(format!(
+                    "remote Gateway provisioning failed before rollback: {provisioning_error:#}"
+                ))),
+            };
         }
+
         self.endpoint(commit.endpoint.id.as_str())
             .context("remote Gateway endpoint disappeared after provisioning")
     }
@@ -610,11 +651,113 @@ mod tests {
         test_support::FailingDesktopSecretStore,
         tests::unique_temp_dir,
     };
+    use anyhow::anyhow;
+    use pioneer_client::gateway::setup::{
+        AddRemoteGatewayApplyMode, AddRemoteGatewayChange, AddRemoteGatewayCommit,
+        AddRemoteGatewayInput, plan_add_remote_gateway,
+    };
     use pioneer_protocol::{
         AuthSecretString, AuthSessionId, DeviceId, GatewayId, PrincipalId, TokenFamilyId,
     };
 
     use super::GatewayRuntime;
+
+    fn stage_remote_gateway_profile(
+        runtime: &mut GatewayRuntime,
+    ) -> (
+        AddRemoteGatewayChange,
+        AddRemoteGatewayCommit,
+        std::path::PathBuf,
+    ) {
+        let runtime_dir = unique_temp_dir();
+        fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        runtime.registry_path = runtime_dir.join("gateway-registry.toml");
+        save_registry(&runtime.registry_path, &runtime.registry).expect("save initial registry");
+
+        let change = plan_add_remote_gateway(
+            &runtime.registry,
+            AddRemoteGatewayInput {
+                name: "Remote Gateway",
+                address: "ws://192.0.2.10:17878",
+                new_endpoint_id: "remote-test".to_owned(),
+                default_remote_name: "Remote Gateway".to_owned(),
+            },
+        )
+        .expect("plan remote Gateway");
+        let commit = change
+            .apply_to_registry(
+                &mut runtime.registry,
+                AddRemoteGatewayApplyMode::ProfileOnly,
+            )
+            .expect("stage remote Gateway");
+        save_registry(&runtime.registry_path, &runtime.registry).expect("save staged registry");
+
+        (change, commit, runtime_dir)
+    }
+
+    #[test]
+    fn failed_remote_gateway_provisioning_rolls_back_unprovisioned_profile() {
+        let mut runtime = GatewayRuntime::for_ws_spec_tests();
+        let (change, commit, runtime_dir) = stage_remote_gateway_profile(&mut runtime);
+
+        let error = runtime
+            .finish_remote_gateway_add(change, commit, Err(anyhow!("injected activation failure")))
+            .expect_err("failed activation must not commit the remote Gateway");
+
+        assert!(error.to_string().contains("injected activation failure"));
+        assert!(runtime.registry.remotes.is_empty());
+        let durable =
+            load_registry(&runtime.registry_path, &runtime.config).expect("load durable registry");
+        assert!(durable.remotes.is_empty());
+
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn failed_remote_gateway_provisioning_preserves_durable_session_recovery() {
+        let mut runtime = GatewayRuntime::for_ws_spec_tests();
+        let (change, commit, runtime_dir) = stage_remote_gateway_profile(&mut runtime);
+        let installation_id = runtime
+            .registry
+            .installation_id
+            .clone()
+            .expect("installation id");
+        runtime
+            .secrets
+            .put_gateway_session(
+                commit.endpoint.id.as_str(),
+                &DesktopGatewaySessionSecret {
+                    schema_version: DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION,
+                    gateway_id: GatewayId::new("G00000000000000000001").expect("Gateway identity"),
+                    principal_id: PrincipalId::new("P00000000000000000001").expect("principal id"),
+                    device_id: DeviceId::new("D00000000000000000001").expect("device id"),
+                    session_id: AuthSessionId::new("S00000000000000000001").expect("session id"),
+                    token_family_id: TokenFamilyId::new("F00000000000000000001")
+                        .expect("token family id"),
+                    installation_id,
+                    refresh_generation: 0,
+                    refresh_expires_at_unix: 2_000,
+                    refresh_token: AuthSecretString::new(format!("prf_{}", "r".repeat(43))),
+                },
+                Some("Remote Gateway session".to_owned()),
+            )
+            .expect("persist staged session");
+
+        runtime
+            .finish_remote_gateway_add(
+                change,
+                commit,
+                Err(anyhow!("injected registry binding failure")),
+            )
+            .expect_err("failed binding must remain visible as an error");
+
+        assert_eq!(runtime.registry.remotes.len(), 1);
+        let durable =
+            load_registry(&runtime.registry_path, &runtime.config).expect("load durable registry");
+        assert_eq!(durable.remotes.len(), 1);
+
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
 
     #[test]
     fn failed_secret_delete_keeps_the_durable_session_binding_retryable() {
