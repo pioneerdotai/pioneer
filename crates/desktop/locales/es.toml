@@ -99,7 +99,7 @@ copy = "Copiar"
 name = "Nombre"
 ok = "Aceptar"
 or = "o"
-token = "Token"
+activation_code = "Código de registro de dispositivo"
 
 [buttons]
 add = "Añadir"
@@ -271,6 +271,7 @@ add = "Añadir pasarela"
 connect_remote = "Conectar pasarela remota"
 delete = "Eliminar"
 edit = "Editar pasarela"
+reauthenticate = "Volver a conectar"
 start_local = "Iniciar pasarela local"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "Conectar pasarela"
 [gateway.popover]
 no_available = "No hay pasarelas disponibles."
 
+[gateway.reauthenticate]
+description = "Introduce un nuevo código de activación para volver a conectar este dispositivo sin cambiar la pasarela guardada."
+title = "Volver a conectar %{name}"
+
 [gateway.status]
 connected = "Pasarela conectada"
 connecting = "Conectando pasarela..."
@@ -324,6 +329,14 @@ unavailable = "Pasarela no disponible"
 
 [gateway.notification]
 path_update_skipped = "La pasarela se inició. Para el comando `pioneer`, puede que necesites agregar %{bin_dir} al PATH en una nueva sesión de terminal."
+
+[gateway.session_terminal]
+authentication_required = "Inicia sesión en esta pasarela con un nuevo código de registro de dispositivo."
+revoked = "La sesión de este dispositivo se cerró o revocó. Inicia sesión de nuevo para continuar."
+expired = "La sesión de este dispositivo caducó. Inicia sesión de nuevo para continuar."
+compromised = "La sesión se cerró por seguridad. Inicia sesión de nuevo para continuar."
+gateway_mismatch = "Esta sesión pertenece a otra pasarela. Comprueba la pasarela y vuelve a vincular."
+storage_failed = "Pioneer no pudo guardar de forma segura esta sesión."
 
 [workspace]
 selector_label = "Espacio de trabajo"
@@ -772,8 +785,33 @@ description = "Gestiona las preferencias de la aplicación."
 [settings.sidebar]
 back = "Atrás"
 general = "General"
+devices = "Dispositivos"
 memory = "Memoria"
 self_improvement = "Auto-mejora"
+
+[settings.devices]
+title = "Dispositivos"
+description = "Gestiona los dispositivos conectados a tu cuenta."
+loading = "Cargando dispositivos..."
+retry = "Reintentar"
+activate_device = "Registrar dispositivo"
+current = "Actual"
+last_seen = "Última actividad: %{value}"
+unknown_time = "Desconocido"
+client_desktop = "Escritorio"
+client_mobile = "Móvil"
+client_other = "Otro"
+logout = "Cerrar sesión"
+revoke = "Revocar"
+logout_confirm_title = "¿Cerrar sesión en este dispositivo?"
+logout_confirm_description = "El dispositivo no se conectará hasta que vuelvas a iniciar sesión."
+revoke_confirm_title = "¿Revocar %{device}?"
+revoke_confirm_description = "El dispositivo se desconectará y tendrá que registrarse de nuevo."
+activation_title = "Registrar otro dispositivo"
+activation_description = "Escanea el código QR o introduce el código de un solo uso en el dispositivo nuevo."
+copy_code = "Copiar código"
+copy_link = "Copiar enlace"
+close_activation = "Cerrar y revocar"
 
 [settings.option.language]
 label = "Idioma de la aplicación"

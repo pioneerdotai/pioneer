@@ -2,12 +2,50 @@ use crate::app::{
     gateway_setup::render_gateway_setup_form,
     root::{GatewaySetupFormMode, PioneerDesktop},
 };
+use crate::gateway::GatewayRuntime;
 use gpui::{prelude::*, *};
 use gpui_component::{theme::ActiveTheme, *};
 
 impl PioneerDesktop {
-    pub(crate) fn render_initial_setup(&self, cx: &mut Context<Self>) -> AnyElement {
-        let allow_local = self.gateway_setup_allows_local();
+    pub(crate) fn render_initial_setup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reauthentication = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(GatewayRuntime::active_gateway)
+            .filter(|endpoint| {
+                endpoint.kind == pioneer_client::gateway::types::GatewayEndpointKind::Remote
+                    && endpoint.session_ref.is_none()
+                    && endpoint.server_gateway_id.is_none()
+            })
+            .cloned();
+        let (title, description, mode) = if let Some(endpoint) = reauthentication {
+            (
+                t!(
+                    "gateway.reauthenticate.title",
+                    name = endpoint.name.as_str()
+                )
+                .to_string(),
+                t!("gateway.reauthenticate.description").to_string(),
+                GatewaySetupFormMode::ReauthenticateGateway {
+                    endpoint_id: endpoint.id,
+                    name: endpoint.name,
+                    address: endpoint.address,
+                    close_dialog_on_success: false,
+                },
+            )
+        } else {
+            let allow_local = self.gateway_setup_allows_local();
+            (
+                t!("gateway.initial.title").to_string(),
+                t!("gateway.initial.description").to_string(),
+                GatewaySetupFormMode::Initial { allow_local },
+            )
+        };
         let desktop_entity = cx.entity().clone();
         let form_state = self.gateway_setup_form_state.clone();
 
@@ -36,7 +74,7 @@ impl PioneerDesktop {
                                     .text_center()
                                     .text_xl()
                                     .font_bold()
-                                    .child(t!("gateway.initial.title").to_string()),
+                                    .child(title),
                             )
                             .child(
                                 div()
@@ -44,13 +82,14 @@ impl PioneerDesktop {
                                     .text_sm()
                                     .text_center()
                                     .opacity(0.6)
-                                    .child(t!("gateway.initial.description").to_string()),
+                                    .child(description),
                             ),
                     )
                     .child(render_gateway_setup_form(
                         form_state,
-                        GatewaySetupFormMode::Initial { allow_local },
+                        mode,
                         desktop_entity,
+                        window,
                         cx,
                     )),
             )

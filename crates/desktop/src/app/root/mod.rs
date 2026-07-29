@@ -88,16 +88,28 @@ impl GatewayOperationSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum GatewaySetupFormMode {
-    Initial { allow_local: bool },
-    AddGateway { allow_local: bool },
-    EditGateway { endpoint_id: String },
+    Initial {
+        allow_local: bool,
+    },
+    AddGateway {
+        allow_local: bool,
+    },
+    ReauthenticateGateway {
+        endpoint_id: String,
+        name: String,
+        address: String,
+        close_dialog_on_success: bool,
+    },
+    EditGateway {
+        endpoint_id: String,
+    },
 }
 
 impl GatewaySetupFormMode {
     pub(super) fn allow_local(&self) -> bool {
         match self {
             Self::Initial { allow_local } | Self::AddGateway { allow_local } => *allow_local,
-            Self::EditGateway { .. } => false,
+            Self::ReauthenticateGateway { .. } | Self::EditGateway { .. } => false,
         }
     }
 
@@ -105,7 +117,7 @@ impl GatewaySetupFormMode {
         match self {
             Self::Initial { .. } => Some(GatewayOperationSource::InitialSetup),
             Self::AddGateway { .. } => Some(GatewayOperationSource::AddGatewayDialog),
-            Self::EditGateway { .. } => None,
+            Self::ReauthenticateGateway { .. } | Self::EditGateway { .. } => None,
         }
     }
 
@@ -113,15 +125,17 @@ impl GatewaySetupFormMode {
         match self {
             Self::Initial { .. } => "connect-remote-gateway",
             Self::AddGateway { .. } => "add-connect-remote-gateway",
+            Self::ReauthenticateGateway { .. } => "reauthenticate-remote-gateway",
             Self::EditGateway { .. } => "save-gateway",
         }
     }
 
-    pub(super) fn local_button_id(&self) -> &'static str {
+    pub(super) fn secondary_button_id(&self) -> Option<&'static str> {
         match self {
-            Self::Initial { .. } => "start-local-gateway",
-            Self::AddGateway { .. } => "add-start-local-gateway",
-            Self::EditGateway { .. } => "delete-gateway",
+            Self::Initial { .. } => Some("start-local-gateway"),
+            Self::AddGateway { .. } => Some("add-start-local-gateway"),
+            Self::ReauthenticateGateway { .. } => None,
+            Self::EditGateway { .. } => Some("delete-gateway"),
         }
     }
 }
@@ -141,6 +155,7 @@ pub(super) enum MainContentView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsContentView {
     General,
+    Devices,
     Memory,
     SelfImprovement,
 }
@@ -150,7 +165,10 @@ pub(super) struct GatewayCoordinator {
     pub(super) client_runtime: ClientRuntime,
     pub(super) ws_command_sender: GatewayWsCommandSender,
     pub(super) ws_connection_id: Option<u64>,
+    pub(super) deferred_ws_events: VecDeque<pioneer_client::transport::ws::GatewayWsEvent>,
     pub(super) connection_epoch: u64,
+    pub(super) session_refresh_generation: u64,
+    pub(super) session_refresh_in_flight: bool,
     pub(super) connection_state: GatewayConnectionState,
     pub(super) status: String,
     pub(super) status_level: GatewayStatusLevel,
@@ -161,6 +179,9 @@ pub(super) struct GatewayCoordinator {
     pub(super) settings: Option<GatewaySettingsSnapshot>,
     pub(super) settings_loading: bool,
     pub(super) settings_error: Option<String>,
+    pub(super) auth_sessions: Vec<pioneer_protocol::AuthSessionListItem>,
+    pub(super) auth_sessions_loading: bool,
+    pub(super) auth_sessions_error: Option<String>,
 }
 
 #[derive(Default)]

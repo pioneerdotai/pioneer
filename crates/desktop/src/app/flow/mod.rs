@@ -8,6 +8,7 @@ mod lifecycle_operation;
 mod lifecycle_setup;
 mod notifications_view;
 mod popover_view;
+mod session_refresh;
 mod thread_list;
 mod thread_start_execute;
 mod thread_start_queue;
@@ -41,7 +42,7 @@ use gpui_component::{
     *,
 };
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
-use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
+use pioneer_client::transport::ws::GatewayWsConnectSpec;
 use pioneer_protocol::GatewayNotification;
 use std::time::Duration;
 use tracing::warn;
@@ -49,10 +50,6 @@ use tracing::warn;
 use client_effects::*;
 use helpers::*;
 pub(crate) use workspace_bootstrap::*;
-
-const REMOTE_WS_CONNECT_TIMEOUT_MIN_MS: u64 = 5_000;
-#[cfg(test)]
-const ID_LEN: usize = pioneer_client::threads::start::THREAD_START_ID_LEN;
 
 struct GatewayOperationSuccess {
     runtime: GatewayRuntime,

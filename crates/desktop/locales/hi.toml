@@ -99,7 +99,7 @@ copy = "कॉपी"
 name = "नाम"
 ok = "ठीक है"
 or = "या"
-token = "टोकन"
+activation_code = "डिवाइस पंजीकरण कोड"
 
 [buttons]
 add = "जोड़ें"
@@ -271,6 +271,7 @@ add = "गेटवे जोड़ें"
 connect_remote = "दूरस्थ गेटवे से कनेक्ट करें"
 delete = "हटाएँ"
 edit = "गेटवे संपादित करें"
+reauthenticate = "फिर से कनेक्ट करें"
 start_local = "स्थानीय गेटवे शुरू करें"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "गेटवे से कनेक्ट करें"
 [gateway.popover]
 no_available = "कोई गेटवे उपलब्ध नहीं है।"
 
+[gateway.reauthenticate]
+description = "सहेजे गए गेटवे को बदले बिना इस डिवाइस को फिर से कनेक्ट करने के लिए नया सक्रियण कोड दर्ज करें।"
+title = "%{name} को फिर से कनेक्ट करें"
+
 [gateway.status]
 connected = "गेटवे कनेक्ट हो गया"
 connecting = "गेटवे कनेक्ट हो रहा है..."
@@ -324,6 +329,14 @@ unavailable = "गेटवे उपलब्ध नहीं है"
 
 [gateway.notification]
 path_update_skipped = "गेटवे शुरू हो गया है। `pioneer` कमांड के लिए नई टर्मिनल सत्र में %{bin_dir} को PATH में जोड़ना पड़ सकता है।"
+
+[gateway.session_terminal]
+authentication_required = "नए डिवाइस नामांकन कोड से इस गेटवे में साइन इन करें।"
+revoked = "इस डिवाइस का सत्र साइन आउट या रद्द कर दिया गया है। जारी रखने के लिए फिर साइन इन करें।"
+expired = "इस डिवाइस का सत्र समाप्त हो गया है। जारी रखने के लिए फिर साइन इन करें।"
+compromised = "सुरक्षा के लिए यह सत्र बंद कर दिया गया है। जारी रखने के लिए फिर साइन इन करें।"
+gateway_mismatch = "यह सत्र किसी दूसरे गेटवे का है। गेटवे जाँचें और फिर से पेयर करें।"
+storage_failed = "Pioneer इस डिवाइस सत्र को सुरक्षित रूप से सहेज नहीं सका।"
 
 [workspace]
 selector_label = "कार्यक्षेत्र"
@@ -772,8 +785,33 @@ description = "एप्लिकेशन प्राथमिकताओं 
 [settings.sidebar]
 back = "वापस"
 general = "सामान्य"
+devices = "डिवाइस"
 memory = "मेमोरी"
 self_improvement = "स्व-सुधार"
+
+[settings.devices]
+title = "डिवाइस"
+description = "अपने खाते में साइन इन किए गए डिवाइस प्रबंधित करें।"
+loading = "डिवाइस लोड हो रहे हैं..."
+retry = "फिर कोशिश करें"
+activate_device = "डिवाइस पंजीकृत करें"
+current = "वर्तमान"
+last_seen = "अंतिम गतिविधि: %{value}"
+unknown_time = "अज्ञात"
+client_desktop = "डेस्कटॉप"
+client_mobile = "मोबाइल"
+client_other = "अन्य"
+logout = "साइन आउट"
+revoke = "रद्द करें"
+logout_confirm_title = "इस डिवाइस से साइन आउट करें?"
+logout_confirm_description = "फिर से साइन इन करने तक यह डिवाइस कनेक्ट नहीं होगा।"
+revoke_confirm_title = "%{device} को रद्द करें?"
+revoke_confirm_description = "डिवाइस डिस्कनेक्ट हो जाएगा और उसे फिर पंजीकृत करना होगा।"
+activation_title = "दूसरा डिवाइस पंजीकृत करें"
+activation_description = "नए डिवाइस पर QR कोड स्कैन करें या एक-बार उपयोग वाला कोड दर्ज करें।"
+copy_code = "कोड कॉपी करें"
+copy_link = "लिंक कॉपी करें"
+close_activation = "बंद करें और रद्द करें"
 
 [settings.option.language]
 label = "ऐप भाषा"

@@ -179,7 +179,10 @@ impl PioneerDesktop {
                 client_runtime,
                 ws_command_sender: gateway_ws_command_sender,
                 ws_connection_id: None,
+                deferred_ws_events: VecDeque::new(),
                 connection_epoch: 0,
+                session_refresh_generation: 0,
+                session_refresh_in_flight: false,
                 connection_state: GatewayConnectionState::Connecting,
                 status: t!("gateway.status.connecting").to_string(),
                 status_level: GatewayStatusLevel::Neutral,
@@ -190,6 +193,9 @@ impl PioneerDesktop {
                 settings: None,
                 settings_loading: false,
                 settings_error: None,
+                auth_sessions: Vec::new(),
+                auth_sessions_loading: false,
+                auth_sessions_error: None,
             },
         };
 
@@ -200,6 +206,12 @@ impl PioneerDesktop {
                 state.width_probe_attempts = 0;
             }
             cx.notify();
+        })
+        .detach();
+        cx.observe_window_activation(window, |view, window, cx| {
+            if window.is_window_active() {
+                view.recover_gateway_session_on_foreground(cx);
+            }
         })
         .detach();
 

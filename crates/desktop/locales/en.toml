@@ -99,7 +99,7 @@ copy = "Copy"
 name = "Name"
 ok = "OK"
 or = "or"
-token = "Token"
+activation_code = "Activation code"
 
 [buttons]
 add = "Add"
@@ -271,6 +271,7 @@ add = "Add gateway"
 connect_remote = "Connect remote"
 delete = "Delete"
 edit = "Edit gateway"
+reauthenticate = "Reconnect"
 start_local = "Start local gateway"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "Connect gateway"
 [gateway.popover]
 no_available = "No available gateways."
 
+[gateway.reauthenticate]
+description = "Enter a new activation code to reconnect this device without changing the saved gateway."
+title = "Reconnect %{name}"
+
 [gateway.status]
 connected = "Gateway connected"
 connecting = "Gateway connecting..."
@@ -324,6 +329,14 @@ unavailable = "Gateway is unavailable"
 
 [gateway.notification]
 path_update_skipped = "Gateway started. For the `pioneer` command, you may need to add %{bin_dir} to PATH in a new terminal session."
+
+[gateway.session_terminal]
+authentication_required = "Sign in to this Gateway with a new activation code."
+revoked = "This device session was signed out or revoked. Sign in again to continue."
+expired = "This device session expired. Sign in again to continue."
+compromised = "This session was closed for security. Sign in again to continue."
+gateway_mismatch = "This session belongs to a different Gateway. Verify the Gateway and activate again."
+storage_failed = "Pioneer could not securely save this device session."
 
 [workspace]
 selector_label = "Workspace"
@@ -1064,8 +1077,33 @@ description = "Manage application preferences."
 [settings.sidebar]
 back = "Back"
 general = "General"
+devices = "Devices"
 memory = "Memory"
 self_improvement = "Self-improvement"
+
+[settings.devices]
+title = "Devices"
+description = "Manage devices signed in to your account."
+loading = "Loading devices..."
+retry = "Retry"
+activate_device = "Activate device"
+current = "Current"
+last_seen = "Last seen %{value}"
+unknown_time = "Unknown"
+client_desktop = "Desktop"
+client_mobile = "Mobile"
+client_other = "Other"
+logout = "Log out"
+revoke = "Revoke"
+logout_confirm_title = "Log out this device?"
+logout_confirm_description = "This device will stop connecting until it signs in again."
+revoke_confirm_title = "Revoke %{device}?"
+revoke_confirm_description = "That device will be disconnected and must be activated again."
+activation_title = "Activate another device"
+activation_description = "Scan the QR code or enter the one-time code on the new device."
+copy_code = "Copy code"
+copy_link = "Copy link"
+close_activation = "Close and revoke"
 
 [settings.option.language]
 label = "App language"

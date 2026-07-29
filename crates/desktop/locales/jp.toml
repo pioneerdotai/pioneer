@@ -99,7 +99,7 @@ copy = "コピー"
 name = "名前"
 ok = "OK"
 or = "または"
-token = "トークン"
+activation_code = "デバイス登録コード"
 
 [buttons]
 add = "追加"
@@ -271,6 +271,7 @@ add = "ゲートウェイを追加"
 connect_remote = "リモートに接続"
 delete = "削除"
 edit = "ゲートウェイを編集"
+reauthenticate = "再接続"
 start_local = "ローカルゲートウェイを起動"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "ゲートウェイに接続"
 [gateway.popover]
 no_available = "利用可能なゲートウェイがありません。"
 
+[gateway.reauthenticate]
+description = "保存済みのゲートウェイを変更せずに、このデバイスを再接続するための新しいアクティベーションコードを入力してください。"
+title = "%{name} に再接続"
+
 [gateway.status]
 connected = "ゲートウェイ接続済み"
 connecting = "ゲートウェイ接続中..."
@@ -324,6 +329,14 @@ unavailable = "ゲートウェイは利用できません"
 
 [gateway.notification]
 path_update_skipped = "ゲートウェイを起動しました。`pioneer` コマンドを使うには、新しいターミナルセッションで %{bin_dir} を PATH に追加する必要がある場合があります。"
+
+[gateway.session_terminal]
+authentication_required = "新しいデバイス登録コードでこのゲートウェイにログインしてください。"
+revoked = "このデバイスのセッションはログアウトまたは取り消されました。もう一度ログインしてください。"
+expired = "このデバイスのセッションは期限切れです。もう一度ログインしてください。"
+compromised = "セキュリティ保護のためセッションを終了しました。もう一度ログインしてください。"
+gateway_mismatch = "このセッションは別のゲートウェイに属しています。確認して再度ペアリングしてください。"
+storage_failed = "Pioneer はデバイスセッションを安全に保存できませんでした。"
 
 [workspace]
 selector_label = "ワークスペース"
@@ -772,8 +785,33 @@ description = "アプリの設定を管理します。"
 [settings.sidebar]
 back = "戻る"
 general = "一般"
+devices = "デバイス"
 memory = "メモリ"
 self_improvement = "自己改善"
+
+[settings.devices]
+title = "デバイス"
+description = "アカウントにログインしているデバイスを管理します。"
+loading = "デバイスを読み込んでいます..."
+retry = "再試行"
+activate_device = "デバイスを登録"
+current = "現在"
+last_seen = "最終アクセス: %{value}"
+unknown_time = "不明"
+client_desktop = "デスクトップ"
+client_mobile = "モバイル"
+client_other = "その他"
+logout = "ログアウト"
+revoke = "取り消す"
+logout_confirm_title = "このデバイスからログアウトしますか？"
+logout_confirm_description = "再度ログインするまで、このデバイスは接続できません。"
+revoke_confirm_title = "%{device} を取り消しますか？"
+revoke_confirm_description = "デバイスは切断され、再度登録が必要になります。"
+activation_title = "別のデバイスを登録"
+activation_description = "新しいデバイスで QR コードをスキャンするか、ワンタイムコードを入力してください。"
+copy_code = "コードをコピー"
+copy_link = "リンクをコピー"
+close_activation = "閉じて取り消す"
 
 [settings.option.language]
 label = "アプリの言語"

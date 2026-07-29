@@ -1,5 +1,15 @@
-use super::*;
+use super::helpers::desktop_session_terminal_message;
+use crate::{
+    app::root::{GatewayConnectionState, MainContentView, PioneerDesktop},
+    gateway::GatewayRuntime,
+};
+use gpui::{AsyncApp, Context, WeakEntity, prelude::*};
 use pioneer_client::runtime::ClientRuntimePostEventSink;
+use pioneer_client::transport::ws::GatewayWsEvent;
+use pioneer_protocol::GatewayNotification;
+use std::collections::VecDeque;
+
+const MAX_DEFERRED_GATEWAY_WS_EVENTS: usize = 32;
 
 impl PioneerDesktop {
     pub(crate) fn start_gateway_ws_event_pump(&self, cx: &mut Context<Self>) {
@@ -41,17 +51,28 @@ impl PioneerDesktop {
         first_event: Option<GatewayWsEvent>,
         cx: &mut Context<Self>,
     ) {
-        let mut events_applied = false;
+        let events = first_event
+            .into_iter()
+            .chain(self.gateway.client_runtime.drain_ws_events());
+        let applicable = partition_gateway_ws_events(
+            self.gateway.ws_connection_id,
+            self.gateway.connecting || self.gateway.session_refresh_in_flight,
+            events,
+            &mut self.gateway.deferred_ws_events,
+        );
+        self.apply_gateway_ws_event_batch(applicable, cx);
+    }
 
-        for event in self
-            .gateway
-            .client_runtime
-            .drain_applicable_ws_events(self.gateway.ws_connection_id, first_event)
-        {
+    fn apply_gateway_ws_event_batch(
+        &mut self,
+        events: impl IntoIterator<Item = GatewayWsEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut events_applied = false;
+        for event in events {
             self.apply_gateway_ws_event(event, cx);
             events_applied = true;
         }
-
         let outcome = {
             let client_runtime = self.gateway.client_runtime.clone();
             let mut sink = DesktopPostEventSink { app: self, cx };
@@ -63,7 +84,35 @@ impl PioneerDesktop {
         }
     }
 
+    pub(in crate::app::flow) fn replay_deferred_gateway_ws_events(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let active_connection_id = self.gateway.ws_connection_id;
+        let applicable = self
+            .gateway
+            .deferred_ws_events
+            .drain(..)
+            .filter(|event| {
+                pioneer_client::transport::ws::should_apply_ws_event(active_connection_id, event)
+            })
+            .collect::<Vec<_>>();
+        self.apply_gateway_ws_event_batch(applicable, cx);
+    }
+
+    pub(in crate::app::flow) fn discard_deferred_gateway_ws_events(&mut self) {
+        self.gateway.deferred_ws_events.clear();
+    }
+
     pub(in crate::app::flow) fn next_gateway_connection_epoch(&mut self) -> u64 {
+        // A user-initiated Gateway operation supersedes any scheduled or
+        // in-flight UI refresh result. The durable refresh transaction may
+        // still finish under its per-endpoint mutation lock, but it must not
+        // replace the runtime selected by the newer operation.
+        self.gateway.session_refresh_generation =
+            self.gateway.session_refresh_generation.wrapping_add(1);
+        self.gateway.session_refresh_in_flight = false;
+        self.discard_deferred_gateway_ws_events();
         self.gateway.connection_epoch =
             pioneer_client::gateway::runtime::next_gateway_operation_epoch(
                 self.gateway.connection_epoch,
@@ -72,6 +121,17 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app::flow) fn apply_gateway_ws_event(
+        &mut self,
+        event: GatewayWsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_gateway_auth_control_event(&event, cx) {
+            return;
+        }
+        self.apply_gateway_ws_event_after_auth_control(event, cx);
+    }
+
+    fn apply_gateway_ws_event_after_auth_control(
         &mut self,
         event: GatewayWsEvent,
         cx: &mut Context<Self>,
@@ -92,6 +152,203 @@ impl PioneerDesktop {
             }
         }
     }
+
+    fn apply_gateway_auth_control_event(
+        &mut self,
+        event: &GatewayWsEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let reason = match event {
+            GatewayWsEvent::Connected {
+                connection_id,
+                endpoint_id,
+                ..
+            } => {
+                let connection_id = *connection_id;
+                let endpoint_id = endpoint_id.clone();
+                let connected_event = event.clone();
+                let sender = self.gateway.ws_command_sender.clone();
+                cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let verification = cx
+                            .background_spawn({
+                                let endpoint_id = endpoint_id.clone();
+                                async move {
+                                    let runtime = GatewayRuntime::load()?;
+                                    runtime.verify_gateway_session_identity(
+                                        endpoint_id.as_str(),
+                                        &sender,
+                                    )
+                                }
+                            })
+                            .await;
+                        let _ = this.update(&mut cx, |view, cx| {
+                            if view.gateway.ws_connection_id != Some(connection_id) {
+                                return;
+                            }
+                            match verification {
+                                Ok(None)
+                                    if view
+                                        .gateway
+                                        .runtime
+                                        .as_ref()
+                                        .is_none_or(|runtime| {
+                                            runtime
+                                                .session_terminal_reason(endpoint_id.as_str())
+                                                .is_none()
+                                        }) =>
+                                {
+                                    view.apply_gateway_ws_event_after_auth_control(
+                                        connected_event,
+                                        cx,
+                                    );
+                                }
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    view.apply_gateway_session_terminal(reason, cx);
+                                }
+                                Err(error) => {
+                                    let rendered = format!("{error:#}");
+                                    if let Some(reason) =
+                                        pioneer_client::gateway::session_lifecycle::terminal_reason_from_auth_code(
+                                            rendered.as_str(),
+                                        )
+                                    {
+                                        view.apply_gateway_session_terminal(reason, cx);
+                                    } else if pioneer_client::gateway::session_lifecycle::auth_code_requires_refresh(
+                                        rendered.as_str(),
+                                    ) {
+                                        view.gateway.ws_connection_id = None;
+                                        view.gateway.connection_state =
+                                            GatewayConnectionState::Disconnected;
+                                        view.recover_gateway_session_now(cx);
+                                        cx.notify();
+                                    } else {
+                                        view.gateway.ws_connection_id = None;
+                                        view.gateway.connection_state =
+                                            GatewayConnectionState::Disconnected;
+                                        view.gateway.error = Some(rendered);
+                                        let _ = view.gateway.ws_command_sender.disconnect();
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                        });
+                    }
+                })
+                .detach();
+                return true;
+            }
+            GatewayWsEvent::Notification {
+                notification:
+                    GatewayNotification::AuthSessionRevoked(pioneer_protocol::AuthSessionRevokedNotification {
+                        session_id,
+                        reason,
+                    }),
+                ..
+            } if self
+                .gateway
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.active_session_matches(session_id)) =>
+            {
+                Some(match reason {
+                    pioneer_protocol::AuthSessionTerminationReason::SessionRevoked => {
+                        pioneer_client::gateway::session_lifecycle::SessionTerminalReason::SessionRevoked
+                    }
+                    pioneer_protocol::AuthSessionTerminationReason::SessionExpired => {
+                        pioneer_client::gateway::session_lifecycle::SessionTerminalReason::SessionExpired
+                    }
+                    pioneer_protocol::AuthSessionTerminationReason::SessionCompromised => {
+                        pioneer_client::gateway::session_lifecycle::SessionTerminalReason::SessionCompromised
+                    }
+                })
+            }
+            GatewayWsEvent::Disconnected { reason, .. }
+                if pioneer_client::gateway::session_lifecycle::auth_code_requires_refresh(reason) =>
+            {
+                self.gateway.ws_connection_id = None;
+                self.gateway.connection_state = GatewayConnectionState::Disconnected;
+                self.recover_gateway_session_now(cx);
+                cx.notify();
+                return true;
+            }
+            GatewayWsEvent::ConnectFailed { error, .. }
+                if pioneer_client::gateway::session_lifecycle::auth_code_requires_refresh(error) =>
+            {
+                self.gateway.ws_connection_id = None;
+                self.gateway.connection_state = GatewayConnectionState::Disconnected;
+                self.recover_gateway_session_now(cx);
+                cx.notify();
+                return true;
+            }
+            GatewayWsEvent::Disconnected { reason, .. } => {
+                pioneer_client::gateway::session_lifecycle::terminal_reason_from_auth_code(reason)
+            }
+            GatewayWsEvent::Notification {
+                notification: GatewayNotification::AuthAccessExpiring(notification),
+                ..
+            } if self
+                .gateway
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.active_session_matches(&notification.session_id)) =>
+            {
+                self.refresh_gateway_session_now(cx);
+                return true;
+            }
+            _ => return false,
+        };
+        let Some(reason) = reason else {
+            return false;
+        };
+        self.apply_gateway_session_terminal(reason, cx);
+        true
+    }
+
+    fn apply_gateway_session_terminal(
+        &mut self,
+        reason: pioneer_client::gateway::session_lifecycle::SessionTerminalReason,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal = self
+            .gateway
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.mark_active_session_terminal(reason).ok().flatten());
+        self.gateway.session_refresh_generation =
+            self.gateway.session_refresh_generation.wrapping_add(1);
+        self.gateway.session_refresh_in_flight = false;
+        self.discard_deferred_gateway_ws_events();
+        self.gateway.ws_connection_id = None;
+        self.gateway.connection_state = GatewayConnectionState::Disconnected;
+        self.gateway.error = Some(desktop_session_terminal_message(
+            terminal.map_or(reason, |terminal| terminal.reason),
+        ));
+        let _ = self.gateway.ws_command_sender.disconnect();
+        cx.notify();
+    }
+}
+
+fn partition_gateway_ws_events(
+    active_connection_id: Option<u64>,
+    defer_unmatched: bool,
+    events: impl IntoIterator<Item = GatewayWsEvent>,
+    deferred: &mut VecDeque<GatewayWsEvent>,
+) -> Vec<GatewayWsEvent> {
+    let mut applicable = Vec::new();
+    for event in events {
+        if pioneer_client::transport::ws::should_apply_ws_event(active_connection_id, &event) {
+            applicable.push(event);
+        } else if defer_unmatched {
+            if deferred.len() == MAX_DEFERRED_GATEWAY_WS_EVENTS {
+                deferred.pop_front();
+            }
+            deferred.push_back(event);
+        }
+    }
+    applicable
 }
 
 struct DesktopPostEventSink<'a, 'cx> {
@@ -142,5 +399,52 @@ impl ClientRuntimePostEventSink for DesktopPostEventSink<'_, '_> {
 
     fn tick_thread_conversations(&mut self) -> bool {
         self.app.tick_thread_conversations()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_client::gateway::types::GatewayEndpointKind;
+
+    fn connecting(connection_id: u64) -> GatewayWsEvent {
+        GatewayWsEvent::Connecting {
+            connection_id,
+            endpoint_id: "local".to_owned(),
+            endpoint_name: "Local".to_owned(),
+            endpoint_kind: GatewayEndpointKind::Local,
+        }
+    }
+
+    #[test]
+    fn replacement_events_are_deferred_until_the_new_connection_is_published() {
+        let mut deferred = VecDeque::new();
+        let applicable = partition_gateway_ws_events(Some(7), true, [connecting(8)], &mut deferred);
+
+        assert!(applicable.is_empty());
+        assert_eq!(deferred.len(), 1);
+
+        let replayed =
+            partition_gateway_ws_events(Some(8), false, deferred.drain(..), &mut VecDeque::new());
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(
+            pioneer_client::transport::ws::event_connection_id(&replayed[0]),
+            8
+        );
+    }
+
+    #[test]
+    fn deferred_event_buffer_is_bounded_and_drops_the_oldest_event() {
+        let mut deferred = VecDeque::new();
+        let events = (1..=(MAX_DEFERRED_GATEWAY_WS_EVENTS as u64 + 1)).map(connecting);
+
+        assert!(partition_gateway_ws_events(None, true, events, &mut deferred).is_empty());
+        assert_eq!(deferred.len(), MAX_DEFERRED_GATEWAY_WS_EVENTS);
+        assert_eq!(
+            deferred
+                .front()
+                .map(pioneer_client::transport::ws::event_connection_id),
+            Some(2)
+        );
     }
 }

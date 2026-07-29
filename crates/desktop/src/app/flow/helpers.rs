@@ -1,50 +1,63 @@
 use super::*;
-use pioneer_client::gateway::{runtime as client_gateway_runtime, setup as client_gateway_setup};
+use pioneer_client::gateway::runtime as client_gateway_runtime;
+use pioneer_client::gateway::session_lifecycle::SessionTerminalReason;
+
+pub(crate) fn desktop_session_terminal_message(reason: SessionTerminalReason) -> String {
+    match reason {
+        SessionTerminalReason::AuthenticationRequired => {
+            t!("gateway.session_terminal.authentication_required").to_string()
+        }
+        SessionTerminalReason::SessionRevoked => t!("gateway.session_terminal.revoked").to_string(),
+        SessionTerminalReason::SessionExpired | SessionTerminalReason::RefreshCredentialInvalid => {
+            t!("gateway.session_terminal.expired").to_string()
+        }
+        SessionTerminalReason::SessionCompromised
+        | SessionTerminalReason::RefreshOutcomeUnknown => {
+            t!("gateway.session_terminal.compromised").to_string()
+        }
+        SessionTerminalReason::GatewayIdentityMismatch => {
+            t!("gateway.session_terminal.gateway_mismatch").to_string()
+        }
+        SessionTerminalReason::SecureStorageFailed => {
+            t!("gateway.session_terminal.storage_failed").to_string()
+        }
+    }
+}
 
 pub(crate) fn build_ws_connect_spec(
-    runtime: &GatewayRuntime,
+    runtime: &mut GatewayRuntime,
     endpoint: &GatewayEndpoint,
 ) -> anyhow::Result<GatewayWsConnectSpec> {
-    let plan = client_gateway_runtime::plan_gateway_connect_spec(
-        endpoint,
-        runtime.gateway_auth_token_for_endpoint(endpoint)?,
-        ws_timings_for_endpoint(runtime, endpoint.kind),
-    );
-    Ok(plan.into())
+    match runtime.prepare_gateway_session(endpoint.id.as_str())? {
+        crate::gateway::DesktopSessionPreparation::Ready(ready) => {
+            Ok(ready.spec.into_connect_spec())
+        }
+        crate::gateway::DesktopSessionPreparation::Terminal(terminal) => {
+            anyhow::bail!(desktop_session_terminal_message(terminal.reason))
+        }
+    }
 }
 
-#[cfg(test)]
-pub(crate) fn build_remote_candidate_ws_connect_spec(
-    runtime: &GatewayRuntime,
-    name: &str,
-    address: &str,
-    token: &str,
-) -> GatewayWsConnectSpec {
-    let plan = client_gateway_runtime::plan_remote_candidate_connect_spec(
-        format!("candidate-{}", pioneer_protocol::generate_id(ID_LEN)),
-        name,
-        t!("gateway.endpoint.remote_name", index = 1).to_string(),
-        address,
-        token,
-        ws_timings_for_endpoint(runtime, GatewayEndpointKind::Remote),
-    );
-    plan.into()
-}
-
-pub(crate) fn validate_remote_candidate_gateway_connection(
-    runtime: &GatewayRuntime,
-    address: &str,
-    token: &str,
-) -> anyhow::Result<()> {
-    let address = crate::gateway::normalize_address(address)?;
-    let timings = ws_timings_for_endpoint(runtime, GatewayEndpointKind::Remote);
-    client_gateway_setup::validate_remote_gateway_connection_with_timings(
-        address.as_str(),
-        Some(token),
-        timings,
-    )
-    .map(|_| ())
-    .map_err(|error| anyhow::anyhow!(error))
+pub(crate) fn build_local_ws_connect_spec_with_recovery(
+    runtime: &mut GatewayRuntime,
+    endpoint: &GatewayEndpoint,
+) -> anyhow::Result<GatewayWsConnectSpec> {
+    match runtime.prepare_gateway_session(endpoint.id.as_str())? {
+        crate::gateway::DesktopSessionPreparation::Ready(ready) => {
+            Ok(ready.spec.into_connect_spec())
+        }
+        crate::gateway::DesktopSessionPreparation::Terminal(_) => {
+            runtime.stage_local_gateway_session_recovery(endpoint.id.as_str())?;
+            match runtime.prepare_gateway_session(endpoint.id.as_str())? {
+                crate::gateway::DesktopSessionPreparation::Ready(ready) => {
+                    Ok(ready.spec.into_connect_spec())
+                }
+                crate::gateway::DesktopSessionPreparation::Terminal(terminal) => {
+                    anyhow::bail!(desktop_session_terminal_message(terminal.reason))
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn should_apply_gateway_operation_result(
@@ -58,17 +71,6 @@ pub(crate) fn gateway_activation_requires_local_start(
     endpoint_kind: Option<GatewayEndpointKind>,
 ) -> bool {
     client_gateway_runtime::gateway_activation_requires_local_start(endpoint_kind)
-}
-
-fn ws_timings_for_endpoint(
-    runtime: &GatewayRuntime,
-    endpoint_kind: GatewayEndpointKind,
-) -> crate::gateway::GatewayWsTimings {
-    client_gateway_runtime::ws_timings_for_endpoint(
-        runtime.ws_timings(),
-        endpoint_kind,
-        Duration::from_millis(REMOTE_WS_CONNECT_TIMEOUT_MIN_MS),
-    )
 }
 
 pub(crate) fn gateway_has_ready_ws_connection(

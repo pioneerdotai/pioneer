@@ -1,3 +1,4 @@
+mod activation;
 mod connectivity;
 mod control;
 mod registry;
@@ -6,14 +7,15 @@ mod secrets;
 mod timings;
 mod ws;
 
-pub(crate) use connectivity::normalize_address;
 pub(crate) use control::GatewayInstallWarning;
-pub(crate) use timings::GatewayWsTimings;
 
 pub use pioneer_client::runtime::ClientRuntime;
+pub(crate) use runtime::{DesktopSessionConnectionOutcome, DesktopSessionPreparation};
 pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
 pub(crate) use ws::DesktopGatewayWsCommandSenderExt;
 pub use ws::GatewayWsCommandSender;
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

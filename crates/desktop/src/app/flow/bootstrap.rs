@@ -37,8 +37,10 @@ impl PioneerDesktop {
                         let mut runtime = GatewayRuntime::load()?;
                         runtime.discover_and_adopt_existing_local_gateway_once()?;
                         runtime.try_recover_active_local_gateway_once()?;
-                        let ws_connection_id = if let Some(endpoint) = runtime.active_gateway() {
-                            let spec = build_ws_connect_spec(&runtime, endpoint)?;
+                        let ws_connection_id = if runtime.setup_required() {
+                            None
+                        } else if let Some(endpoint) = runtime.active_gateway().cloned() {
+                            let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
                             Some(ws_sender.connect_with_retry(spec)?)
                         } else {
                             None

@@ -45,7 +45,9 @@ impl GatewayRuntime {
         }
 
         self.registry.active_gateway_id = Some(self.local_gateway_id().to_owned());
-        save_registry(&self.registry_path, &self.registry)?;
+        if !self.registry_upgrade_pending() {
+            save_registry(&self.registry_path, &self.registry)?;
+        }
         Ok(())
     }
 }

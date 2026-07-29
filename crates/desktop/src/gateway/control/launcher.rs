@@ -2,6 +2,7 @@ use crate::gateway::connectivity::is_gateway_reachable;
 use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
 use pioneer_config::AppConfig;
+use pioneer_protocol::normalize_device_activation_code;
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::io::ErrorKind;
@@ -10,6 +11,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Instant;
 use tracing::info;
+use zeroize::Zeroizing;
 
 use super::install::managed_gateway_install;
 use super::status::is_configured_service_active;
@@ -23,8 +25,8 @@ enum StartAttempt {
     ProgramNotFound,
 }
 
-enum TokenAttempt {
-    Token(String),
+enum DeviceCreateAttempt {
+    Code(Zeroizing<String>),
     ProgramNotFound,
 }
 
@@ -61,6 +63,8 @@ pub(crate) fn start_gateway_service(
     listen_addr: &str,
     timings: &GatewayTimings,
 ) -> Result<Vec<GatewayInstallWarning>> {
+    ensure_desktop_command_config_is_safe()?;
+
     if let Some(command) = make_bundled_gateway_install_command("install", true)
         && let Some(warnings) = try_start_with_launcher(
             "gateway bundled installer",
@@ -115,6 +119,8 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
     listen_addr: &str,
     timings: &GatewayTimings,
 ) -> Result<Vec<GatewayInstallWarning>> {
+    ensure_desktop_command_config_is_safe()?;
+
     if let Some(command) = make_bundled_gateway_install_command("update", false)
         && let Some(warnings) = try_start_with_launcher(
             "gateway bundled installer",
@@ -164,29 +170,34 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
     bail!("{}", t!("errors.gateway.start_command_failed_manual_help"))
 }
 
-pub(crate) fn request_local_superuser_token() -> Result<String> {
-    if let Some(command) = make_managed_pioneer_issue_superuser_token_command()
-        && let Some(token) = try_request_token_with_launcher("managed pioneer binary", command)?
+pub(crate) fn create_local_pending_device_session() -> Result<Zeroizing<String>> {
+    ensure_desktop_command_config_is_safe()?;
+
+    if let Some(command) = make_managed_pioneer_device_create_command()
+        && let Some(activation_code) =
+            try_create_pending_device_session_with_launcher("managed pioneer binary", command)?
     {
-        return Ok(token);
+        return Ok(activation_code);
     }
 
-    if let Some(command) = make_development_pioneer_issue_superuser_token_command()
-        && let Some(token) =
-            try_request_token_with_launcher("development cargo pioneer-dev", command)?
+    if let Some(command) = make_development_pioneer_device_create_command()
+        && let Some(activation_code) = try_create_pending_device_session_with_launcher(
+            "development cargo pioneer-dev",
+            command,
+        )?
     {
-        return Ok(token);
+        return Ok(activation_code);
     }
 
-    if let Some(token) = try_request_token_with_launcher(
+    if let Some(activation_code) = try_create_pending_device_session_with_launcher(
         "configured pioneer command in PATH",
-        make_pioneer_issue_superuser_token_command(),
+        make_pioneer_device_create_command(),
     )? {
-        return Ok(token);
+        return Ok(activation_code);
     }
 
     bail!(
-        "failed to request superuser token; make sure `pioneer issue-superuser-token` is available"
+        "failed to create a pending device session; make sure `pioneer device create` is available"
     )
 }
 
@@ -285,27 +296,29 @@ fn make_development_pioneer_start_command() -> Option<Command> {
     make_development_pioneer_command("start", true)
 }
 
-fn make_pioneer_issue_superuser_token_command() -> Command {
+fn make_pioneer_device_create_command() -> Command {
     let mut command = Command::new(configured_pioneer_command_file_name());
-    command.arg("issue-superuser-token");
+    command.args(["device", "create"]);
     apply_desktop_command_env(&mut command);
     command
 }
 
-fn make_managed_pioneer_issue_superuser_token_command() -> Option<Command> {
+fn make_managed_pioneer_device_create_command() -> Option<Command> {
     let install = managed_gateway_install()?;
     if !install.binary_path.is_file() {
         return None;
     }
 
     let mut command = Command::new(install.binary_path);
-    command.arg("issue-superuser-token");
+    command.args(["device", "create"]);
     apply_desktop_command_env(&mut command);
     Some(command)
 }
 
-fn make_development_pioneer_issue_superuser_token_command() -> Option<Command> {
-    make_development_pioneer_command("issue-superuser-token", false)
+fn make_development_pioneer_device_create_command() -> Option<Command> {
+    let mut command = make_development_pioneer_command("device", false)?;
+    command.arg("create");
+    Some(command)
 }
 
 fn make_development_pioneer_command(
@@ -451,6 +464,47 @@ fn gateway_arch_label() -> &'static str {
 
 fn apply_desktop_command_env(command: &mut Command) {
     command.env("PIONEER_MANAGED_BY", DESKTOP_MANAGED_BY);
+    if let Some(config_path) = desktop_command_config_path() {
+        command.env("PIONEER_CONFIG", config_path);
+    }
+}
+
+fn ensure_desktop_command_config_is_safe() -> Result<()> {
+    let Some(config_path) = desktop_command_config_path() else {
+        return Ok(());
+    };
+    if !config_path.is_file() {
+        bail!(
+            "refusing to launch a Pioneer child process because the explicit config does not exist: {}",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn desktop_command_config_path() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("PIONEER_CONFIG") {
+        let explicit = PathBuf::from(explicit);
+        return Some(
+            std::env::current_dir()
+                .map(|current_dir| absolutize_config_path(explicit.as_path(), &current_dir))
+                .unwrap_or(explicit),
+        );
+    }
+    cfg!(debug_assertions).then(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("config")
+            .join("local.toml")
+    })
+}
+
+fn absolutize_config_path(path: &Path, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    }
 }
 
 fn configured_pioneer_command_file_name() -> String {
@@ -534,13 +588,15 @@ fn parse_install_warnings_json(stdout: &str) -> Vec<GatewayInstallWarning> {
         .collect()
 }
 
-fn try_request_token_with_command(mut command: Command) -> Result<TokenAttempt> {
+fn try_create_pending_device_session_with_command(
+    mut command: Command,
+) -> Result<DeviceCreateAttempt> {
     let command_label = render_command(&command);
 
     let output = match command.output() {
         Ok(output) => output,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(TokenAttempt::ProgramNotFound);
+            return Ok(DeviceCreateAttempt::ProgramNotFound);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -554,57 +610,66 @@ fn try_request_token_with_command(mut command: Command) -> Result<TokenAttempt> 
     };
 
     if !output.status.success() {
+        // The command creates a pending device session and returns its one-time
+        // activation code on stdout. Never attach either output stream to this
+        // error: a partially successful or faulty launcher must not make
+        // credential material observable through logs.
         bail!(
-            "{}",
-            t!(
-                "errors.command.failed_with_output",
-                command_label = command_label.as_str(),
-                details = output_details(&output)
-            )
+            "device activation command failed with exit status {}",
+            output.status
         );
     }
 
-    let stdout = String::from_utf8(output.stdout)
-        .context("failed to parse token command output as UTF-8")?;
+    let stdout = Zeroizing::new(
+        String::from_utf8(output.stdout)
+            .context("failed to parse device activation command output as UTF-8")?,
+    );
 
-    let token = stdout
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty()).then_some(trimmed.to_owned())
-        })
-        .ok_or_else(|| anyhow::anyhow!("token command returned empty output"))?;
+    let activation_code = Zeroizing::new(
+        stdout
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_owned())
+            })
+            .ok_or_else(|| anyhow::anyhow!("device activation command returned empty output"))?,
+    );
+    normalize_device_activation_code(activation_code.as_str())
+        .map_err(|_| anyhow::anyhow!("device activation command returned an invalid credential"))?;
 
-    Ok(TokenAttempt::Token(token))
+    Ok(DeviceCreateAttempt::Code(activation_code))
 }
 
-fn try_request_token_with_launcher(launcher: &str, command: Command) -> Result<Option<String>> {
+fn try_create_pending_device_session_with_launcher(
+    launcher: &str,
+    command: Command,
+) -> Result<Option<Zeroizing<String>>> {
     let command_label = render_command(&command);
 
-    match try_request_token_with_command(command) {
-        Ok(TokenAttempt::ProgramNotFound) => {
+    match try_create_pending_device_session_with_command(command) {
+        Ok(DeviceCreateAttempt::ProgramNotFound) => {
             info!(
                 launcher,
                 command = %command_label,
-                message = "token launcher unavailable"
+                message = "pending device session launcher unavailable"
             );
             Ok(None)
         }
-        Ok(TokenAttempt::Token(token)) => {
+        Ok(DeviceCreateAttempt::Code(activation_code)) => {
             info!(
                 launcher,
                 command = %command_label,
-                message = "superuser token received"
+                message = "pending device session created"
             );
-            Ok(Some(token))
+            Ok(Some(activation_code))
         }
         Err(error) => {
             info!(
                 launcher,
                 command = %command_label,
                 error = %format!("{error:#}"),
-                message = "token launcher failed"
+                message = "device activation launcher failed"
             );
             Ok(None)
         }
@@ -646,12 +711,24 @@ fn output_details(output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BundledGatewayBootstrap, DESKTOP_MANAGED_BY,
-        make_bundled_gateway_install_command_from_bundle, make_pioneer_start_command,
-        parse_install_warnings_json,
+        BundledGatewayBootstrap, DESKTOP_MANAGED_BY, DeviceCreateAttempt, absolutize_config_path,
+        desktop_command_config_path, make_bundled_gateway_install_command_from_bundle,
+        make_pioneer_device_create_command, make_pioneer_start_command,
+        parse_install_warnings_json, try_create_pending_device_session_with_command,
     };
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    #[test]
+    fn relative_explicit_config_is_pinned_before_a_child_changes_directory() {
+        assert_eq!(
+            absolutize_config_path(
+                std::path::Path::new("config/local.toml"),
+                std::path::Path::new("/tmp/pioneer-desktop"),
+            ),
+            PathBuf::from("/tmp/pioneer-desktop/config/local.toml")
+        );
+    }
 
     #[test]
     fn start_commands_use_desktop_managed_context() {
@@ -661,6 +738,72 @@ mod tests {
             command_env(&pioneer_command, OsStr::new("PIONEER_MANAGED_BY")),
             Some(DESKTOP_MANAGED_BY.to_owned())
         );
+    }
+
+    #[test]
+    fn device_create_command_uses_desktop_managed_context() {
+        let command = make_pioneer_device_create_command();
+        assert_eq!(command_args(&command), vec!["device", "create"]);
+        assert_eq!(
+            command_env(&command, OsStr::new("PIONEER_MANAGED_BY")),
+            Some(DESKTOP_MANAGED_BY.to_owned())
+        );
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                command_env(&command, OsStr::new("PIONEER_CONFIG")),
+                desktop_command_config_path().map(|path| path.to_string_lossy().into_owned())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_create_launcher_reads_only_the_last_non_empty_stdout_line() {
+        let activation_code = "K7M4-P9Q2";
+        let script = format!("printf 'launcher preface\\n\\n{activation_code}\\n'");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script.as_str()]);
+
+        let result = try_create_pending_device_session_with_command(command)
+            .expect("run activation fixture command");
+        let DeviceCreateAttempt::Code(code) = result else {
+            panic!("fixture command must return an activation code")
+        };
+        assert_eq!(code.as_str(), activation_code);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_create_launcher_rejects_malformed_success_output_without_echoing_it() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'not-an-activation-secret\\n'"]);
+
+        let error = match try_create_pending_device_session_with_command(command) {
+            Ok(_) => panic!("malformed activation output must fail"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("invalid credential"));
+        assert!(!rendered.contains("not-an-activation-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_device_create_launcher_never_exposes_process_output() {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'secret-stdout\\n'; printf 'secret-stderr\\n' >&2; exit 7",
+        ]);
+
+        let error = match try_create_pending_device_session_with_command(command) {
+            Ok(_) => panic!("fixture command must fail"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("secret-stdout"));
+        assert!(!rendered.contains("secret-stderr"));
+        assert!(rendered.contains("exit status"));
     }
 
     #[test]

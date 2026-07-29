@@ -24,6 +24,7 @@ serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
 toml.workspace = true
+zeroize.workspace = true
 gpui.workspace = true
 gpui-terminal.workspace = true
 gpui-component.workspace = true
@@ -43,6 +44,9 @@ unicode-width.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 base64.workspace = true

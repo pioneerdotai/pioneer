@@ -1,8 +1,10 @@
+mod devices;
 mod lifecycle;
 mod sidebar;
 mod view;
 
 pub(super) const SETTINGS_CONTENT_GENERAL_NODE_ID: &str = "settings:general";
+pub(super) const SETTINGS_CONTENT_DEVICES_NODE_ID: &str = "settings:devices";
 pub(super) const SETTINGS_CONTENT_MEMORY_NODE_ID: &str = "settings:memory";
 pub(super) const SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID: &str = "settings:self-improvement";
 

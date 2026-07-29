@@ -99,7 +99,7 @@ copy = "Copier"
 name = "Nom"
 ok = "OK"
 or = "ou"
-token = "Jeton"
+activation_code = "Code d’inscription de l’appareil"
 
 [buttons]
 add = "Ajouter"
@@ -271,6 +271,7 @@ add = "Ajouter une passerelle"
 connect_remote = "Connecter une passerelle distante"
 delete = "Supprimer"
 edit = "Modifier la passerelle"
+reauthenticate = "Reconnecter"
 start_local = "Démarrer la passerelle locale"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "Connecter la passerelle"
 [gateway.popover]
 no_available = "Aucune passerelle disponible."
 
+[gateway.reauthenticate]
+description = "Saisissez un nouveau code d’activation pour reconnecter cet appareil sans modifier la passerelle enregistrée."
+title = "Reconnecter %{name}"
+
 [gateway.status]
 connected = "Passerelle connectée"
 connecting = "Connexion de la passerelle..."
@@ -324,6 +329,14 @@ unavailable = "Passerelle indisponible"
 
 [gateway.notification]
 path_update_skipped = "La passerelle est démarrée. Pour la commande `pioneer`, vous devrez peut-être ajouter %{bin_dir} au PATH dans une nouvelle session de terminal."
+
+[gateway.session_terminal]
+authentication_required = "Connectez-vous à cette passerelle avec un nouveau code d’inscription d’appareil."
+revoked = "La session de cet appareil a été fermée ou révoquée. Reconnectez-vous pour continuer."
+expired = "La session de cet appareil a expiré. Reconnectez-vous pour continuer."
+compromised = "Cette session a été fermée par sécurité. Reconnectez-vous pour continuer."
+gateway_mismatch = "Cette session appartient à une autre passerelle. Vérifiez-la et associez à nouveau l’appareil."
+storage_failed = "Pioneer n’a pas pu enregistrer cette session de manière sécurisée."
 
 [workspace]
 selector_label = "Espace de travail"
@@ -772,8 +785,33 @@ description = "Gérez les préférences de l'application."
 [settings.sidebar]
 back = "Retour"
 general = "Général"
+devices = "Appareils"
 memory = "Mémoire"
 self_improvement = "Auto-amélioration"
+
+[settings.devices]
+title = "Appareils"
+description = "Gérez les appareils connectés à votre compte."
+loading = "Chargement des appareils..."
+retry = "Réessayer"
+activate_device = "Inscrire un appareil"
+current = "Actuel"
+last_seen = "Dernière activité : %{value}"
+unknown_time = "Inconnu"
+client_desktop = "Ordinateur"
+client_mobile = "Mobile"
+client_other = "Autre"
+logout = "Se déconnecter"
+revoke = "Révoquer"
+logout_confirm_title = "Déconnecter cet appareil ?"
+logout_confirm_description = "Cet appareil ne se reconnectera pas avant une nouvelle authentification."
+revoke_confirm_title = "Révoquer %{device} ?"
+revoke_confirm_description = "Cet appareil sera déconnecté et devra être inscrit à nouveau."
+activation_title = "Inscrire un autre appareil"
+activation_description = "Scannez le QR code ou saisissez le code à usage unique sur le nouvel appareil."
+copy_code = "Copier le code"
+copy_link = "Copier le lien"
+close_activation = "Fermer et révoquer"
 
 [settings.option.language]
 label = "Langue de l'application"

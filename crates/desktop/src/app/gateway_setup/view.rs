@@ -7,7 +7,7 @@ use gpui_component::{
     button::ButtonVariants,
     divider::Divider,
     form::{field, v_form},
-    input::{Input, InputState},
+    input::{Input, InputState, OtpInput, OtpState},
     theme::ActiveTheme,
     *,
 };
@@ -50,9 +50,9 @@ impl GatewaySetupDialogState {
 pub(crate) struct GatewaySetupFormState {
     name_input_state: Entity<InputState>,
     address_input_state: Entity<InputState>,
-    token_input_state: Entity<InputState>,
+    activation_input_state: Entity<OtpState>,
     operation: GatewaySetupDialogState,
-    did_focus_name_input: bool,
+    did_focus_primary_input: bool,
 }
 
 impl GatewaySetupFormState {
@@ -64,10 +64,9 @@ impl GatewaySetupFormState {
         Self {
             name_input_state: cx.new(|cx| InputState::new(window, cx)),
             address_input_state: cx.new(|cx| InputState::new(window, cx)),
-            token_input_state: cx
-                .new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(3, 7)),
+            activation_input_state: cx.new(|cx| OtpState::new(8, window, cx)),
             operation,
-            did_focus_name_input: false,
+            did_focus_primary_input: false,
         }
     }
 
@@ -85,7 +84,7 @@ impl GatewaySetupFormState {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.address_input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.token_input_state
+        self.activation_input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
@@ -95,24 +94,37 @@ impl GatewaySetupFormState {
         cx: &mut Context<Self>,
         name: String,
         address: String,
-        token: String,
     ) {
         self.name_input_state
             .update(cx, |state, cx| state.set_value(name.clone(), window, cx));
         self.address_input_state
             .update(cx, |state, cx| state.set_value(address.clone(), window, cx));
-        self.token_input_state
-            .update(cx, |state, cx| state.set_value(token.clone(), window, cx));
+        self.activation_input_state
+            .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
     pub(super) fn focus_name_input_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.did_focus_name_input {
+        if self.did_focus_primary_input {
             return;
         }
 
         self.name_input_state
             .update(cx, |state, cx| state.focus(window, cx));
-        self.did_focus_name_input = true;
+        self.did_focus_primary_input = true;
+    }
+
+    pub(super) fn focus_activation_input_once(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.did_focus_primary_input {
+            return;
+        }
+
+        self.activation_input_state
+            .update(cx, |state, cx| state.focus(window, cx));
+        self.did_focus_primary_input = true;
     }
 
     pub(super) fn is_connecting(&self) -> bool {
@@ -123,7 +135,7 @@ impl GatewaySetupFormState {
         GatewaySetupFormSnapshot {
             name_input_state: self.name_input_state.clone(),
             address_input_state: self.address_input_state.clone(),
-            token_input_state: self.token_input_state.clone(),
+            activation_input_state: self.activation_input_state.clone(),
             connecting: self.operation.connecting,
             setup_action: self.operation.setup_action,
             error: self.operation.error.clone(),
@@ -136,7 +148,7 @@ impl GatewaySetupFormState {
 pub(super) struct GatewaySetupFormSnapshot {
     pub(super) name_input_state: Entity<InputState>,
     pub(super) address_input_state: Entity<InputState>,
-    pub(super) token_input_state: Entity<InputState>,
+    pub(super) activation_input_state: Entity<OtpState>,
     pub(super) connecting: bool,
     pub(super) setup_action: Option<GatewaySetupAction>,
     pub(super) error: Option<String>,
@@ -189,43 +201,118 @@ pub(crate) fn render_gateway_setup_form(
     form_state: Entity<GatewaySetupFormState>,
     mode: GatewaySetupFormMode,
     desktop_entity: Entity<PioneerDesktop>,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let snapshot = form_state.read(cx).snapshot();
     let status = render_gateway_setup_status(&snapshot, cx);
 
-    let mut form = v_form()
-        .child(
+    let mut form = v_form();
+    if let GatewaySetupFormMode::ReauthenticateGateway { name, address, .. } = &mode {
+        form = form
+            .child(
+                field()
+                    .label(t!("common.name").to_string())
+                    .child(render_readonly_gateway_value(name.clone(), cx)),
+            )
+            .child(
+                field()
+                    .label(t!("common.address").to_string())
+                    .child(render_readonly_gateway_value(address.clone(), cx)),
+            );
+    } else {
+        form = form
+            .child(
+                field()
+                    .label(t!("common.name").to_string())
+                    .child(Input::new(&snapshot.name_input_state).min_w_0()),
+            )
+            .child(
+                field()
+                    .label(t!("common.address").to_string())
+                    .child(Input::new(&snapshot.address_input_state).min_w_0()),
+            );
+    }
+    if !matches!(mode, GatewaySetupFormMode::EditGateway { .. }) {
+        form = form.child(
             field()
-                .label(t!("common.name").to_string())
-                .child(Input::new(&snapshot.name_input_state).min_w_0()),
-        )
-        .child(
-            field()
-                .label(t!("common.address").to_string())
-                .child(Input::new(&snapshot.address_input_state).min_w_0()),
-        )
-        .child(
-            field()
-                .label(t!("common.token").to_string())
-                .child(Input::new(&snapshot.token_input_state).min_w_0()),
-        )
-        .child(
-            field()
-                .label_indent(false)
-                .child(render_gateway_setup_form_actions(
-                    snapshot,
-                    mode,
-                    desktop_entity,
-                    form_state,
-                )),
+                .label(t!("common.activation_code").to_string())
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .when(!snapshot.connecting, |this| {
+                            this.on_key_down(window.listener_for(
+                                &snapshot.activation_input_state,
+                                handle_alphanumeric_otp_key_down,
+                            ))
+                        })
+                        .child(
+                            OtpInput::new(&snapshot.activation_input_state)
+                                .groups(2)
+                                .disabled(snapshot.connecting),
+                        ),
+                ),
         );
+    }
+    form = form.child(
+        field()
+            .label_indent(false)
+            .child(render_gateway_setup_form_actions(
+                snapshot,
+                mode,
+                desktop_entity,
+                form_state,
+            )),
+    );
 
     if let Some(status) = status {
         form = form.child(field().label_indent(false).child(status));
     }
 
     form.into_any_element()
+}
+
+fn handle_alphanumeric_otp_key_down(
+    state: &mut OtpState,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut Context<OtpState>,
+) {
+    let keystroke = &event.keystroke;
+    if keystroke.modifiers.secondary() && keystroke.key.eq_ignore_ascii_case("v") {
+        if let Some(value) = cx.read_from_clipboard().and_then(|item| item.text())
+            && let Ok(normalized) =
+                pioneer_protocol::normalize_device_activation_code_input(value.trim())
+            && !normalized.is_empty()
+        {
+            state.set_value(normalized, window, cx);
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        return;
+    }
+    if keystroke.modifiers.control
+        || keystroke.modifiers.alt
+        || keystroke.modifiers.platform
+        || keystroke.modifiers.function
+    {
+        return;
+    }
+    let typed = keystroke
+        .key_char
+        .as_deref()
+        .unwrap_or(keystroke.key.as_str());
+    if typed.chars().count() != 1 || !typed.is_ascii() {
+        return;
+    }
+    let mut candidate = state.value().to_string();
+    candidate.push_str(typed);
+    if let Ok(normalized) = pioneer_protocol::normalize_device_activation_code_input(&candidate) {
+        state.set_value(normalized, window, cx);
+    }
+    window.prevent_default();
+    cx.stop_propagation();
 }
 
 fn render_gateway_setup_status(
@@ -255,14 +342,16 @@ fn render_gateway_setup_form_actions(
     } else {
         GatewaySetupAction::ConnectRemote
     };
-    let primary_label = if matches!(mode, GatewaySetupFormMode::EditGateway { .. }) {
-        t!("buttons.save").to_string()
-    } else {
-        t!("gateway.action.connect_remote").to_string()
+    let primary_label = match &mode {
+        GatewaySetupFormMode::EditGateway { .. } => t!("buttons.save").to_string(),
+        GatewaySetupFormMode::ReauthenticateGateway { .. } => {
+            t!("gateway.action.reauthenticate").to_string()
+        }
+        _ => t!("gateway.action.connect_remote").to_string(),
     };
     let name_input_state = snapshot.name_input_state.clone();
     let address_input_state = snapshot.address_input_state.clone();
-    let token_input_state = snapshot.token_input_state.clone();
+    let activation_input_state = snapshot.activation_input_state.clone();
 
     let mut actions = v_flex().w_full().min_w_0().pt_4().gap_3().child(
         default_primary_button(mode.remote_button_id())
@@ -275,11 +364,11 @@ fn render_gateway_setup_form_actions(
                 let mode = mode.clone();
                 let name_input_state = name_input_state.clone();
                 let address_input_state = address_input_state.clone();
-                let token_input_state = token_input_state.clone();
+                let activation_input_state = activation_input_state.clone();
                 move |_, window, cx| {
                     let name = name_input_state.read(cx).value().to_string();
                     let address = address_input_state.read(cx).value().to_string();
-                    let token = token_input_state.read(cx).value().to_string();
+                    let activation_code = activation_input_state.read(cx).value().to_string();
                     let _ = desktop_entity.update(cx, |view, cx| {
                         if let GatewaySetupFormMode::EditGateway { endpoint_id } = &mode {
                             view.save_gateway_from_edit_dialog(
@@ -288,8 +377,21 @@ fn render_gateway_setup_form_actions(
                                 endpoint_id.clone(),
                                 name.clone(),
                                 address.clone(),
-                                token.clone(),
                                 Some(form_state.clone()),
+                            );
+                        } else if let GatewaySetupFormMode::ReauthenticateGateway {
+                            endpoint_id,
+                            close_dialog_on_success,
+                            ..
+                        } = &mode
+                        {
+                            view.reauthenticate_remote_gateway_from_form(
+                                window,
+                                cx,
+                                endpoint_id.clone(),
+                                activation_code.clone(),
+                                Some(form_state.clone()),
+                                *close_dialog_on_success,
                             );
                         } else if let Some(source) = mode.operation_source() {
                             view.connect_remote_gateway_from_values(
@@ -298,7 +400,7 @@ fn render_gateway_setup_form_actions(
                                 source,
                                 name.clone(),
                                 address.clone(),
-                                token.clone(),
+                                activation_code.clone(),
                                 Some(form_state.clone()),
                             );
                         }
@@ -309,29 +411,32 @@ fn render_gateway_setup_form_actions(
 
     if let GatewaySetupFormMode::EditGateway { endpoint_id } = &mode {
         actions = actions.child(
-            default_outline_button(mode.local_button_id())
-                .label(t!("gateway.action.delete").to_string())
-                .danger()
-                .loading(
-                    snapshot.connecting
-                        && snapshot.setup_action == Some(GatewaySetupAction::DeleteGateway),
-                )
-                .disabled(snapshot.connecting)
-                .on_click({
-                    let desktop_entity = desktop_entity.clone();
-                    let form_state = form_state.clone();
-                    let endpoint_id = endpoint_id.clone();
-                    move |_, window, cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            view.confirm_delete_gateway_from_edit_dialog(
-                                endpoint_id.clone(),
-                                Some(form_state.clone()),
-                                window,
-                                cx,
-                            );
-                        });
-                    }
-                }),
+            default_outline_button(
+                mode.secondary_button_id()
+                    .expect("edit mode has a delete button id"),
+            )
+            .label(t!("gateway.action.delete").to_string())
+            .danger()
+            .loading(
+                snapshot.connecting
+                    && snapshot.setup_action == Some(GatewaySetupAction::DeleteGateway),
+            )
+            .disabled(snapshot.connecting)
+            .on_click({
+                let desktop_entity = desktop_entity.clone();
+                let form_state = form_state.clone();
+                let endpoint_id = endpoint_id.clone();
+                move |_, window, cx| {
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.confirm_delete_gateway_from_edit_dialog(
+                            endpoint_id.clone(),
+                            Some(form_state.clone()),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }),
         );
     } else if mode.allow_local() {
         let source = mode
@@ -340,31 +445,52 @@ fn render_gateway_setup_form_actions(
         actions = actions
             .child(Divider::horizontal().label(t!("common.or").to_string()))
             .child(
-                default_outline_button(mode.local_button_id())
-                    .label(t!("gateway.action.start_local").to_string())
-                    .loading(
-                        snapshot.connecting
-                            && snapshot.setup_action == Some(GatewaySetupAction::StartLocal),
-                    )
-                    .disabled(snapshot.connecting)
-                    .on_click({
-                        let desktop_entity = desktop_entity.clone();
-                        let form_state = form_state.clone();
-                        move |_, window, cx| {
-                            let _ = desktop_entity.update(cx, |view, cx| {
-                                view.start_local_gateway_from_form(
-                                    window,
-                                    cx,
-                                    source,
-                                    Some(form_state.clone()),
-                                );
-                            });
-                        }
-                    }),
+                default_outline_button(
+                    mode.secondary_button_id()
+                        .expect("local setup action has a button id"),
+                )
+                .label(t!("gateway.action.start_local").to_string())
+                .loading(
+                    snapshot.connecting
+                        && snapshot.setup_action == Some(GatewaySetupAction::StartLocal),
+                )
+                .disabled(snapshot.connecting)
+                .on_click({
+                    let desktop_entity = desktop_entity.clone();
+                    let form_state = form_state.clone();
+                    move |_, window, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.start_local_gateway_from_form(
+                                window,
+                                cx,
+                                source,
+                                Some(form_state.clone()),
+                            );
+                        });
+                    }
+                }),
             );
     }
 
     actions.into_any_element()
+}
+
+fn render_readonly_gateway_value(value: String, cx: &mut App) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .h_9()
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().muted.opacity(0.35))
+        .text_sm()
+        .overflow_hidden()
+        .child(value)
+        .into_any_element()
 }
 
 fn render_start_status(status: String) -> AnyElement {

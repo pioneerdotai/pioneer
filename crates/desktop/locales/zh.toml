@@ -99,7 +99,7 @@ copy = "复制"
 name = "名称"
 ok = "确定"
 or = "或"
-token = "令牌"
+activation_code = "设备注册码"
 
 [buttons]
 add = "添加"
@@ -271,6 +271,7 @@ add = "添加网关"
 connect_remote = "连接远程网关"
 delete = "删除"
 edit = "编辑网关"
+reauthenticate = "重新连接"
 start_local = "启动本地网关"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "连接网关"
 [gateway.popover]
 no_available = "没有可用网关。"
 
+[gateway.reauthenticate]
+description = "输入新的激活码，在不更改已保存网关的情况下重新连接此设备。"
+title = "重新连接 %{name}"
+
 [gateway.status]
 connected = "网关已连接"
 connecting = "正在连接网关..."
@@ -324,6 +329,14 @@ unavailable = "网关不可用"
 
 [gateway.notification]
 path_update_skipped = "网关已启动。对于 `pioneer` 命令，你可能需要在新的终端会话中将 %{bin_dir} 手动加入 PATH。"
+
+[gateway.session_terminal]
+authentication_required = "请使用新的设备注册代码登录此网关。"
+revoked = "此设备会话已退出或被撤销。请重新登录以继续。"
+expired = "此设备会话已过期。请重新登录以继续。"
+compromised = "出于安全原因，此会话已关闭。请重新登录以继续。"
+gateway_mismatch = "此会话属于另一个网关。请确认网关并重新配对。"
+storage_failed = "Pioneer 无法安全保存此设备会话。"
 
 [workspace]
 selector_label = "工作区"
@@ -772,8 +785,33 @@ description = "管理应用偏好设置。"
 [settings.sidebar]
 back = "返回"
 general = "通用"
+devices = "设备"
 memory = "记忆"
 self_improvement = "自我改进"
+
+[settings.devices]
+title = "设备"
+description = "管理已登录你账户的设备。"
+loading = "正在加载设备..."
+retry = "重试"
+activate_device = "注册设备"
+current = "当前"
+last_seen = "最后活动：%{value}"
+unknown_time = "未知"
+client_desktop = "桌面端"
+client_mobile = "移动端"
+client_other = "其他"
+logout = "退出登录"
+revoke = "撤销"
+logout_confirm_title = "在此设备上退出登录？"
+logout_confirm_description = "重新登录前，此设备将无法连接。"
+revoke_confirm_title = "撤销 %{device}？"
+revoke_confirm_description = "该设备将断开连接，并需要重新注册。"
+activation_title = "注册另一台设备"
+activation_description = "在新设备上扫描二维码或输入一次性代码。"
+copy_code = "复制代码"
+copy_link = "复制链接"
+close_activation = "关闭并撤销"
 
 [settings.option.language]
 label = "应用语言"

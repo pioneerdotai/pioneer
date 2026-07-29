@@ -58,8 +58,10 @@ impl PioneerDesktop {
             return;
         }
 
+        let mut schedule_session_refresh = false;
         let outcome = match result {
             Ok(success) => {
+                schedule_session_refresh = success.ws_connection_id.is_some();
                 self.gateway.runtime = Some(success.runtime);
                 GatewayOperationFinishOutcome::Success(GatewayOperationSuccessInfo {
                     ws_connection_id: success.ws_connection_id,
@@ -101,8 +103,16 @@ impl PioneerDesktop {
         if reduction.disconnect_ws {
             let _ = self.gateway.ws_command_sender.disconnect();
         }
+        if self.gateway.ws_connection_id.is_some() {
+            self.replay_deferred_gateway_ws_events(cx);
+        } else {
+            self.discard_deferred_gateway_ws_events();
+        }
 
         execute_desktop_client_effects(self, reduction.effects, cx);
+        if schedule_session_refresh {
+            self.schedule_gateway_session_refresh(cx);
+        }
         if reduction.drive_turn_resume_queue {
             let _ = self.drive_turn_resume_queue(cx);
         }

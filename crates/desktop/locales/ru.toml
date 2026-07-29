@@ -99,7 +99,7 @@ copy = "Копировать"
 name = "Имя"
 ok = "ОК"
 or = "или"
-token = "Токен"
+activation_code = "Код регистрации устройства"
 
 [buttons]
 add = "Добавить"
@@ -271,6 +271,7 @@ add = "Добавить шлюз"
 connect_remote = "Подключить удалённый шлюз"
 delete = "Удалить"
 edit = "Редактировать шлюз"
+reauthenticate = "Подключить заново"
 start_local = "Запустить локальный шлюз"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "Подключение шлюза"
 [gateway.popover]
 no_available = "Нет доступных шлюзов."
 
+[gateway.reauthenticate]
+description = "Введите новый код регистрации устройства, чтобы подключиться заново без изменения сохранённого шлюза."
+title = "Повторное подключение к %{name}"
+
 [gateway.status]
 connected = "Шлюз подключён"
 connecting = "Подключение шлюза..."
@@ -324,6 +329,14 @@ unavailable = "Шлюз недоступен"
 
 [gateway.notification]
 path_update_skipped = "Шлюз запущен. Для команды `pioneer` в новом терминале может потребоваться добавить %{bin_dir} в PATH."
+
+[gateway.session_terminal]
+authentication_required = "Войдите в этот шлюз с новым кодом регистрации устройства."
+revoked = "Сеанс этого устройства завершён или отозван. Войдите снова, чтобы продолжить."
+expired = "Срок действия сеанса устройства истёк. Войдите снова, чтобы продолжить."
+compromised = "Сеанс закрыт из соображений безопасности. Войдите снова, чтобы продолжить."
+gateway_mismatch = "Этот сеанс принадлежит другому шлюзу. Проверьте шлюз и выполните сопряжение снова."
+storage_failed = "Pioneer не удалось безопасно сохранить сеанс устройства."
 
 [workspace]
 selector_label = "Пространство"
@@ -1064,8 +1077,33 @@ description = "Управляйте параметрами приложения.
 [settings.sidebar]
 back = "Назад"
 general = "Общие"
+devices = "Устройства"
 memory = "Память"
 self_improvement = "Самообучение"
+
+[settings.devices]
+title = "Устройства"
+description = "Управляйте устройствами, вошедшими в вашу учётную запись."
+loading = "Загрузка устройств..."
+retry = "Повторить"
+activate_device = "Зарегистрировать устройство"
+current = "Текущее"
+last_seen = "Последняя активность: %{value}"
+unknown_time = "Неизвестно"
+client_desktop = "Компьютер"
+client_mobile = "Мобильное"
+client_other = "Другое"
+logout = "Выйти"
+revoke = "Отозвать"
+logout_confirm_title = "Выйти на этом устройстве?"
+logout_confirm_description = "Устройство не сможет подключаться, пока вы не войдёте снова."
+revoke_confirm_title = "Отозвать доступ для %{device}?"
+revoke_confirm_description = "Устройство будет отключено, и его потребуется подключить заново."
+activation_title = "Регистрация другого устройства"
+activation_description = "Отсканируйте QR-код или введите одноразовый код на новом устройстве."
+copy_code = "Копировать код"
+copy_link = "Копировать ссылку"
+close_activation = "Закрыть и отозвать"
 
 [settings.option.language]
 label = "Язык приложения"

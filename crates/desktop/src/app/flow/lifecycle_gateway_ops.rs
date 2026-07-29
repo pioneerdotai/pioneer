@@ -8,12 +8,17 @@ impl PioneerDesktop {
         source: GatewayOperationSource,
         name: String,
         address: String,
-        token: String,
+        activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
         if source == GatewayOperationSource::AddGatewayDialog {
             self.connect_remote_gateway_from_add_dialog(
-                window, cx, name, address, token, form_state,
+                window,
+                cx,
+                name,
+                address,
+                activation_code,
+                form_state,
             );
             return;
         }
@@ -47,9 +52,9 @@ impl PioneerDesktop {
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
                                 address.as_str(),
-                                Some(token.as_str()),
+                                Some(activation_code.as_str()),
                             )?;
-                            let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                            let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
                             let connection_id = ws_sender.connect_and_wait(spec)?;
                             runtime.activate_gateway(endpoint.id.as_str())?;
 
@@ -85,13 +90,174 @@ impl PioneerDesktop {
         .detach();
     }
 
+    pub(in crate::app) fn reauthenticate_remote_gateway_from_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        endpoint_id: String,
+        activation_code: String,
+        form_state: Option<Entity<GatewaySetupFormState>>,
+        close_dialog_on_success: bool,
+    ) {
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        let Some(operation_epoch) = self.begin_gateway_operation(
+            t!("gateway.status.connecting_remote").to_string(),
+            Some(GatewaySetupAction::ConnectRemote),
+            cx,
+        ) else {
+            return;
+        };
+        self.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+
+        cx.spawn_in(
+            window,
+            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+                let mut cx = cx.clone();
+                let ws_sender = ws_sender.clone();
+
+                async move {
+                    let staged_result = cx
+                        .background_spawn(async move {
+                            let mut runtime =
+                                GatewayRuntime::load().map_err(|error| (None, error))?;
+                            let endpoint = runtime
+                                .reauthenticate_remote_gateway(
+                                    endpoint_id.as_str(),
+                                    activation_code.as_str(),
+                                )
+                                .map_err(|error| (None, error))?;
+                            let spec = match build_ws_connect_spec(&mut runtime, &endpoint) {
+                                Ok(spec) => spec,
+                                Err(error) => return Err((Some(runtime), error)),
+                            };
+
+                            Ok::<
+                                (GatewayRuntime, String, GatewayWsConnectSpec),
+                                (Option<GatewayRuntime>, anyhow::Error),
+                            >((runtime, endpoint.id, spec))
+                        })
+                        .await;
+
+                    let (mut runtime, endpoint_id, spec) = match staged_result {
+                        Ok(staged) => staged,
+                        Err((durable_runtime, error)) => {
+                            let _ = this.update_in(&mut cx, |view, window, cx| {
+                                if let Some(runtime) = durable_runtime
+                                    && should_apply_gateway_operation_result(
+                                        view.gateway.connection_epoch,
+                                        operation_epoch,
+                                    )
+                                {
+                                    // Activation already committed a durable
+                                    // session. Keep it and stop asking for the
+                                    // consumed one-time code.
+                                    view.gateway.runtime = Some(runtime);
+                                    view.finish_gateway_form_error_without_switch(
+                                        operation_epoch,
+                                        error,
+                                        None,
+                                        cx,
+                                    );
+                                    if close_dialog_on_success {
+                                        window.close_dialog(cx);
+                                    }
+                                } else {
+                                    view.finish_gateway_form_error_without_switch(
+                                        operation_epoch,
+                                        error,
+                                        form_state.as_ref(),
+                                        cx,
+                                    );
+                                }
+                            });
+                            return;
+                        }
+                    };
+
+                    let mut threads_to_unsubscribe = None;
+                    let _ = this.update_in(&mut cx, |view, _window, cx| {
+                        if should_apply_gateway_operation_result(
+                            view.gateway.connection_epoch,
+                            operation_epoch,
+                        ) {
+                            threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                        }
+                    });
+
+                    let Some(threads_to_unsubscribe) = threads_to_unsubscribe else {
+                        return;
+                    };
+
+                    let result = cx
+                        .background_spawn(async move {
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
+                            let connection_id = match ws_sender.connect_and_wait(spec) {
+                                Ok(connection_id) => connection_id,
+                                Err(error) => return Err((runtime, error.into())),
+                            };
+                            if let Err(error) = runtime.activate_gateway(endpoint_id.as_str()) {
+                                return Err((runtime, error));
+                            }
+
+                            Ok::<GatewayOperationSuccess, (GatewayRuntime, anyhow::Error)>(
+                                GatewayOperationSuccess {
+                                    runtime,
+                                    ws_connection_id: Some(connection_id),
+                                    ws_connected_ready: true,
+                                    install_warnings: Vec::new(),
+                                },
+                            )
+                        })
+                        .await;
+
+                    let _ = this.update_in(&mut cx, |view, window, cx| match result {
+                        Ok(success) => {
+                            view.finish_gateway_operation(operation_epoch, Ok(success), cx);
+                            if let Some(form_state) = form_state.as_ref() {
+                                form_state.update(cx, |state, cx| {
+                                    state.clear_inputs(window, cx);
+                                });
+                            }
+                            if close_dialog_on_success {
+                                window.close_dialog(cx);
+                            }
+                        }
+                        Err((runtime, error)) => {
+                            if should_apply_gateway_operation_result(
+                                view.gateway.connection_epoch,
+                                operation_epoch,
+                            ) {
+                                // Device activation and secure persistence have
+                                // already succeeded. Keep that durable runtime
+                                // in the UI even when the first ordinary
+                                // connection fails, otherwise the same
+                                // one-time code would be requested again.
+                                view.gateway.runtime = Some(runtime);
+                            }
+                            view.finish_gateway_operation(operation_epoch, Err(error), cx);
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                            if close_dialog_on_success {
+                                window.close_dialog(cx);
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     fn connect_remote_gateway_from_add_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         name: String,
         address: String,
-        token: String,
+        activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -115,17 +281,12 @@ impl PioneerDesktop {
                     let staged_result = cx
                         .background_spawn(async move {
                             let mut runtime = GatewayRuntime::load()?;
-                            validate_remote_candidate_gateway_connection(
-                                &runtime,
-                                address.as_str(),
-                                token.as_str(),
-                            )?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
                                 address.as_str(),
-                                Some(token.as_str()),
+                                Some(activation_code.as_str()),
                             )?;
-                            let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                            let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
 
                             Ok::<(GatewayRuntime, String, GatewayWsConnectSpec), anyhow::Error>((
                                 runtime,
@@ -139,7 +300,7 @@ impl PioneerDesktop {
                         Ok(staged) => staged,
                         Err(error) => {
                             let _ = this.update_in(&mut cx, |view, _window, cx| {
-                                view.finish_add_gateway_form_error_without_switch(
+                                view.finish_gateway_form_error_without_switch(
                                     operation_epoch,
                                     error,
                                     form_state.as_ref(),
@@ -267,7 +428,10 @@ impl PioneerDesktop {
                             );
                             let mut runtime = GatewayRuntime::load()?;
                             let local_start = runtime.ensure_local_gateway_started()?;
-                            let spec = build_ws_connect_spec(&runtime, &local_start.endpoint)?;
+                            let spec = build_local_ws_connect_spec_with_recovery(
+                                &mut runtime,
+                                &local_start.endpoint,
+                            )?;
                             let connection_id = ws_sender.connect_and_wait(spec)?;
                             runtime.activate_gateway(local_start.endpoint.id.as_str())?;
 
@@ -316,7 +480,6 @@ impl PioneerDesktop {
         endpoint_id: String,
         name: String,
         address: String,
-        token: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -354,20 +517,14 @@ impl PioneerDesktop {
                                 anyhow::bail!("{}", t!("errors.gateway.remote_edit_only"));
                             }
 
-                            validate_remote_candidate_gateway_connection(
-                                &runtime,
-                                address.as_str(),
-                                token.as_str(),
-                            )?;
                             let endpoint = runtime.update_remote_gateway(
                                 endpoint_id.as_str(),
                                 name.as_str(),
                                 address.as_str(),
-                                Some(token.as_str()),
                             )?;
                             let was_active =
                                 runtime.active_gateway_id() == Some(endpoint.id.as_str());
-                            let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                            let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
 
                             Ok::<
                                 (GatewayRuntime, GatewayEndpoint, GatewayWsConnectSpec, bool),
@@ -380,7 +537,7 @@ impl PioneerDesktop {
                         Ok(staged) => staged,
                         Err(error) => {
                             let _ = this.update_in(&mut cx, |view, _window, cx| {
-                                view.finish_add_gateway_form_error_without_switch(
+                                view.finish_gateway_form_error_without_switch(
                                     operation_epoch,
                                     error,
                                     form_state.as_ref(),
@@ -507,7 +664,7 @@ impl PioneerDesktop {
                         Ok(staged) => staged,
                         Err(error) => {
                             let _ = this.update_in(&mut cx, |view, _window, cx| {
-                                view.finish_add_gateway_form_error_without_switch(
+                                view.finish_gateway_form_error_without_switch(
                                     operation_epoch,
                                     error,
                                     form_state.as_ref(),
@@ -568,7 +725,14 @@ impl PioneerDesktop {
                                         install_warnings = local_start.warnings;
                                     }
 
-                                    let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                                    let spec = if endpoint.kind == GatewayEndpointKind::Local {
+                                        build_local_ws_connect_spec_with_recovery(
+                                            &mut runtime,
+                                            &endpoint,
+                                        )?
+                                    } else {
+                                        build_ws_connect_spec(&mut runtime, &endpoint)?
+                                    };
                                     let connection_id = if endpoint.kind == GatewayEndpointKind::Remote {
                                         ws_connected_ready = false;
                                         ws_sender.connect_with_retry(spec)?
@@ -721,7 +885,11 @@ impl PioneerDesktop {
                                 endpoint = local_start.endpoint;
                                 install_warnings = local_start.warnings;
                             }
-                            let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                            let spec = if endpoint.kind == GatewayEndpointKind::Local {
+                                build_local_ws_connect_spec_with_recovery(&mut runtime, &endpoint)?
+                            } else {
+                                build_ws_connect_spec(&mut runtime, &endpoint)?
+                            };
                             let (connection_id, ws_connected_ready) =
                                 if endpoint.kind == GatewayEndpointKind::Remote {
                                     (ws_sender.connect_with_retry(spec)?, false)
@@ -774,7 +942,7 @@ impl PioneerDesktop {
         }
     }
 
-    fn finish_add_gateway_form_error_without_switch(
+    fn finish_gateway_form_error_without_switch(
         &mut self,
         operation_epoch: u64,
         error: anyhow::Error,

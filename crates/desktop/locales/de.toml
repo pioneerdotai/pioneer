@@ -99,7 +99,7 @@ copy = "Kopieren"
 name = "Name"
 ok = "OK"
 or = "oder"
-token = "Token"
+activation_code = "Geräteregistrierungscode"
 
 [buttons]
 add = "Hinzufügen"
@@ -271,6 +271,7 @@ add = "Gateway hinzufügen"
 connect_remote = "Entferntes Gateway verbinden"
 delete = "Löschen"
 edit = "Gateway bearbeiten"
+reauthenticate = "Erneut verbinden"
 start_local = "Lokales Gateway starten"
 
 [gateway.add]
@@ -302,6 +303,10 @@ title = "Gateway verbinden"
 [gateway.popover]
 no_available = "Keine verfügbaren Gateways."
 
+[gateway.reauthenticate]
+description = "Geben Sie einen neuen Aktivierungscode ein, um dieses Gerät erneut zu verbinden, ohne das gespeicherte Gateway zu ändern."
+title = "%{name} erneut verbinden"
+
 [gateway.status]
 connected = "Gateway verbunden"
 connecting = "Gateway wird verbunden..."
@@ -324,6 +329,14 @@ unavailable = "Gateway ist nicht verfügbar"
 
 [gateway.notification]
 path_update_skipped = "Gateway gestartet. Für den Befehl `pioneer` müssen Sie %{bin_dir} in einer neuen Terminalsitzung eventuell manuell zu PATH hinzufügen."
+
+[gateway.session_terminal]
+authentication_required = "Melden Sie sich mit einem neuen Geräteregistrierungscode bei diesem Gateway an."
+revoked = "Diese Gerätesitzung wurde abgemeldet oder widerrufen. Bitte erneut anmelden."
+expired = "Diese Gerätesitzung ist abgelaufen. Bitte erneut anmelden."
+compromised = "Diese Sitzung wurde aus Sicherheitsgründen geschlossen. Bitte erneut anmelden."
+gateway_mismatch = "Diese Sitzung gehört zu einem anderen Gateway. Gateway prüfen und erneut koppeln."
+storage_failed = "Pioneer konnte diese Gerätesitzung nicht sicher speichern."
 
 [workspace]
 selector_label = "Arbeitsbereich"
@@ -772,8 +785,33 @@ description = "Verwalten Sie Anwendungseinstellungen."
 [settings.sidebar]
 back = "Zurück"
 general = "Allgemein"
+devices = "Geräte"
 memory = "Speicher"
 self_improvement = "Selbstverbesserung"
+
+[settings.devices]
+title = "Geräte"
+description = "Verwalte die in deinem Konto angemeldeten Geräte."
+loading = "Geräte werden geladen..."
+retry = "Erneut versuchen"
+activate_device = "Gerät registrieren"
+current = "Aktuell"
+last_seen = "Zuletzt gesehen: %{value}"
+unknown_time = "Unbekannt"
+client_desktop = "Desktop"
+client_mobile = "Mobil"
+client_other = "Andere"
+logout = "Abmelden"
+revoke = "Widerrufen"
+logout_confirm_title = "Dieses Gerät abmelden?"
+logout_confirm_description = "Das Gerät verbindet sich erst nach einer erneuten Anmeldung wieder."
+revoke_confirm_title = "%{device} widerrufen?"
+revoke_confirm_description = "Das Gerät wird getrennt und muss erneut registriert werden."
+activation_title = "Weiteres Gerät registrieren"
+activation_description = "Scanne den QR-Code oder gib den Einmalcode auf dem neuen Gerät ein."
+copy_code = "Code kopieren"
+copy_link = "Link kopieren"
+close_activation = "Schließen und widerrufen"
 
 [settings.option.language]
 label = "App-Sprache"

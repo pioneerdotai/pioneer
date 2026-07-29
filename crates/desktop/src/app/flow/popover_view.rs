@@ -249,6 +249,9 @@ impl PioneerDesktop {
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
         let endpoint_address = endpoint.address.clone();
+        let requires_reauthentication = endpoint.kind == GatewayEndpointKind::Remote
+            && endpoint.session_ref.is_none()
+            && endpoint.server_gateway_id.is_none();
         let subtitle = match endpoint.kind {
             GatewayEndpointKind::Local => t!(
                 "gateway.endpoint.local_with_address",
@@ -286,12 +289,21 @@ impl PioneerDesktop {
 
                 move |_, window, cx| {
                     let started = desktop_entity.update(cx, |view, cx| {
-                        view.activate_gateway(
-                            endpoint_id_for_click.clone(),
-                            endpoint_name_for_click.clone(),
-                            window,
-                            cx,
-                        )
+                        if requires_reauthentication {
+                            view.open_reauthenticate_gateway_dialog(
+                                endpoint_id_for_click.clone(),
+                                window,
+                                cx,
+                            );
+                            true
+                        } else {
+                            view.activate_gateway(
+                                endpoint_id_for_click.clone(),
+                                endpoint_name_for_click.clone(),
+                                window,
+                                cx,
+                            )
+                        }
                     });
 
                     if started {

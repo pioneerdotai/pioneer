@@ -69,6 +69,7 @@ impl PioneerDesktop {
     ) -> AnyElement {
         match self.settings_content_view {
             SettingsContentView::General => self.render_settings_general(window, cx),
+            SettingsContentView::Devices => self.render_settings_devices(window, cx),
             SettingsContentView::Memory => self.render_settings_memory(window, cx),
             SettingsContentView::SelfImprovement => {
                 self.render_settings_self_improvement(window, cx)

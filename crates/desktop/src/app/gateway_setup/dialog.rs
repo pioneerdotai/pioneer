@@ -48,6 +48,7 @@ impl PioneerDesktop {
                             form_state.clone(),
                             GatewaySetupFormMode::AddGateway { allow_local },
                             desktop_entity.clone(),
+                            window,
                             cx,
                         )),
                 )
@@ -67,23 +68,12 @@ impl PioneerDesktop {
             return;
         };
 
-        let token = runtime
-            .gateway_auth_token_for_endpoint(&endpoint)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         let desktop_entity = cx.entity().clone();
         let initial_operation = self.gateway_setup_dialog_state().without_error();
         let form_state =
             cx.new(|cx| GatewaySetupFormState::new(window, cx, initial_operation.clone()));
         form_state.update(cx, |state, cx| {
-            state.set_inputs(
-                window,
-                cx,
-                endpoint.name.clone(),
-                endpoint.address.clone(),
-                token.clone(),
-            );
+            state.set_inputs(window, cx, endpoint.name.clone(), endpoint.address.clone());
         });
 
         let endpoint_id = endpoint.id.clone();
@@ -123,6 +113,84 @@ impl PioneerDesktop {
                                 endpoint_id: endpoint_id.clone(),
                             },
                             desktop_entity.clone(),
+                            window,
+                            cx,
+                        )),
+                )
+        });
+    }
+
+    pub(crate) fn open_reauthenticate_gateway_dialog(
+        &mut self,
+        endpoint_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(endpoint) = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.endpoint(endpoint_id.as_str()))
+            .filter(|endpoint| {
+                endpoint.kind == pioneer_client::gateway::types::GatewayEndpointKind::Remote
+                    && endpoint.session_ref.is_none()
+                    && endpoint.server_gateway_id.is_none()
+            })
+        else {
+            return;
+        };
+
+        let desktop_entity = cx.entity().clone();
+        let initial_operation = self.gateway_setup_dialog_state().without_error();
+        let form_state =
+            cx.new(|cx| GatewaySetupFormState::new(window, cx, initial_operation.clone()));
+        let endpoint_id = endpoint.id.clone();
+        let endpoint_name = endpoint.name.clone();
+        let endpoint_address = endpoint.address.clone();
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            form_state.update(cx, |state, cx| {
+                state.focus_activation_input_once(window, cx);
+            });
+            let is_connecting = form_state.read(cx).is_connecting();
+
+            dialog
+                .w(px(384.))
+                .gap_1()
+                .rounded_2xl()
+                .close_button(!is_connecting)
+                .overlay_closable(!is_connecting)
+                .keyboard(!is_connecting)
+                .title(
+                    div().text_base().font_semibold().child(
+                        t!(
+                            "gateway.reauthenticate.title",
+                            name = endpoint_name.as_str()
+                        )
+                        .to_string(),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .opacity(0.6)
+                                .line_height(relative(1.35))
+                                .child(t!("gateway.reauthenticate.description").to_string()),
+                        )
+                        .child(render_gateway_setup_form(
+                            form_state.clone(),
+                            GatewaySetupFormMode::ReauthenticateGateway {
+                                endpoint_id: endpoint_id.clone(),
+                                name: endpoint_name.clone(),
+                                address: endpoint_address.clone(),
+                                close_dialog_on_success: true,
+                            },
+                            desktop_entity.clone(),
+                            window,
                             cx,
                         )),
                 )

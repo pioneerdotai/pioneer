@@ -23,6 +23,12 @@ impl Render for PioneerDesktop {
         };
 
         let is_gateway_setup_required = self.is_gateway_setup_required();
+        let show_gateway_switcher = !is_gateway_setup_required
+            || self
+                .gateway
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.endpoints().is_empty());
         let is_settings_view_active = self.main_content_view == MainContentView::Settings;
         let is_providers_view_active = self.main_content_view == MainContentView::Providers;
         let is_mcp_view_active = self.main_content_view == MainContentView::Mcp;
@@ -37,7 +43,7 @@ impl Render for PioneerDesktop {
         let keepawake_available = !is_gateway_setup_required && self.gateway.settings.is_some();
 
         let body = if is_gateway_setup_required {
-            self.render_initial_setup(cx)
+            self.render_initial_setup(window, cx)
         } else {
             let desktop_entity = cx.entity().clone();
             let content = match self.main_content_view {
@@ -127,7 +133,7 @@ impl Render for PioneerDesktop {
                                     h_flex()
                                         .h_full()
                                         .items_center()
-                                        .child(if !is_gateway_setup_required {
+                                        .child(if show_gateway_switcher {
                                             self.render_gateways_popover(cx)
                                         } else {
                                             div().into_any_element()

@@ -1,5 +1,7 @@
 use crate::gateway::connectivity::is_gateway_reachable;
-use crate::gateway::control::{is_configured_service_active, start_gateway_service};
+use crate::gateway::control::{
+    create_local_pending_device_session, is_configured_service_active, start_gateway_service,
+};
 use crate::gateway::registry::save_registry;
 use anyhow::{Result, bail};
 use pioneer_client::gateway::runtime::{
@@ -57,9 +59,7 @@ impl GatewayRuntime {
 
         match classify_local_gateway_state(reachable, service_active) {
             ActiveGatewayState::Connected => {
-                if self.sync_local_auth_token_from_gateway_request(false)? {
-                    save_registry(&self.registry_path, &self.registry)?;
-                }
+                self.ensure_local_gateway_session()?;
                 Ok(LocalGatewayRecovery::AlreadyRunning)
             }
             ActiveGatewayState::LocalAddressConflict => bail!(
@@ -81,8 +81,10 @@ impl GatewayRuntime {
                 }
 
                 self.registry.active_gateway_id = Some(local_gateway_id.to_owned());
-                let _ = self.sync_local_auth_token_from_gateway_request(true)?;
-                save_registry(&self.registry_path, &self.registry)?;
+                if !self.registry_upgrade_pending() {
+                    save_registry(&self.registry_path, &self.registry)?;
+                }
+                self.ensure_local_gateway_session()?;
                 Ok(LocalGatewayRecovery::Started)
             }
             ActiveGatewayState::NotConfigured => Ok(LocalGatewayRecovery::NotNeeded),
@@ -100,9 +102,7 @@ impl GatewayRuntime {
         let service_active = normalize_local_service_active(reachable, service_active);
 
         if reachable && service_active {
-            if self.sync_local_auth_token_from_gateway_request(false)? {
-                save_registry(&self.registry_path, &self.registry)?;
-            }
+            self.ensure_local_gateway_session()?;
             return Ok(LocalGatewayStartOutcome {
                 endpoint: self.local_gateway()?.clone(),
                 warnings,
@@ -126,13 +126,35 @@ impl GatewayRuntime {
             &self.timings,
         )?);
 
-        if self.sync_local_auth_token_from_gateway_request(true)? {
-            save_registry(&self.registry_path, &self.registry)?;
-        }
+        self.ensure_local_gateway_session()?;
 
         Ok(LocalGatewayStartOutcome {
             endpoint: self.local_gateway()?.clone(),
             warnings,
         })
+    }
+
+    fn ensure_local_gateway_session(&mut self) -> Result<()> {
+        let endpoint = self.local_gateway()?.clone();
+        if endpoint.session_ref.is_some()
+            && endpoint.server_gateway_id.is_some()
+            && let Some(session_ref) = endpoint.session_ref.as_deref()
+            && self.secrets.get_gateway_session(session_ref)?.is_some()
+        {
+            return Ok(());
+        }
+
+        // Local creation is authorized by access to the Gateway host. The
+        // one-time activation code remains only in this Zeroizing value and is
+        // used immediately unless a crash-safe durable envelope is adopted. In
+        // that recovery case its embedded GatewayId still proves that the
+        // envelope belongs to the currently running local Gateway, while the
+        // newly created pending session remains unused and expires normally.
+        let activation_code = create_local_pending_device_session()?;
+        if endpoint.session_ref.is_some() || endpoint.server_gateway_id.is_some() {
+            self.clear_gateway_session_binding_durably(endpoint.id.as_str())?;
+        }
+        self.provision_gateway_session(endpoint.id.as_str(), activation_code.as_str())?;
+        Ok(())
     }
 }

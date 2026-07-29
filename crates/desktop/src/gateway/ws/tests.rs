@@ -877,6 +877,7 @@ fn connect_spec(endpoint_id: &str, endpoint_name: &str, address: &str) -> Gatewa
         endpoint_kind: GatewayEndpointKind::Remote,
         address: address.to_owned(),
         auth_token: None,
+        session: None,
         timings: GatewayWsTimings {
             connect_timeout: Duration::from_millis(600),
             ping_interval: Duration::from_millis(120),
