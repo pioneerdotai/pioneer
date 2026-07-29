@@ -753,6 +753,8 @@ pub async fn rotate_current_refresh<C: ConnectionTrait>(
     consumed_at: DateTimeWithTimeZone,
     retain_until: DateTimeWithTimeZone,
 ) -> Result<bool> {
+    let expected_generation =
+        i64::try_from(expected_generation).context("refresh generation overflow")?;
     let result = auth_refresh_credential::Entity::update_many()
         .col_expr(
             auth_refresh_credential::Column::Status,
@@ -772,14 +774,38 @@ pub async fn rotate_current_refresh<C: ConnectionTrait>(
         )
         .filter(auth_refresh_credential::Column::Id.eq(current_id.to_string()))
         .filter(auth_refresh_credential::Column::Status.eq("current"))
-        .filter(
-            auth_refresh_credential::Column::Generation
-                .eq(i64::try_from(expected_generation).context("refresh generation overflow")?),
-        )
+        .filter(auth_refresh_credential::Column::Generation.eq(expected_generation))
         .exec(db)
         .await
         .context("failed to rotate current refresh credential")?;
-    Ok(result.rows_affected == 1)
+    if result.rows_affected != 1 {
+        return Ok(false);
+    }
+
+    let statement = Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "UPDATE auth_refresh_credential \
+         SET expires_at = ? \
+         WHERE status = 'rotated' \
+         AND generation <= ? \
+         AND julianday(expires_at) < julianday(?) \
+         AND EXISTS (\
+            SELECT 1 FROM auth_refresh_credential rotated \
+            WHERE rotated.id = ? \
+            AND rotated.session_id = auth_refresh_credential.session_id \
+            AND rotated.token_family_id = auth_refresh_credential.token_family_id\
+         )",
+        [
+            retain_until.into(),
+            expected_generation.into(),
+            retain_until.into(),
+            current_id.to_string().into(),
+        ],
+    );
+    db.execute_raw(statement)
+        .await
+        .context("failed to extend rotated refresh retention")?;
+    Ok(true)
 }
 
 pub async fn advance_auth_session_refresh<C: ConnectionTrait>(
@@ -875,6 +901,35 @@ pub async fn cleanup_terminal_refresh_evidence<C: ConnectionTrait>(
         .await
         .map(|result| result.rows_affected())
         .context("failed to clean retained refresh evidence")
+}
+
+pub async fn repair_rotated_refresh_retention<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let statement = Statement::from_string(
+        db.get_database_backend(),
+        "UPDATE auth_refresh_credential AS predecessor \
+         SET expires_at = (\
+            SELECT descendant.expires_at \
+            FROM auth_refresh_credential descendant \
+            WHERE descendant.session_id = predecessor.session_id \
+            AND descendant.token_family_id = predecessor.token_family_id \
+            AND descendant.generation > predecessor.generation \
+            ORDER BY julianday(descendant.expires_at) DESC, descendant.generation DESC \
+            LIMIT 1\
+         ) \
+         WHERE predecessor.status = 'rotated' \
+         AND EXISTS (\
+            SELECT 1 FROM auth_refresh_credential descendant \
+            WHERE descendant.session_id = predecessor.session_id \
+            AND descendant.token_family_id = predecessor.token_family_id \
+            AND descendant.generation > predecessor.generation \
+            AND julianday(descendant.expires_at) > julianday(predecessor.expires_at)\
+         )"
+        .to_owned(),
+    );
+    db.execute_raw(statement)
+        .await
+        .map(|result| result.rows_affected())
+        .context("failed to repair rotated refresh retention")
 }
 
 pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(

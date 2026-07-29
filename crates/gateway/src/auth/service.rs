@@ -2389,7 +2389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotated_refresh_evidence_is_retained_for_the_successor_ttl() {
+    async fn rotated_refresh_evidence_chain_is_retained_for_the_successor_ttl() {
         let (service, _) = fixture().await;
         let initial_grant = service
             .create_initial_session_with_ids(
@@ -2414,6 +2414,22 @@ mod tests {
             )
             .await
             .unwrap();
+        service
+            .database
+            .execute_unprepared(
+                "UPDATE auth_refresh_credential \
+                 SET expires_at = datetime(expires_at, '-1 day') \
+                 WHERE generation = 0",
+            )
+            .await
+            .unwrap();
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(rotated.refresh_token.expose_secret()),
+                refresh_params(2),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             count_where(
                 &service.database,
@@ -2423,7 +2439,13 @@ mod tests {
                 )"
             )
             .await,
-            1
+            2
+        );
+        assert!(
+            pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                .await
+                .unwrap()
+                .is_valid()
         );
         assert_eq!(
             service

@@ -25,8 +25,9 @@ pub use repositories::auth_session::{
     load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
     load_pending_session_for_creator, load_refresh_by_hash, load_session,
     load_session_by_activation_hash, mark_device_revoked, mark_session_revoked,
-    record_failed_device_activation, refresh_status_to_db, revoke_current_refresh_for_session,
-    revoke_reason_to_db, revoke_session_family_for_refresh_reuse, rotate_current_refresh,
+    record_failed_device_activation, refresh_status_to_db, repair_rotated_refresh_retention,
+    revoke_current_refresh_for_session, revoke_reason_to_db,
+    revoke_session_family_for_refresh_reuse, rotate_current_refresh,
     scan_auth_persistence_invariants, touch_active_auth_session, touch_active_device,
 };
 pub use repositories::identity::{
