@@ -174,21 +174,19 @@ struct StoredSecretMeta {
     updated_at_unix: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredSecretMetaWire {
+    schema: u8,
+    kind: String,
+    label: Option<String>,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+}
+
 impl From<SecretMeta> for StoredSecretMeta {
     fn from(value: SecretMeta) -> Self {
         Self {
             schema: METADATA_SCHEMA,
-            kind: value.kind,
-            label: value.label,
-            created_at_unix: value.created_at_unix,
-            updated_at_unix: value.updated_at_unix,
-        }
-    }
-}
-
-impl From<StoredSecretMeta> for SecretMeta {
-    fn from(value: StoredSecretMeta) -> Self {
-        Self {
             kind: value.kind,
             label: value.label,
             created_at_unix: value.created_at_unix,
@@ -207,7 +205,7 @@ fn decode_meta(comment: Option<&str>) -> Result<Option<SecretMeta>> {
         return Ok(None);
     };
 
-    let meta = serde_json::from_str::<StoredSecretMeta>(comment)
+    let meta = serde_json::from_str::<StoredSecretMetaWire>(comment)
         .map_err(|err| KeystoreError::MetadataDecodeFailed(err.to_string()))?;
     if meta.schema != METADATA_SCHEMA {
         return Err(KeystoreError::MetadataDecodeFailed(format!(
@@ -216,7 +214,20 @@ fn decode_meta(comment: Option<&str>) -> Result<Option<SecretMeta>> {
         )));
     }
 
-    Ok(Some(meta.into()))
+    let Ok(kind) = serde_json::from_value::<SecretKind>(serde_json::Value::String(meta.kind))
+    else {
+        // Secret kinds can be retired while their credential entries still
+        // exist in an older runtime home. Keep service-based enumeration
+        // available so the owning upgrade path can delete those entries.
+        return Ok(None);
+    };
+
+    Ok(Some(SecretMeta {
+        kind,
+        label: meta.label,
+        created_at_unix: meta.created_at_unix,
+        updated_at_unix: meta.updated_at_unix,
+    }))
 }
 
 fn is_not_found(err: &keyring_core::Error) -> bool {
@@ -243,6 +254,60 @@ mod tests {
         let store =
             DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(dir.path())).expect("open store");
         (dir, store)
+    }
+
+    #[test]
+    fn retired_secret_kind_metadata_is_treated_as_unavailable() {
+        let decoded = decode_meta(Some(
+            r#"{"schema":1,"kind":"desktop_gateway_auth_token","label":"Legacy Gateway","created_at_unix":1,"updated_at_unix":2}"#,
+        ))
+        .expect("retired metadata must remain enumerable");
+
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn retired_secret_metadata_remains_listable_and_deletable_by_service() {
+        let (_dir, store) = open_temp_store();
+        let raw = store.raw_store().expect("open raw store");
+        for (service, user, kind) in [
+            (
+                "pioneer.desktop.gateway_auth_token",
+                "remote-123",
+                "desktop_gateway_auth_token",
+            ),
+            (
+                "pioneer.gateway.superuser_jwt_token",
+                "superuser",
+                "superuser_jwt_token",
+            ),
+        ] {
+            let entry = raw.build(service, user, None).expect("build retired entry");
+            entry
+                .set_password("retired-secret")
+                .expect("write retired entry");
+            let comment = format!(
+                r#"{{"schema":1,"kind":"{kind}","label":"Legacy Gateway","created_at_unix":1,"updated_at_unix":2}}"#
+            );
+            entry
+                .update_attributes(&HashMap::from([("comment", comment.as_str())]))
+                .expect("write retired metadata");
+
+            let entries = store
+                .list(SecretFilter::Service(service.to_owned()))
+                .expect("list retired service");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id.service(), service);
+            assert_eq!(entries[0].id.user(), user);
+            assert_eq!(entries[0].kind, None);
+            assert!(store.delete(&entries[0].id).expect("delete retired entry"));
+            assert!(
+                store
+                    .list(SecretFilter::Service(service.to_owned()))
+                    .expect("list deleted retired service")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

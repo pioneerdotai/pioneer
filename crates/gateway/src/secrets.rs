@@ -18,6 +18,7 @@ use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
 
 const WORKSPACE_PROVIDER_API_KEY_PREFIX: &str = "workspace:";
 const AUTH_KEY_INITIALIZATION_LOCK_FILE_NAME: &str = ".gateway-auth-key-init.lock";
+const RETIRED_SUPERUSER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.superuser_jwt_token";
 
 #[derive(Clone)]
 pub(crate) struct GatewaySecrets {
@@ -624,6 +625,26 @@ impl GatewaySecrets {
             "Gateway auth credential HMAC key",
             size_bytes,
         )
+    }
+
+    pub(crate) fn purge_retired_superuser_jwt_tokens(&self) -> Result<usize> {
+        let entries = self
+            .store
+            .list(SecretFilter::Service(
+                RETIRED_SUPERUSER_JWT_TOKEN_SERVICE.to_owned(),
+            ))
+            .context("failed to list retired Superuser JWT credentials")?;
+        let mut deleted = 0usize;
+        for entry in entries {
+            if self
+                .store
+                .delete(&entry.id)
+                .context("failed to delete retired Superuser JWT credential")?
+            {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        Ok(deleted)
     }
 
     fn load_or_create_auth_key(

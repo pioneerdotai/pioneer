@@ -26,7 +26,7 @@ pub(crate) const TEST_REFRESH_TOKEN_1: &str =
     "prf_test_111111111111111111111111111111111111111111111111";
 pub(crate) const TEST_DEVICE_ACTIVATION_CODE: &str = "K7M4-P9Q2";
 
-const EPIC_3_MIGRATION: &str = "m20260727_000003_device_sessions";
+const EPIC_2_MIGRATION: &str = "m20260726_000002_gateway_identity_foundation";
 const ISOLATED_RUNTIME_PREFIX: &str = ".pioneer.epic03-test-";
 const PRODUCTION_RUNTIME_DIRECTORY: &str = ".pioneer";
 
@@ -223,8 +223,9 @@ pub(crate) async fn populated_epic2_database() -> PopulatedEpic2Database {
         .expect("connect populated Epic 2 fixture database");
     let migration_count = Migrator::migrations()
         .into_iter()
-        .take_while(|migration| migration.name() != EPIC_3_MIGRATION)
-        .count();
+        .position(|migration| migration.name() == EPIC_2_MIGRATION)
+        .map(|index| index + 1)
+        .expect("Epic 2 identity migration is registered");
     let migration_count = u32::try_from(migration_count).expect("migration count fits u32");
     Migrator::up(&database, Some(migration_count))
         .await

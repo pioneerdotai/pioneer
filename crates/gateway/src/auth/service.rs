@@ -29,8 +29,8 @@ use pioneer_protocol::{
     RefreshCredentialId, RequestId, TokenFamilyId, format_device_activation_code, generate_id,
 };
 use sea_orm::{
-    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
@@ -184,6 +184,13 @@ impl GatewayAuthService {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
             })
+            .await
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        // The rotated row points at its successor while the partial unique index permits only
+        // one current credential. Defer the self-referential FK until commit so the predecessor
+        // can be rotated before the successor is inserted in this same atomic transaction.
+        transaction
+            .execute_unprepared("PRAGMA defer_foreign_keys = ON")
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let current = match load_refresh_by_hash(&transaction, &presented_hash)

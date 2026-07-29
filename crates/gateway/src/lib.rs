@@ -224,6 +224,21 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     ensure_auth_readiness(&database, identity_snapshot.as_ref())
         .await
         .context("Gateway auth readiness failed")?;
+    match gateway_secrets.purge_retired_superuser_jwt_tokens() {
+        Ok(0) => {}
+        Ok(deleted_credentials) => {
+            info!(
+                deleted_credentials,
+                "retired Superuser JWT credentials removed"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "failed to remove retired Superuser JWT credentials; cleanup will retry on the next Gateway start"
+            );
+        }
+    }
     let cleaned_refresh_evidence = auth_service
         .cleanup_refresh_evidence(crate::helpers::unix_timestamp_secs()?, 256)
         .await
@@ -812,6 +827,12 @@ pub async fn create_device(
         .load_or_create_access_jwt_signing_key(config.gateway.auth.secret_size_bytes)?;
     let credential_hmac_key = gateway_secrets
         .load_or_create_auth_credential_hmac_key(config.gateway.auth.secret_size_bytes)?;
+    if let Err(error) = gateway_secrets.purge_retired_superuser_jwt_tokens() {
+        warn!(
+            error = %format!("{error:#}"),
+            "failed to remove retired Superuser JWT credentials; device creation can continue because retired credentials are not accepted"
+        );
+    }
     let service = GatewayAuthService::new(
         database,
         config.gateway.auth.clone(),

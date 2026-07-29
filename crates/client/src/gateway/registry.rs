@@ -60,7 +60,22 @@ pub fn default_registry(config: &GatewayRegistryConfig) -> GatewayRegistry {
 }
 
 pub fn setup_required(registry: &GatewayRegistry) -> bool {
-    registry.active_gateway_id.is_none()
+    let Some(active_gateway_id) = registry.active_gateway_id.as_deref() else {
+        return true;
+    };
+    let endpoint = registry
+        .local
+        .as_ref()
+        .filter(|endpoint| endpoint.id == active_gateway_id)
+        .or_else(|| {
+            registry
+                .remotes
+                .iter()
+                .find(|endpoint| endpoint.id == active_gateway_id)
+        });
+    endpoint.is_none_or(|endpoint| {
+        endpoint.session_ref.is_none() || endpoint.server_gateway_id.is_none()
+    })
 }
 
 pub fn normalize_registry<G>(
@@ -446,6 +461,18 @@ mod tests {
             local.server_gateway_id,
             Some(gateway_id("G00000000000000000001"))
         );
+    }
+
+    #[test]
+    fn setup_is_required_until_the_active_endpoint_has_a_complete_session_binding() {
+        let mut registry = default_registry(&config());
+        registry.active_gateway_id = Some("local".to_owned());
+        assert!(setup_required(&registry));
+
+        let local = registry.local.as_mut().expect("local endpoint");
+        local.session_ref = Some("local-session".to_owned());
+        local.server_gateway_id = Some(gateway_id("G00000000000000000001"));
+        assert!(!setup_required(&registry));
     }
 
     #[test]
