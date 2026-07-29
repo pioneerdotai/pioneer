@@ -7,6 +7,38 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "auth_session_revoked"
+        },
+        "params": {
+          "$ref": "#/$defs/AuthSessionRevokedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "auth_access_expiring"
+        },
+        "params": {
+          "$ref": "#/$defs/AuthAccessExpiringNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "workspace_changed"
         },
         "params": {
@@ -1963,6 +1995,52 @@
         "received_bytes",
         "total_size_bytes",
         "next_offset"
+      ]
+    },
+    "AuthAccessExpiringNotification": {
+      "type": "object",
+      "properties": {
+        "access_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        }
+      },
+      "required": [
+        "session_id",
+        "access_expires_at_unix"
+      ]
+    },
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AuthSessionRevokedNotification": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/AuthSessionTerminationReason"
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        }
+      },
+      "required": [
+        "session_id",
+        "reason"
+      ]
+    },
+    "AuthSessionTerminationReason": {
+      "type": "string",
+      "enum": [
+        "session_revoked",
+        "session_expired",
+        "session_compromised"
       ]
     },
     "ByteRange": {

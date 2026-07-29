@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ThreadAgentsDocSaveReason",
+  "title": "GatewayIdPinValidation",
   "type": "string",
   "enum": [
-    "autosave",
-    "manual"
+    "establish",
+    "matched"
   ]
 }

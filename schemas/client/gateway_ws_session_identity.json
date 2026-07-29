@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayWsSessionIdentity",
+  "type": "object",
+  "properties": {
+    "access_expires_at_unix": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "device_id": {
+      "$ref": "#/$defs/DeviceId"
+    },
+    "refresh_leeway_seconds": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "server_gateway_id": {
+      "$ref": "#/$defs/GatewayId"
+    },
+    "session_id": {
+      "$ref": "#/$defs/AuthSessionId"
+    }
+  },
+  "required": [
+    "server_gateway_id",
+    "session_id",
+    "device_id",
+    "access_expires_at_unix",
+    "refresh_leeway_seconds"
+  ],
+  "$defs": {
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

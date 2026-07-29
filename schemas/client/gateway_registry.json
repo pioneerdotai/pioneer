@@ -9,6 +9,12 @@
         "null"
       ]
     },
+    "installation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "local": {
       "anyOf": [
         {
@@ -43,12 +49,6 @@
         "address": {
           "type": "string"
         },
-        "auth_token_ref": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "id": {
           "type": "string"
         },
@@ -58,7 +58,23 @@
         "name": {
           "type": "string"
         },
+        "server_gateway_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_ref": {
           "type": [
             "string",
             "null"
@@ -86,6 +102,12 @@
         "local",
         "remote"
       ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     }
   }
 }
