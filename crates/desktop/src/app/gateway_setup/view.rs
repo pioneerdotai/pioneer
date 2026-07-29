@@ -287,12 +287,12 @@ fn activation_code_cell_size(mode: &GatewaySetupFormMode) -> Pixels {
         | GatewaySetupFormMode::ReauthenticateGateway {
             close_dialog_on_success: false,
             ..
-        } => px(38.25), // 8 * 38.25 + 6 * 4 + 20 = 350 px.
+        } => px(32.), // 8 * 38.25 + 6 * 4 + 20 = 350 px.
         GatewaySetupFormMode::AddGateway { .. }
         | GatewaySetupFormMode::ReauthenticateGateway {
             close_dialog_on_success: true,
             ..
-        } => px(36.25), // 8 * 36.25 + 6 * 4 + 20 = 334 px.
+        } => px(32.), // 8 * 36.25 + 6 * 4 + 20 = 334 px.
         GatewaySetupFormMode::EditGateway { .. } => px(32.),
     }
 }
