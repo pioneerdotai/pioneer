@@ -288,11 +288,13 @@ embedding_normalized = true
 [gateway.auth]
 jwt_issuer = "pioneer"
 jwt_audience = "pioneer-clients"
-superuser_subject = "superuser"
-superuser_role = "superuser"
 secret_size_bytes = 64
-token_ttl_seconds = 31536000
-token_refresh_leeway_seconds = 86400
+token_refresh_leeway_seconds = 300
+access_token_ttl_seconds = 900
+refresh_token_ttl_seconds = 7776000
+device_activation_code_ttl_seconds = 600
+auth_exchange_timeout_seconds = 15
+opaque_token_size_bytes = 32
 
 [desktop.gateway]
 connect_timeout_ms = 300
@@ -305,4 +307,4 @@ ws_reconnect_max_ms = 10000
 ws_reconnect_jitter_percent = 20
 registry_file_name = "gateway-registry.toml"
 local_gateway_id = "local"
-registry_version = 1
+registry_version = 2

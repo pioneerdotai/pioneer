@@ -2670,14 +2670,99 @@ pub struct GatewayDatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayAuthConfig {
     pub jwt_issuer: String,
     pub jwt_audience: String,
-    pub superuser_subject: String,
-    pub superuser_role: String,
     pub secret_size_bytes: usize,
-    pub token_ttl_seconds: u64,
     pub token_refresh_leeway_seconds: u64,
+    #[serde(default = "default_gateway_access_token_ttl_seconds")]
+    pub access_token_ttl_seconds: u64,
+    #[serde(default = "default_gateway_refresh_token_ttl_seconds")]
+    pub refresh_token_ttl_seconds: u64,
+    #[serde(default = "default_gateway_device_activation_code_ttl_seconds")]
+    pub device_activation_code_ttl_seconds: u64,
+    #[serde(default = "default_gateway_auth_exchange_timeout_seconds")]
+    pub auth_exchange_timeout_seconds: u64,
+    #[serde(default = "default_gateway_opaque_token_size_bytes")]
+    pub opaque_token_size_bytes: usize,
+}
+
+const fn default_gateway_access_token_ttl_seconds() -> u64 {
+    15 * 60
+}
+
+const fn default_gateway_refresh_token_ttl_seconds() -> u64 {
+    90 * 24 * 60 * 60
+}
+
+const fn default_gateway_device_activation_code_ttl_seconds() -> u64 {
+    10 * 60
+}
+
+const fn default_gateway_auth_exchange_timeout_seconds() -> u64 {
+    15
+}
+
+const fn default_gateway_opaque_token_size_bytes() -> usize {
+    32
+}
+
+const MAX_GATEWAY_REFRESH_TOKEN_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
+const MAX_GATEWAY_OPAQUE_TOKEN_SIZE_BYTES: usize = 128;
+
+impl GatewayAuthConfig {
+    pub fn validate_session_security(&self) -> Result<()> {
+        if self.jwt_issuer.trim().is_empty() || self.jwt_audience.trim().is_empty() {
+            bail!("gateway.auth JWT issuer and audience must not be empty");
+        }
+        if self.secret_size_bytes < 32 {
+            bail!("gateway.auth.secret_size_bytes must be at least 32");
+        }
+        if !(60..=3_600).contains(&self.access_token_ttl_seconds) {
+            bail!("gateway.auth.access_token_ttl_seconds must be between 60 and 3600");
+        }
+        if self.refresh_token_ttl_seconds <= self.access_token_ttl_seconds {
+            bail!("gateway.auth.refresh_token_ttl_seconds must exceed access_token_ttl_seconds");
+        }
+        if self.refresh_token_ttl_seconds > MAX_GATEWAY_REFRESH_TOKEN_TTL_SECONDS {
+            bail!("gateway.auth.refresh_token_ttl_seconds must not exceed 365 days");
+        }
+        if !(60..=3_600).contains(&self.device_activation_code_ttl_seconds) {
+            bail!("gateway.auth.device_activation_code_ttl_seconds must be between 60 and 3600");
+        }
+        if !(1..=60).contains(&self.auth_exchange_timeout_seconds) {
+            bail!("gateway.auth.auth_exchange_timeout_seconds must be between 1 and 60");
+        }
+        if !(32..=MAX_GATEWAY_OPAQUE_TOKEN_SIZE_BYTES).contains(&self.opaque_token_size_bytes) {
+            bail!("gateway.auth.opaque_token_size_bytes must be between 32 and 128");
+        }
+        if self.token_refresh_leeway_seconds == 0
+            || self.token_refresh_leeway_seconds >= self.access_token_ttl_seconds
+        {
+            bail!(
+                "gateway.auth.token_refresh_leeway_seconds must be positive and less than access_token_ttl_seconds"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for GatewayAuthConfig {
+    fn default() -> Self {
+        Self {
+            jwt_issuer: "pioneer".to_owned(),
+            jwt_audience: "pioneer-clients".to_owned(),
+            secret_size_bytes: 64,
+            token_refresh_leeway_seconds: 300,
+            access_token_ttl_seconds: default_gateway_access_token_ttl_seconds(),
+            refresh_token_ttl_seconds: default_gateway_refresh_token_ttl_seconds(),
+            device_activation_code_ttl_seconds: default_gateway_device_activation_code_ttl_seconds(
+            ),
+            auth_exchange_timeout_seconds: default_gateway_auth_exchange_timeout_seconds(),
+            opaque_token_size_bytes: default_gateway_opaque_token_size_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4637,6 +4722,83 @@ model = " claude-sonnet "
         assert!(serialized.contains("proactive_writes_model = \"thread\""));
         assert!(!serialized.contains("[active_recall_model]"));
         assert!(!serialized.contains("[proactive_writes_model]"));
+    }
+
+    #[test]
+    fn gateway_auth_session_defaults_are_secure_and_valid() {
+        let config = toml::from_str::<super::GatewayAuthConfig>(
+            r#"
+jwt_issuer = "pioneer"
+jwt_audience = "pioneer-clients"
+secret_size_bytes = 64
+token_refresh_leeway_seconds = 300
+"#,
+        )
+        .expect("minimal auth config remains parseable");
+
+        assert_eq!(config.access_token_ttl_seconds, 900);
+        assert_eq!(config.refresh_token_ttl_seconds, 7_776_000);
+        assert_eq!(config.device_activation_code_ttl_seconds, 600);
+        assert_eq!(config.auth_exchange_timeout_seconds, 15);
+        assert_eq!(config.opaque_token_size_bytes, 32);
+        config.validate_session_security().expect("secure defaults");
+    }
+
+    #[test]
+    fn gateway_auth_config_rejects_removed_shared_jwt_fields() {
+        for removed_field in [
+            r#"superuser_subject = "superuser""#,
+            r#"superuser_role = "superuser""#,
+            "token_ttl_seconds = 31536000",
+        ] {
+            let config = format!(
+                r#"
+jwt_issuer = "pioneer"
+jwt_audience = "pioneer-clients"
+secret_size_bytes = 64
+token_refresh_leeway_seconds = 300
+{removed_field}
+"#
+            );
+            let error = toml::from_str::<super::GatewayAuthConfig>(&config)
+                .expect_err("removed shared-JWT config must fail closed");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for `{removed_field}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_auth_session_validation_rejects_insecure_combinations() {
+        let mut config = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new())
+            .expect("default config")
+            .gateway
+            .auth;
+        config.validate_session_security().expect("secure defaults");
+
+        config.opaque_token_size_bytes = 31;
+        assert!(config.validate_session_security().is_err());
+        config.opaque_token_size_bytes = 32;
+        config.opaque_token_size_bytes = 129;
+        assert!(config.validate_session_security().is_err());
+        config.opaque_token_size_bytes = 32;
+        config.refresh_token_ttl_seconds = config.access_token_ttl_seconds;
+        assert!(config.validate_session_security().is_err());
+        config.refresh_token_ttl_seconds = 366 * 24 * 60 * 60;
+        assert!(config.validate_session_security().is_err());
+        config.refresh_token_ttl_seconds = 7_776_000;
+        config.token_refresh_leeway_seconds = config.access_token_ttl_seconds;
+        assert!(config.validate_session_security().is_err());
+        config.token_refresh_leeway_seconds = 300;
+        config.secret_size_bytes = 31;
+        assert!(config.validate_session_security().is_err());
+        config.secret_size_bytes = 64;
+        config.device_activation_code_ttl_seconds = 0;
+        assert!(config.validate_session_security().is_err());
+        config.device_activation_code_ttl_seconds = 600;
+        config.jwt_issuer.clear();
+        assert!(config.validate_session_security().is_err());
     }
 
     fn write_file(path: &PathBuf, content: &str) {
