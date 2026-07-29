@@ -316,15 +316,20 @@ mod tests {
     #[test]
     fn delete_existing_and_missing() {
         let (_dir, store) = open_temp_store();
-        let id = SecretId::superuser_jwt_token();
+        let id = SecretId::gateway_access_jwt_signing_key();
 
         assert!(!store.delete(&id).expect("delete missing"));
 
         store
             .put_string(
                 &id,
-                "jwt-secret",
-                meta(SecretKind::SuperuserJwtToken, "superuser jwt", 1, 1),
+                "access-jwt-secret",
+                meta(
+                    SecretKind::GatewayAccessJwtSigningKey,
+                    "Gateway access JWT",
+                    1,
+                    1,
+                ),
             )
             .expect("put");
 
@@ -382,15 +387,15 @@ mod tests {
     fn reopening_db_preserves_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = DbKeyStoreConfig::for_runtime_home(dir.path());
-        let id = SecretId::desktop_gateway_auth_token("endpoint").expect("id");
+        let id = SecretId::desktop_gateway_session("endpoint").expect("id");
 
         {
             let store = DbKeyStore::open(config.clone()).expect("open first");
             store
                 .put_string(
                     &id,
-                    "desktop-token",
-                    meta(SecretKind::DesktopGatewayAuthToken, "endpoint", 30, 30),
+                    "desktop-session",
+                    meta(SecretKind::DesktopGatewaySession, "endpoint", 30, 30),
                 )
                 .expect("put");
         }
@@ -398,11 +403,11 @@ mod tests {
         let reopened = DbKeyStore::open(config).expect("open second");
         assert_eq!(
             reopened.get_string(&id).expect("read reopened"),
-            Some("desktop-token".to_owned())
+            Some("desktop-session".to_owned())
         );
         let entries = reopened.list(SecretFilter::All).expect("list reopened");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, Some(SecretKind::DesktopGatewayAuthToken));
+        assert_eq!(entries[0].kind, Some(SecretKind::DesktopGatewaySession));
     }
 
     #[test]

@@ -112,7 +112,7 @@ mod tests {
     fn list_all_and_by_kind_without_values() {
         let store = MemorySecretStore::new();
         let provider_id = SecretId::provider_api_key("openrouter").expect("provider id");
-        let jwt_id = SecretId::superuser_jwt_token();
+        let jwt_id = SecretId::gateway_access_jwt_signing_key();
 
         store
             .put_string(
@@ -125,7 +125,11 @@ mod tests {
             .put_string(
                 &jwt_id,
                 "secret-jwt-value",
-                meta(SecretKind::SuperuserJwtToken, "superuser jwt", 2),
+                meta(
+                    SecretKind::GatewayAccessJwtSigningKey,
+                    "Gateway access JWT",
+                    2,
+                ),
             )
             .expect("put jwt");
 
@@ -145,13 +149,13 @@ mod tests {
     #[test]
     fn list_by_service() {
         let store = MemorySecretStore::new();
-        let id = SecretId::desktop_gateway_auth_token("endpoint").expect("desktop id");
+        let id = SecretId::desktop_gateway_session("endpoint").expect("desktop id");
 
         store
             .put_string(
                 &id,
-                "desktop-token",
-                meta(SecretKind::DesktopGatewayAuthToken, "endpoint", 1),
+                "desktop-session",
+                meta(SecretKind::DesktopGatewaySession, "endpoint", 1),
             )
             .expect("put");
 

@@ -7,11 +7,13 @@ pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
 pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
-pub const SUPERUSER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.superuser_jwt_token";
+pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access_jwt_signing_key";
+pub const GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE: &str =
+    "pioneer.gateway.auth_credential_hmac_key";
 pub const GATEWAY_REMOTE_ACCESS_SECRET_SERVICE: &str = "pioneer.gateway.remote_access_secret";
-pub const DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE: &str = "pioneer.desktop.gateway_auth_token";
+pub const DESKTOP_GATEWAY_SESSION_SERVICE: &str = "pioneer.desktop.gateway_session";
 
-const SUPERUSER_JWT_TOKEN_USER: &str = "superuser";
+const GATEWAY_AUTH_KEY_USER: &str = "gateway";
 const MAX_SPECIFIER_LEN: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,10 +60,17 @@ impl SecretId {
         Self::from_service_user(USER_JWT_TOKEN_SERVICE, token_id)
     }
 
-    pub fn superuser_jwt_token() -> Self {
+    pub fn gateway_access_jwt_signing_key() -> Self {
         Self {
-            service: SUPERUSER_JWT_TOKEN_SERVICE.to_owned(),
-            user: SUPERUSER_JWT_TOKEN_USER.to_owned(),
+            service: GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE.to_owned(),
+            user: GATEWAY_AUTH_KEY_USER.to_owned(),
+        }
+    }
+
+    pub fn gateway_auth_credential_hmac_key() -> Self {
+        Self {
+            service: GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE.to_owned(),
+            user: GATEWAY_AUTH_KEY_USER.to_owned(),
         }
     }
 
@@ -70,9 +79,9 @@ impl SecretId {
         Self::from_service_user(MCP_SECRET_SERVICE, ref_id)
     }
 
-    pub fn desktop_gateway_auth_token(endpoint_id: &str) -> Result<Self> {
-        let endpoint_id = validate_user("desktop endpoint id", endpoint_id)?;
-        Self::from_service_user(DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE, endpoint_id)
+    pub fn desktop_gateway_session(session_ref: &str) -> Result<Self> {
+        let session_ref = validate_user("desktop Gateway session ref", session_ref)?;
+        Self::from_service_user(DESKTOP_GATEWAY_SESSION_SERVICE, session_ref)
     }
 
     pub fn gateway_remote_access_secret(secret_ref: &str) -> Result<Self> {
@@ -106,9 +115,10 @@ pub enum SecretKind {
     CliRuntimeProxy,
     McpSecret,
     UserJwtToken,
-    SuperuserJwtToken,
+    GatewayAccessJwtSigningKey,
+    GatewayAuthCredentialHmacKey,
     GatewayRemoteAccessSecret,
-    DesktopGatewayAuthToken,
+    DesktopGatewaySession,
 }
 
 impl SecretKind {
@@ -119,9 +129,10 @@ impl SecretKind {
             SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
-            SecretKind::SuperuserJwtToken => SUPERUSER_JWT_TOKEN_SERVICE,
+            SecretKind::GatewayAccessJwtSigningKey => GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE,
+            SecretKind::GatewayAuthCredentialHmacKey => GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE,
             SecretKind::GatewayRemoteAccessSecret => GATEWAY_REMOTE_ACCESS_SECRET_SERVICE,
-            SecretKind::DesktopGatewayAuthToken => DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE,
+            SecretKind::DesktopGatewaySession => DESKTOP_GATEWAY_SESSION_SERVICE,
         }
     }
 
@@ -132,9 +143,12 @@ impl SecretKind {
             CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
-            SUPERUSER_JWT_TOKEN_SERVICE => Some(SecretKind::SuperuserJwtToken),
+            GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE => Some(SecretKind::GatewayAccessJwtSigningKey),
+            GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE => {
+                Some(SecretKind::GatewayAuthCredentialHmacKey)
+            }
             GATEWAY_REMOTE_ACCESS_SECRET_SERVICE => Some(SecretKind::GatewayRemoteAccessSecret),
-            DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE => Some(SecretKind::DesktopGatewayAuthToken),
+            DESKTOP_GATEWAY_SESSION_SERVICE => Some(SecretKind::DesktopGatewaySession),
             _ => None,
         }
     }
@@ -297,18 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn superuser_jwt_token_maps_to_current_token_pair() {
-        let id = SecretId::superuser_jwt_token();
+    fn gateway_access_jwt_signing_key_maps_to_stable_pair() {
+        let id = SecretId::gateway_access_jwt_signing_key();
 
-        assert_eq!(id.service(), SUPERUSER_JWT_TOKEN_SERVICE);
-        assert_eq!(id.user(), SUPERUSER_JWT_TOKEN_USER);
+        assert_eq!(id.service(), GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE);
+        assert_eq!(id.user(), GATEWAY_AUTH_KEY_USER);
     }
 
     #[test]
-    fn desktop_token_maps_to_stable_pair() {
-        let id = SecretId::desktop_gateway_auth_token("main-window").expect("desktop id");
+    fn desktop_session_maps_to_dedicated_stable_pair() {
+        let id = SecretId::desktop_gateway_session("local").expect("desktop session id");
 
-        assert_eq!(id.service(), DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE);
-        assert_eq!(id.user(), "main-window");
+        assert_eq!(id.service(), DESKTOP_GATEWAY_SESSION_SERVICE);
+        assert_eq!(id.user(), "local");
+        assert_eq!(
+            SecretKind::from_service(id.service()),
+            Some(SecretKind::DesktopGatewaySession)
+        );
     }
 }
