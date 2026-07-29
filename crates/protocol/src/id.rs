@@ -9,6 +9,7 @@ pub const SKILL_ID_LEN: usize = 21;
 pub const SKILL_PACK_ID_LEN: usize = SKILL_ID_LEN;
 pub const GATEWAY_ID_LEN: usize = 21;
 pub const PRINCIPAL_ID_LEN: usize = 21;
+pub const AUTH_DOMAIN_ID_LEN: usize = 21;
 
 const ALPHANUMERIC: [char; 62] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
@@ -447,11 +448,143 @@ impl From<CheckedIdValidationError> for PrincipalIdError {
     }
 }
 
+macro_rules! auth_domain_id {
+    ($name:ident, $label:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+        #[serde(transparent)]
+        pub struct $name(
+            #[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String,
+        );
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, AuthDomainIdError> {
+                validate_checked_id(value.into(), AUTH_DOMAIN_ID_LEN)
+                    .map(Self)
+                    .map_err(|error| AuthDomainIdError::from_validation($label, error))
+            }
+
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = AuthDomainIdError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = AuthDomainIdError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = AuthDomainIdError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(D::Error::custom)
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthDomainIdError {
+    InvalidLength {
+        domain: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidCharacter {
+        domain: &'static str,
+        index: usize,
+        character: char,
+    },
+}
+
+impl AuthDomainIdError {
+    fn from_validation(domain: &'static str, error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => Self::InvalidLength {
+                domain,
+                expected,
+                actual,
+            },
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter {
+                    domain,
+                    index,
+                    character,
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for AuthDomainIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength {
+                domain,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{domain} must be exactly {expected} characters, got {actual}"
+            ),
+            Self::InvalidCharacter {
+                domain,
+                index,
+                character,
+            } => write!(
+                formatter,
+                "{domain} must contain only ASCII alphanumeric characters; found {character:?} at byte {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuthDomainIdError {}
+
+auth_domain_id!(DeviceId, "device id");
+auth_domain_id!(AuthSessionId, "auth session id");
+auth_domain_id!(RefreshCredentialId, "refresh credential id");
+auth_domain_id!(TokenFamilyId, "token family id");
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GATEWAY_ID_LEN, GatewayId, GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError,
-        SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
+        AUTH_DOMAIN_ID_LEN, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId, GatewayIdError,
+        PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId, SKILL_ID_LEN,
+        SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError, TokenFamilyId,
         generate_id,
     };
     use serde_json::json;
@@ -531,6 +664,34 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(PrincipalId)).unwrap(),
         ] {
             assert_eq!(schema["type"], "string");
+            assert_eq!(schema["minLength"], 21);
+            assert_eq!(schema["maxLength"], 21);
+            assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");
+        }
+    }
+
+    #[test]
+    fn auth_domain_ids_are_distinct_constrained_string_types() {
+        let raw = "D00000000000000000001";
+        let device = DeviceId::new(raw).expect("device id");
+        let session = AuthSessionId::new(raw).expect("session id");
+        let refresh = RefreshCredentialId::new(raw).expect("refresh id");
+        let family = TokenFamilyId::new(raw).expect("family id");
+
+        assert_eq!(device.as_str(), raw);
+        assert_eq!(session.as_str(), raw);
+        assert_eq!(refresh.as_str(), raw);
+        assert_eq!(family.as_str(), raw);
+        assert!(DeviceId::new("short").is_err());
+        assert!(AuthSessionId::new("D0000000000000000000-").is_err());
+        assert_eq!(AUTH_DOMAIN_ID_LEN, 21);
+
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(DeviceId)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(AuthSessionId)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(RefreshCredentialId)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(TokenFamilyId)).unwrap(),
+        ] {
             assert_eq!(schema["minLength"], 21);
             assert_eq!(schema["maxLength"], 21);
             assert_eq!(schema["pattern"], "^[A-Za-z0-9]{21}$");

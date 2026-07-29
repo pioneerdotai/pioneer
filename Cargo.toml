@@ -154,6 +154,7 @@ rathole = { git = "https://github.com/pioneerdotai/relay.git", default-features 
 # Crypto
 hmac = "0.13"
 sha2 = "0.11"
+zeroize = "1"
 subtle = "2.6"
 hex = "0.4"
 icu_collator = "2.2.1"
@@ -162,6 +163,7 @@ url = "2"
 libc = "0.2"
 mime_guess = "2"
 image = "0.25"
+qrcode = { version = "0.14", default-features = false }
 flate2 = "1"
 tar = "0.4"
 windows-sys = "0.61"

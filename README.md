@@ -84,7 +84,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
     </tr>
     <tr>
       <td><strong>Keystore-backed secrets</strong></td>
-      <td>Workspace-scoped provider API keys, MCP env/header secrets, superuser JWT signing material, and desktop gateway bearer tokens are stored in <code>keystore.db</code> instead of ordinary TOML or domain tables.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/architecture/secrets">Architecture</a></td>
+      <td>Workspace-scoped provider API keys, MCP env/header secrets, purpose-separated Gateway auth keys, and desktop device-session refresh envelopes are stored in <code>keystore.db</code> instead of ordinary TOML or domain tables.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/architecture/secrets">Architecture</a></td>
     </tr>
     <tr>
       <td><strong>Real tools</strong></td>
@@ -255,10 +255,9 @@ Useful commands after installation:
 ```bash
 pioneer status                  # check service status and gateway reachability
 pioneer start                   # start the gateway service
-pioneer issue-superuser-token   # print a JWT for privileged clients
+pioneer device create           # create a pending device session and print its one-time activation code
 pioneer secrets status          # inspect keystore status without printing secret values
 pioneer secrets garbage-collection --dry-run
-pioneer secrets rotate-jwt-token superuser
 pioneer update                  # update using the configured release source
 pioneer stop                    # stop and unregister the gateway service
 pioneer version
@@ -280,7 +279,7 @@ Pioneer tools can execute commands, read and write files, use the network, and c
 
 There is currently no separate sandbox for tool runs. All tool execution happens with the permissions of the user account that runs the gateway service.
 
-Before binding the gateway to a non-local interface, make sure access is intentional, the host firewall is configured, and clients use a token issued by the gateway.
+Before binding the gateway to a non-local interface, make sure access is intentional, the host firewall is configured, and every client activates a pending device session created by the gateway.
 
 ## From Source
 

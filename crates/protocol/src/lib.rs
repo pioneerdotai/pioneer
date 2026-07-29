@@ -2,6 +2,7 @@ pub mod constants;
 
 mod agent_event;
 mod artifact;
+mod auth;
 mod cli_runtime;
 mod id;
 mod identity;
@@ -53,6 +54,20 @@ pub use artifact::{
     ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
     ThreadArtifactsChangedNotification,
 };
+pub use auth::{
+    AuthAccessExpiringNotification, AuthCredentialPurpose, AuthDeviceActivateParams,
+    AuthDeviceActivationPresentation, AuthDeviceCreateResponse, AuthDeviceSnapshot,
+    AuthGatewaySnapshot, AuthLogoutResponse, AuthMeResponse, AuthPrincipalSnapshot,
+    AuthRefreshGrant, AuthRefreshParams, AuthSecretString, AuthSessionGrant, AuthSessionListItem,
+    AuthSessionListResponse, AuthSessionRevokeParams, AuthSessionRevokeReason,
+    AuthSessionRevokeResponse, AuthSessionRevokedNotification, AuthSessionSnapshot,
+    AuthSessionStatus, AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind,
+    CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET, DEVICE_ACTIVATION_CODE_SYMBOLS,
+    DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceStatus,
+    MAX_OPAQUE_CREDENTIAL_BODY_LEN, MIN_OPAQUE_CREDENTIAL_BODY_LEN, RefreshCredentialStatus,
+    device_activation_locator, encode_device_activation_entropy, format_device_activation_code,
+    normalize_device_activation_code, normalize_device_activation_code_input,
+};
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
     CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
@@ -76,9 +91,10 @@ pub use cli_runtime::{
     sanitize_runtime_diagnostic_lines,
 };
 pub use id::{
-    GATEWAY_ID_LEN, GatewayId, GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError,
+    AUTH_DOMAIN_ID_LEN, AuthDomainIdError, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId,
+    GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId,
     SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
-    generate_id,
+    TokenFamilyId, generate_id,
 };
 pub use identity::{PersistedActorRef, PrincipalKind, PrincipalStatus};
 pub use jsonrpc::{

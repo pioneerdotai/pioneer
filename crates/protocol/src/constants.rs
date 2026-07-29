@@ -1,4 +1,11 @@
 pub mod methods {
+    pub const AUTH_ME: &str = "auth/me";
+    pub const AUTH_SESSION_LIST: &str = "auth/session/list";
+    pub const AUTH_SESSION_REVOKE: &str = "auth/session/revoke";
+    pub const AUTH_LOGOUT: &str = "auth/logout";
+    pub const AUTH_DEVICE_CREATE: &str = "auth/device/create";
+    pub const AUTH_REFRESH: &str = "auth/refresh";
+    pub const AUTH_DEVICE_ACTIVATE: &str = "auth/device/activate";
     pub const WORKSPACE_LIST: &str = "workspace/list";
     pub const WORKSPACE_CREATE: &str = "workspace/create";
     pub const WORKSPACE_DEFAULT: &str = "workspace/default";
@@ -122,6 +129,8 @@ pub mod methods {
 }
 
 pub mod events {
+    pub const AUTH_SESSION_REVOKED: &str = "auth/session_revoked";
+    pub const AUTH_ACCESS_EXPIRING: &str = "auth/access_expiring";
     pub const WORKSPACE_CHANGED: &str = "workspace/changed";
     pub const THREAD_STARTED: &str = "thread/started";
     pub const THREAD_UPDATED: &str = "thread/updated";

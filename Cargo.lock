@@ -8231,6 +8231,7 @@ dependencies = [
  "pioneer-config",
  "pioneer-gateway",
  "pioneer-observability",
+ "pioneer-protocol",
  "pioneer-tasks",
  "reqwest",
  "serde",
@@ -8287,6 +8288,7 @@ dependencies = [
  "mime_guess",
  "pioneer-protocol",
  "pioneer-skills",
+ "qrcode",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -8297,6 +8299,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -8310,7 +8313,9 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "tokio",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -8384,6 +8389,7 @@ dependencies = [
  "two-face",
  "unicode-width 0.2.2",
  "winresource",
+ "zeroize",
 ]
 
 [[package]]
@@ -8406,6 +8412,7 @@ dependencies = [
  "fs4 1.1.0",
  "futures-util",
  "hex",
+ "hmac 0.13.0",
  "jsonwebtoken",
  "keepawake",
  "libc",
@@ -8453,6 +8460,7 @@ dependencies = [
  "tracing-subscriber",
  "transcribe-rs",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -8580,6 +8588,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -9176,6 +9186,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

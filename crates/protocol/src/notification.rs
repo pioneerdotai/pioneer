@@ -2,7 +2,8 @@ use crate::constants::events;
 use crate::{
     ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactDownloadProgressNotification,
     ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
-    ArtifactUploadProgressNotification, CLIRuntimeAccountUpdatedNotification,
+    ArtifactUploadProgressNotification, AuthAccessExpiringNotification,
+    AuthSessionRevokedNotification, CLIRuntimeAccountUpdatedNotification,
     CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
     ContextCompressedNotification, ContextCompressingNotification,
@@ -59,6 +60,8 @@ pub struct UnknownGatewayNotification {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum GatewayNotification {
+    AuthSessionRevoked(AuthSessionRevokedNotification),
+    AuthAccessExpiring(AuthAccessExpiringNotification),
     WorkspaceChanged(WorkspaceChangedNotification),
     ThreadStarted(ThreadStartedNotification),
     ThreadClosed(ThreadClosedNotification),
@@ -166,6 +169,18 @@ impl GatewayNotification {
         let params = notification.params?;
 
         match method.as_str() {
+            events::AUTH_SESSION_REVOKED => {
+                match serde_json::from_value::<AuthSessionRevokedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::AuthSessionRevoked(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::AUTH_ACCESS_EXPIRING => {
+                match serde_json::from_value::<AuthAccessExpiringNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::AuthAccessExpiring(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::WORKSPACE_CHANGED => {
                 serde_json::from_value::<WorkspaceChangedNotification>(params)
                     .ok()
@@ -621,6 +636,7 @@ impl GatewayNotification {
                 || method.starts_with("artifact/")
                 || method.starts_with("cli_runtime/")
                 || method.starts_with("voice/")
+                || method.starts_with("auth/")
                 || method.starts_with("thread/artifacts_") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
