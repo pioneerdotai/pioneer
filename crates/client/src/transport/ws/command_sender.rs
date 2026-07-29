@@ -21,54 +21,139 @@ use pioneer_protocol::{
     ArtifactReadResponse, ArtifactRestoreParams, ArtifactRestoreResponse,
     ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadFinishParams,
     ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
-    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
-    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
-    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeProxyDeleteParams,
-    CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse,
-    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams,
-    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse,
-    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams,
-    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
-    CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
-    CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, GatewaySettingsGetParams,
-    GatewaySettingsGetResponse, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
-    GatewaySettingsUpdateResponse, McpInstallParams, McpInstallResponse, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams,
-    McpServerDetailsResponse, McpServerRestartParams, McpServerRestartResponse, McpUninstallParams,
-    McpUninstallResponse, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, SkillListParams, SkillListResponse, SkillsHealthParams,
-    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams,
-    SkillsPackInstallResponse, SkillsPackUninstallParams, SkillsPackUninstallResponse,
-    SkillsPackUpdateParams, SkillsPackUpdateResponse, SkillsPolicyListParams,
-    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
-    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
-    SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadFinishParams,
-    SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
-    TaskAcceptParams, TaskAcceptResponse, TaskCancelParams, TaskCancelResponse, TaskReviseParams,
-    TaskReviseResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadParams,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveParams,
-    ThreadAgentsDocSaveResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
-    ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
-    ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
-    ThreadMoveResponse, ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams,
-    ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
-    ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams,
-    TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams, TurnItemsResponse,
-    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
-    TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams,
-    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
-    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
-    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
-    WorkspaceUpdateResponse, validate_voice_streaming_audio_format,
+    AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthSessionListResponse,
+    AuthSessionRevokeParams, AuthSessionRevokeResponse, CLIRuntimeListModelsParams,
+    CLIRuntimeListModelsResponse, CLIRuntimeListParams, CLIRuntimeListResponse,
+    CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams,
+    CLIRuntimeLoginStartResponse, CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse,
+    CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams,
+    CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
+    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams,
+    CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
+    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, McpInstallParams,
+    McpInstallResponse, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerRestartParams,
+    McpServerRestartResponse, McpUninstallParams, McpUninstallResponse, ProviderConfigureParams,
+    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, SkillListParams, SkillListResponse,
+    SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse,
+    SkillsPackInstallParams, SkillsPackInstallResponse, SkillsPackUninstallParams,
+    SkillsPackUninstallResponse, SkillsPackUpdateParams, SkillsPackUpdateResponse,
+    SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
+    SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
+    SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
+    SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
+    TaskCancelResponse, TaskReviseParams, TaskReviseResponse, ThreadAgentsDocArchiveParams,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
+    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
+    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
+    ThreadMoveParams, ThreadMoveResponse, ThreadStartParams, ThreadStartResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
+    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
+    TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
+    TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
+    TurnStartParams, TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams,
+    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
+    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
+    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
+    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    validate_voice_streaming_audio_format,
 };
 use std::time::Duration;
 
 pub const PROVIDER_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
+const AUTH_ERROR_MACHINE_CODES: &[&str] = &[
+    "credential_expired",
+    "gateway_identity_mismatch",
+    "invalid_credential",
+    "session_compromised",
+    "session_expired",
+    "session_revoked",
+];
+
+fn send_auth_json_rpc_request_typed<TResponse, TParams, TTransport>(
+    transport: &TTransport,
+    method: &str,
+    params: &TParams,
+) -> Result<TResponse>
+where
+    TResponse: serde::de::DeserializeOwned,
+    TParams: serde::Serialize,
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(transport, method, params, RPC_REQUEST_TIMEOUT)
+        .map_err(sanitize_auth_rpc_error)
+}
+
+fn sanitize_auth_rpc_error(error: anyhow::Error) -> anyhow::Error {
+    let rendered = format!("{error:#}");
+    let machine_code = AUTH_ERROR_MACHINE_CODES
+        .iter()
+        .copied()
+        .find(|code| rendered.contains(code));
+    match machine_code {
+        // Keep the stable code exact so lifecycle reducers can classify it
+        // without parsing a peer-controlled error message.
+        Some(code) => anyhow!(code),
+        None => anyhow!("Gateway authentication request failed"),
+    }
+}
+
+pub fn auth_me<TTransport>(transport: &TTransport) -> Result<AuthMeResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(transport, methods::AUTH_ME, &serde_json::json!({}))
+}
+
+pub fn auth_session_list<TTransport>(transport: &TTransport) -> Result<AuthSessionListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(
+        transport,
+        methods::AUTH_SESSION_LIST,
+        &serde_json::json!({}),
+    )
+}
+
+pub fn auth_session_revoke<TTransport>(
+    transport: &TTransport,
+    params: AuthSessionRevokeParams,
+) -> Result<AuthSessionRevokeResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(transport, methods::AUTH_SESSION_REVOKE, &params)
+}
+
+pub fn auth_logout<TTransport>(transport: &TTransport) -> Result<AuthLogoutResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(transport, methods::AUTH_LOGOUT, &serde_json::json!({}))
+}
+
+pub fn auth_device_create<TTransport>(transport: &TTransport) -> Result<AuthDeviceCreateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(
+        transport,
+        methods::AUTH_DEVICE_CREATE,
+        &serde_json::json!({}),
+    )
+}
 
 pub fn thread_start<TTransport>(
     transport: &TTransport,
@@ -2393,6 +2478,24 @@ mod tests {
         ) -> std::result::Result<(), String> {
             panic!("validation should run before transport dispatch");
         }
+    }
+
+    #[test]
+    fn auth_rpc_errors_preserve_machine_codes_without_peer_controlled_messages() {
+        let secret = "eyJhbGciOiJIUzI1NiJ9.peer-controlled.signature";
+        let sanitized =
+            sanitize_auth_rpc_error(anyhow!("malicious peer echoed {secret} [session_revoked]"));
+        let rendered = format!("{sanitized:#}");
+
+        assert_eq!(rendered, "session_revoked");
+        assert!(!rendered.contains(secret));
+
+        let generic = format!(
+            "{:#}",
+            sanitize_auth_rpc_error(anyhow!("malicious peer echoed {secret}"))
+        );
+        assert_eq!(generic, "Gateway authentication request failed");
+        assert!(!generic.contains(secret));
     }
 
     struct ExactSkillTurnTransport;

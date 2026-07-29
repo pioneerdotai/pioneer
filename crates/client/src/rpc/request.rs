@@ -109,7 +109,14 @@ pub fn decode_json_rpc_response_value(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(JSON_RPC_REQUEST_FAILED_MESSAGE);
-        return Some((response_id, Err(message.to_owned())));
+        let code = error
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        let message = code
+            .map(|code| format!("{message} [{code}]"))
+            .unwrap_or_else(|| message.to_owned());
+        return Some((response_id, Err(message)));
     }
 
     Some((
@@ -254,6 +261,19 @@ mod tests {
                 "error": {"message": "boom"}
             })),
             Some(("request-1".to_owned(), Err("boom".to_owned())))
+        );
+        assert_eq!(
+            decode_json_rpc_response_value(&json!({
+                "id": "request-1",
+                "error": {
+                    "message": "session is no longer active",
+                    "data": {"code": "session_revoked"}
+                }
+            })),
+            Some((
+                "request-1".to_owned(),
+                Err("session is no longer active [session_revoked]".to_owned())
+            ))
         );
         assert_eq!(
             decode_json_rpc_response_value(&json!({

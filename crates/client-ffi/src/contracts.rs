@@ -2,10 +2,7 @@ use pioneer_client::settings::voice::{
     VoiceInputSettingsPlan, VoiceInputSettingsPlanRequest, VoiceInputStatusReduction,
 };
 use pioneer_client::{
-    gateway::{
-        timings::{GatewayTimingError, GatewayWsTimings},
-        types::GatewayEndpoint,
-    },
+    gateway::timings::{GatewayTimingError, GatewayWsTimings},
     notifications::effects::ClientEffect,
     runtime::{ClientRuntimeWsEvent, ClientRuntimeWsEventContext, reduce_gateway_ws_event},
     state::{
@@ -78,22 +75,6 @@ impl ClientGatewayWsTimings {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientGatewayConnectRequest {
-    pub endpoint: GatewayEndpoint,
-    #[serde(default)]
-    pub auth_token: Option<String>,
-    pub timings: ClientGatewayWsTimings,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClientGatewayConnectResult {
-    pub connection_id: u64,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientGatewaySettingsGetRequest {}
@@ -159,53 +140,7 @@ pub fn reduce_gateway_ws_events_to_client_events(
 
 #[cfg(test)]
 mod tests {
-    use super::ClientGatewayConnectRequest;
     use crate::ClientFfiVoiceAudioChunkParams;
-
-    #[test]
-    fn mobile_connect_contract_remains_endpoint_bearer_and_timings_only() {
-        let value = serde_json::json!({
-            "endpoint": {
-                "id": "local-mobile-profile",
-                "name": "Local",
-                "address": "127.0.0.1:17878",
-                "kind": "local",
-                "auth_token_ref": null,
-                "workspace_id": null,
-                "service_name": null
-            },
-            "auth_token": "legacy-superuser-bearer",
-            "timings": {
-                "connect_timeout_ms": 5000,
-                "ping_interval_ms": 15000,
-                "pong_timeout_ms": 10000,
-                "reconnect_initial_ms": 500,
-                "reconnect_max_ms": 30000,
-                "reconnect_jitter_percent": 20
-            }
-        });
-
-        let request: ClientGatewayConnectRequest =
-            serde_json::from_value(value.clone()).expect("existing Pioneer App connect contract");
-        assert_eq!(request.endpoint.address, "127.0.0.1:17878");
-        assert_eq!(
-            request.auth_token.as_deref(),
-            Some("legacy-superuser-bearer")
-        );
-
-        let encoded =
-            serde_json::to_value(&request).expect("connect request should preserve its wire shape");
-        let object = encoded
-            .as_object()
-            .expect("connect request should encode as an object");
-        assert_eq!(object.len(), 3);
-        assert!(object.contains_key("endpoint"));
-        assert!(object.contains_key("auth_token"));
-        assert!(object.contains_key("timings"));
-        assert!(!object.contains_key("gateway_id"));
-        assert!(!object.contains_key("principal_id"));
-        assert_eq!(encoded["endpoint"]["id"], "local-mobile-profile");
-    }
 
     #[test]
     fn mobile_nitro_voice_array_buffer_uses_the_shared_binary_frame_contract() {

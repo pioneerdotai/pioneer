@@ -40,6 +40,30 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
+            "client_gateway_session_lifecycle_request.json",
+            crate::auth::ClientGatewaySessionLifecycleRequest
+        ),
+        schema_doc!(
+            "client_gateway_session_lifecycle_result.json",
+            crate::auth::ClientGatewaySessionLifecycleResult
+        ),
+        schema_doc!(
+            "client_device_activation_presentation_request.json",
+            crate::auth::ClientDeviceActivationPresentationRequest
+        ),
+        schema_doc!(
+            "client_device_activation_presentation_result.json",
+            crate::auth::ClientDeviceActivationPresentationResult
+        ),
+        schema_doc!(
+            "client_device_activation_parse_request.json",
+            crate::auth::ClientDeviceActivationParseRequest
+        ),
+        schema_doc!(
+            "client_device_activation_parse_result.json",
+            crate::auth::ClientDeviceActivationParseResult
+        ),
+        schema_doc!(
             "client_active_thread_clear_result.json",
             crate::active_thread::ClientActiveThreadClearResult
         ),
@@ -204,12 +228,53 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::skills::ClientComposerSkillChipsRequest
         ),
         schema_doc!(
-            "client_gateway_connect_request.json",
-            crate::contracts::ClientGatewayConnectRequest
+            "client_auth_refresh_request.json",
+            crate::auth::ClientAuthRefreshRequest
         ),
         schema_doc!(
-            "client_gateway_connect_result.json",
-            crate::contracts::ClientGatewayConnectResult
+            "client_auth_activate_device_request.json",
+            crate::auth::ClientAuthDeviceActivateRequest
+        ),
+        schema_doc!(
+            "client_auth_session_cleanup_request.json",
+            crate::auth::ClientAuthSessionCleanupRequest
+        ),
+        schema_doc!(
+            "auth_session_grant.json",
+            pioneer_protocol::AuthSessionGrant
+        ),
+        schema_doc!(
+            "auth_refresh_grant.json",
+            pioneer_protocol::AuthRefreshGrant
+        ),
+        schema_doc!("auth_me_response.json", pioneer_protocol::AuthMeResponse),
+        schema_doc!(
+            "auth_session_list_response.json",
+            pioneer_protocol::AuthSessionListResponse
+        ),
+        schema_doc!(
+            "auth_session_revoke_params.json",
+            pioneer_protocol::AuthSessionRevokeParams
+        ),
+        schema_doc!(
+            "auth_session_revoke_response.json",
+            pioneer_protocol::AuthSessionRevokeResponse
+        ),
+        schema_doc!(
+            "auth_logout_response.json",
+            pioneer_protocol::AuthLogoutResponse
+        ),
+        schema_doc!(
+            "auth_device_create_response.json",
+            pioneer_protocol::AuthDeviceCreateResponse
+        ),
+        schema_doc!(
+            "client_gateway_session_replace_access_request.json",
+            crate::auth::ClientGatewaySessionReplaceAccessRequest
+        ),
+        schema_doc!(
+            "client_gateway_session_replace_access_result.json",
+            crate::auth::ClientGatewaySessionReplaceAccessResult
         ),
         schema_doc!(
             "client_gateway_settings_get_request.json",
@@ -590,6 +655,51 @@ mod tests {
                 .find(|document| document.file_name == expected)
                 .unwrap_or_else(|| panic!("missing skill pack FFI contract {expected}"));
             serde_json::to_string(&document.schema).expect("schema serializes");
+        }
+    }
+
+    #[test]
+    fn auth_ffi_contracts_are_registered_and_client_events_are_secret_free() {
+        let documents = client_ffi_schema_documents();
+        for expected in [
+            "client_auth_refresh_request.json",
+            "client_auth_activate_device_request.json",
+            "client_auth_session_cleanup_request.json",
+            "client_gateway_session_lifecycle_request.json",
+            "client_gateway_session_lifecycle_result.json",
+            "client_device_activation_parse_request.json",
+            "client_device_activation_parse_result.json",
+            "client_device_activation_presentation_request.json",
+            "client_device_activation_presentation_result.json",
+            "client_gateway_session_replace_access_request.json",
+            "client_gateway_session_replace_access_result.json",
+            "auth_session_grant.json",
+            "auth_refresh_grant.json",
+            "auth_me_response.json",
+            "auth_session_list_response.json",
+            "auth_session_revoke_params.json",
+            "auth_session_revoke_response.json",
+            "auth_logout_response.json",
+            "auth_device_create_response.json",
+        ] {
+            assert!(
+                documents
+                    .iter()
+                    .any(|document| document.file_name == expected),
+                "missing auth FFI contract {expected}"
+            );
+        }
+
+        let event = documents
+            .iter()
+            .find(|document| document.file_name == "client_event.json")
+            .expect("ClientEvent schema");
+        let schema = serde_json::to_string(&event.schema).expect("event schema serializes");
+        for forbidden in ["access_token", "refresh_token", "activation_code"] {
+            assert!(
+                !schema.contains(forbidden),
+                "ClientEvent exposes secret field `{forbidden}`"
+            );
         }
     }
 }

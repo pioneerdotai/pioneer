@@ -38,7 +38,8 @@ fn remote_spec() -> GatewayWsConnectSpec {
         endpoint_name: "Remote Prod".to_owned(),
         endpoint_kind: GatewayEndpointKind::Remote,
         address: "wss://gateway.example.com/socket".to_owned(),
-        auth_token: Some("remote-token".to_owned()),
+        auth_token: Some(pioneer_protocol::AuthSecretString::new("remote-token")),
+        session: None,
         timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 5_000, 0).expect("timings"),
     }
 }
@@ -355,14 +356,13 @@ fn reconnect_resume_chaos_filters_stale_ws_events_and_bounds_resume_retries() {
 }
 
 #[test]
-fn remote_gateway_attachment_smoke_builds_authenticated_ws_request() {
+fn remote_gateway_session_access_smoke_builds_authenticated_ws_request() {
     let config = GatewayRegistryConfig {
-        version: 1,
+        version: 2,
         local: Some(GatewayLocalRegistryConfig {
             gateway_id: "local".to_owned(),
             name: "Local Gateway".to_owned(),
             address: "127.0.0.1:17878".to_owned(),
-            auth_token_ref: None,
             service_name: Some("com.pioneer.gateway".to_owned()),
         }),
     };
@@ -372,26 +372,27 @@ fn remote_gateway_attachment_smoke_builds_authenticated_ws_request() {
         name: "Remote Prod".to_owned(),
         address: "wss://gateway.example.com/socket".to_owned(),
         kind: GatewayEndpointKind::Local,
-        auth_token_ref: Some("remote-prod".to_owned()),
+        session_ref: Some("remote-prod".to_owned()),
+        server_gateway_id: Some(
+            pioneer_protocol::GatewayId::new("G00000000000000000001").expect("GatewayId"),
+        ),
         workspace_id: Some(WORKSPACE_ID.to_owned()),
         service_name: Some("must-be-cleared".to_owned()),
     });
 
-    normalize_registry(
-        &mut registry,
-        &config,
-        |endpoint_id| Ok(format!("secret:{endpoint_id}")),
-        |index| format!("Remote Gateway {index}"),
-    )
+    normalize_registry(&mut registry, &config, |index| {
+        format!("Remote Gateway {index}")
+    })
     .expect("registry should normalize");
 
     let remote = registry.remotes.first().expect("remote endpoint");
     assert_eq!(remote.kind, GatewayEndpointKind::Remote);
     assert_eq!(remote.service_name, None);
-    assert_eq!(remote.auth_token_ref.as_deref(), Some("secret:remote-prod"));
+    assert_eq!(remote.session_ref.as_deref(), Some("remote-prod"));
 
     let ws_url = normalize_ws_url(remote.address.as_str());
-    let request = build_ws_request(ws_url.as_str(), Some(" remote-token ")).expect("ws request");
+    let request =
+        build_ws_request(ws_url.as_str(), Some(" short-lived-access ")).expect("ws request");
 
     assert_eq!(
         request.uri().to_string(),
@@ -402,6 +403,6 @@ fn remote_gateway_attachment_smoke_builds_authenticated_ws_request() {
             .headers()
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
-        Some("Bearer remote-token")
+        Some("Bearer short-lived-access")
     );
 }

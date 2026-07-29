@@ -28,24 +28,24 @@ pub fn process_text_payload(
         Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
     >,
     event_tx: &Sender<GatewayWsEvent>,
-) {
+) -> Option<GatewayNotification> {
     let value = match serde_json::from_str::<JsonValue>(payload) {
         Ok(value) => value,
-        Err(_) => return,
+        Err(_) => return None,
     };
 
     if let Some((response_id, response)) = decode_json_rpc_response_value(&value) {
         let Some(response_tx) = pending_requests.remove(response_id.as_str()) else {
-            return;
+            return None;
         };
 
         let _ = response_tx.send(response);
-        return;
+        return None;
     }
 
     let notification = match serde_json::from_value::<JsonRpcNotification>(value) {
         Ok(notification) => notification,
-        Err(_) => return,
+        Err(_) => return None,
     };
 
     if notification.method == events::SKILLS_UPLOAD_CHUNK_ACK
@@ -68,12 +68,14 @@ pub fn process_text_payload(
         }
     }
 
-    if let Some(notification) = GatewayNotification::from_jsonrpc(notification) {
+    let notification = GatewayNotification::from_jsonrpc(notification);
+    if let Some(notification) = notification.clone() {
         let _ = event_tx.send(GatewayWsEvent::Notification {
             connection_id,
             notification,
         });
     }
+    notification
 }
 
 pub fn upload_ack_key(upload_id: &str, offset: u64) -> String {
@@ -130,6 +132,7 @@ mod tests {
             endpoint_kind: GatewayEndpointKind::Remote,
             address: "127.0.0.1:22000".to_owned(),
             auth_token: None,
+            session: None,
             timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),
         }
     }

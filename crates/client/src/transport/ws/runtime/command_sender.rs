@@ -180,6 +180,23 @@ impl GatewayWsCommandSender {
         Ok(connection_id)
     }
 
+    pub fn replace_access_and_wait(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (result_tx, result_rx) = mpsc::channel();
+        self.command_tx
+            .send(GatewayWsCommand::Replace {
+                connection_id,
+                spec,
+                result_tx,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+        result_rx
+            .recv()
+            .map_err(|_| anyhow!("websocket worker dropped access replacement result"))?
+            .map_err(anyhow::Error::msg)?;
+        Ok(connection_id)
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         self.command_tx
             .send(GatewayWsCommand::Shutdown)
@@ -190,6 +207,29 @@ impl GatewayWsCommandSender {
         self.command_tx
             .send(GatewayWsCommand::Disconnect)
             .map_err(|_| anyhow!("websocket worker is not available"))
+    }
+
+    pub fn auth_me(&self) -> Result<AuthMeResponse> {
+        client_ws_commands::auth_me(self)
+    }
+
+    pub fn auth_session_list(&self) -> Result<AuthSessionListResponse> {
+        client_ws_commands::auth_session_list(self)
+    }
+
+    pub fn auth_session_revoke(
+        &self,
+        params: AuthSessionRevokeParams,
+    ) -> Result<AuthSessionRevokeResponse> {
+        client_ws_commands::auth_session_revoke(self, params)
+    }
+
+    pub fn auth_logout(&self) -> Result<AuthLogoutResponse> {
+        client_ws_commands::auth_logout(self)
+    }
+
+    pub fn auth_device_create(&self) -> Result<AuthDeviceCreateResponse> {
+        client_ws_commands::auth_device_create(self)
     }
 
     pub fn thread_start(&self, params: ThreadStartParams) -> Result<ThreadStartResponse> {

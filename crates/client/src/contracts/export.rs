@@ -844,10 +844,31 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "gateway_auth_token_write.json",
-            crate::gateway::setup::GatewayAuthTokenWrite,
+            "gateway_id_pin_validation.json",
+            crate::gateway::registry::GatewayIdPinValidation,
             Domain::Connection,
-            Kind::ActionPlan,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "gateway_session_metadata.json",
+            crate::gateway::session_lifecycle::GatewaySessionMetadata,
+            Domain::Connection,
+            Kind::RegistryDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "session_terminal_reason.json",
+            crate::gateway::session_lifecycle::SessionTerminalReason,
+            Domain::Connection,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "gateway_ws_session_identity.json",
+            crate::transport::ws::GatewayWsSessionIdentity,
+            Domain::Connection,
+            Kind::RegistryDto,
             Stability::Provisional
         ),
         contract_type!(
@@ -1616,13 +1637,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "delete_remote_gateway_registry_plan.json",
             crate::gateway::setup::DeleteRemoteGatewayRegistryPlan,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "gateway_auth_token_update.json",
-            crate::gateway::setup::GatewayAuthTokenUpdate,
             Domain::Connection,
             Kind::ActionPlan,
             Stability::Provisional

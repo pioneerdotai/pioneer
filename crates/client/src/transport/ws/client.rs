@@ -14,17 +14,21 @@ use super::{
     worker::{
         WEBSOCKET_CLOSED_BY_PEER_MESSAGE, WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE,
         WEBSOCKET_PONG_TIMEOUT_MESSAGE, WEBSOCKET_STREAM_ENDED_MESSAGE, connect_failed_event,
-        connected_event, connecting_event, disconnected_event, next_reconnect_plan,
-        should_retry_after_connect_failure, websocket_ping_failed_message,
-        websocket_pong_send_failed_message, websocket_read_failed_message,
-        websocket_write_failed_message,
+        connected_event, connecting_event, disconnect_reason_from_close, disconnected_event,
+        next_reconnect_plan, should_retry_after_connect_failure, terminal_reason_from_disconnect,
+        websocket_ping_failed_message, websocket_pong_send_failed_message,
+        websocket_read_failed_message, websocket_write_failed_message,
     },
 };
 use crate::rpc::PendingJsonRpcRequests;
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt, StreamExt};
-use pioneer_protocol::{ArtifactUploadChunkAckNotification, SkillsUploadChunkAckNotification};
+use pioneer_protocol::{
+    ArtifactUploadChunkAckNotification, AuthSecretString, GatewayNotification,
+    SkillsUploadChunkAckNotification,
+};
 use serde_json::Value as JsonValue;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, sync::mpsc::Sender, thread};
 use tokio::{
     runtime::Runtime,
@@ -40,6 +44,11 @@ pub enum GatewayWsCommand {
         spec: GatewayWsConnectSpec,
         initial_result_tx: Option<Sender<std::result::Result<(), String>>>,
         retry_initial_failure: bool,
+    },
+    Replace {
+        connection_id: u64,
+        spec: GatewayWsConnectSpec,
+        result_tx: Sender<std::result::Result<(), String>>,
     },
     Request {
         request_id: String,
@@ -117,15 +126,6 @@ pub fn spawn_worker(
     });
 }
 
-pub fn connect_websocket_once(spec: &GatewayWsConnectSpec) -> Result<()> {
-    let runtime = Runtime::new().context("failed to create tokio runtime for websocket connect")?;
-    runtime.block_on(async {
-        let stream = connect_websocket(spec).await?;
-        drop(stream);
-        Ok(())
-    })
-}
-
 async fn run_worker(
     mut command_rx: UnboundedReceiver<GatewayWsCommand>,
     event_tx: Sender<GatewayWsEvent>,
@@ -150,9 +150,49 @@ async fn run_worker(
                         retry_initial_failure,
                         event_tx.clone(),
                         rpc_rx,
+                        None,
                     )),
                     rpc_tx,
                 });
+            }
+            GatewayWsCommand::Replace {
+                connection_id,
+                spec,
+                result_tx,
+            } => {
+                if session_access_is_expired(&spec, unix_timestamp_secs()) {
+                    let _ = result_tx.send(Err("access_refresh_required".to_owned()));
+                    continue;
+                }
+                let _ = event_tx.send(connecting_event(connection_id, &spec));
+                match connect_websocket(&spec).await {
+                    Ok(stream) => {
+                        abort_connection_task(&mut connection_task).await;
+                        let (rpc_tx, rpc_rx) = unbounded_channel();
+                        connection_task = Some(ActiveConnectionTask {
+                            handle: tokio::spawn(run_connection_task(
+                                connection_id,
+                                spec,
+                                None,
+                                true,
+                                event_tx.clone(),
+                                rpc_rx,
+                                Some(stream),
+                            )),
+                            rpc_tx,
+                        });
+                        let _ = result_tx.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let _ = event_tx.send(connect_failed_event(
+                            connection_id,
+                            &spec,
+                            message.clone(),
+                        ));
+                        let _ = result_tx.send(Err(message));
+                    }
+                }
             }
             GatewayWsCommand::Request {
                 request_id,
@@ -291,15 +331,29 @@ async fn run_connection_task(
     retry_initial_failure: bool,
     event_tx: Sender<GatewayWsEvent>,
     mut rpc_rx: UnboundedReceiver<ConnectionRpcCommand>,
+    mut established_stream: Option<GatewayWebSocket>,
 ) {
     let mut has_connected = false;
     let mut attempt: u32 = 0;
     let mut backoff = spec.timings.reconnect_initial;
 
     loop {
-        let _ = event_tx.send(connecting_event(connection_id, &spec));
-
-        match connect_websocket(&spec).await {
+        if session_access_is_expired(&spec, unix_timestamp_secs()) {
+            let message = "access_refresh_required".to_owned();
+            if let Some(sender) = initial_result_tx.take() {
+                let _ = sender.send(Err(message.clone()));
+            }
+            let _ = event_tx.send(connect_failed_event(connection_id, &spec, message));
+            return;
+        }
+        let connection = match established_stream.take() {
+            Some(stream) => Ok(stream),
+            None => {
+                let _ = event_tx.send(connecting_event(connection_id, &spec));
+                connect_websocket(&spec).await
+            }
+        };
+        match connection {
             Ok(stream) => {
                 has_connected = true;
                 attempt = 0;
@@ -316,6 +370,9 @@ async fn run_connection_task(
 
                 let _ = event_tx.send(disconnected_event(connection_id, &spec, reason.clone()));
 
+                if terminal_reason_from_disconnect(reason.as_str()).is_some() {
+                    return;
+                }
                 let plan = next_reconnect_plan(connection_id, &spec, attempt, backoff, reason);
                 attempt = plan.attempt;
                 let delay = plan.delay;
@@ -352,13 +409,29 @@ async fn run_connection_task(
     }
 }
 
-async fn connect_websocket(
-    spec: &GatewayWsConnectSpec,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn session_access_is_expired(spec: &GatewayWsConnectSpec, now_unix: u64) -> bool {
+    spec.session
+        .as_ref()
+        .is_some_and(|session| now_unix >= session.access_expires_at_unix)
+}
+
+type GatewayWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_websocket(spec: &GatewayWsConnectSpec) -> Result<GatewayWebSocket> {
     let ws_url = normalize_ws_url(spec.address.as_str());
-    let request = build_ws_request(ws_url.as_str(), spec.auth_token.as_deref())?;
+    let request = build_ws_request(
+        ws_url.as_str(),
+        spec.auth_token
+            .as_ref()
+            .map(AuthSecretString::expose_secret),
+    )?;
     let connect = timeout(spec.timings.connect_timeout, connect_async(request))
         .await
         .context("websocket connect timeout reached")?;
@@ -456,11 +529,16 @@ async fn monitor_connection(
                     }
                     Some(Ok(Message::Close(frame))) => {
                         break frame
-                            .map(|value| value.reason.to_string())
+                            .map(|value| {
+                                disconnect_reason_from_close(
+                                    u16::from(value.code),
+                                    value.reason.as_ref(),
+                                )
+                            })
                             .unwrap_or_else(|| WEBSOCKET_CLOSED_BY_PEER_MESSAGE.to_owned());
                     }
                     Some(Ok(Message::Text(payload))) => {
-                        process_text_payload(
+                        let notification = process_text_payload(
                             payload.as_ref(),
                             connection_id,
                             &mut pending_requests,
@@ -468,6 +546,11 @@ async fn monitor_connection(
                             &mut pending_artifact_upload_chunks,
                             event_tx,
                         );
+                        if let Some(GatewayNotification::AuthSessionRevoked(notification)) =
+                            notification
+                        {
+                            break notification.reason.as_str().to_owned();
+                        }
                     }
                     Some(Ok(Message::Binary(payload))) => {
                         let _ = process_artifact_download_binary_frame(
@@ -506,13 +589,7 @@ mod tests {
     use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
     use std::{net::TcpListener as StdTcpListener, sync::mpsc, time::Duration};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::{
-        accept_async, accept_hdr_async,
-        tungstenite::{
-            handshake::server::{ErrorResponse, Request, Response},
-            http::{Response as HttpResponse, StatusCode},
-        },
-    };
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn ws_client_worker_connects_and_emits_events() {
@@ -566,31 +643,6 @@ mod tests {
         server.join();
     }
 
-    #[test]
-    fn connect_websocket_once_sends_bearer_token() {
-        let address = reserve_unused_local_address();
-        let server = TestAuthWsServer::start(address.clone(), "valid-token");
-        let mut spec = connect_spec(address);
-        spec.auth_token = Some(" valid-token ".to_owned());
-
-        connect_websocket_once(&spec).expect("connect with bearer token");
-
-        server.join();
-    }
-
-    #[test]
-    fn connect_websocket_once_rejects_invalid_bearer_token() {
-        let address = reserve_unused_local_address();
-        let server = TestAuthWsServer::start(address.clone(), "valid-token");
-        let mut spec = connect_spec(address);
-        spec.auth_token = Some("invalid-token".to_owned());
-
-        let error = connect_websocket_once(&spec).expect_err("invalid bearer token should fail");
-
-        assert!(format!("{error:#}").contains("websocket handshake failed"));
-        server.join();
-    }
-
     fn connect_spec(address: String) -> GatewayWsConnectSpec {
         GatewayWsConnectSpec {
             endpoint_id: "local".to_owned(),
@@ -598,6 +650,7 @@ mod tests {
             endpoint_kind: GatewayEndpointKind::Local,
             address,
             auth_token: None,
+            session: None,
             timings: GatewayWsTimings::from_millis(500, 200, 1_000, 10, 50, 0).expect("timings"),
         }
     }
@@ -642,59 +695,17 @@ mod tests {
         }
     }
 
-    struct TestAuthWsServer {
-        handle: std::thread::JoinHandle<()>,
-    }
-
-    impl TestAuthWsServer {
-        fn start(address: String, expected_token: &'static str) -> Self {
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let runtime = Runtime::new().expect("server runtime");
-                runtime.block_on(async move {
-                    let listener = match TcpListener::bind(address.as_str()).await {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(format!("bind server failed: {error}")));
-                            return;
-                        }
-                    };
-                    let _ = ready_tx.send(Ok(()));
-                    let (stream, _) = listener.accept().await.expect("accept");
-                    let callback = move |request: &Request, response: Response| {
-                        let expected = format!("Bearer {expected_token}");
-                        let authorization = request
-                            .headers()
-                            .get("authorization")
-                            .and_then(|value| value.to_str().ok());
-
-                        if authorization == Some(expected.as_str()) {
-                            return Ok(response);
-                        }
-
-                        Err(unauthorized_response())
-                    };
-                    if let Ok(mut websocket) = accept_hdr_async(stream, callback).await {
-                        let _ = timeout(Duration::from_millis(200), websocket.next()).await;
-                    }
-                });
-            });
-            ready_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("server readiness")
-                .expect("server bind");
-            Self { handle }
-        }
-
-        fn join(self) {
-            let _ = self.handle.join();
-        }
-    }
-
-    fn unauthorized_response() -> ErrorResponse {
-        HttpResponse::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .body(Some("unauthorized".to_owned()))
-            .expect("unauthorized response")
+    #[test]
+    fn expired_session_spec_is_never_connected_or_retried() {
+        let mut spec = connect_spec("ws://127.0.0.1:17878".to_owned());
+        spec.session = Some(crate::transport::ws::GatewayWsSessionIdentity {
+            server_gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+            session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000001").unwrap(),
+            device_id: pioneer_protocol::DeviceId::new("D00000000000000000001").unwrap(),
+            access_expires_at_unix: 100,
+            refresh_leeway_seconds: 10,
+        });
+        assert!(!session_access_is_expired(&spec, 99));
+        assert!(session_access_is_expired(&spec, 100));
     }
 }

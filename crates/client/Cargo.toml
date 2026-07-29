@@ -23,6 +23,7 @@ hex.workspace = true
 mime_guess.workspace = true
 pioneer-protocol.workspace = true
 pioneer-skills.workspace = true
+qrcode.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -33,6 +34,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
 futures-util.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 schemars.workspace = true

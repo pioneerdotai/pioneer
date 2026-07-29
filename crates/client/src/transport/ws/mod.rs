@@ -1,10 +1,10 @@
 //! WebSocket transport client.
 
-use crate::gateway::{
-    runtime::GatewayConnectSpecPlan, timings::GatewayWsTimings, types::GatewayEndpointKind,
-};
+use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
 use pioneer_protocol::GatewayNotification;
+use pioneer_protocol::{AuthSecretString, AuthSessionId, DeviceId, GatewayId};
 
+pub mod auth_exchange;
 pub mod backoff;
 pub mod client;
 pub mod command_sender;
@@ -17,25 +17,66 @@ pub mod worker;
 
 pub use runtime::{GatewayWsClient, GatewayWsCommandSender};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GatewayWsConnectSpec {
     pub endpoint_id: String,
     pub endpoint_name: String,
     pub endpoint_kind: GatewayEndpointKind,
     pub address: String,
-    pub auth_token: Option<String>,
+    pub auth_token: Option<AuthSecretString>,
+    pub session: Option<GatewayWsSessionIdentity>,
     pub timings: GatewayWsTimings,
 }
 
-impl From<GatewayConnectSpecPlan> for GatewayWsConnectSpec {
-    fn from(plan: GatewayConnectSpecPlan) -> Self {
-        Self {
-            endpoint_id: plan.endpoint_id,
-            endpoint_name: plan.endpoint_name,
-            endpoint_kind: plan.endpoint_kind,
-            address: plan.address,
-            auth_token: plan.auth_token,
-            timings: plan.timings,
+impl std::fmt::Debug for GatewayWsConnectSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayWsConnectSpec")
+            .field("endpoint_id", &self.endpoint_id)
+            .field("endpoint_name", &self.endpoint_name)
+            .field("endpoint_kind", &self.endpoint_kind)
+            .field("address", &self.address)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("session", &self.session)
+            .field("timings", &self.timings)
+            .finish()
+    }
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GatewayWsSessionIdentity {
+    pub server_gateway_id: GatewayId,
+    pub session_id: AuthSessionId,
+    pub device_id: DeviceId,
+    pub access_expires_at_unix: u64,
+    pub refresh_leeway_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayWsSessionSpec {
+    pub endpoint_id: String,
+    pub endpoint_name: String,
+    pub endpoint_kind: GatewayEndpointKind,
+    pub address: String,
+    pub identity: GatewayWsSessionIdentity,
+    pub access_token: AuthSecretString,
+    pub timings: GatewayWsTimings,
+}
+
+impl GatewayWsSessionSpec {
+    pub fn into_connect_spec(self) -> GatewayWsConnectSpec {
+        GatewayWsConnectSpec {
+            endpoint_id: self.endpoint_id,
+            endpoint_name: self.endpoint_name,
+            endpoint_kind: self.endpoint_kind,
+            address: self.address,
+            auth_token: Some(self.access_token),
+            session: Some(self.identity),
+            timings: self.timings,
         }
     }
 }

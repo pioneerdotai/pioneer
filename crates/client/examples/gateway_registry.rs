@@ -8,12 +8,11 @@ use pioneer_client::gateway::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayRegistryConfig {
-        version: 1,
+        version: 2,
         local: Some(GatewayLocalRegistryConfig {
             gateway_id: "local".to_owned(),
             name: "Local Gateway".to_owned(),
             address: "127.0.0.1:17878".to_owned(),
-            auth_token_ref: Some("local-token".to_owned()),
             service_name: Some("com.pioneer.gateway".to_owned()),
         }),
     };
@@ -27,17 +26,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "  ".to_owned(),
         address: "gateway.example.com".to_owned(),
         kind: GatewayEndpointKind::Local,
-        auth_token_ref: Some("remote-token".to_owned()),
+        session_ref: None,
+        server_gateway_id: None,
         workspace_id: Some("  ws_1  ".to_owned()),
         service_name: Some("ignored-for-remotes".to_owned()),
     });
 
-    normalize_registry(
-        &mut registry,
-        &config,
-        |endpoint_id| Ok(format!("secret:{endpoint_id}")),
-        |index| format!("Remote Gateway {index}"),
-    )?;
+    normalize_registry(&mut registry, &config, |index| {
+        format!("Remote Gateway {index}")
+    })?;
 
     assert_eq!(registry.active_gateway_id, None);
     assert_eq!(

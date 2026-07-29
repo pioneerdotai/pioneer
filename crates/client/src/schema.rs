@@ -245,8 +245,20 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::types::GatewayRegistry
         ),
         schema_doc!(
-            "gateway_auth_token_write.json",
-            crate::gateway::setup::GatewayAuthTokenWrite
+            "gateway_id_pin_validation.json",
+            crate::gateway::registry::GatewayIdPinValidation
+        ),
+        schema_doc!(
+            "gateway_session_metadata.json",
+            crate::gateway::session_lifecycle::GatewaySessionMetadata
+        ),
+        schema_doc!(
+            "session_terminal_reason.json",
+            crate::gateway::session_lifecycle::SessionTerminalReason
+        ),
+        schema_doc!(
+            "gateway_ws_session_identity.json",
+            crate::transport::ws::GatewayWsSessionIdentity
         ),
         schema_doc!(
             "remote_gateway_validation.json",
@@ -259,10 +271,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "set_gateway_workspace_registry_plan.json",
             crate::gateway::setup::SetGatewayWorkspaceRegistryPlan
-        ),
-        schema_doc!(
-            "gateway_auth_token_update.json",
-            crate::gateway::setup::GatewayAuthTokenUpdate
         ),
         schema_doc!(
             "update_remote_gateway_registry_plan.json",
@@ -1261,6 +1269,44 @@ mod tests {
                 file_names.contains(&expected),
                 "missing skill pack contract {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn auth_session_metadata_contracts_are_registered_and_events_are_secret_free() {
+        let documents = client_schema_documents();
+        let file_names = documents
+            .iter()
+            .map(|document| document.file_name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "gateway_id_pin_validation.json",
+            "gateway_session_metadata.json",
+            "session_terminal_reason.json",
+            "gateway_ws_session_identity.json",
+        ] {
+            assert!(
+                file_names.contains(&expected),
+                "missing auth contract {expected}"
+            );
+        }
+
+        for (file_name, contract_name) in [
+            ("gateway_ws_event.json", "GatewayWsEvent"),
+            ("client_snapshot.json", "ClientSnapshot"),
+        ] {
+            let document = documents
+                .iter()
+                .find(|document| document.file_name == file_name)
+                .unwrap_or_else(|| panic!("missing {contract_name} schema"));
+            let schema = serde_json::to_string(&document.schema).expect("schema serializes");
+            for forbidden in ["access_token", "refresh_token", "activation_code"] {
+                assert!(
+                    !schema.contains(forbidden),
+                    "{contract_name} exposes secret field `{forbidden}`"
+                );
+            }
         }
     }
 }

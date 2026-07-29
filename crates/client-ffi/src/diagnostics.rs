@@ -39,7 +39,7 @@ struct ClientFfiDiagnosticsInner {
 }
 
 impl ClientFfiDiagnostics {
-    pub fn record_error(&self, operation: &'static str, message: String, code: &'static str) {
+    pub fn record_error(&self, operation: &'static str, message: String, code: &str) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -286,6 +286,9 @@ fn is_sensitive_diagnostic_key(normalized_key: &[u8]) -> bool {
             | b"authtoken"
             | b"accesstoken"
             | b"refreshtoken"
+            | b"deviceactivationcode"
+            | b"activationcode"
+            | b"sessionsecret"
             | b"bearertoken"
             | b"apikey"
             | b"clientsecret"
@@ -377,6 +380,8 @@ mod tests {
                 "Authorization: Bearer raw-access-token token=raw-token password='raw-password' \
                  signing_secret=\"raw-signing\" apiKey=raw-api-key \
                  access-token=raw-access-token-2 client_secret=raw-client-secret \
+                 device_activation_code=raw-activation \
+                 session_secret=raw-session-secret \
                  jwt_material=raw-jwt-material provider_api_key=prefixed-api-key \
                  owner_principal_id=private-principal displayName='Private Name' \
                  profile_display_name='Prefixed Private Name' \
@@ -399,6 +404,8 @@ mod tests {
             "raw-api-key",
             "raw-access-token-2",
             "raw-client-secret",
+            "raw-activation",
+            "raw-session-secret",
             "raw-jwt-material",
             "prefixed-api-key",
             "private-principal",

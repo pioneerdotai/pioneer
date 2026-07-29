@@ -4,6 +4,7 @@
 //! Client domain logic remains in `pioneer-client`.
 
 mod active_thread;
+mod auth;
 mod composer;
 mod contracts;
 mod diagnostics;
@@ -26,6 +27,11 @@ use active_thread::{
     ClientEnsureWorkspaceDraftRequest, ClientFfiActiveThreadState,
     ClientPrepareVoiceComposerSnapshotRequest,
 };
+use auth::{
+    ClientAuthDeviceActivateRequest, ClientAuthRefreshRequest,
+    ClientGatewaySessionReplaceAccessRequest, ClientGatewaySessionReplaceAccessResult,
+    auth_exchange_error, auth_exchange_runtime,
+};
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
     ClientComposerCapabilitiesUpdateRequest, ClientComposerCapabilityMenuVisibilityRequest,
@@ -46,8 +52,7 @@ use composer::{
     update_composer_capabilities,
 };
 use contracts::{
-    ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
-    ClientGatewaySettingsGetRequest, ClientGatewaySettingsUpdateRequest,
+    ClientEvent, ClientGatewaySettingsGetRequest, ClientGatewaySettingsUpdateRequest,
     ClientVoiceInputPlanRequest, ClientVoiceInputPlanResult,
     reduce_gateway_ws_events_to_client_events,
 };
@@ -73,13 +78,9 @@ use pioneer_client::{
         AgentsDocSaveErrorKind, agents_doc_get_params, agents_doc_save_error_kind,
         agents_doc_save_params,
     },
-    gateway::{
-        runtime::{self as client_gateway_runtime, GatewayProfileError},
-        secrets::GatewayAuthTokenRef,
-        setup::{
-            ActivateGatewayRegistryPlan, DeleteRemoteGatewayRegistryPlan, RemoteGatewayValidation,
-            SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
-        },
+    gateway::setup::{
+        ActivateGatewayRegistryPlan, DeleteRemoteGatewayRegistryPlan, RemoteGatewayValidation,
+        SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
     },
     providers::{
         list::{
@@ -126,6 +127,7 @@ use skills::{
 };
 use std::{
     any::Any,
+    collections::HashMap,
     ffi::{CStr, CString, c_char},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
@@ -141,6 +143,7 @@ use workspaces::{
     WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
     switch_workspace,
 };
+use zeroize::Zeroizing;
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -155,6 +158,8 @@ struct ClientFfiRuntime {
     active_thread: ClientFfiActiveThreadState,
     active_connection_id: Mutex<Option<u64>>,
     diagnostics: ClientFfiDiagnostics,
+    gateway_session_lifecycles:
+        Mutex<HashMap<String, pioneer_client::gateway::session_lifecycle::SessionLifecycle>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -205,16 +210,16 @@ enum FfiResponse<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientFfiError {
     message: String,
-    code: &'static str,
+    code: String,
 }
 
 impl ClientFfiError {
     pub(crate) const GENERIC_CODE: &'static str = "pioneer_client_ffi_error";
 
-    pub(crate) fn new(message: impl Into<String>, code: &'static str) -> Self {
+    pub(crate) fn new(message: impl Into<String>, code: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            code,
+            code: code.into(),
         }
     }
 }
@@ -262,8 +267,7 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<PlanAddRemoteGatewayRequest>(input_json)
             .map_err(|error| format!("invalid gateway add remote planning request: {error}"))?;
 
-        plan_add_remote_gateway_request(request, gateway_auth_token_ref_for_endpoint)
-            .map_err(|error| error.to_string())
+        plan_add_remote_gateway_request(request).map_err(|error| error.to_string())
     }
 
     fn gateway_plan_add_and_activate_remote_registry(
@@ -273,11 +277,8 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<PlanAddRemoteGatewayRequest>(input_json)
             .map_err(|error| format!("invalid gateway add remote registry request: {error}"))?;
 
-        plan_add_and_activate_remote_gateway_registry_request(
-            request,
-            gateway_auth_token_ref_for_endpoint,
-        )
-        .map_err(|error| error.to_string())
+        plan_add_and_activate_remote_gateway_registry_request(request)
+            .map_err(|error| error.to_string())
     }
 
     fn gateway_plan_activate_registry(
@@ -297,8 +298,7 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<PlanUpdateRemoteGatewayRequest>(input_json)
             .map_err(|error| format!("invalid gateway update remote request: {error}"))?;
 
-        plan_update_remote_gateway_registry_request(request, gateway_auth_token_ref_for_endpoint)
-            .map_err(|error| error.to_string())
+        plan_update_remote_gateway_registry_request(request).map_err(|error| error.to_string())
     }
 
     fn gateway_plan_delete_remote_registry(
@@ -321,34 +321,245 @@ impl ClientFfiRuntime {
         plan_set_gateway_workspace_registry_request(request).map_err(|error| error.to_string())
     }
 
-    fn gateway_connect(&self, input_json: &str) -> Result<ClientGatewayConnectResult, String> {
-        let request = serde_json::from_str::<ClientGatewayConnectRequest>(input_json)
-            .map_err(|error| format!("invalid gateway connect request: {error}"))?;
-
-        let timings = request
-            .timings
-            .to_gateway_ws_timings()
-            .map_err(|error| error.to_string())?;
-
-        let plan = client_gateway_runtime::plan_gateway_connect_spec(
-            &request.endpoint,
-            request.auth_token,
-            timings,
+    fn gateway_session_lifecycle_reduce(
+        &self,
+        input_json: &str,
+    ) -> Result<auth::ClientGatewaySessionLifecycleResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<auth::ClientGatewaySessionLifecycleRequest>(input_json)
+                .map_err(|_| {
+                    ClientFfiError::new(
+                        "invalid Gateway session lifecycle request",
+                        auth::INVALID_AUTH_REQUEST_CODE,
+                    )
+                })?;
+        let endpoint_id = request.endpoint_id.trim();
+        if endpoint_id.is_empty() || endpoint_id.len() > 128 {
+            return Err(ClientFfiError::new(
+                "invalid Gateway session lifecycle endpoint id",
+                auth::INVALID_AUTH_REQUEST_CODE,
+            ));
+        }
+        let mut lifecycles = self.gateway_session_lifecycles.lock().map_err(|_| {
+            ClientFfiError::new(
+                "Gateway session lifecycle lock is poisoned",
+                ClientFfiError::GENERIC_CODE,
+            )
+        })?;
+        let release_lifecycle = matches!(
+            &request.event,
+            pioneer_client::gateway::session_lifecycle::SessionLifecycleEvent::NoStoredSession
         );
+        let result = {
+            let lifecycle = lifecycles.entry(endpoint_id.to_owned()).or_default();
+            let effect = lifecycle.reduce(request.event);
+            auth::ClientGatewaySessionLifecycleResult {
+                state: lifecycle.state().clone(),
+                effect,
+            }
+        };
+        if release_lifecycle {
+            lifecycles.remove(endpoint_id);
+        }
+        Ok(result)
+    }
 
+    fn gateway_device_activation_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<auth::ClientDeviceActivationPresentationResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<auth::ClientDeviceActivationPresentationRequest>(input_json)
+                .map_err(|_| {
+                    ClientFfiError::new(
+                        "invalid activation presentation request",
+                        auth::INVALID_AUTH_REQUEST_CODE,
+                    )
+                })?;
+        auth::ClientDeviceActivationPresentationResult::from_request(request)
+            .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE))
+    }
+
+    fn gateway_device_activation_parse(
+        &self,
+        input_json: &str,
+    ) -> Result<auth::ClientDeviceActivationParseResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = serde_json::from_str::<auth::ClientDeviceActivationParseRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid activation URI request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        auth::ClientDeviceActivationParseResult::from_request(request)
+            .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE))
+    }
+
+    fn gateway_auth_refresh(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthRefreshGrant, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientAuthRefreshRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid auth refresh request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        runtime
+            .block_on(client.refresh(
+                &request.address,
+                request.credential.expose_secret(),
+                request.params,
+            ))
+            .map_err(auth_exchange_error)
+    }
+
+    fn gateway_auth_device_activate(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthSessionGrant, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientAuthDeviceActivateRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid device activation request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        runtime
+            .block_on(client.activate_device(
+                &request.address,
+                request.credential.expose_secret(),
+                request.params,
+            ))
+            .map_err(auth_exchange_error)
+    }
+
+    fn gateway_auth_session_cleanup(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthSessionRevokeResponse, ClientFfiError> {
+        self.require_initialized()?;
+        let request = serde_json::from_str::<auth::ClientAuthSessionCleanupRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid auth session cleanup request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        runtime
+            .block_on(client.cleanup_session_once(
+                &request.address,
+                request.access_token.expose_secret(),
+                request.session_id,
+            ))
+            .map_err(auth_exchange_error)
+    }
+
+    fn gateway_auth_me(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthMeResponse, ClientFfiError> {
+        parse_empty_auth_request(input_json)?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_me()
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_auth_session_list(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthSessionListResponse, ClientFfiError> {
+        parse_empty_auth_request(input_json)?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_session_list()
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_auth_session_revoke(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthSessionRevokeResponse, ClientFfiError> {
+        let params = serde_json::from_str::<pioneer_protocol::AuthSessionRevokeParams>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid session revoke request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_session_revoke(params)
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_auth_logout(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthLogoutResponse, ClientFfiError> {
+        parse_empty_auth_request(input_json)?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_logout()
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_auth_device_create(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthDeviceCreateResponse, ClientFfiError> {
+        parse_empty_auth_request(input_json)?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_device_create()
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_session_replace_access(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientGatewaySessionReplaceAccessResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = serde_json::from_str::<ClientGatewaySessionReplaceAccessRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid access replacement request",
+                    auth::INVALID_AUTH_REQUEST_CODE,
+                )
+            })?;
+        let spec = request
+            .into_session_spec()
+            .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE))?;
         let connection_id = self
             .client_runtime
             .ws_command_sender()
-            .connect_with_retry(plan.into())
-            .map_err(|error| format!("{error:#}"))?;
-
-        *self
-            .active_connection_id
-            .lock()
-            .map_err(|_| "client ffi connection lock is poisoned".to_owned())? =
-            Some(connection_id);
-
-        Ok(ClientGatewayConnectResult { connection_id })
+            .replace_access_and_wait(spec.into_connect_spec())
+            .map_err(normal_auth_error)?;
+        *self.active_connection_id.lock().map_err(|_| {
+            ClientFfiError::new(
+                "client ffi connection lock is poisoned",
+                ClientFfiError::GENERIC_CODE,
+            )
+        })? = Some(connection_id);
+        Ok(ClientGatewaySessionReplaceAccessResult { connection_id })
     }
 
     fn gateway_next_events(&self) -> Result<Vec<ClientEvent>, String> {
@@ -1341,6 +1552,36 @@ fn thread_timeline_page_merge_mode(anchor: &TimelinePageAnchor) -> TopLevelPageM
     }
 }
 
+fn parse_empty_auth_request(input_json: &str) -> Result<(), ClientFfiError> {
+    let value = serde_json::from_str::<serde_json::Value>(input_json).map_err(|_| {
+        ClientFfiError::new("invalid auth request", auth::INVALID_AUTH_REQUEST_CODE)
+    })?;
+    if value.as_object().is_none_or(|object| !object.is_empty()) {
+        return Err(ClientFfiError::new(
+            "auth request must be an empty object",
+            auth::INVALID_AUTH_REQUEST_CODE,
+        ));
+    }
+    Ok(())
+}
+
+fn normal_auth_error(error: anyhow::Error) -> ClientFfiError {
+    let message = format!("{error:#}");
+    let code = [
+        "session_revoked",
+        "session_expired",
+        "session_compromised",
+        "gateway_identity_mismatch",
+        "invalid_credential",
+        "device_activation_consumed",
+        "device_activation_expired",
+    ]
+    .into_iter()
+    .find(|code| message.contains(code))
+    .unwrap_or(ClientFfiError::GENERIC_CODE);
+    ClientFfiError::new(message, code)
+}
+
 fn turn_work_page_merge_mode(anchor: &TimelinePageAnchor) -> WorkPageMergeMode {
     match anchor {
         TimelinePageAnchor::Newest | TimelinePageAnchor::After { .. } => {
@@ -1511,7 +1752,48 @@ ffi_client_json_method!(
     pioneer_client_ffi_gateway_plan_set_workspace_registry,
     gateway_plan_set_workspace_registry
 );
-ffi_client_json_method!(pioneer_client_ffi_gateway_connect, gateway_connect);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_session_lifecycle_reduce,
+    gateway_session_lifecycle_reduce
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_device_activation_presentation,
+    gateway_device_activation_presentation
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_device_activation_parse,
+    gateway_device_activation_parse
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_refresh,
+    gateway_auth_refresh
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_device_activate,
+    gateway_auth_device_activate
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_session_cleanup,
+    gateway_auth_session_cleanup
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_gateway_auth_me, gateway_auth_me);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_session_list,
+    gateway_auth_session_list
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_session_revoke,
+    gateway_auth_session_revoke
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_gateway_auth_logout, gateway_auth_logout);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_device_create,
+    gateway_auth_device_create
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_session_replace_access,
+    gateway_session_replace_access
+);
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_settings_get,
     gateway_settings_get
@@ -1804,9 +2086,12 @@ pub unsafe extern "C" fn pioneer_client_ffi_string_destroy(value: *mut c_char) {
         }
 
         // SAFETY: strings returned by this crate are allocated with
-        // `CString::into_raw`; this reclaims and drops that allocation.
+        // `CString::into_raw`; this reclaims that allocation. The buffer can
+        // contain direct-return auth credentials, so overwrite its contents
+        // before releasing the allocation.
         unsafe {
-            drop(CString::from_raw(value));
+            let mut bytes = CString::from_raw(value).into_bytes();
+            bytes.fill(0);
         }
     }));
 }
@@ -1821,7 +2106,7 @@ unsafe fn ffi_ref<'a>(ptr: *mut PioneerClientFfi) -> Result<&'a PioneerClientFfi
     unsafe { ptr.as_ref() }.ok_or_else(|| "received invalid client pointer".to_owned())
 }
 
-unsafe fn read_c_string(ptr: *const c_char) -> Result<String, String> {
+unsafe fn read_c_string(ptr: *const c_char) -> Result<Zeroizing<String>, String> {
     if ptr.is_null() {
         return Err("received null string pointer".to_owned());
     }
@@ -1830,17 +2115,8 @@ unsafe fn read_c_string(ptr: *const c_char) -> Result<String, String> {
     // native bridge for the duration of this call.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
-        .map(str::to_owned)
+        .map(|value| Zeroizing::new(value.to_owned()))
         .map_err(|error| format!("received non-utf8 string: {error}"))
-}
-
-fn gateway_auth_token_ref_for_endpoint(endpoint_id: &str) -> Result<String, GatewayProfileError> {
-    GatewayAuthTokenRef::for_endpoint_id(endpoint_id)
-        .map(GatewayAuthTokenRef::into_string)
-        .map_err(|error| GatewayProfileError::InvalidAuthTokenRef {
-            endpoint_id: endpoint_id.to_owned(),
-            reason: error.to_string(),
-        })
 }
 
 fn to_json_response<T: Serialize>(result: Result<T, String>) -> String {
@@ -1941,7 +2217,7 @@ where
     catch_unwind(AssertUnwindSafe(|| {
         let response = operation();
         if let Err(error) = &response {
-            diagnostics.record_error(operation_name, error.message.clone(), error.code);
+            diagnostics.record_error(operation_name, error.message.clone(), error.code.as_str());
         }
         to_json_typed_response(response)
     }))
@@ -2036,6 +2312,104 @@ mod tests {
         let value: serde_json::Value = decode_response(response.as_str());
 
         assert_eq!(value["value"], 1);
+    }
+
+    #[test]
+    fn auth_ffi_error_codes_are_machine_readable_and_diagnostics_are_redacted() {
+        let diagnostics = ClientFfiDiagnostics::default();
+        let secret = "prf_auth-response-must-not-enter-diagnostics";
+        let response = ffi_typed_response_json_with_diagnostics::<(), _>(
+            &diagnostics,
+            "gateway_auth_refresh",
+            || {
+                Err(ClientFfiError::new(
+                    format!("refresh_token={secret}"),
+                    "session_compromised",
+                ))
+            },
+        );
+        let response: serde_json::Value =
+            serde_json::from_str(response.as_str()).expect("typed auth response");
+        assert_eq!(response["code"], "session_compromised");
+
+        let events = diagnostics.drain().expect("diagnostics drain");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code.as_deref(), Some("session_compromised"));
+        assert!(!events[0].message.contains(secret));
+        assert!(events[0].message.contains("[redacted]"));
+    }
+
+    #[test]
+    fn invalid_auth_ffi_input_never_echoes_the_supplied_credential() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").expect("initialize client");
+        let secret = "prf_input-must-not-be-echoed";
+        let error = runtime
+            .gateway_auth_refresh(
+                serde_json::json!({
+                    "address": "ws://localhost:17878",
+                    "credential": secret,
+                    "params": {"unexpected": true}
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("invalid refresh request");
+
+        assert_eq!(error.code, auth::INVALID_AUTH_REQUEST_CODE);
+        assert!(!error.message.contains(secret));
+    }
+
+    #[test]
+    fn no_stored_session_releases_the_endpoint_lifecycle_entry() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").expect("initialize client");
+        let endpoint_id = "remote-lifecycle-test";
+        runtime
+            .gateway_session_lifecycle_reduce(
+                serde_json::json!({
+                    "endpoint_id": endpoint_id,
+                    "event": {
+                        "kind": "stored_session_loaded",
+                        "data": {
+                            "gateway_id": "G00000000000000000001",
+                            "device_id": "D00000000000000000001",
+                            "session_id": "S00000000000000000001",
+                            "refresh_generation": 0,
+                            "refresh_expires_at_unix": 1_900_000_000_u64
+                        }
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("store lifecycle");
+        assert_eq!(
+            runtime
+                .gateway_session_lifecycles
+                .lock()
+                .expect("lifecycle lock")
+                .len(),
+            1
+        );
+
+        runtime
+            .gateway_session_lifecycle_reduce(
+                serde_json::json!({
+                    "endpoint_id": endpoint_id,
+                    "event": {"kind": "no_stored_session"}
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("release lifecycle");
+        assert!(
+            runtime
+                .gateway_session_lifecycles
+                .lock()
+                .expect("lifecycle lock")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2482,14 +2856,13 @@ mod tests {
             .gateway_plan_add_remote(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": null,
                         "local": {
                             "id": "local",
                             "name": "Local",
                             "address": "127.0.0.1:17878",
                             "kind": "local",
-                            "auth_token_ref": null,
                             "workspace_id": null,
                             "service_name": null
                         },
@@ -2497,7 +2870,6 @@ mod tests {
                     },
                     "name": " Remote ",
                     "address": "127.0.0.1:23000",
-                    "auth_token": " token ",
                     "new_endpoint_id": "remote-one",
                     "default_remote_name": "Remote 1"
                 })
@@ -2507,17 +2879,8 @@ mod tests {
             .expect("plan add remote");
 
         assert_eq!(result.endpoint.id, "remote-one");
-        assert_eq!(
-            result.endpoint.auth_token_ref.as_deref(),
-            Some("remote-one")
-        );
-        assert_eq!(
-            result
-                .token_write
-                .as_ref()
-                .map(|write| write.token.as_str()),
-            Some("token")
-        );
+        assert!(result.endpoint.session_ref.is_none());
+        assert!(result.previous_endpoint.is_none());
     }
 
     #[test]
@@ -2527,13 +2890,12 @@ mod tests {
             .gateway_plan_add_and_activate_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": null,
                         "remotes": []
                     },
                     "name": " Remote ",
                     "address": "127.0.0.1:23000",
-                    "auth_token": " token ",
                     "new_endpoint_id": "remote-one",
                     "default_remote_name": "Remote 1"
                 })
@@ -2549,13 +2911,7 @@ mod tests {
         );
         assert!(result.registry.local.is_none());
         assert_eq!(result.registry.remotes.len(), 1);
-        assert_eq!(
-            result
-                .token_write
-                .as_ref()
-                .map(|write| write.token.as_str()),
-            Some("token")
-        );
+        assert!(result.endpoint.session_ref.is_none());
     }
 
     #[test]
@@ -2565,14 +2921,13 @@ mod tests {
             .gateway_plan_activate_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": null,
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
                             "address": "127.0.0.1:23000",
                             "kind": "remote",
-                            "auth_token_ref": null,
                             "workspace_id": null,
                             "service_name": null
                         }]
@@ -2592,20 +2947,19 @@ mod tests {
     }
 
     #[test]
-    fn gateway_update_remote_registry_plan_returns_token_write() {
+    fn gateway_update_remote_registry_plan_updates_profile_only() {
         let runtime = ClientFfiRuntime::default();
         let result = runtime
             .gateway_plan_update_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": "remote-one",
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
                             "address": "127.0.0.1:23000",
                             "kind": "remote",
-                            "auth_token_ref": null,
                             "workspace_id": null,
                             "service_name": null
                         }]
@@ -2613,10 +2967,6 @@ mod tests {
                     "gateway_id": "remote-one",
                     "name": "Renamed",
                     "address": "127.0.0.1:24000",
-                    "auth_token_update": {
-                        "mode": "replace",
-                        "token": " token "
-                    },
                     "default_remote_name": "Remote 1"
                 })
                 .to_string()
@@ -2626,13 +2976,7 @@ mod tests {
 
         assert_eq!(result.endpoint.name, "Renamed");
         assert_eq!(result.endpoint.address, "127.0.0.1:24000");
-        assert_eq!(
-            result
-                .token_write
-                .as_ref()
-                .map(|write| write.token.as_str()),
-            Some("token")
-        );
+        assert_eq!(result.previous_endpoint.address, "127.0.0.1:23000");
     }
 
     #[test]
@@ -2642,7 +2986,7 @@ mod tests {
             .gateway_plan_delete_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": "remote-one",
                         "remotes": [
                             {
@@ -2650,7 +2994,6 @@ mod tests {
                                 "name": "One",
                                 "address": "127.0.0.1:23000",
                                 "kind": "remote",
-                                "auth_token_ref": "remote-one",
                                 "workspace_id": null,
                                 "service_name": null
                             },
@@ -2659,7 +3002,6 @@ mod tests {
                                 "name": "Two",
                                 "address": "127.0.0.1:24000",
                                 "kind": "remote",
-                                "auth_token_ref": null,
                                 "workspace_id": null,
                                 "service_name": null
                             }
@@ -2674,7 +3016,6 @@ mod tests {
 
         assert!(result.deleted_active);
         assert_eq!(result.endpoint.id, "remote-one");
-        assert_eq!(result.deleted_token_ref.as_deref(), Some("remote-one"));
         assert_eq!(
             result.registry.active_gateway_id.as_deref(),
             Some("remote-two")
@@ -2688,14 +3029,13 @@ mod tests {
             .gateway_plan_set_workspace_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 1,
+                        "version": 2,
                         "active_gateway_id": "remote-one",
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
                             "address": "127.0.0.1:23000",
                             "kind": "remote",
-                            "auth_token_ref": null,
                             "workspace_id": null,
                             "service_name": null
                         }]

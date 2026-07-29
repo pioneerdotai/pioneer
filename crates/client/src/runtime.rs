@@ -658,7 +658,9 @@ pub fn reduce_gateway_notification(
                 reduce_voice_session_result_notification(&notification),
             ))
         }
-        GatewayNotification::ContextCompressing(_)
+        GatewayNotification::AuthSessionRevoked(_)
+        | GatewayNotification::AuthAccessExpiring(_)
+        | GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
         | GatewayNotification::SkillsUploadChunkAck(_)
@@ -742,6 +744,7 @@ mod tests {
             endpoint_kind: GatewayEndpointKind::Remote,
             address: "127.0.0.1:17878".to_owned(),
             auth_token: None,
+            session: None,
             timings: timings(),
         }
     }
