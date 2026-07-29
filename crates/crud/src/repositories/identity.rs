@@ -14,6 +14,8 @@ pub struct GatewayIdentityRecord {
     pub id: GatewayId,
     pub singleton_key: i64,
     pub identity_bootstrap_version: i64,
+    pub auth_schema_version: i64,
+    pub auth_ready_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -150,6 +152,8 @@ pub async fn create_gateway_singleton<C: ConnectionTrait>(
         id: Set(id.to_string()),
         singleton_key: Set(GATEWAY_SINGLETON_KEY),
         identity_bootstrap_version: Set(identity_bootstrap_version),
+        auth_schema_version: Set(0),
+        auth_ready_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -178,6 +182,41 @@ pub async fn set_identity_bootstrap_version<C: ConnectionTrait>(
             .update(db)
             .await
             .context("failed to update identity bootstrap marker")?,
+    )
+}
+
+pub async fn mark_gateway_auth_ready<C: ConnectionTrait>(
+    db: &C,
+    id: &GatewayId,
+    auth_schema_version: i64,
+    now: DateTimeWithTimeZone,
+) -> Result<GatewayIdentityRecord> {
+    let model = gateway_identity::Entity::find_by_id(id.to_string())
+        .one(db)
+        .await
+        .context("failed to load Gateway identity for auth readiness")?
+        .context("Gateway identity disappeared before auth readiness")?;
+    if model.auth_schema_version == auth_schema_version {
+        if model.auth_ready_at.is_none() {
+            bail!("Gateway auth readiness marker is incomplete");
+        }
+        return gateway_identity_record_from_model(model);
+    }
+    if model.auth_schema_version != 0 {
+        bail!(
+            "unsupported Gateway auth schema version {}",
+            model.auth_schema_version
+        );
+    }
+    let mut active: gateway_identity::ActiveModel = model.into();
+    active.auth_schema_version = Set(auth_schema_version);
+    active.auth_ready_at = Set(Some(now));
+    active.updated_at = Set(now);
+    gateway_identity_record_from_model(
+        active
+            .update(db)
+            .await
+            .context("failed to mark Gateway auth ready")?,
     )
 }
 
@@ -395,6 +434,8 @@ pub fn gateway_identity_record_from_model(
         id: GatewayId::new(model.id).context("invalid persisted Gateway id")?,
         singleton_key: model.singleton_key,
         identity_bootstrap_version: model.identity_bootstrap_version,
+        auth_schema_version: model.auth_schema_version,
+        auth_ready_at: model.auth_ready_at,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })

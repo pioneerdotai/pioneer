@@ -8,6 +8,7 @@ pub mod agent_memory_quarantine;
 pub mod agent_memory_repair_job;
 pub(crate) mod agent_skill;
 pub mod artifact;
+pub(crate) mod auth_session;
 pub(crate) mod canonical_turn_event;
 pub mod cli_runtime_binding;
 pub mod hook_run;

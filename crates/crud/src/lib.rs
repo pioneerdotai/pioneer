@@ -13,6 +13,22 @@ mod turn_item_terminal;
 mod util;
 
 pub use events::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+pub use repositories::auth_session::{
+    AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewPendingDeviceSessionRow,
+    NewRefreshCredentialRow, PendingSessionIssuer, activate_pending_auth_session,
+    activate_pending_device, advance_auth_session_refresh, auth_session_status_to_db,
+    cleanup_terminal_refresh_evidence, client_kind_to_db, device_status_to_db,
+    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
+    expire_stale_pending_sessions, insert_pending_device_session, insert_refresh_credential,
+    list_pending_activation_locator_hashes, list_sessions_for_principal,
+    load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
+    load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
+    load_pending_session_for_creator, load_refresh_by_hash, load_session,
+    load_session_by_activation_hash, mark_device_revoked, mark_session_revoked,
+    record_failed_device_activation, refresh_status_to_db, revoke_current_refresh_for_session,
+    revoke_reason_to_db, revoke_session_family_for_refresh_reuse, rotate_current_refresh,
+    scan_auth_persistence_invariants, touch_active_auth_session, touch_active_device,
+};
 pub use repositories::identity::{
     ActorReferenceRow, ActorResourceKind, GATEWAY_SINGLETON_KEY, GatewayIdentityRecord,
     GatewayPrincipalRecord, IdentityInvariantRows, LegacyActorBackfillCounts, actor_ref_from_db,
@@ -20,8 +36,8 @@ pub use repositories::identity::{
     gateway_identity_record_from_model, gateway_principal_record_from_model,
     list_gateway_identities, list_gateway_principals, load_gateway_singleton,
     load_identity_invariant_rows, load_principal_by_id, load_superusers_for_gateway,
-    principal_kind_from_db, principal_kind_to_db, principal_status_from_db, principal_status_to_db,
-    set_identity_bootstrap_version,
+    mark_gateway_auth_ready, principal_kind_from_db, principal_kind_to_db,
+    principal_status_from_db, principal_status_to_db, set_identity_bootstrap_version,
 };
 
 use anyhow::{Context, Result, bail};
