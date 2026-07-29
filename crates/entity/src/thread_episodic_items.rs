@@ -26,8 +26,6 @@ pub struct Model {
     #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub text_hash: String,
     pub source_text_hash: String,
-    pub projection_group_id: Option<String>,
-    pub embedding_artifact_id: Option<String>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
     pub capsule_id: Option<String>,
@@ -41,6 +39,10 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub deleted_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub projection_group_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub embedding_artifact_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

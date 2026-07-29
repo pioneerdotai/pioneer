@@ -17,6 +17,7 @@ pub struct Model {
     pub model: String,
     pub dimension: i64,
     pub normalized: bool,
+    #[sea_orm(column_type = "Binary(1)")]
     pub vector_bytes: Vec<u8>,
     pub created_at: DateTimeWithTimeZone,
     pub last_used_at: DateTimeWithTimeZone,

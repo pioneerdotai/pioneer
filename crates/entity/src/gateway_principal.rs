@@ -21,6 +21,10 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub removed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(has_many)]
+    pub auth_sessions: HasMany<super::auth_session::Entity>,
+    #[sea_orm(has_many)]
+    pub devices: HasMany<super::device::Entity>,
     #[sea_orm(
         belongs_to,
         from = "gateway_id",
