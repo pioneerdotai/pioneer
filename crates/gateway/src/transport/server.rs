@@ -938,8 +938,9 @@ mod tests {
 
     fn restricted_refresh() -> CapturedAdmission {
         let credential = format!(
-            "prf_{}",
-            "r".repeat(pioneer_protocol::MIN_OPAQUE_CREDENTIAL_BODY_LEN)
+            "{}{}",
+            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+            "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
         );
         CapturedAdmission::Restricted(RestrictedAdmission::new(
             PresentedCredential::classify(&credential).unwrap(),

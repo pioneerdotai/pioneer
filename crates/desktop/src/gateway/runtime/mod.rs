@@ -737,7 +737,11 @@ mod tests {
                     installation_id,
                     refresh_generation: 0,
                     refresh_expires_at_unix: 2_000,
-                    refresh_token: AuthSecretString::new(format!("prf_{}", "r".repeat(43))),
+                    refresh_token: AuthSecretString::new(format!(
+                        "{}{}",
+                        pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+                        "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
+                    )),
                 },
                 Some("Remote Gateway session".to_owned()),
             )
@@ -849,7 +853,11 @@ mod tests {
                     installation_id,
                     refresh_generation: 0,
                     refresh_expires_at_unix: 2_000,
-                    refresh_token: AuthSecretString::new(format!("prf_{}", "r".repeat(43))),
+                    refresh_token: AuthSecretString::new(format!(
+                        "{}{}",
+                        pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+                        "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
+                    )),
                 },
                 Some("Local Gateway session".to_owned()),
             )

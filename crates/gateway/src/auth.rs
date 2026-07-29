@@ -7,7 +7,7 @@ mod opaque;
 mod readiness;
 mod service;
 
-pub(crate) const AUTH_SCHEMA_VERSION: i64 = 1;
+pub(crate) const AUTH_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) use admission::{AuthAdmissionService, CapturedAdmission, RestrictedAdmission};
 pub(crate) use context::{

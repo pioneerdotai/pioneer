@@ -294,7 +294,6 @@ access_token_ttl_seconds = 900
 refresh_token_ttl_seconds = 7776000
 device_activation_code_ttl_seconds = 600
 auth_exchange_timeout_seconds = 15
-opaque_token_size_bytes = 32
 
 [desktop.gateway]
 connect_timeout_ms = 300

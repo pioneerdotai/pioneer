@@ -11,25 +11,13 @@ pub struct Model {
     pub id: String,
     #[sea_orm(unique)]
     pub session_id: String,
+    #[sea_orm(unique)]
     pub token_family_id: String,
-    #[sea_orm(unique_key = "idx_auth_refresh_generation")]
     pub generation: i64,
     #[sea_orm(column_type = "Binary(1)", unique)]
     pub token_hash: Vec<u8>,
-    pub status: String,
     pub issued_at: DateTimeWithTimeZone,
     pub expires_at: DateTimeWithTimeZone,
-    pub consumed_at: Option<DateTimeWithTimeZone>,
-    pub replaced_by_id: Option<String>,
-    #[sea_orm(
-        self_ref,
-        relation_enum = "SelfRef",
-        from = "replaced_by_id",
-        to = "id",
-        on_update = "NoAction",
-        on_delete = "Restrict"
-    )]
-    pub auth_refresh_credential: HasOne<Entity>,
     #[sea_orm(
         belongs_to,
         from = "session_id",

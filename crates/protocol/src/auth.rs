@@ -4,8 +4,9 @@ use zeroize::Zeroize;
 
 use crate::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, TokenFamilyId};
 
-pub const MIN_OPAQUE_CREDENTIAL_BODY_LEN: usize = 43;
-pub const MAX_OPAQUE_CREDENTIAL_BODY_LEN: usize = 171;
+pub const REFRESH_CREDENTIAL_PREFIX: &str = "prf2_";
+pub const REFRESH_CREDENTIAL_BODY_LEN: usize = 164;
+pub const DEVICE_SESSION_AUTH_PROTOCOL_VERSION: u32 = 3;
 pub const DEVICE_ACTIVATION_CODE_SYMBOLS: usize = 8;
 pub const DEVICE_ACTIVATION_LOCATOR_SYMBOLS: usize = 1;
 pub const DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -68,15 +69,6 @@ impl AuthSessionTerminationReason {
             Self::SessionCompromised => "session_compromised",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RefreshCredentialStatus {
-    Current,
-    Rotated,
-    Revoked,
-    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -530,10 +522,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuthSessionRevokeReason::ActivationAttemptsExceeded).unwrap(),
             "\"activation_attempts_exceeded\""
-        );
-        assert_eq!(
-            serde_json::to_string(&RefreshCredentialStatus::Current).unwrap(),
-            "\"current\""
         );
         assert!(serde_json::from_str::<DeviceStatus>("\"unknown\"").is_err());
     }

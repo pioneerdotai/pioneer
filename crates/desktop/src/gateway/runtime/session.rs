@@ -603,7 +603,7 @@ fn rotated_session(
     expected_installation_id: &str,
     grant: AuthRefreshGrant,
 ) -> Result<(DesktopGatewaySessionSecret, DesktopSessionAccessGrant)> {
-    if grant.auth_protocol_version != 2
+    if grant.auth_protocol_version != pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION
         || grant.credential_storage_order
             != CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
         || grant.gateway.id != previous.gateway_id
@@ -821,7 +821,11 @@ mod tests {
     }
 
     fn refresh_token(generation: u64) -> String {
-        format!("prf_generation_{generation:020}_000000000000000000000000")
+        format!(
+            "{}{generation:020}{}",
+            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+            "0".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN - 20)
+        )
     }
 
     fn stored_session(generation: u64) -> DesktopGatewaySessionSecret {
@@ -870,7 +874,7 @@ mod tests {
                 client_kind: ClientKind::Desktop,
                 status: DeviceStatus::Active,
             },
-            auth_protocol_version: 2,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
             credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         }
     }

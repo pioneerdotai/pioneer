@@ -3,8 +3,7 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use pioneer_protocol::{
-    MAX_OPAQUE_CREDENTIAL_BODY_LEN, MIN_OPAQUE_CREDENTIAL_BODY_LEN,
-    normalize_device_activation_code,
+    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, normalize_device_activation_code,
 };
 
 use super::{AuthError, AuthErrorCode};
@@ -48,8 +47,8 @@ impl PresentedCredential {
         if raw.is_empty() || raw.len() > MAX_PRESENTED_CREDENTIAL_BYTES {
             return Err(AuthError::new(AuthErrorCode::MalformedCredential));
         }
-        let (kind, canonical) = if let Some(body) = raw.strip_prefix("prf_") {
-            validate_opaque_body(body)?;
+        let (kind, canonical) = if let Some(body) = raw.strip_prefix(REFRESH_CREDENTIAL_PREFIX) {
+            validate_refresh_body(body)?;
             (PresentedCredentialKind::Refresh, raw.to_owned())
         } else if let Ok(canonical) = normalize_device_activation_code(raw) {
             (PresentedCredentialKind::DeviceActivation, canonical)
@@ -71,8 +70,8 @@ impl PresentedCredential {
     }
 }
 
-fn validate_opaque_body(body: &str) -> Result<(), AuthError> {
-    if !(MIN_OPAQUE_CREDENTIAL_BODY_LEN..=MAX_OPAQUE_CREDENTIAL_BODY_LEN).contains(&body.len())
+fn validate_refresh_body(body: &str) -> Result<(), AuthError> {
+    if body.len() != REFRESH_CREDENTIAL_BODY_LEN
         || !body
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
@@ -147,7 +146,10 @@ mod tests {
                 None,
             ),
             (
-                format!("prf_{}", "r".repeat(MIN_OPAQUE_CREDENTIAL_BODY_LEN)),
+                format!(
+                    "{REFRESH_CREDENTIAL_PREFIX}{}",
+                    "r".repeat(REFRESH_CREDENTIAL_BODY_LEN)
+                ),
                 PresentedCredentialKind::Refresh,
                 None,
             ),
@@ -177,8 +179,11 @@ mod tests {
             assert!(!format!("{error:?} {error}").contains(raw) || raw.is_empty());
         }
         for raw in [
-            "prf_too_short".to_owned(),
-            format!("prf_{}+", "r".repeat(MIN_OPAQUE_CREDENTIAL_BODY_LEN)),
+            "prf2_too_short".to_owned(),
+            format!(
+                "{REFRESH_CREDENTIAL_PREFIX}{}+",
+                "r".repeat(REFRESH_CREDENTIAL_BODY_LEN)
+            ),
         ] {
             assert_eq!(
                 PresentedCredential::classify(&raw).unwrap_err().code(),
@@ -188,7 +193,7 @@ mod tests {
         for old_or_invalid_activation in [
             format!(
                 "device_G00000000000000000001_{}",
-                "e".repeat(MAX_OPAQUE_CREDENTIAL_BODY_LEN)
+                "e".repeat(REFRESH_CREDENTIAL_BODY_LEN)
             ),
             "K7M4-P9U2".to_owned(),
         ] {

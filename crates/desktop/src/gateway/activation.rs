@@ -219,7 +219,7 @@ fn session_from_grant(
     expected_installation_id: &str,
     expected_gateway_id: Option<&GatewayId>,
 ) -> Result<(DesktopGatewaySessionSecret, DesktopSessionAccessGrant)> {
-    if grant.auth_protocol_version != 2
+    if grant.auth_protocol_version != pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION
         || expected_gateway_id.is_some_and(|expected| &grant.gateway.id != expected)
         || grant.principal.kind != pioneer_protocol::PrincipalKind::Superuser
         || grant.device.installation_id != expected_installation_id
@@ -345,10 +345,14 @@ mod tests {
             },
             access_token: AuthSecretString::new(ACCESS_SECRET),
             access_expires_at_unix: 1_000,
-            refresh_token: AuthSecretString::new(format!("prf_{}", "r".repeat(43))),
+            refresh_token: AuthSecretString::new(format!(
+                "{}{}",
+                pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+                "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
+            )),
             refresh_expires_at_unix: 2_000,
             refresh_generation: 0,
-            auth_protocol_version: 2,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
             credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         }
     }

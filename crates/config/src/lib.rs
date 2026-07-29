@@ -2684,8 +2684,6 @@ pub struct GatewayAuthConfig {
     pub device_activation_code_ttl_seconds: u64,
     #[serde(default = "default_gateway_auth_exchange_timeout_seconds")]
     pub auth_exchange_timeout_seconds: u64,
-    #[serde(default = "default_gateway_opaque_token_size_bytes")]
-    pub opaque_token_size_bytes: usize,
 }
 
 const fn default_gateway_access_token_ttl_seconds() -> u64 {
@@ -2704,12 +2702,7 @@ const fn default_gateway_auth_exchange_timeout_seconds() -> u64 {
     15
 }
 
-const fn default_gateway_opaque_token_size_bytes() -> usize {
-    32
-}
-
 const MAX_GATEWAY_REFRESH_TOKEN_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
-const MAX_GATEWAY_OPAQUE_TOKEN_SIZE_BYTES: usize = 128;
 
 impl GatewayAuthConfig {
     pub fn validate_session_security(&self) -> Result<()> {
@@ -2734,9 +2727,6 @@ impl GatewayAuthConfig {
         if !(1..=60).contains(&self.auth_exchange_timeout_seconds) {
             bail!("gateway.auth.auth_exchange_timeout_seconds must be between 1 and 60");
         }
-        if !(32..=MAX_GATEWAY_OPAQUE_TOKEN_SIZE_BYTES).contains(&self.opaque_token_size_bytes) {
-            bail!("gateway.auth.opaque_token_size_bytes must be between 32 and 128");
-        }
         if self.token_refresh_leeway_seconds == 0
             || self.token_refresh_leeway_seconds >= self.access_token_ttl_seconds
         {
@@ -2760,7 +2750,6 @@ impl Default for GatewayAuthConfig {
             device_activation_code_ttl_seconds: default_gateway_device_activation_code_ttl_seconds(
             ),
             auth_exchange_timeout_seconds: default_gateway_auth_exchange_timeout_seconds(),
-            opaque_token_size_bytes: default_gateway_opaque_token_size_bytes(),
         }
     }
 }
@@ -4740,16 +4729,16 @@ token_refresh_leeway_seconds = 300
         assert_eq!(config.refresh_token_ttl_seconds, 7_776_000);
         assert_eq!(config.device_activation_code_ttl_seconds, 600);
         assert_eq!(config.auth_exchange_timeout_seconds, 15);
-        assert_eq!(config.opaque_token_size_bytes, 32);
         config.validate_session_security().expect("secure defaults");
     }
 
     #[test]
-    fn gateway_auth_config_rejects_removed_shared_jwt_fields() {
+    fn gateway_auth_config_rejects_removed_fields() {
         for removed_field in [
             r#"superuser_subject = "superuser""#,
             r#"superuser_role = "superuser""#,
             "token_ttl_seconds = 31536000",
+            "opaque_token_size_bytes = 32",
         ] {
             let config = format!(
                 r#"
@@ -4761,7 +4750,7 @@ token_refresh_leeway_seconds = 300
 "#
             );
             let error = toml::from_str::<super::GatewayAuthConfig>(&config)
-                .expect_err("removed shared-JWT config must fail closed");
+                .expect_err("removed auth config must fail closed");
             assert!(
                 error.to_string().contains("unknown field"),
                 "unexpected error for `{removed_field}`: {error}"
@@ -4777,12 +4766,6 @@ token_refresh_leeway_seconds = 300
             .auth;
         config.validate_session_security().expect("secure defaults");
 
-        config.opaque_token_size_bytes = 31;
-        assert!(config.validate_session_security().is_err());
-        config.opaque_token_size_bytes = 32;
-        config.opaque_token_size_bytes = 129;
-        assert!(config.validate_session_security().is_err());
-        config.opaque_token_size_bytes = 32;
         config.refresh_token_ttl_seconds = config.access_token_ttl_seconds;
         assert!(config.validate_session_security().is_err());
         config.refresh_token_ttl_seconds = 366 * 24 * 60 * 60;

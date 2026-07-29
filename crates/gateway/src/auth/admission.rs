@@ -64,9 +64,9 @@ impl AuthAdmissionService {
         })
     }
 
-    /// Performs only bounded header parsing, format classification and local
-    /// cryptographic verification. Persisted session state is deliberately not
-    /// available to this synchronous handshake path.
+    /// Performs only bounded header parsing, format classification and access-JWT
+    /// verification. Refresh-envelope verification and persisted session checks
+    /// remain in the restricted async exchange path.
     pub(crate) fn capture_request(
         &self,
         request: &Request,

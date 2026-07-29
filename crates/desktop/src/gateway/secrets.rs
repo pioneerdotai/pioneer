@@ -10,13 +10,14 @@ use pioneer_keystore::{
     SecretStore,
 };
 use pioneer_protocol::{
-    AuthSecretString, AuthSessionId, DeviceId, GatewayId, MAX_OPAQUE_CREDENTIAL_BODY_LEN,
-    MIN_OPAQUE_CREDENTIAL_BODY_LEN, PrincipalId, TokenFamilyId,
+    AuthSecretString, AuthSessionId, DeviceId, GatewayId, PrincipalId, REFRESH_CREDENTIAL_BODY_LEN,
+    REFRESH_CREDENTIAL_PREFIX, TokenFamilyId,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-pub(crate) const DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 2;
+const RETIRED_DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 1;
 const RETIRED_DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE: &str = "pioneer.desktop.gateway_auth_token";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +34,12 @@ pub(crate) struct DesktopGatewaySessionSecret {
     pub refresh_expires_at_unix: u64,
     pub refresh_token: AuthSecretString,
 }
+
+#[derive(Deserialize)]
+struct DesktopGatewaySessionEnvelopeVersion {
+    schema_version: u32,
+}
+
 impl DesktopGatewaySessionSecret {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.schema_version != DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION {
@@ -57,11 +64,11 @@ impl DesktopGatewaySessionSecret {
 }
 
 pub(crate) fn is_valid_refresh_credential(value: &str) -> bool {
-    let Some(entropy) = value.strip_prefix("prf_") else {
+    let Some(body) = value.strip_prefix(REFRESH_CREDENTIAL_PREFIX) else {
         return false;
     };
-    (MIN_OPAQUE_CREDENTIAL_BODY_LEN..=MAX_OPAQUE_CREDENTIAL_BODY_LEN).contains(&entropy.len())
-        && entropy
+    body.len() == REFRESH_CREDENTIAL_BODY_LEN
+        && body
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
@@ -95,6 +102,14 @@ impl DesktopSecrets {
             return Ok(None);
         };
         let raw = Zeroizing::new(raw);
+        let version = serde_json::from_str::<DesktopGatewaySessionEnvelopeVersion>(raw.as_str())
+            .context("failed to decode desktop Gateway session envelope version")?;
+        if version.schema_version == RETIRED_DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION {
+            self.store
+                .delete(&id)
+                .context("failed to delete retired desktop Gateway session")?;
+            return Ok(None);
+        }
         let session = serde_json::from_str::<DesktopGatewaySessionSecret>(raw.as_str())
             .context("failed to decode desktop Gateway session envelope")?;
         session.validate()?;
@@ -195,4 +210,44 @@ fn current_unix_i64() -> Result<i64> {
         .context("system clock is before unix epoch")?
         .as_secs();
     i64::try_from(timestamp).context("current unix timestamp does not fit in i64")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_keystore::MemorySecretStore;
+
+    #[test]
+    fn retired_session_envelope_is_deleted_and_treated_as_missing() {
+        let store = Arc::new(MemorySecretStore::new());
+        let id = SecretId::desktop_gateway_session("remote-1").unwrap();
+        store
+            .put_string(
+                &id,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "gateway_id": "G00000000000000000001",
+                    "principal_id": "P00000000000000000001",
+                    "device_id": "D00000000000000000001",
+                    "session_id": "S00000000000000000001",
+                    "token_family_id": "F00000000000000000001",
+                    "installation_id": "installation-desktop-1",
+                    "refresh_generation": 3,
+                    "refresh_expires_at_unix": 1_900_000_000_u64,
+                    "refresh_token": format!("prf_{}", "r".repeat(43)),
+                })
+                .to_string(),
+                SecretMeta {
+                    kind: SecretKind::DesktopGatewaySession,
+                    label: Some("Remote".to_owned()),
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+            )
+            .unwrap();
+        let secrets = DesktopSecrets::new(store.clone());
+
+        assert!(secrets.get_gateway_session("remote-1").unwrap().is_none());
+        assert!(!store.exists(&id).unwrap());
+    }
 }

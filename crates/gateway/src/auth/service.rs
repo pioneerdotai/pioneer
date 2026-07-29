@@ -6,17 +6,16 @@ use pioneer_config::GatewayAuthConfig;
 use pioneer_crud::{
     DeviceActivationFailureOutcome, NewPendingDeviceSessionRow, NewRefreshCredentialRow,
     PendingSessionIssuer, activate_pending_auth_session, activate_pending_device,
-    advance_auth_session_refresh, auth_session_status_to_db, cleanup_terminal_refresh_evidence,
+    advance_auth_session_refresh, auth_session_status_to_db, delete_refresh_for_session,
     expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
     expire_stale_pending_sessions, insert_pending_device_session, insert_refresh_credential,
     list_pending_activation_locator_hashes, list_sessions_for_principal,
-    load_active_device_by_installation, load_active_session_by_device, load_device,
-    load_gateway_singleton, load_pending_local_session,
+    load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
+    load_device, load_gateway_singleton, load_pending_local_session,
     load_pending_session_by_activation_locator_hash, load_pending_session_for_creator,
-    load_principal_by_id, load_refresh_by_hash, load_session, load_session_by_activation_hash,
-    mark_device_revoked, mark_session_revoked, record_failed_device_activation,
-    revoke_current_refresh_for_session, revoke_session_family_for_refresh_reuse,
-    rotate_current_refresh, touch_active_auth_session, touch_active_device,
+    load_principal_by_id, load_session, load_session_by_activation_hash, mark_device_revoked,
+    mark_session_revoked, record_failed_device_activation, replace_current_refresh,
+    revoke_session_family_for_refresh_reuse, touch_active_auth_session, touch_active_device,
 };
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthDeviceActivateParams, AuthDeviceCreateResponse, AuthDeviceSnapshot,
@@ -29,8 +28,8 @@ use pioneer_protocol::{
     RefreshCredentialId, RequestId, TokenFamilyId, format_device_activation_code, generate_id,
 };
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqliteTransactionMode,
-    TransactionOptions, TransactionTrait,
+    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait,
 };
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
@@ -48,8 +47,8 @@ use super::{
 
 const MAX_INSTALLATION_TEXT: usize = 255;
 const MAX_DIAGNOSTIC_TEXT: usize = 255;
-const AUTH_EVIDENCE_CLEANUP_BATCH_SIZE: u64 = 256;
-const AUTH_EVIDENCE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
+const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 pub(crate) struct GatewayAuthService {
     database: DatabaseConnection,
@@ -133,10 +132,7 @@ impl GatewayAuthService {
                 &config,
                 identity.gateway.id.clone(),
             )?,
-            opaque_credentials: OpaqueCredentialFactory::new(
-                credential_hmac_key.as_bytes(),
-                config.opaque_token_size_bytes,
-            )?,
+            opaque_credentials: OpaqueCredentialFactory::new(credential_hmac_key.as_bytes())?,
             database,
             config,
             identity,
@@ -159,17 +155,19 @@ impl GatewayAuthService {
         RequestId::new(params.refresh_request_id.clone())
             .map_err(|_| AuthError::new(AuthErrorCode::MalformedCredential))?;
         params.client_version = bounded_optional(params.client_version, MAX_DIAGNOSTIC_TEXT)?;
+        let presented = self
+            .opaque_credentials
+            .verify_refresh_raw(admission.credential().expose_for_authentication())?;
         let presented_hash = self
             .opaque_credentials
             .fingerprint_refresh_raw(admission.credential().expose_for_authentication());
-        let successor = self.opaque_credentials.generate_refresh();
-        let successor_hash = self.opaque_credentials.fingerprint(&successor);
-        let successor_id = RefreshCredentialId::new(generate_id(AUTH_DOMAIN_ID_LEN))
-            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let access_jti = generate_id(AUTH_DOMAIN_ID_LEN);
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let now = datetime(now_unix)?;
+        let next_generation = presented
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let refresh_expires_at_unix = now_unix
             .checked_add(self.config.refresh_token_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -177,6 +175,14 @@ impl GatewayAuthService {
             .checked_add(self.config.access_token_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let refresh_expires_at = datetime(refresh_expires_at_unix)?;
+        let successor = self.opaque_credentials.generate_refresh(
+            &presented.session_id,
+            &presented.token_family_id,
+            next_generation,
+            refresh_expires_at_unix,
+        );
+        let successor_hash = self.opaque_credentials.fingerprint(&successor);
+        let access_jti = generate_id(AUTH_DOMAIN_ID_LEN);
 
         let transaction = self
             .database
@@ -186,43 +192,80 @@ impl GatewayAuthService {
             })
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        // The rotated row points at its successor while the partial unique index permits only
-        // one current credential. Defer the self-referential FK until commit so the predecessor
-        // can be rotated before the successor is inserted in this same atomic transaction.
-        transaction
-            .execute_unprepared("PRAGMA defer_foreign_keys = ON")
-            .await
-            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let current = match load_refresh_by_hash(&transaction, &presented_hash)
+        let session = match load_session(&transaction, &presented.session_id)
             .await
             .map_err(storage_error)?
         {
-            Some(current) => current,
+            Some(session) => session,
             None => {
                 let _ = transaction.rollback().await;
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
         };
-        if current.status == "rotated" {
-            let presented_status = current.status.clone();
-            let session_id = AuthSessionId::new(current.session_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let token_family_id = TokenFamilyId::new(current.token_family_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let session = load_session(&transaction, &session_id)
+        if session.token_family_id != presented.token_family_id.as_str() {
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+        if session.status == "revoked" {
+            let code = if session.revoke_reason.as_deref() == Some("refresh_reuse") {
+                AuthErrorCode::SessionCompromised
+            } else {
+                AuthErrorCode::SessionRevoked
+            };
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(code));
+        }
+        if session.status == "expired" {
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(AuthErrorCode::SessionExpired));
+        }
+        if session.status != "active" {
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+        }
+        let session_generation = u64::try_from(session.refresh_generation)
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let device_id = DeviceId::new(session.device_id.clone())
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if session
+            .refresh_expires_at
+            .as_ref()
+            .is_none_or(|expires_at| now >= *expires_at)
+        {
+            expire_session_refresh_family(
+                &transaction,
+                &presented.session_id,
+                &presented.token_family_id,
+                now,
+            )
+            .await
+            .map_err(storage_error)?;
+            mark_device_revoked(&transaction, &device_id, now)
                 .await
-                .map_err(storage_error)?
-                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if session.token_family_id != token_family_id.as_str() {
+                .map_err(storage_error)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+            self.disconnect_session_after_commit(
+                &presented.session_id,
+                AuthSessionTerminationReason::SessionExpired,
+            )
+            .await;
+            return Err(AuthError::new(AuthErrorCode::SessionExpired));
+        }
+        if presented.generation < session_generation {
+            // A retired generation is replay evidence only for as long as that
+            // credential itself was valid. After its signed expiry it must not
+            // remain a permanent way to revoke an otherwise healthy session.
+            if now_unix >= presented.expires_at_unix {
                 let _ = transaction.rollback().await;
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
-            let device_id = DeviceId::new(session.device_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
             revoke_session_family_for_refresh_reuse(
                 &transaction,
-                &session_id,
-                &token_family_id,
+                &presented.session_id,
+                &presented.token_family_id,
                 now,
             )
             .await
@@ -236,106 +279,46 @@ impl GatewayAuthService {
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
             tracing::warn!(
                 event = "auth_refresh_reuse_detected",
-                session_id = %session_id,
-                token_family_id = %token_family_id,
-                presented_status,
+                session_id = %presented.session_id,
+                token_family_id = %presented.token_family_id,
+                presented_generation = presented.generation,
+                current_generation = session_generation,
                 outcome = "family_revoked",
-                reason = "non_current_refresh_reuse",
+                reason = "cryptographically_valid_prior_generation",
             );
             self.disconnect_session_after_commit(
-                &session_id,
+                &presented.session_id,
                 AuthSessionTerminationReason::SessionCompromised,
             )
             .await;
             return Err(AuthError::new(AuthErrorCode::SessionCompromised));
         }
-        if current.status == "revoked" {
-            let session_id = AuthSessionId::new(current.session_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let session = load_session(&transaction, &session_id)
-                .await
-                .map_err(storage_error)?
-                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let code = if session.revoke_reason.as_deref() == Some("refresh_reuse") {
-                AuthErrorCode::SessionCompromised
-            } else {
-                AuthErrorCode::SessionRevoked
-            };
-            let _ = transaction.rollback().await;
-            return Err(AuthError::new(code));
-        }
-        if current.status == "expired" {
-            let _ = transaction.rollback().await;
-            return Err(AuthError::new(AuthErrorCode::SessionExpired));
-        }
-        if current.status != "current" {
+        if presented.generation > session_generation {
             let _ = transaction.rollback().await;
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
-        if now >= current.expires_at {
-            let session_id = AuthSessionId::new(current.session_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let token_family_id = TokenFamilyId::new(current.token_family_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let session = load_session(&transaction, &session_id)
-                .await
-                .map_err(storage_error)?
-                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if session.token_family_id != token_family_id.as_str() {
-                let _ = transaction.rollback().await;
-                return Err(AuthError::new(AuthErrorCode::InvalidCredential));
-            }
-            let device_id = DeviceId::new(session.device_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            expire_session_refresh_family(&transaction, &session_id, &token_family_id, now)
-                .await
-                .map_err(storage_error)?;
-            mark_device_revoked(&transaction, &device_id, now)
-                .await
-                .map_err(storage_error)?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            self.disconnect_session_after_commit(
-                &session_id,
-                AuthSessionTerminationReason::SessionExpired,
+        let current = load_current_refresh(&transaction, &presented.session_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if current.session_id != presented.session_id.as_str()
+            || current.token_family_id != presented.token_family_id.as_str()
+            || current.generation != session.refresh_generation
+            || timestamp(current.expires_at)? != presented.expires_at_unix
+            || current.token_hash.len() != presented_hash.len()
+            || !bool::from(
+                current
+                    .token_hash
+                    .as_slice()
+                    .ct_eq(presented_hash.as_slice()),
             )
-            .await;
-            return Err(AuthError::new(AuthErrorCode::SessionExpired));
+        {
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
+
         let result = async {
-            let generation = u64::try_from(current.generation)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let next_generation = generation
-                .checked_add(1)
-                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let session_id = AuthSessionId::new(current.session_id.clone())
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
             let current_id = RefreshCredentialId::new(current.id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let token_family_id = TokenFamilyId::new(current.token_family_id)
-                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            let session = load_session(&transaction, &session_id)
-                .await
-                .map_err(storage_error)?
-                .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if session.status == "expired"
-                || session
-                    .refresh_expires_at
-                    .is_none_or(|expires_at| now >= expires_at)
-            {
-                return Err(AuthError::new(AuthErrorCode::SessionExpired));
-            }
-            if session.status != "active" {
-                return Err(AuthError::new(AuthErrorCode::SessionRevoked));
-            }
-            if session.token_family_id != token_family_id.as_str()
-                || session.refresh_generation != current.generation
-            {
-                return Err(AuthError::new(AuthErrorCode::InvalidCredential));
-            }
-            let device_id = DeviceId::new(session.device_id.clone())
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
             let gateway_id = pioneer_protocol::GatewayId::new(session.gateway_id.clone())
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -365,11 +348,15 @@ impl GatewayAuthService {
             {
                 return Err(AuthError::new(AuthErrorCode::SessionRevoked));
             }
-            if !rotate_current_refresh(
+            if !replace_current_refresh(
                 &transaction,
                 &current_id,
-                generation,
-                &successor_id,
+                &presented.session_id,
+                &presented.token_family_id,
+                presented.generation,
+                &presented_hash,
+                next_generation,
+                &successor_hash,
                 now,
                 refresh_expires_at,
             )
@@ -379,25 +366,10 @@ impl GatewayAuthService {
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
             self.inject_refresh_failure(1)?;
-            insert_refresh_credential(
-                &transaction,
-                NewRefreshCredentialRow {
-                    id: successor_id,
-                    session_id: session_id.clone(),
-                    token_family_id: token_family_id.clone(),
-                    generation: next_generation,
-                    token_hash: successor_hash,
-                    issued_at: now,
-                    expires_at: refresh_expires_at,
-                },
-            )
-            .await
-            .map_err(storage_error)?;
-            self.inject_refresh_failure(2)?;
             if !advance_auth_session_refresh(
                 &transaction,
-                &session_id,
-                generation,
+                &presented.session_id,
+                presented.generation,
                 next_generation,
                 refresh_expires_at,
                 now,
@@ -407,24 +379,25 @@ impl GatewayAuthService {
             {
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
-            self.inject_refresh_failure(3)?;
+            self.inject_refresh_failure(2)?;
             let access_token = self.access_issuer.issue(
                 &AccessJwtSubject {
                     gateway_id: gateway_id.clone(),
                     principal_id: principal_id.clone(),
                     device_id: device_id.clone(),
-                    session_id: session_id.clone(),
+                    session_id: presented.session_id.clone(),
                 },
                 now_unix,
                 Some(access_jti),
             )?;
+            self.inject_refresh_failure(3)?;
             Ok((
                 gateway_id,
                 principal_id,
                 principal,
                 device_id,
-                session_id,
-                token_family_id,
+                presented.session_id.clone(),
+                presented.token_family_id.clone(),
                 next_generation,
                 device,
                 access_token,
@@ -491,7 +464,7 @@ impl GatewayAuthService {
                 )?,
                 status: DeviceStatus::Active,
             },
-            auth_protocol_version: 2,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
             credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         })
     }
@@ -696,16 +669,6 @@ impl GatewayAuthService {
         Ok(self.validate_session_lease(principal).await?.me)
     }
 
-    pub(crate) async fn cleanup_refresh_evidence(
-        &self,
-        now_unix: u64,
-        batch_size: u64,
-    ) -> Result<u64, AuthError> {
-        cleanup_terminal_refresh_evidence(&self.database, datetime(now_unix)?, batch_size)
-            .await
-            .map_err(storage_error)
-    }
-
     pub(crate) async fn expire_pending_device_sessions(
         &self,
         now_unix: u64,
@@ -778,12 +741,12 @@ impl GatewayAuthService {
         u64::try_from(expired.len()).map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))
     }
 
-    pub(crate) fn spawn_evidence_maintenance(self: &Arc<Self>) {
+    pub(crate) fn spawn_auth_maintenance(self: &Arc<Self>) {
         let service = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(AUTH_EVIDENCE_CLEANUP_INTERVAL);
+            let mut interval = tokio::time::interval(AUTH_MAINTENANCE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Startup performs the first cleanup synchronously before the
+            // Startup performs the first reconciliation synchronously before the
             // listener opens. The detached worker starts with the next tick.
             interval.tick().await;
             loop {
@@ -795,15 +758,15 @@ impl GatewayAuthService {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
-                            event = "auth_evidence_cleanup_failed",
+                            event = "auth_maintenance_failed",
                             error = %error,
-                            "failed to read the clock for auth evidence cleanup"
+                            "failed to read the clock for auth maintenance"
                         );
                         continue;
                     }
                 };
                 match service
-                    .expire_stale_sessions(now_unix, AUTH_EVIDENCE_CLEANUP_BATCH_SIZE)
+                    .expire_stale_sessions(now_unix, AUTH_MAINTENANCE_BATCH_SIZE)
                     .await
                 {
                     Ok(expired_sessions) if expired_sessions > 0 => tracing::info!(
@@ -813,31 +776,14 @@ impl GatewayAuthService {
                     ),
                     Ok(_) => {}
                     Err(error) => tracing::warn!(
-                        event = "auth_evidence_cleanup_failed",
-                        evidence_kind = "session_expiry",
+                        event = "auth_maintenance_failed",
+                        maintenance_kind = "session_expiry",
                         error_code = error.code().as_str(),
                         "stale auth session expiry failed"
                     ),
                 }
                 match service
-                    .cleanup_refresh_evidence(now_unix, AUTH_EVIDENCE_CLEANUP_BATCH_SIZE)
-                    .await
-                {
-                    Ok(deleted_rows) if deleted_rows > 0 => tracing::info!(
-                        event = "auth_refresh_evidence_cleaned",
-                        deleted_rows,
-                        "expired refresh evidence cleanup completed"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        event = "auth_evidence_cleanup_failed",
-                        evidence_kind = "refresh",
-                        error_code = error.code().as_str(),
-                        "expired refresh evidence cleanup failed"
-                    ),
-                }
-                match service
-                    .expire_pending_device_sessions(now_unix, AUTH_EVIDENCE_CLEANUP_BATCH_SIZE)
+                    .expire_pending_device_sessions(now_unix, AUTH_MAINTENANCE_BATCH_SIZE)
                     .await
                 {
                     Ok(expired_sessions) if expired_sessions > 0 => tracing::info!(
@@ -847,8 +793,8 @@ impl GatewayAuthService {
                     ),
                     Ok(_) => {}
                     Err(error) => tracing::warn!(
-                        event = "auth_evidence_cleanup_failed",
-                        evidence_kind = "device_activation",
+                        event = "auth_maintenance_failed",
+                        maintenance_kind = "device_activation",
                         error_code = error.code().as_str(),
                         "pending device session expiry failed"
                     ),
@@ -952,7 +898,7 @@ impl GatewayAuthService {
             mark_session_revoked(&transaction, row, reason, now)
                 .await
                 .map_err(storage_error)?;
-            revoke_current_refresh_for_session(&transaction, target_id)
+            delete_refresh_for_session(&transaction, target_id)
                 .await
                 .map_err(storage_error)?;
             mark_device_revoked(&transaction, &device_id, now)
@@ -1264,8 +1210,6 @@ impl GatewayAuthService {
             .fingerprint_device_activation_locator_raw(
                 admission.credential().expose_for_authentication(),
             )?;
-        let refresh = self.opaque_credentials.generate_refresh();
-        let refresh_hash = self.opaque_credentials.fingerprint(&refresh);
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let now = datetime(now_unix)?;
@@ -1380,6 +1324,13 @@ impl GatewayAuthService {
         }
         let token_family_id = TokenFamilyId::new(pending_session.token_family_id.clone())
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let refresh = self.opaque_credentials.generate_refresh(
+            &session_id,
+            &token_family_id,
+            0,
+            refresh_expires_at_unix,
+        );
+        let refresh_hash = self.opaque_credentials.fingerprint(&refresh);
         let result = async {
             let gateway_id = pioneer_protocol::GatewayId::new(pending_session.gateway_id.clone())
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -1452,7 +1403,7 @@ impl GatewayAuthService {
                     )
                     .await
                     .map_err(storage_error)?;
-                    revoke_current_refresh_for_session(&transaction, &existing_session_id)
+                    delete_refresh_for_session(&transaction, &existing_session_id)
                         .await
                         .map_err(storage_error)?;
                     superseded_session_id = Some(existing_session_id);
@@ -1578,7 +1529,7 @@ impl GatewayAuthService {
             refresh_token: AuthSecretString::new(refresh.expose_for_exchange().to_owned()),
             refresh_expires_at_unix,
             refresh_generation: 0,
-            auth_protocol_version: 2,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
             credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         })
     }
@@ -1871,7 +1822,10 @@ mod tests {
         let identity = Arc::new(bootstrap_identity(&database).await.unwrap().snapshot);
         database
             .execute_unprepared(
-                "UPDATE gateway_identity SET auth_schema_version = 1, auth_ready_at = CURRENT_TIMESTAMP",
+                format!(
+                    "UPDATE gateway_identity SET auth_schema_version = {AUTH_SCHEMA_VERSION}, auth_ready_at = CURRENT_TIMESTAMP"
+                )
+                .as_str(),
             )
             .await
             .unwrap();
@@ -1902,7 +1856,12 @@ mod tests {
         assert_eq!(grant.principal.id, identity.superuser.id);
         assert_eq!(grant.device.installation_id, "desktop-installation");
         assert_eq!(grant.refresh_generation, 0);
-        assert!(grant.refresh_token.expose_secret().starts_with("prf_"));
+        assert!(
+            grant
+                .refresh_token
+                .expose_secret()
+                .starts_with(pioneer_protocol::REFRESH_CREDENTIAL_PREFIX)
+        );
         assert!(!format!("{grant:?}").contains(grant.refresh_token.expose_secret()));
 
         let replay = service
@@ -2029,7 +1988,7 @@ mod tests {
             .database
             .execute_unprepared(
                 "UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'; \
-                 UPDATE auth_refresh_credential SET status = 'revoked'",
+                 DELETE FROM auth_refresh_credential",
             )
             .await
             .unwrap();
@@ -2364,103 +2323,20 @@ mod tests {
             raw = rotated.refresh_token.expose_secret().to_owned();
             last_expiry = rotated.refresh_expires_at_unix;
         }
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
         assert_eq!(
-            count(&service.database, "auth_refresh_credential").await,
-            101
-        );
-        assert_eq!(
-            count_where(
+            scalar_i64(
                 &service.database,
-                "auth_refresh_credential",
-                "status = 'current'"
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'rotated'"
+                "SELECT generation AS value FROM auth_refresh_credential"
             )
             .await,
             100
-        );
-    }
-
-    #[tokio::test]
-    async fn rotated_refresh_evidence_chain_is_retained_for_the_successor_ttl() {
-        let (service, _) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session SET refresh_expires_at = datetime('now', '+1 day'); \
-                 UPDATE auth_refresh_credential SET expires_at = datetime('now', '+1 day')",
-            )
-            .await
-            .unwrap();
-
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(initial_grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_refresh_credential \
-                 SET expires_at = datetime(expires_at, '-1 day') \
-                 WHERE generation = 0",
-            )
-            .await
-            .unwrap();
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(rotated.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'rotated' AND expires_at = (\
-                    SELECT expires_at FROM auth_refresh_credential WHERE status = 'current'\
-                )"
-            )
-            .await,
-            2
         );
         assert!(
             pioneer_crud::scan_auth_persistence_invariants(&service.database)
                 .await
                 .unwrap()
                 .is_valid()
-        );
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(rotated.refresh_expires_at_unix, 256)
-                .await
-                .unwrap(),
-            0,
-            "rotated evidence remains through the full successor TTL"
-        );
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(rotated.refresh_expires_at_unix + 1, 256)
-                .await
-                .unwrap(),
-            1
         );
     }
 
@@ -2486,13 +2362,12 @@ mod tests {
             assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
             assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
             assert_eq!(
-                count_where(
+                scalar_i64(
                     &service.database,
-                    "auth_refresh_credential",
-                    "status = 'current'"
+                    "SELECT generation AS value FROM auth_refresh_credential"
                 )
                 .await,
-                1
+                0
             );
             assert_eq!(
                 scalar_i64(
@@ -2523,7 +2398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_refresh_marks_session_and_current_credential_expired() {
+    async fn expired_refresh_expires_session_and_deletes_current_credential() {
         let (service, _) = fixture().await;
         let hook = Arc::new(RecordingDisconnectHook::default());
         service.set_disconnect_hook(hook.clone());
@@ -2560,14 +2435,7 @@ mod tests {
             .await,
             "expired"
         );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_refresh_credential"
-            )
-            .await,
-            "expired"
-        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
         assert_eq!(
             hook.0.lock().unwrap().as_slice(),
             &[(
@@ -2627,14 +2495,7 @@ mod tests {
             .await,
             "expired"
         );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_refresh_credential"
-            )
-            .await,
-            "expired"
-        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
         assert_eq!(
             scalar_text(&service.database, "SELECT status AS value FROM device").await,
             "revoked"
@@ -2656,7 +2517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_older_generation_reuse_revokes_family_after_commit_but_unknown_does_not() {
+    async fn signed_older_generation_reuse_revokes_family_but_unknown_token_does_not() {
         let (service, _) = fixture().await;
         let hook = Arc::new(RecordingDisconnectHook::default());
         service.set_disconnect_hook(hook.clone());
@@ -2700,15 +2561,7 @@ mod tests {
             .await,
             "refresh_reuse"
         );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'current'"
-            )
-            .await,
-            0
-        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
         assert_eq!(hook.0.lock().unwrap().len(), 1);
 
         let (other, _) = fixture().await;
@@ -2724,8 +2577,9 @@ mod tests {
                 .exchange_refresh(
                     refresh_admission(
                         format!(
-                            "prf_{}",
-                            "u".repeat(pioneer_protocol::MIN_OPAQUE_CREDENTIAL_BODY_LEN)
+                            "{}{}",
+                            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+                            "u".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
                         )
                         .as_str(),
                     ),
@@ -2739,6 +2593,52 @@ mod tests {
             "active"
         );
         assert!(!active.refresh_token.expose_secret().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_prior_generation_cannot_revoke_an_active_session() {
+        let (service, _) = fixture().await;
+        let initial = service
+            .create_initial_session_with_ids(
+                params("desktop-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(initial.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .unwrap();
+        let expired_prior = service.opaque_credentials.refresh_from_nonce(
+            &initial.session.id,
+            &initial.session.token_family_id,
+            0,
+            unix_timestamp_secs().unwrap() - 1,
+            &[9; 32],
+        );
+
+        let error = service
+            .exchange_refresh(
+                refresh_admission(expired_prior.expose_for_exchange()),
+                refresh_params(2),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session"
+            )
+            .await,
+            "active"
+        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+        assert!(!rotated.refresh_token.expose_secret().is_empty());
     }
 
     #[tokio::test]
@@ -2830,167 +2730,7 @@ mod tests {
             count_where(&service.database, "auth_session", "status = 'active'").await,
             2
         );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'current'"
-            )
-            .await,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_is_bounded_and_retains_recent_reuse_evidence() {
-        let (service, _) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        service
-            .exchange_refresh(
-                refresh_admission(initial_grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(unix_timestamp_secs().unwrap(), 10)
-                .await
-                .unwrap(),
-            0
-        );
-        service.database.execute_unprepared(
-            "UPDATE auth_refresh_credential SET consumed_at = datetime('now', '-181 days') WHERE status = 'rotated'",
-        ).await.unwrap();
-        let cleaned = service
-            .cleanup_refresh_evidence(unix_timestamp_secs().unwrap() + 91 * 24 * 60 * 60, 1)
-            .await
-            .unwrap();
-        assert_eq!(cleaned, 1);
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'current'"
-            )
-            .await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_uses_each_credential_expiry_instead_of_the_current_config_ttl() {
-        let (service, _) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        service
-            .exchange_refresh(
-                refresh_admission(initial_grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_refresh_credential \
-                 SET consumed_at = datetime('now', '-181 days') \
-                 WHERE status = 'rotated'",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(unix_timestamp_secs().unwrap() + 89 * 24 * 60 * 60, 10)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(unix_timestamp_secs().unwrap() + 91 * 24 * 60 * 60, 10)
-                .await
-                .unwrap(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_complete_terminal_refresh_chain_without_losing_session_history() {
-        let (service, _) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let generation_one = service
-            .exchange_refresh(
-                refresh_admission(initial_grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        let generation_two = service
-            .exchange_refresh(
-                refresh_admission(generation_one.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap();
-        let principal =
-            authenticate_access_token(&service, generation_two.access_token.expose_secret()).await;
-        service.logout(principal.as_ref()).await.unwrap();
-
-        let cleanup_time = unix_timestamp_secs().unwrap() + 91 * 24 * 60 * 60;
-        for remaining in (0..3).rev() {
-            assert_eq!(
-                service
-                    .cleanup_refresh_evidence(cleanup_time, 1)
-                    .await
-                    .unwrap(),
-                1
-            );
-            assert_eq!(
-                count(&service.database, "auth_refresh_credential").await,
-                remaining
-            );
-        }
-        assert_eq!(
-            service
-                .cleanup_refresh_evidence(cleanup_time, 1)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(count(&service.database, "auth_session").await, 1);
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "revoked"
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
-                .await
-                .unwrap()
-                .is_valid()
-        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 2);
     }
 
     #[tokio::test]
@@ -3144,7 +2884,7 @@ mod tests {
             count_where(
                 &service.database,
                 "auth_refresh_credential",
-                "session_id = 'S00000000000000000002' AND status = 'current'"
+                "session_id = 'S00000000000000000002'"
             )
             .await,
             0
@@ -3190,15 +2930,7 @@ mod tests {
             )
             .await;
         assert_eq!(hook.0.lock().unwrap().len(), 1);
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "status = 'current'"
-            )
-            .await,
-            0
-        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
         assert_eq!(
             service
                 .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
@@ -3945,7 +3677,7 @@ mod tests {
         let rows = database
             .query_all_raw(Statement::from_string(
                 database.get_database_backend(),
-                "SELECT id || ':' || COALESCE(installation_id, '') || ':' || COALESCE(display_name, '') AS value FROM device UNION ALL SELECT id || ':' || status || ':' || token_family_id FROM auth_session UNION ALL SELECT id || ':' || hex(token_hash) || ':' || status FROM auth_refresh_credential".to_owned(),
+                "SELECT id || ':' || COALESCE(installation_id, '') || ':' || COALESCE(display_name, '') AS value FROM device UNION ALL SELECT id || ':' || status || ':' || token_family_id FROM auth_session UNION ALL SELECT id || ':' || hex(token_hash) || ':' || generation FROM auth_refresh_credential".to_owned(),
             ))
             .await
             .unwrap();

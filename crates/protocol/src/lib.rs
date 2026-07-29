@@ -63,10 +63,11 @@ pub use auth::{
     AuthSessionRevokeResponse, AuthSessionRevokedNotification, AuthSessionSnapshot,
     AuthSessionStatus, AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind,
     CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET, DEVICE_ACTIVATION_CODE_SYMBOLS,
-    DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceStatus,
-    MAX_OPAQUE_CREDENTIAL_BODY_LEN, MIN_OPAQUE_CREDENTIAL_BODY_LEN, RefreshCredentialStatus,
-    device_activation_locator, encode_device_activation_entropy, format_device_activation_code,
-    normalize_device_activation_code, normalize_device_activation_code_input,
+    DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS,
+    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, REFRESH_CREDENTIAL_BODY_LEN,
+    REFRESH_CREDENTIAL_PREFIX, device_activation_locator, encode_device_activation_entropy,
+    format_device_activation_code, normalize_device_activation_code,
+    normalize_device_activation_code_input,
 };
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,

@@ -36,6 +36,7 @@ mod m20260726_000001_self_improvement_core;
 mod m20260726_000002_gateway_identity_foundation;
 mod m20260727_000001_thread_episodic_projection_embeddings;
 mod m20260728_000001_device_sessions;
+mod m20260729_000001_refresh_credentials_v2;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -73,6 +74,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260726_000002_gateway_identity_foundation::Migration),
             Box::new(m20260727_000001_thread_episodic_projection_embeddings::Migration),
             Box::new(m20260728_000001_device_sessions::Migration),
+            Box::new(m20260729_000001_refresh_credentials_v2::Migration),
         ]
     }
 }

@@ -501,8 +501,9 @@ mod tests {
 
     fn refresh_admission() -> RestrictedAdmission {
         let credential = format!(
-            "prf_{}",
-            "r".repeat(pioneer_protocol::MIN_OPAQUE_CREDENTIAL_BODY_LEN)
+            "{}{}",
+            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+            "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
         );
         RestrictedAdmission::new(
             PresentedCredential::classify(&credential).unwrap(),

@@ -9,8 +9,8 @@ use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
     AuthDeviceActivateParams, AuthLogoutResponse, AuthRefreshGrant, AuthRefreshParams,
     AuthSessionGrant, AuthSessionId, AuthSessionRevokeResponse, JSONRPC_VERSION,
-    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, MAX_OPAQUE_CREDENTIAL_BODY_LEN,
-    MIN_OPAQUE_CREDENTIAL_BODY_LEN, RequestId, constants::methods,
+    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, REFRESH_CREDENTIAL_BODY_LEN,
+    REFRESH_CREDENTIAL_PREFIX, RequestId, constants::methods,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt, time::Duration};
@@ -115,7 +115,7 @@ impl AuthExchangeClient {
         credential: &str,
         params: AuthRefreshParams,
     ) -> Result<AuthRefreshGrant, AuthExchangeError> {
-        if !is_bounded_opaque_credential(credential, "prf_") {
+        if !is_refresh_credential(credential) {
             return Err(AuthExchangeError::new(
                 AuthExchangeErrorKind::CredentialMethodMismatch,
                 "refresh requires a refresh credential",
@@ -310,11 +310,11 @@ pub fn normalize_auth_ws_url(address: &str) -> Result<String, AuthExchangeError>
     }
 }
 
-fn is_bounded_opaque_credential(value: &str, prefix: &str) -> bool {
-    let Some(body) = value.strip_prefix(prefix) else {
+fn is_refresh_credential(value: &str) -> bool {
+    let Some(body) = value.strip_prefix(REFRESH_CREDENTIAL_PREFIX) else {
         return false;
     };
-    (MIN_OPAQUE_CREDENTIAL_BODY_LEN..=MAX_OPAQUE_CREDENTIAL_BODY_LEN).contains(&body.len())
+    body.len() == REFRESH_CREDENTIAL_BODY_LEN
         && body
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
@@ -611,7 +611,7 @@ mod tests {
             refresh_token: AuthSecretString::new("refresh-secret"),
             refresh_expires_at_unix: 100,
             refresh_generation: 0,
-            auth_protocol_version: 2,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
             credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         }
     }

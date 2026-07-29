@@ -1,15 +1,23 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use pioneer_protocol::{
-    DEVICE_ACTIVATION_ALPHABET, device_activation_locator, encode_device_activation_entropy,
-    normalize_device_activation_code,
+    AUTH_DOMAIN_ID_LEN, AuthSessionId, DEVICE_ACTIVATION_ALPHABET, REFRESH_CREDENTIAL_BODY_LEN,
+    REFRESH_CREDENTIAL_PREFIX, TokenFamilyId, device_activation_locator,
+    encode_device_activation_entropy, normalize_device_activation_code,
 };
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{AuthError, AuthErrorCode};
 
 type HmacSha256 = Hmac<Sha256>;
+const REFRESH_CREDENTIAL_VERSION: u8 = 2;
+const REFRESH_NONCE_BYTES: usize = 32;
+const REFRESH_MAC_BYTES: usize = 32;
+const REFRESH_PAYLOAD_BYTES: usize =
+    1 + AUTH_DOMAIN_ID_LEN + AUTH_DOMAIN_ID_LEN + 8 + 8 + REFRESH_NONCE_BYTES;
+const REFRESH_ENVELOPE_BYTES: usize = REFRESH_PAYLOAD_BYTES + REFRESH_MAC_BYTES;
+const REFRESH_MAC_DOMAIN: &[u8] = b"refresh_envelope_v2\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpaqueCredentialKind {
@@ -26,7 +34,7 @@ impl OpaqueCredentialKind {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct OpaqueCredential {
     kind: OpaqueCredentialKind,
     value: String,
@@ -62,29 +70,44 @@ impl Drop for OpaqueCredential {
 
 pub(crate) struct OpaqueCredentialFactory {
     hmac_key: Vec<u8>,
-    entropy_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedRefreshCredential {
+    pub(crate) session_id: AuthSessionId,
+    pub(crate) token_family_id: TokenFamilyId,
+    pub(crate) generation: u64,
+    pub(crate) expires_at_unix: u64,
 }
 
 impl OpaqueCredentialFactory {
-    pub(crate) fn new(hmac_key: &[u8], entropy_bytes: usize) -> Result<Self, AuthError> {
-        if hmac_key.len() < 32 || entropy_bytes < 32 {
+    pub(crate) fn new(hmac_key: &[u8]) -> Result<Self, AuthError> {
+        if hmac_key.len() < 32 {
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
         Ok(Self {
             hmac_key: hmac_key.to_vec(),
-            entropy_bytes,
         })
     }
 
-    pub(crate) fn generate_refresh(&self) -> OpaqueCredential {
-        let mut entropy = vec![0u8; self.entropy_bytes];
-        rand::fill(entropy.as_mut_slice());
-        let encoded = URL_SAFE_NO_PAD.encode(&entropy);
-        entropy.zeroize();
-        OpaqueCredential {
-            kind: OpaqueCredentialKind::Refresh,
-            value: format!("prf_{encoded}"),
-        }
+    pub(crate) fn generate_refresh(
+        &self,
+        session_id: &AuthSessionId,
+        token_family_id: &TokenFamilyId,
+        generation: u64,
+        expires_at_unix: u64,
+    ) -> OpaqueCredential {
+        let mut nonce = [0u8; REFRESH_NONCE_BYTES];
+        rand::fill(&mut nonce);
+        let credential = self.build_refresh(
+            session_id,
+            token_family_id,
+            generation,
+            expires_at_unix,
+            &nonce,
+        );
+        nonce.zeroize();
+        credential
     }
 
     pub(crate) fn generate_device_activation(&self) -> OpaqueCredential {
@@ -115,11 +138,21 @@ impl OpaqueCredentialFactory {
     }
 
     #[cfg(test)]
-    pub(crate) fn refresh_from_entropy(
+    pub(crate) fn refresh_from_nonce(
         &self,
-        entropy: &[u8],
-    ) -> Result<OpaqueCredential, AuthError> {
-        self.credential_from_entropy(OpaqueCredentialKind::Refresh, entropy)
+        session_id: &AuthSessionId,
+        token_family_id: &TokenFamilyId,
+        generation: u64,
+        expires_at_unix: u64,
+        nonce: &[u8; REFRESH_NONCE_BYTES],
+    ) -> OpaqueCredential {
+        self.build_refresh(
+            session_id,
+            token_family_id,
+            generation,
+            expires_at_unix,
+            nonce,
+        )
     }
 
     #[cfg(test)]
@@ -138,23 +171,86 @@ impl OpaqueCredentialFactory {
         })
     }
 
-    #[cfg(test)]
-    fn credential_from_entropy(
+    fn build_refresh(
         &self,
-        kind: OpaqueCredentialKind,
-        entropy: &[u8],
-    ) -> Result<OpaqueCredential, AuthError> {
-        if entropy.len() != self.entropy_bytes {
-            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        session_id: &AuthSessionId,
+        token_family_id: &TokenFamilyId,
+        generation: u64,
+        expires_at_unix: u64,
+        nonce: &[u8; REFRESH_NONCE_BYTES],
+    ) -> OpaqueCredential {
+        let mut envelope = Vec::with_capacity(REFRESH_ENVELOPE_BYTES);
+        envelope.push(REFRESH_CREDENTIAL_VERSION);
+        envelope.extend_from_slice(session_id.as_str().as_bytes());
+        envelope.extend_from_slice(token_family_id.as_str().as_bytes());
+        envelope.extend_from_slice(&generation.to_be_bytes());
+        envelope.extend_from_slice(&expires_at_unix.to_be_bytes());
+        envelope.extend_from_slice(nonce);
+        let mac = fingerprint(self.hmac_key.as_slice(), REFRESH_MAC_DOMAIN, &envelope);
+        envelope.extend_from_slice(&mac);
+        debug_assert_eq!(envelope.len(), REFRESH_ENVELOPE_BYTES);
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&envelope));
+        envelope.zeroize();
+        debug_assert_eq!(encoded.len(), REFRESH_CREDENTIAL_BODY_LEN);
+        OpaqueCredential {
+            kind: OpaqueCredentialKind::Refresh,
+            value: format!("{REFRESH_CREDENTIAL_PREFIX}{}", encoded.as_str()),
         }
-        let encoded = URL_SAFE_NO_PAD.encode(entropy);
-        let value = match kind {
-            OpaqueCredentialKind::Refresh => format!("prf_{encoded}"),
-            OpaqueCredentialKind::DeviceActivation => {
-                return Err(AuthError::new(AuthErrorCode::InvalidCredential));
-            }
-        };
-        Ok(OpaqueCredential { kind, value })
+    }
+
+    pub(crate) fn verify_refresh_raw(
+        &self,
+        token: &str,
+    ) -> Result<VerifiedRefreshCredential, AuthError> {
+        let body = token
+            .strip_prefix(REFRESH_CREDENTIAL_PREFIX)
+            .filter(|body| body.len() == REFRESH_CREDENTIAL_BODY_LEN)
+            .ok_or_else(|| AuthError::new(AuthErrorCode::MalformedCredential))?;
+        let envelope = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(body)
+                .map_err(|_| AuthError::new(AuthErrorCode::MalformedCredential))?,
+        );
+        if envelope.len() != REFRESH_ENVELOPE_BYTES {
+            return Err(AuthError::new(AuthErrorCode::MalformedCredential));
+        }
+        let (payload, presented_mac) = envelope.split_at(REFRESH_PAYLOAD_BYTES);
+        let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_slice())
+            .expect("HMAC accepts arbitrary key length");
+        mac.update(REFRESH_MAC_DOMAIN);
+        mac.update(payload);
+        mac.verify_slice(presented_mac)
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if payload[0] != REFRESH_CREDENTIAL_VERSION {
+            return Err(AuthError::new(AuthErrorCode::UnsupportedCredential));
+        }
+
+        let session_start = 1;
+        let family_start = session_start + AUTH_DOMAIN_ID_LEN;
+        let generation_start = family_start + AUTH_DOMAIN_ID_LEN;
+        let expiry_start = generation_start + 8;
+        let session_id = std::str::from_utf8(&payload[session_start..family_start])
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let token_family_id = std::str::from_utf8(&payload[family_start..generation_start])
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let generation = u64::from_be_bytes(
+            payload[generation_start..expiry_start]
+                .try_into()
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+        );
+        let expires_at_unix = u64::from_be_bytes(
+            payload[expiry_start..expiry_start + 8]
+                .try_into()
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+        );
+        Ok(VerifiedRefreshCredential {
+            session_id: AuthSessionId::new(session_id.to_owned())
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            token_family_id: TokenFamilyId::new(token_family_id.to_owned())
+                .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
+            generation,
+            expires_at_unix,
+        })
     }
 
     pub(crate) fn fingerprint(&self, credential: &OpaqueCredential) -> [u8; 32] {
@@ -245,12 +341,38 @@ mod tests {
 
     #[test]
     fn deterministic_fixtures_are_redacted_and_domain_separated() {
-        let factory = OpaqueCredentialFactory::new(&[7; 64], 32).unwrap();
-        let entropy = [1; 32];
-        let refresh = factory.refresh_from_entropy(&entropy).unwrap();
-        let repeated_refresh = factory.refresh_from_entropy(&entropy).unwrap();
+        let factory = OpaqueCredentialFactory::new(&[7; 64]).unwrap();
+        let session_id = AuthSessionId::new("S00000000000000000001").unwrap();
+        let token_family_id = TokenFamilyId::new("F00000000000000000001").unwrap();
+        let nonce = [1; REFRESH_NONCE_BYTES];
+        let refresh = factory.refresh_from_nonce(&session_id, &token_family_id, 7, 12_345, &nonce);
+        let repeated_refresh =
+            factory.refresh_from_nonce(&session_id, &token_family_id, 7, 12_345, &nonce);
         let activation = factory.device_activation_from_entropy(&[1; 5]).unwrap();
-        assert!(refresh.expose_for_exchange().starts_with("prf_"));
+        assert!(
+            refresh
+                .expose_for_exchange()
+                .starts_with(REFRESH_CREDENTIAL_PREFIX)
+        );
+        assert_eq!(
+            refresh
+                .expose_for_exchange()
+                .strip_prefix(REFRESH_CREDENTIAL_PREFIX)
+                .unwrap()
+                .len(),
+            REFRESH_CREDENTIAL_BODY_LEN
+        );
+        assert_eq!(
+            factory
+                .verify_refresh_raw(refresh.expose_for_exchange())
+                .unwrap(),
+            VerifiedRefreshCredential {
+                session_id,
+                token_family_id,
+                generation: 7,
+                expires_at_unix: 12_345,
+            }
+        );
         assert_eq!(activation.expose_for_exchange().len(), 8);
         assert!(normalize_device_activation_code(activation.expose_for_exchange()).is_ok());
         assert_eq!(
@@ -287,11 +409,40 @@ mod tests {
 
     #[test]
     fn requested_locator_replaces_only_the_transient_routing_symbol() {
-        let factory = OpaqueCredentialFactory::new(&[7; 64], 32).unwrap();
+        let factory = OpaqueCredentialFactory::new(&[7; 64]).unwrap();
         let activation = factory
             .generate_device_activation_for_locator("Z")
             .expect("activation");
         assert!(activation.expose_for_exchange().starts_with('Z'));
         assert_eq!(activation.expose_for_exchange().len(), 8);
+    }
+
+    #[test]
+    fn refresh_envelope_rejects_tampering_and_legacy_tokens() {
+        let factory = OpaqueCredentialFactory::new(&[7; 64]).unwrap();
+        let other_factory = OpaqueCredentialFactory::new(&[8; 64]).unwrap();
+        let session_id = AuthSessionId::new("S00000000000000000001").unwrap();
+        let token_family_id = TokenFamilyId::new("F00000000000000000001").unwrap();
+        let refresh =
+            factory.refresh_from_nonce(&session_id, &token_family_id, 0, 12_345, &[1; 32]);
+        let mut tampered = refresh.expose_for_exchange().to_owned();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        assert_eq!(
+            factory.verify_refresh_raw(&tampered).unwrap_err().code(),
+            AuthErrorCode::InvalidCredential
+        );
+        assert_eq!(
+            other_factory
+                .verify_refresh_raw(refresh.expose_for_exchange())
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::InvalidCredential
+        );
+        assert!(
+            factory
+                .verify_refresh_raw(&format!("prf_{}", "r".repeat(43)))
+                .is_err()
+        );
     }
 }

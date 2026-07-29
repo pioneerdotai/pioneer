@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
     expire_stale_auth_sessions, load_gateway_singleton, load_principal_by_id,
-    mark_gateway_auth_ready, repair_rotated_refresh_retention, scan_auth_persistence_invariants,
+    mark_gateway_auth_ready, scan_auth_persistence_invariants,
 };
 use pioneer_protocol::{PrincipalKind, PrincipalStatus};
 use sea_orm::{DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait};
@@ -39,7 +39,6 @@ pub(crate) async fn ensure_auth_readiness(
         }
         let now = chrono::Utc::now().fixed_offset();
         let expired_sessions = expire_stale_auth_sessions(&transaction, now, 256).await?;
-        let repaired_refresh_retention = repair_rotated_refresh_retention(&transaction).await?;
         let report = scan_auth_persistence_invariants(&transaction).await?;
         if !report.is_valid() {
             bail!(
@@ -48,11 +47,11 @@ pub(crate) async fn ensure_auth_readiness(
             );
         }
         mark_gateway_auth_ready(&transaction, &gateway.id, AUTH_SCHEMA_VERSION, now).await?;
-        Ok((expired_sessions, repaired_refresh_retention))
+        Ok(expired_sessions)
     }
     .await;
     match result {
-        Ok((expired_sessions, repaired_refresh_retention)) => {
+        Ok(expired_sessions) => {
             transaction
                 .commit()
                 .await
@@ -61,12 +60,6 @@ pub(crate) async fn ensure_auth_readiness(
                 tracing::info!(
                     expired_sessions = expired_sessions.len(),
                     "expired auth sessions reconciled during startup"
-                );
-            }
-            if repaired_refresh_retention > 0 {
-                tracing::warn!(
-                    repaired_refresh_credentials = repaired_refresh_retention,
-                    "repaired rotated refresh retention during startup"
                 );
             }
             Ok(())
@@ -118,7 +111,7 @@ mod tests {
                 format!(
                     "INSERT INTO device(id,gateway_id,principal_id,installation_id,display_name,client_kind,status,created_at,updated_at,last_seen_at) VALUES('D00000000000000000001','{}','{}','desktop','Desktop','desktop','active',datetime('now','-2 days'),datetime('now','-2 days'),datetime('now','-2 days')); \
                      INSERT INTO auth_session(id,gateway_id,principal_id,device_id,token_family_id,activation_token_hash,activation_locator_hash,activation_failed_attempts,activation_expires_at,activated_at,status,refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,refresh_expires_at) VALUES('S00000000000000000001','{}','{}','D00000000000000000001','F00000000000000000001',randomblob(32),randomblob(32),0,datetime('now','-2 days'),datetime('now','-2 days'),'active',0,datetime('now','-2 days'),datetime('now','-2 days'),datetime('now','-2 days'),datetime('now','-2 days'),datetime('now','-1 day')); \
-                     INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at) VALUES('R00000000000000000001','S00000000000000000001','F00000000000000000001',0,zeroblob(32),'current',datetime('now','-2 days'),datetime('now','-1 day'))",
+                     INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,issued_at,expires_at) VALUES('R00000000000000000001','S00000000000000000001','F00000000000000000001',0,zeroblob(32),datetime('now','-2 days'),datetime('now','-1 day'))",
                     identity.gateway.id,
                     identity.superuser.id,
                     identity.gateway.id,
@@ -138,80 +131,103 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let refresh = database
+        assert_eq!(session.try_get::<String>("", "status").unwrap(), "expired");
+        let refresh_count = database
             .query_one_raw(sea_orm::Statement::from_string(
                 database.get_database_backend(),
-                "SELECT status FROM auth_refresh_credential".to_owned(),
+                "SELECT COUNT(*) AS count FROM auth_refresh_credential".to_owned(),
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(session.try_get::<String>("", "status").unwrap(), "expired");
-        assert_eq!(refresh.try_get::<String>("", "status").unwrap(), "expired");
+        assert_eq!(refresh_count.try_get::<i64>("", "count").unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn readiness_repairs_legacy_rotated_refresh_retention() {
+    async fn refresh_v2_migration_resets_legacy_sessions_without_losing_identity() {
+        const REFRESH_V2_MIGRATION: &str = "m20260729_000001_refresh_credentials_v2";
+
         let database = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&database, None).await.unwrap();
-        crate::bootstrap::bootstrap(&database).await.unwrap();
-        let identity = crate::identity::bootstrap_identity(&database)
-            .await
-            .unwrap()
-            .snapshot;
+        let migrations_before_refresh_v2 = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == REFRESH_V2_MIGRATION)
+            .expect("refresh v2 migration is registered");
+        Migrator::up(
+            &database,
+            Some(u32::try_from(migrations_before_refresh_v2).unwrap()),
+        )
+        .await
+        .unwrap();
         database
             .execute_unprepared(
-                format!(
-                    "INSERT INTO device(id,gateway_id,principal_id,installation_id,display_name,client_kind,status,created_at,updated_at,last_seen_at) VALUES('D00000000000000000001','{}','{}','desktop','Desktop','desktop','active',datetime('now','-10 minutes'),datetime('now','-8 minutes'),datetime('now','-8 minutes')); \
-                     INSERT INTO auth_session(id,gateway_id,principal_id,device_id,token_family_id,activation_token_hash,activation_locator_hash,activation_failed_attempts,activation_expires_at,activated_at,status,refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,refresh_expires_at) VALUES('S00000000000000000001','{}','{}','D00000000000000000001','F00000000000000000001',randomblob(32),randomblob(32),0,datetime('now','-1 minute'),datetime('now','-10 minutes'),'active',2,datetime('now','-10 minutes'),datetime('now','-8 minutes'),datetime('now','-8 minutes'),datetime('now','-8 minutes'),datetime('now','+90 days')); \
-                     INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at) VALUES('R00000000000000000003','S00000000000000000001','F00000000000000000001',2,randomblob(32),'current',datetime('now','-8 minutes'),datetime('now','+90 days')); \
-                     INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at,consumed_at,replaced_by_id) VALUES('R00000000000000000002','S00000000000000000001','F00000000000000000001',1,randomblob(32),'rotated',datetime('now','-9 minutes'),datetime('now','+2 days'),datetime('now','-8 minutes'),'R00000000000000000003'); \
-                     INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at,consumed_at,replaced_by_id) VALUES('R00000000000000000001','S00000000000000000001','F00000000000000000001',0,randomblob(32),'rotated',datetime('now','-10 minutes'),datetime('now','+1 day'),datetime('now','-9 minutes'),'R00000000000000000002')",
-                    identity.gateway.id,
-                    identity.superuser.id,
-                    identity.gateway.id,
-                    identity.superuser.id,
-                )
-                .as_str(),
+                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('W00000000000000000001','Preserved workspace',1,1); \
+                 INSERT INTO gateway_identity(id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,created_at,updated_at) VALUES('G00000000000000000001',1,1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+                 INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at,removed_at) VALUES('P00000000000000000001','G00000000000000000001','superuser',NULL,'active','Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL); \
+                 INSERT INTO device(id,gateway_id,principal_id,installation_id,display_name,client_kind,status,created_at,updated_at,last_seen_at) VALUES('D00000000000000000001','G00000000000000000001','P00000000000000000001','desktop','Desktop','desktop','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+                 INSERT INTO auth_session(id,gateway_id,principal_id,device_id,token_family_id,activation_token_hash,activation_locator_hash,activation_failed_attempts,activation_expires_at,activated_at,status,refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,refresh_expires_at) VALUES('S00000000000000000001','G00000000000000000001','P00000000000000000001','D00000000000000000001','F00000000000000000001',randomblob(32),randomblob(32),0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,datetime('now','+90 days')); \
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000001','F00000000000000000001',1,randomblob(32),'current',CURRENT_TIMESTAMP,datetime('now','+90 days')); \
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at,consumed_at,replaced_by_id) VALUES('R00000000000000000001','S00000000000000000001','F00000000000000000001',0,randomblob(32),'rotated',CURRENT_TIMESTAMP,datetime('now','+90 days'),CURRENT_TIMESTAMP,'R00000000000000000002')",
             )
             .await
             .unwrap();
 
-        let before = pioneer_crud::scan_auth_persistence_invariants(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            before
-                .violations
-                .iter()
-                .filter(|violation| violation.contains("invalid successor"))
-                .count(),
-            2
-        );
+        Migrator::up(&database, None).await.unwrap();
 
-        ensure_auth_readiness(&database, &identity).await.unwrap();
-
-        let repaired = database
+        let reset = database
             .query_one_raw(sea_orm::Statement::from_string(
                 database.get_database_backend(),
-                "SELECT COUNT(*) AS repaired \
-                 FROM auth_refresh_credential \
-                 WHERE status = 'rotated' \
-                 AND expires_at = (\
-                    SELECT expires_at FROM auth_refresh_credential WHERE status = 'current'\
-                 )"
-                .to_owned(),
+                "SELECT d.status AS device_status, s.status AS session_status, s.revoke_reason, g.auth_schema_version, g.auth_ready_at, (SELECT COUNT(*) FROM auth_refresh_credential) AS refresh_count FROM device d JOIN auth_session s ON s.device_id = d.id CROSS JOIN gateway_identity g".to_owned(),
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(repaired.try_get::<i64>("", "repaired").unwrap(), 2);
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&database)
-                .await
-                .unwrap()
-                .is_valid()
+        assert_eq!(
+            reset.try_get::<String>("", "device_status").unwrap(),
+            "revoked"
         );
+        assert_eq!(
+            reset.try_get::<String>("", "session_status").unwrap(),
+            "revoked"
+        );
+        assert_eq!(
+            reset.try_get::<String>("", "revoke_reason").unwrap(),
+            "security_reset"
+        );
+        assert_eq!(reset.try_get::<i64>("", "auth_schema_version").unwrap(), 0);
+        assert!(
+            reset
+                .try_get::<Option<String>>("", "auth_ready_at")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reset.try_get::<i64>("", "refresh_count").unwrap(), 0);
+        let workspace_count = database
+            .query_one_raw(sea_orm::Statement::from_string(
+                database.get_database_backend(),
+                "SELECT COUNT(*) AS count FROM workspace WHERE id = 'W00000000000000000001' AND name = 'Preserved workspace'".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace_count.try_get::<i64>("", "count").unwrap(), 1);
+        let retired_columns = database
+            .query_one_raw(sea_orm::Statement::from_string(
+                database.get_database_backend(),
+                "SELECT COUNT(*) AS count FROM pragma_table_info('auth_refresh_credential') WHERE name IN ('status','consumed_at','replaced_by_id')".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired_columns.try_get::<i64>("", "count").unwrap(), 0);
+
+        let identity = crate::identity::bootstrap_identity(&database)
+            .await
+            .unwrap()
+            .snapshot;
+        ensure_auth_readiness(&database, &identity).await.unwrap();
+        let gateway = load_gateway_singleton(&database).await.unwrap().unwrap();
+        assert_eq!(gateway.auth_schema_version, AUTH_SCHEMA_VERSION);
+        assert!(gateway.auth_ready_at.is_some());
     }
 
     #[tokio::test]

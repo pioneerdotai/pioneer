@@ -239,16 +239,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             );
         }
     }
-    let cleaned_refresh_evidence = auth_service
-        .cleanup_refresh_evidence(crate::helpers::unix_timestamp_secs()?, 256)
-        .await
-        .context("failed to clean expired refresh evidence")?;
-    if cleaned_refresh_evidence > 0 {
-        info!(
-            deleted_rows = cleaned_refresh_evidence,
-            "expired refresh evidence cleanup completed"
-        );
-    }
     let expired_pending_sessions = auth_service
         .expire_pending_device_sessions(crate::helpers::unix_timestamp_secs()?, 256)
         .await
@@ -259,7 +249,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             "expired pending device sessions marked terminal"
         );
     }
-    auth_service.spawn_evidence_maintenance();
+    auth_service.spawn_auth_maintenance();
 
     let voice_input_desired_state = VoiceInputDesiredState::from_config(&config.gateway.voice);
     let voice_input_supervisor = create_voice_input_supervisor(

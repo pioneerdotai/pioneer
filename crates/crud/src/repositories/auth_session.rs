@@ -7,7 +7,7 @@ use pioneer_entity::{
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokeReason, AuthSessionStatus, ClientInstallationDescriptor,
     ClientKind, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
-    PrincipalId, RefreshCredentialId, RefreshCredentialStatus, TokenFamilyId,
+    PrincipalId, RefreshCredentialId, TokenFamilyId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -139,15 +139,6 @@ pub const fn auth_session_status_to_db(value: AuthSessionStatus) -> &'static str
         AuthSessionStatus::Active => "active",
         AuthSessionStatus::Revoked => "revoked",
         AuthSessionStatus::Expired => "expired",
-    }
-}
-
-pub const fn refresh_status_to_db(value: RefreshCredentialStatus) -> &'static str {
-    match value {
-        RefreshCredentialStatus::Current => "current",
-        RefreshCredentialStatus::Rotated => "rotated",
-        RefreshCredentialStatus::Revoked => "revoked",
-        RefreshCredentialStatus::Expired => "expired",
     }
 }
 
@@ -297,11 +288,8 @@ pub async fn insert_refresh_credential<C: ConnectionTrait>(
         token_family_id: Set(row.token_family_id.to_string()),
         generation: Set(i64::try_from(row.generation).context("refresh generation overflow")?),
         token_hash: Set(row.token_hash.to_vec()),
-        status: Set(refresh_status_to_db(RefreshCredentialStatus::Current).to_owned()),
         issued_at: Set(row.issued_at),
         expires_at: Set(row.expires_at),
-        consumed_at: Set(None),
-        replaced_by_id: Set(None),
     }
     .insert(db)
     .await
@@ -398,24 +386,12 @@ pub async fn touch_active_auth_session<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
-pub async fn load_refresh_by_hash<C: ConnectionTrait>(
-    db: &C,
-    token_hash: &[u8; 32],
-) -> Result<Option<auth_refresh_credential::Model>> {
-    auth_refresh_credential::Entity::find()
-        .filter(auth_refresh_credential::Column::TokenHash.eq(token_hash.to_vec()))
-        .one(db)
-        .await
-        .context("failed to lookup refresh credential")
-}
-
 pub async fn load_current_refresh<C: ConnectionTrait>(
     db: &C,
     session_id: &AuthSessionId,
 ) -> Result<Option<auth_refresh_credential::Model>> {
     auth_refresh_credential::Entity::find()
         .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
-        .filter(auth_refresh_credential::Column::Status.eq("current"))
         .one(db)
         .await
         .context("failed to load current refresh credential")
@@ -628,20 +604,15 @@ pub async fn mark_device_revoked<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
-pub async fn revoke_current_refresh_for_session<C: ConnectionTrait>(
+pub async fn delete_refresh_for_session<C: ConnectionTrait>(
     db: &C,
     session_id: &AuthSessionId,
 ) -> Result<u64> {
-    let result = auth_refresh_credential::Entity::update_many()
-        .col_expr(
-            auth_refresh_credential::Column::Status,
-            Expr::value(refresh_status_to_db(RefreshCredentialStatus::Revoked)),
-        )
+    let result = auth_refresh_credential::Entity::delete_many()
         .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
-        .filter(auth_refresh_credential::Column::Status.eq("current"))
         .exec(db)
         .await
-        .context("failed to revoke current refresh credential")?;
+        .context("failed to delete current refresh credential")?;
     Ok(result.rows_affected)
 }
 
@@ -668,17 +639,12 @@ pub async fn expire_session_refresh_family<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to expire auth session")?;
-    auth_refresh_credential::Entity::update_many()
-        .col_expr(
-            auth_refresh_credential::Column::Status,
-            Expr::value(refresh_status_to_db(RefreshCredentialStatus::Expired)),
-        )
+    auth_refresh_credential::Entity::delete_many()
         .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
         .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
-        .filter(auth_refresh_credential::Column::Status.eq("current"))
         .exec(db)
         .await
-        .context("failed to expire current refresh credential")?;
+        .context("failed to delete expired refresh credential")?;
     Ok(session.rows_affected == 1)
 }
 
@@ -745,67 +711,47 @@ pub async fn expire_stale_pending_sessions<C: ConnectionTrait>(
     Ok(expired)
 }
 
-pub async fn rotate_current_refresh<C: ConnectionTrait>(
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_current_refresh<C: ConnectionTrait>(
     db: &C,
     current_id: &RefreshCredentialId,
+    session_id: &AuthSessionId,
+    token_family_id: &TokenFamilyId,
     expected_generation: u64,
-    replacement_id: &RefreshCredentialId,
-    consumed_at: DateTimeWithTimeZone,
-    retain_until: DateTimeWithTimeZone,
+    expected_hash: &[u8; 32],
+    next_generation: u64,
+    next_hash: &[u8; 32],
+    issued_at: DateTimeWithTimeZone,
+    expires_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let expected_generation =
         i64::try_from(expected_generation).context("refresh generation overflow")?;
     let result = auth_refresh_credential::Entity::update_many()
         .col_expr(
-            auth_refresh_credential::Column::Status,
-            Expr::value(refresh_status_to_db(RefreshCredentialStatus::Rotated)),
+            auth_refresh_credential::Column::Generation,
+            Expr::value(i64::try_from(next_generation).context("refresh generation overflow")?),
         )
         .col_expr(
-            auth_refresh_credential::Column::ConsumedAt,
-            Expr::value(Some(consumed_at)),
+            auth_refresh_credential::Column::TokenHash,
+            Expr::value(next_hash.to_vec()),
         )
         .col_expr(
-            auth_refresh_credential::Column::ReplacedById,
-            Expr::value(Some(replacement_id.to_string())),
+            auth_refresh_credential::Column::IssuedAt,
+            Expr::value(issued_at),
         )
         .col_expr(
             auth_refresh_credential::Column::ExpiresAt,
-            Expr::value(retain_until),
+            Expr::value(expires_at),
         )
         .filter(auth_refresh_credential::Column::Id.eq(current_id.to_string()))
-        .filter(auth_refresh_credential::Column::Status.eq("current"))
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
         .filter(auth_refresh_credential::Column::Generation.eq(expected_generation))
+        .filter(auth_refresh_credential::Column::TokenHash.eq(expected_hash.to_vec()))
         .exec(db)
         .await
-        .context("failed to rotate current refresh credential")?;
-    if result.rows_affected != 1 {
-        return Ok(false);
-    }
-
-    let statement = Statement::from_sql_and_values(
-        db.get_database_backend(),
-        "UPDATE auth_refresh_credential \
-         SET expires_at = ? \
-         WHERE status = 'rotated' \
-         AND generation <= ? \
-         AND julianday(expires_at) < julianday(?) \
-         AND EXISTS (\
-            SELECT 1 FROM auth_refresh_credential rotated \
-            WHERE rotated.id = ? \
-            AND rotated.session_id = auth_refresh_credential.session_id \
-            AND rotated.token_family_id = auth_refresh_credential.token_family_id\
-         )",
-        [
-            retain_until.into(),
-            expected_generation.into(),
-            retain_until.into(),
-            current_id.to_string().into(),
-        ],
-    );
-    db.execute_raw(statement)
-        .await
-        .context("failed to extend rotated refresh retention")?;
-    Ok(true)
+        .context("failed to replace current refresh credential")?;
+    Ok(result.rows_affected == 1)
 }
 
 pub async fn advance_auth_session_refresh<C: ConnectionTrait>(
@@ -861,75 +807,13 @@ pub async fn revoke_session_family_for_refresh_reuse<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to revoke compromised auth session")?;
-    auth_refresh_credential::Entity::update_many()
-        .col_expr(
-            auth_refresh_credential::Column::Status,
-            Expr::value("revoked"),
-        )
+    auth_refresh_credential::Entity::delete_many()
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
         .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
-        .filter(auth_refresh_credential::Column::Status.eq("current"))
         .exec(db)
         .await
-        .context("failed to revoke compromised refresh branch")?;
+        .context("failed to delete compromised refresh credential")?;
     Ok(session.rows_affected == 1)
-}
-
-pub async fn cleanup_terminal_refresh_evidence<C: ConnectionTrait>(
-    db: &C,
-    expired_before: DateTimeWithTimeZone,
-    batch_size: u64,
-) -> Result<u64> {
-    if batch_size == 0 {
-        return Ok(0);
-    }
-    let statement = Statement::from_sql_and_values(
-        db.get_database_backend(),
-        "DELETE FROM auth_refresh_credential WHERE id IN (\
-            SELECT candidate.id FROM auth_refresh_credential candidate \
-            WHERE candidate.status IN ('rotated', 'revoked', 'expired') \
-            AND candidate.expires_at < ? \
-            AND NOT EXISTS (SELECT 1 FROM auth_refresh_credential predecessor \
-                WHERE predecessor.replaced_by_id = candidate.id) \
-            ORDER BY candidate.expires_at ASC, candidate.generation ASC LIMIT ?\
-        )",
-        [
-            expired_before.into(),
-            i64::try_from(batch_size).unwrap_or(i64::MAX).into(),
-        ],
-    );
-    db.execute_raw(statement)
-        .await
-        .map(|result| result.rows_affected())
-        .context("failed to clean retained refresh evidence")
-}
-
-pub async fn repair_rotated_refresh_retention<C: ConnectionTrait>(db: &C) -> Result<u64> {
-    let statement = Statement::from_string(
-        db.get_database_backend(),
-        "UPDATE auth_refresh_credential AS predecessor \
-         SET expires_at = (\
-            SELECT descendant.expires_at \
-            FROM auth_refresh_credential descendant \
-            WHERE descendant.session_id = predecessor.session_id \
-            AND descendant.token_family_id = predecessor.token_family_id \
-            AND descendant.generation > predecessor.generation \
-            ORDER BY julianday(descendant.expires_at) DESC, descendant.generation DESC \
-            LIMIT 1\
-         ) \
-         WHERE predecessor.status = 'rotated' \
-         AND EXISTS (\
-            SELECT 1 FROM auth_refresh_credential descendant \
-            WHERE descendant.session_id = predecessor.session_id \
-            AND descendant.token_family_id = predecessor.token_family_id \
-            AND descendant.generation > predecessor.generation \
-            AND julianday(descendant.expires_at) > julianday(predecessor.expires_at)\
-         )"
-        .to_owned(),
-    );
-    db.execute_raw(statement)
-        .await
-        .map(|result| result.rows_affected())
-        .context("failed to repair rotated refresh retention")
 }
 
 pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
@@ -955,10 +839,6 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         .map(|row| (row.id.as_str(), row))
         .collect::<HashMap<_, _>>();
     let session_by_id = sessions
-        .iter()
-        .map(|row| (row.id.as_str(), row))
-        .collect::<HashMap<_, _>>();
-    let refresh_by_id = refreshes
         .iter()
         .map(|row| (row.id.as_str(), row))
         .collect::<HashMap<_, _>>();
@@ -1214,34 +1094,31 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         }
     }
 
-    let mut current_sessions = HashSet::new();
+    let mut refresh_sessions = HashSet::new();
+    let mut refresh_families = HashSet::new();
     let mut refresh_hashes = HashSet::new();
-    let mut refresh_generations = HashSet::new();
-    let mut refreshes_by_session = HashMap::<&str, Vec<&auth_refresh_credential::Model>>::new();
     for row in &refreshes {
         if RefreshCredentialId::new(row.id.clone()).is_err()
             || AuthSessionId::new(row.session_id.clone()).is_err()
             || TokenFamilyId::new(row.token_family_id.clone()).is_err()
-            || row
-                .replaced_by_id
-                .as_ref()
-                .is_some_and(|id| RefreshCredentialId::new(id.clone()).is_err())
         {
             violations.push(format!("refresh `{}` has invalid domain IDs", row.id));
         }
         let session = session_by_id.get(row.session_id.as_str());
-        refreshes_by_session
-            .entry(row.session_id.as_str())
-            .or_default()
-            .push(row);
+        if !refresh_sessions.insert(row.session_id.as_str()) {
+            violations.push(format!(
+                "session `{}` has multiple current refresh credentials",
+                row.session_id
+            ));
+        }
+        if !refresh_families.insert(row.token_family_id.as_str()) {
+            violations.push(format!(
+                "token family `{}` has multiple current refresh credentials",
+                row.token_family_id
+            ));
+        }
         if !refresh_hashes.insert(row.token_hash.as_slice()) {
             violations.push("multiple refresh credentials share one token hash".to_owned());
-        }
-        if !refresh_generations.insert((row.session_id.as_str(), row.generation)) {
-            violations.push(format!(
-                "session `{}` has duplicate refresh generation {}",
-                row.session_id, row.generation
-            ));
         }
         if session.is_none_or(|session| session.token_family_id != row.token_family_id) {
             violations.push(format!("refresh `{}` has mismatched ownership", row.id));
@@ -1249,122 +1126,30 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         if row.generation < 0
             || row.token_hash.len() != 32
             || row.expires_at < row.issued_at
-            || session.is_some_and(|session| row.generation > session.refresh_generation)
+            || session.is_some_and(|session| {
+                session.status != "active"
+                    || row.generation != session.refresh_generation
+                    || session.refresh_expires_at.as_ref() != Some(&row.expires_at)
+            })
         {
             violations.push(format!(
-                "refresh `{}` has impossible generation state",
+                "refresh `{}` does not match its active session",
                 row.id
             ));
-        }
-        match row.status.as_str() {
-            "current" => {
-                if row.consumed_at.is_some() || row.replaced_by_id.is_some() {
-                    violations.push(format!(
-                        "current refresh `{}` has terminal metadata",
-                        row.id
-                    ));
-                }
-                if !current_sessions.insert(row.session_id.as_str()) {
-                    violations.push(format!(
-                        "session `{}` has multiple current refreshes",
-                        row.session_id
-                    ));
-                }
-                if session.is_some_and(|session| {
-                    session.status != "active"
-                        || session.refresh_generation != row.generation
-                        || session.refresh_expires_at.as_ref() != Some(&row.expires_at)
-                }) {
-                    violations.push(format!(
-                        "current refresh `{}` does not match its active session",
-                        row.id
-                    ));
-                }
-            }
-            "rotated" => {
-                let successor = row
-                    .replaced_by_id
-                    .as_deref()
-                    .and_then(|id| refresh_by_id.get(id).copied());
-                if row.consumed_at.is_none() || successor.is_none() {
-                    violations.push(format!(
-                        "rotated refresh `{}` has a dangling replacement",
-                        row.id
-                    ));
-                }
-                if successor.is_some_and(|successor| {
-                    successor.id == row.id
-                        || successor.session_id != row.session_id
-                        || successor.token_family_id != row.token_family_id
-                        || row.generation.checked_add(1) != Some(successor.generation)
-                        || row.expires_at < successor.expires_at
-                        || row
-                            .consumed_at
-                            .is_some_and(|consumed| successor.issued_at < consumed)
-                }) {
-                    violations.push(format!(
-                        "rotated refresh `{}` has an invalid successor",
-                        row.id
-                    ));
-                }
-            }
-            "revoked" | "expired" => {
-                if row.consumed_at.is_some() || row.replaced_by_id.is_some() {
-                    violations.push(format!(
-                        "terminal refresh `{}` has rotation metadata",
-                        row.id
-                    ));
-                }
-            }
-            _ => violations.push(format!("refresh `{}` has an unknown status", row.id)),
         }
     }
 
     for row in &sessions {
-        let session_refreshes = refreshes_by_session
-            .get(row.id.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let generation_row = session_refreshes
-            .iter()
-            .find(|refresh| refresh.generation == row.refresh_generation);
-        if generation_row.is_none() && (row.status == "active" || !session_refreshes.is_empty()) {
-            violations.push(format!(
-                "session `{}` has no refresh at its recorded generation",
-                row.id
-            ));
-        }
-        if row.status == "active" && !current_sessions.contains(row.id.as_str()) {
+        let has_refresh = refresh_sessions.contains(row.id.as_str());
+        if row.status == "active" && !has_refresh {
             violations.push(format!(
                 "active session `{}` has no current refresh credential",
                 row.id
             ));
         }
-        if row.status == "pending" && !session_refreshes.is_empty() {
-            violations.push(format!(
-                "pending session `{}` already has refresh credentials",
-                row.id
-            ));
-        }
-        if row.status != "active" && current_sessions.contains(row.id.as_str()) {
+        if row.status != "active" && has_refresh {
             violations.push(format!(
                 "terminal session `{}` still has a current refresh credential",
-                row.id
-            ));
-        }
-        if row.status == "revoked"
-            && generation_row.is_some_and(|refresh| refresh.status != "revoked")
-        {
-            violations.push(format!(
-                "revoked session `{}` has a non-revoked latest refresh",
-                row.id
-            ));
-        }
-        if row.status == "expired"
-            && generation_row.is_some_and(|refresh| refresh.status != "expired")
-        {
-            violations.push(format!(
-                "expired session `{}` has a non-expired latest refresh",
                 row.id
             ));
         }
@@ -1399,10 +1184,8 @@ async fn scan_auth_schema_invariants<C: ConnectionTrait>(db: &C) -> Result<Vec<S
         "idx_auth_session_device_status",
         "idx_auth_session_expiry_status",
         "idx_auth_refresh_token_hash",
-        "idx_auth_refresh_generation",
-        "idx_auth_refresh_current",
-        "idx_auth_refresh_family_status",
-        "idx_auth_refresh_expiry_status",
+        "idx_auth_refresh_session",
+        "idx_auth_refresh_family",
     ];
     const REQUIRED_TABLE_CONSTRAINTS: &[(&str, &[&str])] = &[
         (
@@ -1440,8 +1223,6 @@ async fn scan_auth_schema_invariants<C: ConnectionTrait>(db: &C) -> Result<Vec<S
                 "ck_auth_refresh_generation",
                 "ck_auth_refresh_hash",
                 "ck_auth_refresh_expiry",
-                "ck_auth_refresh_status",
-                "ck_auth_refresh_terminal",
             ],
         ),
     ];
@@ -1644,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repositories_support_two_independent_devices_and_refresh_history() {
+    async fn repositories_support_two_independent_devices_and_current_refreshes() {
         let db = fixture().await;
 
         for (device_raw, session_raw, installation) in [
@@ -1800,13 +1581,13 @@ mod tests {
                 "DROP INDEX idx_device_active_installation;
                  INSERT INTO device(id,gateway_id,principal_id,installation_id,display_name,client_kind,status,created_at,updated_at,last_seen_at) VALUES('D00000000000000000002','G00000000000000000001','P00000000000000000001','desktop-a','Duplicate','desktop','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
                  INSERT INTO auth_session(id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,activation_token_hash,activation_locator_hash,activation_failed_attempts,activation_expires_at,activated_at,status,refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,refresh_expires_at) VALUES('S00000000000000000002','G00000000000000000001','P00000000000000000001','D00000000000000000002','F00000000000000000002',NULL,randomblob(32),randomblob(32),0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,datetime('now','+90 days'));
-                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000002','F00000000000000000002',0,randomblob(32),'current',CURRENT_TIMESTAMP,datetime('now','+90 days'))",
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000002','F00000000000000000002',0,randomblob(32),CURRENT_TIMESTAMP,datetime('now','+90 days'))",
                 "multiple active devices",
             ),
             (
-                "DROP INDEX idx_auth_refresh_current;
-                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,status,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000001','F00000000000000000001',1,randomblob(32),'current',CURRENT_TIMESTAMP,datetime('now','+90 days'))",
-                "multiple current refreshes",
+                "DROP INDEX idx_auth_refresh_session;
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000001','F00000000000000000002',1,randomblob(32),CURRENT_TIMESTAMP,datetime('now','+90 days'))",
+                "multiple current refresh credentials",
             ),
             (
                 "UPDATE auth_session SET created_by_session_id = 'S00000000000000000099'",
