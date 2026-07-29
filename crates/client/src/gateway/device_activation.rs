@@ -11,6 +11,8 @@ use pioneer_protocol::{
 };
 use qrcode::{Color, QrCode};
 
+use crate::transport::ws::rpc::normalize_ws_url;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceActivationQrPresentation {
     pub device_id: DeviceId,
@@ -30,6 +32,7 @@ impl DeviceActivationQrPresentation {
         created: AuthDeviceCreateResponse,
     ) -> Result<Self> {
         let protected_endpoint = protected_endpoint.into();
+        let protected_endpoint = normalize_ws_url(protected_endpoint.as_str());
         let presentation = AuthDeviceActivationPresentation::new(
             protected_endpoint.clone(),
             created.gateway_id.clone(),
@@ -109,10 +112,11 @@ mod tests {
     #[test]
     fn activation_qr_and_manual_code_round_trip_without_debug_leakage() {
         let presentation = DeviceActivationQrPresentation::from_created_device(
-            "wss://gateway.example/ws",
+            "91.224.86.172:17878",
             created_device(),
         )
         .unwrap();
+        assert_eq!(presentation.protected_endpoint, "ws://91.224.86.172:17878");
         let parsed = AuthDeviceActivationPresentation::parse(presentation.deep_link()).unwrap();
         assert_eq!(parsed.gateway_id, presentation.gateway_id);
         assert_eq!(parsed.activation_code(), presentation.manual_code());

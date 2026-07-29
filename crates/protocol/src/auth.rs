@@ -471,27 +471,13 @@ fn validate_protected_activation_endpoint(endpoint: &str) -> Result<(), String> 
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
         return Err("Gateway endpoint must not contain credentials or a fragment".to_owned());
     }
-    let host = parsed
+    parsed
         .host_str()
         .ok_or_else(|| "Gateway endpoint must contain a host".to_owned())?;
     match parsed.scheme() {
-        "wss" => Ok(()),
-        "ws" => is_loopback_host(host)
-            .then_some(())
-            .ok_or_else(|| "plaintext device activation endpoint must be loopback".to_owned()),
+        "ws" | "wss" => Ok(()),
         _ => Err("device activation endpoint must use ws or wss".to_owned()),
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 impl std::fmt::Debug for AuthDeviceActivationPresentation {
@@ -649,12 +635,14 @@ mod tests {
     }
 
     #[test]
-    fn activation_presentation_accepts_ipv4_and_ipv6_loopback_plaintext() {
+    fn activation_presentation_accepts_local_and_remote_plaintext() {
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         for endpoint in [
             "ws://localhost:17878",
             "ws://127.0.0.1:17878",
             "ws://[::1]:17878",
+            "ws://91.224.86.172:17878",
+            "ws://gateway.example.test:17878",
         ] {
             assert!(
                 AuthDeviceActivationPresentation::new(endpoint, gateway_id.clone(), "K7M4-P9Q2",)
