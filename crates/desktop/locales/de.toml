@@ -99,7 +99,7 @@ copy = "Kopieren"
 name = "Name"
 ok = "OK"
 or = "oder"
-activation_code = "Geräteregistrierungscode"
+activation_code = "Aktivierungscode"
 
 [buttons]
 add = "Hinzufügen"
@@ -331,7 +331,7 @@ unavailable = "Gateway ist nicht verfügbar"
 path_update_skipped = "Gateway gestartet. Für den Befehl `pioneer` müssen Sie %{bin_dir} in einer neuen Terminalsitzung eventuell manuell zu PATH hinzufügen."
 
 [gateway.session_terminal]
-authentication_required = "Melden Sie sich mit einem neuen Geräteregistrierungscode bei diesem Gateway an."
+authentication_required = "Melden Sie sich mit einem neuen Aktivierungscode bei diesem Gateway an."
 revoked = "Diese Gerätesitzung wurde abgemeldet oder widerrufen. Bitte erneut anmelden."
 expired = "Diese Gerätesitzung ist abgelaufen. Bitte erneut anmelden."
 compromised = "Diese Sitzung wurde aus Sicherheitsgründen geschlossen. Bitte erneut anmelden."

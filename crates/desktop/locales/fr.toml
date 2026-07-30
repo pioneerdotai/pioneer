@@ -99,7 +99,7 @@ copy = "Copier"
 name = "Nom"
 ok = "OK"
 or = "ou"
-activation_code = "Code d’inscription de l’appareil"
+activation_code = "Code d’activation"
 
 [buttons]
 add = "Ajouter"
@@ -331,7 +331,7 @@ unavailable = "Passerelle indisponible"
 path_update_skipped = "La passerelle est démarrée. Pour la commande `pioneer`, vous devrez peut-être ajouter %{bin_dir} au PATH dans une nouvelle session de terminal."
 
 [gateway.session_terminal]
-authentication_required = "Connectez-vous à cette passerelle avec un nouveau code d’inscription d’appareil."
+authentication_required = "Connectez-vous à cette passerelle avec un nouveau code d’activation."
 revoked = "La session de cet appareil a été fermée ou révoquée. Reconnectez-vous pour continuer."
 expired = "La session de cet appareil a expiré. Reconnectez-vous pour continuer."
 compromised = "Cette session a été fermée par sécurité. Reconnectez-vous pour continuer."

@@ -99,7 +99,7 @@ copy = "コピー"
 name = "名前"
 ok = "OK"
 or = "または"
-activation_code = "デバイス登録コード"
+activation_code = "アクティベーションコード"
 
 [buttons]
 add = "追加"
@@ -331,7 +331,7 @@ unavailable = "ゲートウェイは利用できません"
 path_update_skipped = "ゲートウェイを起動しました。`pioneer` コマンドを使うには、新しいターミナルセッションで %{bin_dir} を PATH に追加する必要がある場合があります。"
 
 [gateway.session_terminal]
-authentication_required = "新しいデバイス登録コードでこのゲートウェイにログインしてください。"
+authentication_required = "新しいアクティベーションコードでこのゲートウェイにログインしてください。"
 revoked = "このデバイスのセッションはログアウトまたは取り消されました。もう一度ログインしてください。"
 expired = "このデバイスのセッションは期限切れです。もう一度ログインしてください。"
 compromised = "セキュリティ保護のためセッションを終了しました。もう一度ログインしてください。"

@@ -1,5 +1,5 @@
 use crate::app::{
-    gateway_setup::render_gateway_setup_form,
+    gateway_setup::{GATEWAY_SETUP_INITIAL_CARD_WIDTH_PX, render_gateway_setup_form},
     root::{GatewaySetupFormMode, PioneerDesktop},
 };
 use crate::gateway::GatewayRuntime;
@@ -56,7 +56,7 @@ impl PioneerDesktop {
             .items_center()
             .child(
                 v_flex()
-                    .w_96()
+                    .w(px(GATEWAY_SETUP_INITIAL_CARD_WIDTH_PX))
                     .p_4()
                     .pb_6()
                     .gap_5()

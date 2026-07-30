@@ -1,3 +1,4 @@
+use super::GATEWAY_SETUP_FORM_WIDTH_PX;
 use crate::{
     app::root::{GatewaySetupAction, GatewaySetupFormMode, PioneerDesktop},
     components::buttonts::{default_outline_button, default_primary_button},
@@ -12,6 +13,8 @@ use gpui_component::{
     *,
 };
 use tracing::warn;
+
+const ACTIVATION_CODE_CELL_SIZE_PX: f32 = 32.0;
 
 #[derive(Clone)]
 pub(crate) struct GatewaySetupDialogState {
@@ -206,9 +209,9 @@ pub(crate) fn render_gateway_setup_form(
 ) -> AnyElement {
     let snapshot = form_state.read(cx).snapshot();
     let status = render_gateway_setup_status(&snapshot, cx);
-    let activation_cell_size = activation_code_cell_size(&mode);
 
     let mut form = v_form();
+
     if let GatewaySetupFormMode::ReauthenticateGateway { name, address, .. } = &mode {
         form = form
             .child(
@@ -234,6 +237,7 @@ pub(crate) fn render_gateway_setup_form(
                     .child(Input::new(&snapshot.address_input_state).min_w_0()),
             );
     }
+
     if !matches!(mode, GatewaySetupFormMode::EditGateway { .. }) {
         form = form.child(
             field()
@@ -251,12 +255,13 @@ pub(crate) fn render_gateway_setup_form(
                         .child(
                             OtpInput::new(&snapshot.activation_input_state)
                                 .groups(2)
-                                .with_size(activation_cell_size)
+                                .with_size(px(ACTIVATION_CODE_CELL_SIZE_PX))
                                 .disabled(snapshot.connecting),
                         ),
                 ),
         );
     }
+
     form = form.child(
         field()
             .label_indent(false)
@@ -272,29 +277,16 @@ pub(crate) fn render_gateway_setup_form(
         form = form.child(field().label_indent(false).child(status));
     }
 
-    form.into_any_element()
-}
-
-fn activation_code_cell_size(mode: &GatewaySetupFormMode) -> Pixels {
-    // gpui-component's OtpInput has fixed 4 px gaps inside each four-cell
-    // group and a fixed 20 px gap between the groups. The surrounding forms
-    // have fixed widths, so size the eight cells to consume the remaining
-    // width exactly instead of leaving the OTP row narrower than other inputs.
-    // The values below are the 384 px initial card/dialog widths after their
-    // respective border and horizontal padding have been accounted for.
-    match mode {
-        GatewaySetupFormMode::Initial { .. }
-        | GatewaySetupFormMode::ReauthenticateGateway {
-            close_dialog_on_success: false,
-            ..
-        } => px(32.), // 8 * 38.25 + 6 * 4 + 20 = 350 px.
-        GatewaySetupFormMode::AddGateway { .. }
-        | GatewaySetupFormMode::ReauthenticateGateway {
-            close_dialog_on_success: true,
-            ..
-        } => px(32.), // 8 * 36.25 + 6 * 4 + 20 = 334 px.
-        GatewaySetupFormMode::EditGateway { .. } => px(32.),
-    }
+    h_flex()
+        .w_full()
+        .justify_center()
+        .child(
+            div()
+                .w(px(GATEWAY_SETUP_FORM_WIDTH_PX))
+                .min_w_0()
+                .child(form),
+        )
+        .into_any_element()
 }
 
 fn handle_alphanumeric_otp_key_down(

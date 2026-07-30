@@ -99,7 +99,7 @@ copy = "复制"
 name = "名称"
 ok = "确定"
 or = "或"
-activation_code = "设备注册码"
+activation_code = "激活码"
 
 [buttons]
 add = "添加"
@@ -331,7 +331,7 @@ unavailable = "网关不可用"
 path_update_skipped = "网关已启动。对于 `pioneer` 命令，你可能需要在新的终端会话中将 %{bin_dir} 手动加入 PATH。"
 
 [gateway.session_terminal]
-authentication_required = "请使用新的设备注册代码登录此网关。"
+authentication_required = "请使用新的激活码登录此网关。"
 revoked = "此设备会话已退出或被撤销。请重新登录以继续。"
 expired = "此设备会话已过期。请重新登录以继续。"
 compromised = "出于安全原因，此会话已关闭。请重新登录以继续。"

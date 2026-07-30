@@ -1,4 +1,7 @@
-use super::view::{GatewaySetupFormState, render_gateway_setup_form};
+use super::{
+    GATEWAY_SETUP_DIALOG_WIDTH_PX,
+    view::{GatewaySetupFormState, render_gateway_setup_form},
+};
 use crate::app::root::{GatewaySetupFormMode, PioneerDesktop};
 use gpui::{prelude::*, *};
 use gpui_component::{StyledExt, WindowExt, *};
@@ -21,7 +24,7 @@ impl PioneerDesktop {
             };
 
             dialog
-                .w(px(384.))
+                .w(px(GATEWAY_SETUP_DIALOG_WIDTH_PX))
                 .gap_1()
                 .rounded_2xl()
                 .close_button(!is_connecting)
@@ -84,7 +87,7 @@ impl PioneerDesktop {
             let is_connecting = form_state.read(cx).is_connecting();
 
             dialog
-                .w(px(384.))
+                .w(px(GATEWAY_SETUP_DIALOG_WIDTH_PX))
                 .gap_1()
                 .rounded_2xl()
                 .close_button(!is_connecting)
@@ -155,7 +158,7 @@ impl PioneerDesktop {
             let is_connecting = form_state.read(cx).is_connecting();
 
             dialog
-                .w(px(384.))
+                .w(px(GATEWAY_SETUP_DIALOG_WIDTH_PX))
                 .gap_1()
                 .rounded_2xl()
                 .close_button(!is_connecting)

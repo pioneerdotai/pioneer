@@ -99,7 +99,7 @@ copy = "Copiar"
 name = "Nombre"
 ok = "Aceptar"
 or = "o"
-activation_code = "Código de registro de dispositivo"
+activation_code = "Código de activación"
 
 [buttons]
 add = "Añadir"
@@ -331,7 +331,7 @@ unavailable = "Pasarela no disponible"
 path_update_skipped = "La pasarela se inició. Para el comando `pioneer`, puede que necesites agregar %{bin_dir} al PATH en una nueva sesión de terminal."
 
 [gateway.session_terminal]
-authentication_required = "Inicia sesión en esta pasarela con un nuevo código de registro de dispositivo."
+authentication_required = "Inicia sesión en esta pasarela con un nuevo código de activación."
 revoked = "La sesión de este dispositivo se cerró o revocó. Inicia sesión de nuevo para continuar."
 expired = "La sesión de este dispositivo caducó. Inicia sesión de nuevo para continuar."
 compromised = "La sesión se cerró por seguridad. Inicia sesión de nuevo para continuar."
