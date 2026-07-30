@@ -1,6 +1,9 @@
-use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::{ClipboardItem, prelude::*, *};
-use gpui_component::{button::*, spinner::Spinner, theme::ActiveTheme, *};
+use crate::{
+    app::root::{GatewayConnectionState, PioneerDesktop},
+    components::buttonts::{default_outline_button, default_primary_button},
+};
+use gpui::{prelude::*, *};
+use gpui_component::{button::*, clipboard::Clipboard, spinner::Spinner, theme::ActiveTheme, *};
 use pioneer_client::gateway::device_activation::DeviceActivationQrPresentation;
 use pioneer_protocol::{
     AuthSessionListItem, AuthSessionRevokeParams, AuthSessionStatus, ClientKind, DeviceStatus,
@@ -110,18 +113,48 @@ impl PioneerDesktop {
                                         ),
                                 )
                                 .child(
-                                    Button::new("devices-create-activation")
-                                        .small()
-                                        .primary()
-                                        .label(t!("settings.devices.activate_device").to_string())
-                                        .on_click({
-                                            let desktop = desktop.clone();
-                                            move |_, window, cx| {
-                                                let _ = desktop.update(cx, |view, cx| {
-                                                    view.create_desktop_activation(window, cx)
-                                                });
-                                            }
-                                        }),
+                                    div().pt_1p5().child(
+                                        Button::new("devices-create-activation")
+                                            .ghost()
+                                            .justify_start()
+                                            .px_2()
+                                            .group("new-device-btn")
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_sm()
+                                                    .line_height(relative(1.))
+                                                    .child(
+                                                        t!("settings.devices.activate_device")
+                                                            .to_string(),
+                                                    ),
+                                            )
+                                            .child({
+                                                let icon_bg = cx.theme().foreground.opacity(0.075);
+                                                let icon_bg_hover =
+                                                    cx.theme().foreground.opacity(0.1);
+                                                div()
+                                                    .id("new-device-icon")
+                                                    .size_6()
+                                                    .rounded_full()
+                                                    .bg(icon_bg)
+                                                    .group_hover("new-device-btn", move |s| {
+                                                        s.bg(icon_bg_hover)
+                                                    })
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(Icon::new(IconName::Plus).size_4())
+                                            })
+                                            .on_click({
+                                                let desktop = desktop.clone();
+                                                move |_, window, cx| {
+                                                    let _ = desktop.update(cx, |view, cx| {
+                                                        view.create_desktop_activation(window, cx)
+                                                    });
+                                                }
+                                            }),
+                                    ),
                                 ),
                         )
                         .child(content),
@@ -358,50 +391,135 @@ impl PioneerDesktop {
     ) {
         let desktop = cx.entity().clone();
         let sender = self.gateway.ws_command_sender.clone();
+
         window.open_dialog(cx, move |dialog, _window, cx| {
             let phase = activation_state.read(cx).phase.clone();
+
+            let code = match &phase {
+                DeviceActivationDialogPhase::Ready(presentation) => {
+                    Some(presentation.manual_code().to_owned())
+                }
+                _ => None,
+            };
+            let link = match &phase {
+                DeviceActivationDialogPhase::Ready(presentation) => {
+                    Some(presentation.deep_link().to_owned())
+                }
+                _ => None,
+            };
+
             let content = match phase {
                 DeviceActivationDialogPhase::Loading => v_flex()
                     .w_full()
                     .min_h(px(240.))
                     .items_center()
                     .justify_center()
-                    .gap_3()
+                    .gap_2()
                     .child(Spinner::new())
                     .child(
                         div()
                             .text_sm()
-                            .opacity(0.7)
+                            .opacity(0.6)
                             .child(t!("settings.devices.activation_loading").to_string()),
                     )
                     .into_any_element(),
                 DeviceActivationDialogPhase::Ready(presentation) => v_flex()
                     .w_full()
+                    .pt_1()
+                    .pb_5()
+                    .gap_5()
                     .items_center()
-                    .gap_4()
                     .child(
                         div()
                             .text_sm()
-                            .opacity(0.7)
+                            .line_height(relative(1.35))
+                            .opacity(0.6)
                             .child(t!("settings.devices.activation_description").to_string()),
                     )
-                    .child(render_activation_qr(&presentation))
                     .child(
-                        div()
+                        v_flex()
                             .w_full()
-                            .p_2()
-                            .rounded_md()
-                            .bg(cx.theme().muted)
-                            .font_family("monospace")
-                            .text_xs()
-                            .child(presentation.manual_code().to_owned()),
+                            .items_center()
+                            .gap_4()
+                            .child(render_activation_qr(&presentation))
+                            .when_some(code, |this, code| {
+                                this.child(
+                                    v_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div().text_sm().opacity(0.6).child(
+                                                t!("settings.devices.code_label").to_string(),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .w_full()
+                                                .p_4()
+                                                .rounded_2xl()
+                                                .justify_center()
+                                                .bg(cx.theme().muted)
+                                                .text_xl()
+                                                .font_semibold()
+                                                .child(presentation.manual_code().to_owned())
+                                                .child(
+                                                    div().absolute().top_1p5().right_1p5().child(
+                                                        Clipboard::new("activation-copy-code")
+                                                            .value(code),
+                                                    ),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when_some(link, |this, link| {
+                                this.child(
+                                    v_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div().text_sm().opacity(0.6).child(
+                                                t!("settings.devices.link_label").to_string(),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .p_4()
+                                                .rounded_2xl()
+                                                .justify_center()
+                                                .bg(cx.theme().muted)
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .overflow_x_hidden()
+                                                        .whitespace_normal()
+                                                        .text_center()
+                                                        .child(link.to_owned()),
+                                                )
+                                                .child(
+                                                    div().absolute().top_1p5().right_1p5().child(
+                                                        Clipboard::new("activation-copy-link")
+                                                            .value(link),
+                                                    ),
+                                                ),
+                                        ),
+                                )
+                            }),
                     )
                     .into_any_element(),
                 DeviceActivationDialogPhase::Failed(error) => v_flex()
                     .w_full()
                     .min_h(px(180.))
                     .justify_center()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
                             .text_sm()
@@ -434,10 +552,9 @@ impl PioneerDesktop {
                         DeviceActivationDialogPhase::Loading => Vec::new(),
                         DeviceActivationDialogPhase::Failed(_) => {
                             let mut actions = vec![
-                                Button::new("activation-error-close")
-                                    .small()
-                                    .outline()
+                                default_outline_button("activation-error-close")
                                     .label(t!("buttons.cancel").to_string())
+                                    .outline()
                                     .on_click(|_, window, cx| {
                                         window.close_dialog(cx);
                                     })
@@ -445,9 +562,7 @@ impl PioneerDesktop {
                             ];
                             if let Some(endpoint_address) = endpoint_address.clone() {
                                 actions.push(
-                                    Button::new("activation-retry")
-                                        .small()
-                                        .primary()
+                                    default_primary_button("activation-retry")
                                         .label(t!("settings.devices.retry").to_string())
                                         .on_click({
                                             let activation_state = activation_state.clone();
@@ -471,47 +586,7 @@ impl PioneerDesktop {
                             actions
                         }
                         DeviceActivationDialogPhase::Ready(_) => vec![
-                            Button::new("activation-copy-code")
-                                .small()
-                                .outline()
-                                .label(t!("settings.devices.copy_code").to_string())
-                                .on_click({
-                                    let activation_state = activation_state.clone();
-                                    move |_, _, cx| {
-                                        let code = match &activation_state.read(cx).phase {
-                                            DeviceActivationDialogPhase::Ready(presentation) => {
-                                                Some(presentation.manual_code().to_owned())
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some(code) = code {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(code));
-                                        }
-                                    }
-                                })
-                                .into_any_element(),
-                            Button::new("activation-copy-link")
-                                .small()
-                                .outline()
-                                .label(t!("settings.devices.copy_link").to_string())
-                                .on_click({
-                                    let activation_state = activation_state.clone();
-                                    move |_, _, cx| {
-                                        let link = match &activation_state.read(cx).phase {
-                                            DeviceActivationDialogPhase::Ready(presentation) => {
-                                                Some(presentation.deep_link().to_owned())
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some(link) = link {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(link));
-                                        }
-                                    }
-                                })
-                                .into_any_element(),
-                            Button::new("activation-close")
-                                .small()
-                                .primary()
+                            default_primary_button("activation-close")
                                 .label(t!("settings.devices.close_activation").to_string())
                                 .on_click({
                                     let activation_state = activation_state.clone();
@@ -610,8 +685,9 @@ fn render_session_row(
         )
         .child(
             Button::new(("devices-session-action", index))
+                .ghost()
+                .compact()
                 .small()
-                .outline()
                 .label(action_label)
                 .on_click(move |_, window, cx| {
                     let item = item.clone();
