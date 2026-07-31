@@ -31,7 +31,8 @@ use pioneer_client::{
         render_fingerprint::render_fingerprint_hex,
         rows::TimelineRow,
         semantic::{
-            SemanticTimelineCachePatch, SemanticTimelineState, TopLevelPageMergeMode,
+            DEFAULT_TOP_LEVEL_PAGE_LIMIT, DEFAULT_TURN_WORK_PAGE_LIMIT, SemanticTimelineCachePatch,
+            SemanticTimelineLiveUpdate, SemanticTimelineState, TopLevelPageMergeMode,
             WorkPageMergeMode, apply_conversation_event_to_semantic_timeline,
             apply_conversation_event_to_semantic_timeline_with_patch,
             apply_local_composer_event_to_semantic_timeline_with_patch,
@@ -55,7 +56,8 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     AgentExecutionBackend, GatewayNotification, RuntimeSummary, Thread, ThreadGetParams,
-    ThreadMode, ThreadTimelinePageResponse, TurnWorkItemsGetResponse, TurnWorkPageResponse,
+    ThreadMode, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 use pioneer_protocol::{ThreadComposerExecutionMode, TurnPermissionMode};
 use serde::{Deserialize, Serialize};
@@ -275,6 +277,22 @@ struct ClientFfiActiveThreadInner {
     coordinators: HashMap<String, ThreadCoordinator>,
     semantic_timelines: SemanticTimelineState,
     pending_requests: PendingRequestState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SemanticTimelineReconcileRequest {
+    ThreadNewest {
+        thread_id: String,
+    },
+    TurnWorkNewest {
+        thread_id: String,
+        turn_id: String,
+    },
+    TurnWorkItems {
+        thread_id: String,
+        turn_id: String,
+        work_item_ids: Vec<String>,
+    },
 }
 
 impl ClientFfiActiveThreadState {
@@ -1183,14 +1201,22 @@ impl ClientFfiActiveThreadState {
                 SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::SemanticTimeline(update) => {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-                apply_semantic_timeline_live_update_with_patch(
-                    &mut inner.semantic_timelines,
-                    update,
-                )
+                // Keep inactive parent timelines current while a child thread is on screen.
+                // Desktop performs the same reconciliation in its semantic request controller;
+                // the FFI boundary must own it for mobile instead of relying on screen-local caches.
+                let reconcile_requests = semantic_timeline_reconcile_requests(&update);
+                let patch = {
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+                    apply_semantic_timeline_live_update_with_patch(
+                        &mut inner.semantic_timelines,
+                        update,
+                    )
+                };
+                self.reconcile_semantic_timeline(runtime, reconcile_requests);
+                patch
             }
             ClientRuntimeNotification::CLIRuntimePendingRequests { reduction, .. }
             | ClientRuntimeNotification::PendingRequests { reduction } => {
@@ -1204,6 +1230,61 @@ impl ClientFfiActiveThreadState {
         };
 
         Ok(semantic_timeline_patch)
+    }
+
+    fn reconcile_semantic_timeline(
+        &self,
+        runtime: &ClientRuntime,
+        requests: Vec<SemanticTimelineReconcileRequest>,
+    ) {
+        for request in requests {
+            match request {
+                SemanticTimelineReconcileRequest::ThreadNewest { thread_id } => {
+                    let Ok(page) = ws_commands::thread_timeline_page(
+                        &runtime.ws_command_sender(),
+                        ThreadTimelinePageParams {
+                            thread_id,
+                            anchor: TimelinePageAnchor::Newest,
+                            limit: Some(DEFAULT_TOP_LEVEL_PAGE_LIMIT),
+                        },
+                    ) else {
+                        continue;
+                    };
+                    let _ = self.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset);
+                }
+                SemanticTimelineReconcileRequest::TurnWorkNewest { thread_id, turn_id } => {
+                    let Ok(page) = ws_commands::turn_work_page(
+                        &runtime.ws_command_sender(),
+                        TurnWorkPageParams {
+                            thread_id,
+                            turn_id,
+                            anchor: TimelinePageAnchor::Newest,
+                            limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
+                        },
+                    ) else {
+                        continue;
+                    };
+                    let _ = self.apply_turn_work_page(page, WorkPageMergeMode::Reset);
+                }
+                SemanticTimelineReconcileRequest::TurnWorkItems {
+                    thread_id,
+                    turn_id,
+                    work_item_ids,
+                } => {
+                    let Ok(response) = ws_commands::turn_work_items_get(
+                        &runtime.ws_command_sender(),
+                        TurnWorkItemsGetParams {
+                            thread_id,
+                            turn_id,
+                            work_item_ids,
+                        },
+                    ) else {
+                        continue;
+                    };
+                    let _ = self.apply_turn_work_items_get_response(response);
+                }
+            }
+        }
     }
 
     fn apply_turn_start_send_reduction(
@@ -1245,6 +1326,43 @@ impl ClientFfiActiveThreadState {
         }
 
         Ok(())
+    }
+}
+
+fn semantic_timeline_reconcile_requests(
+    update: &SemanticTimelineLiveUpdate,
+) -> Vec<SemanticTimelineReconcileRequest> {
+    match update {
+        SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification) => {
+            vec![SemanticTimelineReconcileRequest::ThreadNewest {
+                thread_id: notification.thread_id.clone(),
+            }]
+        }
+        SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification) => {
+            let mut work_item_ids = notification.changed_work_item_ids.clone();
+            work_item_ids.sort();
+            work_item_ids.dedup();
+
+            let mut requests = Vec::with_capacity(2);
+            if !work_item_ids.is_empty() {
+                requests.push(SemanticTimelineReconcileRequest::TurnWorkItems {
+                    thread_id: notification.thread_id.clone(),
+                    turn_id: notification.turn_id.clone(),
+                    work_item_ids,
+                });
+            }
+            requests.push(SemanticTimelineReconcileRequest::TurnWorkNewest {
+                thread_id: notification.thread_id.clone(),
+                turn_id: notification.turn_id.clone(),
+            });
+            requests
+        }
+        SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification) => {
+            vec![SemanticTimelineReconcileRequest::TurnWorkNewest {
+                thread_id: notification.thread_id.clone(),
+                turn_id: notification.turn_id.clone(),
+            }]
+        }
     }
 }
 
@@ -1880,8 +1998,9 @@ mod tests {
     use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_protocol::{
         CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, SkillId,
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
-        TurnPermissionApprovalRequest, TurnStatus,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        ThreadTimelineBlocksChangedNotification, TimelineChangeReason, Turn, TurnKind, TurnOrigin,
+        TurnPermissionApprovalRequest, TurnStatus, TurnWorkItemsChangedNotification,
     };
     use serde_json::json;
 
@@ -2171,6 +2290,61 @@ mod tests {
             error
                 .to_string()
                 .contains("missing field `permission_mode`")
+        );
+    }
+
+    #[test]
+    fn semantic_block_change_reconciles_parent_timeline_even_when_it_is_not_active() {
+        let requests = semantic_timeline_reconcile_requests(
+            &SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(
+                ThreadTimelineBlocksChangedNotification {
+                    workspace_id: "ws_a".to_owned(),
+                    thread_id: "parent_thread".to_owned(),
+                    changed_block_ids: vec!["parent_answer".to_owned()],
+                    removed_block_ids: Vec::new(),
+                    before_cursor: None,
+                    after_cursor: None,
+                    reason: TimelineChangeReason::LiveEvent,
+                },
+            ),
+        );
+
+        assert_eq!(
+            requests,
+            vec![SemanticTimelineReconcileRequest::ThreadNewest {
+                thread_id: "parent_thread".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn semantic_work_change_reconciles_parent_item_and_work_state() {
+        let requests = semantic_timeline_reconcile_requests(
+            &SemanticTimelineLiveUpdate::TurnWorkItemsChanged(TurnWorkItemsChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                thread_id: "parent_thread".to_owned(),
+                turn_id: "parent_turn".to_owned(),
+                changed_work_item_ids: vec!["task_anchor".to_owned(), "task_anchor".to_owned()],
+                removed_work_item_ids: Vec::new(),
+                before_cursor: None,
+                after_cursor: None,
+                reason: TimelineChangeReason::LiveEvent,
+            }),
+        );
+
+        assert_eq!(
+            requests,
+            vec![
+                SemanticTimelineReconcileRequest::TurnWorkItems {
+                    thread_id: "parent_thread".to_owned(),
+                    turn_id: "parent_turn".to_owned(),
+                    work_item_ids: vec!["task_anchor".to_owned()],
+                },
+                SemanticTimelineReconcileRequest::TurnWorkNewest {
+                    thread_id: "parent_thread".to_owned(),
+                    turn_id: "parent_turn".to_owned(),
+                },
+            ]
         );
     }
 
