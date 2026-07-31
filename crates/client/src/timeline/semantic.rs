@@ -7,12 +7,13 @@
 use crate::conversation::ConversationEvent;
 use pioneer_protocol::{
     AgentMessagePhase, ItemDeltaStream, MarkdownDocument, SystemEventLevel, TaskAttachmentMode,
-    TaskTriggerKind, ThreadComposerExecutionMode, ThreadTimelineBlocksChangedNotification,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock, TimelineBlockKind,
-    TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn, TurnItem, TurnKind, TurnOrigin,
-    TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsChangedNotification,
-    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
-    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification, UserMessageAttachment,
+    TaskStatus, TaskTriggerKind, ThreadComposerExecutionMode,
+    ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
+    TurnItem, TurnKind, TurnOrigin, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
+    TurnWorkStateChangedNotification, UserMessageAttachment,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -910,7 +911,16 @@ pub fn apply_top_level_page(
         cache.stale_block_ids.clear();
     }
 
-    for block in page.blocks {
+    for incoming in page.blocks {
+        let existing = cache
+            .blocks_by_id
+            .get(incoming.block_id.as_str())
+            .or_else(|| {
+                (merge_mode == TopLevelPageMergeMode::Reset)
+                    .then(|| before.blocks_by_id.get(incoming.block_id.as_str()))
+                    .flatten()
+            });
+        let block = newest_top_level_block(existing, incoming);
         cache.stale_block_ids.remove(block.block_id.as_str());
         cache.blocks_by_id.insert(block.block_id.clone(), block);
     }
@@ -2348,6 +2358,10 @@ fn work_item_order_key(range: Option<&TurnWorkRangeCache>, item_id: &str) -> Str
 }
 
 fn upsert_top_level_block(thread: &mut ThreadSemanticTimelineState, block: TimelineBlock) {
+    let block = newest_top_level_block(
+        thread.top_level.blocks_by_id.get(block.block_id.as_str()),
+        block,
+    );
     thread
         .top_level
         .stale_block_ids
@@ -2357,6 +2371,58 @@ fn upsert_top_level_block(thread: &mut ThreadSemanticTimelineState, block: Timel
         .blocks_by_id
         .insert(block.block_id.clone(), block);
     sort_top_level_blocks(&mut thread.top_level);
+}
+
+fn newest_top_level_block(
+    existing: Option<&TimelineBlock>,
+    incoming: TimelineBlock,
+) -> TimelineBlock {
+    let Some(existing) = existing else {
+        return incoming;
+    };
+    let (
+        TimelineBlockKind::DetachedTaskRun {
+            task: existing_task,
+        },
+        TimelineBlockKind::DetachedTaskRun {
+            task: incoming_task,
+        },
+    ) = (&existing.kind, &incoming.kind)
+    else {
+        return incoming;
+    };
+    if existing_task.id != incoming_task.id {
+        return incoming;
+    }
+
+    let existing_revision = (
+        existing_task.updated_at,
+        detached_task_status_rank(existing_task.status),
+    );
+    let incoming_revision = (
+        incoming_task.updated_at,
+        detached_task_status_rank(incoming_task.status),
+    );
+    if existing_revision > incoming_revision {
+        existing.clone()
+    } else {
+        incoming
+    }
+}
+
+const fn detached_task_status_rank(status: TaskStatus) -> u8 {
+    match status {
+        TaskStatus::Draft => 0,
+        TaskStatus::Scheduled => 1,
+        TaskStatus::Queued => 2,
+        TaskStatus::Running => 3,
+        TaskStatus::Waiting => 4,
+        TaskStatus::WaitingReview => 5,
+        TaskStatus::Completed
+        | TaskStatus::Failed
+        | TaskStatus::Blocked
+        | TaskStatus::Cancelled => 6,
+    }
 }
 
 fn upsert_user_message_block(
@@ -3216,6 +3282,49 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.ordered_block_ids, vec!["block_b"]);
+    }
+
+    #[test]
+    fn stale_detached_task_page_cannot_regress_running_card_to_queued() {
+        let mut state = SemanticTimelineState::default();
+        let running = detached_task_block(TaskStatus::Running, 20);
+
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![running]),
+            TopLevelPageMergeMode::Reset,
+        ));
+        apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![detached_task_block(TaskStatus::Queued, 10)]),
+            TopLevelPageMergeMode::Reset,
+        );
+
+        assert_eq!(detached_task_status(&state), Some(TaskStatus::Running));
+
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![detached_task_block(TaskStatus::Queued, 30)]),
+            TopLevelPageMergeMode::Merge,
+        ));
+        assert_eq!(detached_task_status(&state), Some(TaskStatus::Queued));
+    }
+
+    #[test]
+    fn equal_revision_detached_task_event_prefers_running_over_queued() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![detached_task_block(TaskStatus::Running, 20)]),
+            TopLevelPageMergeMode::Reset,
+        ));
+
+        upsert_top_level_block(
+            state.thread_mut("thread_a"),
+            detached_task_block(TaskStatus::Queued, 20),
+        );
+
+        assert_eq!(detached_task_status(&state), Some(TaskStatus::Running));
     }
 
     #[test]
@@ -5126,6 +5235,38 @@ mod tests {
                 message: None,
             },
         }
+    }
+
+    fn detached_task_block(status: TaskStatus, updated_at: i64) -> TimelineBlock {
+        let TurnItem::Task { mut item } = task_turn_item(TaskAttachmentMode::Detached, status)
+        else {
+            unreachable!("task fixture must stay a task item");
+        };
+        item.updated_at = updated_at;
+        TimelineBlock {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            block_id: "turn:task_turn:detached-task-run:task_anchor".to_owned(),
+            turn_id: Some("task_turn".to_owned()),
+            sort_key: "002".to_owned(),
+            started_at_unix_ms: item.started_at.map(|value| value.saturating_mul(1_000)),
+            updated_at_unix_ms: Some(updated_at.saturating_mul(1_000)),
+            kind: TimelineBlockKind::DetachedTaskRun { task: item },
+        }
+    }
+
+    fn detached_task_status(state: &SemanticTimelineState) -> Option<TaskStatus> {
+        state
+            .thread("thread_a")
+            .and_then(|thread| {
+                thread
+                    .top_level
+                    .block("turn:task_turn:detached-task-run:task_anchor")
+            })
+            .and_then(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task } => Some(task.status),
+                _ => None,
+            })
     }
 
     fn user_block(thread_id: &str, block_id: &str, sort_key: &str, turn_id: &str) -> TimelineBlock {

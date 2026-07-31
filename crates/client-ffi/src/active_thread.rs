@@ -283,6 +283,7 @@ struct ClientFfiActiveThreadInner {
 enum SemanticTimelineReconcileRequest {
     ThreadNewest {
         thread_id: String,
+        merge_mode: TopLevelPageMergeMode,
     },
     TurnWorkNewest {
         thread_id: String,
@@ -1270,7 +1271,10 @@ impl ClientFfiActiveThreadState {
     ) {
         for request in requests {
             match request {
-                SemanticTimelineReconcileRequest::ThreadNewest { thread_id } => {
+                SemanticTimelineReconcileRequest::ThreadNewest {
+                    thread_id,
+                    merge_mode,
+                } => {
                     let Ok(page) = ws_commands::thread_timeline_page(
                         &runtime.ws_command_sender(),
                         ThreadTimelinePageParams {
@@ -1281,7 +1285,7 @@ impl ClientFfiActiveThreadState {
                     ) else {
                         continue;
                     };
-                    let _ = self.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset);
+                    let _ = self.apply_thread_timeline_page(page, merge_mode);
                 }
                 SemanticTimelineReconcileRequest::TurnWorkNewest { thread_id, turn_id } => {
                     let Ok(page) = ws_commands::turn_work_page(
@@ -1367,6 +1371,7 @@ fn semantic_timeline_reconcile_requests(
         SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification) => {
             vec![SemanticTimelineReconcileRequest::ThreadNewest {
                 thread_id: notification.thread_id.clone(),
+                merge_mode: TopLevelPageMergeMode::Merge,
             }]
         }
         SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification) => {
@@ -2360,6 +2365,7 @@ mod tests {
             requests,
             vec![SemanticTimelineReconcileRequest::ThreadNewest {
                 thread_id: "parent_thread".to_owned(),
+                merge_mode: TopLevelPageMergeMode::Merge,
             }]
         );
 
