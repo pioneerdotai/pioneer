@@ -280,6 +280,7 @@ pub async fn create_superuser<C: ConnectionTrait>(
         created_at: Set(now),
         updated_at: Set(now),
         removed_at: Set(None),
+        authorization_guard: Set(1),
     }
     .insert(db)
     .await

@@ -23,10 +23,10 @@ use pioneer_memory::hooks::{
     MemoryWorkspaceThreadRecallRequest, memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_protocol::{
-    ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
-    ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
-    ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
-    ThreadEpisodicWorkspaceId,
+    PrincipalId, ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic,
+    ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput,
+    ThreadEpisodicRecallPolicyContext, ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId,
+    ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId, ThreadVisibility,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -106,6 +106,59 @@ impl ThreadEpisodicMemoryRecallProvider {
             crud_store,
         }
     }
+
+    async fn accessible_thread_ids_for_member(
+        &self,
+        workspace_id: &str,
+        principal_id: Option<&str>,
+    ) -> Option<BTreeSet<String>> {
+        self.member_thread_ids(workspace_id, principal_id, false)
+            .await
+    }
+
+    async fn workspace_visible_thread_ids_for_member(
+        &self,
+        workspace_id: &str,
+        principal_id: Option<&str>,
+    ) -> Option<BTreeSet<String>> {
+        self.member_thread_ids(workspace_id, principal_id, true)
+            .await
+    }
+
+    async fn member_thread_ids(
+        &self,
+        workspace_id: &str,
+        principal_id: Option<&str>,
+        workspace_visible_only: bool,
+    ) -> Option<BTreeSet<String>> {
+        let principal_id = principal_id?;
+        let Ok(principal_id) = PrincipalId::new(principal_id) else {
+            return Some(BTreeSet::new());
+        };
+        match self
+            .crud_store
+            .list_accessible_threads_for_principal(&principal_id, workspace_id, u64::MAX)
+            .await
+        {
+            Ok(threads) => Some(
+                threads
+                    .into_iter()
+                    .filter(|thread| {
+                        member_thread_matches_recall_boundary(thread, workspace_visible_only)
+                    })
+                    .map(|thread| thread.id)
+                    .collect(),
+            ),
+            Err(_) => Some(BTreeSet::new()),
+        }
+    }
+}
+
+fn member_thread_matches_recall_boundary(
+    thread: &pioneer_protocol::Thread,
+    workspace_visible_only: bool,
+) -> bool {
+    !workspace_visible_only || thread.visibility == Some(ThreadVisibility::Workspace)
 }
 
 #[async_trait]
@@ -130,6 +183,19 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
         &self,
         request: MemoryCurrentThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
+        if self
+            .accessible_thread_ids_for_member(
+                request.workspace_id.as_str(),
+                request.principal_id.as_deref(),
+            )
+            .await
+            .is_some_and(|thread_ids| !thread_ids.contains(request.thread_id.as_str()))
+        {
+            return Ok(MemoryEpisodicRecallResponse {
+                diagnostics: vec!["memory.episodic_recall.current_thread_inaccessible".to_owned()],
+                ..MemoryEpisodicRecallResponse::default()
+            });
+        }
         let output = self
             .service
             .search_current_thread(
@@ -182,6 +248,12 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                 ..MemoryEpisodicRecallResponse::default()
             });
         };
+        let accessible_thread_ids = self
+            .workspace_visible_thread_ids_for_member(
+                request.workspace_id.as_str(),
+                request.principal_id.as_deref(),
+            )
+            .await;
         let output = service
             .search_related_threads(WorkspaceEpisodicRecallRequest {
                 workspace_id: request.workspace_id,
@@ -201,6 +273,7 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                     context_recall_allowed: true,
                     include_sensitive_context: false,
                 },
+                accessible_thread_ids,
             })
             .await;
         let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
@@ -231,6 +304,12 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                 ..MemoryEpisodicRecallResponse::default()
             });
         };
+        let accessible_thread_ids = self
+            .workspace_visible_thread_ids_for_member(
+                request.workspace_id.as_str(),
+                request.principal_id.as_deref(),
+            )
+            .await;
         let output = service
             .search_workspace_threads(WorkspaceEpisodicRecallRequest {
                 workspace_id: request.workspace_id,
@@ -250,6 +329,7 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                     context_recall_allowed: true,
                     include_sensitive_context: false,
                 },
+                accessible_thread_ids,
             })
             .await;
         let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
@@ -829,9 +909,10 @@ mod tests {
         MemoryTurnPolicy,
     };
     use pioneer_protocol::{
-        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole, Thread,
         ThreadEpisodicItemId, ThreadEpisodicScoreBreakdown, ThreadEpisodicSourceActorRole,
-        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
+        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus,
     };
     use std::collections::BTreeMap;
     use tokio::sync::Mutex;
@@ -863,6 +944,36 @@ mod tests {
             self.inputs.lock().await.push(input);
             self.output.lock().await.clone()
         }
+    }
+
+    #[test]
+    fn cross_thread_member_recall_excludes_private_sources() {
+        let thread = |id: &str, visibility| Thread {
+            id: id.to_owned(),
+            workspace_id: "ws_1".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Chat,
+            model: "test".to_owned(),
+            model_provider: "test".to_owned(),
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: Some(visibility),
+            turns: Vec::new(),
+        };
+        let private = thread("private", ThreadVisibility::Private);
+        let workspace = thread("workspace", ThreadVisibility::Workspace);
+
+        assert!(member_thread_matches_recall_boundary(&private, false));
+        assert!(member_thread_matches_recall_boundary(&workspace, false));
+        assert!(!member_thread_matches_recall_boundary(&private, true));
+        assert!(member_thread_matches_recall_boundary(&workspace, true));
     }
 
     #[tokio::test]

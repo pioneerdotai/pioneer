@@ -14,15 +14,21 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
+use super::membership::{
+    PersistedThreadAccessClass, persisted_thread_access_class_from_db,
+    persisted_thread_access_class_to_db,
+};
 use crate::SelfImprovementSourceTurnRecord;
 use crate::convention::{
     is_terminal_task_run_status_db, is_terminal_task_status_db, task_delivery_mode_to_db,
     task_result_candidate_status_to_db, task_run_status_to_db, task_run_thread_binding_kind_to_db,
-    task_run_turn_kind_from_db, task_status_to_db, thread_origin_kind_to_db,
-    thread_sidebar_visibility_to_db, turn_kind_to_db, turn_origin_to_db, turn_status_to_db,
+    task_run_turn_kind_from_db, task_status_to_db, thread_origin_kind_from_db,
+    thread_origin_kind_to_db, thread_sidebar_visibility_from_db, thread_sidebar_visibility_to_db,
+    turn_kind_from_db, turn_kind_to_db, turn_origin_from_db, turn_origin_to_db,
+    turn_status_from_db, turn_status_to_db,
 };
 use crate::util::unix_to_datetime;
 
@@ -64,6 +70,9 @@ pub async fn project_completed_source_turn<C: ConnectionTrait>(
             thread.workspace_id,
             notification.workspace_id
         );
+    }
+    if !workspace_visible_source_thread(&thread) {
+        return Ok(None);
     }
 
     let eligible = matches!(
@@ -149,6 +158,9 @@ pub async fn project_completed_collaborative_source_exchange<C: ConnectionTrait>
             "collaborative self-improvement source workspace mismatch for thread `{}`",
             notification.thread_id
         );
+    }
+    if !workspace_visible_source_thread(&parent_thread) {
+        return Ok(None);
     }
     if parent_thread.origin_kind != thread_origin_kind_to_db(ThreadOriginKind::Collaborative) {
         return Ok(None);
@@ -626,7 +638,26 @@ pub async fn list_after_cursor<C: ConnectionTrait>(
     }
 
     let rows = self_improvement_source_turn::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            self_improvement_source_turn::Entity::belongs_to(thread::Entity)
+                .from(self_improvement_source_turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread::Column::AccessClass.eq(persisted_thread_access_class_to_db(
+                PersistedThreadAccessClass::Workspace,
+            )),
+        )
+        .filter(
+            thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
+                ThreadSidebarVisibility::Visible,
+            )),
+        )
+        .filter(thread::Column::OriginKind.is_in(workspace_visible_source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(cursor_source_id))
         .filter(
             self_improvement_source_turn::Column::TerminalAt
@@ -657,7 +688,26 @@ pub async fn list_frozen_range<C: ConnectionTrait>(
     }
 
     let rows = self_improvement_source_turn::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            self_improvement_source_turn::Entity::belongs_to(thread::Entity)
+                .from(self_improvement_source_turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread::Column::AccessClass.eq(persisted_thread_access_class_to_db(
+                PersistedThreadAccessClass::Workspace,
+            )),
+        )
+        .filter(
+            thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
+                ThreadSidebarVisibility::Visible,
+            )),
+        )
+        .filter(thread::Column::OriginKind.is_in(workspace_visible_source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
         .filter(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
         .filter(
@@ -716,10 +766,44 @@ async fn records_from_models<C: ConnectionTrait>(
         .into_iter()
         .map(|parent_turn| (parent_turn.id.clone(), parent_turn))
         .collect::<std::collections::HashMap<_, _>>();
+    let thread_ids = models
+        .iter()
+        .map(|model| model.thread_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let source_threads = thread::Entity::find()
+        .filter(thread::Column::Id.is_in(thread_ids))
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to revalidate self-improvement source threads for workspace \
+                 `{workspace_id}`"
+            )
+        })?
+        .into_iter()
+        .map(|model| (model.id.clone(), model))
+        .collect::<std::collections::HashMap<_, _>>();
 
     models
         .into_iter()
         .map(|model| {
+            let source_thread =
+                source_threads
+                    .get(model.thread_id.as_str())
+                    .with_context(|| {
+                        format!(
+                            "self-improvement source `{}` thread `{}` is missing",
+                            model.id, model.thread_id
+                        )
+                    })?;
+            if source_thread.workspace_id != workspace_id
+                || !workspace_visible_source_thread(source_thread)
+            {
+                bail!(
+                    "self-improvement source `{}` is no longer workspace-visible",
+                    model.id
+                );
+            }
             let parent_turn = parent_turns.get(model.turn_id.as_str()).with_context(|| {
                 format!(
                     "self-improvement source `{}` parent turn `{}` is missing",
@@ -732,7 +816,42 @@ async fn records_from_models<C: ConnectionTrait>(
                     model.id
                 );
             }
+            if turn_status_from_db(parent_turn.status.as_str()) != Some(TurnStatus::Completed)
+                || turn_kind_from_db(parent_turn.turn_kind.as_str()) != Some(TurnKind::Conversation)
+                || turn_origin_from_db(parent_turn.origin.as_str()) != Some(TurnOrigin::User)
+            {
+                bail!(
+                    "self-improvement source `{}` parent turn is not terminal eligible history",
+                    model.id
+                );
+            }
             Ok(record_from_model(model, parent_turn.created_at.timestamp()))
         })
         .collect()
+}
+
+fn workspace_visible_source_origins() -> Vec<String> {
+    [
+        ThreadOriginKind::Collaborative,
+        ThreadOriginKind::DirectMessage,
+        ThreadOriginKind::User,
+    ]
+    .into_iter()
+    .map(|origin| thread_origin_kind_to_db(origin).to_owned())
+    .collect()
+}
+
+fn workspace_visible_source_thread(model: &thread::Model) -> bool {
+    persisted_thread_access_class_from_db(model.access_class.as_str()).ok()
+        == Some(PersistedThreadAccessClass::Workspace)
+        && thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())
+            == Some(ThreadSidebarVisibility::Visible)
+        && thread_origin_kind_from_db(model.origin_kind.as_str()).is_some_and(|origin| {
+            matches!(
+                origin,
+                ThreadOriginKind::Collaborative
+                    | ThreadOriginKind::DirectMessage
+                    | ThreadOriginKind::User
+            )
+        })
 }

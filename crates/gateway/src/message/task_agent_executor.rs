@@ -61,6 +61,49 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("message processor is no longer available"))
     }
 
+    async fn initiating_member_still_has_root_access(
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+    ) -> Result<bool> {
+        let root_task = match task_response.task.root_task_id.as_deref() {
+            Some(root_task_id) => processor
+                .crud_store
+                .get_task(root_task_id)
+                .await?
+                .map(|response| response.task)
+                .ok_or_else(|| anyhow!("task root `{root_task_id}` is unavailable"))?,
+            None => task_response.task.clone(),
+        };
+        if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
+            return Ok(true);
+        }
+        let owner_id = root_task
+            .owner_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("user-owned task root has no initiating principal"))?;
+        let root_thread_id = root_task
+            .created_by_thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("user-owned task root has no authoritative thread"))?;
+        let root_turn_id = root_task
+            .created_by_turn_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("user-owned task root has no initiating turn"))?;
+        let context = match processor
+            .revalidate_execution_authorization_for_turn(
+                root_task.workspace_id.as_str(),
+                root_thread_id,
+                root_turn_id,
+                crate::authorization::ResourceAction::ThreadWrite,
+            )
+            .await
+        {
+            Ok(context) => context,
+            Err(_) => return Ok(false),
+        };
+        Ok(context.initiating_principal_id().as_str() == owner_id)
+    }
+
     async fn start_or_recover_run(
         &self,
         context: TaskExecutionContext,
@@ -71,6 +114,9 @@ impl TaskAgentExecutor {
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
         };
+        if !Self::initiating_member_still_has_root_access(&processor, &task_response).await? {
+            return Ok(TaskExecutorStartOutcome::Rejected);
+        }
         if task_response.task.status.is_terminal() || run.status.is_terminal() {
             return Ok(TaskExecutorStartOutcome::Queued);
         }
@@ -297,6 +343,7 @@ impl TaskAgentExecutor {
             mode: Some(child_mode),
             origin_kind: Some(ThreadOriginKind::TaskRun),
             sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+            visibility: None,
             agent_nickname: agent_spec.agent_nickname.clone(),
             agent_role: agent_spec.agent_role.clone(),
         };
@@ -361,6 +408,7 @@ impl TaskAgentExecutor {
             permission_profile: None,
             cli_runtime_options: None,
         });
+        let child_execution_backend = turn_params.execution_backend.clone();
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
             let conversation_history = frozen_conversation_scope
                 .as_ref()
@@ -379,6 +427,22 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to resolve hidden task CLI runtime execution security")?;
+            let cli_execution_backend = AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: runtime_id.clone(),
+                runtime_kind,
+            };
+            let child_authorization_context = resolve_task_child_execution_authorization_context(
+                processor,
+                task,
+                parent,
+                effective_model_provider.as_str(),
+                effective_model.model.as_str(),
+                Some(&cli_execution_backend),
+                turn_params.capabilities.as_slice(),
+                &child_security_snapshot.permission_profile,
+            )
+            .await
+            .context("failed to resolve hidden task CLI runtime authorization")?;
             // The shared CLI preparation future is deliberately large. Run it
             // from a fresh Tokio task so Task scheduler dispatch frames do not
             // consume the native runtime worker's stack before preparation
@@ -425,6 +489,36 @@ impl TaskAgentExecutor {
                     return Err(error).context("failed to prepare hidden task CLI runtime turn");
                 }
             };
+            if let Some(authorization_context) = child_authorization_context.as_ref() {
+                let encoded = authorization_context
+                    .to_persisted_json()
+                    .context("failed to encode hidden task CLI runtime authorization")?;
+                let persisted = processor
+                    .crud_store
+                    .set_turn_execution_authorization_context(
+                        child_turn_id.as_str(),
+                        encoded.as_str(),
+                    )
+                    .await;
+                if !matches!(persisted, Ok(true)) {
+                    processor
+                        .abort_prepared_task_cli_runtime_turn(prepared)
+                        .await;
+                    match persisted {
+                        Ok(false) => {
+                            bail!(
+                                "hidden task CLI runtime turn disappeared before authorization bind"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(error).context(
+                                "failed to persist hidden task CLI runtime authorization",
+                            );
+                        }
+                        Ok(true) => unreachable!(),
+                    }
+                }
+            }
             if processor
                 .crud_store
                 .get_task_run(run.id.as_str())
@@ -555,6 +649,27 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden task execution security");
             }
         };
+        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+            processor,
+            task,
+            parent,
+            turn_outcome.materialization.thread.model_provider.as_str(),
+            turn_outcome.materialization.thread.model.as_str(),
+            child_execution_backend.as_ref(),
+            turn_outcome.materialization.capabilities.as_slice(),
+            &child_security_snapshot.permission_profile,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve hidden task execution authorization");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             context.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -582,10 +697,11 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden task turn");
         }
-        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+        if let Err(error) = persist_resolved_task_child_execution_envelope(
             processor,
             child_turn_id.as_str(),
             &child_security_snapshot,
+            child_authorization_context.as_ref(),
         )
         .await
         {
@@ -626,7 +742,9 @@ impl TaskAgentExecutor {
             .await
             .context("failed to mark task run execution running")?;
         let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load hidden task workspace skill policies")?;
         let skill_catalog = processor
             .validate_turn_skill_capabilities(
                 task.workspace_id.as_str(),
@@ -694,12 +812,7 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            processor
-                .load_agent_skill_overlay_for_new_native_turn(
-                    task.workspace_id.as_str(),
-                    child_turn_id.as_str(),
-                )
-                .await
+            load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await?
         } else {
             Vec::new()
         };
@@ -846,6 +959,21 @@ impl TaskAgentExecutor {
         let task = &task_response.task;
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
+        if !Self::initiating_member_still_has_root_access(processor, task_response).await? {
+            self.block_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "task_root_access_revoked",
+                    "task continuation was blocked after root-thread access was revoked".to_owned(),
+                    TaskErrorClass::Policy,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         match message_future(self.acquire_write_locks(processor, task, run, handle.clone())).await?
         {
             TaskExecutorStartOutcome::Started => {}
@@ -885,6 +1013,14 @@ impl TaskAgentExecutor {
                         .await?;
                 }
                 TurnStatus::InProgress => {
+                    revalidate_existing_task_child_execution_authorization(
+                        processor,
+                        task,
+                        child_thread_id.as_str(),
+                        child_turn_id.as_str(),
+                    )
+                    .await
+                    .context("revision task continuation authorization is no longer active")?;
                     let started_at = now_timestamp_secs();
                     processor
                         .crud_store
@@ -949,6 +1085,7 @@ impl TaskAgentExecutor {
                     mode: Some(ThreadMode::Agent),
                     origin_kind: Some(ThreadOriginKind::TaskRun),
                     sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                    visibility: None,
                     agent_nickname: agent_spec.agent_nickname.clone(),
                     agent_role: agent_spec.agent_role.clone(),
                 },
@@ -1143,6 +1280,41 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
+        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+            processor,
+            task,
+            &parent,
+            turn_outcome.materialization.thread.model_provider.as_str(),
+            turn_outcome.materialization.thread.model.as_str(),
+            None,
+            turn_outcome.materialization.capabilities.as_slice(),
+            &child_security_snapshot.permission_profile,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_execution_authorization_unavailable",
+                        format!(
+                            "failed to resolve revision task execution authorization: {error:#}"
+                        ),
+                        TaskErrorClass::Policy,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -1179,10 +1351,11 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
-        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+        if let Err(error) = persist_resolved_task_child_execution_envelope(
             processor,
             child_turn_id.as_str(),
             &child_security_snapshot,
+            child_authorization_context.as_ref(),
         )
         .await
         {
@@ -1225,7 +1398,9 @@ impl TaskAgentExecutor {
             .await
             .context("failed to mark revision task run execution running")?;
         let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load revision task workspace skill policies")?;
         let skill_catalog = processor
             .validate_turn_skill_capabilities(
                 task.workspace_id.as_str(),
@@ -1277,12 +1452,7 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            processor
-                .load_agent_skill_overlay_for_new_native_turn(
-                    task.workspace_id.as_str(),
-                    child_turn_id.as_str(),
-                )
-                .await
+            load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await?
         } else {
             Vec::new()
         };
@@ -1441,6 +1611,14 @@ impl TaskAgentExecutor {
                 Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::InProgress => {
+                revalidate_existing_task_child_execution_authorization(
+                    processor,
+                    &task_response.task,
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                )
+                .await
+                .context("task child continuation authorization is no longer active")?;
                 if task_cli_runtime_backend(&task_response.task)?.is_some() {
                     let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
                     let Some(binding) = processor
@@ -1573,6 +1751,7 @@ impl TaskAgentExecutor {
                     mode: Some(ThreadMode::Agent),
                     origin_kind: Some(ThreadOriginKind::TaskRun),
                     sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                    visibility: None,
                     agent_nickname: agent_spec.agent_nickname.clone(),
                     agent_role: agent_spec.agent_role.clone(),
                 },
@@ -1697,7 +1876,9 @@ impl TaskAgentExecutor {
                 .context("failed to mark restored task run execution running")?;
         }
         let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load restored task workspace skill policies")?;
         let skill_catalog = processor
             .validate_turn_skill_capabilities(
                 task.workspace_id.as_str(),
@@ -2288,7 +2469,16 @@ impl TaskAgentExecutor {
                     )
                     .await?;
                 }
-                TurnStatus::InProgress => {}
+                TurnStatus::InProgress => {
+                    revalidate_existing_task_child_execution_authorization(
+                        processor,
+                        &task_response.task,
+                        task_run_turn.thread_id.as_str(),
+                        task_run_turn.turn_id.as_str(),
+                    )
+                    .await
+                    .context("reviewer task continuation authorization is no longer active")?;
+                }
                 TurnStatus::Failed | TurnStatus::Interrupted => {
                     let handle = TaskExecutionHandle::new(
                         processor.crud_store.clone(),
@@ -2370,6 +2560,7 @@ impl TaskAgentExecutor {
             mode: Some(ThreadMode::Agent),
             origin_kind: Some(ThreadOriginKind::TaskRun),
             sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+            visibility: None,
             agent_nickname: reviewer_spec.agent_nickname.clone(),
             agent_role: reviewer_spec.agent_role.clone(),
         };
@@ -2465,6 +2656,28 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden reviewer execution security");
             }
         };
+        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+            processor,
+            task,
+            &parent,
+            turn_outcome.materialization.thread.model_provider.as_str(),
+            turn_outcome.materialization.thread.model.as_str(),
+            None,
+            turn_outcome.materialization.capabilities.as_slice(),
+            &child_security_snapshot.permission_profile,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error)
+                    .context("failed to resolve hidden reviewer execution authorization");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             task_run_turn.thread_id.as_str(),
@@ -2489,10 +2702,11 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden reviewer turn");
         }
-        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+        if let Err(error) = persist_resolved_task_child_execution_envelope(
             processor,
             task_run_turn.turn_id.as_str(),
             &child_security_snapshot,
+            child_authorization_context.as_ref(),
         )
         .await
         {
@@ -2510,7 +2724,9 @@ impl TaskAgentExecutor {
             .await
             .map_err(|error| anyhow!("failed to prepare reviewer agent runtime: {error}"))?;
         let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load reviewer task workspace skill policies")?;
         let skill_catalog = processor
             .validate_turn_skill_capabilities(
                 task.workspace_id.as_str(),
@@ -2560,12 +2776,7 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            processor
-                .load_agent_skill_overlay_for_new_native_turn(
-                    task.workspace_id.as_str(),
-                    task_run_turn.turn_id.as_str(),
-                )
-                .await
+            load_task_agent_skill_overlay(processor, task, task_run_turn.turn_id.as_str()).await?
         } else {
             Vec::new()
         };
@@ -3305,6 +3516,18 @@ async fn ensure_task_run_occurrence_context(
             run.id
         )
     })?;
+    let occurrence_authorization_context = resolve_task_parent_execution_authorization_context(
+        processor,
+        &task_response.task,
+        &parent,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to resolve task run occurrence authorization for run `{}`",
+            run.id
+        )
+    })?;
     ensure_task_run_occurrence_turn(
         processor,
         &task_response.task,
@@ -3313,6 +3536,7 @@ async fn ensure_task_run_occurrence_context(
         origin,
         permission_profile,
         &occurrence_security_snapshot,
+        occurrence_authorization_context.as_ref(),
     )
     .await?;
     ensure_task_run_occurrence_anchor(
@@ -3367,6 +3591,7 @@ async fn ensure_task_run_occurrence_turn(
     origin: TurnOrigin,
     permission_profile: &TurnPermissionProfileSnapshot,
     execution_security_snapshot: &TurnExecutionSecuritySnapshot,
+    authorization_context: Option<&crate::authorization::ExecutionAuthorizationContext>,
 ) -> Result<()> {
     if processor
         .crud_store
@@ -3379,11 +3604,17 @@ async fn ensure_task_run_occurrence_turn(
             .get_turn_execution_security_snapshot(run.id.as_str())
             .await?
             .is_none()
+            || (authorization_context.is_some()
+                && processor
+                    .load_turn_execution_authorization_context(run.id.as_str())
+                    .await?
+                    .is_none())
         {
-            persist_resolved_task_child_execution_security_snapshot(
+            persist_resolved_task_child_execution_envelope(
                 processor,
                 run.id.as_str(),
                 execution_security_snapshot,
+                authorization_context,
             )
             .await
             .with_context(|| {
@@ -3453,10 +3684,11 @@ async fn ensure_task_run_occurrence_turn(
                 run.id, task.id
             )
         })?;
-    persist_resolved_task_child_execution_security_snapshot(
+    persist_resolved_task_child_execution_envelope(
         processor,
         run.id.as_str(),
         execution_security_snapshot,
+        authorization_context,
     )
     .await
     .with_context(|| {
@@ -4437,22 +4669,160 @@ async fn resolve_task_child_cli_execution_security_snapshot(
     )
 }
 
-async fn persist_resolved_task_child_execution_security_snapshot(
+async fn persist_resolved_task_child_execution_envelope(
     processor: &Arc<MessageProcessor>,
     child_turn_id: &str,
     snapshot: &TurnExecutionSecuritySnapshot,
+    authorization_context: Option<&crate::authorization::ExecutionAuthorizationContext>,
 ) -> Result<()> {
-    let updated = processor
-        .crud_store
-        .set_turn_execution_security_snapshot(child_turn_id, snapshot)
-        .await?;
+    let updated = if let Some(authorization_context) = authorization_context {
+        let encoded = authorization_context
+            .to_persisted_json()
+            .context("failed to encode task continuation authorization context")?;
+        processor
+            .crud_store
+            .set_turn_execution_envelope(child_turn_id, snapshot, encoded.as_str())
+            .await?
+    } else {
+        processor
+            .crud_store
+            .set_turn_execution_security_snapshot(child_turn_id, snapshot)
+            .await?
+    };
     if !updated {
         bail!(
-            "failed to persist task child execution security snapshot: turn `{}` was not found",
+            "failed to persist task child execution envelope: turn `{}` was not found",
             child_turn_id
         );
     }
     Ok(())
+}
+
+async fn task_root_user_owner_id(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+) -> Result<Option<String>> {
+    let root_task = match task.root_task_id.as_deref() {
+        Some(root_task_id) => processor
+            .crud_store
+            .get_task(root_task_id)
+            .await?
+            .map(|response| response.task)
+            .ok_or_else(|| anyhow!("task root `{root_task_id}` is unavailable"))?,
+        None => task.clone(),
+    };
+    if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
+        return Ok(None);
+    }
+    root_task
+        .owner_id
+        .filter(|owner_id| !owner_id.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| anyhow!("user-owned task root has no initiating principal"))
+}
+
+async fn resolve_task_parent_execution_authorization_context(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
+    let user_owner_id = task_root_user_owner_id(processor, task).await?;
+    let Some(parent_turn_id) = parent.parent_turn_id.as_deref() else {
+        if user_owner_id.is_some() {
+            bail!("user-owned task continuation has no initiating parent turn");
+        }
+        return Ok(None);
+    };
+    let context = processor
+        .load_turn_execution_authorization_context(parent_turn_id)
+        .await
+        .context("failed to load task parent execution authorization context")?;
+    let Some(context) = context else {
+        if user_owner_id.is_some() {
+            bail!("user-owned task continuation has no durable initiating authority");
+        }
+        return Ok(None);
+    };
+    let current = processor
+        .revalidate_execution_authorization_for_turn(
+            task.workspace_id.as_str(),
+            parent.parent_thread_id.as_str(),
+            parent_turn_id,
+            crate::authorization::ResourceAction::ThreadWrite,
+        )
+        .await
+        .context("task initiating authority no longer permits continuation")?;
+    if current != context
+        || current.workspace_id() != task.workspace_id
+        || current.root_thread_id() != parent.root_thread_id
+        || user_owner_id
+            .as_deref()
+            .is_some_and(|owner_id| current.initiating_principal_id().as_str() != owner_id)
+    {
+        bail!("task continuation differs from its initiating authorization boundary");
+    }
+    Ok(Some(current))
+}
+
+async fn resolve_task_child_execution_authorization_context(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    parent: &TaskParentRuntimeContext,
+    provider: &str,
+    model: &str,
+    execution_backend: Option<&AgentExecutionBackend>,
+    capabilities: &[pioneer_protocol::TurnCapability],
+    permission_profile: &TurnPermissionProfileSnapshot,
+) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
+    resolve_task_parent_execution_authorization_context(processor, task, parent)
+        .await?
+        .map(|context| {
+            context.derive_continuation(
+                provider,
+                model,
+                execution_backend,
+                capabilities,
+                permission_profile,
+            )
+        })
+        .transpose()
+}
+
+async fn revalidate_existing_task_child_execution_authorization(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    child_thread_id: &str,
+    child_turn_id: &str,
+) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
+    let user_owner_id = task_root_user_owner_id(processor, task).await?;
+    let context = processor
+        .load_turn_execution_authorization_context(child_turn_id)
+        .await
+        .context("failed to load task child execution authorization")?;
+    let Some(context) = context else {
+        if user_owner_id.is_some() {
+            bail!("user-owned task child has no durable initiating authority");
+        }
+        return Ok(None);
+    };
+    context
+        .revalidate_for_turn_scope(
+            processor.crud_store.as_ref(),
+            task.workspace_id.as_str(),
+            child_thread_id,
+            child_turn_id,
+            crate::authorization::ResourceAction::ThreadWrite,
+            processor.authorization_invalidation_hub.current_revision(),
+        )
+        .await
+        .context("task child initiating authority no longer permits continuation")?;
+    if user_owner_id
+        .as_deref()
+        .is_some_and(|owner_id| context.initiating_principal_id().as_str() != owner_id)
+    {
+        bail!("task child authorization principal differs from the task owner");
+    }
+    Ok(Some(context))
 }
 
 async fn load_required_task_child_execution_security_snapshot(
@@ -5817,34 +6187,54 @@ fn task_value_into_string(value: TaskValue) -> Option<String> {
 async fn load_workspace_skill_policies(
     processor: &Arc<MessageProcessor>,
     workspace_id: &str,
-) -> std::collections::HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>
-{
-    match processor
+) -> Result<
+    std::collections::HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
+> {
+    processor
         .crud_store
         .list_workspace_skill_policies(workspace_id)
         .await
-    {
-        Ok(records) => records
-            .into_iter()
-            .map(|record| {
-                (
-                    pioneer_skills::SkillPolicyKey::new(record.skill_id),
-                    pioneer_agent::WorkspaceSkillPolicy {
-                        enabled: record.enabled,
-                        allow_implicit_invocation: record.allow_implicit_invocation,
-                    },
-                )
-            })
-            .collect(),
-        Err(error) => {
-            warn!(
-                workspace_id,
-                error = %format!("{error:#}"),
-                "failed to load workspace skill policies for task child turn; continuing"
-            );
-            std::collections::HashMap::new()
-        }
-    }
+        .with_context(|| {
+            format!(
+                "authoritative workspace skill policy projection is unavailable for \
+                 `{workspace_id}`"
+            )
+        })
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| {
+                    (
+                        pioneer_skills::SkillPolicyKey::new(record.skill_id),
+                        pioneer_agent::WorkspaceSkillPolicy {
+                            enabled: record.enabled,
+                            allow_implicit_invocation: record.allow_implicit_invocation,
+                        },
+                    )
+                })
+                .collect()
+        })
+}
+
+async fn load_task_agent_skill_overlay(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    turn_id: &str,
+) -> Result<Vec<pioneer_skills::AgentSkillRuntimeEntry>> {
+    let Some(owner_id) = task_root_user_owner_id(processor, task).await? else {
+        return Ok(processor
+            .load_agent_skill_overlay_for_new_native_turn(task.workspace_id.as_str(), turn_id)
+            .await);
+    };
+    let principal_id = pioneer_protocol::PrincipalId::new(owner_id)
+        .context("Member-owned task has an invalid initiating principal")?;
+    processor
+        .load_agent_skill_overlay_for_member_turn(
+            &principal_id,
+            task.workspace_id.as_str(),
+            turn_id,
+        )
+        .await
 }
 
 fn task_error(
@@ -5895,7 +6285,7 @@ mod tests {
     use pioneer_tools::{
         ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::Database;
+    use sea_orm::{ConnectionTrait, Database};
 
     fn test_task_run_turn() -> TaskRunTurn {
         TaskRunTurn {
@@ -6170,6 +6560,27 @@ mod tests {
                 .await
                 .expect("missing checkpoint should not fail");
         assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_workspace_skill_policy_projection_fails_closed() {
+        let (processor, task, _task_run_turn, _lineage) =
+            task_artifact_harness("skill_policy_unavailable").await;
+        processor
+            .crud_store
+            .database_connection()
+            .execute_unprepared("DROP TABLE skill_workspace_policy")
+            .await
+            .expect("remove isolated policy table");
+
+        let error = load_workspace_skill_policies(&processor, task.workspace_id.as_str())
+            .await
+            .expect_err("missing policy authority must not fall back to global defaults");
+
+        assert!(
+            format!("{error:#}").contains("authoritative workspace skill policy projection"),
+            "failure must identify the unavailable authorization projection"
+        );
     }
 
     async fn task_artifact_harness(

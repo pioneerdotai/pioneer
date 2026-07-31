@@ -1250,6 +1250,7 @@ fn active_recall_thread_episodic_summary_is_bounded_and_metadata_only() {
         input_text: "continue".to_owned(),
         task_id: None,
         agent_id: None,
+        principal_id: None,
     };
     let long_content = (0..12)
         .map(|index| {

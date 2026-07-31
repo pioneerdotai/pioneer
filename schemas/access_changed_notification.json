@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AccessChangedNotification",
+  "description": "Minimal notification telling an authenticated client to re-resolve access.",
+  "type": "object",
+  "properties": {
+    "authorization_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "change": {
+      "$ref": "#/$defs/AccessChangeKind"
+    },
+    "thread_id": {
+      "description": "Exact affected thread when the committed ACL mutation is thread-scoped.\n\nThis is an opaque server-owned identifier, not protected thread\ncontent. It is omitted for workspace-wide changes and lets clients\nevict only the affected thread instead of discarding unrelated\nworkspace state.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "authorization_revision",
+    "workspace_id",
+    "change"
+  ],
+  "$defs": {
+    "AccessChangeKind": {
+      "description": "Payload-safe reason for invalidating client authorization-derived state.\n\nThis vocabulary deliberately contains no protected resource metadata or\npolicy-engine details.",
+      "type": "string",
+      "enum": [
+        "workspace_membership",
+        "thread_created",
+        "thread_visibility",
+        "thread_participant_added",
+        "thread_participant_removed"
+      ]
+    }
+  }
+}

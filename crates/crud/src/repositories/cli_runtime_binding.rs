@@ -383,9 +383,18 @@ pub struct CliRuntimePendingRequestRecord {
     pub payload_json: String,
     pub status: CliRuntimePendingRequestStatus,
     pub response_json: Option<String>,
+    pub authorization_binding: Option<CliRuntimeRequestAuthorizationBinding>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub resolved_at: Option<DateTimeWithTimeZone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeRequestAuthorizationBinding {
+    pub initiating_principal_id: String,
+    pub initiating_session_id: String,
+    pub initiating_session_generation: i64,
+    pub authorization_context_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +430,8 @@ pub struct CliRuntimePendingRequestListFilter {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub status: Option<CliRuntimePendingRequestStatus>,
+    pub initiating_principal_id: Option<String>,
+    pub initiating_session_id: Option<String>,
     pub limit: Option<u64>,
 }
 
@@ -1448,6 +1459,16 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
     if let Some(status) = filter.status {
         query = query.filter(cli_runtime_pending_request::Column::Status.eq(status.as_str()));
     }
+    if let Some(initiating_principal_id) = filter.initiating_principal_id {
+        query = query.filter(
+            cli_runtime_pending_request::Column::InitiatingPrincipalId.eq(initiating_principal_id),
+        );
+    }
+    if let Some(initiating_session_id) = filter.initiating_session_id {
+        query = query.filter(
+            cli_runtime_pending_request::Column::InitiatingSessionId.eq(initiating_session_id),
+        );
+    }
     if let Some(limit) = filter.limit {
         query = query.limit(limit);
     }
@@ -1814,10 +1835,68 @@ fn active_pending_request_from_new(
         payload_json: Set(request.payload_json),
         status: Set(CliRuntimePendingRequestStatus::Pending.as_str().to_owned()),
         response_json: Set(None),
+        initiating_principal_id: Set(None),
+        initiating_session_id: Set(None),
+        initiating_session_generation: Set(None),
+        authorization_context_fingerprint: Set(None),
         created_at: Set(request.created_at),
         updated_at: Set(request.updated_at),
         resolved_at: Set(None),
     }
+}
+
+pub async fn bind_pending_request_authorization<C: ConnectionTrait>(
+    db: &C,
+    request_id: &str,
+    binding: &CliRuntimeRequestAuthorizationBinding,
+) -> Result<CliRuntimePendingRequestRecord> {
+    if binding.initiating_principal_id.trim().is_empty()
+        || binding.initiating_session_id.trim().is_empty()
+        || binding.initiating_session_generation < 0
+        || binding.authorization_context_fingerprint.len() != 64
+        || !binding
+            .authorization_context_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(anyhow!(
+            "CLI runtime pending request authorization binding is invalid"
+        ));
+    }
+    let current = find_pending_request(db, request_id)
+        .await?
+        .context("CLI runtime pending request to authorize is missing")?;
+    if current.status != CliRuntimePendingRequestStatus::Pending {
+        return Err(anyhow!(
+            "CLI runtime pending request authorization cannot bind terminal request"
+        ));
+    }
+    if let Some(existing) = current.authorization_binding {
+        if existing == *binding {
+            return find_pending_request(db, request_id)
+                .await?
+                .context("authorized CLI runtime pending request is missing");
+        }
+        return Err(anyhow!(
+            "CLI runtime pending request is bound to different initiating authority"
+        ));
+    }
+    cli_runtime_pending_request::Entity::update(cli_runtime_pending_request::ActiveModel {
+        request_id: Set(request_id.to_owned()),
+        initiating_principal_id: Set(Some(binding.initiating_principal_id.clone())),
+        initiating_session_id: Set(Some(binding.initiating_session_id.clone())),
+        initiating_session_generation: Set(Some(binding.initiating_session_generation)),
+        authorization_context_fingerprint: Set(Some(
+            binding.authorization_context_fingerprint.clone(),
+        )),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .context("failed to bind CLI runtime pending request authorization")?;
+    find_pending_request(db, request_id)
+        .await?
+        .context("authorized CLI runtime pending request is missing")
 }
 
 fn active_native_event_from_new(
@@ -2019,6 +2098,37 @@ fn turn_mcp_metadata_from_model(
 fn pending_request_record_from_model(
     model: cli_runtime_pending_request::Model,
 ) -> Result<CliRuntimePendingRequestRecord> {
+    let authorization_binding = match (
+        model.initiating_principal_id,
+        model.initiating_session_id,
+        model.initiating_session_generation,
+        model.authorization_context_fingerprint,
+    ) {
+        (None, None, None, None) => None,
+        (
+            Some(initiating_principal_id),
+            Some(initiating_session_id),
+            Some(initiating_session_generation),
+            Some(authorization_context_fingerprint),
+        ) if initiating_session_generation >= 0
+            && authorization_context_fingerprint.len() == 64
+            && authorization_context_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(CliRuntimeRequestAuthorizationBinding {
+                initiating_principal_id,
+                initiating_session_id,
+                initiating_session_generation,
+                authorization_context_fingerprint,
+            })
+        }
+        _ => {
+            return Err(anyhow!(
+                "CLI runtime pending request authorization binding is incomplete or invalid"
+            ));
+        }
+    };
     Ok(CliRuntimePendingRequestRecord {
         request_id: model.request_id,
         runtime_id: model.runtime_id,
@@ -2033,6 +2143,7 @@ fn pending_request_record_from_model(
         payload_json: model.payload_json,
         status: CliRuntimePendingRequestStatus::from_db(model.status.as_str())?,
         response_json: model.response_json,
+        authorization_binding,
         created_at: model.created_at,
         updated_at: model.updated_at,
         resolved_at: model.resolved_at,

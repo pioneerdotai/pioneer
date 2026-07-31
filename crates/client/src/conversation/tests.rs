@@ -46,6 +46,7 @@ fn thread_snapshot_with_turn(turn: Turn) -> Thread {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: vec![turn],
     }
 }

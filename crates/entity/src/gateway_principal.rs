@@ -21,6 +21,7 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub removed_at: Option<DateTimeWithTimeZone>,
+    pub authorization_guard: i64,
     #[sea_orm(has_many)]
     pub auth_sessions: HasMany<super::auth_session::Entity>,
     #[sea_orm(has_many)]
@@ -33,6 +34,10 @@ pub struct Model {
         on_delete = "Restrict"
     )]
     pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    #[sea_orm(has_many, via = "thread_membership")]
+    pub threads: HasMany<super::thread::Entity>,
+    #[sea_orm(has_many, via = "workspace_membership")]
+    pub workspaces: HasMany<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

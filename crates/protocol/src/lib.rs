@@ -1,5 +1,6 @@
 pub mod constants;
 
+mod access;
 mod agent_event;
 mod artifact;
 mod auth;
@@ -26,6 +27,7 @@ mod voice;
 pub mod voice_contract;
 mod workspace;
 
+pub use access::{AccessChangeKind, AccessChangedNotification};
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
@@ -97,11 +99,15 @@ pub use id::{
     SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
     TokenFamilyId, generate_id,
 };
-pub use identity::{PersistedActorRef, PrincipalKind, PrincipalStatus};
+pub use identity::{
+    MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey,
+    RoleKeyError,
+};
 pub use jsonrpc::{
-    INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
-    REQUEST_ID_LEN, RequestId, RequestIdError,
+    AUTHENTICATION_TERMINAL_CODE, FORBIDDEN_CODE, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, METHOD_NOT_FOUND_CODE, NOT_FOUND_CODE, PARSE_ERROR_CODE, REQUEST_ID_LEN,
+    RequestId, RequestIdError,
 };
 pub use markdown::{
     MARKDOWN_AST_VERSION, MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList,
@@ -236,11 +242,14 @@ pub use thread::{
     ThreadFolder, ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
     ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
     ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode, ThreadMoveParams,
-    ThreadMoveResponse, ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility,
-    ThreadStartParams, ThreadStartResponse, ThreadStartedNotification, ThreadStatus,
-    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
-    ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse,
-    ThreadUpdatedNotification,
+    ThreadMoveResponse, ThreadOriginKind, ThreadParticipantChangeKind,
+    ThreadParticipantMutationParams, ThreadParticipantSummary,
+    ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
+    ThreadParticipantsResponse, ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ThreadVisibility,
 };
 pub use thread_agents_doc::{
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
@@ -326,9 +335,9 @@ pub use turn::{
     UserMessageAttachment, WebFetchLink, WebSearchResultItem,
     build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
     build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
-    collect_execution_checkpoint_strict_obligations, normalize_metadata_reasoning_effort,
-    reasoning_effort_comparison_key, resolve_turn_permission_profile, skill_capability_key,
-    skill_pack_capability_key,
+    collect_execution_checkpoint_strict_obligations, mcp_server_capability_key,
+    mcp_tool_capability_key, normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
+    resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,

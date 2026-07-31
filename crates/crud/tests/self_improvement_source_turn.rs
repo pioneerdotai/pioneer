@@ -62,6 +62,7 @@ fn thread(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     }
 }
@@ -89,6 +90,23 @@ async fn start_turn(store: &CrudStore, thread: &Thread, turn: &Turn) {
         )
         .await
         .expect("turn start must project");
+    if matches!(
+        thread.origin_kind,
+        ThreadOriginKind::Collaborative | ThreadOriginKind::DirectMessage | ThreadOriginKind::User
+    ) && thread.sidebar_visibility == ThreadSidebarVisibility::Visible
+    {
+        store
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    thread.id
+                )
+                .as_str(),
+            )
+            .await
+            .expect("self-improvement source fixture must be workspace-visible");
+    }
 }
 
 async fn complete_turn(store: &CrudStore, thread: &Thread, mut turn: Turn, terminal_at: i64) {
@@ -305,6 +323,37 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
     let eligible_turn = turn("turn_eligible_a1", TurnKind::Conversation, TurnOrigin::User);
     start_turn(&store, &eligible_thread, &eligible_turn).await;
     complete_turn(&store, &eligible_thread, eligible_turn, START_AT + 1).await;
+
+    let private_thread = thread(
+        "ws_source_a",
+        "thread_private_source",
+        ThreadOriginKind::User,
+        START_AT + 2,
+    );
+    let private_turn = turn(
+        "turn_private_source",
+        TurnKind::Conversation,
+        TurnOrigin::User,
+    );
+    start_turn(&store, &private_thread, &private_turn).await;
+    database
+        .execute_unprepared(
+            "UPDATE thread SET access_class = 'private' \
+             WHERE id = 'thread_private_source'",
+        )
+        .await
+        .expect("private source fixture must become private before completion");
+    complete_turn(&store, &private_thread, private_turn, START_AT + 3).await;
+    assert_eq!(
+        scalar_i64(
+            &database,
+            "SELECT COUNT(*) AS value FROM self_improvement_source_turn \
+             WHERE turn_id = 'turn_private_source'",
+        )
+        .await,
+        0,
+        "private source must be excluded before entering the immutable source ledger"
+    );
 
     let first = store
         .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)

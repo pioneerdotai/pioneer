@@ -12,6 +12,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use super::identity::actor_ref_from_db;
+use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
 use super::self_improvement_source_turn::{
     VerifiedCollaborativeExchange, collaborative_child_lineage_matches,
     verify_collaborative_exchange,
@@ -71,6 +72,13 @@ pub async fn list_for_frozen_range<C: ConnectionTrait>(
                  `{workspace_id}`",
                 visible_thread.workspace_id
             );
+        }
+        if persisted_thread_access_class_from_db(visible_thread.access_class.as_str()).ok()
+            != Some(PersistedThreadAccessClass::Workspace)
+            || thread_sidebar_visibility_from_db(visible_thread.sidebar_visibility.as_str())
+                != Some(ThreadSidebarVisibility::Visible)
+        {
+            bail!("canonical history thread `{thread_id}` is no longer workspace-visible");
         }
         let origin =
             thread_origin_kind_from_db(visible_thread.origin_kind.as_str()).with_context(|| {

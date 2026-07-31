@@ -382,12 +382,8 @@ impl MessageProcessor {
             created_at,
         );
 
-        self.send_notification_to_workspace_connections(
-            workspace_id,
-            events::SKILLS_CHANGED,
-            &notification,
-        )
-        .await;
+        self.send_gateway_management_notification(events::SKILLS_CHANGED, &notification)
+            .await;
     }
 }
 

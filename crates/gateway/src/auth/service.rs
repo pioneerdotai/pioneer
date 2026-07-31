@@ -25,7 +25,8 @@ use pioneer_protocol::{
     AuthSessionRevokeResponse, AuthSessionSnapshot, AuthSessionStatus,
     AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind, CredentialStorageOrder,
     DEVICE_ACTIVATION_ALPHABET, DeviceId, DeviceStatus, PrincipalKind, PrincipalStatus,
-    RefreshCredentialId, RequestId, TokenFamilyId, format_device_activation_code, generate_id,
+    RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, format_device_activation_code,
+    generate_id,
 };
 use sea_orm::{
     DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
@@ -324,20 +325,21 @@ impl GatewayAuthService {
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
             let principal_id = pioneer_protocol::PrincipalId::new(session.principal_id.clone())
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if gateway_id != self.identity.gateway.id || principal_id != self.identity.superuser.id
-            {
+            if gateway_id != self.identity.gateway.id {
                 return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
             }
             let principal = load_principal_by_id(&transaction, &principal_id)
                 .await
                 .map_err(storage_error)?
                 .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if principal.gateway_id != gateway_id
-                || principal.kind != PrincipalKind::Superuser
-                || principal.status != PrincipalStatus::Active
-            {
+            if principal.gateway_id != gateway_id {
                 return Err(AuthError::new(AuthErrorCode::SessionRevoked));
             }
+            validate_authenticated_principal(
+                principal.kind,
+                principal.status,
+                principal.role_key.as_deref(),
+            )?;
             let device = load_device(&transaction, &device_id)
                 .await
                 .map_err(storage_error)?
@@ -600,9 +602,8 @@ impl GatewayAuthService {
         {
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
-        if owner.status != PrincipalStatus::Active || owner.kind != PrincipalKind::Superuser {
-            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
-        }
+        let role_key =
+            validate_authenticated_principal(owner.kind, owner.status, owner.role_key.as_deref())?;
         if session.status == "expired" {
             return Err(AuthError::new(AuthErrorCode::SessionExpired));
         }
@@ -621,7 +622,7 @@ impl GatewayAuthService {
         }
         Ok(SessionLeaseSnapshot {
             kind: owner.kind,
-            role_key: owner.role_key,
+            role_key: role_key.clone(),
             me: AuthMeResponse {
                 gateway: AuthGatewaySnapshot {
                     id: principal.gateway_id.clone(),
@@ -658,6 +659,7 @@ impl GatewayAuthService {
                         .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?,
                     refresh_expires_at_unix: timestamp(refresh_expires_at)?,
                 },
+                role_key,
             },
         })
     }
@@ -1016,17 +1018,7 @@ impl GatewayAuthService {
             {
                 return Err(AuthError::new(AuthErrorCode::AuthNotReady));
             }
-            let principal = load_principal_by_id(&transaction, &self.identity.superuser.id)
-                .await
-                .map_err(storage_error)?
-                .ok_or_else(|| AuthError::new(AuthErrorCode::AuthNotReady))?;
-            if principal.gateway_id != self.identity.gateway.id
-                || principal.kind != PrincipalKind::Superuser
-                || principal.status != PrincipalStatus::Active
-            {
-                return Err(AuthError::new(AuthErrorCode::AuthNotReady));
-            }
-            match authenticated_actor {
+            let principal_id = match authenticated_actor {
                 Some(current) => {
                     self.validate_active_actor_in_transaction(&transaction, current, now)
                         .await?;
@@ -1049,8 +1041,20 @@ impl GatewayAuthService {
                             .await
                             .map_err(storage_error)?;
                     }
+                    current.principal_id.clone()
                 }
                 None => {
+                    let principal = load_principal_by_id(&transaction, &self.identity.superuser.id)
+                        .await
+                        .map_err(storage_error)?
+                        .ok_or_else(|| AuthError::new(AuthErrorCode::AuthNotReady))?;
+                    if principal.gateway_id != self.identity.gateway.id
+                        || principal.kind != PrincipalKind::Superuser
+                        || principal.status != PrincipalStatus::Active
+                        || principal.role_key.is_some()
+                    {
+                        return Err(AuthError::new(AuthErrorCode::AuthNotReady));
+                    }
                     if let Some(previous) = load_pending_local_session(
                         &transaction,
                         &self.identity.gateway.id,
@@ -1073,8 +1077,9 @@ impl GatewayAuthService {
                             .await
                             .map_err(storage_error)?;
                     }
+                    self.identity.superuser.id.clone()
                 }
-            }
+            };
             expire_stale_pending_sessions(
                 &transaction,
                 now,
@@ -1130,7 +1135,7 @@ impl GatewayAuthService {
                     device_id: ids.device_id.clone(),
                     session_id: ids.session_id.clone(),
                     gateway_id: self.identity.gateway.id.clone(),
-                    principal_id: self.identity.superuser.id.clone(),
+                    principal_id: principal_id.clone(),
                     token_family_id: ids.token_family_id.clone(),
                     issuer,
                     activation_token_hash: activation_hash,
@@ -1141,16 +1146,16 @@ impl GatewayAuthService {
             )
             .await
             .map_err(storage_error)?;
-            Ok(activation)
+            Ok((activation, principal_id))
         }
         .await;
-        let activation = match result {
-            Ok(activation) => {
+        let (activation, principal_id) = match result {
+            Ok(result) => {
                 transaction
                     .commit()
                     .await
                     .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-                activation
+                result
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -1161,7 +1166,7 @@ impl GatewayAuthService {
             event = "auth_pending_device_session_created",
             device_id = %ids.device_id,
             auth_session_id = %ids.session_id,
-            principal_id = %self.identity.superuser.id,
+            principal_id = %principal_id,
             issuer = if authenticated_actor.is_some() { "authenticated_session" } else { "local_cli" },
             outcome = "created",
         );
@@ -1370,12 +1375,14 @@ impl GatewayAuthService {
                 .await
                 .map_err(storage_error)?
                 .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-            if principal.gateway_id != gateway_id
-                || principal.kind != PrincipalKind::Superuser
-                || principal.status != PrincipalStatus::Active
-            {
+            if principal.gateway_id != gateway_id {
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
+            validate_authenticated_principal(
+                principal.kind,
+                principal.status,
+                principal.role_key.as_deref(),
+            )?;
             let existing_device = load_active_device_by_installation(
                 &transaction,
                 &gateway_id,
@@ -1614,10 +1621,12 @@ impl GatewayAuthService {
             .await
             .map_err(storage_error)?
             .ok_or_else(|| AuthError::new(AuthErrorCode::SessionRevoked))?;
-        if owner.gateway_id != current.gateway_id
-            || owner.status != PrincipalStatus::Active
-            || owner.kind != PrincipalKind::Superuser
-        {
+        if owner.gateway_id != current.gateway_id {
+            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+        }
+        let role_key =
+            validate_authenticated_principal(owner.kind, owner.status, owner.role_key.as_deref())?;
+        if owner.kind != current.kind || role_key.as_ref() != current.role_key.as_ref() {
             return Err(AuthError::new(AuthErrorCode::SessionRevoked));
         }
         Ok(())
@@ -1667,8 +1676,29 @@ impl GatewayAuthService {
 #[derive(Debug)]
 pub(crate) struct SessionLeaseSnapshot {
     kind: PrincipalKind,
-    role_key: Option<String>,
+    role_key: Option<RoleKey>,
     me: AuthMeResponse,
+}
+
+fn validate_authenticated_principal(
+    kind: PrincipalKind,
+    status: PrincipalStatus,
+    persisted_role_key: Option<&str>,
+) -> Result<Option<RoleKey>, AuthError> {
+    if status != PrincipalStatus::Active {
+        return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+    }
+    match kind {
+        PrincipalKind::Superuser if persisted_role_key.is_none() => Ok(None),
+        PrincipalKind::User => {
+            let role_key = persisted_role_key
+                .and_then(|value| RoleKey::new(value).ok())
+                .filter(RoleKey::is_supported)
+                .ok_or_else(|| AuthError::new(AuthErrorCode::SessionRevoked))?;
+            Ok(Some(role_key))
+        }
+        PrincipalKind::Superuser => Err(AuthError::new(AuthErrorCode::SessionRevoked)),
+    }
 }
 
 #[async_trait]
@@ -1838,6 +1868,358 @@ mod tests {
         )
         .unwrap();
         (service, identity)
+    }
+
+    async fn member_access_credential(
+        service: &GatewayAuthService,
+        grant: &AuthSessionGrant,
+    ) -> (pioneer_protocol::PrincipalId, AccessCredential) {
+        let member_id =
+            pioneer_protocol::PrincipalId::new("P0000000000000000000A").expect("Member id");
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                    created_at,updated_at,removed_at\
+                 ) VALUES(\
+                    'P0000000000000000000A','{}','user','member','active',\
+                    'Member A','member-a','member-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                 );\
+                 UPDATE device SET principal_id='P0000000000000000000A'\
+                    WHERE id='D00000000000000000001';\
+                 UPDATE auth_session SET principal_id='P0000000000000000000A'\
+                    WHERE id='S00000000000000000001';",
+                    service.identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .expect("provision test-only Member session owner");
+        let now = unix_timestamp_secs().expect("current test time");
+        let raw = service
+            .access_issuer
+            .issue(
+                &AccessJwtSubject {
+                    gateway_id: service.identity.gateway.id.clone(),
+                    principal_id: member_id.clone(),
+                    device_id: grant.device.id.clone(),
+                    session_id: grant.session.id.clone(),
+                },
+                now,
+                Some("M00000000000000000001".to_owned()),
+            )
+            .expect("issue test Member access credential");
+        let credential = service
+            .access_issuer
+            .validate(raw.as_str(), now)
+            .expect("validate signed test Member access credential");
+        (member_id, credential)
+    }
+
+    #[test]
+    fn persisted_access_principal_contract_accepts_only_supported_active_shapes() {
+        assert_eq!(
+            validate_authenticated_principal(
+                PrincipalKind::Superuser,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            validate_authenticated_principal(
+                PrincipalKind::User,
+                PrincipalStatus::Active,
+                Some("member"),
+            )
+            .unwrap(),
+            Some(RoleKey::member())
+        );
+        for (kind, status, role) in [
+            (
+                PrincipalKind::User,
+                PrincipalStatus::Suspended,
+                Some("member"),
+            ),
+            (
+                PrincipalKind::User,
+                PrincipalStatus::Removed,
+                Some("member"),
+            ),
+            (PrincipalKind::User, PrincipalStatus::Active, None),
+            (PrincipalKind::User, PrincipalStatus::Active, Some("viewer")),
+            (
+                PrincipalKind::User,
+                PrincipalStatus::Active,
+                Some("Invalid"),
+            ),
+            (
+                PrincipalKind::Superuser,
+                PrincipalStatus::Active,
+                Some("member"),
+            ),
+        ] {
+            assert_eq!(
+                validate_authenticated_principal(kind, status, role)
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn member_access_uses_persisted_role_and_remains_default_denied_for_dispatch() {
+        use crate::request_context::{CanonicalMethod, ConnectionContext, RequestContext};
+
+        let (service, _identity) = fixture().await;
+        let grant = service
+            .create_initial_session_with_ids(
+                params("member-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let (member_id, credential) = member_access_credential(&service, &grant).await;
+
+        let principal = service
+            .authenticate_access(credential.clone())
+            .await
+            .expect("active supported Member authenticates");
+        assert_eq!(principal.principal_id, member_id);
+        assert_eq!(principal.kind, PrincipalKind::User);
+        assert_eq!(principal.role_key, Some(RoleKey::member()));
+        let connection = ConnectionContext::new(47, principal);
+        let context =
+            RequestContext::new(&connection, None, CanonicalMethod::rpc("workspace/list"));
+        assert_eq!(context.role_key().map(RoleKey::as_str), Some("member"));
+        assert_eq!(
+            crate::authorization::AuthorizationService::new().authorize_action(
+                context.principal().kind,
+                context.role_key(),
+                crate::authorization::ResourceAction::WorkspaceList,
+            ),
+            crate::authorization::ActionGateDecision::RequireResource {
+                role: RoleKey::member(),
+            }
+        );
+
+        service
+            .database
+            .execute_unprepared(
+                "UPDATE gateway_principal SET status='suspended'\
+                 WHERE id='P0000000000000000000A'",
+            )
+            .await
+            .expect("suspend test Member");
+        assert_eq!(
+            service
+                .authenticate_access(credential)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::SessionRevoked,
+        );
+    }
+
+    #[tokio::test]
+    async fn member_refresh_rotates_and_revalidates_current_principal_status() {
+        let (service, _identity) = fixture().await;
+        let initial = service
+            .create_initial_session_with_ids(
+                params("member-refresh-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let _ = member_access_credential(&service, &initial).await;
+
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(initial.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .expect("active Member refresh rotates");
+        assert_eq!(rotated.principal.id.as_str(), "P0000000000000000000A");
+        assert_eq!(rotated.principal.kind, PrincipalKind::User);
+        assert_eq!(rotated.refresh_generation, 1);
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+
+        service
+            .database
+            .execute_unprepared(
+                "UPDATE gateway_principal SET status='suspended'\
+                 WHERE id='P0000000000000000000A'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .exchange_refresh(
+                    refresh_admission(rotated.refresh_token.expose_secret()),
+                    refresh_params(2),
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::SessionRevoked,
+        );
+        assert_eq!(
+            scalar_i64(
+                &service.database,
+                "SELECT refresh_generation AS value FROM auth_session \
+                 WHERE id='S00000000000000000001'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_cross_principal_session_device_substitution() {
+        let (service, _identity) = fixture().await;
+        let initial = service
+            .create_initial_session_with_ids(
+                params("member-substitution-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let _ = member_access_credential(&service, &initial).await;
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                    created_at,updated_at,removed_at\
+                 ) VALUES(\
+                    'P0000000000000000000B','{}','user','member','active',\
+                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                 );\
+                 UPDATE device SET principal_id='P0000000000000000000B'\
+                    WHERE id='D00000000000000000001';",
+                    service.identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .exchange_refresh(
+                    refresh_admission(initial.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::SessionRevoked,
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session \
+                 WHERE id='S00000000000000000001'"
+            )
+            .await,
+            "active"
+        );
+        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+    }
+
+    #[tokio::test]
+    async fn member_refresh_reuse_revokes_only_the_exact_session_family() {
+        let (service, _identity) = fixture().await;
+        let member_a = service
+            .create_initial_session_with_ids(
+                params("member-a-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let member_b = service
+            .create_initial_session_with_ids(
+                params("member-b-installation", ClientKind::Desktop),
+                ids(2),
+            )
+            .await
+            .unwrap();
+        let _ = member_access_credential(&service, &member_a).await;
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                    created_at,updated_at,removed_at\
+                 ) VALUES(\
+                    'P0000000000000000000B','{}','user','member','active',\
+                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                 );\
+                 UPDATE device SET principal_id='P0000000000000000000B'\
+                    WHERE id='D00000000000000000002';\
+                 UPDATE auth_session SET principal_id='P0000000000000000000B'\
+                    WHERE id='S00000000000000000002';",
+                    service.identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+
+        let member_a_old = member_a.refresh_token.expose_secret().to_owned();
+        let member_a_current = service
+            .exchange_refresh(refresh_admission(&member_a_old), refresh_params(1))
+            .await
+            .unwrap();
+        let member_b_current = service
+            .exchange_refresh(
+                refresh_admission(member_b.refresh_token.expose_secret()),
+                refresh_params(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .exchange_refresh(refresh_admission(&member_a_old), refresh_params(3))
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::SessionCompromised,
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session \
+                 WHERE id='S00000000000000000001'"
+            )
+            .await,
+            "revoked"
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session \
+                 WHERE id='S00000000000000000002'"
+            )
+            .await,
+            "active"
+        );
+        let member_b_next = service
+            .exchange_refresh(
+                refresh_admission(member_b_current.refresh_token.expose_secret()),
+                refresh_params(4),
+            )
+            .await
+            .expect("independent Member family remains refreshable");
+        assert_eq!(member_b_next.refresh_generation, 2);
+        assert!(!member_a_current.refresh_token.expose_secret().is_empty());
     }
 
     #[tokio::test]
@@ -3000,6 +3382,222 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(replay.code(), AuthErrorCode::DeviceActivationConsumed);
+    }
+
+    #[tokio::test]
+    async fn member_device_and_session_lifecycle_is_owner_scoped_while_local_cli_stays_superuser() {
+        let (service, identity) = fixture().await;
+        let member_initial = service
+            .create_initial_session_with_ids(
+                params("member-primary-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let (_, member_access) = member_access_credential(&service, &member_initial).await;
+        let member = service.authenticate_access(member_access).await.unwrap();
+
+        let member_pending = service.create_device(member.as_ref()).await.unwrap();
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                format!(
+                    "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
+                    member_pending.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            member.principal_id.as_str()
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                format!(
+                    "SELECT created_by_session_id AS value FROM auth_session WHERE id='{}'",
+                    member_pending.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            member.session_id.as_str()
+        );
+        let member_paired = service
+            .activate_device_with_ids(
+                device_activation_admission(
+                    &service,
+                    member_pending.activation_code.expose_secret(),
+                ),
+                device_activation_params("member-paired-installation"),
+                issued_ids(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(member_paired.principal.id, member.principal_id);
+        assert_eq!(member_paired.principal.kind, PrincipalKind::User);
+        let member_paired_principal = authenticate_grant(&service, &member_paired).await;
+        assert_eq!(
+            member_paired_principal
+                .role_key
+                .as_ref()
+                .map(RoleKey::as_str),
+            Some("member")
+        );
+
+        let superuser = service
+            .create_initial_session_with_ids(
+                params("superuser-installation", ClientKind::Desktop),
+                ids(3),
+            )
+            .await
+            .unwrap();
+        let superuser_principal = authenticate_grant(&service, &superuser).await;
+        let member_sessions = service.list_sessions(member.as_ref()).await.unwrap();
+        assert_eq!(member_sessions.sessions.len(), 2);
+        assert!(member_sessions.sessions.iter().all(|item| {
+            item.session.id == member_initial.session.id
+                || item.session.id == member_paired.session.id
+        }));
+        assert_eq!(
+            service
+                .revoke_owned_session(
+                    member.as_ref(),
+                    &superuser.session.id,
+                    None,
+                    AuthSessionRevokeReason::SelfRevoke,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::InvalidCredential,
+        );
+        service
+            .validate_session_lease(superuser_principal.as_ref())
+            .await
+            .expect("cross-principal revoke cannot affect peer session");
+
+        let own_revoke = service
+            .revoke_owned_session(
+                member.as_ref(),
+                &member_paired.session.id,
+                None,
+                AuthSessionRevokeReason::SelfRevoke,
+            )
+            .await
+            .unwrap();
+        assert!(own_revoke.revoked);
+        service
+            .validate_session_lease(member.as_ref())
+            .await
+            .expect("revoking a peer device preserves current Member session");
+
+        let local_pending = service.create_local_device().await.unwrap();
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                format!(
+                    "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
+                    local_pending.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            identity.superuser.id.as_str()
+        );
+        assert_eq!(
+            scalar_i64(
+                &service.database,
+                format!(
+                    "SELECT COUNT(*) AS value FROM auth_session \
+                     WHERE id='{}' AND created_by_session_id IS NULL",
+                    local_pending.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            service
+                .revoke_owned_session(
+                    member.as_ref(),
+                    &local_pending.session_id,
+                    None,
+                    AuthSessionRevokeReason::SelfRevoke,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::InvalidCredential,
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_pending_device_owner_substitution() {
+        let (service, _identity) = fixture().await;
+        let member_initial = service
+            .create_initial_session_with_ids(
+                params("member-owner-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let (_, member_access) = member_access_credential(&service, &member_initial).await;
+        let member = service.authenticate_access(member_access).await.unwrap();
+        let pending = service.create_device(member.as_ref()).await.unwrap();
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                    created_at,updated_at,removed_at\
+                 ) VALUES(\
+                    'P0000000000000000000B','{}','user','member','active',\
+                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                 );",
+                    service.identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "UPDATE device SET principal_id='P0000000000000000000B' WHERE id='{}'",
+                    pending.device_id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, pending.activation_code.expose_secret(),),
+                    device_activation_params("substituted-owner-installation"),
+                    issued_ids(2),
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::DeviceActivationConsumed,
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                format!(
+                    "SELECT status AS value FROM auth_session WHERE id='{}'",
+                    pending.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            "pending"
+        );
     }
 
     #[tokio::test]

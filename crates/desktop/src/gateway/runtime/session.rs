@@ -886,6 +886,7 @@ mod tests {
             principal: grant.principal,
             device: grant.device,
             session: grant.session,
+            role_key: None,
         }
     }
 

@@ -1,14 +1,47 @@
 use super::*;
+use crate::authorization::{AuthorizedThread, ResourceAction};
 
 const THREAD_AGENTS_DOC_MAX_CHARS: usize = 64 * 1024;
 
 impl MessageProcessor {
+    async fn require_member_thread_agents_doc_proof(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        authorization: Option<&AuthorizedThread>,
+        expected_action: ResourceAction,
+    ) -> bool {
+        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User
+            || authorization.is_some_and(|proof| proof.action() == expected_action)
+        {
+            return true;
+        }
+        self.send_error(
+            request_context.connection_id(),
+            crate::authorization::AuthorizationExternalError::NotFound.response(request_id.clone()),
+        )
+        .await;
+        false
+    }
+
     pub(super) async fn thread_agents_doc_get(
         &self,
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocGetParams,
+        authorization: Option<&AuthorizedThread>,
     ) {
+        if !self
+            .require_member_thread_agents_doc_proof(
+                request_context,
+                &request_id,
+                authorization,
+                ResourceAction::ThreadRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         let (workspace_id, folder_id) = match self
             .validate_thread_agents_doc_scope(
@@ -16,7 +49,9 @@ impl MessageProcessor {
                 request_id.clone(),
                 methods::THREAD_AGENTS_DOC_GET,
                 params.workspace_id,
+                params.thread_id,
                 params.folder_id,
+                authorization,
             )
             .await
         {
@@ -62,8 +97,21 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocSaveParams,
+        authorization: Option<&AuthorizedThread>,
     ) {
+        if !self
+            .require_member_thread_agents_doc_proof(
+                request_context,
+                &request_id,
+                authorization,
+                ResourceAction::ThreadWrite,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
+        let notification_thread_id = params.thread_id.clone();
         if params.content.chars().count() > THREAD_AGENTS_DOC_MAX_CHARS {
             self.send_error(
                 connection_id,
@@ -86,7 +134,9 @@ impl MessageProcessor {
                 request_id.clone(),
                 methods::THREAD_AGENTS_DOC_SAVE,
                 params.workspace_id,
+                params.thread_id,
                 params.folder_id,
+                authorization,
             )
             .await
         {
@@ -137,8 +187,14 @@ impl MessageProcessor {
         )
         .await;
 
-        self.notify_thread_agents_doc_changed(workspace_id, folder_id, Some(doc_payload), true)
-            .await;
+        self.notify_thread_agents_doc_changed(
+            workspace_id,
+            notification_thread_id.as_deref(),
+            folder_id,
+            Some(doc_payload),
+            true,
+        )
+        .await;
     }
 
     pub(super) async fn thread_agents_doc_archive(
@@ -146,15 +202,30 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocArchiveParams,
+        authorization: Option<&AuthorizedThread>,
     ) {
+        if !self
+            .require_member_thread_agents_doc_proof(
+                request_context,
+                &request_id,
+                authorization,
+                ResourceAction::ThreadManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
+        let notification_thread_id = params.thread_id.clone();
         let (workspace_id, folder_id) = match self
             .validate_thread_agents_doc_scope(
                 connection_id,
                 request_id.clone(),
                 methods::THREAD_AGENTS_DOC_ARCHIVE,
                 params.workspace_id,
+                params.thread_id,
                 params.folder_id,
+                authorization,
             )
             .await
         {
@@ -216,8 +287,14 @@ impl MessageProcessor {
         )
         .await;
 
-        self.notify_thread_agents_doc_changed(workspace_id, folder_id, archived_payload, true)
-            .await;
+        self.notify_thread_agents_doc_changed(
+            workspace_id,
+            notification_thread_id.as_deref(),
+            folder_id,
+            archived_payload,
+            true,
+        )
+        .await;
     }
 
     pub(super) async fn thread_agents_doc_resolve_for_thread(
@@ -225,7 +302,19 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocResolveForThreadParams,
+        authorization: Option<&AuthorizedThread>,
     ) {
+        if !self
+            .require_member_thread_agents_doc_proof(
+                request_context,
+                &request_id,
+                authorization,
+                ResourceAction::ThreadRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         if params.thread_id.trim().is_empty() {
             self.send_error(
@@ -238,6 +327,17 @@ impl MessageProcessor {
                         methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+        if let Some(authorization) = authorization
+            && (authorization.workspace_id() != params.workspace_id.trim()
+                || authorization.thread_id() != params.thread_id.trim())
+        {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
@@ -298,8 +398,55 @@ impl MessageProcessor {
         request_id: RequestId,
         method: &'static str,
         workspace_id: String,
+        thread_id: Option<String>,
         folder_id: Option<String>,
+        authorization: Option<&AuthorizedThread>,
     ) -> Option<(String, Option<String>)> {
+        if let Some(authorization) = authorization {
+            if workspace_id.trim() != authorization.workspace_id()
+                || thread_id.as_deref().map(str::trim) != Some(authorization.thread_id())
+            {
+                self.send_error(
+                    connection_id,
+                    crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return None;
+            }
+            let canonical_folder_id = match self
+                .crud_store
+                .resolve_thread_agents_doc_folder_for_thread(
+                    authorization.workspace_id(),
+                    authorization.thread_id(),
+                )
+                .await
+            {
+                Ok(folder_id) => folder_id,
+                Err(error) => {
+                    self.send_thread_agents_doc_error(connection_id, request_id, method, error)
+                        .await;
+                    return None;
+                }
+            };
+            if folder_id.as_deref().map(str::trim) != canonical_folder_id.as_deref()
+                && folder_id.is_some()
+            {
+                self.send_error(
+                    connection_id,
+                    crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return None;
+            }
+            self.session_manager
+                .set_connection_workspace(
+                    connection_id,
+                    Some(authorization.workspace_id().to_owned()),
+                )
+                .await;
+            return Some((authorization.workspace_id().to_owned(), canonical_folder_id));
+        }
+
         let workspace_id = match self
             .workspace_manager
             .validate_workspace_id(workspace_id.as_str())
@@ -463,9 +610,10 @@ impl MessageProcessor {
         }
     }
 
-    async fn notify_thread_agents_doc_changed(
+    pub(super) async fn notify_thread_agents_doc_changed(
         &self,
         workspace_id: String,
+        thread_id: Option<&str>,
         folder_id: Option<String>,
         doc: Option<ThreadAgentsDocPayload>,
         effective_changed: bool,
@@ -494,12 +642,20 @@ impl MessageProcessor {
             effective,
             effective_changed,
         };
-        self.send_notification_to_workspace_connections(
-            workspace_id.as_str(),
-            events::THREAD_AGENTS_DOC_CHANGED,
-            &notification,
-        )
-        .await;
+        if let Some(thread_id) = thread_id {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_AGENTS_DOC_CHANGED,
+                &notification,
+            )
+            .await;
+        } else {
+            self.send_gateway_management_notification(
+                events::THREAD_AGENTS_DOC_CHANGED,
+                &notification,
+            )
+            .await;
+        }
         self.notify_thread_tree_changed(workspace_id).await;
     }
 }

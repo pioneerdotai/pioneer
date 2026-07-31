@@ -10,6 +10,7 @@ pub struct MemoryTurnContext {
     pub input_text: String,
     pub task_id: Option<String>,
     pub agent_id: Option<String>,
+    pub principal_id: Option<String>,
 }
 
 impl MemoryTurnContext {

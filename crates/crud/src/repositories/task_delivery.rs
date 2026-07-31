@@ -13,6 +13,7 @@ use sea_orm::{
 use crate::convention::{
     task_delivery_attempt_status_to_db, task_delivery_mode_to_db, task_delivery_status_to_db,
 };
+use crate::repositories::task::{TaskRootAccessFilter, accessible_task_ids};
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
 const DEFAULT_DELIVERY_LIMIT: u64 = 100;
@@ -125,6 +126,14 @@ pub async fn list_deliveries<C: ConnectionTrait>(
     db: &C,
     params: &TaskDeliveriesParams,
 ) -> Result<Vec<task_delivery::Model>> {
+    list_deliveries_scoped(db, params, None).await
+}
+
+pub async fn list_deliveries_scoped<C: ConnectionTrait>(
+    db: &C,
+    params: &TaskDeliveriesParams,
+    access: Option<&TaskRootAccessFilter>,
+) -> Result<Vec<task_delivery::Model>> {
     let mut query = task_delivery::Entity::find()
         .filter(task_delivery::Column::WorkspaceId.eq(params.workspace_id.clone()))
         .order_by_desc(task_delivery::Column::UpdatedAt)
@@ -135,6 +144,10 @@ pub async fn list_deliveries<C: ConnectionTrait>(
                 .unwrap_or(DEFAULT_DELIVERY_LIMIT),
         );
 
+    if let Some(access) = access {
+        query =
+            query.filter(task_delivery::Column::TaskId.in_subquery(accessible_task_ids(access)));
+    }
     if let Some(task_id) = params.task_id.as_deref() {
         query = query.filter(task_delivery::Column::TaskId.eq(task_id.to_owned()));
     }

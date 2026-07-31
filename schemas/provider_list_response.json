@@ -18,8 +18,7 @@
       "type": "object",
       "properties": {
         "api_key_configured": {
-          "type": "boolean",
-          "default": false
+          "type": "boolean"
         },
         "capabilities": {
           "$ref": "#/$defs/ProviderSummaryCapabilities",

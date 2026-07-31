@@ -2,7 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-use crate::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, TokenFamilyId};
+use crate::{
+    AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, RoleKey, TokenFamilyId,
+};
 
 pub const REFRESH_CREDENTIAL_PREFIX: &str = "prf2_";
 pub const REFRESH_CREDENTIAL_BODY_LEN: usize = 164;
@@ -117,6 +119,8 @@ pub struct AuthMeResponse {
     pub principal: AuthPrincipalSnapshot,
     pub device: AuthDeviceSnapshot,
     pub session: AuthSessionSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_key: Option<RoleKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -510,6 +514,48 @@ mod tests {
             "\"activation_attempts_exceeded\""
         );
         assert!(serde_json::from_str::<DeviceStatus>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn auth_me_role_key_is_additive_and_validated() {
+        let legacy = serde_json::json!({
+            "gateway": {"id": "G00000000000000000001"},
+            "principal": {
+                "id": "P00000000000000000001",
+                "kind": "superuser",
+                "display_name": "Superuser",
+                "nickname": "superuser"
+            },
+            "device": {
+                "id": "D00000000000000000001",
+                "installation_id": "desktop-installation",
+                "display_name": "Desktop",
+                "client_kind": "desktop",
+                "status": "active"
+            },
+            "session": {
+                "id": "S00000000000000000001",
+                "device_id": "D00000000000000000001",
+                "token_family_id": "F00000000000000000001",
+                "status": "active",
+                "refresh_generation": 1,
+                "refresh_expires_at_unix": 2
+            }
+        });
+        let decoded: AuthMeResponse =
+            serde_json::from_value(legacy.clone()).expect("legacy auth/me should decode");
+        assert_eq!(decoded.role_key, None);
+
+        let mut member = legacy;
+        member["principal"]["kind"] = serde_json::json!("user");
+        member["role_key"] = serde_json::json!("member");
+        let decoded: AuthMeResponse =
+            serde_json::from_value(member).expect("Member auth/me should decode");
+        assert_eq!(decoded.role_key, Some(RoleKey::member()));
+
+        let mut invalid = serde_json::to_value(decoded).expect("Member auth/me should re-encode");
+        invalid["role_key"] = serde_json::json!("Member");
+        assert!(serde_json::from_value::<AuthMeResponse>(invalid).is_err());
     }
 
     #[test]

@@ -86,6 +86,10 @@ impl MessageProcessor {
         delivery: TaskDelivery,
         attempt: TaskDeliveryAttempt,
     ) -> Result<()> {
+        if delivery.mode != TaskDeliveryMode::None {
+            self.ensure_task_delivery_still_authorized(&delivery)
+                .await?;
+        }
         match delivery.mode {
             TaskDeliveryMode::None => {
                 self.complete_delivery(delivery, attempt, None, None, None, None)
@@ -108,6 +112,56 @@ impl MessageProcessor {
             }
             TaskDeliveryMode::Webhook => self.deliver_webhook(delivery, attempt).await,
         }
+    }
+
+    async fn ensure_task_delivery_still_authorized(&self, delivery: &TaskDelivery) -> Result<()> {
+        let Some(task_response) = self.crud_store.get_task(delivery.task_id.as_str()).await? else {
+            bail!("task delivery root task is unavailable");
+        };
+        let root_task = match task_response.task.root_task_id.as_deref() {
+            Some(root_task_id) => self
+                .crud_store
+                .get_task(root_task_id)
+                .await?
+                .map(|response| response.task)
+                .ok_or_else(|| anyhow!("task delivery root task is unavailable"))?,
+            None => task_response.task,
+        };
+        if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
+            return Ok(());
+        }
+        let owner_id = root_task
+            .owner_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("user-owned task delivery has no initiating principal"))?;
+        let root_thread_id = root_task
+            .created_by_thread_id
+            .as_deref()
+            .or_else(|| {
+                (root_task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then_some(root_task.owner_id.as_deref())
+                    .flatten()
+            })
+            .ok_or_else(|| anyhow!("user-owned task delivery has no authoritative root thread"))?;
+        let root_turn_id = root_task
+            .created_by_turn_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("user-owned task delivery has no initiating turn"))?;
+        let context = self
+            .revalidate_execution_authorization_for_turn(
+                root_task.workspace_id.as_str(),
+                root_thread_id,
+                root_turn_id,
+                crate::authorization::ResourceAction::ThreadWrite,
+            )
+            .await
+            .map_err(|_| {
+                anyhow!("task delivery withheld because initiating authority is no longer active")
+            })?;
+        if context.initiating_principal_id().as_str() != owner_id {
+            bail!("task delivery withheld because initiating principal lost root-thread access");
+        }
+        Ok(())
     }
 
     async fn complete_delivery(
@@ -245,7 +299,8 @@ impl MessageProcessor {
                 .await;
             return Err(error).map_err(|error| anyhow!("{error:#}"));
         }
-        self.send_notification_to_connections(
+        self.send_notification_to_authorized_thread_connections(
+            thread_id,
             events::TURN_STARTED,
             &turn_outcome.started_notification,
             turn_outcome.started_notification_connection_ids.clone(),
@@ -291,6 +346,7 @@ impl MessageProcessor {
                     mode: Some(thread.mode),
                     origin_kind: Some(thread.origin_kind),
                     sidebar_visibility: Some(thread.sidebar_visibility),
+                    visibility: None,
                     agent_nickname: thread.agent_nickname.clone(),
                     agent_role: thread.agent_role.clone(),
                 },

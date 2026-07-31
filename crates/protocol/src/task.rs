@@ -2905,7 +2905,7 @@ mod tests {
                 },
             ],
             capabilities: vec![crate::TurnCapability {
-                id: "mcp:workspace:docs".to_owned(),
+                id: "mcp-server:workspace:docs".to_owned(),
                 kind: crate::TurnCapabilityKind::McpServer {
                     name: "docs".to_owned(),
                     scope_kind: crate::McpScopeKind::Workspace,

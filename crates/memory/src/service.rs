@@ -57,9 +57,9 @@ use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryControlRecord, AgentMemoryListFilter,
     AgentMemoryQualityDecisionRecord, AgentMemoryRepairJobRecord, CrudStore,
-    MemoryLifecycleActorRecord, NewAgentMemoryCandidate, NewAgentMemoryControlRecord,
-    NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
-    NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
+    MemoryLifecycleActorRecord, MemoryScopeResolution, NewAgentMemoryCandidate,
+    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision,
+    NewAgentMemoryQuarantine, NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
 };
 use pioneer_hooks::HookRunId;
 use pioneer_protocol::{
@@ -241,6 +241,13 @@ impl MemoryService {
             .or(params.source_context_kind)
             .or(Some(MemorySourceContextKind::DirectUserConversation));
         let prepared = self.policy.prepare_remember(&context, &params)?;
+        let provenance = effective_provenance(&params, context.actor.clone());
+        validate_memory_write_source(
+            &context,
+            &params.scope,
+            provenance.source_thread_id.as_deref(),
+            prepared.sensitivity,
+        )?;
         let resolved_scope = self
             .store
             .resolve_memory_scope(params.scope.clone())
@@ -251,6 +258,7 @@ impl MemoryService {
                     params.scope.kind, params.scope.key
                 )
             })?;
+        validate_memory_write_scope(&context, &resolved_scope)?;
 
         let existing = if params.supersedes.is_none() {
             match params.key.as_deref() {
@@ -268,11 +276,15 @@ impl MemoryService {
             }
         } else {
             let superseded_id = params.supersedes.as_deref().expect("checked above");
-            self.store
+            let superseded = self
+                .store
                 .get_agent_memory_record(superseded_id, false)
                 .await
                 .with_context(|| format!("failed to load superseded memory `{superseded_id}`"))?
                 .with_context(|| format!("superseded memory `{superseded_id}` does not exist"))?;
+            if !self.row_control_plane_visible(&superseded, &context, &[], now) {
+                bail!("superseded memory `{superseded_id}` does not exist");
+            }
             None
         };
 
@@ -285,8 +297,6 @@ impl MemoryService {
             .unwrap_or_else(|| generate_id(ID_LEN));
         let metadata_json =
             metadata_with_idempotency(&params.metadata, params.idempotency_key.as_deref())?;
-        let provenance = effective_provenance(&params, context.actor.clone());
-
         let backend_request = BackendPutRequest {
             memory_id: memory_id.clone(),
             scope: params.scope.clone(),
@@ -416,6 +426,24 @@ impl MemoryService {
             .disposition
             .unwrap_or(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
+        let provenance = semantic_write_provenance(&params, &context);
+        validate_memory_write_source(
+            &context,
+            &params.scope,
+            provenance.source_thread_id.as_deref(),
+            sensitivity,
+        )?;
+        let resolved_scope = self
+            .store
+            .resolve_memory_scope(params.scope.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve semantic memory scope `{:?}/{}`",
+                    params.scope.kind, params.scope.key
+                )
+            })?;
+        validate_memory_write_scope(&context, &resolved_scope)?;
         let mut base_metadata = params.metadata.clone();
         for (key, value) in semantic_metadata(
             &params.semantic,
@@ -1093,6 +1121,7 @@ impl MemoryService {
                 include_expired,
                 include_deleted,
                 include_superseded,
+                allowed_source_thread_ids: context.accessible_source_thread_ids(),
                 limit: Some(u64::from(limit)),
             })
             .await?;
@@ -1563,6 +1592,7 @@ impl MemoryService {
                     include_expired: params.statuses.contains(&MemoryStatus::Expired),
                     include_deleted: params.statuses.contains(&MemoryStatus::Deleted),
                     include_superseded: params.statuses.contains(&MemoryStatus::Superseded),
+                    allowed_source_thread_ids: context.accessible_source_thread_ids(),
                     limit: Some(backend_limit as u64),
                 })
                 .await?;
@@ -1727,6 +1757,7 @@ impl MemoryService {
                 include_expired: false,
                 include_deleted: false,
                 include_superseded: false,
+                allowed_source_thread_ids: context.accessible_source_thread_ids(),
                 limit: Some(u64::from(top_k)),
             })
             .await
@@ -1812,6 +1843,7 @@ impl MemoryService {
                         include_expired: false,
                         include_deleted: false,
                         include_superseded: false,
+                        allowed_source_thread_ids: context.accessible_source_thread_ids(),
                         limit: Some(u64::from(top_k)),
                     })
                     .await?;
@@ -2123,6 +2155,7 @@ impl MemoryService {
                 workspace_guard: context.workspace_guard(),
                 categories: params.categories.clone(),
                 statuses: params.statuses.clone(),
+                allowed_source_thread_ids: context.accessible_source_thread_ids(),
                 limit: Some(u64::from(self.normalized_limit(params.limit))),
             })
             .await?;
@@ -2147,6 +2180,7 @@ impl MemoryService {
             .store
             .get_agent_memory_candidate(params.candidate_id.as_str(), context.workspace_guard())
             .await?
+            .filter(|candidate| candidate_workspace_visible(candidate, &context))
             .map(crud_candidate_to_protocol)
             .transpose()?;
         Ok(MemoryCandidatesGetResponse { candidate })
@@ -2426,6 +2460,7 @@ impl MemoryService {
                 workspace_guard: context.workspace_guard(),
                 categories: Vec::new(),
                 statuses: pending_candidate_statuses(),
+                allowed_source_thread_ids: context.accessible_source_thread_ids(),
                 limit: None,
             })
             .await?;
@@ -2473,6 +2508,7 @@ impl MemoryService {
         self.store
             .get_agent_memory_candidate(candidate_id, context.workspace_guard())
             .await?
+            .filter(|candidate| candidate_workspace_visible(candidate, context))
             .with_context(|| format!("memory candidate `{candidate_id}` was not found"))
     }
 
@@ -2962,6 +2998,7 @@ impl MemoryService {
             return false;
         }
         workspace_visible(row, context)
+            && context.allows_source_thread(row.source_thread_id.as_deref())
     }
 
     async fn hydrate_visible_row(
@@ -3062,7 +3099,8 @@ impl MemoryService {
             row.repair_status == REPAIR_STATUS_OK,
             quarantined,
             &read_policy,
-            workspace_visible(row, context),
+            workspace_visible(row, context)
+                && context.allows_source_thread(row.source_thread_id.as_deref()),
             quality,
         );
         Ok(decide_memory_recall_visibility(&input))
@@ -4230,7 +4268,7 @@ fn candidate_workspace_visible(
     candidate: &AgentMemoryCandidateRecord,
     context: &MemoryOperationContext,
 ) -> bool {
-    match candidate.workspace_id.as_deref() {
+    let workspace_visible = match candidate.workspace_id.as_deref() {
         Some(candidate_workspace_id) => context
             .workspace_id
             .as_deref()
@@ -4240,7 +4278,54 @@ fn candidate_workspace_visible(
             MemoryScopeKind::Agent => context.allow_global_agent,
             _ => false,
         },
+    };
+    workspace_visible && context.allows_source_thread(candidate.source_thread_id.as_deref())
+}
+
+fn validate_memory_write_source(
+    context: &MemoryOperationContext,
+    scope: &MemoryScope,
+    source_thread_id: Option<&str>,
+    sensitivity: MemorySensitivity,
+) -> Result<()> {
+    if !context.source_access.requires_authoritative_provenance() {
+        return Ok(());
     }
+    if scope.kind == MemoryScopeKind::User {
+        bail!("member memory cannot use personal user scope");
+    }
+    if context
+        .read_policy
+        .as_ref()
+        .is_some_and(|policy| !policy.allows(sensitivity))
+    {
+        bail!("member memory sensitivity is not permitted");
+    }
+    if !context.allows_source_thread(source_thread_id) {
+        bail!("member memory requires provenance from an accessible source thread");
+    }
+    if scope.kind == MemoryScopeKind::Thread
+        && source_thread_id.is_some_and(|thread_id| thread_id != scope.key)
+    {
+        bail!("thread memory provenance does not match its source thread");
+    }
+    Ok(())
+}
+
+fn validate_memory_write_scope(
+    context: &MemoryOperationContext,
+    resolved_scope: &MemoryScopeResolution,
+) -> Result<()> {
+    if !context.source_access.requires_authoritative_provenance() {
+        return Ok(());
+    }
+    let Some(context_workspace_id) = context.workspace_id.as_deref() else {
+        bail!("member memory requires an authoritative workspace");
+    };
+    if resolved_scope.workspace_id.as_deref() != Some(context_workspace_id) {
+        bail!("member memory scope is outside the authorized workspace");
+    }
+    Ok(())
 }
 
 fn hook_run_visible(run: &pioneer_crud::HookRunRecord, context: &MemoryOperationContext) -> bool {

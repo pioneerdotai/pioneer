@@ -169,6 +169,7 @@ pub(super) struct GatewayCoordinator {
     pub(super) connection_epoch: u64,
     pub(super) session_refresh_generation: u64,
     pub(super) session_refresh_in_flight: bool,
+    pub(super) authorization_revision: Option<u64>,
     pub(super) connection_state: GatewayConnectionState,
     pub(super) status: String,
     pub(super) status_level: GatewayStatusLevel,

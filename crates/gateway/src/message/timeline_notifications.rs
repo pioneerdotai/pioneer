@@ -282,8 +282,8 @@ impl MessageProcessor {
             after_cursor: None,
             reason: TimelineChangeReason::LiveEvent,
         };
-        self.send_notification_to_workspace_connections(
-            workspace_id,
+        self.send_notification_to_thread_subscribers(
+            thread_id,
             events::THREAD_TIMELINE_BLOCKS_CHANGED,
             &payload,
         )

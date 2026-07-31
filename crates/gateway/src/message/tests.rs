@@ -1,5 +1,5 @@
 use super::{
-    CLIRuntimeMachineRequestKey, MessageProcessor, message_future,
+    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor, message_future,
     record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
@@ -53,7 +53,7 @@ use pioneer_crud::{
     NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection, NewCliRuntimePendingRequest,
     NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, SkillInstallationPatch,
     SkillInstallationRecord, SkillPackInstallationRecord, ThreadAgentsDocSaveReason,
-    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
+    TurnItemAttemptDeadlines, WorkspaceSkillPolicyRecord, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -74,10 +74,10 @@ use pioneer_memory::hooks::{
     MemoryTurnContext,
 };
 use pioneer_protocol::{
-    AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactUploadChunkHeader,
-    ArtifactUploadSourceKind, ArtifactUploadStartParams, CLIAgentRuntimeKind,
-    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
-    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactCapabilitiesResponse,
+    ArtifactUploadChunkHeader, ArtifactUploadSourceKind, ArtifactUploadStartParams,
+    CLIAgentRuntimeKind, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
+    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondResponse,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification,
@@ -100,17 +100,18 @@ use pioneer_protocol::{
     ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
-    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
-    SkillsPackInstallResponse, SkillsPackUninstallResponse, SkillsPackUpdateResponse,
-    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
-    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
-    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
-    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
+    RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
+    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
+    SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
+    SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
+    SkillsUninstallResponse, SkillsUpdateResponse, SkillsUploadAbortResponse,
+    SkillsUploadChunkHeader, SkillsUploadFinishResponse, SkillsUploadStartResponse,
+    TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
+    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
+    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
+    TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
     TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
     TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
@@ -121,19 +122,20 @@ use pioneer_protocol::{
     TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
     ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    ThreadUpdateResponse, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView, ToolStoragePayload, Turn,
-    TurnAcceptedCapability, TurnCancelResponse, TurnCapability, TurnCapabilityAcceptedReason,
-    TurnCapabilityKind, TurnCapabilityRejectedReason, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
-    TurnKind, TurnOrigin, TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus,
-    UserInput, UserMessageAttachment, VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome,
-    VoiceSessionResultNotification, VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    ThreadFolderMoveResponse, ThreadGetResponse, ThreadHistoryEventPayload, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, ThreadUpdateResponse, ThreadVisibility, ToolCallStatus,
+    ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView,
+    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse, TurnCapability,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput, UserMessageAttachment,
+    VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
+    VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -163,6 +165,8 @@ use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+mod member_client_harness;
+
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
     pioneer_protocol::default_turn_permission_profile_snapshot()
 }
@@ -182,6 +186,128 @@ async fn registered_request_context(
         None,
         crate::request_context::CanonicalMethod::rpc(canonical_method),
     )
+}
+
+async fn persist_test_execution_authorization_context(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    workspace_id: &str,
+    root_thread_id: &str,
+    turn_id: &str,
+) {
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let connection = processor
+        .session_manager
+        .connection_context(connection_id)
+        .await
+        .expect("test connection context");
+    let context = crate::authorization::ExecutionAuthorizationContext::for_test(
+        connection.principal(),
+        workspace_id,
+        root_thread_id,
+        &default_test_permission_profile(),
+        None,
+    );
+    let encoded = context
+        .to_persisted_json()
+        .expect("test execution authorization should serialize");
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(turn_id, encoded.as_str())
+            .await
+            .expect("test execution authorization should persist")
+    );
+}
+
+async fn ensure_test_superuser_execution_authority(crud_store: &CrudStore) {
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,2,CURRENT_TIMESTAMP,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT OR IGNORE INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                'P00000000000000000001','G00000000000000000001','superuser',NULL,'active',\
+                'Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT OR IGNORE INTO device(\
+                id,gateway_id,principal_id,installation_id,display_name,client_kind,\
+                platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
+             ) VALUES(\
+                'D00000000000000000001','G00000000000000000001',\
+                'P00000000000000000001','message-test-superuser','Message Test Superuser',\
+                'desktop','test','1','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT OR IGNORE INTO auth_session(\
+                id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
+                activation_token_hash,activation_locator_hash,activation_failed_attempts,\
+                activation_expires_at,activated_at,status,refresh_generation,created_at,\
+                updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,\
+                revoke_reason\
+             ) VALUES(\
+                'S00000000000000000001','G00000000000000000001',\
+                'P00000000000000000001','D00000000000000000001',\
+                'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
+                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                datetime('now','+90 days'),NULL,NULL\
+             );\
+             INSERT OR IGNORE INTO auth_refresh_credential(\
+                id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
+             ) VALUES(\
+                'R00000000000000000001','S00000000000000000001',\
+                'F00000000000000000001',0,randomblob(32),CURRENT_TIMESTAMP,\
+                datetime('now','+90 days')\
+             );",
+        )
+        .await
+        .expect("test Superuser execution authority should materialize");
+}
+
+async fn persist_test_cli_execution_authorization_context(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    root_thread_id: &str,
+    turn_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+) {
+    ensure_test_superuser_execution_authority(crud_store).await;
+    let runtime_kind = match runtime_kind {
+        "codex" => CLIAgentRuntimeKind::Codex,
+        "claude" => CLIAgentRuntimeKind::Claude,
+        other => panic!("unsupported test CLI runtime kind `{other}`"),
+    };
+    let execution_backend = AgentExecutionBackend::CLIAgentRuntime {
+        runtime_id: runtime_id.to_owned(),
+        runtime_kind,
+    };
+    let principal = authenticated_test_superuser();
+    let context = crate::authorization::ExecutionAuthorizationContext::for_test(
+        principal.as_ref(),
+        workspace_id,
+        root_thread_id,
+        &default_test_permission_profile(),
+        Some(&execution_backend),
+    );
+    let encoded = context
+        .to_persisted_json()
+        .expect("test CLI execution authorization should serialize");
+    assert!(
+        crud_store
+            .set_turn_execution_authorization_context(turn_id, encoded.as_str())
+            .await
+            .expect("test CLI execution authorization should persist")
+    );
 }
 
 fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
@@ -517,6 +643,33 @@ fn test_cli_runtime_manager(
         )
         .expect("CLI runtime manager should build"),
     )
+}
+
+fn with_enabled_test_cli_runtime_catalog(processor: MessageProcessor) -> MessageProcessor {
+    let runtime_home = std::env::temp_dir().join(format!(
+        "pioneer-message-cli-runtime-{}",
+        pioneer_protocol::generate_id(21)
+    ));
+    std::fs::create_dir_all(runtime_home.as_path())
+        .expect("test CLI runtime home should be created");
+    let app_config = pioneer_config::AppConfig::load().expect("test app config should load");
+    let settings_name = crate::settings::normalize_settings_file_name(
+        app_config.gateway.settings_file_name.as_str(),
+    )
+    .expect("test Gateway settings file name should be valid");
+    let settings_path = runtime_home.join(settings_name.as_str());
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        app_config.gateway.settings_version,
+        settings_name.as_str(),
+    )
+    .expect("test Gateway settings should load");
+    settings
+        .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings::default())
+        .expect("test CLI runtime catalog should be accepted");
+    crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
+        .expect("test CLI runtime catalog should persist");
+    processor.with_runtime_home_for_tests(runtime_home)
 }
 
 struct CliRuntimeSecurityHarness {
@@ -1139,7 +1292,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
     harness: &CliRuntimeSkillPreflightHarness,
     thread_id: &str,
 ) {
-    harness
+    let started = harness
         .thread_manager
         .thread_start(
             harness.connection_id,
@@ -1160,12 +1313,21 @@ async fn seed_cli_runtime_skill_preflight_thread(
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .unwrap();
+    harness
+        .crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist CLI runtime skill preflight authorization root");
 }
 
 #[test]
@@ -2028,7 +2190,7 @@ async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_ef
             "mcp",
             vec![
                 serde_json::to_value(pioneer_protocol::TurnCapability {
-                    id: "mcp:server".to_owned(),
+                    id: "mcp-server:workspace:server".to_owned(),
                     kind: pioneer_protocol::TurnCapabilityKind::McpServer {
                         name: "server".to_owned(),
                         scope_kind: McpScopeKind::Workspace,
@@ -2098,7 +2260,7 @@ async fn seed_cli_runtime_security_thread(
     model_provider: &str,
     sandbox: Option<SandboxMode>,
 ) {
-    harness
+    let started = harness
         .thread_manager
         .thread_start(
             harness.connection_id,
@@ -2113,12 +2275,21 @@ async fn seed_cli_runtime_security_thread(
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("thread/start should seed CLI runtime security regression thread");
+    harness
+        .crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist CLI runtime security authorization root");
 }
 
 async fn seed_vertical_self_improvement_thread(
@@ -2158,6 +2329,22 @@ async fn seed_vertical_self_improvement_thread(
         serde_json::from_value(response.result).expect("vertical thread/start must decode");
     assert_eq!(started.thread.id, thread_id);
     assert_eq!(started.thread.origin_kind, origin_kind);
+    assert_eq!(
+        harness
+            .crud_store
+            .update_user_thread_management(
+                harness.workspace_id.as_str(),
+                thread_id,
+                None,
+                None,
+                Some(pioneer_crud::PersistedThreadAccessClass::Workspace),
+                None,
+            )
+            .await
+            .expect("self-improvement source visibility should persist"),
+        Some(true),
+        "self-improvement vertical source must be explicitly workspace-visible"
+    );
 }
 
 fn cli_runtime_execution_backend(runtime_id: &str, runtime_kind: CLIAgentRuntimeKind) -> JsonValue {
@@ -4923,7 +5110,7 @@ async fn setup_provider_api_key_processor(
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
-        session_manager,
+        session_manager.clone(),
         workspace_manager.clone(),
         crud_store,
         gateway_secrets,
@@ -5695,6 +5882,7 @@ async fn ensure_task_create_parent_turn_for_test(
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -5772,6 +5960,7 @@ async fn seed_completed_task_parent_with_history(
                 sidebar_visibility: ThreadSidebarVisibility::Visible,
                 agent_nickname: None,
                 agent_role: None,
+                visibility: None,
                 turns: Vec::new(),
             },
             SandboxMode::FullAccess,
@@ -6418,6 +6607,7 @@ async fn setup_progress_delta_harness(
                     mode: Some(pioneer_protocol::ThreadMode::Agent),
                     origin_kind: None,
                     sidebar_visibility: None,
+                    visibility: None,
                     agent_nickname: None,
                     agent_role: None,
                 },
@@ -6445,6 +6635,7 @@ async fn setup_progress_delta_harness(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -6824,6 +7015,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let seed_turn = Turn {
@@ -6903,6 +7095,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let seed_turn = Turn {
@@ -6988,6 +7181,7 @@ async fn title_generation_retries_after_transient_failure() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let seed_turn = Turn {
@@ -7073,6 +7267,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         sidebar_visibility: ThreadSidebarVisibility::Hidden,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let seed_turn = Turn {
@@ -7191,7 +7386,7 @@ async fn start_thread_for_artifact_test(
     workspace_id: &str,
     thread_id: &str,
 ) -> ThreadStartResponse {
-    processor
+    let response = processor
         .thread_manager
         .thread_start(
             connection_id,
@@ -7206,13 +7401,23 @@ async fn start_thread_for_artifact_test(
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("thread/start should succeed")
-        .response
+        .response;
+    processor
+        .crud_store
+        .upsert_thread_model(
+            &response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("artifact test thread authorization root should persist");
+    response
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7238,7 +7443,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         test_tool_loop_config(),
     );
     let parent_thread_id = "thr_collaborative_composer";
-    processor
+    let started = processor
         .thread_manager
         .thread_start(
             connection_id,
@@ -7253,12 +7458,21 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
                 mode: Some(ThreadMode::Agent),
                 origin_kind: Some(ThreadOriginKind::Collaborative),
                 sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("collaborative thread should start");
+    processor
+        .crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist collaborative authorization root");
 
     let turn_id = "turn_collaborative_message";
     let request_id = generate_test_request_id("composer", "detached");
@@ -7356,7 +7570,7 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
     processor.start_task_event_listener().await;
 
     let parent_thread_id = "thr_concurrent_frozen_composer";
-    thread_manager
+    let started = thread_manager
         .thread_start(
             connection_id,
             workspace_id.clone(),
@@ -7370,12 +7584,35 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
                 mode: Some(ThreadMode::Agent),
                 origin_kind: Some(ThreadOriginKind::Collaborative),
                 sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("collaborative thread should start");
+    crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist concurrent Composer authorization root");
+    assert_eq!(
+        crud_store
+            .update_user_thread_management(
+                workspace_id.as_str(),
+                parent_thread_id,
+                None,
+                None,
+                Some(pioneer_crud::PersistedThreadAccessClass::Workspace),
+                None,
+            )
+            .await
+            .expect("concurrent Composer source visibility should persist"),
+        Some(true),
+        "self-improvement source regression requires an explicitly workspace-visible root"
+    );
 
     for (turn_id, command) in [
         ("turn_concurrent_task_a", "ASYNC_TASK_A"),
@@ -7717,7 +7954,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     processor.start_task_event_listener().await;
 
     let parent_thread_id = "thr_collab_child_stop";
-    thread_manager
+    let started = thread_manager
         .thread_start(
             connection_id,
             workspace_id.clone(),
@@ -7731,12 +7968,20 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
                 mode: Some(ThreadMode::Agent),
                 origin_kind: Some(ThreadOriginKind::Collaborative),
                 sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("collaborative parent should start");
+    crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist child-stop authorization root");
 
     let message_turn_id = "turn_collab_child_stop";
     let start_request_id = generate_test_request_id("collabstop", "start");
@@ -7795,6 +8040,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -7802,15 +8048,20 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         .await
         .expect("child subscription should start");
 
-    // Keep a workspace-scoped observer that is not subscribed to either
-    // thread. This models a client viewing the child while retaining a cached
-    // parent timeline.
+    // Keep an observer subscribed to the parent timeline while the primary
+    // connection operates on the child.
     let (observer_tx, mut observer_rx) = mpsc::channel(256);
     let observer_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), observer_tx).await;
     session_manager
         .set_connection_workspace(observer_connection_id, Some(workspace_id.clone()))
         .await;
+    assert!(
+        thread_manager
+            .subscribe_connection(parent_thread_id, observer_connection_id)
+            .await,
+        "observer should subscribe to the parent timeline"
+    );
 
     let cancel_request_id = generate_test_request_id("collabstop", "cancel");
     processor
@@ -7905,7 +8156,8 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         crate::task_tools::task_run_anchor_id(run_id.as_str()).as_str(),
     );
     let mut saw_offscreen_parent_refresh = false;
-    for _ in 0..8 {
+    let mut observed_refreshes = Vec::new();
+    for _ in 0..32 {
         let notification =
             recv_notification_by_method(&mut observer_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
                 .await;
@@ -7916,6 +8168,11 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
                     .expect("timeline blocks notification should include params"),
             )
             .expect("timeline blocks notification should decode");
+        observed_refreshes.push((
+            notification.thread_id.clone(),
+            notification.changed_block_ids.clone(),
+            notification.removed_block_ids.clone(),
+        ));
         if notification.thread_id == parent_thread_id
             && notification
                 .changed_block_ids
@@ -7927,7 +8184,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     }
     assert!(
         saw_offscreen_parent_refresh,
-        "a workspace client viewing the child must receive the parent Task-card refresh"
+        "a parent subscriber must receive the parent Task-card refresh; observed {observed_refreshes:?}"
     );
 
     processor
@@ -8007,6 +8264,7 @@ async fn setup_write_file_artifact_registration_gateway(
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -8195,6 +8453,7 @@ async fn materialize_artifact_api_thread(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -8216,6 +8475,49 @@ async fn materialize_artifact_api_thread(
         )
         .await
         .expect("artifact API test thread should materialize");
+}
+
+async fn subscribe_test_connection_to_materialized_thread(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    workspace_id: &str,
+    thread_id: &str,
+) {
+    let thread = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("test thread lookup should succeed")
+        .expect("test thread should be materialized before subscription");
+    let sandbox_mode = processor
+        .crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("test thread sandbox lookup should succeed");
+    processor
+        .thread_manager
+        .thread_start_seeded(
+            connection_id,
+            workspace_id.to_owned(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: None,
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            Some(thread),
+            sandbox_mode,
+        )
+        .await
+        .expect("test connection should subscribe to materialized thread");
 }
 
 async fn ingest_bound_test_artifact(
@@ -9430,7 +9732,7 @@ async fn collaborative_voice_composer_admits_detached_task() {
         "run this voice command asynchronously",
     ));
     let parent_thread_id = "thr_voice_collaborative";
-    thread_manager
+    let started = thread_manager
         .thread_start(
             connection_id,
             workspace_id.clone(),
@@ -9444,12 +9746,20 @@ async fn collaborative_voice_composer_admits_detached_task() {
                 mode: Some(ThreadMode::Agent),
                 origin_kind: Some(ThreadOriginKind::Collaborative),
                 sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("collaborative thread should start");
+    crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist collaborative voice authorization root");
 
     let turn_id = "turn_voice_detached";
     let result = submit_test_voice_turn(
@@ -9511,7 +9821,7 @@ async fn task_run_voice_composer_stays_foreground() {
         )),
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -9519,7 +9829,7 @@ async fn task_run_voice_composer_stays_foreground() {
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child"));
     let child_thread_id = "thr_voice_task_run";
-    thread_manager
+    let started = thread_manager
         .thread_start(
             connection_id,
             workspace_id.clone(),
@@ -9533,12 +9843,20 @@ async fn task_run_voice_composer_stays_foreground() {
                 mode: Some(ThreadMode::Agent),
                 origin_kind: Some(ThreadOriginKind::TaskRun),
                 sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
         )
         .await
         .expect("TaskRun child thread should start");
+    crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist task-run voice authorization target");
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -9829,7 +10147,7 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
-        session_manager,
+        session_manager.clone(),
         workspace_manager,
         crud_store.clone(),
         test_gateway_secrets(),
@@ -10000,7 +10318,13 @@ async fn voice_status_disabled_and_start_report_model_unavailable() {
         test_context_budget(),
         test_tool_loop_config(),
     );
-
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_voice_unavailable",
+        "turn_voice_unavailable_fixture",
+    )
+    .await;
     let status_request_id = generate_test_request_id("voice", "status_unavailable");
     let status_request = json!({
         "jsonrpc": "2.0",
@@ -10064,6 +10388,13 @@ async fn voice_session_requires_ready_for_every_non_ready_phase() {
         test_tool_loop_config(),
     )
     .with_voice_input_supervisor(supervisor.clone());
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_voice_not_ready",
+        "turn_voice_not_ready_fixture",
+    )
+    .await;
 
     async fn assert_rejected(
         processor: &MessageProcessor,
@@ -10934,13 +11265,22 @@ async fn binary_ingress_rejects_unregistered_connections_before_decoding_every_f
 async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dispatch() {
     let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
     let (user_tx, mut user_rx) = mpsc::channel(16);
+    let (roleless_tx, mut roleless_rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let superuser_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
     let mut user_principal = (*authenticated_test_superuser()).clone();
     user_principal.kind = pioneer_protocol::PrincipalKind::User;
+    user_principal.role_key = Some(RoleKey::member());
     let user_connection_id = session_manager
         .register_connection(user_tx, Arc::new(user_principal))
+        .await
+        .unwrap();
+    let mut roleless_principal = (*authenticated_test_superuser()).clone();
+    roleless_principal.kind = pioneer_protocol::PrincipalKind::User;
+    roleless_principal.role_key = None;
+    let roleless_connection_id = session_manager
+        .register_connection(roleless_tx, Arc::new(roleless_principal))
         .await
         .unwrap();
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -10981,6 +11321,87 @@ async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dis
         "absolute Superuser allow-path must not require a workspace membership"
     );
 
+    let unmapped_request_id = generate_test_request_id("authzdeny", "unknown");
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": unmapped_request_id,
+                "method": "future/unregistered",
+                "params": {
+                    "prompt": "must not reach any handler"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let unmapped = recv_error_by_id(&mut superuser_rx, unmapped_request_id.as_str()).await;
+    assert_eq!(unmapped.error.code, METHOD_NOT_FOUND_CODE);
+    assert_eq!(unmapped.error.message, "method not found");
+
+    let inaccessible_request_id = generate_test_request_id("authzscope", "empty");
+    processor
+        .process_request_for_connection(
+            user_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": inaccessible_request_id,
+                "method": "workspace/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let inaccessible = recv_response_by_id(&mut user_rx, inaccessible_request_id.as_str()).await;
+    let inaccessible: WorkspaceListResponse =
+        serde_json::from_value(inaccessible.result).expect("decode scoped empty workspace list");
+    assert!(
+        inaccessible.workspaces.is_empty(),
+        "Member without memberships must receive an empty collection"
+    );
+    let no_default_id = generate_test_request_id("authzscope", "nodefault");
+    processor
+        .process_request_for_connection(
+            user_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": no_default_id,
+                "method": "workspace/default",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let no_default = recv_error_by_id(&mut user_rx, no_default_id.as_str()).await;
+    assert_eq!(no_default.error.message, "not_found");
+    assert_eq!(
+        processor
+            .session_manager
+            .connection_workspace_id(user_connection_id)
+            .await,
+        None,
+        "empty Member default must preserve no selected workspace"
+    );
+
+    let terminal_request_id = generate_test_request_id("authzdeny", "terminal");
+    processor
+        .process_request_for_connection(
+            roleless_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": terminal_request_id,
+                "method": "workspace/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let terminal = recv_error_by_id(&mut roleless_rx, terminal_request_id.as_str()).await;
+    assert_eq!(terminal.error.message, "authentication_terminal");
+    let terminal_json = serde_json::to_string(&terminal).expect("serialize terminal response");
+    assert!(!terminal_json.contains("unsupported_role"));
+
     let workspaces_before = workspace_manager
         .list_workspaces()
         .await
@@ -11002,12 +11423,9 @@ async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dis
         )
         .await;
     let denied = recv_error_by_id(&mut user_rx, deny_request_id.as_str()).await;
-    assert!(
-        denied
-            .error
-            .message
-            .contains("principal kind is not supported")
-    );
+    assert_eq!(denied.error.message, "forbidden");
+    let denied_json = serde_json::to_string(&denied).expect("serialize forbidden response");
+    assert!(!denied_json.contains("management_denied"));
     assert_eq!(
         workspace_manager
             .list_workspaces()
@@ -11075,6 +11493,1612 @@ async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dis
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_workspace_discovery_default_and_selection_are_membership_scoped() {
+    const MEMBER_ID: &str = "P0000000000000000000A";
+    const MEMBER_WORKSPACE_ID: &str = "W0000000000000000000A";
+
+    let (workspace_manager, crud_store, global_default_id) = setup_workspace_manager().await;
+    workspace_manager
+        .create_workspace(MEMBER_WORKSPACE_ID, Some("Member workspace"))
+        .await
+        .expect("create Member workspace");
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                'P0000000000000000000A','G00000000000000000001','user','member','active',\
+                'Member A','member-a','member-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                'P0000000000000000000A','W0000000000000000000A','system',NULL,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );",
+        )
+        .await
+        .expect("materialize Member workspace grant");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
+    let superuser_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
+    let (member_tx, mut member_rx) = mpsc::channel(16);
+    let mut member_principal = (*authenticated_test_superuser()).clone();
+    member_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(MEMBER_ID).expect("Member principal id");
+    member_principal.kind = pioneer_protocol::PrincipalKind::User;
+    member_principal.role_key = Some(RoleKey::member());
+    member_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
+    member_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+    let member_connection_id = session_manager
+        .register_connection(member_tx, Arc::new(member_principal))
+        .await
+        .expect("register Member connection");
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager.clone(),
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let list_id = generate_test_request_id("memberws", "list");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": list_id,
+                "method": "workspace/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let listed = recv_response_by_id(&mut member_rx, list_id.as_str()).await;
+    let listed: WorkspaceListResponse =
+        serde_json::from_value(listed.result).expect("decode Member workspace list");
+    assert_eq!(
+        listed
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![MEMBER_WORKSPACE_ID]
+    );
+
+    let default_id = generate_test_request_id("memberws", "default");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": default_id,
+                "method": "workspace/default",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let selected_default = recv_response_by_id(&mut member_rx, default_id.as_str()).await;
+    let selected_default: WorkspaceDefaultResponse =
+        serde_json::from_value(selected_default.result).expect("decode Member default");
+    assert_eq!(selected_default.workspace.id, MEMBER_WORKSPACE_ID);
+    assert_eq!(
+        session_manager
+            .connection_workspace_id(member_connection_id)
+            .await
+            .as_deref(),
+        Some(MEMBER_WORKSPACE_ID)
+    );
+
+    let denied_id = generate_test_request_id("memberws", "foreign");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": denied_id,
+                "method": "workspace/select",
+                "params": {
+                    "workspace_id": global_default_id,
+                    "make_current": true
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let denied = recv_error_by_id(&mut member_rx, denied_id.as_str()).await;
+    assert_eq!(denied.error.message, "not_found");
+    assert_eq!(
+        session_manager
+            .connection_workspace_id(member_connection_id)
+            .await
+            .as_deref(),
+        Some(MEMBER_WORKSPACE_ID),
+        "denied selection must preserve previous connection scope"
+    );
+
+    let select_id = generate_test_request_id("memberws", "select");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": select_id,
+                "method": "workspace/select",
+                "params": {
+                    "workspace_id": MEMBER_WORKSPACE_ID,
+                    "make_current": true
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let selected = recv_response_by_id(&mut member_rx, select_id.as_str()).await;
+    let selected: WorkspaceSelectResponse =
+        serde_json::from_value(selected.result).expect("decode Member selection");
+    assert_eq!(selected.workspace.id, MEMBER_WORKSPACE_ID);
+    assert!(
+        workspace_manager
+            .list_workspaces()
+            .await
+            .expect("list global workspaces")
+            .iter()
+            .any(|workspace| workspace.id == global_default_id && workspace.is_current),
+        "Member make_current must not mutate the server-global current workspace"
+    );
+
+    let capabilities_id = generate_test_request_id("memberws", "artifact-capabilities");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": capabilities_id,
+                "method": "artifact/capabilities",
+                "params": {
+                    "workspace_id": MEMBER_WORKSPACE_ID
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let capabilities = recv_response_by_id(&mut member_rx, capabilities_id.as_str()).await;
+    let capabilities: ArtifactCapabilitiesResponse =
+        serde_json::from_value(capabilities.result).expect("decode Member artifact capabilities");
+    assert!(capabilities.upload.max_file_size_bytes > 0);
+
+    let denied_capabilities_id =
+        generate_test_request_id("memberws", "foreign-artifact-capabilities");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": denied_capabilities_id,
+                "method": "artifact/capabilities",
+                "params": {
+                    "workspace_id": global_default_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let denied_capabilities =
+        recv_error_by_id(&mut member_rx, denied_capabilities_id.as_str()).await;
+    assert_eq!(denied_capabilities.error.message, "not_found");
+
+    let skills_id = generate_test_request_id("memberws", "skills");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": skills_id,
+                "method": "skills/list",
+                "params": {
+                    "workspace_id": MEMBER_WORKSPACE_ID,
+                    "include_health": false,
+                    "include_policy": false
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let skills = recv_response_by_id(&mut member_rx, skills_id.as_str()).await;
+    let skills: SkillListResponse =
+        serde_json::from_value(skills.result).expect("decode Member skill list");
+    assert!(skills.snapshot_version > 0);
+
+    let denied_skills_id = generate_test_request_id("memberws", "foreign-skills");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": denied_skills_id,
+                "method": "skills/list",
+                "params": {
+                    "workspace_id": global_default_id,
+                    "include_health": false,
+                    "include_policy": false
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let denied_skills = recv_error_by_id(&mut member_rx, denied_skills_id.as_str()).await;
+    assert_eq!(denied_skills.error.message, "not_found");
+
+    let superuser_list_id = generate_test_request_id("superws", "list");
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": superuser_list_id,
+                "method": "workspace/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await;
+    let superuser_list = recv_response_by_id(&mut superuser_rx, superuser_list_id.as_str()).await;
+    let superuser_list: WorkspaceListResponse =
+        serde_json::from_value(superuser_list.result).expect("decode Superuser workspace list");
+    assert!(
+        superuser_list
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == global_default_id)
+            && superuser_list
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == MEMBER_WORKSPACE_ID),
+        "Superuser must list all workspaces without membership rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_notification_fanout_revalidates_membership_before_serialization() {
+    const MEMBER_ALLOWED_ID: &str = "P0000000000000000000A";
+    const MEMBER_DENIED_ID: &str = "P0000000000000000000B";
+
+    struct CountedPayload {
+        serializations: Arc<AtomicUsize>,
+    }
+
+    impl serde::Serialize for CountedPayload {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.serializations.fetch_add(1, Ordering::SeqCst);
+            serializer.serialize_str("protected workspace payload")
+        }
+    }
+
+    fn member_principal(
+        principal_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
+        let mut principal = (*authenticated_test_superuser()).clone();
+        principal.principal_id =
+            pioneer_protocol::PrincipalId::new(principal_id).expect("Member principal id");
+        principal.kind = pioneer_protocol::PrincipalKind::User;
+        principal.role_key = Some(RoleKey::member());
+        principal.device_id = pioneer_protocol::DeviceId::new(device_id).expect("Member device id");
+        principal.session_id =
+            pioneer_protocol::AuthSessionId::new(session_id).expect("Member session id");
+        Arc::new(principal)
+    }
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES\
+                ('P0000000000000000000A','G00000000000000000001','user','member','active',\
+                 'Allowed Member','allowed-member','allowed-member',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL),\
+                ('P0000000000000000000B','G00000000000000000001','user','member','active',\
+                 'Denied Member','denied-member','denied-member',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
+             INSERT INTO thread(\
+                id,workspace_id,name,preview,mode,model,model_provider,status,\
+                origin_kind,sidebar_visibility,access_class,created_at,updated_at,\
+                created_by_actor_kind,created_by_actor_id\
+             ) VALUES(\
+                'T0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'Notification root','', 'chat','test','test','active','user','visible',\
+                'workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'principal',\
+                'P0000000000000000000A');\
+             INSERT INTO task(\
+                id,workspace_id,owner_kind,owner_id,created_by_thread_id,\
+                root_task_id,parent_task_id,executor_kind,status,title,goal\
+             ) VALUES(\
+                'K0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'user','P0000000000000000000A','T0000000000000000000N',NULL,NULL,\
+                'agent','waiting','Notification task','Notification task');",
+        )
+        .await
+        .expect("materialize notification recipient ACL");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let (superuser_tx, mut superuser_rx) = mpsc::channel(8);
+    let superuser_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
+    let (allowed_tx, mut allowed_rx) = mpsc::channel(8);
+    let allowed_connection_id = session_manager
+        .register_connection(
+            allowed_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000A",
+                "S0000000000000000000A",
+            ),
+        )
+        .await
+        .expect("register allowed Member");
+    let (denied_tx, mut denied_rx) = mpsc::channel(8);
+    let denied_connection_id = session_manager
+        .register_connection(
+            denied_tx,
+            member_principal(
+                MEMBER_DENIED_ID,
+                "D0000000000000000000B",
+                "S0000000000000000000B",
+            ),
+        )
+        .await
+        .expect("register denied Member");
+    let (unselected_tx, mut unselected_rx) = mpsc::channel(8);
+    let _unselected_connection_id = session_manager
+        .register_connection(
+            unselected_tx,
+            member_principal(
+                MEMBER_DENIED_ID,
+                "D0000000000000000000C",
+                "S0000000000000000000C",
+            ),
+        )
+        .await
+        .expect("register unselected Member");
+
+    for connection_id in [
+        superuser_connection_id,
+        allowed_connection_id,
+        denied_connection_id,
+    ] {
+        session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+    }
+
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    processor
+        .send_notification_to_workspace_connections(
+            workspace_id.as_str(),
+            "test/workspace-protected",
+            &json!({ "title": "must remain protected" }),
+        )
+        .await;
+
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/workspace-protected")
+            .await
+            .method,
+        "test/workspace-protected"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/workspace-protected")
+            .await
+            .method,
+        "test/workspace-protected"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "selected workspace is only a candidate and cannot grant Member delivery"
+    );
+    assert!(
+        unselected_rx.try_recv().is_err(),
+        "an empty Member workspace selection must not become all-connections fanout"
+    );
+
+    let queued_before_revoke = processor
+        .authorized_workspace_notification_recipients(
+            workspace_id.as_str(),
+            vec![allowed_connection_id],
+        )
+        .await;
+    assert_eq!(
+        queued_before_revoke,
+        vec![allowed_connection_id],
+        "the deterministic race must start with an authorized queued recipient"
+    );
+    let queued_task_before_revoke = processor
+        .authorized_task_notification_recipients(
+            "K0000000000000000000N",
+            workspace_id.as_str(),
+            vec![allowed_connection_id],
+        )
+        .await;
+    assert_eq!(
+        queued_task_before_revoke,
+        vec![allowed_connection_id],
+        "task delivery must begin with an authorized root recipient"
+    );
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "DELETE FROM workspace_membership \
+             WHERE principal_id='P0000000000000000000A'",
+        )
+        .await
+        .expect("revoke allowed Member membership");
+    session_manager
+        .set_connection_workspace(superuser_connection_id, None)
+        .await;
+
+    let queued_serializations = Arc::new(AtomicUsize::new(0));
+    processor
+        .send_notification_to_reauthorized_workspace_connections(
+            workspace_id.as_str(),
+            "test/workspace-queued-before-revoke",
+            &CountedPayload {
+                serializations: queued_serializations.clone(),
+            },
+            queued_before_revoke,
+        )
+        .await;
+    assert_eq!(
+        queued_serializations.load(Ordering::SeqCst),
+        0,
+        "a queued pre-revoke recipient must be revalidated before protected serialization"
+    );
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "a recipient captured before the committed revoke must be rejected before queueing"
+    );
+
+    let queued_task_serializations = Arc::new(AtomicUsize::new(0));
+    processor
+        .send_notification_to_reauthorized_task_connections(
+            "K0000000000000000000N",
+            workspace_id.as_str(),
+            "test/task-queued-before-revoke",
+            &CountedPayload {
+                serializations: queued_task_serializations.clone(),
+            },
+            queued_task_before_revoke,
+        )
+        .await;
+    assert_eq!(
+        queued_task_serializations.load(Ordering::SeqCst),
+        0,
+        "task root authority must be revalidated before protected serialization"
+    );
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "a task event queued before membership revoke must not be delivered after commit"
+    );
+
+    let serializations = Arc::new(AtomicUsize::new(0));
+    processor
+        .send_notification_to_workspace_connections(
+            workspace_id.as_str(),
+            "test/workspace-protected-after-revoke",
+            &CountedPayload {
+                serializations: serializations.clone(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        serializations.load(Ordering::SeqCst),
+        0,
+        "a protected payload must not be serialized when every candidate is denied"
+    );
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "membership removal must affect the next workspace notification"
+    );
+    assert!(denied_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn gateway_management_notifications_are_superuser_only() {
+    let (workspace_manager, crud_store, _) = setup_workspace_manager().await;
+    let session_manager = Arc::new(SessionManager::new());
+    let (superuser_tx, mut superuser_rx) = mpsc::channel(4);
+    let _superuser_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
+
+    let mut member_principal = (*authenticated_test_superuser()).clone();
+    member_principal.principal_id =
+        pioneer_protocol::PrincipalId::new("P0000000000000000000A").expect("Member principal id");
+    member_principal.kind = pioneer_protocol::PrincipalKind::User;
+    member_principal.role_key = Some(RoleKey::member());
+    member_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
+    member_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+    let (member_tx, mut member_rx) = mpsc::channel(4);
+    session_manager
+        .register_connection(member_tx, Arc::new(member_principal))
+        .await
+        .expect("register Member");
+
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    processor
+        .send_gateway_management_notification(
+            "test/gateway-management",
+            &json!({"settings": "superuser-only"}),
+        )
+        .await;
+
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/gateway-management")
+            .await
+            .method,
+        "test/gateway-management"
+    );
+    assert!(
+        member_rx.try_recv().is_err(),
+        "ordinary Members must not receive Gateway management or settings notifications"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() {
+    const MEMBER_ALLOWED_ID: &str = "P0000000000000000000A";
+    const MEMBER_DENIED_ID: &str = "P0000000000000000000B";
+    const THREAD_ID: &str = "T00000000000000000001";
+
+    fn member_principal(
+        principal_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
+        let mut principal = (*authenticated_test_superuser()).clone();
+        principal.principal_id =
+            pioneer_protocol::PrincipalId::new(principal_id).expect("Member principal id");
+        principal.kind = pioneer_protocol::PrincipalKind::User;
+        principal.role_key = Some(RoleKey::member());
+        principal.device_id = pioneer_protocol::DeviceId::new(device_id).expect("Member device id");
+        principal.session_id =
+            pioneer_protocol::AuthSessionId::new(session_id).expect("Member session id");
+        Arc::new(principal)
+    }
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES\
+                ('P0000000000000000000A','G00000000000000000001','user','member','active',\
+                 'Allowed Member','allowed-realtime','allowed-realtime',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL),\
+                ('P0000000000000000000B','G00000000000000000001','user','member','active',\
+                 'Denied Member','denied-realtime','denied-realtime',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize realtime Member principals and workspace grants");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let (superuser_tx, mut superuser_rx) = mpsc::channel(16);
+    let superuser_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
+    let (allowed_tx, mut allowed_rx) = mpsc::channel(16);
+    let allowed_connection_id = session_manager
+        .register_connection(
+            allowed_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000A",
+                "S0000000000000000000A",
+            ),
+        )
+        .await
+        .expect("register allowed Member");
+    let (denied_tx, mut denied_rx) = mpsc::channel(16);
+    let denied_connection_id = session_manager
+        .register_connection(
+            denied_tx,
+            member_principal(
+                MEMBER_DENIED_ID,
+                "D0000000000000000000B",
+                "S0000000000000000000B",
+            ),
+        )
+        .await
+        .expect("register denied Member");
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let create_id = generate_test_request_id("realtimethread", "create");
+    processor
+        .process_request_for_connection(
+            allowed_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": create_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut allowed_rx, create_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_STARTED).await;
+
+    let superuser_open_id = generate_test_request_id("realtimethread", "superopen");
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": superuser_open_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut superuser_rx, superuser_open_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_STARTED).await;
+
+    let (other_session_tx, mut other_session_rx) = mpsc::channel(16);
+    processor
+        .session_manager
+        .register_connection(
+            other_session_tx,
+            member_principal(
+                MEMBER_ALLOWED_ID,
+                "D0000000000000000000C",
+                "S0000000000000000000C",
+            ),
+        )
+        .await
+        .expect("register another session for the allowed Member");
+
+    processor
+        .send_execution_owner_notification(
+            THREAD_ID,
+            MEMBER_ALLOWED_ID,
+            "S0000000000000000000A",
+            "test/execution-owner-only",
+            &json!({"command": "private"}),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/execution-owner-only")
+            .await
+            .method,
+        "test/execution-owner-only"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/execution-owner-only")
+            .await
+            .method,
+        "test/execution-owner-only"
+    );
+    assert!(
+        other_session_rx.try_recv().is_err(),
+        "another session of the same principal must not receive an execution approval payload"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "another workspace Member must not receive an execution approval payload"
+    );
+
+    let denied_open_id = generate_test_request_id("realtimethread", "deniedopen");
+    processor
+        .process_request_for_connection(
+            denied_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": denied_open_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let denied = recv_error_by_id(&mut denied_rx, denied_open_id.as_str()).await;
+    assert_eq!(denied.error.message, "not_found");
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&denied_connection_id),
+        "failed subscription admission must not mutate the in-memory graph"
+    );
+
+    let memory_context = pioneer_memory::MemoryOperationContext {
+        workspace_id: Some(workspace_id.clone()),
+        thread_id: Some(THREAD_ID.to_owned()),
+        ..Default::default()
+    };
+    processor
+        .send_memory_changed_notification(
+            allowed_connection_id,
+            &memory_context,
+            &pioneer_protocol::MemoryChangedNotification {
+                memory_id: "private-thread-memory".to_owned(),
+                scope: pioneer_protocol::MemoryScope {
+                    kind: pioneer_protocol::MemoryScopeKind::Thread,
+                    key: THREAD_ID.to_owned(),
+                },
+                change_kind: pioneer_protocol::MemoryChangeKind::Updated,
+                record: None,
+            },
+        )
+        .await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::MEMORY_CHANGED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::MEMORY_CHANGED).await;
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "private-thread memory events must inherit the exact thread ACL"
+    );
+
+    processor
+        .session_manager
+        .set_connection_workspace(denied_connection_id, Some(workspace_id.clone()))
+        .await;
+    processor
+        .send_memory_changed_notification(
+            allowed_connection_id,
+            &memory_context,
+            &pioneer_protocol::MemoryChangedNotification {
+                memory_id: "private-source-workspace-memory".to_owned(),
+                scope: pioneer_protocol::MemoryScope {
+                    kind: pioneer_protocol::MemoryScopeKind::Workspace,
+                    key: workspace_id.clone(),
+                },
+                change_kind: pioneer_protocol::MemoryChangeKind::Updated,
+                record: None,
+            },
+        )
+        .await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::MEMORY_CHANGED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::MEMORY_CHANGED).await;
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "workspace memory events must retain the ACL of their private source thread"
+    );
+
+    processor
+        .notify_thread_agents_doc_changed(workspace_id.clone(), Some(THREAD_ID), None, None, true)
+        .await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_AGENTS_DOC_CHANGED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_AGENTS_DOC_CHANGED).await;
+    let denied_tree_refresh =
+        recv_notification_by_method(&mut denied_rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(
+        denied_tree_refresh.method,
+        events::THREAD_TREE_CHANGED,
+        "workspace tree metadata may refresh without exposing private document content"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "private-thread AGENTS.md content must inherit the exact thread ACL"
+    );
+
+    assert!(
+        thread_manager
+            .subscribe_connection(THREAD_ID, denied_connection_id)
+            .await,
+        "inject a stale identity snapshot for fail-closed coverage"
+    );
+    processor
+        .send_notification_to_thread_subscribers(
+            THREAD_ID,
+            "test/private-thread-current-acl",
+            &json!({"private": true}),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/private-thread-current-acl")
+            .await
+            .method,
+        "test/private-thread-current-acl"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/private-thread-current-acl")
+            .await
+            .method,
+        "test/private-thread-current-acl"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "a stale subscriber identity must fail closed before delivery"
+    );
+
+    processor
+        .send_voice_session_result_notification(
+            allowed_connection_id,
+            THREAD_ID,
+            VoiceSessionResultNotification {
+                session_id: "voice-result-before-revoke".to_owned(),
+                outcome: VoiceSessionOutcome::TurnStarted,
+                turn_id: Some("voice-turn-before-revoke".to_owned()),
+                error: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, events::VOICE_SESSION_RESULT)
+            .await
+            .method,
+        events::VOICE_SESSION_RESULT,
+        "the direct terminal voice result must reach its currently authorized owner"
+    );
+
+    let queued_before_revoke = processor
+        .authorized_thread_notification_recipients(
+            THREAD_ID,
+            thread_manager.subscribed_connections(THREAD_ID).await,
+        )
+        .await;
+    assert!(
+        queued_before_revoke.contains(&allowed_connection_id)
+            && queued_before_revoke.contains(&superuser_connection_id),
+        "the deterministic race must capture both authorized recipients before the revoke"
+    );
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "DELETE FROM thread_membership \
+             WHERE principal_id='P0000000000000000000A' \
+               AND thread_id='T00000000000000000001'",
+        )
+        .await
+        .expect("remove private-thread membership");
+    processor
+        .send_notification_to_reauthorized_thread_connections(
+            THREAD_ID,
+            "test/private-thread-after-revoke",
+            &json!({"private": true}),
+            queued_before_revoke,
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/private-thread-after-revoke")
+            .await
+            .method,
+        "test/private-thread-after-revoke"
+    );
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "private membership removal must affect the next delivery"
+    );
+    assert!(denied_rx.try_recv().is_err());
+
+    processor
+        .send_voice_session_result_notification(
+            allowed_connection_id,
+            THREAD_ID,
+            VoiceSessionResultNotification {
+                session_id: "voice-result-after-revoke".to_owned(),
+                outcome: VoiceSessionOutcome::TurnStarted,
+                turn_id: Some("voice-turn-after-revoke".to_owned()),
+                error: None,
+            },
+        )
+        .await;
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "a delayed terminal voice result must revalidate the exact thread ACL after revoke"
+    );
+
+    let old_cursor = super::timeline_cursor::encode_thread_timeline_cursor(
+        pioneer_crud::SEMANTIC_TIMELINE_PROJECTION_VERSION,
+        THREAD_ID,
+        "private-block-known-before-revoke",
+        "00000000000000000001",
+    )
+    .expect("encode previously authorized private cursor");
+    let denied_replay_id = generate_test_request_id("realtimethread", "oldcursor");
+    processor
+        .process_request_for_connection(
+            allowed_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": denied_replay_id,
+                "method": "thread/timeline/page",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "anchor": {
+                        "kind": "before",
+                        "cursor": old_cursor
+                    },
+                    "limit": 10
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let denied_replay = recv_error_by_id(&mut allowed_rx, denied_replay_id.as_str()).await;
+    assert_eq!(
+        denied_replay.error.message, "not_found",
+        "a previously valid cursor cannot prove historical private access"
+    );
+
+    let superuser_replay_id = generate_test_request_id("realtimethread", "supercursor");
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": superuser_replay_id,
+                "method": "thread/timeline/page",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "anchor": {
+                        "kind": "before",
+                        "cursor": super::timeline_cursor::encode_thread_timeline_cursor(
+                            pioneer_crud::SEMANTIC_TIMELINE_PROJECTION_VERSION,
+                            THREAD_ID,
+                            "private-block-known-before-revoke",
+                            "00000000000000000001",
+                        ).expect("encode Superuser replay cursor")
+                    },
+                    "limit": 10
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let superuser_replay =
+        recv_response_by_id(&mut superuser_rx, superuser_replay_id.as_str()).await;
+    let superuser_replay: pioneer_protocol::ThreadTimelinePageResponse =
+        serde_json::from_value(superuser_replay.result)
+            .expect("Superuser private replay response decodes");
+    assert_eq!(superuser_replay.thread_id, THREAD_ID);
+
+    assert_eq!(
+        crud_store
+            .update_user_thread_management(
+                workspace_id.as_str(),
+                THREAD_ID,
+                None,
+                None,
+                Some(pioneer_crud::PersistedThreadAccessClass::Workspace),
+                None,
+            )
+            .await
+            .expect("change thread visibility"),
+        Some(true)
+    );
+    processor
+        .send_notification_to_thread_subscribers(
+            THREAD_ID,
+            "test/workspace-thread-after-visibility-change",
+            &json!({"private": false}),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(
+            &mut allowed_rx,
+            "test/workspace-thread-after-visibility-change"
+        )
+        .await
+        .method,
+        "test/workspace-thread-after-visibility-change"
+    );
+    assert_eq!(
+        recv_notification_by_method(
+            &mut superuser_rx,
+            "test/workspace-thread-after-visibility-change"
+        )
+        .await
+        .method,
+        "test/workspace-thread-after-visibility-change"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "workspace visibility cannot repair a mismatched subscription identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_workspace_revoke_evicts_only_affected_live_state() {
+    const MEMBER_ID: &str = "P0000000000000000000A";
+    const AFFECTED_THREAD_ID: &str = "T00000000000000000001";
+    const UNRELATED_THREAD_ID: &str = "T00000000000000000002";
+
+    let (workspace_manager, crud_store, affected_workspace_id) = setup_workspace_manager().await;
+    let unrelated_workspace_id = "W0000000000000000000B";
+    workspace_manager
+        .create_workspace(unrelated_workspace_id, Some("Unrelated workspace"))
+        .await
+        .expect("create unrelated workspace");
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                'P0000000000000000000A','G00000000000000000001','user','member','active',\
+                'Revoked Member','revoked-member','revoked-member',\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                ('P0000000000000000000A','W0000000000000000000B',\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize Member and two workspace grants");
+
+    let mut member_principal = (*authenticated_test_superuser()).clone();
+    member_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(MEMBER_ID).expect("Member principal id");
+    member_principal.kind = pioneer_protocol::PrincipalKind::User;
+    member_principal.role_key = Some(RoleKey::member());
+    member_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
+    member_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+    let member_principal = Arc::new(member_principal);
+    let session_manager = Arc::new(SessionManager::new());
+    let (member_tx, mut member_rx) = mpsc::channel(32);
+    let connection_id = session_manager
+        .register_connection(member_tx, member_principal.clone())
+        .await
+        .expect("register Member connection");
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    for (request_suffix, workspace_id, thread_id) in [
+        (
+            "affected",
+            affected_workspace_id.as_str(),
+            AFFECTED_THREAD_ID,
+        ),
+        ("unrelated", unrelated_workspace_id, UNRELATED_THREAD_ID),
+    ] {
+        let request_id = generate_test_request_id("revokecreate", request_suffix);
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "thread/start",
+                    "params": {
+                        "thread_id": thread_id,
+                        "workspace_id": workspace_id
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let _ = recv_response_by_id(&mut member_rx, request_id.as_str()).await;
+        let _ = recv_notification_by_method(&mut member_rx, events::THREAD_STARTED).await;
+    }
+    while member_rx.try_recv().is_ok() {}
+    session_manager
+        .set_connection_workspace(connection_id, Some(affected_workspace_id.clone()))
+        .await;
+
+    let owner = AuthenticatedTransferOwner {
+        principal_id: member_principal.principal_id.clone(),
+        auth_session_id: member_principal.session_id.clone(),
+        connection_id,
+    };
+    let now = super::now_timestamp_secs();
+    let affected_upload = processor
+        .artifact_uploads
+        .start(
+            &owner,
+            ArtifactUploadStartParams {
+                workspace_id: affected_workspace_id.clone(),
+                thread_id: Some(AFFECTED_THREAD_ID.to_owned()),
+                planned_turn_id: None,
+                client_attachment_id: "affected-upload".to_owned(),
+                file_name: "affected.txt".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                size_bytes: 1,
+                sha256: "00".repeat(32),
+                source_kind: ArtifactUploadSourceKind::UserComposer,
+            },
+            now,
+        )
+        .await
+        .expect("start affected upload");
+    let unrelated_upload = processor
+        .artifact_uploads
+        .start(
+            &owner,
+            ArtifactUploadStartParams {
+                workspace_id: unrelated_workspace_id.to_owned(),
+                thread_id: Some(UNRELATED_THREAD_ID.to_owned()),
+                planned_turn_id: None,
+                client_attachment_id: "unrelated-upload".to_owned(),
+                file_name: "unrelated.txt".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                size_bytes: 1,
+                sha256: "11".repeat(32),
+                source_kind: ArtifactUploadSourceKind::UserComposer,
+            },
+            now,
+        )
+        .await
+        .expect("start unrelated upload");
+
+    let artifact_ref = |artifact_id: &str| pioneer_protocol::ArtifactRef {
+        artifact_id: artifact_id.to_owned(),
+        version_id: Some(format!("{artifact_id}-version")),
+        display_name: format!("{artifact_id}.txt"),
+        kind: pioneer_protocol::ArtifactKind::Text,
+        mime_type: Some("text/plain".to_owned()),
+        size_bytes: Some(1),
+        sha256: Some("22".repeat(32)),
+        status: pioneer_protocol::ArtifactStatus::Ready,
+        preview: None,
+    };
+    let affected_download = processor
+        .artifact_downloads
+        .start_scoped(
+            &owner,
+            pioneer_artifacts::ArtifactDownloadSnapshot {
+                artifact: artifact_ref("artifact-affected"),
+                workspace_id: affected_workspace_id.clone(),
+                artifact_id: "artifact-affected".to_owned(),
+                artifact_version_id: "artifact-affected-version".to_owned(),
+                blob_id: "blob-affected".to_owned(),
+                storage_key: "storage-affected".to_owned(),
+                display_name: "affected.txt".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                size_bytes: 1,
+                sha256: "22".repeat(32),
+            },
+            Some(AFFECTED_THREAD_ID.to_owned()),
+            now,
+        )
+        .await
+        .expect("start affected download");
+    let unrelated_download = processor
+        .artifact_downloads
+        .start_scoped(
+            &owner,
+            pioneer_artifacts::ArtifactDownloadSnapshot {
+                artifact: artifact_ref("artifact-unrelated"),
+                workspace_id: unrelated_workspace_id.to_owned(),
+                artifact_id: "artifact-unrelated".to_owned(),
+                artifact_version_id: "artifact-unrelated-version".to_owned(),
+                blob_id: "blob-unrelated".to_owned(),
+                storage_key: "storage-unrelated".to_owned(),
+                display_name: "unrelated.txt".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                size_bytes: 1,
+                sha256: "33".repeat(32),
+            },
+            Some(UNRELATED_THREAD_ID.to_owned()),
+            now,
+        )
+        .await
+        .expect("start unrelated download");
+
+    let audio_format = VoiceAudioFormat {
+        sample_rate_hz: pioneer_protocol::VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
+        channels: pioneer_protocol::VOICE_AUDIO_TARGET_CHANNELS,
+        encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+    };
+    for (session_id, workspace_id, thread_id) in [
+        (
+            "voice-access-revoke-affected",
+            affected_workspace_id.as_str(),
+            AFFECTED_THREAD_ID,
+        ),
+        (
+            "voice-access-revoke-unrelated",
+            unrelated_workspace_id,
+            UNRELATED_THREAD_ID,
+        ),
+    ] {
+        processor
+            .voice_sessions
+            .create_authenticated_session(
+                session_id,
+                owner.clone(),
+                VoiceSessionStartContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: format!("turn-{thread_id}"),
+                },
+                audio_format,
+            )
+            .expect("create scoped voice session");
+        processor
+            .voice_session_buffers
+            .start_session(session_id, audio_format)
+            .expect("create scoped voice buffer");
+    }
+
+    let transaction = crud_store
+        .database_connection()
+        .begin()
+        .await
+        .expect("begin membership rollback transaction");
+    transaction
+        .execute_unprepared(&format!(
+            "DELETE FROM workspace_membership \
+             WHERE principal_id='{MEMBER_ID}' \
+               AND workspace_id='{}'",
+            affected_workspace_id
+        ))
+        .await
+        .expect("delete membership inside rollback transaction");
+    transaction
+        .rollback()
+        .await
+        .expect("rollback membership change");
+    assert_eq!(
+        session_manager
+            .connection_workspace_id(connection_id)
+            .await
+            .as_deref(),
+        Some(affected_workspace_id.as_str()),
+        "rolled-back mutation must not change runtime authority"
+    );
+    assert!(
+        thread_manager
+            .subscribed_connection_ids(AFFECTED_THREAD_ID)
+            .await
+            .contains(&connection_id)
+    );
+    assert!(
+        processor
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                affected_workspace_id.as_str(),
+                affected_upload.upload_id.as_str(),
+                now,
+            )
+            .await
+            .is_ok()
+    );
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "DELETE FROM workspace_membership \
+             WHERE principal_id='{MEMBER_ID}' \
+               AND workspace_id='{}'",
+            affected_workspace_id
+        ))
+        .await
+        .expect("commit workspace membership removal");
+
+    let chunk = [7_u8];
+    let chunk_header = ArtifactUploadChunkHeader {
+        workspace_id: affected_workspace_id.clone(),
+        upload_id: affected_upload.upload_id.clone(),
+        offset: 0,
+        len: 1,
+        chunk_sha256: Some(hex::encode(Sha256::digest(chunk))),
+    };
+    processor
+        .process_binary_frame_for_connection(
+            connection_id,
+            upload_binary_test_frame(
+                super::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC,
+                &chunk_header,
+                chunk.as_slice(),
+            )
+            .as_slice(),
+        )
+        .await
+        .expect("post-commit binary request reaches current-ACL admission");
+    assert!(
+        timeout(Duration::from_millis(50), member_rx.recv())
+            .await
+            .is_err(),
+        "post-commit protected binary ack must not be queued before eviction"
+    );
+    assert_eq!(
+        processor
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                affected_workspace_id.as_str(),
+                affected_upload.upload_id.as_str(),
+                now,
+            )
+            .await
+            .expect("denied race must leave session unchanged")
+            .received_bytes,
+        0,
+        "current ACL must deny mutation even before runtime invalidation is consumed"
+    );
+
+    processor
+        .process_binary_frame_for_connection(
+            connection_id,
+            voice_test_frame("voice-access-revoke-affected", 0, 960, 12_000).as_slice(),
+        )
+        .await
+        .expect("post-commit voice chunk reaches current-ACL admission");
+    assert!(
+        timeout(Duration::from_millis(50), member_rx.recv())
+            .await
+            .is_err(),
+        "post-commit protected voice ack must not be queued before eviction"
+    );
+    assert_eq!(
+        processor
+            .voice_session_buffers
+            .buffered_bytes_for_test("voice-access-revoke-affected")
+            .expect("denied race must retain the scoped voice buffer"),
+        0,
+        "current ACL must deny voice mutation even before runtime invalidation is consumed"
+    );
+
+    let signal = processor
+        .publish_committed_workspace_membership_invalidation(
+            member_principal.principal_id.clone(),
+            affected_workspace_id.clone(),
+        )
+        .await;
+    let access_changed = recv_notification_by_method(&mut member_rx, "access/changed").await;
+    let access_changed_json =
+        serde_json::to_string(&access_changed).expect("safe access-change notification encodes");
+    assert_eq!(
+        access_changed
+            .params
+            .as_ref()
+            .and_then(|params| params.get("authorization_revision"))
+            .and_then(JsonValue::as_u64),
+        Some(signal.authorization_revision)
+    );
+    assert!(!access_changed_json.contains(AFFECTED_THREAD_ID));
+    assert!(!access_changed_json.contains("affected.txt"));
+
+    assert_eq!(
+        session_manager.connection_workspace_id(connection_id).await,
+        None
+    );
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(AFFECTED_THREAD_ID)
+            .await
+            .contains(&connection_id)
+    );
+    assert!(
+        thread_manager
+            .subscribed_connection_ids(UNRELATED_THREAD_ID)
+            .await
+            .contains(&connection_id)
+    );
+    assert!(
+        processor
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                affected_workspace_id.as_str(),
+                affected_upload.upload_id.as_str(),
+                now,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                unrelated_workspace_id,
+                unrelated_upload.upload_id.as_str(),
+                now,
+            )
+            .await
+            .is_ok()
+    );
+    assert!(
+        processor
+            .artifact_downloads
+            .get(
+                &owner,
+                affected_workspace_id.as_str(),
+                affected_download.download_id.as_str(),
+                now,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        processor
+            .artifact_downloads
+            .get(
+                &owner,
+                unrelated_workspace_id,
+                unrelated_download.download_id.as_str(),
+                now,
+            )
+            .await
+            .is_ok()
+    );
+    assert!(
+        processor
+            .voice_sessions
+            .lookup_authenticated_session("voice-access-revoke-affected", &owner)
+            .is_err()
+    );
+    assert!(
+        processor
+            .voice_sessions
+            .lookup_authenticated_session("voice-access-revoke-unrelated", &owner)
+            .is_ok()
+    );
+
+    processor
+        .publish_committed_workspace_membership_invalidation(
+            member_principal.principal_id.clone(),
+            affected_workspace_id.clone(),
+        )
+        .await;
+    let _ = recv_notification_by_method(&mut member_rx, "access/changed").await;
+    assert!(
+        session_manager
+            .connection_principal(connection_id)
+            .await
+            .is_ok(),
+        "idempotent eviction must keep the unrelated authenticated session active"
+    );
+    assert!(
+        thread_manager
+            .subscribed_connection_ids(UNRELATED_THREAD_ID)
+            .await
+            .contains(&connection_id)
+    );
+
+    drop(member_rx);
+    processor
+        .publish_committed_workspace_membership_invalidation(
+            member_principal.principal_id.clone(),
+            affected_workspace_id.clone(),
+        )
+        .await;
+    assert!(
+        session_manager
+            .connection_principal(connection_id)
+            .await
+            .is_err(),
+        "failed safe-notification delivery closes the connection"
+    );
+    let database = crud_store.database_connection();
+    assert!(
+        pioneer_crud::find_workspace_membership(
+            &database,
+            &member_principal.principal_id,
+            affected_workspace_id.as_str(),
+        )
+        .await
+        .expect("membership lookup remains available")
+        .is_none(),
+        "notification failure cannot restore committed access"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
     let (
         processor,
@@ -11088,10 +13112,16 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
         _skills_runtime,
     ) = setup_binary_ingress_processor().await;
     let chunk = b"artifact binary ingress";
+    let principal = authenticated_test_superuser();
+    let owner = AuthenticatedTransferOwner {
+        principal_id: principal.principal_id.clone(),
+        auth_session_id: principal.session_id.clone(),
+        connection_id: owner_connection_id,
+    };
     let session = processor
         .artifact_uploads
         .start(
-            owner_connection_id,
+            &owner,
             ArtifactUploadStartParams {
                 workspace_id: workspace_id.clone(),
                 thread_id: None,
@@ -11134,7 +13164,7 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
         processor
             .artifact_uploads
             .finish(
-                owner_connection_id,
+                &owner,
                 workspace_id.as_str(),
                 session.upload_id.as_str(),
                 i64::MAX / 2,
@@ -11161,7 +13191,7 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
         processor
             .artifact_uploads
             .finish(
-                owner_connection_id,
+                &owner,
                 workspace_id.as_str(),
                 session.upload_id.as_str(),
                 i64::MAX / 2,
@@ -11186,7 +13216,7 @@ async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_w
         processor
             .artifact_uploads
             .finish(
-                owner_connection_id,
+                &owner,
                 workspace_id.as_str(),
                 session.upload_id.as_str(),
                 i64::MAX / 2,
@@ -11312,7 +13342,7 @@ async fn voice_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
         mut owner_rx,
         foreign_connection_id,
         mut foreign_rx,
-        _crud_store,
+        crud_store,
         workspace_id,
         _skills_runtime,
     ) = setup_binary_ingress_processor().await;
@@ -11322,11 +13352,24 @@ async fn voice_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
         channels: pioneer_protocol::VOICE_AUDIO_TARGET_CHANNELS,
         encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
     };
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_binary_ingress",
+        "turn_binary_ingress",
+    )
+    .await;
+    let principal = authenticated_test_superuser();
+    let owner = AuthenticatedTransferOwner {
+        principal_id: principal.principal_id.clone(),
+        auth_session_id: principal.session_id.clone(),
+        connection_id: owner_connection_id,
+    };
     processor
         .voice_sessions
-        .create_session(
+        .create_authenticated_session(
             session_id,
-            owner_connection_id,
+            owner.clone(),
             VoiceSessionStartContext {
                 workspace_id,
                 thread_id: "thread_binary_ingress".to_owned(),
@@ -11341,7 +13384,7 @@ async fn voice_binary_ingress_is_context_bound_and_rejects_malformed_frames_with
         .expect("voice buffer should start");
     processor
         .voice_sessions
-        .mark_recording(session_id, owner_connection_id)
+        .mark_recording_authenticated(session_id, &owner)
         .expect("voice session should record");
     let valid_frame = voice_test_frame(session_id, 0, 960, 12_000);
 
@@ -11480,6 +13523,20 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
         "turn_artifact_api_01",
     )
     .await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_api",
+        "turn_artifact_api_02",
+    )
+    .await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        other_workspace.id.as_str(),
+        "thr_artifact_api_other",
+        "turn_artifact_api_other",
+    )
+    .await;
     let artifact = ingest_bound_test_artifact(
         &processor,
         workspace_id.as_str(),
@@ -11493,7 +13550,7 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
     ingest_bound_test_artifact(
         &processor,
         other_workspace.id.as_str(),
-        "thr_artifact_api",
+        "thr_artifact_api_other",
         "turn_artifact_api_other",
         "msg_artifact_api_other",
         "other.txt",
@@ -11866,12 +13923,19 @@ async fn artifact_read_caps_oversized_json_request() {
         test_provider(),
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
     );
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_read_cap",
+        "turn_artifact_read_cap",
+    )
+    .await;
     let artifact = ingest_bound_test_artifact(
         &processor,
         workspace_id.as_str(),
@@ -11923,12 +13987,19 @@ async fn artifact_get_and_read_reject_cross_workspace_artifact() {
         test_provider(),
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
     );
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        other_workspace.id.as_str(),
+        "thr_foreign_artifact_api",
+        "turn_foreign_artifact_api",
+    )
+    .await;
     let artifact = ingest_bound_test_artifact(
         &processor,
         other_workspace.id.as_str(),
@@ -11957,7 +14028,7 @@ async fn artifact_get_and_read_reject_cross_workspace_artifact() {
         )
         .await;
     let get_error = recv_error_by_id(&mut rx, get_id.as_str()).await;
-    assert!(get_error.error.message.contains("failed to get artifact"));
+    assert_eq!(get_error.error.message, "not_found");
 
     let read_id = generate_test_request_id("artifactread", "foreign");
     processor
@@ -11976,7 +14047,7 @@ async fn artifact_get_and_read_reject_cross_workspace_artifact() {
         )
         .await;
     let read_error = recv_error_by_id(&mut rx, read_id.as_str()).await;
-    assert!(read_error.error.message.contains("failed to read artifact"));
+    assert_eq!(read_error.error.message, "not_found");
 }
 
 #[test]
@@ -12713,6 +14784,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let parent_turn = Turn {
@@ -12827,7 +14899,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         accepted.review_event.reviewer_kind,
         TaskResultReviewerKind::User
     );
-    let expected_user_id = format!("connection:{connection_id}");
+    let expected_user_id = authenticated_test_superuser().principal_id.to_string();
     assert_eq!(
         accepted.review_event.reviewer_user_id.as_deref(),
         Some(expected_user_id.as_str())
@@ -14119,6 +16191,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let parent_turn = Turn {
@@ -15110,6 +17183,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let creation_turn = Turn {
@@ -15822,6 +17896,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let parent_turn = Turn {
@@ -16143,7 +18218,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         processor.start_task_event_listener().await;
 
         let parent_thread_id = format!("thr_dynamic_native_{runtime_id}");
-        thread_manager
+        let started = thread_manager
             .thread_start(
                 connection_id,
                 workspace_id.clone(),
@@ -16157,12 +18232,20 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                     mode: Some(ThreadMode::Agent),
                     origin_kind: Some(ThreadOriginKind::Collaborative),
                     sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                    visibility: None,
                     agent_nickname: None,
                     agent_role: None,
                 },
             )
             .await
             .expect("collaborative native parent should start");
+        crud_store
+            .upsert_thread_model(
+                &started.response.thread,
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("persist native Composer authorization root");
 
         let turn_id = format!("turn_dynamic_native_{runtime_id}");
         let request_id = generate_test_request_id("dynamic", runtime_id);
@@ -17081,6 +19164,7 @@ async fn assert_detached_native_child_turn_cancellation() {
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -19147,6 +21231,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -20188,6 +22273,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -20320,6 +22406,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     crud_store
@@ -20486,6 +22573,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     crud_store
@@ -20601,6 +22689,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -20906,6 +22995,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -21489,6 +23579,7 @@ async fn setup_execution_window_terminal_turn(
                 mode: None,
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -21537,6 +23628,15 @@ async fn setup_execution_window_terminal_turn(
         )
         .await
         .expect("turn start should persist");
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
 
     (processor, crud_store, workspace_id)
 }
@@ -22856,6 +24956,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -22866,6 +24967,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         .prepare_api_provider_turn_start(
             connection_id,
             pioneer_protocol::PersistedActorRef::System,
+            None,
             pioneer_protocol::TurnStartParams {
                 thread_id: "thread_security_native".to_owned(),
                 turn_id: "turn_security_native".to_owned(),
@@ -22885,6 +24987,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 }),
                 cli_runtime_options: None,
             },
+            None,
             None,
         )
         .await
@@ -22969,6 +25072,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -22979,6 +25083,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
         .prepare_api_provider_turn_start(
             connection_id,
             pioneer_protocol::PersistedActorRef::System,
+            None,
             pioneer_protocol::TurnStartParams {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -22998,6 +25103,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 }),
                 cli_runtime_options: None,
             },
+            None,
             None,
         )
         .await
@@ -24627,12 +26733,31 @@ async fn codex_review_start_rejects_before_target_validation() {
             connection_id,
             &json!({
                 "jsonrpc": "2.0",
+                "id": "codexreviewthread0003",
+                "method": "thread/start",
+                "params": {
+                    "thread_id": "thread_codex_review_bad_target",
+                    "workspace_id": workspace_id,
+                    "name": "Codex invalid review target"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _thread_response = recv_response_by_id(&mut rx, "codexreviewthread0003").await;
+    let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
                 "id": "codexreviewbadtarget1",
                 "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REVIEW_START,
                 "params": {
                     "workspace_id": workspace_id,
                     "runtime_id": "codex",
-                    "thread_id": "thread_codex_review_missing",
+                    "thread_id": "thread_codex_review_bad_target",
                     "target": {
                         "type": "custom",
                         "instructions": "   "
@@ -25103,6 +27228,179 @@ async fn codex_thread_ops_fork_creates_pioneer_thread_and_native_binding() {
         .expect("fork thread lookup should succeed")
         .expect("fork thread should persist");
     assert_eq!(stored_thread.name.as_deref(), Some("Forked source"));
+    assert_eq!(stored_thread.visibility, Some(ThreadVisibility::Private));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_codex_thread_fork_commits_private_creator_membership() {
+    const MEMBER_ID: &str = "P0000000000000000000A";
+    const SOURCE_THREAD_ID: &str = "T00000000000000000011";
+    const FORK_THREAD_ID: &str = "T00000000000000000012";
+    const SOURCE_REQUEST_ID: &str = "R00000000000000000011";
+    const FORK_REQUEST_ID: &str = "R00000000000000000012";
+    const READ_REQUEST_ID: &str = "R00000000000000000013";
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                'P0000000000000000000A','G00000000000000000001','user','member','active',\
+                'Fork Member','fork-member','fork-member',\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );",
+        )
+        .await
+        .expect("materialize Member fork authority");
+
+    let mut member_principal = (*authenticated_test_superuser()).clone();
+    member_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(MEMBER_ID).expect("Member principal id");
+    member_principal.kind = pioneer_protocol::PrincipalKind::User;
+    member_principal.role_key = Some(RoleKey::member());
+    member_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
+    member_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+    let member_principal = Arc::new(member_principal);
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager
+        .register_connection(tx, member_principal.clone())
+        .await
+        .expect("register Member connection");
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    *cli_session.thread_fork_result.lock().await = Some(CLIAgentRuntimeThreadForkResult {
+        native_thread_id: "codex-native-member-fork".to_owned(),
+        native_cwd: Some("/tmp/member-fork".to_owned()),
+        native_model: Some("gpt-5.1".to_owned()),
+        raw: None,
+    });
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session));
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": SOURCE_REQUEST_ID,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": SOURCE_THREAD_ID,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, SOURCE_REQUEST_ID).await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+            thread_id: SOURCE_THREAD_ID.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-native-member-source".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/member-project".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: "{}".to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("Member source binding should persist");
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": FORK_REQUEST_ID,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_THREAD_FORK,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "source_thread_id": SOURCE_THREAD_ID,
+                    "fork_thread_id": FORK_THREAD_ID,
+                    "name": "Member fork"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let response = recv_response_by_id(&mut rx, FORK_REQUEST_ID).await;
+    let result: CLIRuntimeThreadForkResponse =
+        serde_json::from_value(response.result).expect("Member fork result should decode");
+    assert_eq!(result.thread.id, FORK_THREAD_ID);
+    assert_eq!(result.thread.visibility, Some(ThreadVisibility::Private));
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    assert!(
+        pioneer_crud::find_thread_membership(
+            &crud_store.database_connection(),
+            FORK_THREAD_ID,
+            &member_principal.principal_id,
+        )
+        .await
+        .expect("Member fork membership lookup should succeed")
+        .is_some(),
+        "CLI fork must atomically grant the Member creator access to its private thread"
+    );
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": READ_REQUEST_ID,
+                "method": "thread/get",
+                "params": {
+                    "thread_id": FORK_THREAD_ID
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let readable = recv_response_by_id(&mut rx, READ_REQUEST_ID).await;
+    let readable: ThreadGetResponse =
+        serde_json::from_value(readable.result).expect("Member fork should remain readable");
+    assert_eq!(readable.thread.id, FORK_THREAD_ID);
 }
 
 async fn start_loaded_thread_and_turn_for_cli_runtime_test(
@@ -25756,6 +28054,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -27082,6 +29381,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -27698,6 +29998,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -27912,18 +30213,20 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             raw: Some(json!({"turnId": "codex-turn-steer"})),
         });
         let cli_manager = test_cli_runtime_manager(cli_session.clone());
-        let processor = MessageProcessor::new(
-            thread_manager,
-            test_provider(),
-            session_manager,
-            workspace_manager,
-            crud_store.clone(),
-            test_gateway_secrets(),
-            test_summary_config(),
-            test_context_budget(),
-            test_tool_loop_config(),
-        )
-        .with_cli_runtime_manager_for_tests(cli_manager.clone());
+        let processor = with_enabled_test_cli_runtime_catalog(
+            MessageProcessor::new(
+                thread_manager,
+                test_provider(),
+                session_manager,
+                workspace_manager,
+                crud_store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_context_budget(),
+                test_tool_loop_config(),
+            )
+            .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+        );
 
         start_loaded_thread_and_turn_for_cli_runtime_test(
             &processor,
@@ -27932,6 +30235,15 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             workspace_id.as_str(),
             "thread_codex_steer",
             "turn_codex_steer",
+        )
+        .await;
+        persist_test_cli_execution_authorization_context(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_codex_steer",
+            "turn_codex_steer",
+            "claude",
+            "claude",
         )
         .await;
 
@@ -27967,6 +30279,39 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             )
             .await
             .expect("CLI runtime session should be active for steering");
+
+        let denied_steer_payload = json!({
+            "jsonrpc": "2.0",
+            "id": "codexsteer00000000000",
+            "method": pioneer_protocol::constants::methods::CLI_RUNTIME_TURN_STEER,
+            "params": {
+                "workspace_id": workspace_id,
+                "runtime_id": "codex",
+                "thread_id": "thread_codex_steer",
+                "turn_id": "turn_codex_steer",
+                "message": "Use a runtime outside the frozen projection"
+            }
+        })
+        .to_string();
+        message_future(
+            processor.process_request_for_connection(connection_id, &denied_steer_payload),
+        )
+        .await;
+
+        let denied = recv_error_by_id(&mut rx, "codexsteer00000000000").await;
+        assert_eq!(denied.error.code, pioneer_protocol::NOT_FOUND_CODE);
+        assert_eq!(denied.error.message, "not_found");
+        assert!(cli_session.turn_steers.lock().await.is_empty());
+
+        persist_test_cli_execution_authorization_context(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_codex_steer",
+            "turn_codex_steer",
+            "codex",
+            "codex",
+        )
+        .await;
 
         let steer_payload = json!({
             "jsonrpc": "2.0",
@@ -28010,18 +30355,20 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     start_loaded_thread_and_turn_for_cli_runtime_test(
         &processor,
@@ -28030,6 +30377,15 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
         workspace_id.as_str(),
         "thread_codex_steer_no_session",
         "turn_codex_steer_no_session",
+    )
+    .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_codex_steer_no_session",
+        "turn_codex_steer_no_session",
+        "codex",
+        "codex",
     )
     .await;
 
@@ -28233,18 +30589,20 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager.clone(),
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     seed_cli_runtime_approval_turn(
         crud_store.as_ref(),
@@ -28302,6 +30660,47 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         opened_payload.request.native_request_id.as_deref(),
         Some("codex-native-request-1")
     );
+
+    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
+    foreign_principal.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002")
+        .expect("foreign CLI response session id");
+    let foreign_connection_id = session_manager
+        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .await
+        .expect("foreign CLI response session should register");
+    session_manager
+        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
+        .await;
+    processor
+        .process_request_for_connection(
+            foreign_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntime_foreign001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": pending_request_id.clone(),
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let foreign_error = recv_error_by_id(&mut foreign_rx, "cliruntime_foreign001").await;
+    assert_eq!(foreign_error.error.message, "not_found");
+    assert_eq!(
+        crud_store
+            .get_cli_runtime_pending_request(pending_request_id.as_str())
+            .await
+            .expect("foreign response pending request lookup should succeed")
+            .expect("foreign response must not consume the pending request")
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
 
     processor
         .process_request_for_connection(
@@ -28386,9 +30785,11 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
         test_tool_loop_config(),
     );
 
-    seed_cli_runtime_approval_turn(
+    seed_cli_runtime_approval_turn_for_runtime(
         crud_store.as_ref(),
         workspace_id.as_str(),
+        "claude",
+        "claude",
         "thread_cli_native_cancel",
         "turn_cli_native_cancel",
         "claude-thread-native-cancel",
@@ -28487,7 +30888,7 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
-        session_manager,
+        session_manager.clone(),
         workspace_manager,
         crud_store,
         test_gateway_secrets(),
@@ -28495,6 +30896,28 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
         test_context_budget(),
         test_tool_loop_config(),
     );
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_native_permission",
+        "turn_native_permission",
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        "thread_native_permission",
+        "turn_native_permission",
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        "thread_native_permission",
+    )
+    .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
     processor
@@ -28528,6 +30951,44 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
     assert_eq!(
         opened_params["request"]["action"],
         serde_json::json!("shell_command")
+    );
+
+    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
+    foreign_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S00000000000000000002").expect("foreign session id");
+    let foreign_connection_id = session_manager
+        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .await
+        .expect("foreign test session should register");
+    session_manager
+        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
+        .await;
+    let foreign_response_id = "permissionforeign0001";
+    processor
+        .process_request_for_connection(
+            foreign_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": foreign_response_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": "perm-approval-request-1",
+                    "resolution": "allow_for_turn"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let foreign_response = recv_error_by_id(&mut foreign_rx, foreign_response_id).await;
+    assert_eq!(foreign_response.error.message, "not_found");
+    assert!(
+        processor
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .contains_key("perm-approval-request-1"),
+        "foreign session must not consume the legitimate pending request"
     );
 
     let respond_payload = json!({
@@ -28607,6 +31068,27 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         root_turn_id,
     )
     .await;
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        child_thread_id,
+        child_turn_id,
+    )
+    .await;
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        grandchild_thread_id,
+        grandchild_turn_id,
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        grandchild_thread_id,
+    )
+    .await;
     processor
         .crud_store
         .append_task_event(
@@ -28649,6 +31131,14 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         )
         .await
         .expect("grandchild task lineage should persist");
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        root_thread_id,
+        grandchild_turn_id,
+    )
+    .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
     processor
@@ -28778,6 +31268,28 @@ async fn native_permission_request_cancellation_resolves_and_removes_pending_req
         test_context_budget(),
         test_tool_loop_config(),
     );
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_native_permission_cancelled",
+        "turn_native_permission_cancelled",
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        "thread_native_permission_cancelled",
+        "turn_native_permission_cancelled",
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        "thread_native_permission_cancelled",
+    )
+    .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
     processor
@@ -28874,11 +31386,7 @@ async fn cli_runtime_request_respond_rejects_stale_request_ids() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "cliruntime_reqstale01").await;
-    assert!(
-        error.error.message.contains("unknown or stale"),
-        "stale request error should be explicit: {}",
-        error.error.message
-    );
+    assert_eq!(error.error.message, "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -28916,7 +31424,7 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
             "command": "echo unbound"
         })),
     };
-    processor
+    crud_store
         .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
             request_id: "cli-approval-unbound-respond".to_owned(),
             runtime_id: "codex".to_owned(),
@@ -28955,11 +31463,7 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "cliruntime_unbound001").await;
-    assert!(
-        error.error.message.contains("not bound to CLI runtime"),
-        "error should mention missing turn binding: {}",
-        error.error.message
-    );
+    assert_eq!(error.error.message, "not_found");
     let pending = crud_store
         .get_cli_runtime_pending_request("cli-approval-unbound-respond")
         .await
@@ -28967,7 +31471,7 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
         .expect("pending request should exist");
     assert_eq!(
         pending.status,
-        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
     );
     assert!(cli_session.responses.lock().await.is_empty());
 }
@@ -29180,6 +31684,15 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
         )
         .await
         .expect("grandchild task lineage should persist");
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+        grandchild_turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
 
     let opened = open_test_codex_command_approval(
         &processor,
@@ -29291,18 +31804,20 @@ async fn cli_runtime_request_claude_approval_roundtrip_preserves_provider_payloa
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     seed_cli_runtime_approval_turn_for_runtime(
         crud_store.as_ref(),
@@ -29441,18 +31956,20 @@ async fn cli_runtime_request_claude_denial_blocks_provider_action() {
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     seed_cli_runtime_approval_turn_for_runtime(
         crud_store.as_ref(),
@@ -29860,11 +32377,7 @@ async fn cli_runtime_file_change_approval_rejects_stale_request_id() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "fileapproval_stale001").await;
-    assert!(
-        error.error.message.contains("unknown or stale"),
-        "stale file change approval should be explicit: {}",
-        error.error.message
-    );
+    assert_eq!(error.error.message, "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30075,11 +32588,7 @@ async fn cli_runtime_user_input_request_rejects_stale_request_id() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "userinput_stale000001").await;
-    assert!(
-        error.error.message.contains("unknown or stale"),
-        "stale user input request should be explicit: {}",
-        error.error.message
-    );
+    assert_eq!(error.error.message, "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30146,6 +32655,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -30556,18 +33066,20 @@ async fn cli_runtime_approval_processor() -> (
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     seed_cli_runtime_approval_turn(
         crud_store.as_ref(),
@@ -30646,6 +33158,15 @@ async fn seed_cli_runtime_approval_turn_for_runtime(
     native_thread_id: &str,
 ) {
     materialize_cli_runtime_approval_turn(crud_store, workspace_id, thread_id, turn_id).await;
+    persist_test_cli_execution_authorization_context(
+        crud_store,
+        workspace_id,
+        thread_id,
+        turn_id,
+        runtime_id,
+        runtime_kind,
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -30695,6 +33216,7 @@ async fn materialize_cli_runtime_approval_turn(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     };
     let turn = Turn {
@@ -31615,7 +34137,7 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_skill_binding_failure_remains_a_diagnostic_projection() {
+async fn agent_skill_binding_failure_fails_closed_before_execution() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
@@ -31669,8 +34191,8 @@ async fn agent_skill_binding_failure_remains_a_diagnostic_projection() {
         .await;
 
     assert!(
-        committed,
-        "diagnostic binding storage must not become native turn authority"
+        !committed,
+        "the persisted skill projection is part of execution authority and must fail closed"
     );
     assert!(
         crud_store
@@ -33734,9 +36256,12 @@ async fn thread_history_is_not_a_reachable_timeline_api() {
 
     let response = recv_error_by_id(&mut rx, "ccccccccccccccccccccc").await;
     assert_eq!(response.error.code, METHOD_NOT_FOUND_CODE);
+    assert_eq!(response.error.message, "method not found");
     assert!(
-        response.error.message.contains("thread/history"),
-        "error should identify removed raw timeline method"
+        !serde_json::to_string(&response)
+            .expect("serialize method-not-found response")
+            .contains("thread/history"),
+        "unmapped methods must use the same bounded non-reflecting response"
     );
 }
 
@@ -34825,6 +37350,20 @@ async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_anc
         grandchild_turn_id,
     )
     .await;
+    subscribe_test_connection_to_materialized_thread(
+        &harness.processor,
+        harness.connection_id,
+        harness.workspace_id.as_str(),
+        child_thread_id,
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        &harness.processor,
+        harness.connection_id,
+        harness.workspace_id.as_str(),
+        grandchild_thread_id,
+    )
+    .await;
     harness
         .processor
         .crud_store
@@ -34869,6 +37408,15 @@ async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_anc
         )
         .await
         .expect("grandchild task lineage should persist");
+    persist_test_cli_execution_authorization_context(
+        harness.processor.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        harness.thread_id.as_str(),
+        grandchild_turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
 
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
@@ -35178,6 +37726,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 mode: Some(ThreadMode::Agent),
                 origin_kind: None,
                 sidebar_visibility: None,
+                visibility: None,
                 agent_nickname: None,
                 agent_role: None,
             },
@@ -35239,6 +37788,15 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
         )
         .await
         .expect("live semantic turn start should persist");
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        "codex",
+        "codex",
+    )
+    .await;
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -36170,6 +38728,7 @@ fn semantic_fixture_thread(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     }
 }
@@ -36699,18 +39258,20 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone())),
+    );
 
     start_loaded_thread_and_turn_for_cli_runtime_test(
         &processor,
@@ -36719,6 +39280,15 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
         workspace_id.as_str(),
         "thread_cli_blocked_respond",
         "turn_cli_blocked_respond",
+    )
+    .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_blocked_respond",
+        "turn_cli_blocked_respond",
+        "codex",
+        "codex",
     )
     .await;
 
@@ -36825,18 +39395,20 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     let thread_id = "thread_cli_completed_pending_cleanup";
     let turn_id = "turn_cli_completed_pending_cleanup";
@@ -36989,18 +39561,20 @@ async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_sess
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     let thread_id = "thread_cli_no_active_session_respond";
     let turn_id = "codex-turn-no-active-session-respond";
@@ -37103,18 +39677,20 @@ async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thre
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone())),
+    );
 
     let thread_id = "thread_cli_mismatched_native_thread_respond";
     let turn_id = "codex-turn-respond-active";
@@ -37419,6 +39995,15 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
         turn_id,
     )
     .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -37575,6 +40160,15 @@ async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_nativ
         turn_id,
     )
     .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "claude",
+        "claude",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -37719,6 +40313,15 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
         workspace_id.as_str(),
         thread_id,
         turn_id,
+    )
+    .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex",
+        "codex",
     )
     .await;
 
@@ -39270,7 +41873,12 @@ Gateway skill body"#,
     );
     assert!(dynamic_result.content.contains("gw-shell-ok"));
 
-    let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _turn_completed = recv_notification_by_method_timeout(
+        &mut rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(10),
+    )
+    .await;
     let history = crud_store_for_assert
         .get_thread_history("thr_000000000000000130", Some(64))
         .await
@@ -39954,6 +42562,19 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         "same-label",
     )
     .await;
+    crud_store
+        .upsert_workspace_skill_policy(
+            &WorkspaceSkillPolicyRecord {
+                id: "p".repeat(21),
+                workspace_id: workspace_id.clone(),
+                skill_id: first_id.clone(),
+                enabled: Some(true),
+                allow_implicit_invocation: Some(false),
+            },
+            1_900_700_000,
+        )
+        .await
+        .expect("seed exact Member skill policy");
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -39983,6 +42604,51 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
             .await
             .expect("each duplicate label must resolve by its own exact ID");
     }
+    let allowed_member_capability = TurnCapability {
+        id: pioneer_protocol::skill_capability_key(&first_id),
+        kind: TurnCapabilityKind::Skill {
+            skill_id: first_id.clone(),
+            pack_id: None,
+        },
+        label: None,
+    };
+    processor
+        .enforce_member_skill_capability_projection(
+            workspace_id.as_str(),
+            std::slice::from_ref(&allowed_member_capability),
+        )
+        .await
+        .expect("explicit workspace policy must admit the exact installed skill");
+    let denied_member_capability = TurnCapability {
+        id: pioneer_protocol::skill_capability_key(&second_id),
+        kind: TurnCapabilityKind::Skill {
+            skill_id: second_id.clone(),
+            pack_id: None,
+        },
+        label: None,
+    };
+    assert!(
+        processor
+            .enforce_member_skill_capability_projection(
+                workspace_id.as_str(),
+                std::slice::from_ref(&denied_member_capability),
+            )
+            .await
+            .is_err(),
+        "global catalog availability must not replace explicit workspace policy"
+    );
+    let mut spoofed_member_capability = allowed_member_capability;
+    spoofed_member_capability.id = "skill:/private/skill/archive".to_owned();
+    assert!(
+        processor
+            .enforce_member_skill_capability_projection(
+                workspace_id.as_str(),
+                std::slice::from_ref(&spoofed_member_capability),
+            )
+            .await
+            .is_err(),
+        "raw path-like IDs must not enter the Member skill projection"
+    );
 
     let unavailable = TurnCapability {
         id: format!("skill:{unavailable_id}"),
@@ -44676,6 +47342,8 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
+    let crud_store = Arc::new(CrudStore::new(connection.clone()));
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
     let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
     let workspaces = workspace_manager
         .list_workspaces()
@@ -44689,11 +47357,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
         .expect("default workspace should exist after bootstrap")
         .id
         .clone();
-    (
-        workspace_manager,
-        Arc::new(CrudStore::new(connection)),
-        workspace_id,
-    )
+    (workspace_manager, crud_store, workspace_id)
 }
 
 async fn setup_workspace_message_processor() -> (
@@ -44815,6 +47479,7 @@ fn phase_13_test_thread(
         sidebar_visibility: ThreadSidebarVisibility::Visible,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     }
 }
@@ -45973,6 +48638,7 @@ fn memory_tool_context(harness: &MemoryGatewayHarness, turn_suffix: &str) -> Mem
         input_text: "phase09 memory tool test".to_owned(),
         task_id: None,
         agent_id: Some("phase09-agent".to_owned()),
+        principal_id: None,
     }
 }
 
@@ -46782,24 +49448,23 @@ async fn memory_provider_recall_calls_memory_service() {
         crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
     let recall_context = memory_tool_context(&harness, "provider_recall");
     let thread_start_id = memory_request_id("providerthread");
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": thread_start_id.as_str(),
+        "method": "thread/start",
+        "params": {
+            "thread_id": recall_context.thread_id.clone(),
+            "workspace_id": harness.workspace_id.clone(),
+            "model": "test-model",
+            "model_provider": "openai",
+            "mode": "Agent"
+        }
+    });
     harness
         .processor
-        .thread_start(
-            &request_context,
-            thread_start_id.clone(),
-            ThreadStartParams {
-                thread_id: recall_context.thread_id.clone(),
-                workspace_id: harness.workspace_id.clone(),
-                name: None,
-                model: Some("test-model".to_owned()),
-                model_provider: Some("openai".to_owned()),
-                sandbox: None,
-                mode: Some(pioneer_protocol::ThreadMode::Agent),
-                origin_kind: None,
-                sidebar_visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
+        .process_request_for_connection(
+            harness.connection_id,
+            thread_start_request.to_string().as_str(),
         )
         .await;
     let (thread_response, _) = recv_response_and_notification_by_id_method(
@@ -47058,6 +49723,7 @@ async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
                 sidebar_visibility: ThreadSidebarVisibility::Visible,
                 agent_nickname: None,
                 agent_role: None,
+                visibility: None,
                 turns: Vec::new(),
             },
             pioneer_protocol::PersistedActorRef::System,
@@ -48197,8 +50863,17 @@ async fn recv_notification_by_method(
     rx: &mut mpsc::Receiver<Message>,
     method: &str,
 ) -> JsonRpcNotification {
+    recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
+}
+
+async fn recv_notification_by_method_timeout(
+    rx: &mut mpsc::Receiver<Message>,
+    method: &str,
+    wait_for: Duration,
+) -> JsonRpcNotification {
+    let context = format!("notification method `{method}`");
     for _ in 0..200 {
-        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
+        let payload = recv_text_timeout_context(rx, wait_for, context.as_str()).await;
         let value: serde_json::Value =
             serde_json::from_str(&payload).expect("json-rpc payload should decode");
         if value.get("id").is_none()

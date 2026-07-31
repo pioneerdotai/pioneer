@@ -1493,6 +1493,7 @@ mod tests {
             sidebar_visibility,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }

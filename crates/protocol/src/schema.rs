@@ -34,16 +34,17 @@ use crate::artifact::{
 };
 
 use crate::{
-    AgentDurableEvent, AgentExecutionBackend, AgentMessagePhase, AgentProgressEvent,
-    BackendSecurityCapabilities, ByteRange, CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy,
-    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
-    CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
-    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
-    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
-    CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
-    CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams,
-    CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
-    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    AccessChangeKind, AccessChangedNotification, AgentDurableEvent, AgentExecutionBackend,
+    AgentMessagePhase, AgentProgressEvent, AuthMeResponse, BackendSecurityCapabilities, ByteRange,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CLIRuntimeAccountUpdatedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams, CLIRuntimeGetResponse,
+    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
+    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeLoginStartType,
+    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeProxyDeleteParams,
+    CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse,
+    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
     CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
     CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
@@ -118,7 +119,7 @@ use crate::{
     ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
     ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
     ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    ProviderTranscriptionModelMetadata, ProviderTransportKind, RuntimeAccountSnapshot,
+    ProviderTranscriptionModelMetadata, ProviderTransportKind, RoleKey, RuntimeAccountSnapshot,
     RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SandboxBackendKind, SandboxBackendRequirement,
     SandboxMode, SandboxPolicy, SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem,
@@ -186,11 +187,14 @@ use crate::{
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
     ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadMode, ThreadMoveParams,
-    ThreadMoveResponse, ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility,
-    ThreadStartParams, ThreadStartResponse, ThreadStartedNotification, ThreadStatus,
-    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
-    ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse,
-    ThreadUpdatedNotification, ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    ThreadMoveResponse, ThreadOriginKind, ThreadParticipantChangeKind,
+    ThreadParticipantMutationParams, ThreadParticipantSummary,
+    ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
+    ThreadParticipantsResponse, ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ThreadVisibility, ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolOutputPolicySnapshot,
     ToolOutputSummary, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
@@ -250,6 +254,12 @@ macro_rules! schema_doc {
 
 pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
     vec![
+        schema_doc!("access_change_kind.json", AccessChangeKind),
+        schema_doc!(
+            "access_changed_notification.json",
+            AccessChangedNotification
+        ),
+        schema_doc!("auth_me_response.json", AuthMeResponse),
         schema_doc!("agent_durable_event.json", AgentDurableEvent),
         schema_doc!("agent_progress_event.json", AgentProgressEvent),
         schema_doc!("durable_event_causality_key.json", DurableEventCausalityKey),
@@ -277,6 +287,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             TurnPermissionAuditRequestKey
         ),
         schema_doc!("turn_rejected_capability.json", TurnRejectedCapability),
+        schema_doc!("role_key.json", RoleKey),
         schema_doc!("workspace.json", Workspace),
         schema_doc!("workspace_list_params.json", WorkspaceListParams),
         schema_doc!("workspace_list_response.json", WorkspaceListResponse),
@@ -664,6 +675,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             ThreadEpisodicRecallOutput
         ),
         schema_doc!("thread.json", Thread),
+        schema_doc!("thread_visibility.json", ThreadVisibility),
         schema_doc!("thread_status.json", ThreadStatus),
         schema_doc!("thread_mode.json", ThreadMode),
         schema_doc!("thread_origin_kind.json", ThreadOriginKind),
@@ -674,6 +686,27 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("thread_tree_response.json", ThreadTreeResponse),
         schema_doc!("thread_update_params.json", ThreadUpdateParams),
         schema_doc!("thread_update_response.json", ThreadUpdateResponse),
+        schema_doc!(
+            "thread_participants_list_params.json",
+            ThreadParticipantsListParams
+        ),
+        schema_doc!(
+            "thread_participant_mutation_params.json",
+            ThreadParticipantMutationParams
+        ),
+        schema_doc!("thread_participant_summary.json", ThreadParticipantSummary),
+        schema_doc!(
+            "thread_participants_response.json",
+            ThreadParticipantsResponse
+        ),
+        schema_doc!(
+            "thread_participant_change_kind.json",
+            ThreadParticipantChangeKind
+        ),
+        schema_doc!(
+            "thread_participants_changed_notification.json",
+            ThreadParticipantsChangedNotification
+        ),
         schema_doc!("thread_get_params.json", ThreadGetParams),
         schema_doc!("thread_get_response.json", ThreadGetResponse),
         schema_doc!("thread_history_event.json", ThreadHistoryEvent),

@@ -666,16 +666,13 @@ impl ComposerCapabilityKind {
         match self {
             Self::Skill { skill_id, .. } => pioneer_protocol::skill_capability_key(skill_id),
             Self::McpServer { name, scope_kind } => {
-                format!("mcp-server:{}:{name}", scope_kind.as_str())
+                pioneer_protocol::mcp_server_capability_key(*scope_kind, name)
             }
             Self::McpTool {
                 server_name,
                 raw_tool_name,
                 scope_kind,
-            } => format!(
-                "mcp-tool:{}:{server_name}:{raw_tool_name}",
-                scope_kind.as_str()
-            ),
+            } => pioneer_protocol::mcp_tool_capability_key(*scope_kind, server_name, raw_tool_name),
         }
     }
 }

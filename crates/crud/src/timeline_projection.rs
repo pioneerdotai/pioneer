@@ -793,6 +793,7 @@ mod tests {
             permission_profile_snapshot_json: None,
             execution_security_snapshot_version: None,
             execution_security_snapshot_json: None,
+            execution_authorization_context_json: None,
         }
     }
 

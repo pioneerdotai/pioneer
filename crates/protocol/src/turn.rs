@@ -1340,7 +1340,18 @@ impl<'de> Deserialize<'de> for TurnCapability {
         let expected = match &wire.kind {
             TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_capability_key(skill_id)),
             TurnCapabilityKind::SkillPack { pack_id } => Some(skill_pack_capability_key(pack_id)),
-            TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => None,
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                Some(mcp_server_capability_key(*scope_kind, name))
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => Some(mcp_tool_capability_key(
+                *scope_kind,
+                server_name,
+                raw_tool_name,
+            )),
         };
         if let Some(expected) = expected
             && wire.id != expected
@@ -1365,6 +1376,23 @@ pub fn skill_capability_key(skill_id: &SkillId) -> String {
 /// Builds the canonical internal key for a selected skill pack capability.
 pub fn skill_pack_capability_key(pack_id: &SkillPackId) -> String {
     format!("skill_pack:{pack_id}")
+}
+
+/// Builds the canonical internal key for a selected MCP server.
+pub fn mcp_server_capability_key(scope_kind: McpScopeKind, name: &str) -> String {
+    format!("mcp-server:{}:{name}", scope_kind.as_str())
+}
+
+/// Builds the canonical internal key for a selected MCP tool.
+pub fn mcp_tool_capability_key(
+    scope_kind: McpScopeKind,
+    server_name: &str,
+    raw_tool_name: &str,
+) -> String {
+    format!(
+        "mcp-tool:{}:{server_name}:{raw_tool_name}",
+        scope_kind.as_str()
+    )
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -5442,6 +5470,30 @@ mod tests {
         assert_eq!(encoded["capabilities"][0]["kind"]["type"], "skill");
         assert_eq!(encoded["capabilities"][1]["kind"]["type"], "mcpServer");
         assert_eq!(encoded["capabilities"][2]["kind"]["type"], "mcpTool");
+    }
+
+    #[test]
+    fn mcp_capability_ids_must_match_exact_server_and_tool_identity() {
+        let spoofed_server = serde_json::from_value::<TurnCapability>(json!({
+            "id": "mcp-server:workspace:other",
+            "kind": {
+                "type": "mcpServer",
+                "name": "browser",
+                "scopeKind": "workspace"
+            }
+        }));
+        assert!(spoofed_server.is_err());
+
+        let spoofed_tool = serde_json::from_value::<TurnCapability>(json!({
+            "id": "mcp-tool:workspace:browser:delete",
+            "kind": {
+                "type": "mcpTool",
+                "serverName": "browser",
+                "rawToolName": "open",
+                "scopeKind": "workspace"
+            }
+        }));
+        assert!(spoofed_tool.is_err());
     }
 
     #[test]

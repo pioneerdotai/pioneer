@@ -23,6 +23,12 @@
       "$ref": "#/$defs/ThreadAgentsDocSaveReason",
       "default": "autosave"
     },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "workspace_id": {
       "type": "string"
     }

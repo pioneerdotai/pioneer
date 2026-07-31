@@ -120,6 +120,7 @@ pub struct AgentMemoryListFilter {
     pub include_expired: bool,
     pub include_deleted: bool,
     pub include_superseded: bool,
+    pub allowed_source_thread_ids: Option<Vec<String>>,
     pub limit: Option<u64>,
 }
 
@@ -232,6 +233,7 @@ pub struct AgentMemoryCandidateListFilter {
     pub workspace_guard: Option<MemoryWorkspaceGuard>,
     pub categories: Vec<MemoryCategory>,
     pub statuses: Vec<MemoryCandidateStatus>,
+    pub allowed_source_thread_ids: Option<Vec<String>>,
     pub limit: Option<u64>,
 }
 

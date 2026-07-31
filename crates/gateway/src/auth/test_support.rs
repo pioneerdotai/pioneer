@@ -147,6 +147,10 @@ impl IsolatedAuthRuntime {
         &self.config_path
     }
 
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
     pub(crate) fn safe_summary(&self) -> String {
         format!(
             "config={} runtime_home={} database={} listen_addr=127.0.0.1:0",
@@ -244,7 +248,15 @@ pub(crate) async fn populated_epic2_database() -> PopulatedEpic2Database {
     Migrator::up(&database, Some(migration_count))
         .await
         .expect("apply migrations through Epic 2");
-    crate::bootstrap::bootstrap(&database)
+    database
+        .execute_unprepared(
+            "INSERT INTO workspace(\
+                id,name,is_active,is_current,created_at,updated_at\
+             ) VALUES(\
+                '000000000000000000000','Default Workspace',1,1,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             )",
+        )
         .await
         .expect("populate default Gateway workspace");
     database

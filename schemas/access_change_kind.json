@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AccessChangeKind",
+  "description": "Payload-safe reason for invalidating client authorization-derived state.\n\nThis vocabulary deliberately contains no protected resource metadata or\npolicy-engine details.",
+  "type": "string",
+  "enum": [
+    "workspace_membership",
+    "thread_created",
+    "thread_visibility",
+    "thread_participant_added",
+    "thread_participant_removed"
+  ]
+}

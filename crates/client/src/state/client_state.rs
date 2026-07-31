@@ -62,6 +62,11 @@ pub struct GatewayClientState {
     pub connection_epoch: u64,
     pub ws_connection_id: Option<u64>,
     pub bootstrap_complete: bool,
+    /// Highest access invalidation observed for the current endpoint.
+    ///
+    /// This is an ephemeral ordering marker, never a cached authorization
+    /// grant, and must be reset when the endpoint changes.
+    pub authorization_revision: Option<u64>,
     pub settings: Option<GatewaySettingsSnapshot>,
     pub settings_loading: bool,
     pub settings_error: Option<String>,

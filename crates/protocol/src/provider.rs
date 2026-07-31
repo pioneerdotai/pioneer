@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // --- Provider list ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -18,7 +22,7 @@ pub struct ProviderSummary {
     pub name: String,
     #[serde(default)]
     pub capabilities: ProviderSummaryCapabilities,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub api_key_configured: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,

@@ -1,6 +1,110 @@
 use super::*;
+use crate::authorization::ResourceAction;
+
+fn task_authorization_unavailable(
+    request_id: RequestId,
+    action: ResourceAction,
+    resource_kind: &'static str,
+    audit_class: &'static str,
+) -> JsonRpcErrorResponse {
+    crate::authorization::record_authorization_unavailable(
+        action.safe_name(),
+        resource_kind,
+        audit_class,
+    );
+    crate::authorization::AuthorizationExternalError::Unavailable.response(request_id)
+}
 
 impl MessageProcessor {
+    async fn require_member_task_proof(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        proof: Option<&crate::authorization::AuthorizedTask>,
+        expected_task_id: &str,
+        expected_action: ResourceAction,
+    ) -> bool {
+        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+            return true;
+        }
+        if proof.is_some_and(|proof| {
+            proof.task_id() == expected_task_id && proof.action() == expected_action
+        }) {
+            return true;
+        }
+        self.send_error(
+            request_context.connection_id(),
+            crate::authorization::AuthorizationExternalError::NotFound.response(request_id.clone()),
+        )
+        .await;
+        false
+    }
+
+    async fn require_member_task_batch_proof(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        proofs: Option<&[crate::authorization::AuthorizedTask]>,
+        params: &TaskWaitParams,
+        expected_action: ResourceAction,
+    ) -> bool {
+        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+            return true;
+        }
+        let Some(proofs) = proofs else {
+            self.send_error(
+                request_context.connection_id(),
+                crate::authorization::AuthorizationExternalError::NotFound
+                    .response(request_id.clone()),
+            )
+            .await;
+            return false;
+        };
+        if !proofs.is_empty()
+            && proofs.iter().all(|proof| proof.action() == expected_action)
+            && params
+                .task_ids
+                .iter()
+                .all(|task_id| proofs.iter().any(|proof| proof.task_id() == task_id))
+        {
+            return true;
+        }
+        self.send_error(
+            request_context.connection_id(),
+            crate::authorization::AuthorizationExternalError::NotFound.response(request_id.clone()),
+        )
+        .await;
+        false
+    }
+
+    async fn task_root_access_filter(
+        &self,
+        request_context: &RequestContext,
+        workspace_id: &str,
+    ) -> anyhow::Result<Option<pioneer_crud::TaskRootAccessFilter>> {
+        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+            return Ok(None);
+        }
+        let threads = pioneer_crud::list_accessible_threads_for_principal(
+            &self.crud_store.database_connection(),
+            &request_context.principal().principal_id,
+            workspace_id,
+            u64::MAX,
+        )
+        .await?;
+        Ok(Some(pioneer_crud::TaskRootAccessFilter {
+            allowed_root_thread_ids: threads.into_iter().map(|thread| thread.id).collect(),
+        }))
+    }
+
+    fn task_mutation_context(
+        request_context: &RequestContext,
+    ) -> pioneer_tasks::TaskMutationContext {
+        pioneer_tasks::TaskMutationContext::user(
+            request_context.principal().principal_id.to_string(),
+        )
+    }
+
     pub(crate) async fn task_create_context_for_params(
         &self,
         params: &TaskCreateParams,
@@ -101,11 +205,74 @@ impl MessageProcessor {
     pub(super) async fn task_create(
         &self,
         request_context: &RequestContext,
+        authorized_thread: Option<&crate::authorization::AuthorizedThread>,
         request_id: RequestId,
-        params: TaskCreateParams,
+        mut params: TaskCreateParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.task_create_context_for_params(&params).await {
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            let Some(authorized_thread) = authorized_thread else {
+                self.send_error(
+                    connection_id,
+                    task_authorization_unavailable(
+                        request_id,
+                        ResourceAction::TaskRun,
+                        "thread",
+                        "execution",
+                    ),
+                )
+                .await;
+                return;
+            };
+            if authorized_thread.action() != ResourceAction::TaskRun {
+                self.send_error(
+                    connection_id,
+                    crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            params.workspace_id = authorized_thread.workspace_id().to_owned();
+            params.created_by_thread_id = Some(authorized_thread.thread_id().to_owned());
+            params.owner_kind = pioneer_protocol::TaskOwnerKind::User;
+            params.owner_id = Some(request_context.principal().principal_id.to_string());
+            if let Some(turn_id) = params.created_by_turn_id.as_deref() {
+                match self
+                    .crud_store
+                    .get_turn(authorized_thread.thread_id(), turn_id)
+                    .await
+                {
+                    Ok(Some((workspace_id, _)))
+                        if workspace_id == authorized_thread.workspace_id() => {}
+                    Ok(_) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                "task creator turn does not belong to the authorized initiating thread",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_authorization_unavailable(
+                                request_id,
+                                ResourceAction::TaskRun,
+                                "turn",
+                                "execution",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        }
+        let mut context = match self.task_create_context_for_params(&params).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_error(
@@ -120,6 +287,7 @@ impl MessageProcessor {
                 return;
             }
         };
+        context.actor_id = Some(request_context.principal().principal_id.to_string());
         match message_future(self.task_runtime.service().create_task(context, params)).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -142,9 +310,22 @@ impl MessageProcessor {
     pub(super) async fn task_get(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskGetParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task(params).await {
             Ok(response_payload) => {
@@ -172,7 +353,35 @@ impl MessageProcessor {
         params: TaskListParams,
     ) {
         let connection_id = request_context.connection_id();
-        match self.task_runtime.service().list_tasks(params).await {
+        let access = match self
+            .task_root_access_filter(request_context, params.workspace_id.as_str())
+            .await
+        {
+            Ok(access) => access,
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    task_authorization_unavailable(
+                        request_id,
+                        ResourceAction::TaskRead,
+                        "task",
+                        "read",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let response = match access.as_ref() {
+            Some(access) => {
+                self.task_runtime
+                    .service()
+                    .list_tasks_scoped(params, access)
+                    .await
+            }
+            None => self.task_runtime.service().list_tasks(params).await,
+        };
+        match response {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
@@ -194,9 +403,22 @@ impl MessageProcessor {
     pub(super) async fn task_tree(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskTreeTaskParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task_tree(params).await {
             Ok(response_payload) => {
@@ -220,9 +442,22 @@ impl MessageProcessor {
     pub(super) async fn task_events(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskEventsParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match self.task_runtime.service().get_task_events(params).await {
             Ok(response_payload) => {
@@ -246,9 +481,22 @@ impl MessageProcessor {
     pub(super) async fn task_wait(
         &self,
         request_context: &RequestContext,
+        authorized_tasks: Option<&[crate::authorization::AuthorizedTask]>,
         request_id: RequestId,
         params: TaskWaitParams,
     ) {
+        if !self
+            .require_member_task_batch_proof(
+                request_context,
+                &request_id,
+                authorized_tasks,
+                &params,
+                ResourceAction::TaskRead,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match self
             .task_runtime
@@ -277,12 +525,24 @@ impl MessageProcessor {
     pub(super) async fn task_accept(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskAcceptParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
-        let context =
-            pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
+        let context = Self::task_mutation_context(request_context);
         match message_future(
             self.task_runtime
                 .service()
@@ -311,12 +571,24 @@ impl MessageProcessor {
     pub(super) async fn task_revise(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskReviseParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
-        let context =
-            pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
+        let context = Self::task_mutation_context(request_context);
         let response_payload = match message_future(
             self.task_runtime
                 .service()
@@ -357,14 +629,27 @@ impl MessageProcessor {
     pub(super) async fn task_cancel(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskCancelParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
-                .cancel_task(pioneer_tasks::TaskMutationContext::default(), params),
+                .cancel_task(Self::task_mutation_context(request_context), params),
         )
         .await
         {
@@ -389,14 +674,27 @@ impl MessageProcessor {
     pub(super) async fn task_detach(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskDetachParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
-                .detach_task(pioneer_tasks::TaskMutationContext::default(), params),
+                .detach_task(Self::task_mutation_context(request_context), params),
         )
         .await
         {
@@ -421,14 +719,27 @@ impl MessageProcessor {
     pub(super) async fn task_reschedule(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskRescheduleParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
-                .reschedule_task(pioneer_tasks::TaskMutationContext::default(), params),
+                .reschedule_task(Self::task_mutation_context(request_context), params),
         )
         .await
         {
@@ -453,14 +764,27 @@ impl MessageProcessor {
     pub(super) async fn task_pause(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskPauseParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
-                .pause_task(pioneer_tasks::TaskMutationContext::default(), params),
+                .pause_task(Self::task_mutation_context(request_context), params),
         )
         .await
         {
@@ -485,14 +809,27 @@ impl MessageProcessor {
     pub(super) async fn task_resume(
         &self,
         request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
         request_id: RequestId,
         params: TaskResumeParams,
     ) {
+        if !self
+            .require_member_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskManage,
+            )
+            .await
+        {
+            return;
+        }
         let connection_id = request_context.connection_id();
         match message_future(
             self.task_runtime
                 .service()
-                .resume_task(pioneer_tasks::TaskMutationContext::default(), params),
+                .resume_task(Self::task_mutation_context(request_context), params),
         )
         .await
         {
@@ -521,7 +858,37 @@ impl MessageProcessor {
         params: TaskAgendaParams,
     ) {
         let connection_id = request_context.connection_id();
-        match message_future(self.task_runtime.service().list_agenda(params)).await {
+        let access = match self
+            .task_root_access_filter(request_context, params.workspace_id.as_str())
+            .await
+        {
+            Ok(access) => access,
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    task_authorization_unavailable(
+                        request_id,
+                        ResourceAction::TaskRead,
+                        "task",
+                        "read",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let response = match access.as_ref() {
+            Some(access) => {
+                message_future(
+                    self.task_runtime
+                        .service()
+                        .list_agenda_scoped(params, access),
+                )
+                .await
+            }
+            None => message_future(self.task_runtime.service().list_agenda(params)).await,
+        };
+        match response {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
@@ -547,7 +914,35 @@ impl MessageProcessor {
         params: TaskDeliveriesParams,
     ) {
         let connection_id = request_context.connection_id();
-        match self.task_runtime.service().list_deliveries(params).await {
+        let access = match self
+            .task_root_access_filter(request_context, params.workspace_id.as_str())
+            .await
+        {
+            Ok(access) => access,
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    task_authorization_unavailable(
+                        request_id,
+                        ResourceAction::TaskRead,
+                        "task",
+                        "read",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let response = match access.as_ref() {
+            Some(access) => {
+                self.task_runtime
+                    .service()
+                    .list_deliveries_scoped(params, access)
+                    .await
+            }
+            None => self.task_runtime.service().list_deliveries(params).await,
+        };
+        match response {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await

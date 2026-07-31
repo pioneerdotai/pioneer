@@ -20,8 +20,9 @@ const ARTIFACT_DOWNLOAD_TTL_SECS: i64 = 3600;
 #[derive(Debug, Clone)]
 pub(in crate::message) struct ArtifactDownloadSession {
     pub download_id: String,
-    pub connection_id: ConnectionId,
+    pub owner: AuthenticatedTransferOwner,
     pub workspace_id: String,
+    pub thread_id: Option<String>,
     pub artifact_id: String,
     pub artifact_version_id: String,
     pub blob_id: String,
@@ -44,19 +45,36 @@ impl ArtifactDownloadSessionManager {
         Self::default()
     }
 
-    pub async fn start(
+    #[cfg(test)]
+    pub async fn start<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         snapshot: ArtifactDownloadSnapshot,
         now: i64,
-    ) -> Result<ArtifactDownloadSession> {
+    ) -> Result<ArtifactDownloadSession>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        self.start_scoped(owner, snapshot, None, now).await
+    }
+
+    pub async fn start_scoped<O>(
+        &self,
+        owner: O,
+        snapshot: ArtifactDownloadSnapshot,
+        thread_id: Option<String>,
+        now: i64,
+    ) -> Result<ArtifactDownloadSession>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         let mut guard = self.sessions.lock().await;
         prune_expired_downloads(&mut guard, now);
         let active_for_scope = guard
             .values()
             .filter(|session| {
-                session.connection_id == connection_id
-                    && session.workspace_id == snapshot.workspace_id
+                session.owner == owner && session.workspace_id == snapshot.workspace_id
             })
             .count();
         if active_for_scope >= ARTIFACT_DOWNLOAD_MAX_CONCURRENT_DOWNLOADS as usize {
@@ -66,8 +84,9 @@ impl ArtifactDownloadSessionManager {
         let download_id = pioneer_protocol::generate_id(21);
         let session = ArtifactDownloadSession {
             download_id: download_id.clone(),
-            connection_id,
+            owner,
             workspace_id: snapshot.workspace_id,
+            thread_id,
             artifact_id: snapshot.artifact_id,
             artifact_version_id: snapshot.artifact_version_id,
             blob_id: snapshot.blob_id,
@@ -83,33 +102,39 @@ impl ArtifactDownloadSessionManager {
         Ok(session)
     }
 
-    pub async fn get(
+    pub async fn get<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         workspace_id: &str,
         download_id: &str,
         now: i64,
-    ) -> Result<ArtifactDownloadSession> {
+    ) -> Result<ArtifactDownloadSession>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         let mut guard = self.sessions.lock().await;
         prune_expired_downloads(&mut guard, now);
         let session = guard
             .get(download_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("artifact download not found"))?;
-        validate_session_owner(&session, connection_id, workspace_id, now)?;
+        validate_session_owner(&session, &owner, workspace_id, now)?;
         Ok(session)
     }
 
-    pub async fn finish(
+    pub async fn finish<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         workspace_id: &str,
         download_id: &str,
         now: i64,
-    ) -> Result<()> {
-        let session = self
-            .get(connection_id, workspace_id, download_id, now)
-            .await?;
+    ) -> Result<()>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
+        let session = self.get(&owner, workspace_id, download_id, now).await?;
         self.sessions
             .lock()
             .await
@@ -117,22 +142,41 @@ impl ArtifactDownloadSessionManager {
         Ok(())
     }
 
-    pub async fn abort(
+    pub async fn abort<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         workspace_id: &str,
         download_id: &str,
         now: i64,
-    ) -> Result<()> {
-        self.finish(connection_id, workspace_id, download_id, now)
-            .await
+    ) -> Result<()>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        self.finish(owner, workspace_id, download_id, now).await
     }
 
     pub async fn abort_connection(&self, connection_id: ConnectionId) {
         self.sessions
             .lock()
             .await
-            .retain(|_, session| session.connection_id != connection_id);
+            .retain(|_, session| session.owner.connection_id != connection_id);
+    }
+
+    pub async fn abort_connection_scope(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: Option<&str>,
+    ) -> usize {
+        let mut guard = self.sessions.lock().await;
+        let before = guard.len();
+        guard.retain(|_, session| {
+            !(session.owner.connection_id == connection_id
+                && session.workspace_id == workspace_id
+                && thread_id
+                    .is_none_or(|thread_id| session.thread_id.as_deref() == Some(thread_id)))
+        });
+        before.saturating_sub(guard.len())
     }
 
     #[cfg(test)]
@@ -145,10 +189,12 @@ impl MessageProcessor {
     pub(crate) async fn artifact_download_start(
         &self,
         request_context: &RequestContext,
+        authorization: &crate::authorization::AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactDownloadStartParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -189,9 +235,24 @@ impl MessageProcessor {
             }
         };
         let artifact = snapshot.artifact.clone();
+        if authorization.workspace_id() != snapshot.workspace_id
+            || authorization.artifact_id() != snapshot.artifact_id
+        {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let session = match self
             .artifact_downloads
-            .start(connection_id, snapshot, now_timestamp_secs())
+            .start_scoped(
+                owner,
+                snapshot,
+                authorization.thread_id().map(str::to_owned),
+                now_timestamp_secs(),
+            )
             .await
         {
             Ok(session) => session,
@@ -245,10 +306,12 @@ impl MessageProcessor {
     pub(crate) async fn artifact_download_chunk(
         &self,
         request_context: &RequestContext,
+        authorization: &crate::authorization::AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactDownloadChunkParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -268,7 +331,7 @@ impl MessageProcessor {
         let session = match self
             .artifact_downloads
             .get(
-                connection_id,
+                &owner,
                 workspace_id.as_str(),
                 params.download_id.as_str(),
                 now,
@@ -289,6 +352,16 @@ impl MessageProcessor {
                 return;
             }
         };
+        if authorization.workspace_id() != session.workspace_id
+            || authorization.artifact_id() != session.artifact_id
+        {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if let Err(error) = validate_download_range(&session, params.offset, params.len) {
             self.send_error(
                 connection_id,
@@ -377,10 +450,12 @@ impl MessageProcessor {
     pub(crate) async fn artifact_download_finish(
         &self,
         request_context: &RequestContext,
+        authorization: &crate::authorization::AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactDownloadFinishParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -396,10 +471,44 @@ impl MessageProcessor {
                 return;
             }
         };
+        let session = match self
+            .artifact_downloads
+            .get(
+                &owner,
+                workspace_id.as_str(),
+                params.download_id.as_str(),
+                now_timestamp_secs(),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!("artifact download finish failed: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if authorization.workspace_id() != session.workspace_id
+            || authorization.artifact_id() != session.artifact_id
+        {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if let Err(error) = self
             .artifact_downloads
             .finish(
-                connection_id,
+                &owner,
                 workspace_id.as_str(),
                 params.download_id.as_str(),
                 now_timestamp_secs(),
@@ -433,10 +542,12 @@ impl MessageProcessor {
     pub(crate) async fn artifact_download_abort(
         &self,
         request_context: &RequestContext,
+        authorization: &crate::authorization::AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactDownloadAbortParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -452,10 +563,44 @@ impl MessageProcessor {
                 return;
             }
         };
+        let session = match self
+            .artifact_downloads
+            .get(
+                &owner,
+                workspace_id.as_str(),
+                params.download_id.as_str(),
+                now_timestamp_secs(),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!("artifact download abort failed: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if authorization.workspace_id() != session.workspace_id
+            || authorization.artifact_id() != session.artifact_id
+        {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if let Err(error) = self
             .artifact_downloads
             .abort(
-                connection_id,
+                &owner,
                 workspace_id.as_str(),
                 params.download_id.as_str(),
                 now_timestamp_secs(),
@@ -563,11 +708,11 @@ pub(in crate::message) fn parse_artifact_download_chunk_frame(
 
 fn validate_session_owner(
     session: &ArtifactDownloadSession,
-    connection_id: ConnectionId,
+    owner: &AuthenticatedTransferOwner,
     workspace_id: &str,
     now: i64,
 ) -> Result<()> {
-    if session.workspace_id != workspace_id || session.connection_id != connection_id {
+    if session.workspace_id != workspace_id || session.owner != *owner {
         bail!("artifact download not found");
     }
     if session.expires_at <= now {
@@ -608,6 +753,22 @@ mod tests {
     use pioneer_protocol::{ArtifactKind, ArtifactRef, ArtifactStatus};
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Message;
+
+    fn authenticated_owner(
+        connection_id: ConnectionId,
+        principal_byte: char,
+        session_byte: char,
+    ) -> AuthenticatedTransferOwner {
+        AuthenticatedTransferOwner {
+            principal_id: pioneer_protocol::PrincipalId::new(principal_byte.to_string().repeat(21))
+                .expect("principal id"),
+            auth_session_id: pioneer_protocol::AuthSessionId::new(
+                session_byte.to_string().repeat(21),
+            )
+            .expect("auth session id"),
+            connection_id,
+        }
+    }
 
     #[test]
     fn artifact_download_parse_valid_frame() {
@@ -695,6 +856,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_download_session_is_principal_and_auth_session_bound() {
+        let manager = ArtifactDownloadSessionManager::new();
+        let owner = authenticated_owner(7, 'P', 'S');
+        let session = manager
+            .start(owner.clone(), snapshot("ws_a", "art_a", 5), 100)
+            .await
+            .expect("download session");
+
+        assert!(
+            manager
+                .get(
+                    authenticated_owner(7, 'Q', 'S'),
+                    "ws_a",
+                    session.download_id.as_str(),
+                    101,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .get(
+                    authenticated_owner(7, 'P', 'T'),
+                    "ws_a",
+                    session.download_id.as_str(),
+                    101,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .get(&owner, "ws_a", session.download_id.as_str(), 101)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn artifact_download_chunk_frame_reaches_registered_connection() {
         let session_manager = SessionManager::new();
         let (tx, mut rx) = mpsc::channel(2);
@@ -726,8 +926,9 @@ mod tests {
     fn artifact_download_range_validation_rejects_invalid_ranges() {
         let session = ArtifactDownloadSession {
             download_id: "dl".to_owned(),
-            connection_id: 1,
+            owner: AuthenticatedTransferOwner::from(1),
             workspace_id: "ws".to_owned(),
+            thread_id: None,
             artifact_id: "art".to_owned(),
             artifact_version_id: "av".to_owned(),
             blob_id: "blob".to_owned(),

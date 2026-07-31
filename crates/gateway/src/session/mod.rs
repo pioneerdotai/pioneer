@@ -130,7 +130,7 @@ impl SessionManager {
     pub async fn connection_ids_for_workspace(&self, workspace_id: &str) -> Vec<ConnectionId> {
         let trimmed = workspace_id.trim();
         if trimmed.is_empty() {
-            return self.connection_ids().await;
+            return Vec::new();
         }
 
         self.connections
@@ -429,6 +429,27 @@ mod tests {
             ids.is_empty(),
             "unknown workspace should not fan out to unrelated connections"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_recipient_selector_never_means_all_connections() {
+        let manager = SessionManager::new();
+        let (tx_a, _rx_a) = mpsc::channel(2);
+        let (tx_b, _rx_b) = mpsc::channel(2);
+        let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
+        let connection_b = register_authenticated_test_connection(&manager, tx_b).await;
+        manager
+            .set_connection_workspace(connection_a, Some("ws_a".to_owned()))
+            .await;
+        assert!(
+            manager.connection_ids_for_workspace("").await.is_empty(),
+            "an empty selector is no workspace, never an all-connections wildcard"
+        );
+        assert!(
+            manager.connection_ids_for_workspace("   ").await.is_empty(),
+            "a whitespace selector is no workspace, never an all-connections wildcard"
+        );
+        assert_ne!(connection_a, connection_b);
     }
 
     #[tokio::test]

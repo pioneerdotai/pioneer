@@ -123,6 +123,7 @@ pub fn agents_doc_archive_params_for_summary(
 ) -> ThreadAgentsDocArchiveParams {
     ThreadAgentsDocArchiveParams {
         workspace_id: summary.workspace_id.clone(),
+        thread_id: None,
         folder_id: folder_id.map(str::to_owned),
         expected_version: Some(summary.version),
     }

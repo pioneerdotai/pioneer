@@ -11,6 +11,9 @@ pub const PARSE_ERROR_CODE: i64 = -32700;
 pub const INVALID_REQUEST_CODE: i64 = -32600;
 pub const METHOD_NOT_FOUND_CODE: i64 = -32601;
 pub const INVALID_PARAMS_CODE: i64 = -32602;
+pub const AUTHENTICATION_TERMINAL_CODE: i64 = -32040;
+pub const FORBIDDEN_CODE: i64 = -32043;
+pub const NOT_FOUND_CODE: i64 = -32044;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -156,8 +159,9 @@ pub struct JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
-        REQUEST_ID_LEN, RequestId, RequestIdError,
+        AUTHENTICATION_TERMINAL_CODE, FORBIDDEN_CODE, JSONRPC_VERSION, JsonRpcErrorResponse,
+        JsonRpcNotification, JsonRpcResponse, NOT_FOUND_CODE, REQUEST_ID_LEN, RequestId,
+        RequestIdError,
     };
     use serde_json::json;
 
@@ -170,6 +174,15 @@ mod tests {
         assert_eq!(response.jsonrpc, JSONRPC_VERSION);
         assert_eq!(response.id, request_id);
         assert_eq!(response.result, json!({"ok": true}));
+    }
+
+    #[test]
+    fn authorization_error_codes_are_stable_and_distinct() {
+        assert_eq!(AUTHENTICATION_TERMINAL_CODE, -32040);
+        assert_eq!(FORBIDDEN_CODE, -32043);
+        assert_eq!(NOT_FOUND_CODE, -32044);
+        assert_ne!(AUTHENTICATION_TERMINAL_CODE, FORBIDDEN_CODE);
+        assert_ne!(FORBIDDEN_CODE, NOT_FOUND_CODE);
     }
 
     #[test]

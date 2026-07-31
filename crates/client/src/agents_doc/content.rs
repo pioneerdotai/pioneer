@@ -63,6 +63,7 @@ pub fn agents_doc_get_params(
 ) -> ThreadAgentsDocGetParams {
     ThreadAgentsDocGetParams {
         workspace_id: workspace_id.to_owned(),
+        thread_id: None,
         folder_id: folder_id.map(str::to_owned),
     }
 }
@@ -76,6 +77,7 @@ pub fn agents_doc_save_params(
 ) -> ThreadAgentsDocSaveParams {
     ThreadAgentsDocSaveParams {
         workspace_id: workspace_id.to_owned(),
+        thread_id: None,
         folder_id: folder_id.map(str::to_owned),
         content: agents_doc_normalize_content(content),
         expected_version,

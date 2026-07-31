@@ -9,6 +9,7 @@ use pioneer_memory::{
     InMemoryMemoryBackend, MemoryBackend, MemoryModeRecallParams, MemoryOperationContext,
     MemoryQuarantineRequest, MemoryReadPolicy, MemoryRecallMode, MemoryRecallParams,
     MemoryRecallTarget, MemoryRestoreRequest, MemoryService, MemoryServiceConfig,
+    MemorySourceAccessPolicy,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
@@ -2756,6 +2757,282 @@ async fn forget_tombstone_suppresses_stale_backend_search_hit() {
         .await
         .expect("service get");
     assert!(service_get.record.is_none());
+}
+
+#[tokio::test]
+async fn member_memory_write_requires_accessible_normal_thread_provenance() {
+    let (_store, _backend, service) = setup_service().await;
+    let member_context = MemoryOperationContext {
+        workspace_id: Some("ws_member_memory".to_owned()),
+        thread_id: Some("thread_allowed".to_owned()),
+        actor: Some(MemoryActor {
+            kind: MemoryActorKind::User,
+            id: Some("member_a".to_owned()),
+        }),
+        now_unix: Some(410),
+        allow_global_user: false,
+        allow_global_agent: false,
+        read_policy: Some(MemoryReadPolicy {
+            allow_normal: true,
+            allow_personal: false,
+            allow_secret_like: false,
+            allow_regulated: false,
+        }),
+        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_allowed".to_owned()]),
+        ..MemoryOperationContext::default()
+    };
+    let mut allowed = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+        Some("member.allowed"),
+        "Member memory has authoritative accessible provenance.",
+    );
+    allowed.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_allowed".to_owned()),
+        source_turn_id: Some("turn_allowed".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    service
+        .remember(member_context.clone(), allowed)
+        .await
+        .expect("accessible normal memory should be accepted");
+
+    let missing_provenance = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+        Some("member.missing"),
+        "Missing provenance must be rejected.",
+    );
+    assert!(
+        service
+            .remember(member_context.clone(), missing_provenance)
+            .await
+            .is_err()
+    );
+
+    let mut inaccessible = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+        Some("member.inaccessible"),
+        "Inaccessible source provenance must be rejected.",
+    );
+    inaccessible.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_private".to_owned()),
+        source_turn_id: Some("turn_private".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    assert!(
+        service
+            .remember(member_context.clone(), inaccessible)
+            .await
+            .is_err()
+    );
+
+    let mut personal = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+        Some("member.personal"),
+        "Personal content must be rejected.",
+    );
+    personal.sensitivity = Some(MemorySensitivity::Personal);
+    personal.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_allowed".to_owned()),
+        source_turn_id: Some("turn_allowed".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    assert!(
+        service
+            .remember(member_context.clone(), personal)
+            .await
+            .is_err()
+    );
+
+    let mut foreign_workspace = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_private"),
+        Some("member.foreign"),
+        "Member writes must remain in the authorized workspace.",
+    );
+    foreign_workspace.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_allowed".to_owned()),
+        source_turn_id: Some("turn_allowed".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    assert!(
+        service
+            .remember(member_context.clone(), foreign_workspace)
+            .await
+            .is_err()
+    );
+
+    let mut user_scope = remember_params(
+        scope(MemoryScopeKind::User, "member_a"),
+        Some("member.user_scope"),
+        "Member personal scope must be rejected.",
+    );
+    user_scope.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_allowed".to_owned()),
+        source_turn_id: Some("turn_allowed".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    assert!(service.remember(member_context, user_scope).await.is_err());
+}
+
+#[tokio::test]
+async fn member_memory_cannot_supersede_an_inaccessible_record() {
+    let (store, _backend, service) = setup_service().await;
+    let mut private = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_private"),
+        Some("private.fact"),
+        "Private workspace memory.",
+    );
+    private.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_private".to_owned()),
+        source_turn_id: Some("turn_private".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    let private = service
+        .remember(workspace_context("ws_private", 411), private)
+        .await
+        .expect("seed private memory");
+
+    let member_context = MemoryOperationContext {
+        workspace_id: Some("ws_member_memory".to_owned()),
+        thread_id: Some("thread_allowed".to_owned()),
+        now_unix: Some(412),
+        read_policy: Some(MemoryReadPolicy {
+            allow_normal: true,
+            allow_personal: false,
+            allow_secret_like: false,
+            allow_regulated: false,
+        }),
+        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_allowed".to_owned()]),
+        ..MemoryOperationContext::default()
+    };
+    let mut replacement = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+        Some("member.replacement"),
+        "Authorized workspace replacement.",
+    );
+    replacement.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_allowed".to_owned()),
+        source_turn_id: Some("turn_allowed".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    replacement.supersedes = Some(private.record.id.clone());
+
+    assert!(service.remember(member_context, replacement).await.is_err());
+    let private_row = store
+        .get_agent_memory_record(private.record.id.as_str(), true)
+        .await
+        .expect("load private memory")
+        .expect("private memory remains");
+    assert_eq!(private_row.status, MemoryStatus::Active);
+}
+
+#[tokio::test]
+async fn member_memory_search_and_cached_get_recheck_current_source_acl() {
+    let (_store, _backend, service) = setup_service().await;
+    let workspace_scope = scope(MemoryScopeKind::Workspace, "ws_member_recall");
+    let mut accessible = remember_params(
+        workspace_scope.clone(),
+        Some("member.visible"),
+        "Shared source token from an accessible thread.",
+    );
+    accessible.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_visible".to_owned()),
+        source_turn_id: Some("turn_visible".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    let accessible = service
+        .remember(workspace_context("ws_member_recall", 420), accessible)
+        .await
+        .expect("seed accessible memory");
+
+    let mut private = remember_params(
+        workspace_scope.clone(),
+        Some("member.private"),
+        "Shared source token from a private thread.",
+    );
+    private.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_private".to_owned()),
+        source_turn_id: Some("turn_private".to_owned()),
+        source_item_id: None,
+        created_by: None,
+    });
+    service
+        .remember(workspace_context("ws_member_recall", 421), private)
+        .await
+        .expect("seed private memory");
+
+    let mut missing = remember_params(
+        workspace_scope.clone(),
+        Some("member.missing"),
+        "Shared source token without provenance.",
+    );
+    missing.provenance = None;
+    service
+        .remember(workspace_context("ws_member_recall", 422), missing)
+        .await
+        .expect("seed legacy missing-provenance memory");
+
+    let member_context = MemoryOperationContext {
+        workspace_id: Some("ws_member_recall".to_owned()),
+        thread_id: Some("thread_visible".to_owned()),
+        now_unix: Some(423),
+        read_policy: Some(MemoryReadPolicy {
+            allow_normal: true,
+            allow_personal: false,
+            allow_secret_like: false,
+            allow_regulated: false,
+        }),
+        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_visible".to_owned()]),
+        ..MemoryOperationContext::default()
+    };
+    let visible = service
+        .search(
+            member_context.clone(),
+            MemorySearchParams {
+                query: "Shared source token".to_owned(),
+                scopes: vec![workspace_scope.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("member search");
+    assert_eq!(visible.hits.len(), 1);
+    assert_eq!(visible.hits[0].record.id, accessible.record.id);
+
+    let revoked_context = MemoryOperationContext {
+        source_access: MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new()),
+        ..member_context
+    };
+    let cached_search = service
+        .search(
+            revoked_context.clone(),
+            MemorySearchParams {
+                query: "Shared source token".to_owned(),
+                scopes: vec![workspace_scope],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cached search after ACL revocation");
+    assert!(cached_search.hits.is_empty());
+    let cached_get = service
+        .get(
+            revoked_context,
+            MemoryGetParams {
+                memory_id: accessible.record.id,
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("cached get after ACL revocation");
+    assert!(cached_get.record.is_none());
 }
 
 #[tokio::test]

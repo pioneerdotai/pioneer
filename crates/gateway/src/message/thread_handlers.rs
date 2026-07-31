@@ -1,101 +1,296 @@
 use super::*;
+use crate::authorization::{
+    AuthorizationExternalError, AuthorizedThread, AuthorizedWorkspace, ResourceAction,
+    record_authorization_unavailable,
+};
+use crate::thread::ThreadSubscriptionIdentity;
+use pioneer_crud::{PersistedThreadAccessClass, PrivateThreadParticipantMutation};
+use pioneer_protocol::{
+    PrincipalId, Thread, ThreadParticipantChangeKind, ThreadParticipantSummary,
+    ThreadParticipantsChangedNotification, ThreadParticipantsResponse,
+};
+
+#[derive(Clone, Debug)]
+pub(super) enum ThreadParticipantOperation {
+    List,
+    Add(PrincipalId),
+    Remove(PrincipalId),
+}
+
+fn open_only_thread_start_params(thread: &Thread) -> ThreadStartParams {
+    ThreadStartParams {
+        thread_id: thread.id.clone(),
+        workspace_id: thread.workspace_id.clone(),
+        name: None,
+        model: None,
+        model_provider: None,
+        sandbox: None,
+        mode: None,
+        origin_kind: None,
+        sidebar_visibility: None,
+        visibility: None,
+        agent_nickname: None,
+        agent_role: None,
+    }
+}
+
+fn retain_accessible_thread_placements(
+    placements: &mut Vec<pioneer_protocol::ThreadPlacement>,
+    accessible_thread_ids: &HashSet<String>,
+) {
+    placements.retain(|placement| accessible_thread_ids.contains(&placement.thread_id));
+}
+
+fn retain_accessible_thread_agents_doc_summaries(
+    summaries: &mut Vec<ThreadAgentsDocSummary>,
+    folders: &[pioneer_protocol::ThreadFolder],
+    placements: &[pioneer_protocol::ThreadPlacement],
+    accessible_thread_ids: &HashSet<String>,
+) {
+    if accessible_thread_ids.is_empty() {
+        summaries.clear();
+        return;
+    }
+
+    let folder_parents = folders
+        .iter()
+        .map(|folder| (folder.id.as_str(), folder.parent_folder_id.as_deref()))
+        .collect::<HashMap<_, _>>();
+    let mut accessible_doc_scopes = HashSet::from([None]);
+
+    for placement in placements
+        .iter()
+        .filter(|placement| accessible_thread_ids.contains(&placement.thread_id))
+    {
+        let mut folder_id = placement.folder_id.as_deref();
+        let mut visited = HashSet::new();
+        while let Some(candidate) = folder_id {
+            let Some(parent_folder_id) = folder_parents.get(candidate) else {
+                break;
+            };
+            if !visited.insert(candidate) {
+                break;
+            }
+            accessible_doc_scopes.insert(Some(candidate.to_owned()));
+            folder_id = *parent_folder_id;
+        }
+    }
+
+    summaries.retain(|summary| accessible_doc_scopes.contains(&summary.folder_id));
+}
 
 impl MessageProcessor {
-    pub(super) async fn thread_start(
+    pub(super) async fn thread_create_and_start(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedWorkspace,
         request_id: RequestId,
-        params: ThreadStartParams,
+        mut params: ThreadStartParams,
     ) {
         let connection_id = request_context.connection_id();
-        if params.thread_id.trim().is_empty() {
+        if authorization.action() != ResourceAction::ThreadCreate
+            || authorization.workspace_id() != params.workspace_id.trim()
+        {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `thread_id` is required",
-                        methods::THREAD_START
-                    ),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         }
 
-        let workspace_id = match self
-            .workspace_manager
-            .validate_workspace_id(params.workspace_id.as_str())
-            .await
-        {
-            Ok(workspace_id) => workspace_id,
-            Err(error) => {
-                let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
-                        INVALID_REQUEST_CODE,
-                        format!("failed to validate workspace for thread/start: {message}"),
-                    ),
-                    _ => (
-                        INVALID_PARAMS_CODE,
-                        format!("invalid params for `{}`: {error}", methods::THREAD_START),
-                    ),
-                };
+        let is_superuser = authorization.decision().is_absolute_superuser();
+        let access_class = match (is_superuser, params.visibility) {
+            (true, Some(ThreadVisibility::Workspace)) => PersistedThreadAccessClass::Workspace,
+            (true, Some(ThreadVisibility::Private) | None) | (false, None) => {
+                PersistedThreadAccessClass::Private
+            }
+            (false, Some(_)) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), code, message),
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        "Member-created threads must use private visibility",
+                    ),
                 )
                 .await;
                 return;
             }
         };
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
 
-        let persisted_thread = match self
-            .crud_store
-            .get_thread_model(params.thread_id.as_str())
-            .await
+        let workspace_id = authorization.workspace_id().to_owned();
+        if !is_superuser {
+            // Provider/model selection is a server-owned execution
+            // capability. A Member may use the configured defaults but
+            // cannot establish a new provider boundary through thread/create.
+            params.model = None;
+            params.model_provider = None;
+        }
+        let (mut thread, sandbox_mode) = match self
+            .thread_manager
+            .prepare_new_user_thread(workspace_id.clone(), &params)
         {
-            Ok(model) => model,
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to load thread from storage: {error:#}"),
+                        format!("failed to prepare thread: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
         };
+        thread.visibility = Some(match access_class {
+            PersistedThreadAccessClass::Private => ThreadVisibility::Private,
+            PersistedThreadAccessClass::Workspace => ThreadVisibility::Workspace,
+            PersistedThreadAccessClass::Internal => {
+                unreachable!("ordinary thread creation cannot select internal access")
+            }
+        });
 
-        if let Some(persisted_thread) = persisted_thread.as_ref()
-            && persisted_thread.workspace_id != workspace_id
-        {
+        let creator = request_context.persisted_actor();
+        let persist_result = if is_superuser {
+            self.crud_store
+                .create_superuser_thread(&thread, creator, access_class)
+                .await
+        } else {
+            self.crud_store
+                .create_member_private_thread(
+                    &thread,
+                    &request_context.principal().gateway_id,
+                    authorization.principal_id(),
+                    creator,
+                )
+                .await
+        };
+        if let Err(error) = persist_result {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: thread `{}` belongs to workspace `{}`",
-                        methods::THREAD_START,
-                        persisted_thread.id,
-                        persisted_thread.workspace_id
-                    ),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to commit thread creation: {error:#}"),
                 ),
             )
             .await;
             return;
         }
 
+        if !is_superuser {
+            self.publish_committed_authorization_invalidation(
+                AccessChangeKind::ThreadCreated,
+                Some(authorization.principal_id().clone()),
+                workspace_id.clone(),
+                Some(thread.id.clone()),
+            )
+            .await;
+        }
+
+        let outcome = self
+            .thread_manager
+            .thread_start_seeded_authenticated(
+                connection_id,
+                ThreadSubscriptionIdentity::new(
+                    request_context.principal().principal_id.clone(),
+                    request_context.principal().session_id.clone(),
+                ),
+                workspace_id.clone(),
+                open_only_thread_start_params(&thread),
+                Some(thread),
+                Some(sandbox_mode),
+            )
+            .await
+            .map_err(|error| format!("failed to publish committed thread: {error:#}"));
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, error),
+                )
+                .await;
+                return;
+            }
+        };
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id))
+            .await;
+        self.finish_thread_start(connection_id, request_id, outcome)
+            .await;
+    }
+
+    pub(super) async fn thread_open(
+        &self,
+        request_context: &RequestContext,
+        authorization: &AuthorizedThread,
+        request_id: RequestId,
+        params: ThreadStartParams,
+    ) {
+        let connection_id = request_context.connection_id();
+        if authorization.action() != ResourceAction::ThreadRead
+            || authorization.thread_id() != params.thread_id.trim()
+            || authorization.workspace_id() != params.workspace_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+        if params.visibility.is_some() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    "`visibility` is valid only when creating a missing thread",
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let persisted_thread = match self
+            .crud_store
+            .get_thread_model(authorization.thread_id())
+            .await
+        {
+            Ok(Some(thread))
+                if thread.workspace_id == authorization.workspace_id()
+                    && thread.id == authorization.thread_id() =>
+            {
+                thread
+            }
+            Ok(_) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load authorized thread: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let persisted_sandbox_mode = match self
             .crud_store
-            .get_thread_sandbox_mode(params.thread_id.as_str())
+            .get_thread_sandbox_mode(authorization.thread_id())
             .await
         {
             Ok(mode) => mode,
@@ -112,24 +307,22 @@ impl MessageProcessor {
                 return;
             }
         };
-
-        let outcome = if persisted_thread.is_none() && persisted_sandbox_mode.is_none() {
-            self.thread_manager
-                .thread_start(connection_id, workspace_id, params)
-                .await
-        } else {
-            self.thread_manager
-                .thread_start_seeded(
-                    connection_id,
-                    workspace_id,
-                    params,
-                    persisted_thread,
-                    persisted_sandbox_mode,
-                )
-                .await
-        };
-
-        let outcome = match outcome {
+        let workspace_id = authorization.workspace_id().to_owned();
+        let outcome = match self
+            .thread_manager
+            .thread_start_seeded_authenticated(
+                connection_id,
+                ThreadSubscriptionIdentity::new(
+                    request_context.principal().principal_id.clone(),
+                    request_context.principal().session_id.clone(),
+                ),
+                workspace_id.clone(),
+                open_only_thread_start_params(&persisted_thread),
+                Some(persisted_thread),
+                persisted_sandbox_mode,
+            )
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.send_error(
@@ -137,13 +330,26 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to create thread: {error:#}"),
+                        format!("failed to open authorized thread: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
         };
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id))
+            .await;
+        self.finish_thread_start(connection_id, request_id, outcome)
+            .await;
+    }
+
+    async fn finish_thread_start(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        outcome: crate::thread::ThreadStartOutcome,
+    ) {
         let replay_workspace_id = outcome.response.thread.workspace_id.clone();
         let replay_thread_id = outcome.response.thread.id.clone();
 
@@ -172,37 +378,13 @@ impl MessageProcessor {
             return;
         }
 
-        let notification = match JsonRpcNotification::from_params(
+        self.send_notification_to_authorized_thread_connections(
+            replay_thread_id.as_str(),
             events::THREAD_STARTED,
             &outcome.started_notification,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(error = %error, "failed to encode thread/started notification");
-                return;
-            }
-        };
-
-        match serde_json::to_string(&notification) {
-            Ok(payload) => {
-                for notification_connection_id in outcome.started_notification_connection_ids {
-                    if let Err(error) = self
-                        .session_manager
-                        .send_text(notification_connection_id, payload.clone())
-                        .await
-                    {
-                        warn!(
-                            connection_id = notification_connection_id,
-                            error = %format!("{error:#}"),
-                            "failed to send thread/started notification"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                error!(error = %error, "failed to serialize thread/started notification");
-            }
-        }
+            outcome.started_notification_connection_ids,
+        )
+        .await;
 
         self.replay_native_permission_requests_for_thread(
             connection_id,
@@ -215,57 +397,29 @@ impl MessageProcessor {
     pub(super) async fn thread_tree(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedWorkspace,
         request_id: RequestId,
         params: ThreadTreeParams,
     ) {
         let connection_id = request_context.connection_id();
-        if params.workspace_id.trim().is_empty() {
+        if authorization.action() != ResourceAction::WorkspaceRead
+            || authorization.workspace_id() != params.workspace_id.trim()
+        {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `workspace_id` is required",
-                        methods::THREAD_TREE
-                    ),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         }
 
-        let workspace_id = match self
-            .workspace_manager
-            .validate_workspace_id(params.workspace_id.as_str())
-            .await
-        {
-            Ok(workspace_id) => workspace_id,
-            Err(error) => {
-                let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
-                        INVALID_REQUEST_CODE,
-                        format!("failed to validate workspace for thread/tree: {message}"),
-                    ),
-                    _ => (
-                        INVALID_PARAMS_CODE,
-                        format!("invalid params for `{}`: {error}", methods::THREAD_TREE),
-                    ),
-                };
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), code, message),
-                )
-                .await;
-                return;
-            }
-        };
+        let workspace_id = authorization.workspace_id().to_owned();
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
 
         let threads = match self
-            .list_threads_snapshot_for_connection(workspace_id.as_str(), 500, connection_id)
+            .list_threads_snapshot_for_authorization(authorization, 500, connection_id)
             .await
         {
             Ok(threads) => threads,
@@ -303,7 +457,7 @@ impl MessageProcessor {
             }
         };
 
-        let placements = match self
+        let mut placements = match self
             .crud_store
             .list_thread_placements(workspace_id.as_str())
             .await
@@ -322,8 +476,13 @@ impl MessageProcessor {
                 return;
             }
         };
+        let accessible_thread_ids = threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect::<HashSet<_>>();
+        retain_accessible_thread_placements(&mut placements, &accessible_thread_ids);
 
-        let agents_docs = match self
+        let mut agents_docs = match self
             .crud_store
             .list_thread_agents_doc_summaries(workspace_id.as_str())
             .await
@@ -345,6 +504,14 @@ impl MessageProcessor {
                 return;
             }
         };
+        if !authorization.decision().is_absolute_superuser() {
+            retain_accessible_thread_agents_doc_summaries(
+                &mut agents_docs,
+                &folders,
+                &placements,
+                &accessible_thread_ids,
+            );
+        }
 
         let response_payload = ThreadTreeResponse {
             workspace_id,
@@ -382,10 +549,19 @@ impl MessageProcessor {
     pub(super) async fn thread_get(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedThread,
         request_id: RequestId,
         params: ThreadGetParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.thread_id() != params.thread_id.trim() {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -442,6 +618,14 @@ impl MessageProcessor {
             .await;
             return;
         };
+        if thread.workspace_id != authorization.workspace_id() {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         let response_payload = ThreadGetResponse { thread };
 
@@ -470,6 +654,7 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn list_threads_snapshot_for_connection(
         &self,
         workspace_id: &str,
@@ -480,6 +665,72 @@ impl MessageProcessor {
             .await
     }
 
+    async fn list_threads_snapshot_for_authorization(
+        &self,
+        authorization: &AuthorizedWorkspace,
+        limit: u64,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
+        let persisted_threads = if authorization.decision().is_absolute_superuser() {
+            self.crud_store
+                .list_threads_for_workspace(authorization.workspace_id(), limit)
+                .await?
+        } else {
+            self.crud_store
+                .list_accessible_threads_for_principal(
+                    authorization.principal_id(),
+                    authorization.workspace_id(),
+                    limit,
+                )
+                .await?
+        };
+        let allowed_ids = persisted_threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect::<HashSet<_>>();
+        let mut threads_by_id = HashMap::new();
+        for thread in persisted_threads {
+            if self
+                .thread_manager
+                .empty_draft_visibility_for_connection(thread.id.as_str(), connection_id)
+                .await
+                == Some(false)
+            {
+                continue;
+            }
+            threads_by_id.insert(thread.id.clone(), thread);
+        }
+        for thread in self
+            .thread_manager
+            .list_threads_for_workspace_visible_to(
+                authorization.workspace_id(),
+                Some(connection_id),
+            )
+            .await
+        {
+            if !authorization.decision().is_absolute_superuser()
+                && !allowed_ids.contains(thread.id.as_str())
+            {
+                continue;
+            }
+            match threads_by_id.get(thread.id.as_str()) {
+                Some(existing) if existing.updated_at >= thread.updated_at => {}
+                _ => {
+                    threads_by_id.insert(thread.id.clone(), thread);
+                }
+            }
+        }
+        let mut threads = threads_by_id.into_values().collect::<Vec<_>>();
+        threads.sort_by(|lhs, rhs| {
+            rhs.updated_at
+                .cmp(&lhs.updated_at)
+                .then_with(|| lhs.id.cmp(&rhs.id))
+        });
+        threads.truncate(limit as usize);
+        Ok(threads)
+    }
+
+    #[cfg(test)]
     async fn list_threads_snapshot_internal(
         &self,
         workspace_id: &str,
@@ -527,43 +778,43 @@ impl MessageProcessor {
     pub(super) async fn thread_update(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedThread,
         request_id: RequestId,
         params: ThreadUpdateParams,
     ) {
         let connection_id = request_context.connection_id();
-        if params.workspace_id.trim().is_empty() {
+        if authorization.action() != ResourceAction::ThreadManage
+            || authorization.workspace_id() != params.workspace_id.trim()
+            || authorization.thread_id() != params.thread_id.trim()
+        {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `workspace_id` is required",
-                        methods::THREAD_UPDATE
-                    ),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         }
 
-        if params.thread_id.trim().is_empty() {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `thread_id` is required",
-                        methods::THREAD_UPDATE
+        let name = match params.name.as_deref() {
+            Some(name) if !name.trim().is_empty() => Some(name.trim()),
+            Some(_) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: `name` must not be empty",
+                            methods::THREAD_UPDATE
+                        ),
                     ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let Some(name) = params.name.as_deref() else {
+                )
+                .await;
+                return;
+            }
+            None => None,
+        };
+        if name.is_none() && params.visibility.is_none() && params.archived.is_none() {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
@@ -577,67 +828,69 @@ impl MessageProcessor {
             )
             .await;
             return;
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `name` must not be empty",
-                        methods::THREAD_UPDATE
-                    ),
-                ),
-            )
-            .await;
-            return;
         }
 
-        let workspace_id = match self
-            .workspace_manager
-            .validate_workspace_id(params.workspace_id.as_str())
+        let workspace_id = authorization.workspace_id().to_owned();
+        let access_class = params.visibility.map(|visibility| match visibility {
+            ThreadVisibility::Private => PersistedThreadAccessClass::Private,
+            ThreadVisibility::Workspace => PersistedThreadAccessClass::Workspace,
+        });
+        let member_principal_id = (!authorization.decision().is_absolute_superuser())
+            .then(|| authorization.principal_id());
+        let changed = match self
+            .crud_store
+            .update_user_thread_management(
+                authorization.workspace_id(),
+                authorization.thread_id(),
+                member_principal_id,
+                name,
+                access_class,
+                params.archived,
+            )
             .await
         {
-            Ok(workspace_id) => workspace_id,
-            Err(error) => {
-                let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
-                        INVALID_REQUEST_CODE,
-                        format!("failed to validate workspace for thread/update: {message}"),
-                    ),
-                    _ => (
-                        INVALID_PARAMS_CODE,
-                        format!("invalid params for `{}`: {error}", methods::THREAD_UPDATE),
-                    ),
-                };
+            Ok(Some(changed)) => changed,
+            Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), code, message),
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to update authorized thread: {error:#}"),
+                    ),
                 )
                 .await;
                 return;
             }
         };
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        if changed && params.visibility.is_some() {
+            self.publish_committed_authorization_invalidation(
+                AccessChangeKind::ThreadVisibility,
+                None,
+                workspace_id.clone(),
+                Some(authorization.thread_id().to_owned()),
+            )
             .await;
+        }
 
-        let current_thread = match self
+        let thread = match self
             .crud_store
-            .get_thread_model(params.thread_id.as_str())
+            .get_thread_model(authorization.thread_id())
             .await
         {
             Ok(Some(thread)) => thread,
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("thread `{}` was not found", params.thread_id),
-                    ),
+                    AuthorizationExternalError::NotFound.response(request_id),
                 )
                 .await;
                 return;
@@ -648,88 +901,24 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to load thread for update: {error:#}"),
+                        format!("failed to load committed thread update: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
         };
-
-        if current_thread.workspace_id != workspace_id {
+        if thread.workspace_id != workspace_id {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: thread `{}` belongs to workspace `{}`",
-                        methods::THREAD_UPDATE,
-                        params.thread_id,
-                        current_thread.workspace_id
-                    ),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         }
-
-        let changed = match self
-            .crud_store
-            .update_thread_name_if_changed(params.thread_id.as_str(), name)
-            .await
-        {
-            Ok(changed) => changed,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to update thread: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let thread = if changed {
-            match self
-                .crud_store
-                .get_thread_model(params.thread_id.as_str())
-                .await
-            {
-                Ok(Some(thread)) => thread,
-                Ok(None) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("thread `{}` was not found after update", params.thread_id),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to load thread after update: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        } else {
-            current_thread
-        };
-
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
         if changed {
             self.thread_manager
                 .sync_thread_metadata_from_persisted(&thread)
@@ -775,10 +964,267 @@ impl MessageProcessor {
             )
             .await;
             self.notify_thread_tree_changed(workspace_id).await;
-            self.best_effort_sync_cli_runtime_thread_name(
-                thread.workspace_id.as_str(),
-                thread.id.as_str(),
-                name,
+            if let Some(name) = name {
+                self.best_effort_sync_cli_runtime_thread_name(
+                    thread.workspace_id.as_str(),
+                    thread.id.as_str(),
+                    name,
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn thread_participants(
+        &self,
+        request_context: &RequestContext,
+        authorization: &AuthorizedThread,
+        request_id: RequestId,
+        workspace_id: &str,
+        thread_id: &str,
+        operation: ThreadParticipantOperation,
+    ) {
+        let connection_id = request_context.connection_id();
+        if authorization.action() != ResourceAction::ThreadParticipantsManage
+            || authorization.workspace_id() != workspace_id
+            || authorization.thread_id() != thread_id
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+        let acting_member = (!authorization.decision().is_absolute_superuser())
+            .then(|| authorization.principal_id());
+        let actor = request_context.persisted_actor();
+        let gateway_id = &request_context.principal().gateway_id;
+
+        let (changed, participant_ids, access_change_kind, target_principal_id) = match operation {
+            ThreadParticipantOperation::List => {
+                match self
+                    .crud_store
+                    .list_private_thread_participant_ids(
+                        gateway_id,
+                        authorization.workspace_id(),
+                        authorization.thread_id(),
+                        acting_member,
+                    )
+                    .await
+                {
+                    Ok(Some(ids)) => (false, ids, None, None),
+                    Ok(None) => {
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::NotFound.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            ResourceAction::ThreadParticipantsManage.safe_name(),
+                            "thread",
+                            "read",
+                        );
+                        warn!(
+                            connection_id,
+                            error = %format!("{error:#}"),
+                            "private-thread participant list failed"
+                        );
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::Unavailable.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            ThreadParticipantOperation::Add(target) => {
+                match self
+                    .crud_store
+                    .add_private_thread_participant(
+                        gateway_id,
+                        authorization.workspace_id(),
+                        authorization.thread_id(),
+                        acting_member,
+                        &target,
+                        actor,
+                    )
+                    .await
+                {
+                    Ok(Some(PrivateThreadParticipantMutation::Applied {
+                        changed,
+                        participant_ids: ids,
+                    })) => (
+                        changed,
+                        ids,
+                        Some(AccessChangeKind::ThreadParticipantAdded),
+                        Some(target),
+                    ),
+                    Ok(Some(PrivateThreadParticipantMutation::TargetUnavailable)) | Ok(None) => {
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::NotFound.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Ok(Some(PrivateThreadParticipantMutation::MandatoryCreator)) => {
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::Forbidden.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            ResourceAction::ThreadParticipantsManage.safe_name(),
+                            "thread",
+                            "mutation",
+                        );
+                        warn!(
+                            connection_id,
+                            error = %format!("{error:#}"),
+                            "private-thread participant add failed"
+                        );
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::Unavailable.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            ThreadParticipantOperation::Remove(target) => {
+                match self
+                    .crud_store
+                    .remove_private_thread_participant(
+                        gateway_id,
+                        authorization.workspace_id(),
+                        authorization.thread_id(),
+                        acting_member,
+                        &target,
+                    )
+                    .await
+                {
+                    Ok(Some(PrivateThreadParticipantMutation::Applied {
+                        changed,
+                        participant_ids: ids,
+                    })) => (
+                        changed,
+                        ids,
+                        Some(AccessChangeKind::ThreadParticipantRemoved),
+                        Some(target),
+                    ),
+                    Ok(Some(PrivateThreadParticipantMutation::TargetUnavailable)) | Ok(None) => {
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::NotFound.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Ok(Some(PrivateThreadParticipantMutation::MandatoryCreator)) => {
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::Forbidden.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            ResourceAction::ThreadParticipantsManage.safe_name(),
+                            "thread",
+                            "mutation",
+                        );
+                        warn!(
+                            connection_id,
+                            error = %format!("{error:#}"),
+                            "private-thread participant remove failed"
+                        );
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::Unavailable.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        };
+
+        if changed {
+            self.publish_committed_authorization_invalidation(
+                access_change_kind
+                    .expect("changed participant mutation carries an access-change kind"),
+                target_principal_id.clone(),
+                authorization.workspace_id().to_owned(),
+                Some(authorization.thread_id().to_owned()),
+            )
+            .await;
+        }
+
+        let participants = participant_ids
+            .iter()
+            .cloned()
+            .map(|principal_id| ThreadParticipantSummary { principal_id })
+            .collect();
+        let response_payload = ThreadParticipantsResponse {
+            workspace_id: authorization.workspace_id().to_owned(),
+            thread_id: authorization.thread_id().to_owned(),
+            participant_ids,
+            participants,
+            changed,
+        };
+        let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode participant response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send thread participant response"
+            );
+            return;
+        }
+
+        if changed {
+            let change = match access_change_kind
+                .expect("changed participant mutation carries an access-change kind")
+            {
+                AccessChangeKind::ThreadParticipantAdded => ThreadParticipantChangeKind::Added,
+                AccessChangeKind::ThreadParticipantRemoved => ThreadParticipantChangeKind::Removed,
+                _ => unreachable!("participant mutation emitted a non-participant change kind"),
+            };
+            let notification = ThreadParticipantsChangedNotification {
+                workspace_id: authorization.workspace_id().to_owned(),
+                thread_id: authorization.thread_id().to_owned(),
+                change,
+                principal_id: target_principal_id
+                    .expect("changed participant mutation carries a target principal"),
+            };
+            self.send_notification_to_thread_subscribers(
+                authorization.thread_id(),
+                events::THREAD_PARTICIPANTS_CHANGED,
+                &notification,
             )
             .await;
         }
@@ -1367,10 +1813,19 @@ impl MessageProcessor {
     pub(super) async fn thread_unsubscribe(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedThread,
         request_id: RequestId,
         params: ThreadUnsubscribeParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.thread_id() != params.thread_id.trim() {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let outcome = self
             .thread_manager
             .thread_unsubscribe(connection_id, &params.thread_id)
@@ -1406,36 +1861,132 @@ impl MessageProcessor {
         };
         let closed_thread_id = closed_notification.thread_id.clone();
 
-        let notification =
-            match JsonRpcNotification::from_params(events::THREAD_CLOSED, &closed_notification) {
-                Ok(notification) => notification,
-                Err(error) => {
-                    error!(error = %error, "failed to encode thread/closed notification");
-                    return;
-                }
-            };
-
-        match serde_json::to_string(&notification) {
-            Ok(payload) => {
-                for notification_connection_id in outcome.closed_notification_connection_ids {
-                    if let Err(error) = self
-                        .session_manager
-                        .send_text(notification_connection_id, payload.clone())
-                        .await
-                    {
-                        warn!(
-                            connection_id = notification_connection_id,
-                            error = %format!("{error:#}"),
-                            "failed to send thread/closed notification"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                error!(error = %error, "failed to serialize thread/closed notification");
-            }
-        }
+        self.send_notification_to_removed_thread_subscribers(
+            closed_thread_id.as_str(),
+            events::THREAD_CLOSED,
+            &closed_notification,
+            outcome.closed_notification_subscribers,
+        )
+        .await;
 
         self.teardown_agent_thread(closed_thread_id.as_str()).await;
+    }
+}
+
+#[cfg(test)]
+mod access_filter_tests {
+    use super::*;
+
+    #[test]
+    fn folder_placements_do_not_reveal_inaccessible_thread_ids() {
+        let mut placements = vec![
+            pioneer_protocol::ThreadPlacement {
+                thread_id: "accessible".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                folder_id: Some("folder".to_owned()),
+            },
+            pioneer_protocol::ThreadPlacement {
+                thread_id: "private-peer-or-internal".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                folder_id: Some("folder".to_owned()),
+            },
+        ];
+        retain_accessible_thread_placements(
+            &mut placements,
+            &HashSet::from(["accessible".to_owned()]),
+        );
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].thread_id, "accessible");
+    }
+
+    #[test]
+    fn agents_doc_summaries_follow_only_accessible_thread_folder_lineage() {
+        let folders = vec![
+            pioneer_protocol::ThreadFolder {
+                id: "parent".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                parent_folder_id: None,
+                name: "Parent".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            pioneer_protocol::ThreadFolder {
+                id: "child".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                parent_folder_id: Some("parent".to_owned()),
+                name: "Child".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            pioneer_protocol::ThreadFolder {
+                id: "private-peer".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                parent_folder_id: None,
+                name: "Private peer".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+            },
+        ];
+        let placements = vec![
+            pioneer_protocol::ThreadPlacement {
+                thread_id: "accessible".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                folder_id: Some("child".to_owned()),
+            },
+            pioneer_protocol::ThreadPlacement {
+                thread_id: "inaccessible".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                folder_id: Some("private-peer".to_owned()),
+            },
+        ];
+        let summary = |id: &str, folder_id: Option<&str>| ThreadAgentsDocSummary {
+            id: id.to_owned(),
+            workspace_id: "workspace".to_owned(),
+            folder_id: folder_id.map(str::to_owned),
+            status: ThreadAgentsDocStatus::Active,
+            content_sha256: format!("sha-{id}"),
+            version: 1,
+            char_count: 1,
+            updated_at: 1,
+        };
+        let mut summaries = vec![
+            summary("root", None),
+            summary("parent", Some("parent")),
+            summary("child", Some("child")),
+            summary("private-peer", Some("private-peer")),
+        ];
+
+        retain_accessible_thread_agents_doc_summaries(
+            &mut summaries,
+            &folders,
+            &placements,
+            &HashSet::from(["accessible".to_owned()]),
+        );
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "parent", "child"]
+        );
+    }
+
+    #[test]
+    fn agents_doc_summaries_require_at_least_one_accessible_thread() {
+        let mut summaries = vec![ThreadAgentsDocSummary {
+            id: "root".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            folder_id: None,
+            status: ThreadAgentsDocStatus::Active,
+            content_sha256: "sha-root".to_owned(),
+            version: 1,
+            char_count: 1,
+            updated_at: 1,
+        }];
+
+        retain_accessible_thread_agents_doc_summaries(&mut summaries, &[], &[], &HashSet::new());
+
+        assert!(summaries.is_empty());
     }
 }

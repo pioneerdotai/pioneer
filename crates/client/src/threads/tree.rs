@@ -905,6 +905,8 @@ pub fn plan_thread_rename(
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
         name: Some(new_name.to_owned()),
+        visibility: None,
+        archived: None,
     })
 }
 
@@ -1168,6 +1170,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }

@@ -3,6 +3,12 @@
   "title": "ThreadUpdateParams",
   "type": "object",
   "properties": {
+    "archived": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "name": {
       "type": [
         "string",
@@ -12,6 +18,16 @@
     "thread_id": {
       "type": "string"
     },
+    "visibility": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadVisibility"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "workspace_id": {
       "type": "string"
     }
@@ -19,5 +35,15 @@
   "required": [
     "workspace_id",
     "thread_id"
-  ]
+  ],
+  "$defs": {
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    }
+  }
 }

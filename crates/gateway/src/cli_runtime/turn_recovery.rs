@@ -445,6 +445,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {

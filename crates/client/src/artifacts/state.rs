@@ -188,6 +188,20 @@ impl ThreadArtifactsState {
         self.cache.clear_error(thread_id);
     }
 
+    /// Removes every in-memory artifact projection owned by the supplied
+    /// threads while preserving unrelated thread caches.
+    ///
+    /// Access-loss handling intentionally drops preview paths, action state,
+    /// and local-file references together with the summaries so no shell can
+    /// continue presenting a protected artifact through a secondary cache.
+    pub fn remove_threads(&mut self, thread_ids: &[String]) {
+        let removed_artifact_keys = self.cache.remove_threads(thread_ids);
+        self.preview.remove_keys(&removed_artifact_keys);
+        self.actions.remove_keys(&removed_artifact_keys);
+        self.local_files_by_artifact
+            .retain(|key, _| !removed_artifact_keys.contains(key));
+    }
+
     pub fn set_filter(&mut self, filter: ThreadArtifactFilter) {
         self.cache.set_filter(filter);
     }
@@ -458,6 +472,52 @@ impl ThreadArtifactCacheState {
         if self.active_thread_id.as_deref() == Some(thread_id) {
             self.error = None;
         }
+    }
+
+    fn remove_threads(&mut self, thread_ids: &[String]) -> HashSet<ArtifactVersionKey> {
+        let thread_ids = thread_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if thread_ids.is_empty() {
+            return HashSet::new();
+        }
+
+        let mut removed_artifact_keys = HashSet::new();
+        for thread_id in &thread_ids {
+            if let Some(entry) = self.cache_by_thread.remove(*thread_id) {
+                removed_artifact_keys.extend(
+                    entry
+                        .items
+                        .iter()
+                        .map(|summary| artifact_version_key(&summary.artifact)),
+                );
+            }
+            self.loading_thread_ids.remove(*thread_id);
+            self.refresh_requested_thread_ids.remove(*thread_id);
+            self.retry_after_by_thread.remove(*thread_id);
+            self.transient_retry_count_by_thread.remove(*thread_id);
+        }
+
+        if self
+            .active_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| thread_ids.contains(thread_id))
+        {
+            self.active_thread_id = None;
+            self.selected_artifact_id = None;
+            self.error = None;
+        }
+        if self
+            .loading_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| thread_ids.contains(thread_id))
+        {
+            self.loading_thread_id = None;
+        }
+        self.loading = !self.loading_thread_ids.is_empty();
+
+        removed_artifact_keys
     }
 
     pub fn set_filter(&mut self, filter: ThreadArtifactFilter) {
@@ -828,6 +888,61 @@ mod tests {
             ),
             ThreadArtifactsRefreshPlan::RequestRefreshAfterCurrent
         );
+    }
+
+    #[test]
+    fn access_loss_removes_only_invalidated_thread_artifact_projections() {
+        let protected = artifact_summary(
+            "art_protected",
+            "protected.txt",
+            ArtifactKind::Text,
+            ArtifactCreatedByKind::Agent,
+            Vec::new(),
+        );
+        let unrelated = artifact_summary(
+            "art_unrelated",
+            "unrelated.txt",
+            ArtifactKind::Text,
+            ArtifactCreatedByKind::Agent,
+            Vec::new(),
+        );
+        let protected_ref = protected.artifact.clone();
+        let unrelated_ref = unrelated.artifact.clone();
+        let mut state = ThreadArtifactsState::default();
+        state.apply_loaded("thread_protected", vec![protected]);
+        state.apply_loaded("thread_unrelated", vec![unrelated]);
+        state.set_action_status(&protected_ref, ArtifactActionStatus::Queued);
+        state.set_action_status(&unrelated_ref, ArtifactActionStatus::Queued);
+        state.set_local_file(
+            &protected_ref,
+            ArtifactLocalFile {
+                path: "protected-cache".into(),
+                sha256: "protected".to_owned(),
+                size_bytes: Some(1),
+            },
+        );
+        state.set_local_file(
+            &unrelated_ref,
+            ArtifactLocalFile {
+                path: "unrelated-cache".into(),
+                sha256: "unrelated".to_owned(),
+                size_bytes: Some(1),
+            },
+        );
+        state.activate_thread(Some("thread_unrelated"));
+
+        state.remove_threads(&["thread_protected".to_owned()]);
+
+        assert!(state.needs_load("thread_protected"));
+        assert!(!state.needs_load("thread_unrelated"));
+        assert_eq!(state.items_for_active_thread().len(), 1);
+        assert!(state.action_status(&protected_ref).is_none());
+        assert!(state.local_file(&protected_ref).is_none());
+        assert_eq!(
+            state.action_status(&unrelated_ref),
+            Some(&ArtifactActionStatus::Queued)
+        );
+        assert!(state.local_file(&unrelated_ref).is_some());
     }
 
     fn artifact_summary(

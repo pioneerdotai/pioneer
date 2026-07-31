@@ -50,6 +50,33 @@ pub(crate) struct GatewayMemoryProvider {
     processor: Weak<MessageProcessor>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryExecutionAccess {
+    Read,
+    Write,
+}
+
+impl MemoryExecutionAccess {
+    const fn thread_action(self) -> crate::authorization::ResourceAction {
+        match self {
+            Self::Read => crate::authorization::ResourceAction::ThreadRead,
+            Self::Write => crate::authorization::ResourceAction::ThreadWrite,
+        }
+    }
+
+    const fn memory_action(self) -> crate::authorization::ResourceAction {
+        match self {
+            Self::Read => crate::authorization::ResourceAction::MemoryRead,
+            Self::Write => crate::authorization::ResourceAction::MemoryWrite,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryExecutionBoundary {
+    member_restricted: bool,
+}
+
 impl GatewayMemoryProvider {
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
         Self { processor }
@@ -97,6 +124,49 @@ fn resolve_internal_model_selection(
     (configured_provider, configured_model)
 }
 
+async fn authorize_memory_execution(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    member_principal_hint: Option<&str>,
+    access: MemoryExecutionAccess,
+) -> Result<MemoryExecutionBoundary, String> {
+    match processor
+        .revalidate_tool_execution_authorization(
+            workspace_id,
+            thread_id,
+            turn_id,
+            member_principal_hint,
+            access.thread_action(),
+        )
+        .await
+    {
+        Ok(Some(current)) => {
+            crate::authorization::record_tool_decision(
+                access.memory_action(),
+                "memory",
+                current.authorization().decision(),
+            );
+            Ok(MemoryExecutionBoundary {
+                member_restricted: current.principal().kind
+                    == pioneer_protocol::PrincipalKind::User,
+            })
+        }
+        Ok(None) => Ok(MemoryExecutionBoundary {
+            member_restricted: false,
+        }),
+        Err(_) => {
+            crate::authorization::record_authorization_unavailable(
+                access.memory_action().safe_name(),
+                "memory",
+                "tool",
+            );
+            Err("memory is unavailable for the current execution".to_owned())
+        }
+    }
+}
+
 #[async_trait]
 impl AgentMemoryProvider for GatewayMemoryProvider {
     async fn recall_memory(
@@ -122,11 +192,24 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 truncated: false,
             });
         }
+        let boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Read,
+        )
+        .await?;
 
         let response = runtime
             .service()
             .recall_for_prompt(
-                runtime.operation_context_for_turn(&context, None),
+                runtime.operation_context_for_authorized_turn(
+                    &context,
+                    None,
+                    boundary.member_restricted,
+                ),
                 MemoryRecallParams {
                     query: request.query,
                     scopes: Vec::new(),
@@ -175,6 +258,15 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
             });
         }
+        authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Read,
+        )
+        .await?;
 
         let handler = Arc::new(MemoryToolHandler { processor, context });
         let mut bundle = ToolExtensionBundle::default();
@@ -204,10 +296,26 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 truncated: false,
             });
         }
+        let boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Read,
+        )
+        .await?;
 
         let response = runtime
             .service()
-            .recall_mode_for_prompt(runtime.operation_context_for_turn(&context, None), request)
+            .recall_mode_for_prompt(
+                runtime.operation_context_for_authorized_turn(
+                    &context,
+                    None,
+                    boundary.member_restricted,
+                ),
+                request,
+            )
             .await
             .map_err(|error| format!("{error:#}"))?;
 
@@ -250,6 +358,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         if !config.enabled || !config.provider_enabled || !config.proactive_writes_enabled {
             return Ok(r#"{"facts":[]}"#.to_owned());
         }
+        authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            None,
+            MemoryExecutionAccess::Read,
+        )
+        .await?;
         let (provider_name, model) = self.resolve_internal_model(
             processor.as_ref(),
             MemoryInternalModelPurpose::PostTurnExtractor,
@@ -380,8 +497,21 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 ..MemoryManifest::default()
             });
         }
+        let boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Read,
+        )
+        .await?;
 
-        let operation_context = runtime.operation_context_for_turn(&context, None);
+        let operation_context = runtime.operation_context_for_authorized_turn(
+            &context,
+            None,
+            boundary.member_restricted,
+        );
         let active = runtime
             .service()
             .list(
@@ -468,12 +598,22 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         runtime
             .ensure_enabled()
             .map_err(|error| format!("{error:#}"))?;
-        let operation_context = runtime.operation_context_for_turn(
+        let boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Write,
+        )
+        .await?;
+        let operation_context = runtime.operation_context_for_authorized_turn(
             &context,
             Some(MemoryActor {
                 kind: MemoryActorKind::Extractor,
                 id: Some("memory.post_turn_extractor".to_owned()),
             }),
+            boundary.member_restricted,
         );
         let response = runtime
             .service()
@@ -500,13 +640,43 @@ impl ToolHandler for MemoryToolHandler {
         invocation: ToolInvocation,
         _trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let access = match invocation.tool_name.as_str() {
+            MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => MemoryExecutionAccess::Read,
+            MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL => MemoryExecutionAccess::Write,
+            other => return Err(ToolError::NotFound(other.to_owned())),
+        };
+        let boundary = authorize_memory_execution(
+            self.processor.as_ref(),
+            self.context.workspace_id.as_str(),
+            self.context.thread_id.as_str(),
+            self.context.turn_id.as_str(),
+            self.context.principal_id.as_deref(),
+            access,
+        )
+        .await
+        .map_err(ToolError::execution_failed)?;
         match invocation.tool_name.as_str() {
-            MEMORY_SEARCH_TOOL => self.handle_search(invocation).await,
-            MEMORY_LIST_TOOL => self.handle_list(invocation).await,
-            MEMORY_GET_TOOL => self.handle_get(invocation).await,
-            MEMORY_REMEMBER_TOOL => self.handle_remember(invocation).await,
-            MEMORY_FORGET_TOOL => self.handle_forget(invocation).await,
-            other => Err(ToolError::NotFound(other.to_owned())),
+            MEMORY_SEARCH_TOOL => {
+                self.handle_search(invocation, boundary.member_restricted)
+                    .await
+            }
+            MEMORY_LIST_TOOL => {
+                self.handle_list(invocation, boundary.member_restricted)
+                    .await
+            }
+            MEMORY_GET_TOOL => {
+                self.handle_get(invocation, boundary.member_restricted)
+                    .await
+            }
+            MEMORY_REMEMBER_TOOL => {
+                self.handle_remember(invocation, boundary.member_restricted)
+                    .await
+            }
+            MEMORY_FORGET_TOOL => {
+                self.handle_forget(invocation, boundary.member_restricted)
+                    .await
+            }
+            _ => unreachable!("memory tool name was classified above"),
         }
     }
 }
@@ -515,6 +685,7 @@ impl MemoryToolHandler {
     async fn handle_search(
         &self,
         invocation: ToolInvocation,
+        member_restricted: bool,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: MemorySearchToolInput = decode_tool_args(invocation)?;
         let query = required_string(input.query.as_deref(), "query")?;
@@ -523,7 +694,7 @@ impl MemoryToolHandler {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_LIMIT);
         let scopes = self.scopes_for_kinds(&input.scopes)?;
-        let context = self.operation_context(None)?;
+        let context = self.operation_context(None, member_restricted)?;
 
         let response = self
             .processor
@@ -554,6 +725,7 @@ impl MemoryToolHandler {
     async fn handle_list(
         &self,
         invocation: ToolInvocation,
+        member_restricted: bool,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: MemoryListToolInput = decode_tool_args(invocation)?;
         let limit = input
@@ -561,7 +733,7 @@ impl MemoryToolHandler {
             .unwrap_or(DEFAULT_LIST_LIMIT)
             .clamp(1, MAX_LIST_LIMIT);
         let scopes = self.scopes_for_kinds(&input.scopes)?;
-        let context = self.operation_context(None)?;
+        let context = self.operation_context(None, member_restricted)?;
 
         let response = self
             .processor
@@ -591,6 +763,7 @@ impl MemoryToolHandler {
     async fn handle_get(
         &self,
         invocation: ToolInvocation,
+        member_restricted: bool,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: MemoryGetToolInput = decode_tool_args(invocation)?;
         let memory_id = optional_trimmed(input.memory_id);
@@ -601,7 +774,7 @@ impl MemoryToolHandler {
             ));
         }
 
-        let context = self.operation_context(None)?;
+        let context = self.operation_context(None, member_restricted)?;
         let response = if let Some(memory_id) = memory_id {
             self.processor
                 .memory_runtime()
@@ -636,6 +809,7 @@ impl MemoryToolHandler {
     async fn handle_remember(
         &self,
         invocation: ToolInvocation,
+        member_restricted: bool,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let idempotency_key = invocation.idempotency_key.clone();
         let input: MemoryRememberToolInput = decode_tool_args(invocation)?;
@@ -647,7 +821,7 @@ impl MemoryToolHandler {
         let key = optional_trimmed(input.key)
             .or_else(|| Some(stable_memory_key(input.category, content.as_str())));
         let actor = assistant_actor(&self.context);
-        let context = self.operation_context(Some(actor.clone()))?;
+        let context = self.operation_context(Some(actor.clone()), member_restricted)?;
         let source_context_kind = input
             .source_context
             .unwrap_or(MemoryToolSourceContext::DirectUserConversation)
@@ -685,7 +859,11 @@ impl MemoryToolHandler {
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
         self.processor
-            .send_memory_changed_after_tool_remember(&context, &response)
+            .send_memory_changed_after_tool_remember(
+                &context,
+                self.context.principal_id.as_deref(),
+                &response,
+            )
             .await;
 
         Ok(function_output(remember_output(&response)))
@@ -694,6 +872,7 @@ impl MemoryToolHandler {
     async fn handle_forget(
         &self,
         invocation: ToolInvocation,
+        member_restricted: bool,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: MemoryForgetToolInput = decode_tool_args(invocation)?;
         let memory_id = optional_trimmed(input.memory_id);
@@ -719,7 +898,7 @@ impl MemoryToolHandler {
         };
         let reason = optional_trimmed(input.reason);
         let actor = assistant_actor(&self.context);
-        let context = self.operation_context(Some(actor.clone()))?;
+        let context = self.operation_context(Some(actor.clone()), member_restricted)?;
         let response = self
             .processor
             .memory_runtime()
@@ -739,6 +918,7 @@ impl MemoryToolHandler {
         self.processor
             .send_memory_forgotten_after_tool_forget(
                 &context,
+                self.context.principal_id.as_deref(),
                 reason.clone(),
                 input.dry_run,
                 &response,
@@ -755,12 +935,13 @@ impl MemoryToolHandler {
     fn operation_context(
         &self,
         actor: Option<MemoryActor>,
+        member_restricted: bool,
     ) -> Result<MemoryOperationContext, ToolError> {
         let runtime = self.processor.memory_runtime();
         runtime
             .ensure_enabled()
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(runtime.operation_context_for_turn(&self.context, actor))
+        Ok(runtime.operation_context_for_authorized_turn(&self.context, actor, member_restricted))
     }
 
     fn scopes_for_kinds(&self, kinds: &[MemoryScopeKind]) -> Result<Vec<MemoryScope>, ToolError> {

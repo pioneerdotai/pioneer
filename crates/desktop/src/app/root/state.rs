@@ -184,6 +184,7 @@ impl PioneerDesktop {
                 connection_epoch: 0,
                 session_refresh_generation: 0,
                 session_refresh_in_flight: false,
+                authorization_revision: None,
                 connection_state: GatewayConnectionState::Connecting,
                 status: t!("gateway.status.connecting").to_string(),
                 status_level: GatewayStatusLevel::Neutral,

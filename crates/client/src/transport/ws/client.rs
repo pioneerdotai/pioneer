@@ -20,14 +20,13 @@ use super::{
         websocket_read_failed_message, websocket_write_failed_message,
     },
 };
-use crate::rpc::PendingJsonRpcRequests;
+use crate::rpc::{JsonRpcResponseSender, PendingJsonRpcRequests};
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
     ArtifactUploadChunkAckNotification, AuthSecretString, GatewayNotification,
     SkillsUploadChunkAckNotification,
 };
-use serde_json::Value as JsonValue;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, sync::mpsc::Sender, thread};
 use tokio::{
@@ -53,7 +52,7 @@ pub enum GatewayWsCommand {
     Request {
         request_id: String,
         payload: String,
-        response_tx: Sender<std::result::Result<JsonValue, String>>,
+        response_tx: JsonRpcResponseSender,
     },
     BinaryUploadChunk {
         upload_id: String,
@@ -84,7 +83,7 @@ enum ConnectionRpcCommand {
     Request {
         request_id: String,
         payload: String,
-        response_tx: Sender<std::result::Result<JsonValue, String>>,
+        response_tx: JsonRpcResponseSender,
     },
     BinaryUploadChunk {
         upload_id: String,
@@ -200,7 +199,9 @@ async fn run_worker(
                 response_tx,
             } => {
                 let Some(connection_task) = connection_task.as_mut() else {
-                    let _ = response_tx.send(Err("websocket is not connected".to_owned()));
+                    let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "websocket is not connected",
+                    )));
                     continue;
                 };
 
@@ -214,8 +215,9 @@ async fn run_worker(
                     })
                     .is_err()
                 {
-                    let _ = fallback_tx
-                        .send(Err("websocket connection task is unavailable".to_owned()));
+                    let _ = fallback_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "websocket connection task is unavailable",
+                    )));
                 }
             }
             GatewayWsCommand::BinaryUploadChunk {
@@ -476,7 +478,9 @@ async fn monitor_connection(
                         if let Err(error) = writer.send(Message::Text(payload.into())).await {
                             let message = websocket_write_failed_message(error);
                             if let Some(response_tx) = pending_requests.remove(request_id.as_str()) {
-                                let _ = response_tx.send(Err(message.clone()));
+                                let _ = response_tx.send(Err(
+                                    crate::rpc::JsonRpcResponseError::transport(message.clone()),
+                                ));
                             }
                             break message;
                         }

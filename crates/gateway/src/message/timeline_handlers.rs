@@ -4,12 +4,13 @@ use super::timeline_cursor::{
     validate_timeline_limit,
 };
 use super::*;
+use crate::authorization::{AuthorizationExternalError, AuthorizedThread, AuthorizedTurn};
 use anyhow::{Context, Result, anyhow};
 use pioneer_crud::{
     BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
     BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
     CliRuntimePendingRequestListFilter, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION,
-    WORK_VISIBILITY_VISIBLE, approval_block_id,
+    ThreadTimelineApprovalScope, WORK_VISIBILITY_VISIBLE, approval_block_id,
 };
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
@@ -51,10 +52,19 @@ impl MessageProcessor {
     pub(super) async fn thread_timeline_page(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedThread,
         request_id: RequestId,
         params: ThreadTimelinePageParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.thread_id() != params.thread_id.trim() {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -131,9 +141,28 @@ impl MessageProcessor {
                 return;
             }
         };
+        if thread_model.workspace_id != authorization.workspace_id() {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
+        let approval_scope = (!authorization.decision().is_absolute_superuser()).then(|| {
+            ThreadTimelineApprovalScope {
+                initiating_principal_id: request_context.principal().principal_id.to_string(),
+                initiating_session_id: request_context.principal().session_id.to_string(),
+            }
+        });
         let rows_page = match self
-            .load_thread_timeline_rows(params.thread_id.as_str(), anchor, limit)
+            .load_thread_timeline_rows(
+                params.thread_id.as_str(),
+                approval_scope.as_ref(),
+                anchor,
+                limit,
+            )
             .await
         {
             Ok(page) => page,
@@ -173,7 +202,10 @@ impl MessageProcessor {
 
         let requested_thread_id = params.thread_id.clone();
         let workspace_id = thread_model.workspace_id.clone();
-        let mut blocks = match self.thread_timeline_blocks_from_rows(rows_page.rows).await {
+        let mut blocks = match self
+            .thread_timeline_blocks_from_rows(rows_page.rows, approval_scope.as_ref())
+            .await
+        {
             Ok(blocks) => blocks,
             Err(error) => {
                 self.send_error(
@@ -189,7 +221,11 @@ impl MessageProcessor {
             }
         };
         let descendant_pending_blocks = match self
-            .descendant_pending_request_blocks(workspace_id.as_str(), requested_thread_id.as_str())
+            .descendant_pending_request_blocks(
+                workspace_id.as_str(),
+                requested_thread_id.as_str(),
+                approval_scope.as_ref(),
+            )
             .await
         {
             Ok(blocks) => blocks,
@@ -247,10 +283,21 @@ impl MessageProcessor {
     pub(super) async fn turn_work_page(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedTurn,
         request_id: RequestId,
         params: TurnWorkPageParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.thread_id() != params.thread_id.trim()
+            || authorization.turn_id() != params.turn_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -301,7 +348,12 @@ impl MessageProcessor {
             .get_turn_work_projection(params.turn_id.as_str())
             .await
         {
-            Ok(Some(projection)) if projection.thread_id == params.thread_id => projection,
+            Ok(Some(projection))
+                if projection.thread_id == params.thread_id
+                    && projection.workspace_id == authorization.workspace_id() =>
+            {
+                projection
+            }
             Ok(Some(_)) => {
                 self.send_error(
                     connection_id,
@@ -452,10 +504,21 @@ impl MessageProcessor {
     pub(super) async fn turn_work_items_get(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedTurn,
         request_id: RequestId,
         params: TurnWorkItemsGetParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.thread_id() != params.thread_id.trim()
+            || authorization.turn_id() != params.turn_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if params.thread_id.trim().is_empty()
             || params.turn_id.trim().is_empty()
             || params.work_item_ids.is_empty()
@@ -489,7 +552,12 @@ impl MessageProcessor {
             .get_turn_work_projection(params.turn_id.as_str())
             .await
         {
-            Ok(Some(projection)) if projection.thread_id == params.thread_id => projection,
+            Ok(Some(projection))
+                if projection.thread_id == params.thread_id
+                    && projection.workspace_id == authorization.workspace_id() =>
+            {
+                projection
+            }
             Ok(Some(_)) => {
                 self.send_error(
                     connection_id,
@@ -598,6 +666,7 @@ impl MessageProcessor {
     async fn load_thread_timeline_rows(
         &self,
         thread_id: &str,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
         anchor: ResolvedTimelineAnchor,
         limit: u64,
     ) -> Result<ThreadTimelineRowsPage> {
@@ -610,6 +679,7 @@ impl MessageProcessor {
                     .crud_store
                     .list_thread_timeline_projection_page(
                         thread_id,
+                        approval_scope,
                         ProjectionPageAnchor::End,
                         fetch_limit,
                     )
@@ -629,6 +699,7 @@ impl MessageProcessor {
                     .crud_store
                     .list_thread_timeline_projection_page(
                         thread_id,
+                        approval_scope,
                         ProjectionPageAnchor::Start,
                         fetch_limit,
                     )
@@ -648,6 +719,7 @@ impl MessageProcessor {
                     .crud_store
                     .list_thread_timeline_projection_page(
                         thread_id,
+                        approval_scope,
                         ProjectionPageAnchor::Before(sort_key.as_str()),
                         fetch_limit,
                     )
@@ -667,6 +739,7 @@ impl MessageProcessor {
                     .crud_store
                     .list_thread_timeline_projection_page(
                         thread_id,
+                        approval_scope,
                         ProjectionPageAnchor::After(sort_key.as_str()),
                         fetch_limit,
                     )
@@ -682,8 +755,13 @@ impl MessageProcessor {
                 })
             }
             ResolvedTimelineAnchor::Around(sort_key) => {
-                self.load_thread_timeline_rows_around(thread_id, sort_key.as_str(), limit)
-                    .await
+                self.load_thread_timeline_rows_around(
+                    thread_id,
+                    approval_scope,
+                    sort_key.as_str(),
+                    limit,
+                )
+                .await
             }
         }
     }
@@ -691,6 +769,7 @@ impl MessageProcessor {
     async fn load_thread_timeline_rows_around(
         &self,
         thread_id: &str,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
         sort_key: &str,
         limit: u64,
     ) -> Result<ThreadTimelineRowsPage> {
@@ -699,6 +778,7 @@ impl MessageProcessor {
             .crud_store
             .list_thread_timeline_projection_page(
                 thread_id,
+                approval_scope,
                 ProjectionPageAnchor::Before(sort_key),
                 before_limit.saturating_add(1),
             )
@@ -711,7 +791,7 @@ impl MessageProcessor {
 
         let anchor_row = self
             .crud_store
-            .find_thread_timeline_projection_block_by_sort_key(thread_id, sort_key)
+            .find_thread_timeline_projection_block_by_sort_key(thread_id, approval_scope, sort_key)
             .await?;
         let anchor_len = u64::from(anchor_row.is_some());
         let after_limit = limit
@@ -721,6 +801,7 @@ impl MessageProcessor {
             .crud_store
             .list_thread_timeline_projection_page(
                 thread_id,
+                approval_scope,
                 ProjectionPageAnchor::After(sort_key),
                 after_limit.saturating_add(1),
             )
@@ -1036,10 +1117,16 @@ impl MessageProcessor {
     async fn thread_timeline_blocks_from_rows(
         &self,
         rows: Vec<thread_timeline_block::Model>,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
     ) -> Result<Vec<TimelineBlock>> {
         let mut blocks = Vec::with_capacity(rows.len());
         for row in rows {
-            blocks.push(self.thread_timeline_block_from_row(row).await?);
+            if let Some(block) = self
+                .thread_timeline_block_from_row(row, approval_scope)
+                .await?
+            {
+                blocks.push(block);
+            }
         }
         Ok(blocks)
     }
@@ -1048,6 +1135,7 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         thread_id: &str,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
     ) -> Result<Vec<TimelineBlock>> {
         let descendant_thread_ids = self.descendant_task_thread_ids(thread_id).await?;
         if descendant_thread_ids.is_empty() {
@@ -1062,11 +1150,17 @@ impl MessageProcessor {
                     workspace_id: Some(workspace_id.to_owned()),
                     thread_id: Some(descendant_thread_id),
                     status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                    initiating_principal_id: approval_scope
+                        .map(|scope| scope.initiating_principal_id.clone()),
+                    initiating_session_id: approval_scope
+                        .map(|scope| scope.initiating_session_id.clone()),
                     ..Default::default()
                 })
                 .await?;
             for request in requests {
-                if let Some(block) = pending_request_proxy_block(request)? {
+                if cli_runtime_pending_request_visible_to_scope(&request, approval_scope)
+                    && let Some(block) = pending_request_proxy_block(request)?
+                {
                     blocks.push(block);
                 }
             }
@@ -1115,7 +1209,8 @@ impl MessageProcessor {
     async fn thread_timeline_block_from_row(
         &self,
         row: thread_timeline_block::Model,
-    ) -> Result<TimelineBlock> {
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
+    ) -> Result<Option<TimelineBlock>> {
         let kind = match row.block_kind.as_str() {
             BLOCK_KIND_USER_MESSAGE => self.user_message_timeline_block_kind(&row).await?,
             BLOCK_KIND_TURN_WORK => self.turn_work_timeline_block_kind(&row).await?,
@@ -1129,7 +1224,15 @@ impl MessageProcessor {
                 state: TurnWorkState::Running,
                 message: None,
             },
-            BLOCK_KIND_APPROVAL => self.approval_timeline_block_kind(&row).await?,
+            BLOCK_KIND_APPROVAL => {
+                let Some(kind) = self
+                    .approval_timeline_block_kind(&row, approval_scope)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                kind
+            }
             BLOCK_KIND_SYSTEM => terminal_turn_state_timeline_block_kind(&row)?,
             other => {
                 return Err(anyhow!(
@@ -1139,7 +1242,7 @@ impl MessageProcessor {
             }
         };
 
-        Ok(TimelineBlock {
+        Ok(Some(TimelineBlock {
             workspace_id: row.workspace_id,
             thread_id: row.thread_id,
             block_id: row.block_id,
@@ -1148,13 +1251,14 @@ impl MessageProcessor {
             started_at_unix_ms: row.started_at.map(|value| value.timestamp_millis()),
             updated_at_unix_ms: Some(row.updated_at.timestamp_millis()),
             kind,
-        })
+        }))
     }
 
     async fn approval_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
-    ) -> Result<TimelineBlockKind> {
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
+    ) -> Result<Option<TimelineBlockKind>> {
         let request_id = row
             .source_key
             .as_deref()
@@ -1167,7 +1271,10 @@ impl MessageProcessor {
                 format!("failed to load CLI runtime pending request `{request_id}`")
             })?;
         let Some(record) = record else {
-            return Ok(TimelineBlockKind::PendingRequest {
+            if approval_scope.is_some() {
+                return Ok(None);
+            }
+            return Ok(Some(TimelineBlockKind::PendingRequest {
                 runtime_id: String::new(),
                 request_id: request_id.to_owned(),
                 status: CLIRuntimePendingRequestStatus::Expired,
@@ -1179,8 +1286,11 @@ impl MessageProcessor {
                     native_request_id: None,
                     payload: None,
                 },
-            });
+            }));
         };
+        if !cli_runtime_pending_request_visible_to_scope(&record, approval_scope) {
+            return Ok(None);
+        }
         let request =
             serde_json::from_str::<CLIRuntimePendingRequest>(record.payload_json.as_str())
                 .with_context(|| {
@@ -1190,13 +1300,13 @@ impl MessageProcessor {
                     )
                 })?;
 
-        Ok(TimelineBlockKind::PendingRequest {
+        Ok(Some(TimelineBlockKind::PendingRequest {
             runtime_id: record.runtime_id,
             request_id: record.request_id,
             status: parse_cli_runtime_pending_request_status(record.status.as_str()),
             item_id: record.native_item_id,
             request,
-        })
+        }))
     }
 
     async fn user_message_timeline_block_kind(
@@ -1612,6 +1722,24 @@ fn parse_cli_runtime_pending_request_status(value: &str) -> CLIRuntimePendingReq
     }
 }
 
+fn cli_runtime_pending_request_visible_to_scope(
+    record: &CliRuntimePendingRequestRecord,
+    approval_scope: Option<&ThreadTimelineApprovalScope>,
+) -> bool {
+    let Some(approval_scope) = approval_scope else {
+        // The caller may omit the scope only after central authorization has
+        // proven the absolute Superuser bypass.
+        return true;
+    };
+    record
+        .authorization_binding
+        .as_ref()
+        .is_some_and(|binding| {
+            binding.initiating_principal_id == approval_scope.initiating_principal_id
+                && binding.initiating_session_id == approval_scope.initiating_session_id
+        })
+}
+
 fn pending_request_proxy_block(
     record: CliRuntimePendingRequestRecord,
 ) -> Result<Option<TimelineBlock>> {
@@ -1724,6 +1852,68 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
 #[cfg(test)]
 mod timeline_handler_unit_tests {
     use super::*;
+
+    fn pending_request_for(principal_id: &str, session_id: &str) -> CliRuntimePendingRequestRecord {
+        let now = chrono::Utc::now().fixed_offset();
+        CliRuntimePendingRequestRecord {
+            request_id: "approval-request".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            thread_id: "thread".to_owned(),
+            turn_id: Some("turn".to_owned()),
+            native_thread_id: None,
+            native_turn_id: None,
+            native_item_id: None,
+            request_kind: "command_approval".to_owned(),
+            payload_json: "{}".to_owned(),
+            status: StoredCliRuntimePendingRequestStatus::Pending,
+            response_json: None,
+            authorization_binding: Some(pioneer_crud::CliRuntimeRequestAuthorizationBinding {
+                initiating_principal_id: principal_id.to_owned(),
+                initiating_session_id: session_id.to_owned(),
+                initiating_session_generation: 0,
+                authorization_context_fingerprint: "a".repeat(64),
+            }),
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn approval_payload_visibility_is_exact_principal_and_session() {
+        let record = pending_request_for("principal-a", "session-a");
+        let exact = ThreadTimelineApprovalScope {
+            initiating_principal_id: "principal-a".to_owned(),
+            initiating_session_id: "session-a".to_owned(),
+        };
+        let other_session = ThreadTimelineApprovalScope {
+            initiating_principal_id: "principal-a".to_owned(),
+            initiating_session_id: "session-b".to_owned(),
+        };
+        let other_principal = ThreadTimelineApprovalScope {
+            initiating_principal_id: "principal-b".to_owned(),
+            initiating_session_id: "session-a".to_owned(),
+        };
+
+        assert!(cli_runtime_pending_request_visible_to_scope(
+            &record,
+            Some(&exact)
+        ));
+        assert!(!cli_runtime_pending_request_visible_to_scope(
+            &record,
+            Some(&other_session)
+        ));
+        assert!(!cli_runtime_pending_request_visible_to_scope(
+            &record,
+            Some(&other_principal)
+        ));
+        assert!(
+            cli_runtime_pending_request_visible_to_scope(&record, None),
+            "central absolute-Superuser admission may observe management approvals"
+        );
+    }
 
     #[test]
     fn terminal_system_row_metadata_preserves_state_and_message() {

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoleKey",
+  "type": "string",
+  "maxLength": 32,
+  "minLength": 1,
+  "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+}

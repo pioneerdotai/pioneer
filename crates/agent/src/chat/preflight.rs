@@ -2292,6 +2292,7 @@ mod tests {
                 input_text: "как меня зовут?".to_owned(),
                 task_id: None,
                 agent_id: None,
+                principal_id: None,
             },
             &TurnPrePromptContextHookInput::from_parts(
                 "как меня зовут?",
@@ -2326,6 +2327,7 @@ mod tests {
                 input_text: "а завтра какая?".to_owned(),
                 task_id: None,
                 agent_id: None,
+                principal_id: None,
             },
             &TurnPrePromptContextHookInput::from_parts(
                 "а завтра какая?",

@@ -7,6 +7,9 @@
 mod artifact_prompt_refs;
 mod attachment;
 mod auth;
+pub(crate) mod authorization;
+#[cfg(test)]
+mod authorization_test_support;
 mod bootstrap;
 pub mod claude_mcp_conformance;
 #[doc(hidden)]

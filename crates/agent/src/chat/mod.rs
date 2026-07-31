@@ -36,16 +36,16 @@ use crate::{
     AgentMcpMaterializationRequest, AgentMcpResolutionDiagnostic, AgentMcpServerRef,
     AgentMcpToolProvider, AgentMcpToolRef, AgentTurnHookRuntimeContext, ExecutionCheckpointContext,
     ExecutionWindowContinuation, ResolvedArtifactInput, RetainedProviderHistoryMessage,
-    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext,
-    TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization,
-    TurnToolProvider,
+    ReviewRequiredTaskObservation, SkillContinuationAuthorizationContext, TaskToolMaterialization,
+    TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
+    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{
-    HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
+    HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
     TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolErrorClass,
     TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus, TurnPostTurnToolStatus,
     TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
@@ -1819,6 +1819,9 @@ async fn run_agent_turn_preflight_stage(
         input_text: input_text.to_owned(),
         task_id: hook_runtime_context.task_id.clone(),
         agent_id: hook_runtime_context.agent_id.clone(),
+        principal_id: (hook_runtime_context.actor_kind == HookActorKind::User)
+            .then(|| hook_runtime_context.actor_id.clone())
+            .flatten(),
     };
     let episodic_capabilities = MemoryEpisodicRecallCapabilities {
         current_thread_search: !memory_context
@@ -4929,6 +4932,7 @@ async fn execute_agent_provider_response(
                     let event_tx = event_tx.clone();
                     let runtime_tool_index = runtime_tool_index.clone();
                     let runtime_recheck_policy = runtime_recheck_policy.clone();
+                    let turn_tool_provider = turn_tool_provider.clone();
                     let workspace_id = workspace_id.to_owned();
                     let thread_id = thread_id.to_owned();
                     let turn_id = turn_id.to_owned();
@@ -4971,10 +4975,39 @@ async fn execute_agent_provider_response(
                         }
 
                         if let Some(descriptor) = runtime_tool_index.get(tool_name.as_str()) {
-                            let check = pioneer_skills::recheck_runtime_tool_execution(
-                                descriptor,
-                                &runtime_recheck_policy,
-                            );
+                            let check = match turn_tool_provider.as_ref() {
+                                Some(provider) => match provider
+                                    .authorize_skill_continuation(
+                                        SkillContinuationAuthorizationContext {
+                                            workspace_id: workspace_id.clone(),
+                                            thread_id: thread_id.clone(),
+                                            turn_id: turn_id.clone(),
+                                            skill_id: descriptor.skill_id.clone(),
+                                            fingerprint: descriptor.skill_fingerprint.clone(),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => pioneer_skills::recheck_runtime_tool_execution(
+                                        descriptor,
+                                        &runtime_recheck_policy,
+                                    ),
+                                    Err(_) => pioneer_skills::RuntimeExecutionCheck {
+                                        allowed: false,
+                                        reason_code: Some(
+                                            "runtime.authorization_revoked".to_owned(),
+                                        ),
+                                        message:
+                                            "skill is no longer authorized for this turn"
+                                                .to_owned(),
+                                        dependency_diagnostics: Vec::new(),
+                                    },
+                                },
+                                None => pioneer_skills::recheck_runtime_tool_execution(
+                                    descriptor,
+                                    &runtime_recheck_policy,
+                                ),
+                            };
 
                             if !check.allowed {
                                 let error_payload = serde_json::json!({

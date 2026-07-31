@@ -62,6 +62,8 @@ pub struct ThreadAgentsDocResolvedPayload {
 pub struct ThreadAgentsDocGetParams {
     pub workspace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
 }
 
@@ -76,6 +78,8 @@ pub struct ThreadAgentsDocGetResponse {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadAgentsDocSaveParams {
     pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
     pub content: String,
@@ -93,6 +97,8 @@ pub struct ThreadAgentsDocSaveResponse {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThreadAgentsDocArchiveParams {
     pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

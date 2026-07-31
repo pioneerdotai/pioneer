@@ -28,6 +28,21 @@ pub use repositories::auth_session::{
     replace_current_refresh, revoke_reason_to_db, revoke_session_family_for_refresh_reuse,
     scan_auth_persistence_invariants, touch_active_auth_session, touch_active_device,
 };
+pub use repositories::authorization_persistence::{
+    AuthorizationPersistenceInvariantKind, AuthorizationPersistenceInvariantReport,
+    LearnedVersionIneligibleReason, MemberLearnedVersionEligibility,
+    derive_member_learned_version_eligibility, scan_authorization_persistence_invariants,
+};
+pub use repositories::authorization_scope::{
+    ArtifactAuthorizationScope, CapabilityAuthorizationScope, PersistedCapabilityScopeKind,
+    SessionAuthorizationScope, TaskAuthorizationScope, ThreadAuthorizationScope,
+    ThreadStartAuthorizationScope, TurnAuthorizationScope, WorkspaceAuthorizationScope,
+    resolve_artifact_authorization_scope, resolve_artifact_binding_authorization_root,
+    resolve_persisted_capability_authorization_scope, resolve_session_authorization_scope,
+    resolve_task_authorization_scope, resolve_thread_authorization_scope,
+    resolve_thread_start_authorization_scope, resolve_turn_authorization_scope,
+    resolve_workspace_authorization_scope,
+};
 pub use repositories::identity::{
     ActorReferenceRow, ActorResourceKind, GATEWAY_SINGLETON_KEY, GatewayIdentityRecord,
     GatewayPrincipalRecord, IdentityInvariantRows, LegacyActorBackfillCounts, actor_ref_from_db,
@@ -38,24 +53,38 @@ pub use repositories::identity::{
     mark_gateway_auth_ready, principal_kind_from_db, principal_kind_to_db,
     principal_status_from_db, principal_status_to_db, set_identity_bootstrap_version,
 };
+pub use repositories::membership::{
+    NewThreadMembership, NewWorkspaceMembership, PersistedThreadAccessClass,
+    PrivateThreadParticipantMutation, delete_thread_membership, delete_workspace_membership,
+    find_accessible_thread_for_principal, find_active_workspace_for_principal,
+    find_shared_workspace_principal_for_principal, find_thread_membership,
+    find_workspace_membership, insert_thread_membership, insert_workspace_membership,
+    list_accessible_threads_for_principal, list_active_workspaces_for_principal,
+    list_directory_principals_for_superuser, list_shared_workspace_principals_for_principal,
+    list_thread_memberships_for_principal, list_thread_memberships_for_thread,
+    list_workspace_memberships_for_principal, list_workspace_memberships_for_workspace,
+    persisted_thread_access_class_from_db, persisted_thread_access_class_to_db,
+};
+pub use repositories::task::TaskRootAccessFilter;
+pub use repositories::turn::find_turn_initiator;
 
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
-    ArtifactSummary, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
-    PersistedActorRef, PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SkillPackId, StorageOutputPolicy,
-    Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    ArtifactSummary, GatewayId, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope,
+    MemoryScopeKind, PersistedActorRef, PrincipalId, PromptManifest, ProviderFailureClass,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId,
+    SkillPackId, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
+    TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
     TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind, TaskGetResponse,
     TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus,
     TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
     Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
-    ThreadStatus, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
-    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind,
+    ThreadStatus, ThreadVisibility, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload,
+    ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent,
+    TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind,
     TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
@@ -748,13 +777,14 @@ pub use crate::repositories::cli_runtime_binding::{
     CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord, CliRuntimeNativeTurnOwner,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
     CliRuntimePendingRequestStatus, CliRuntimeProviderSessionBinding,
-    CliRuntimeProviderSessionLifecycle, CliRuntimeThreadBindingRecord, CliRuntimeThreadMcpMetadata,
-    CliRuntimeTurnAttemptRecord, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
-    CliRuntimeTurnBindingRecord, CliRuntimeTurnMcpMetadata, NewCliRuntimeExecutionSegment,
-    NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-    NewCliRuntimeTurnBinding, PrepareClaudeProviderSessionBinding,
-    PreparedClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
-    ResolveCliRuntimePendingRequest, deserialize_cli_runtime_json, serialize_cli_runtime_json,
+    CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
+    CliRuntimeThreadBindingRecord, CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptRecord,
+    CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnBindingRecord,
+    CliRuntimeTurnMcpMetadata, NewCliRuntimeExecutionSegment, NewCliRuntimeNativeEvent,
+    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+    PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
+    PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
+    deserialize_cli_runtime_json, serialize_cli_runtime_json,
 };
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
@@ -767,17 +797,18 @@ pub use crate::repositories::thread_timeline_projection::{
     PROJECTION_META_STATUS_BACKFILLING, PROJECTION_META_STATUS_COMPLETE,
     PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING, ProjectionMetaConfigRecord,
     ProjectionMetaRecord, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_KEY,
-    SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
-    TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
-    count_thread_timeline_blocks, count_turn_work_items, delete_thread_timeline_block,
-    delete_thread_timeline_blocks_for_thread, delete_thread_timeline_blocks_for_turn,
-    delete_turn_work_items_for_turn, delete_turn_work_projection, find_projection_meta,
-    find_thread_timeline_block_by_sort_key, find_turn_work_item_projection,
-    find_turn_work_item_projection_by_order_key, find_turn_work_projection,
-    list_projection_meta_by_key_prefix, list_thread_timeline_blocks_page,
-    list_turn_work_item_projections_by_ids, list_turn_work_items_page,
-    update_projection_meta_status, upsert_projection_meta, upsert_projection_meta_with_config,
-    upsert_thread_timeline_block, upsert_turn_work_item_projection, upsert_turn_work_projection,
+    SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineApprovalScope, ThreadTimelineBlockRecord,
+    TurnWorkItemProjectionRecord, TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN,
+    WORK_VISIBILITY_VISIBLE, count_thread_timeline_blocks, count_turn_work_items,
+    delete_thread_timeline_block, delete_thread_timeline_blocks_for_thread,
+    delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
+    delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
+    find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
+    find_turn_work_projection, list_projection_meta_by_key_prefix,
+    list_thread_timeline_blocks_page, list_turn_work_item_projections_by_ids,
+    list_turn_work_items_page, update_projection_meta_status, upsert_projection_meta,
+    upsert_projection_meta_with_config, upsert_thread_timeline_block,
+    upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
 pub use crate::repositories::turn_mcp_projection::{
     TurnMcpProjectionPersistenceError, TurnMcpProjectionReplaceOutcome,
@@ -1573,6 +1604,84 @@ pub struct CrudStore {
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
+}
+
+async fn authorize_private_participant_scope(
+    transaction: &sea_orm::DatabaseTransaction,
+    workspace_id: &str,
+    thread_id: &str,
+    acting_member_principal_id: Option<&PrincipalId>,
+) -> Result<Option<pioneer_entity::thread::Model>> {
+    let Some(model) = repositories::thread::find_thread_by_id(transaction, thread_id).await? else {
+        return Ok(None);
+    };
+    if model.workspace_id != workspace_id
+        || model.sidebar_visibility != "visible"
+        || persisted_thread_access_class_from_db(model.access_class.as_str())?
+            != PersistedThreadAccessClass::Private
+    {
+        return Ok(None);
+    }
+    if let Some(principal_id) = acting_member_principal_id {
+        if find_workspace_membership(transaction, principal_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if actor_ref_from_db(
+            model.created_by_actor_kind.as_deref(),
+            model.created_by_actor_id.as_deref(),
+        )?
+        .as_ref()
+            != Some(&PersistedActorRef::Principal(principal_id.clone()))
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(model))
+}
+
+async fn validated_participant_ids_from_rows(
+    transaction: &sea_orm::DatabaseTransaction,
+    gateway_id: &GatewayId,
+    workspace_id: &str,
+    rows: Vec<pioneer_entity::thread_membership::Model>,
+) -> Result<Vec<PrincipalId>> {
+    let mut participant_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let principal_id = PrincipalId::new(row.principal_id)
+            .context("thread membership contains an invalid principal id")?;
+        let principal = load_principal_by_id(transaction, &principal_id)
+            .await?
+            .context("thread membership references a missing principal")?;
+        let role = principal
+            .role_key
+            .as_deref()
+            .map(pioneer_protocol::RoleKey::new)
+            .transpose()
+            .context("thread membership principal has an invalid role")?;
+        if principal.gateway_id != *gateway_id
+            || principal.kind != pioneer_protocol::PrincipalKind::User
+            || !matches!(
+                principal.status,
+                pioneer_protocol::PrincipalStatus::Active
+                    | pioneer_protocol::PrincipalStatus::Suspended
+            )
+            || !role
+                .as_ref()
+                .is_some_and(pioneer_protocol::RoleKey::is_supported)
+            || find_workspace_membership(transaction, &principal_id, workspace_id)
+                .await?
+                .is_none()
+        {
+            anyhow::bail!(
+                "thread membership violates persisted Member workspace-parent invariants"
+            );
+        }
+        participant_ids.push(principal_id);
+    }
+    Ok(participant_ids)
 }
 
 fn skill_upload_session_record_from_model(
@@ -3628,6 +3737,44 @@ impl CrudStore {
         .await
     }
 
+    pub async fn open_cli_runtime_pending_request_with_authorization(
+        &self,
+        request: NewCliRuntimePendingRequest,
+        authorization: CliRuntimeRequestAuthorizationBinding,
+    ) -> Result<CliRuntimePendingRequestRecord> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin authorized CLI runtime request transaction")?;
+            let opened =
+                cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
+            let record = cli_runtime_binding::bind_pending_request_authorization(
+                &transaction,
+                opened.request_id.as_str(),
+                &authorization,
+            )
+            .await?;
+            if let Err(error) =
+                crate::timeline_live_projection::project_cli_runtime_pending_request(
+                    &transaction,
+                    &record,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit authorized CLI runtime request transaction")?;
+            Ok(record)
+        })
+        .await
+    }
+
     pub async fn get_cli_runtime_pending_request(
         &self,
         request_id: &str,
@@ -4415,6 +4562,49 @@ impl CrudStore {
             .list_artifacts(&self.connection, workspace_id, filter)
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn list_artifact_ids_for_authorized_thread_roots(
+        &self,
+        workspace_id: &str,
+        authorized_thread_roots: &[Vec<String>],
+    ) -> Result<Vec<String>> {
+        let authorized_thread_ids = authorized_thread_roots
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if authorized_thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidates = pioneer_entity::artifact::Entity::find()
+            .filter(pioneer_entity::artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .order_by_asc(pioneer_entity::artifact::Column::Id)
+            .all(&self.connection)
+            .await
+            .context("failed to list artifact authorization candidates")?;
+        let mut artifact_ids = Vec::new();
+        for candidate in candidates {
+            let Some(scope) = resolve_artifact_authorization_scope(
+                &self.connection,
+                candidate.id.as_str(),
+                Some(workspace_id),
+                None,
+            )
+            .await?
+            else {
+                continue;
+            };
+            if scope
+                .thread_id
+                .as_ref()
+                .is_some_and(|thread_id| authorized_thread_ids.contains(thread_id))
+            {
+                artifact_ids.push(candidate.id);
+            }
+        }
+        Ok(artifact_ids)
     }
 
     pub async fn list_conversation_artifact_refs(
@@ -7305,6 +7495,26 @@ impl CrudStore {
         )
     }
 
+    pub async fn list_thread_episodic_thread_directory_entries_for_workspace_scoped(
+        &self,
+        workspace_id: &str,
+        allowed_thread_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicThreadDirectoryRecord>> {
+        Ok(
+            thread_episodic_repository::list_thread_directory_entries_for_workspace_scoped(
+                &self.connection,
+                workspace_id,
+                allowed_thread_ids,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(crate::thread_episodic::thread_episodic_thread_directory_record_from_model)
+            .collect(),
+        )
+    }
+
     pub async fn count_active_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
@@ -8249,28 +8459,40 @@ impl CrudStore {
     }
 
     pub async fn list_tasks(&self, params: TaskListParams) -> Result<Vec<Task>> {
+        self.list_tasks_scoped(params, None).await
+    }
+
+    pub async fn list_tasks_scoped(
+        &self,
+        params: TaskListParams,
+        access: Option<&TaskRootAccessFilter>,
+    ) -> Result<Vec<Task>> {
         let limit = params.limit.map(u64::from);
         let rows = if let Some(parent_task_id) = params.parent_task_id.as_deref() {
-            task_repository::list_tasks_by_parent(&self.connection, parent_task_id).await?
+            task_repository::list_tasks_by_parent_scoped(&self.connection, parent_task_id, access)
+                .await?
         } else if let Some(root_task_id) = params.root_task_id.as_deref() {
-            task_repository::list_tasks_by_root(&self.connection, root_task_id).await?
+            task_repository::list_tasks_by_root_scoped(&self.connection, root_task_id, access)
+                .await?
         } else if let Some(owner_kind) = params.owner_kind {
             let owner_kind = task_owner_kind_to_db(owner_kind);
-            task_repository::list_tasks_by_owner(
+            task_repository::list_tasks_by_owner_scoped(
                 &self.connection,
                 params.workspace_id.as_str(),
                 owner_kind,
                 params.owner_id.as_deref(),
                 limit,
+                access,
             )
             .await?
         } else {
             let status = params.status.map(task_status_to_db);
-            task_repository::list_tasks_by_workspace_status(
+            task_repository::list_tasks_by_workspace_status_scoped(
                 &self.connection,
                 params.workspace_id.as_str(),
                 status,
                 limit,
+                access,
             )
             .await?
         };
@@ -9476,7 +9698,15 @@ impl CrudStore {
         &self,
         params: TaskDeliveriesParams,
     ) -> Result<TaskDeliveriesResponse> {
-        let deliveries = task_delivery::list_deliveries(&self.connection, &params)
+        self.list_task_deliveries_scoped(params, None).await
+    }
+
+    pub async fn list_task_deliveries_scoped(
+        &self,
+        params: TaskDeliveriesParams,
+        access: Option<&TaskRootAccessFilter>,
+    ) -> Result<TaskDeliveriesResponse> {
+        let deliveries = task_delivery::list_deliveries_scoped(&self.connection, &params, access)
             .await?
             .into_iter()
             .map(task_delivery_from_db_model)
@@ -9497,17 +9727,28 @@ impl CrudStore {
     }
 
     pub async fn list_task_agenda(&self, params: TaskAgendaParams) -> Result<TaskAgendaResponse> {
+        self.list_task_agenda_scoped(params, None).await
+    }
+
+    pub async fn list_task_agenda_scoped(
+        &self,
+        params: TaskAgendaParams,
+        access: Option<&TaskRootAccessFilter>,
+    ) -> Result<TaskAgendaResponse> {
         let limit = params.limit.unwrap_or(100).max(1).min(500);
         let tasks = self
-            .list_tasks(TaskListParams {
-                workspace_id: params.workspace_id.clone(),
-                owner_kind: params.owner_kind,
-                owner_id: params.owner_id.clone(),
-                parent_task_id: None,
-                root_task_id: None,
-                status: None,
-                limit: None,
-            })
+            .list_tasks_scoped(
+                TaskListParams {
+                    workspace_id: params.workspace_id.clone(),
+                    owner_kind: params.owner_kind,
+                    owner_id: params.owner_id.clone(),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    status: None,
+                    limit: None,
+                },
+                access,
+            )
             .await?;
         let mut items = Vec::new();
         for task in tasks {
@@ -9858,6 +10099,57 @@ impl CrudStore {
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {
             turn::find_turn_execution_security_snapshot(&self.connection, turn_id.as_str()).await
+        })
+        .await
+    }
+
+    pub async fn set_turn_execution_envelope(
+        &self,
+        turn_id: &str,
+        snapshot: &TurnExecutionSecuritySnapshot,
+        authorization_context_json: &str,
+    ) -> Result<bool> {
+        let turn_id = turn_id.to_owned();
+        let snapshot = snapshot.clone();
+        let authorization_context_json = authorization_context_json.to_owned();
+        self.run_serialized_write(|| async {
+            turn::set_turn_execution_envelope(
+                &self.connection,
+                turn_id.as_str(),
+                &snapshot,
+                authorization_context_json.as_str(),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn set_turn_execution_authorization_context(
+        &self,
+        turn_id: &str,
+        context_json: &str,
+    ) -> Result<bool> {
+        let turn_id = turn_id.to_owned();
+        let context_json = context_json.to_owned();
+        self.run_serialized_write(|| async {
+            turn::set_turn_execution_authorization_context(
+                &self.connection,
+                turn_id.as_str(),
+                context_json.as_str(),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn get_turn_execution_authorization_context(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<String>> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            turn::find_turn_execution_authorization_context(&self.connection, turn_id.as_str())
+                .await
         })
         .await
     }
@@ -10988,14 +11280,65 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         bindings: &[TurnSkillBindingRecord],
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        let turn_id = turn_id.to_owned();
+        let bindings = bindings.to_vec();
         self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin turn skill projection transaction")?;
             turn_skill_binding::replace_turn_skill_bindings(
-                &self.connection,
-                turn_id,
-                bindings,
+                &transaction,
+                turn_id.as_str(),
+                bindings.as_slice(),
                 unix_to_datetime(event_timestamp_secs),
             )
-            .await
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit turn skill projection transaction")
+        })
+        .await
+    }
+
+    pub async fn replace_turn_skill_bindings_with_authorization_context(
+        &self,
+        turn_id: &str,
+        bindings: &[TurnSkillBindingRecord],
+        event_timestamp_secs: i64,
+        authorization_context_json: &str,
+    ) -> Result<()> {
+        let turn_id = turn_id.to_owned();
+        let bindings = bindings.to_vec();
+        let authorization_context_json = authorization_context_json.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin authorized turn skill projection transaction")?;
+            turn_skill_binding::replace_turn_skill_bindings(
+                &transaction,
+                turn_id.as_str(),
+                bindings.as_slice(),
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?;
+            if !turn::set_turn_execution_authorization_context(
+                &transaction,
+                turn_id.as_str(),
+                authorization_context_json.as_str(),
+            )
+            .await?
+            {
+                anyhow::bail!("turn disappeared while binding its skill projection");
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit authorized turn skill projection transaction")
         })
         .await
     }
@@ -12968,6 +13311,33 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .await
     }
 
+    pub async fn replace_turn_mcp_projection_with_authorization_context(
+        &self,
+        replacement: &TurnMcpProjectionReplacement,
+        authorization_context_json: &str,
+    ) -> std::result::Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+    {
+        let replacement = replacement.clone();
+        let authorization_context_json = authorization_context_json.to_owned();
+        self.write_coordinator
+            .run_serialized_with_retry(
+                || {
+                    let replacement = replacement.clone();
+                    let authorization_context_json = authorization_context_json.clone();
+                    async move {
+                        turn_mcp_projection::replace_turn_mcp_projection_with_authorization_context(
+                            &self.connection,
+                            &replacement,
+                            authorization_context_json.as_str(),
+                        )
+                        .await
+                    }
+                },
+                TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            )
+            .await
+    }
+
     pub async fn list_turn_mcp_bindings(&self, turn_id: &str) -> Result<Vec<TurnMcpBindingRecord>> {
         let rows = turn_mcp_binding::list_turn_mcp_bindings(&self.connection, turn_id).await?;
         Ok(rows
@@ -13133,18 +13503,27 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     pub async fn list_thread_timeline_projection_page(
         &self,
         thread_id: &str,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
         anchor: ProjectionPageAnchor<'_>,
         limit: u64,
     ) -> Result<Vec<pioneer_entity::thread_timeline_block::Model>> {
-        list_thread_timeline_blocks_page(&self.connection, thread_id, anchor, limit).await
+        list_thread_timeline_blocks_page(&self.connection, thread_id, approval_scope, anchor, limit)
+            .await
     }
 
     pub async fn find_thread_timeline_projection_block_by_sort_key(
         &self,
         thread_id: &str,
+        approval_scope: Option<&ThreadTimelineApprovalScope>,
         sort_key: &str,
     ) -> Result<Option<pioneer_entity::thread_timeline_block::Model>> {
-        find_thread_timeline_block_by_sort_key(&self.connection, thread_id, sort_key).await
+        find_thread_timeline_block_by_sort_key(
+            &self.connection,
+            thread_id,
+            approval_scope,
+            sort_key,
+        )
+        .await
     }
 
     pub async fn get_turn_work_projection(
@@ -13241,6 +13620,413 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             }
         })
         .await
+    }
+
+    /// Creates a new ordinary user thread and, for a Member, its creator
+    /// membership in one transaction. No caller-visible state exists if either
+    /// insert fails.
+    pub async fn create_member_private_thread(
+        &self,
+        thread_model: &Thread,
+        gateway_id: &GatewayId,
+        creator_principal_id: &PrincipalId,
+        creator: PersistedActorRef,
+    ) -> Result<()> {
+        let thread_model = thread_model.clone();
+        let gateway_id = gateway_id.clone();
+        let creator_principal_id = creator_principal_id.clone();
+        let created_at = unix_to_datetime(thread_model.created_at);
+        let updated_at = unix_to_datetime(thread_model.updated_at);
+        self.run_serialized_write(|| {
+            let thread_model = thread_model.clone();
+            let gateway_id = gateway_id.clone();
+            let creator_principal_id = creator_principal_id.clone();
+            let creator = creator.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin member thread creation transaction")?;
+                thread::insert_user_thread_with_creator(
+                    &transaction,
+                    &thread_model,
+                    &creator,
+                    PersistedThreadAccessClass::Private,
+                    created_at,
+                    updated_at,
+                )
+                .await?;
+                insert_thread_membership(
+                    &transaction,
+                    &NewThreadMembership {
+                        gateway_id,
+                        principal_id: creator_principal_id,
+                        workspace_id: thread_model.workspace_id.clone(),
+                        thread_id: thread_model.id.clone(),
+                        added_by: creator,
+                        now: updated_at,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit member thread creation transaction")
+            }
+        })
+        .await
+    }
+
+    /// Creates a new ordinary user thread for the absolute Superuser. The
+    /// access class is explicit but cannot be `internal`.
+    pub async fn create_superuser_thread(
+        &self,
+        thread_model: &Thread,
+        creator: PersistedActorRef,
+        access_class: PersistedThreadAccessClass,
+    ) -> Result<()> {
+        let thread_model = thread_model.clone();
+        let created_at = unix_to_datetime(thread_model.created_at);
+        let updated_at = unix_to_datetime(thread_model.updated_at);
+        self.run_serialized_write(|| {
+            let thread_model = thread_model.clone();
+            let creator = creator.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin superuser thread creation transaction")?;
+                thread::insert_user_thread_with_creator(
+                    &transaction,
+                    &thread_model,
+                    &creator,
+                    access_class,
+                    created_at,
+                    updated_at,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit superuser thread creation transaction")
+            }
+        })
+        .await
+    }
+
+    /// Applies a creator/Superuser thread-management patch under one exact
+    /// transaction. Passing a Member principal re-checks both its current
+    /// workspace membership and persisted creator identity inside the write.
+    pub async fn update_user_thread_management(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        member_principal_id: Option<&PrincipalId>,
+        name: Option<&str>,
+        access_class: Option<PersistedThreadAccessClass>,
+        archived: Option<bool>,
+    ) -> Result<Option<bool>> {
+        let workspace_id = workspace_id.to_owned();
+        let thread_id = thread_id.to_owned();
+        let member_principal_id = member_principal_id.cloned();
+        let name = name.map(str::to_owned);
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.clone();
+            let thread_id = thread_id.clone();
+            let member_principal_id = member_principal_id.clone();
+            let name = name.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread management transaction")?;
+                if let Some(principal_id) = member_principal_id.as_ref()
+                    && find_workspace_membership(&transaction, principal_id, workspace_id.as_str())
+                        .await?
+                        .is_none()
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back unauthorized thread management")?;
+                    return Ok(None);
+                }
+                let result = thread::update_user_thread_management(
+                    &transaction,
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    member_principal_id.as_ref(),
+                    name.as_deref(),
+                    access_class,
+                    archived,
+                    unix_to_datetime(chrono::Utc::now().timestamp()),
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread management transaction")?;
+                Ok(result)
+            }
+        })
+        .await
+    }
+
+    pub async fn list_private_thread_participant_ids(
+        &self,
+        gateway_id: &GatewayId,
+        workspace_id: &str,
+        thread_id: &str,
+        acting_member_principal_id: Option<&PrincipalId>,
+    ) -> Result<Option<Vec<PrincipalId>>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin participant list snapshot")?;
+        if authorize_private_participant_scope(
+            &transaction,
+            workspace_id,
+            thread_id,
+            acting_member_principal_id,
+        )
+        .await?
+        .is_none()
+        {
+            transaction
+                .rollback()
+                .await
+                .context("failed to roll back inaccessible participant list")?;
+            return Ok(None);
+        }
+        let rows = list_thread_memberships_for_thread(&transaction, thread_id).await?;
+        let participant_ids =
+            validated_participant_ids_from_rows(&transaction, gateway_id, workspace_id, rows)
+                .await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to finish participant list snapshot")?;
+        Ok(Some(participant_ids))
+    }
+
+    pub async fn add_private_thread_participant(
+        &self,
+        gateway_id: &GatewayId,
+        workspace_id: &str,
+        thread_id: &str,
+        acting_member_principal_id: Option<&PrincipalId>,
+        target_principal_id: &PrincipalId,
+        actor: PersistedActorRef,
+    ) -> Result<Option<PrivateThreadParticipantMutation>> {
+        let gateway_id = gateway_id.clone();
+        let workspace_id = workspace_id.to_owned();
+        let thread_id = thread_id.to_owned();
+        let acting_member_principal_id = acting_member_principal_id.cloned();
+        let target_principal_id = target_principal_id.clone();
+        self.run_serialized_write(|| {
+            let gateway_id = gateway_id.clone();
+            let workspace_id = workspace_id.clone();
+            let thread_id = thread_id.clone();
+            let acting_member_principal_id = acting_member_principal_id.clone();
+            let target_principal_id = target_principal_id.clone();
+            let actor = actor.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin participant add transaction")?;
+                if authorize_private_participant_scope(
+                    &transaction,
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    acting_member_principal_id.as_ref(),
+                )
+                .await?
+                .is_none()
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back inaccessible participant add")?;
+                    return Ok(None);
+                }
+                if !repositories::membership::private_thread_participant_target_is_eligible(
+                    &transaction,
+                    &gateway_id,
+                    workspace_id.as_str(),
+                    &target_principal_id,
+                    false,
+                )
+                .await?
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back unavailable participant add")?;
+                    return Ok(Some(PrivateThreadParticipantMutation::TargetUnavailable));
+                }
+                let existed =
+                    find_thread_membership(&transaction, thread_id.as_str(), &target_principal_id)
+                        .await?
+                        .is_some();
+                insert_thread_membership(
+                    &transaction,
+                    &NewThreadMembership {
+                        gateway_id: gateway_id.clone(),
+                        principal_id: target_principal_id,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.clone(),
+                        added_by: actor,
+                        now: unix_to_datetime(chrono::Utc::now().timestamp()),
+                    },
+                )
+                .await?;
+                let rows =
+                    list_thread_memberships_for_thread(&transaction, thread_id.as_str()).await?;
+                let participant_ids = validated_participant_ids_from_rows(
+                    &transaction,
+                    &gateway_id,
+                    workspace_id.as_str(),
+                    rows,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit participant add transaction")?;
+                Ok(Some(PrivateThreadParticipantMutation::Applied {
+                    changed: !existed,
+                    participant_ids,
+                }))
+            }
+        })
+        .await
+    }
+
+    pub async fn remove_private_thread_participant(
+        &self,
+        gateway_id: &GatewayId,
+        workspace_id: &str,
+        thread_id: &str,
+        acting_member_principal_id: Option<&PrincipalId>,
+        target_principal_id: &PrincipalId,
+    ) -> Result<Option<PrivateThreadParticipantMutation>> {
+        let gateway_id = gateway_id.clone();
+        let workspace_id = workspace_id.to_owned();
+        let thread_id = thread_id.to_owned();
+        let acting_member_principal_id = acting_member_principal_id.cloned();
+        let target_principal_id = target_principal_id.clone();
+        self.run_serialized_write(|| {
+            let gateway_id = gateway_id.clone();
+            let workspace_id = workspace_id.clone();
+            let thread_id = thread_id.clone();
+            let acting_member_principal_id = acting_member_principal_id.clone();
+            let target_principal_id = target_principal_id.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin participant remove transaction")?;
+                let Some(thread) = authorize_private_participant_scope(
+                    &transaction,
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    acting_member_principal_id.as_ref(),
+                )
+                .await?
+                else {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back inaccessible participant remove")?;
+                    return Ok(None);
+                };
+                let creator = actor_ref_from_db(
+                    thread.created_by_actor_kind.as_deref(),
+                    thread.created_by_actor_id.as_deref(),
+                )?;
+                if creator.as_ref()
+                    == Some(&PersistedActorRef::Principal(target_principal_id.clone()))
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to preserve creator participant membership")?;
+                    return Ok(Some(PrivateThreadParticipantMutation::MandatoryCreator));
+                }
+                if !repositories::membership::private_thread_participant_target_is_eligible(
+                    &transaction,
+                    &gateway_id,
+                    workspace_id.as_str(),
+                    &target_principal_id,
+                    true,
+                )
+                .await?
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back unavailable participant remove")?;
+                    return Ok(Some(PrivateThreadParticipantMutation::TargetUnavailable));
+                }
+                let changed = delete_thread_membership(
+                    &transaction,
+                    &gateway_id,
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    &target_principal_id,
+                )
+                .await?;
+                let rows =
+                    list_thread_memberships_for_thread(&transaction, thread_id.as_str()).await?;
+                let participant_ids = validated_participant_ids_from_rows(
+                    &transaction,
+                    &gateway_id,
+                    workspace_id.as_str(),
+                    rows,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit participant remove transaction")?;
+                Ok(Some(PrivateThreadParticipantMutation::Applied {
+                    changed,
+                    participant_ids,
+                }))
+            }
+        })
+        .await
+    }
+
+    pub async fn list_accessible_threads_for_principal(
+        &self,
+        principal_id: &PrincipalId,
+        workspace_id: &str,
+        limit: u64,
+    ) -> Result<Vec<Thread>> {
+        let models = repositories::membership::list_accessible_threads_for_principal(
+            &self.connection,
+            principal_id,
+            workspace_id,
+            limit,
+        )
+        .await?;
+        let mut threads = Vec::with_capacity(models.len());
+        for model in models {
+            let Some(mut thread) = thread_from_db_model(model) else {
+                continue;
+            };
+            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
+            threads.push(thread);
+        }
+        Ok(threads)
     }
 
     pub async fn list_threads_for_workspace(
@@ -13436,6 +14222,16 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ResolvedThreadAgentsDocRecord>> {
         thread_agents_doc::ThreadAgentsDocRepository::new()
             .resolve_for_thread(&self.connection, workspace_id, thread_id)
+            .await
+    }
+
+    pub async fn resolve_thread_agents_doc_folder_for_thread(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Option<String>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .folder_for_thread(&self.connection, workspace_id, thread_id)
             .await
     }
 
@@ -17056,6 +17852,12 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
     let status = thread_status_from_db(model.status.as_str())?;
     let origin_kind = thread_origin_kind_from_db(model.origin_kind.as_str())?;
     let sidebar_visibility = thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())?;
+    let visibility =
+        match persisted_thread_access_class_from_db(model.access_class.as_str()).ok()? {
+            PersistedThreadAccessClass::Private => Some(ThreadVisibility::Private),
+            PersistedThreadAccessClass::Workspace => Some(ThreadVisibility::Workspace),
+            PersistedThreadAccessClass::Internal => None,
+        };
 
     Some(Thread {
         workspace_id: model.workspace_id,
@@ -17073,6 +17875,7 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
         sidebar_visibility,
         agent_nickname: model.agent_nickname,
         agent_role: model.agent_role,
+        visibility,
         turns: Vec::new(),
     })
 }
@@ -17245,10 +18048,11 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome,
-        ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
-        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
-        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
+        ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BLOCK_KIND_APPROVAL,
+        BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
+        CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter,
+        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
+        CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
         CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
         CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits, CrudStore,
         IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
@@ -17257,19 +18061,20 @@ mod tests {
         NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
-        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillDependencySnapshotRecord,
-        SkillInstallationPatch, SkillInstallationRecord, SkillPackChildDiff,
-        SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        ProjectionPageAnchor, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
+        SkillDependencySnapshotRecord, SkillInstallationPatch, SkillInstallationRecord,
+        SkillPackChildDiff, SkillPackInstallationRecord,
+        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
         ThreadEpisodicCapsuleWriteState, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
         ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
-        ThreadEpisodicWorkspaceActiveWriteSegmentRequest, TurnExecutionCheckpointKind,
-        TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
-        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
-        TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnSkillBindingRecord,
-        WorkspaceSkillPolicyRecord,
+        ThreadEpisodicWorkspaceActiveWriteSegmentRequest, ThreadTimelineApprovalScope,
+        ThreadTimelineBlockRecord, TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
+        TurnExecutionWindowUsageAggregateRecord, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
+        TurnMcpProjectionPersistenceError, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
+        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord, upsert_thread_timeline_block,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -17368,6 +18173,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -17871,6 +18677,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }
@@ -18774,6 +19581,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_approval_scope_filters_before_pagination_and_anchor_lookup() {
+        let workspace_id = "ws_timeline_approval";
+        let thread_id = "T".repeat(21);
+        let owner_principal_id = "P".repeat(21);
+        let owner_session_id = "S".repeat(21);
+        let other_principal_id = "Q".repeat(21);
+        let other_session_id = "R".repeat(21);
+        let store = test_store_with_workspace(workspace_id).await;
+        let created_at = unix_to_datetime(1_700_020_500);
+
+        for (request_id, principal_id, session_id) in [
+            (
+                "approval-request-other",
+                other_principal_id.as_str(),
+                other_session_id.as_str(),
+            ),
+            (
+                "approval-request-owner",
+                owner_principal_id.as_str(),
+                owner_session_id.as_str(),
+            ),
+        ] {
+            store
+                .open_cli_runtime_pending_request_with_authorization(
+                    NewCliRuntimePendingRequest {
+                        request_id: request_id.to_owned(),
+                        runtime_id: "codex".to_owned(),
+                        runtime_kind: "codex".to_owned(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.clone(),
+                        turn_id: None,
+                        native_thread_id: None,
+                        native_turn_id: None,
+                        native_item_id: None,
+                        request_kind: "command_approval".to_owned(),
+                        payload_json: "{}".to_owned(),
+                        created_at,
+                        updated_at: created_at,
+                    },
+                    CliRuntimeRequestAuthorizationBinding {
+                        initiating_principal_id: principal_id.to_owned(),
+                        initiating_session_id: session_id.to_owned(),
+                        initiating_session_generation: 0,
+                        authorization_context_fingerprint: "a".repeat(64),
+                    },
+                )
+                .await
+                .expect("authorized pending request should persist");
+        }
+
+        for (block_id, block_kind, source_key, sort_key) in [
+            (
+                "approval-block-other",
+                BLOCK_KIND_APPROVAL,
+                Some("approval-request-other"),
+                "000-other",
+            ),
+            (
+                "ordinary-shared-block",
+                BLOCK_KIND_USER_MESSAGE,
+                None,
+                "001-shared",
+            ),
+            (
+                "approval-block-owner",
+                BLOCK_KIND_APPROVAL,
+                Some("approval-request-owner"),
+                "002-owner",
+            ),
+        ] {
+            upsert_thread_timeline_block(
+                &store.database_connection(),
+                ThreadTimelineBlockRecord {
+                    block_id: block_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.clone(),
+                    turn_id: None,
+                    block_kind: block_kind.to_owned(),
+                    sort_key: sort_key.to_owned(),
+                    source_kind: source_key.map(|_| "cli_runtime_pending_request".to_owned()),
+                    source_key: source_key.map(str::to_owned),
+                    started_at: Some(created_at),
+                    completed_at: None,
+                    metadata_json: "{}".to_owned(),
+                    created_at,
+                    updated_at: created_at,
+                },
+            )
+            .await
+            .expect("timeline block should persist");
+        }
+
+        let approval_scope = ThreadTimelineApprovalScope {
+            initiating_principal_id: owner_principal_id,
+            initiating_session_id: owner_session_id,
+        };
+        let page = store
+            .list_thread_timeline_projection_page(
+                thread_id.as_str(),
+                Some(&approval_scope),
+                ProjectionPageAnchor::Start,
+                2,
+            )
+            .await
+            .expect("scoped timeline page should load");
+        assert_eq!(
+            page.into_iter().map(|row| row.block_id).collect::<Vec<_>>(),
+            vec![
+                "ordinary-shared-block".to_owned(),
+                "approval-block-owner".to_owned(),
+            ],
+            "a foreign approval must be removed in SQL before LIMIT is applied"
+        );
+        assert!(
+            store
+                .find_thread_timeline_projection_block_by_sort_key(
+                    thread_id.as_str(),
+                    Some(&approval_scope),
+                    "000-other",
+                )
+                .await
+                .expect("foreign anchor lookup should succeed")
+                .is_none(),
+            "a foreign approval must not be usable as a Member cursor anchor"
+        );
+        assert!(
+            store
+                .find_thread_timeline_projection_block_by_sort_key(
+                    thread_id.as_str(),
+                    Some(&approval_scope),
+                    "002-owner",
+                )
+                .await
+                .expect("owner anchor lookup should succeed")
+                .is_some(),
+            "the initiating session must retain its own approval anchor"
+        );
+    }
+
+    #[tokio::test]
     async fn cli_runtime_pending_request_cancel_and_expire_helpers_are_terminal() {
         let store = test_store_with_workspace("ws_cli_pending_terminal").await;
         let created_at = unix_to_datetime(1_700_021_000);
@@ -18938,6 +19885,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
 
@@ -20791,6 +21739,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -20966,6 +21915,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -21084,6 +22034,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -21435,6 +22386,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -23595,6 +24547,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
 
@@ -23802,6 +24755,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -24055,6 +25009,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -24317,6 +25272,68 @@ mod tests {
             .await
             .expect("must read replaced turn skill bindings");
         assert_eq!(second_read, second);
+    }
+
+    #[tokio::test]
+    async fn skill_bindings_and_execution_authorization_context_commit_atomically() {
+        let (store, _, _) = test_store_with_started_turn(
+            "workspace_skill_context",
+            "thread_skill_context",
+            "turn_skill_context",
+        )
+        .await;
+        let committed = vec![TurnSkillBindingRecord {
+            skill_id: SkillId::new("S".repeat(21)).expect("valid skill id"),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "committed-skill".to_owned(),
+            skill_version: Some("1.0.0".to_owned()),
+            fingerprint: "committed-fingerprint".to_owned(),
+            source_kind: "system".to_owned(),
+            resolved_reason: "explicit_composer_capability".to_owned(),
+        }];
+        let committed_context = r#"{"version":1,"state":"committed"}"#;
+        store
+            .replace_turn_skill_bindings_with_authorization_context(
+                "turn_skill_context",
+                committed.as_slice(),
+                1_700_000_000,
+                committed_context,
+            )
+            .await
+            .expect("skill projection and authorization context should persist");
+
+        let attempted = vec![TurnSkillBindingRecord {
+            skill_id: SkillId::new("T".repeat(21)).expect("valid skill id"),
+            skill_owner: None,
+            skill_slug: "attempted-skill".to_owned(),
+            skill_version: Some("2.0.0".to_owned()),
+            fingerprint: "attempted-fingerprint".to_owned(),
+            source_kind: "user".to_owned(),
+            resolved_reason: "path_match".to_owned(),
+        }];
+        store
+            .replace_turn_skill_bindings_with_authorization_context(
+                "turn_skill_context",
+                attempted.as_slice(),
+                1_700_000_100,
+                "   ",
+            )
+            .await
+            .expect_err("invalid authorization context must abort the whole transaction");
+        assert_eq!(
+            store
+                .find_turn_skill_bindings("turn_skill_context")
+                .await
+                .expect("committed skill binding query"),
+            committed
+        );
+        assert_eq!(
+            store
+                .get_turn_execution_authorization_context("turn_skill_context")
+                .await
+                .expect("committed skill authorization context query"),
+            Some(committed_context.to_owned())
+        );
     }
 
     fn skill_pack_record(id: char, name: &str, scope_key: &str) -> SkillPackInstallationRecord {
@@ -25407,6 +26424,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_projection_and_execution_authorization_context_commit_atomically() {
+        let (store, _, _) = test_store_with_started_turn(
+            "workspace_projection_context",
+            "thread_projection_context",
+            "turn_projection_context",
+        )
+        .await;
+        let committed = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_context",
+                "workspace_projection_context",
+                "manifest-context-committed",
+                1,
+            ),
+            bindings: vec![test_turn_mcp_binding(1)],
+        };
+        let committed_context = r#"{"version":1,"state":"committed"}"#;
+        store
+            .replace_turn_mcp_projection_with_authorization_context(&committed, committed_context)
+            .await
+            .expect("projection and authorization context should persist");
+        assert_eq!(
+            store
+                .get_turn_execution_authorization_context("turn_projection_context")
+                .await
+                .expect("authorization context query"),
+            Some(committed_context.to_owned())
+        );
+
+        let attempted = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_context",
+                "workspace_projection_context",
+                "manifest-context-attempted",
+                2,
+            ),
+            bindings: vec![test_turn_mcp_binding(2), test_turn_mcp_binding(3)],
+        };
+        store
+            .replace_turn_mcp_projection_with_authorization_context(&attempted, "   ")
+            .await
+            .expect_err("invalid authorization context must abort the whole transaction");
+        assert_eq!(
+            store
+                .get_turn_mcp_projection("turn_projection_context")
+                .await
+                .expect("committed projection query"),
+            Some(committed.projection)
+        );
+        assert_eq!(
+            store
+                .list_turn_mcp_bindings("turn_projection_context")
+                .await
+                .expect("committed binding query"),
+            committed.bindings
+        );
+        assert_eq!(
+            store
+                .get_turn_execution_authorization_context("turn_projection_context")
+                .await
+                .expect("committed authorization context query"),
+            Some(committed_context.to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn turn_mcp_binding_repositories_round_trip_all_digest_fields() {
         let connection = Database::connect("sqlite::memory:")
             .await
@@ -25885,6 +26968,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -26078,6 +27162,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -26461,6 +27546,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let permission_profile = TurnPermissionProfileSnapshot::from_mode(
@@ -26645,6 +27731,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let permission_profile = TurnPermissionProfileSnapshot::from_mode(
@@ -26753,6 +27840,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         store
@@ -26814,6 +27902,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         store
@@ -27130,6 +28219,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -27182,6 +28272,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         store
@@ -27409,6 +28500,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let first_turn = Turn {
@@ -27601,6 +28693,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {

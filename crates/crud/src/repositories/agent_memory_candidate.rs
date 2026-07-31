@@ -99,6 +99,17 @@ pub async fn list_candidates<C: ConnectionTrait>(
     if let Some(guard) = &filter.workspace_guard {
         query = query.filter(workspace_guard_condition(guard));
     }
+    if let Some(thread_ids) = filter.allowed_source_thread_ids {
+        query = if thread_ids.is_empty() {
+            query.filter(
+                Condition::all()
+                    .add(agent_memory_candidate::Column::SourceThreadId.is_null())
+                    .add(agent_memory_candidate::Column::SourceThreadId.is_not_null()),
+            )
+        } else {
+            query.filter(agent_memory_candidate::Column::SourceThreadId.is_in(thread_ids))
+        };
+    }
 
     let statuses = if filter.statuses.is_empty() {
         vec![memory_candidate_status_to_db(MemoryCandidateStatus::Pending).to_owned()]

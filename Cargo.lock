@@ -8424,6 +8424,7 @@ dependencies = [
  "pioneer-artifacts",
  "pioneer-cli-agent-runtime",
  "pioneer-cli-mcp-bridge",
+ "pioneer-client",
  "pioneer-config",
  "pioneer-crud",
  "pioneer-entity",

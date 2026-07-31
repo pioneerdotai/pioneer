@@ -1,13 +1,13 @@
 use crate::constants::events;
 use crate::{
-    ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactDownloadProgressNotification,
-    ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
-    ArtifactUploadProgressNotification, AuthAccessExpiringNotification,
-    AuthSessionRevokedNotification, CLIRuntimeAccountUpdatedNotification,
-    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
-    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
-    ContextCompressedNotification, ContextCompressingNotification,
-    GatewayRemoteAccessStatusChangedNotification,
+    AccessChangedNotification, ArtifactCreatedNotification, ArtifactDeletedNotification,
+    ArtifactDownloadProgressNotification, ArtifactProjectionUpdatedNotification,
+    ArtifactUpdatedNotification, ArtifactUploadProgressNotification,
+    AuthAccessExpiringNotification, AuthSessionRevokedNotification,
+    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolvedNotification,
+    CLIRuntimeStatusChangedNotification, ContextCompressedNotification,
+    ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     GatewayVoiceInputStatusChangedNotification, ItemCompletedNotification, ItemDeltaNotification,
     ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
@@ -28,15 +28,16 @@ use crate::{
     TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadStartedNotification, ThreadTimelineBlocksChangedNotification,
-    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
-    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnPermissionRequestOpenedNotification,
-    TurnPermissionRequestResolvedNotification, TurnStartedNotification,
-    TurnToolLoopBudgetExceededNotification, TurnWorkItemsChangedNotification,
-    TurnWorkStateChangedNotification, VoiceSessionResultNotification, WorkspaceChangedNotification,
+    ThreadClosedNotification, ThreadParticipantsChangedNotification, ThreadStartedNotification,
+    ThreadTimelineBlocksChangedNotification, ThreadTreeChangedNotification,
+    ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification,
+    TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
+    TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
+    TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
+    VoiceSessionResultNotification, WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -60,12 +61,14 @@ pub struct UnknownGatewayNotification {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum GatewayNotification {
+    AccessChanged(AccessChangedNotification),
     AuthSessionRevoked(AuthSessionRevokedNotification),
     AuthAccessExpiring(AuthAccessExpiringNotification),
     WorkspaceChanged(WorkspaceChangedNotification),
     ThreadStarted(ThreadStartedNotification),
     ThreadClosed(ThreadClosedNotification),
     ThreadUpdated(ThreadUpdatedNotification),
+    ThreadParticipantsChanged(ThreadParticipantsChangedNotification),
     ThreadTreeChanged(ThreadTreeChangedNotification),
     ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
     ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification),
@@ -169,6 +172,12 @@ impl GatewayNotification {
         let params = notification.params?;
 
         match method.as_str() {
+            events::ACCESS_CHANGED => {
+                match serde_json::from_value::<AccessChangedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::AccessChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::AUTH_SESSION_REVOKED => {
                 match serde_json::from_value::<AuthSessionRevokedNotification>(params.clone()) {
                     Ok(notification) => Some(Self::AuthSessionRevoked(notification)),
@@ -195,6 +204,14 @@ impl GatewayNotification {
             events::THREAD_UPDATED => serde_json::from_value::<ThreadUpdatedNotification>(params)
                 .ok()
                 .map(Self::ThreadUpdated),
+            events::THREAD_PARTICIPANTS_CHANGED => {
+                match serde_json::from_value::<ThreadParticipantsChangedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::ThreadParticipantsChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::THREAD_TREE_CHANGED => {
                 serde_json::from_value::<ThreadTreeChangedNotification>(params)
                     .ok()
@@ -637,6 +654,7 @@ impl GatewayNotification {
                 || method.starts_with("cli_runtime/")
                 || method.starts_with("voice/")
                 || method.starts_with("auth/")
+                || method.starts_with("access/")
                 || method.starts_with("thread/artifacts_") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
@@ -747,7 +765,7 @@ mod tests {
     use super::GatewayNotification;
     use crate::constants::events;
     use crate::{
-        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemDeltaStream,
+        AccessChangeKind, ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemDeltaStream,
         JsonRpcNotification, MemoryCandidateCreatedNotification, MemoryChangedNotification,
         MemoryForgottenNotification, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
         ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
@@ -1282,6 +1300,28 @@ mod tests {
         let mapped =
             GatewayNotification::from_jsonrpc(notification).expect("known notification should map");
         assert!(matches!(mapped, GatewayNotification::ThreadUpdated(_)));
+    }
+
+    #[test]
+    fn maps_access_changed_without_protected_payload() {
+        let notification = JsonRpcNotification::from_params(
+            events::ACCESS_CHANGED,
+            &crate::AccessChangedNotification {
+                authorization_revision: 7,
+                workspace_id: "ws_123".to_owned(),
+                thread_id: Some("thread_123".to_owned()),
+                change: AccessChangeKind::ThreadVisibility,
+            },
+        )
+        .expect("notification should encode");
+
+        let mapped =
+            GatewayNotification::from_jsonrpc(notification).expect("notification should map");
+        assert!(matches!(mapped, GatewayNotification::AccessChanged(_)));
+        let serialized = serde_json::to_value(mapped).expect("notification should serialize");
+        assert_eq!(serialized["params"]["authorization_revision"], 7);
+        assert_eq!(serialized["params"]["thread_id"], "thread_123");
+        assert!(serialized["params"].get("principal_id").is_none());
     }
 
     #[test]

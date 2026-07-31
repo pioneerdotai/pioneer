@@ -36,6 +36,7 @@ impl MessageProcessor {
         self.resolve_deferred_task_result_post_turn(&task_response, &event.payload)
             .await;
         let workspace_id = context.workspace_id.clone();
+        let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
         let awaits_owner_thread_delivery = match event.payload.run_id() {
@@ -80,7 +81,8 @@ impl MessageProcessor {
 
         match event.payload {
             TaskEventPayload::TaskCreated { task } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_CREATED,
                     &pioneer_protocol::TaskCreatedNotification { context, task },
@@ -89,7 +91,8 @@ impl MessageProcessor {
             }
             TaskEventPayload::TriggerCreated { trigger } => {
                 if trigger.kind() != TaskTriggerKind::Immediate {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
                         &pioneer_protocol::TaskScheduledNotification { context, trigger },
@@ -103,7 +106,8 @@ impl MessageProcessor {
                     .into_iter()
                     .find(|trigger| trigger.id == trigger_id)
                 {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
                         &pioneer_protocol::TaskScheduledNotification { context, trigger },
@@ -119,7 +123,8 @@ impl MessageProcessor {
                         .find(|run| run.id == *run_id)
                         .cloned()
                 });
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_QUEUED,
                     &pioneer_protocol::TaskQueuedNotification { context, run },
@@ -127,7 +132,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunCreated { run, .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RUN_CREATED,
                     &pioneer_protocol::TaskRunCreatedNotification { context, run },
@@ -136,7 +142,8 @@ impl MessageProcessor {
             }
             TaskEventPayload::RunStarted { run_id, .. } => {
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_STARTED,
                         &pioneer_protocol::TaskRunStartedNotification { context, run },
@@ -147,7 +154,8 @@ impl MessageProcessor {
             TaskEventPayload::Progress {
                 message, details, ..
             } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_PROGRESS,
                     &pioneer_protocol::TaskProgressNotification {
@@ -164,7 +172,8 @@ impl MessageProcessor {
                         .await?;
                 }
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_COMPLETED,
                         &pioneer_protocol::TaskRunCompletedNotification { context, run },
@@ -176,7 +185,8 @@ impl MessageProcessor {
                 self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_FAILED,
                         &pioneer_protocol::TaskRunFailedNotification { context, run },
@@ -188,7 +198,8 @@ impl MessageProcessor {
                 self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_BLOCKED,
                         &pioneer_protocol::TaskRunFailedNotification { context, run },
@@ -200,7 +211,8 @@ impl MessageProcessor {
                 self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_CANCELLED,
                         &pioneer_protocol::TaskRunFailedNotification { context, run },
@@ -209,7 +221,8 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::TaskCompleted { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_COMPLETED,
                     &pioneer_protocol::TaskCompletedNotification {
@@ -220,7 +233,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskFailed { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_FAILED,
                     &pioneer_protocol::TaskFailedNotification {
@@ -231,7 +245,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskBlocked { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_BLOCKED,
                     &pioneer_protocol::TaskFailedNotification {
@@ -242,7 +257,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskCancelled { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_CANCELLED,
                     &pioneer_protocol::TaskCancelledNotification {
@@ -253,7 +269,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskDetached { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DETACHED,
                     &pioneer_protocol::TaskDetachedNotification {
@@ -270,7 +287,8 @@ impl MessageProcessor {
                 changed_fields,
                 ..
             } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_UPDATED,
                     &pioneer_protocol::TaskUpdatedNotification {
@@ -282,7 +300,8 @@ impl MessageProcessor {
                     },
                 )
                 .await;
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },
@@ -292,7 +311,8 @@ impl MessageProcessor {
             TaskEventPayload::TaskRescheduled {
                 trigger, reason, ..
             } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RESCHEDULED,
                     &pioneer_protocol::TaskRescheduledNotification {
@@ -309,7 +329,8 @@ impl MessageProcessor {
                 reason,
                 ..
             } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_PAUSED,
                     &pioneer_protocol::TaskPausedNotification {
@@ -320,7 +341,8 @@ impl MessageProcessor {
                     },
                 )
                 .await;
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },
@@ -338,7 +360,8 @@ impl MessageProcessor {
                     .rev()
                     .find(|trigger| trigger.next_fire_at.is_some())
                     .cloned();
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RESUMED,
                     &pioneer_protocol::TaskResumedNotification {
@@ -350,7 +373,8 @@ impl MessageProcessor {
                 )
                 .await;
                 if let Some(trigger) = scheduled_trigger {
-                    self.send_notification_to_workspace_connections(
+                    self.send_notification_to_task_workspace_connections(
+                        notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
                         &pioneer_protocol::TaskScheduledNotification {
@@ -360,7 +384,8 @@ impl MessageProcessor {
                     )
                     .await;
                 }
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },
@@ -368,7 +393,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::TaskRecovered { recovered_at, .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RECOVERED,
                     &pioneer_protocol::TaskRecoveredNotification {
@@ -384,7 +410,8 @@ impl MessageProcessor {
             | TaskEventPayload::WriteLockReleased { .. }
             | TaskEventPayload::WriteLockBlocked { .. }
             | TaskEventPayload::WriteLockExpired { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },
@@ -393,7 +420,8 @@ impl MessageProcessor {
             }
             TaskEventPayload::ChildThreadLinked { .. }
             | TaskEventPayload::TaskThreadLineageCreated { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },
@@ -403,7 +431,8 @@ impl MessageProcessor {
             TaskEventPayload::DeliveryQueued { delivery } => {
                 let (child_thread_id, child_turn_id) =
                     task_delivery_child_lineage(&self.crud_store, delivery.run_id.as_str()).await;
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_QUEUED,
                     &pioneer_protocol::TaskDeliveryQueuedNotification {
@@ -424,7 +453,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::DeliveryStarted { delivery, attempt } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_STARTED,
                     &pioneer_protocol::TaskDeliveryStartedNotification {
@@ -441,7 +471,8 @@ impl MessageProcessor {
                     delivery.run_id.as_str(),
                 )
                 .await?;
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_DELIVERED,
                     &pioneer_protocol::TaskDeliveryDeliveredNotification {
@@ -460,7 +491,8 @@ impl MessageProcessor {
                     )
                     .await?;
                 }
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_FAILED,
                     &pioneer_protocol::TaskDeliveryFailedNotification {
@@ -477,7 +509,8 @@ impl MessageProcessor {
                     delivery.run_id.as_str(),
                 )
                 .await?;
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_CANCELLED,
                     &pioneer_protocol::TaskDeliveryCancelledNotification {
@@ -504,7 +537,8 @@ impl MessageProcessor {
             | TaskEventPayload::TaskRunEnteredReview { .. }
             | TaskEventPayload::DepthLimitExceeded { .. }
             | TaskEventPayload::WriteLockExtended { .. } => {
-                self.send_notification_to_workspace_connections(
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
                     &pioneer_protocol::TaskTreeChangedNotification { context },

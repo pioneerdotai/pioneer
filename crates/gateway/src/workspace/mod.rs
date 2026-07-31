@@ -1,3 +1,4 @@
+use pioneer_crud::list_active_workspaces_for_principal;
 use pioneer_entity::workspace;
 use pioneer_protocol::Workspace;
 use pioneer_sqlite::{
@@ -11,6 +12,8 @@ use sea_orm::{
 use sea_orm::{ConnectionTrait, prelude::Expr};
 use std::future::Future;
 use std::time::Duration;
+
+use crate::authorization::{AuthorizedWorkspace, AuthorizedWorkspaceCollection, ResourceAction};
 
 pub const DEFAULT_WORKSPACE_ID: &str = "000000000000000000000";
 pub const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
@@ -79,6 +82,31 @@ impl WorkspaceManager {
                 })?;
 
             Ok(models.into_iter().map(model_to_workspace).collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn list_authorized_workspaces(
+        &self,
+        proof: &AuthorizedWorkspaceCollection,
+    ) -> Result<Vec<Workspace>, WorkspaceError> {
+        if proof.action() != ResourceAction::WorkspaceList {
+            return Err(WorkspaceError::Internal(
+                "workspace list authorization proof action mismatch".to_owned(),
+            ));
+        }
+        if proof.decision().is_absolute_superuser() {
+            return self.list_workspaces().await;
+        }
+        self.run_with_retry(|| async {
+            list_active_workspaces_for_principal(&self.connection, proof.principal_id())
+                .await
+                .map(|models| models.into_iter().map(model_to_workspace).collect())
+                .map_err(|error| {
+                    WorkspaceError::Internal(format!(
+                        "failed to query authorized workspaces: {error}"
+                    ))
+                })
         })
         .await
     }
@@ -205,6 +233,35 @@ impl WorkspaceManager {
         .await
     }
 
+    pub(crate) async fn authorized_default_workspace(
+        &self,
+        proof: &AuthorizedWorkspaceCollection,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        if proof.action() != ResourceAction::WorkspaceRead {
+            return Err(WorkspaceError::Internal(
+                "workspace default authorization proof action mismatch".to_owned(),
+            ));
+        }
+        if proof.decision().is_absolute_superuser() {
+            return self.ensure_default_workspace().await.map(Some);
+        }
+        self.run_with_retry(|| async {
+            let workspaces =
+                list_active_workspaces_for_principal(&self.connection, proof.principal_id())
+                    .await
+                    .map_err(|error| {
+                        WorkspaceError::Internal(format!(
+                            "failed to query authorized default workspace: {error}"
+                        ))
+                    })?
+                    .into_iter()
+                    .map(model_to_workspace)
+                    .collect::<Vec<_>>();
+            Ok(select_default_workspace(workspaces.as_slice()))
+        })
+        .await
+    }
+
     pub async fn select_workspace(
         &self,
         requested_workspace_id: &str,
@@ -273,6 +330,21 @@ impl WorkspaceManager {
             Ok(model_to_workspace(updated))
         })
         .await
+    }
+
+    pub(crate) async fn select_authorized_workspace(
+        &self,
+        proof: &AuthorizedWorkspace,
+        requested_make_current: bool,
+    ) -> Result<Workspace, WorkspaceError> {
+        if proof.action() != ResourceAction::WorkspaceRead {
+            return Err(WorkspaceError::Internal(
+                "workspace selection authorization proof action mismatch".to_owned(),
+            ));
+        }
+        let make_current = proof.decision().is_absolute_superuser() && requested_make_current;
+        self.select_workspace(proof.workspace_id(), make_current)
+            .await
     }
 
     pub async fn update_workspace(

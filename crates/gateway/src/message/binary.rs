@@ -1,5 +1,12 @@
 use super::*;
-use crate::message::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC;
+use crate::authorization::{
+    ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+    BinaryIngressKind, DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+    binary_ingress_entry, record_binary_decision,
+};
+use crate::message::artifacts::{
+    ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC, upload::parse_artifact_upload_chunk_frame,
+};
 use crate::message::skills::SKILL_UPLOAD_CHUNK_FRAME_MAGIC;
 use pioneer_protocol::{
     VOICE_AUDIO_FORMAT_CONTRACT, VOICE_AUDIO_MAX_CHUNK_BYTES, VOICE_AUDIO_MAX_CHUNK_DURATION_MS,
@@ -18,35 +25,18 @@ pub(in crate::message) struct GatewayVoiceChunkFrame {
     pub audio_payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GatewayBinaryFrameKind {
-    ArtifactUploadChunk,
-    SkillUploadChunk,
-    VoiceChunk,
-}
-
-impl GatewayBinaryFrameKind {
-    fn from_payload(payload: &[u8]) -> Option<Self> {
-        if payload.starts_with(VOICE_CHUNK_FRAME_MAGIC) {
-            return Some(Self::VoiceChunk);
-        }
-        if payload.starts_with(SKILL_UPLOAD_CHUNK_FRAME_MAGIC) {
-            return Some(Self::SkillUploadChunk);
-        }
-        if payload.starts_with(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC) {
-            return Some(Self::ArtifactUploadChunk);
-        }
-
-        None
+fn classify_binary_payload(payload: &[u8]) -> Option<BinaryIngressKind> {
+    if payload.starts_with(VOICE_CHUNK_FRAME_MAGIC) {
+        return Some(BinaryIngressKind::VoiceChunk);
+    }
+    if payload.starts_with(SKILL_UPLOAD_CHUNK_FRAME_MAGIC) {
+        return Some(BinaryIngressKind::SkillUploadChunk);
+    }
+    if payload.starts_with(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC) {
+        return Some(BinaryIngressKind::ArtifactUploadChunk);
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::ArtifactUploadChunk => "artifact/upload/chunk",
-            Self::SkillUploadChunk => "skills/upload/chunk",
-            Self::VoiceChunk => "voice/chunk",
-        }
-    }
+    None
 }
 
 impl MessageProcessor {
@@ -55,7 +45,7 @@ impl MessageProcessor {
         connection: &crate::request_context::ConnectionContext,
         payload: &[u8],
     ) {
-        let Some(kind) = GatewayBinaryFrameKind::from_payload(payload) else {
+        let Some(kind) = classify_binary_payload(payload) else {
             let context = crate::request_context::RequestContext::new(
                 connection,
                 None,
@@ -73,42 +63,204 @@ impl MessageProcessor {
             .await;
             return;
         };
+        let Ok(registration) = binary_ingress_entry(kind) else {
+            let context = crate::request_context::RequestContext::new(
+                connection,
+                None,
+                crate::request_context::CanonicalMethod::binary("binary/unregistered"),
+            );
+            let span = context.request_span();
+            async {
+                warn!(
+                    rejection_reason = "unregistered_binary_frame",
+                    frame_len = payload.len(),
+                    "unregistered gateway binary frame ignored"
+                );
+            }
+            .instrument(span)
+            .await;
+            return;
+        };
         let context = crate::request_context::RequestContext::new(
             connection,
             None,
-            crate::request_context::CanonicalMethod::binary(kind.name()),
+            crate::request_context::CanonicalMethod::binary(registration.kind.safe_name()),
         );
-        let authorization_decision = context.authorization_decision();
         let span = context.request_span();
 
         async {
-            if !authorization_decision.is_allowed() {
-                warn!(
-                    rejection_reason = "unsupported_principal",
-                    frame_len = payload.len(),
-                    "authorization denied for gateway binary frame"
-                );
+            let decision = match kind {
+                BinaryIngressKind::ArtifactUploadChunk => {
+                    self.authorize_artifact_upload_chunk(&context, payload)
+                        .await
+                }
+                BinaryIngressKind::VoiceChunk => {
+                    self.authorize_voice_chunk(&context, payload).await
+                }
+                BinaryIngressKind::SkillUploadChunk => {
+                    let service = AuthorizationService::new();
+                    match service.authorize_action(
+                        context.principal().kind,
+                        context.role_key(),
+                        registration.action,
+                    ) {
+                        ActionGateDecision::AllowSuperuser => AuthorizationDecision::AllowSuperuser,
+                        ActionGateDecision::RequireResource { .. } => AuthorizationDecision::Deny {
+                            reason: DenyReason::MissingAuthoritativeResource,
+                            disclosure: registration.disclosure,
+                        },
+                        ActionGateDecision::Deny { reason, disclosure } => {
+                            AuthorizationDecision::Deny { reason, disclosure }
+                        }
+                    }
+                }
+            };
+            record_binary_decision(registration, &decision);
+            if !decision.is_allowed() {
                 return;
             }
 
             debug!(frame_len = payload.len(), "processing gateway binary frame");
 
             match kind {
-                GatewayBinaryFrameKind::ArtifactUploadChunk => {
+                BinaryIngressKind::ArtifactUploadChunk => {
                     self.process_artifact_upload_chunk_frame(&context, payload)
                         .await;
                 }
-                GatewayBinaryFrameKind::SkillUploadChunk => {
+                BinaryIngressKind::SkillUploadChunk => {
                     self.process_skill_upload_chunk_frame(&context, payload)
                         .await;
                 }
-                GatewayBinaryFrameKind::VoiceChunk => {
+                BinaryIngressKind::VoiceChunk => {
                     self.process_voice_chunk_frame(&context, payload).await;
                 }
             }
         }
         .instrument(span)
         .await;
+    }
+
+    async fn authorize_artifact_upload_chunk(
+        &self,
+        request_context: &RequestContext,
+        payload: &[u8],
+    ) -> AuthorizationDecision {
+        let Ok((header, _)) = parse_artifact_upload_chunk_frame(payload) else {
+            return missing_binary_resource();
+        };
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
+        let Ok(session) = self
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                header.workspace_id.as_str(),
+                header.upload_id.as_str(),
+                now_timestamp_secs(),
+            )
+            .await
+        else {
+            return missing_binary_resource();
+        };
+        let action = if session.planned_turn_id.is_some() {
+            ResourceAction::ThreadWrite
+        } else {
+            ResourceAction::ArtifactWrite
+        };
+        let service = AuthorizationService::new();
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.role_key(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        if let (Some(thread_id), Some(turn_id)) = (
+            session.thread_id.as_deref(),
+            session.planned_turn_id.as_deref(),
+        ) {
+            match resolver
+                .authorize_turn(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    turn_id,
+                    Some(session.workspace_id.as_str()),
+                    Some(thread_id),
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
+                Ok(ProofResolution::Denied(decision)) => decision,
+                Err(_) => missing_binary_resource(),
+            }
+        } else if let Some(thread_id) = session.thread_id.as_deref() {
+            match resolver
+                .authorize_thread(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    thread_id,
+                    Some(session.workspace_id.as_str()),
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
+                Ok(ProofResolution::Denied(decision)) => decision,
+                Err(_) => missing_binary_resource(),
+            }
+        } else {
+            match resolver
+                .authorize_workspace(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    session.workspace_id.as_str(),
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
+                Ok(ProofResolution::Denied(decision)) => decision,
+                Err(_) => missing_binary_resource(),
+            }
+        }
+    }
+
+    async fn authorize_voice_chunk(
+        &self,
+        request_context: &RequestContext,
+        payload: &[u8],
+    ) -> AuthorizationDecision {
+        let Ok(chunk) = decode_gateway_voice_chunk_frame(payload) else {
+            return missing_binary_resource();
+        };
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
+        let Ok(session) = self
+            .voice_sessions
+            .lookup_authenticated_session(chunk.header.session_id.as_str(), &owner)
+        else {
+            return missing_binary_resource();
+        };
+        let action = ResourceAction::ThreadWrite;
+        let service = AuthorizationService::new();
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.role_key(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        match resolver
+            .authorize_thread(
+                request_context.principal(),
+                &gate,
+                action,
+                session.thread_id.as_str(),
+                Some(session.workspace_id.as_str()),
+            )
+            .await
+        {
+            Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
+            Ok(ProofResolution::Denied(decision)) => decision,
+            Err(_) => missing_binary_resource(),
+        }
     }
 
     #[cfg(test)]
@@ -156,9 +308,10 @@ impl MessageProcessor {
         chunk: GatewayVoiceChunkFrame,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let session = match self
             .voice_sessions
-            .lookup_session(chunk.header.session_id.as_str(), connection_id)
+            .lookup_authenticated_session(chunk.header.session_id.as_str(), &owner)
         {
             Ok(session) => session,
             Err(error) => {
@@ -217,6 +370,13 @@ impl MessageProcessor {
                 );
             }
         }
+    }
+}
+
+fn missing_binary_resource() -> AuthorizationDecision {
+    AuthorizationDecision::Deny {
+        reason: DenyReason::MissingAuthoritativeResource,
+        disclosure: DisclosurePolicy::NotFound,
     }
 }
 
@@ -349,10 +509,10 @@ mod tests {
         payload.extend_from_slice(SKILL_UPLOAD_CHUNK_FRAME_MAGIC);
         payload.extend_from_slice(&0u32.to_be_bytes());
 
-        let kind = GatewayBinaryFrameKind::from_payload(payload.as_slice());
+        let kind = classify_binary_payload(payload.as_slice());
 
-        assert_eq!(kind, Some(GatewayBinaryFrameKind::SkillUploadChunk));
-        assert_eq!(kind.expect("kind").name(), "skills/upload/chunk");
+        assert_eq!(kind, Some(BinaryIngressKind::SkillUploadChunk));
+        assert_eq!(kind.expect("kind").safe_name(), "skills/upload/chunk");
     }
 
     #[test]
@@ -361,25 +521,25 @@ mod tests {
         payload.extend_from_slice(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC);
         payload.extend_from_slice(&0u32.to_be_bytes());
 
-        let kind = GatewayBinaryFrameKind::from_payload(payload.as_slice());
+        let kind = classify_binary_payload(payload.as_slice());
 
-        assert_eq!(kind, Some(GatewayBinaryFrameKind::ArtifactUploadChunk));
-        assert_eq!(kind.expect("kind").name(), "artifact/upload/chunk");
+        assert_eq!(kind, Some(BinaryIngressKind::ArtifactUploadChunk));
+        assert_eq!(kind.expect("kind").safe_name(), "artifact/upload/chunk");
     }
 
     #[test]
     fn binary_frame_kind_detects_voice_chunk_magic() {
         let frame = voice_frame("voice_session_1", 0, b"\xff\x00").expect("voice frame");
 
-        let kind = GatewayBinaryFrameKind::from_payload(frame.as_slice());
+        let kind = classify_binary_payload(frame.as_slice());
 
-        assert_eq!(kind, Some(GatewayBinaryFrameKind::VoiceChunk));
-        assert_eq!(kind.expect("kind").name(), "voice/chunk");
+        assert_eq!(kind, Some(BinaryIngressKind::VoiceChunk));
+        assert_eq!(kind.expect("kind").safe_name(), "voice/chunk");
     }
 
     #[test]
     fn binary_frame_kind_rejects_unknown_magic() {
-        assert_eq!(GatewayBinaryFrameKind::from_payload(b"NOPE"), None);
+        assert_eq!(classify_binary_payload(b"NOPE"), None);
     }
 
     #[test]

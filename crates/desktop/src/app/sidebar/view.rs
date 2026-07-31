@@ -1167,6 +1167,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let coordinator_with_preview = ThreadCoordinator::new(thread_with_preview);

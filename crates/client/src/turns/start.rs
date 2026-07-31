@@ -357,6 +357,7 @@ mod tests {
             sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
 
@@ -394,6 +395,7 @@ mod tests {
             sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
 

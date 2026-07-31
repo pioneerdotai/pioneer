@@ -1,14 +1,22 @@
 use super::*;
+use crate::authorization::{
+    AuthorizationExternalError, AuthorizedWorkspace, AuthorizedWorkspaceCollection,
+};
 
 impl MessageProcessor {
     pub(super) async fn workspace_list(
         &self,
         request_context: &RequestContext,
+        proof: &AuthorizedWorkspaceCollection,
         request_id: RequestId,
         _params: WorkspaceListParams,
     ) {
         let connection_id = request_context.connection_id();
-        let workspaces = match self.workspace_manager.list_workspaces().await {
+        let workspaces = match self
+            .workspace_manager
+            .list_authorized_workspaces(proof)
+            .await
+        {
             Ok(workspaces) => workspaces,
             Err(error) => {
                 let (code, message) = match &error {
@@ -131,12 +139,25 @@ impl MessageProcessor {
     pub(super) async fn workspace_default(
         &self,
         request_context: &RequestContext,
+        proof: &AuthorizedWorkspaceCollection,
         request_id: RequestId,
         _params: WorkspaceDefaultParams,
     ) {
         let connection_id = request_context.connection_id();
-        let workspace = match self.workspace_manager.ensure_default_workspace().await {
-            Ok(workspace) => workspace,
+        let workspace = match self
+            .workspace_manager
+            .authorized_default_workspace(proof)
+            .await
+        {
+            Ok(Some(workspace)) => workspace,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 let (code, message) = match &error {
                     WorkspaceError::Internal(message) => (
@@ -192,13 +213,16 @@ impl MessageProcessor {
     pub(super) async fn workspace_select(
         &self,
         request_context: &RequestContext,
+        proof: &AuthorizedWorkspace,
         request_id: RequestId,
         params: WorkspaceSelectParams,
     ) {
         let connection_id = request_context.connection_id();
-        let was_current = if params.make_current {
+        let changes_global_current =
+            proof.decision().is_absolute_superuser() && params.make_current;
+        let was_current = if changes_global_current {
             self.workspace_manager
-                .select_workspace(params.workspace_id.as_str(), false)
+                .select_workspace(proof.workspace_id(), false)
                 .await
                 .map(|workspace| workspace.is_current)
                 .unwrap_or(false)
@@ -208,7 +232,7 @@ impl MessageProcessor {
 
         let workspace = match self
             .workspace_manager
-            .select_workspace(params.workspace_id.as_str(), params.make_current)
+            .select_authorized_workspace(proof, params.make_current)
             .await
         {
             Ok(workspace) => workspace,
@@ -267,7 +291,7 @@ impl MessageProcessor {
             return;
         }
 
-        if params.make_current && !was_current {
+        if changes_global_current && !was_current {
             self.notify_workspace_changed(WorkspaceChangeKind::CurrentChanged, workspace)
                 .await;
         }
@@ -343,7 +367,11 @@ impl MessageProcessor {
 
     async fn notify_workspace_changed(&self, kind: WorkspaceChangeKind, workspace: Workspace) {
         let notification = WorkspaceChangedNotification { kind, workspace };
-        self.send_notification_to_all_connections(events::WORKSPACE_CHANGED, &notification)
-            .await;
+        self.send_notification_to_authorized_workspace_connections(
+            notification.workspace.id.as_str(),
+            events::WORKSPACE_CHANGED,
+            &notification,
+        )
+        .await;
     }
 }

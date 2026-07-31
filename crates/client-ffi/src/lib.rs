@@ -162,6 +162,12 @@ struct ClientFfiRuntime {
         Mutex<HashMap<String, pioneer_client::gateway::session_lifecycle::SessionLifecycle>>,
 }
 
+fn contains_gateway_connection_epoch_boundary(events: &[ClientEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, ClientEvent::GatewayConnectionChanged(_)))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientFfiConfig {
@@ -553,6 +559,11 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .replace_access_and_wait(spec.into_connect_spec())
             .map_err(normal_auth_error)?;
+        self.active_thread
+            .begin_authorization_epoch()
+            .map_err(|error| {
+                ClientFfiError::new(format!("{error:#}"), ClientFfiError::GENERIC_CODE)
+            })?;
         *self.active_connection_id.lock().map_err(|_| {
             ClientFfiError::new(
                 "client ffi connection lock is poisoned",
@@ -588,6 +599,11 @@ impl ClientFfiRuntime {
             let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
+                if contains_gateway_connection_epoch_boundary(events.as_slice()) {
+                    self.active_thread
+                        .begin_authorization_epoch()
+                        .map_err(|error| format!("{error:#}"))?;
+                }
                 return Ok(events);
             }
         }
@@ -597,6 +613,9 @@ impl ClientFfiRuntime {
         self.client_runtime
             .ws_command_sender()
             .disconnect()
+            .map_err(|error| format!("{error:#}"))?;
+        self.active_thread
+            .begin_authorization_epoch()
             .map_err(|error| format!("{error:#}"))?;
         *self
             .active_connection_id
@@ -2285,6 +2304,7 @@ fn into_c_string(value: String) -> *mut c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_client::state::client_state::GatewayConnectionState;
 
     fn decode_response<T: for<'de> Deserialize<'de>>(json: &str) -> T {
         #[derive(Deserialize)]
@@ -3075,5 +3095,21 @@ mod tests {
         assert_eq!(error["status"], "error");
         assert_eq!(error["code"], "pioneer_client_ffi_panic");
         assert!(error["message"].as_str().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn gateway_connection_event_starts_a_new_authorization_revision_epoch() {
+        assert!(contains_gateway_connection_epoch_boundary(&[
+            ClientEvent::GatewayConnectionChanged(contracts::ClientGatewayConnectionEvent {
+                connection_state: GatewayConnectionState::Connected,
+                gateway_error: None,
+            }),
+        ]));
+        assert!(!contains_gateway_connection_epoch_boundary(&[
+            ClientEvent::Error(contracts::ClientErrorEvent {
+                message: "unrelated".to_owned(),
+                code: None,
+            }),
+        ]));
     }
 }

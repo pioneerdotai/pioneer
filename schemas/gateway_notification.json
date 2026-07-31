@@ -7,6 +7,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "access_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/AccessChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "auth_session_revoked"
         },
         "params": {
@@ -91,6 +107,22 @@
         },
         "params": {
           "$ref": "#/$defs/ThreadUpdatedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "thread_participants_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/ThreadParticipantsChangedNotification"
         }
       },
       "required": [
@@ -1444,6 +1476,46 @@
     }
   ],
   "$defs": {
+    "AccessChangeKind": {
+      "description": "Payload-safe reason for invalidating client authorization-derived state.\n\nThis vocabulary deliberately contains no protected resource metadata or\npolicy-engine details.",
+      "type": "string",
+      "enum": [
+        "workspace_membership",
+        "thread_created",
+        "thread_visibility",
+        "thread_participant_added",
+        "thread_participant_removed"
+      ]
+    },
+    "AccessChangedNotification": {
+      "description": "Minimal notification telling an authenticated client to re-resolve access.",
+      "type": "object",
+      "properties": {
+        "authorization_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "change": {
+          "$ref": "#/$defs/AccessChangeKind"
+        },
+        "thread_id": {
+          "description": "Exact affected thread when the committed ACL mutation is thread-scoped.\n\nThis is an opaque server-owned identifier, not protected thread\ncontent. It is omitted for workspace-wide changes and lets clients\nevict only the affected thread instead of discarding unrelated\nworkspace state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorization_revision",
+        "workspace_id",
+        "change"
+      ]
+    },
     "AgentExecutionBackend": {
       "oneOf": [
         {
@@ -4408,6 +4480,12 @@
         "ask",
         "deny"
       ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "PromptManifest": {
       "type": "object",
@@ -8053,6 +8131,16 @@
           "type": "integer",
           "format": "int64"
         },
+        "visibility": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadVisibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -8288,6 +8376,36 @@
         }
       ]
     },
+    "ThreadParticipantChangeKind": {
+      "type": "string",
+      "enum": [
+        "added",
+        "removed"
+      ]
+    },
+    "ThreadParticipantsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/ThreadParticipantChangeKind"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "change",
+        "principal_id"
+      ]
+    },
     "ThreadSidebarVisibility": {
       "type": "string",
       "enum": [
@@ -8385,6 +8503,14 @@
       },
       "required": [
         "thread"
+      ]
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
       ]
     },
     "TimelineChangeReason": {

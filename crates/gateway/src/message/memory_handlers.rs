@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{Result, anyhow};
-use pioneer_memory::MemoryOperationContext;
+use pioneer_memory::{MemoryOperationContext, MemoryReadPolicy, MemorySourceAccessPolicy};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse,
     MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
@@ -21,7 +21,7 @@ impl MessageProcessor {
         params: MemorySearchParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.memory_context(connection_id, None).await {
+        let context = match self.memory_context(request_context, None).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -65,7 +65,7 @@ impl MessageProcessor {
         params: MemoryGetParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.memory_context(connection_id, None).await {
+        let context = match self.memory_context(request_context, None).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -109,7 +109,7 @@ impl MessageProcessor {
         params: MemoryListParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.memory_context(connection_id, None).await {
+        let context = match self.memory_context(request_context, None).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -155,7 +155,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         let actor = authenticated_memory_request_actor(request_context);
         bind_authenticated_memory_remember_actor(&mut params, actor.clone());
-        let context = match self.memory_context(connection_id, Some(actor)).await {
+        let context = match self.memory_context(request_context, Some(actor)).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -209,7 +209,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -259,7 +259,7 @@ impl MessageProcessor {
         params: MemoryCandidatesListParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.memory_context(connection_id, None).await {
+        let context = match self.memory_context(request_context, None).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -308,7 +308,7 @@ impl MessageProcessor {
         params: MemoryCandidatesGetParams,
     ) {
         let connection_id = request_context.connection_id();
-        let context = match self.memory_context(connection_id, None).await {
+        let context = match self.memory_context(request_context, None).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -359,7 +359,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -415,7 +415,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -471,7 +471,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -524,7 +524,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -585,7 +585,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -638,7 +638,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
         let context = match self
-            .memory_context(connection_id, params.actor.clone())
+            .memory_context(request_context, params.actor.clone())
             .await
         {
             Ok(context) => context,
@@ -694,9 +694,10 @@ impl MessageProcessor {
 
     async fn memory_context(
         &self,
-        connection_id: ConnectionId,
+        request_context: &RequestContext,
         actor: Option<MemoryActor>,
     ) -> Result<MemoryOperationContext> {
+        let connection_id = request_context.connection_id();
         let workspace_id = match self
             .session_manager
             .connection_workspace_id(connection_id)
@@ -716,9 +717,32 @@ impl MessageProcessor {
             }
         };
 
-        Ok(self
+        let mut context = self
             .memory_runtime
-            .operation_context(Some(workspace_id), actor))
+            .operation_context(Some(workspace_id.clone()), actor);
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            let accessible_threads = self
+                .crud_store
+                .list_accessible_threads_for_principal(
+                    &request_context.principal().principal_id,
+                    workspace_id.as_str(),
+                    u64::MAX,
+                )
+                .await
+                .context("failed to resolve Member memory provenance scope")?;
+            context.allow_global_user = false;
+            context.allow_global_agent = false;
+            context.read_policy = Some(MemoryReadPolicy {
+                allow_normal: true,
+                allow_personal: false,
+                allow_secret_like: false,
+                allow_regulated: false,
+            });
+            context.source_access = MemorySourceAccessPolicy::accessible_threads(
+                accessible_threads.into_iter().map(|thread| thread.id),
+            );
+        }
+        Ok(context)
     }
 
     async fn send_memory_response<T: Serialize>(
@@ -867,11 +891,9 @@ impl MessageProcessor {
     pub(crate) async fn send_memory_changed_after_tool_remember(
         &self,
         context: &MemoryOperationContext,
+        initiating_principal_id: Option<&str>,
         response: &MemoryRememberResponse,
     ) {
-        let Some(workspace_id) = context.workspace_id.as_deref() else {
-            return;
-        };
         let notification = MemoryChangedNotification {
             memory_id: response.record.id.clone(),
             scope: response.record.scope.clone(),
@@ -883,8 +905,15 @@ impl MessageProcessor {
             record: Some(response.record.clone()),
         };
 
-        self.send_notification_to_workspace_connections(
-            workspace_id,
+        self.send_memory_notification_for_scope(
+            context,
+            initiating_principal_id,
+            &notification.scope,
+            notification
+                .record
+                .as_ref()
+                .and_then(|record| record.provenance.source_thread_id.as_deref())
+                .or(context.thread_id.as_deref()),
             events::MEMORY_CHANGED,
             &notification,
         )
@@ -896,9 +925,6 @@ impl MessageProcessor {
         context: &MemoryOperationContext,
         response: &MemorySemanticWriteResponse,
     ) {
-        let Some(workspace_id) = context.workspace_id.as_deref() else {
-            return;
-        };
         if let Some(record) = response.record.as_ref() {
             let notification = MemoryChangedNotification {
                 memory_id: record.id.clone(),
@@ -910,8 +936,15 @@ impl MessageProcessor {
                 },
                 record: Some(record.clone()),
             };
-            self.send_notification_to_workspace_connections(
-                workspace_id,
+            self.send_memory_notification_for_scope(
+                context,
+                None,
+                &notification.scope,
+                notification
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.provenance.source_thread_id.as_deref())
+                    .or(context.thread_id.as_deref()),
                 events::MEMORY_CHANGED,
                 &notification,
             )
@@ -922,6 +955,7 @@ impl MessageProcessor {
     pub(crate) async fn send_memory_forgotten_after_tool_forget(
         &self,
         context: &MemoryOperationContext,
+        initiating_principal_id: Option<&str>,
         reason: Option<String>,
         dry_run: bool,
         response: &MemoryForgetResponse,
@@ -929,41 +963,78 @@ impl MessageProcessor {
         if dry_run || response.forgotten_memory_ids.is_empty() {
             return;
         }
-        let Some(workspace_id) = context.workspace_id.as_deref() else {
-            return;
-        };
 
         let notification = MemoryForgottenNotification {
             memory_ids: response.forgotten_memory_ids.clone(),
             reason,
         };
-        self.send_notification_to_workspace_connections(
-            workspace_id,
-            events::MEMORY_FORGOTTEN,
-            &notification,
-        )
-        .await;
+        if let Some(initiating_principal_id) = initiating_principal_id {
+            self.send_principal_owned_notification(
+                initiating_principal_id,
+                events::MEMORY_FORGOTTEN,
+                &notification,
+            )
+            .await;
+            return;
+        }
+        if context
+            .actor
+            .as_ref()
+            .is_some_and(|actor| actor.kind == MemoryActorKind::Assistant)
+        {
+            self.send_superuser_personal_notification(events::MEMORY_FORGOTTEN, &notification)
+                .await;
+            return;
+        }
+        if let Some(task_id) = context.task_id.as_deref() {
+            if let Some(workspace_id) = context.workspace_id.as_deref() {
+                self.send_notification_to_task_workspace_connections(
+                    task_id,
+                    workspace_id,
+                    events::MEMORY_FORGOTTEN,
+                    &notification,
+                )
+                .await;
+            }
+        } else if let Some(thread_id) = context.thread_id.as_deref() {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::MEMORY_FORGOTTEN,
+                &notification,
+            )
+            .await;
+        } else if let Some(workspace_id) = context.workspace_id.as_deref() {
+            self.send_notification_to_workspace_connections(
+                workspace_id,
+                events::MEMORY_FORGOTTEN,
+                &notification,
+            )
+            .await;
+        }
     }
 
-    async fn send_memory_changed_notification(
+    pub(super) async fn send_memory_changed_notification(
         &self,
         connection_id: ConnectionId,
         context: &MemoryOperationContext,
         notification: &MemoryChangedNotification,
     ) {
-        match notification.scope.kind {
-            MemoryScopeKind::Workspace | MemoryScopeKind::Thread | MemoryScopeKind::Task => {
-                if let Some(workspace_id) = context.workspace_id.as_deref() {
-                    self.send_notification_to_workspace_connections(
-                        workspace_id,
-                        events::MEMORY_CHANGED,
-                        notification,
-                    )
-                    .await;
-                    return;
-                }
-            }
-            _ => {}
+        if self
+            .send_memory_notification_for_scope(
+                context,
+                None,
+                &notification.scope,
+                notification
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.provenance.source_thread_id.as_deref())
+                    .or(context.thread_id.as_deref()),
+                events::MEMORY_CHANGED,
+                notification,
+            )
+            .await
+        {
+            return;
         }
 
         self.send_notification_to_connections(
@@ -972,6 +1043,93 @@ impl MessageProcessor {
             vec![connection_id],
         )
         .await;
+    }
+
+    async fn send_memory_notification_for_scope<T: Serialize>(
+        &self,
+        context: &MemoryOperationContext,
+        initiating_principal_id: Option<&str>,
+        scope: &pioneer_protocol::MemoryScope,
+        source_thread_id: Option<&str>,
+        method: &str,
+        notification: &T,
+    ) -> bool {
+        match scope.kind {
+            MemoryScopeKind::Workspace => {
+                let Some(workspace_id) = context.workspace_id.as_deref() else {
+                    return false;
+                };
+                if scope.key != workspace_id {
+                    return false;
+                }
+                if let Some(source_thread_id) = source_thread_id
+                    .map(str::trim)
+                    .filter(|source_thread_id| !source_thread_id.is_empty())
+                {
+                    let candidate_connection_ids = self
+                        .session_manager
+                        .connection_ids_for_workspace(workspace_id)
+                        .await;
+                    self.send_thread_scoped_notification_to_connections(
+                        source_thread_id,
+                        method,
+                        notification,
+                        candidate_connection_ids,
+                    )
+                    .await;
+                } else {
+                    self.send_notification_to_workspace_connections(
+                        workspace_id,
+                        method,
+                        notification,
+                    )
+                    .await;
+                }
+                true
+            }
+            MemoryScopeKind::Thread => {
+                if scope.key.trim().is_empty() {
+                    return false;
+                }
+                self.send_notification_to_thread_subscribers(
+                    scope.key.as_str(),
+                    method,
+                    notification,
+                )
+                .await;
+                true
+            }
+            MemoryScopeKind::Task => {
+                let Some(workspace_id) = context.workspace_id.as_deref() else {
+                    return false;
+                };
+                if scope.key.trim().is_empty() {
+                    return false;
+                }
+                self.send_notification_to_task_workspace_connections(
+                    scope.key.as_str(),
+                    workspace_id,
+                    method,
+                    notification,
+                )
+                .await;
+                true
+            }
+            MemoryScopeKind::User | MemoryScopeKind::Agent => {
+                if let Some(initiating_principal_id) = initiating_principal_id {
+                    self.send_principal_owned_notification(
+                        initiating_principal_id,
+                        method,
+                        notification,
+                    )
+                    .await;
+                } else {
+                    self.send_superuser_personal_notification(method, notification)
+                        .await;
+                }
+                true
+            }
+        }
     }
 
     async fn send_memory_forgotten_after_forget(

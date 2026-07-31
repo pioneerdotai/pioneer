@@ -5,6 +5,9 @@ use pioneer_entity::{
     agent_skill, agent_skill_version, self_improvement_run, self_improvement_source_turn,
     self_improvement_workspace_state, thread, turn,
 };
+use pioneer_protocol::{
+    ThreadOriginKind, ThreadSidebarVisibility, TurnKind, TurnOrigin, TurnStatus,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter};
@@ -15,7 +18,12 @@ use super::agent_skill::{
     apply_create_in_caller_transaction, apply_rollback_in_caller_transaction,
     apply_update_in_caller_transaction,
 };
+use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_to_db};
 use super::self_improvement_run::STATUS_COMPLETED;
+use crate::convention::{
+    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, turn_kind_from_db,
+    turn_origin_from_db, turn_status_from_db,
+};
 use crate::{
     AcceptedAgentSkillCreate, FinalizeSelfImprovementRunInput, FinalizeSelfImprovementRunResult,
     SelfImprovementFinalOutcome, SelfImprovementFinalizationConflict,
@@ -773,28 +781,72 @@ async fn source_turns_match_frozen_range<C: ConnectionTrait>(
     if turns.len() != source_turn_ids.len() {
         return Ok(false);
     }
+    if turns.iter().any(|turn| {
+        turn_status_from_db(turn.status.as_str()) != Some(TurnStatus::Completed)
+            || turn_kind_from_db(turn.turn_kind.as_str()) != Some(TurnKind::Conversation)
+            || turn_origin_from_db(turn.origin.as_str()) != Some(TurnOrigin::User)
+    }) {
+        return Ok(false);
+    }
     let thread_ids = turns
-        .into_iter()
-        .map(|turn| turn.thread_id)
+        .iter()
+        .map(|turn| turn.thread_id.clone())
         .collect::<HashSet<_>>();
     let workspace_threads = thread::Entity::find()
         .filter(thread::Column::Id.is_in(thread_ids.iter().cloned().collect::<Vec<_>>()))
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread::Column::AccessClass.eq(persisted_thread_access_class_to_db(
+                PersistedThreadAccessClass::Workspace,
+            )),
+        )
         .all(db)
         .await
         .context("failed to verify cited Agent skill workspace ownership")?;
     if workspace_threads.len() != thread_ids.len() {
         return Ok(false);
     }
-    let new_anchor_count = self_improvement_source_turn::Entity::find()
+    if workspace_threads.iter().any(|source_thread| {
+        thread_sidebar_visibility_from_db(source_thread.sidebar_visibility.as_str())
+            != Some(ThreadSidebarVisibility::Visible)
+            || !thread_origin_kind_from_db(source_thread.origin_kind.as_str()).is_some_and(
+                |origin| {
+                    matches!(
+                        origin,
+                        ThreadOriginKind::Collaborative
+                            | ThreadOriginKind::DirectMessage
+                            | ThreadOriginKind::User
+                    )
+                },
+            )
+    }) {
+        return Ok(false);
+    }
+    let source_rows = self_improvement_source_turn::Entity::find()
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
-        .filter(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
         .filter(self_improvement_source_turn::Column::TurnId.is_in(source_turn_ids.to_vec()))
         .all(db)
         .await
-        .context("failed to verify Agent skill new-anchor evidence")?
-        .len();
+        .context("failed to verify complete Agent skill source provenance")?;
+    if source_rows.len() != source_turn_ids.len() {
+        return Ok(false);
+    }
+    let source_thread_by_turn = source_rows
+        .iter()
+        .map(|source| (source.turn_id.as_str(), source.thread_id.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    if turns.iter().any(|turn| {
+        source_thread_by_turn.get(turn.id.as_str()).copied() != Some(turn.thread_id.as_str())
+    }) {
+        return Ok(false);
+    }
+    let new_anchor_count = source_rows
+        .iter()
+        .filter(|source| source.id > source_lower_exclusive && source.id <= source_upper_inclusive)
+        .count();
+    // At least one cited source must come from this immutable run range. All
+    // other cited context must still have a complete same-workspace ledger
+    // identity and a currently workspace-visible parent.
     Ok(new_anchor_count > 0)
 }
 

@@ -347,6 +347,7 @@ fn evaluation_context_for_fixture(
         allow_global_user: true,
         allow_global_agent: true,
         read_policy: None,
+        source_access: Default::default(),
     }
 }
 

@@ -1,14 +1,332 @@
 use super::*;
 
 impl MessageProcessor {
-    pub(super) async fn send_notification_to_all_connections<T: Serialize>(
+    pub(super) async fn send_principal_owned_notification<T: Serialize>(
+        &self,
+        owner_principal_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        self.send_personal_notification(Some(owner_principal_id), method, payload)
+            .await;
+    }
+
+    pub(super) async fn send_superuser_personal_notification<T: Serialize>(
         &self,
         method: &str,
         payload: &T,
     ) {
-        let connection_ids = self.session_manager.connection_ids().await;
-        self.send_notification_to_connections(method, payload, connection_ids)
+        self.send_personal_notification(None, method, payload).await;
+    }
+
+    async fn send_personal_notification<T: Serialize>(
+        &self,
+        owner_principal_id: Option<&str>,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_personal_notification_recipients(
+                owner_principal_id,
+                candidate_connection_ids,
+            )
             .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_personal_notification_recipients(
+                owner_principal_id,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_personal_notification_recipients(
+                owner_principal_id,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_personal_notification_recipients(
+        &self,
+        owner_principal_id: Option<&str>,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{ActionGateDecision, AuthorizationService, ResourceAction};
+
+        let owner_principal_id = owner_principal_id
+            .map(str::trim)
+            .filter(|principal_id| !principal_id.is_empty());
+        if candidate_connection_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let service = AuthorizationService::new();
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+
+            match service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::MemoryRead,
+            ) {
+                ActionGateDecision::AllowSuperuser => recipients.push(connection_id),
+                ActionGateDecision::RequireResource { .. }
+                    if owner_principal_id
+                        .is_some_and(|owner| principal.principal_id.as_str() == owner) =>
+                {
+                    recipients.push(connection_id);
+                }
+                ActionGateDecision::RequireResource { .. } | ActionGateDecision::Deny { .. } => {}
+            }
+        }
+        recipients
+    }
+
+    pub(super) async fn send_execution_owner_notification<T: Serialize>(
+        &self,
+        thread_id: &str,
+        initiating_principal_id: &str,
+        initiating_session_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_execution_owner_notification_recipients(
+                thread_id,
+                initiating_principal_id,
+                initiating_session_id,
+                candidate_connection_ids,
+            )
+            .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_execution_owner_notification_recipients(
+                thread_id,
+                initiating_principal_id,
+                initiating_session_id,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_execution_owner_notification_recipients(
+                thread_id,
+                initiating_principal_id,
+                initiating_session_id,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_execution_owner_notification_recipients(
+        &self,
+        thread_id: &str,
+        initiating_principal_id: &str,
+        initiating_session_id: &str,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_thread_notification_decision,
+        };
+
+        let thread_id = thread_id.trim();
+        let initiating_principal_id = initiating_principal_id.trim();
+        let initiating_session_id = initiating_session_id.trim();
+        if thread_id.is_empty()
+            || initiating_principal_id.is_empty()
+            || initiating_session_id.is_empty()
+            || candidate_connection_ids.is_empty()
+        {
+            return Vec::new();
+        }
+
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
+                continue;
+            }
+            let action_gate = service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::CliRuntimeUse,
+            );
+            if action_gate == ActionGateDecision::AllowSuperuser {
+                recipients.push(connection_id);
+                continue;
+            }
+            if principal.principal_id.as_str() != initiating_principal_id
+                || principal.session_id.as_str() != initiating_session_id
+            {
+                continue;
+            }
+            if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
+                let decision = AuthorizationDecision::Deny {
+                    reason: *reason,
+                    disclosure: *disclosure,
+                };
+                record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
+                continue;
+            }
+            match resolver
+                .authorize_thread(
+                    principal.as_ref(),
+                    &action_gate,
+                    ResourceAction::CliRuntimeUse,
+                    thread_id,
+                    None,
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_thread_notification_decision(
+                        ResourceAction::CliRuntimeUse,
+                        proof.decision(),
+                    );
+                    recipients.push(connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        ResourceAction::CliRuntimeUse.safe_name(),
+                        "thread",
+                        "execution_notification",
+                    );
+                    warn!(
+                        connection_id,
+                        authorization_action = ResourceAction::CliRuntimeUse.safe_name(),
+                        authorization_resource_kind = "thread",
+                        error = %format!("{error:#}"),
+                        "execution notification authorization unavailable"
+                    );
+                }
+            }
+        }
+        recipients
+    }
+
+    pub(super) async fn send_gateway_management_notification<T: Serialize>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_gateway_management_notification_recipients(candidate_connection_ids)
+            .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_gateway_management_notification_recipients(
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_gateway_management_notification_recipients(serialization_connection_ids)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_gateway_management_notification_recipients(
+        &self,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{ActionGateDecision, AuthorizationService, ResourceAction};
+
+        let service = AuthorizationService::new();
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            if service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::GatewayManage,
+            ) == ActionGateDecision::AllowSuperuser
+            {
+                recipients.push(connection_id);
+            }
+        }
+        recipients
     }
 
     pub(super) async fn send_notification_to_workspace_connections<T: Serialize>(
@@ -17,12 +335,170 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
-        let connection_ids = self
+        let candidate_connection_ids = self
             .session_manager
             .connection_ids_for_workspace(workspace_id)
             .await;
-        self.send_notification_to_connections(method, payload, connection_ids)
+        let connection_ids = self
+            .authorized_workspace_notification_recipients(workspace_id, candidate_connection_ids)
             .await;
+        self.send_notification_to_reauthorized_workspace_connections(
+            workspace_id,
+            method,
+            payload,
+            connection_ids,
+        )
+        .await;
+    }
+
+    pub(super) async fn send_notification_to_authorized_workspace_connections<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let connection_ids = self
+            .authorized_workspace_notification_recipients(workspace_id, candidate_connection_ids)
+            .await;
+        self.send_notification_to_reauthorized_workspace_connections(
+            workspace_id,
+            method,
+            payload,
+            connection_ids,
+        )
+        .await;
+    }
+
+    pub(super) async fn send_notification_to_reauthorized_workspace_connections<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        method: &str,
+        payload: &T,
+        initially_authorized_connection_ids: Vec<ConnectionId>,
+    ) {
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_workspace_notification_recipients(
+                workspace_id,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_workspace_notification_recipients(
+                workspace_id,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    pub(super) async fn authorized_workspace_notification_recipients(
+        &self,
+        workspace_id: &str,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_workspace_notification_decision,
+        };
+
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() || candidate_connection_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_workspace_notification_decision(ResourceAction::WorkspaceRead, &decision);
+                continue;
+            }
+
+            let action_gate = service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::WorkspaceRead,
+            );
+            if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
+                let decision = AuthorizationDecision::Deny {
+                    reason: *reason,
+                    disclosure: *disclosure,
+                };
+                record_workspace_notification_decision(ResourceAction::WorkspaceRead, &decision);
+                continue;
+            }
+
+            match resolver
+                .authorize_workspace(
+                    principal.as_ref(),
+                    &action_gate,
+                    ResourceAction::WorkspaceRead,
+                    workspace_id,
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_workspace_notification_decision(
+                        ResourceAction::WorkspaceRead,
+                        proof.decision(),
+                    );
+                    recipients.push(connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_workspace_notification_decision(
+                        ResourceAction::WorkspaceRead,
+                        &decision,
+                    );
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        ResourceAction::WorkspaceRead.safe_name(),
+                        "workspace",
+                        "notification",
+                    );
+                    warn!(
+                        connection_id,
+                        authorization_action = ResourceAction::WorkspaceRead.safe_name(),
+                        authorization_resource_kind = "workspace",
+                        error = %format!("{error:#}"),
+                        "workspace notification authorization unavailable"
+                    );
+                }
+            }
+        }
+
+        recipients
     }
 
     pub(crate) async fn send_notification_to_thread_subscribers<T: Serialize>(
@@ -31,12 +507,490 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
-        let connection_ids = self
+        let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        self.send_notification_to_authorized_thread_subscribers(
+            thread_id,
+            method,
+            payload,
+            subscribers,
+        )
+        .await;
+    }
+
+    pub(crate) async fn send_notification_to_authorized_thread_connections<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        let subscribers = self
             .thread_manager
-            .subscribed_connection_ids(thread_id)
+            .subscribed_connections_for_candidates(thread_id, candidate_connection_ids)
             .await;
-        self.send_notification_to_connections(method, payload, connection_ids)
+        self.send_notification_to_authorized_thread_subscribers(
+            thread_id,
+            method,
+            payload,
+            subscribers,
+        )
+        .await;
+    }
+
+    pub(crate) async fn send_notification_to_authorized_thread_subscribers<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        subscribers: Vec<crate::thread::ThreadSubscriber>,
+    ) {
+        let connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, subscribers)
             .await;
+        self.send_notification_to_reauthorized_thread_connections(
+            thread_id,
+            method,
+            payload,
+            connection_ids,
+        )
+        .await;
+    }
+
+    pub(crate) async fn send_notification_to_removed_thread_subscribers<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        subscribers: Vec<crate::thread::ThreadSubscriber>,
+    ) {
+        let initially_authorized_connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, subscribers.clone())
+            .await;
+        let serialization_subscribers =
+            retain_thread_subscribers(subscribers, &initially_authorized_connection_ids);
+        let serialization_connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, serialization_subscribers.clone())
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let final_subscribers =
+            retain_thread_subscribers(serialization_subscribers, &serialization_connection_ids);
+        let connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, final_subscribers)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    pub(super) async fn send_notification_to_reauthorized_thread_connections<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        initially_authorized_connection_ids: Vec<ConnectionId>,
+    ) {
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, initially_authorized_connection_ids)
+            .await;
+        let serialization_connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, serialization_subscribers)
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, serialization_connection_ids)
+            .await;
+        let connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, subscribers)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    pub(super) async fn send_thread_scoped_notification_to_connections<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        let initially_authorized_connection_ids = self
+            .authorized_thread_connection_recipients(thread_id, candidate_connection_ids)
+            .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_thread_connection_recipients(thread_id, initially_authorized_connection_ids)
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_thread_connection_recipients(thread_id, serialization_connection_ids)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    pub(crate) async fn send_notification_to_thread_subscription_scopes<T: Serialize>(
+        &self,
+        thread_ids: &[String],
+        method: &str,
+        payload: &T,
+    ) {
+        let mut inspected_thread_ids = HashSet::new();
+        let mut recipient_ids = HashSet::new();
+
+        for thread_id in thread_ids {
+            let thread_id = thread_id.trim();
+            if thread_id.is_empty() || !inspected_thread_ids.insert(thread_id.to_owned()) {
+                continue;
+            }
+            let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+            recipient_ids.extend(
+                self.authorized_thread_notification_recipients(thread_id, subscribers)
+                    .await,
+            );
+        }
+
+        if recipient_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+
+        let initially_authorized_connection_ids: Vec<_> = recipient_ids.into_iter().collect();
+        let mut final_recipient_ids = HashSet::new();
+        for thread_id in inspected_thread_ids {
+            let subscribers = self
+                .thread_manager
+                .subscribed_connections_for_candidates(
+                    thread_id.as_str(),
+                    initially_authorized_connection_ids.clone(),
+                )
+                .await;
+            final_recipient_ids.extend(
+                self.authorized_thread_notification_recipients(thread_id.as_str(), subscribers)
+                    .await,
+            );
+        }
+
+        self.send_serialized_notification_to_connections(
+            method,
+            &serialized,
+            final_recipient_ids.into_iter().collect(),
+        )
+        .await;
+    }
+
+    pub(super) async fn authorized_thread_notification_recipients(
+        &self,
+        thread_id: &str,
+        subscribers: Vec<crate::thread::ThreadSubscriber>,
+    ) -> Vec<ConnectionId> {
+        let candidates = subscribers
+            .into_iter()
+            .map(|subscriber| (subscriber.connection_id, Some(subscriber.identity)))
+            .collect();
+        self.authorized_thread_notification_candidates(thread_id, candidates)
+            .await
+    }
+
+    async fn authorized_thread_connection_recipients(
+        &self,
+        thread_id: &str,
+        connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        let candidates = connection_ids
+            .into_iter()
+            .map(|connection_id| (connection_id, None))
+            .collect();
+        self.authorized_thread_notification_candidates(thread_id, candidates)
+            .await
+    }
+
+    async fn authorized_thread_notification_candidates(
+        &self,
+        thread_id: &str,
+        candidates: Vec<(
+            ConnectionId,
+            Option<crate::thread::ThreadSubscriptionIdentity>,
+        )>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_thread_notification_decision,
+        };
+
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() || candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(candidates.len());
+
+        for (connection_id, expected_identity) in candidates {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if expected_identity.is_some_and(|identity| {
+                principal.principal_id != identity.principal_id
+                    || principal.session_id != identity.session_id
+            }) {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                continue;
+            }
+
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                continue;
+            }
+
+            let action_gate = service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::ThreadRead,
+            );
+            if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
+                let decision = AuthorizationDecision::Deny {
+                    reason: *reason,
+                    disclosure: *disclosure,
+                };
+                record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                continue;
+            }
+
+            match resolver
+                .authorize_thread(
+                    principal.as_ref(),
+                    &action_gate,
+                    ResourceAction::ThreadRead,
+                    thread_id,
+                    None,
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_thread_notification_decision(
+                        ResourceAction::ThreadRead,
+                        proof.decision(),
+                    );
+                    recipients.push(connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        ResourceAction::ThreadRead.safe_name(),
+                        "thread",
+                        "notification",
+                    );
+                    warn!(
+                        connection_id,
+                        authorization_action = ResourceAction::ThreadRead.safe_name(),
+                        authorization_resource_kind = "thread",
+                        error = %format!("{error:#}"),
+                        "thread notification authorization unavailable"
+                    );
+                }
+            }
+        }
+
+        recipients
+    }
+
+    pub(crate) async fn send_notification_to_task_workspace_connections<T: Serialize>(
+        &self,
+        task_id: &str,
+        workspace_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self
+            .session_manager
+            .connection_ids_for_workspace(workspace_id)
+            .await;
+        let connection_ids = self
+            .authorized_task_notification_recipients(
+                task_id,
+                workspace_id,
+                candidate_connection_ids,
+            )
+            .await;
+        self.send_notification_to_reauthorized_task_connections(
+            task_id,
+            workspace_id,
+            method,
+            payload,
+            connection_ids,
+        )
+        .await;
+    }
+
+    pub(super) async fn send_notification_to_reauthorized_task_connections<T: Serialize>(
+        &self,
+        task_id: &str,
+        workspace_id: &str,
+        method: &str,
+        payload: &T,
+        initially_authorized_connection_ids: Vec<ConnectionId>,
+    ) {
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_task_notification_recipients(
+                task_id,
+                workspace_id,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_task_notification_recipients(
+                task_id,
+                workspace_id,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    pub(super) async fn authorized_task_notification_recipients(
+        &self,
+        task_id: &str,
+        workspace_id: &str,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_task_notification_decision,
+        };
+
+        let task_id = task_id.trim();
+        let workspace_id = workspace_id.trim();
+        if task_id.is_empty() || workspace_id.is_empty() || candidate_connection_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_task_notification_decision(ResourceAction::TaskRead, &decision);
+                continue;
+            }
+            let action_gate = service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::TaskRead,
+            );
+            if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
+                let decision = AuthorizationDecision::Deny {
+                    reason: *reason,
+                    disclosure: *disclosure,
+                };
+                record_task_notification_decision(ResourceAction::TaskRead, &decision);
+                continue;
+            }
+            match resolver
+                .authorize_task(
+                    principal.as_ref(),
+                    &action_gate,
+                    ResourceAction::TaskRead,
+                    task_id,
+                    Some(workspace_id),
+                    None,
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_task_notification_decision(ResourceAction::TaskRead, proof.decision());
+                    recipients.push(connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_task_notification_decision(ResourceAction::TaskRead, &decision);
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        ResourceAction::TaskRead.safe_name(),
+                        "task",
+                        "notification",
+                    );
+                    warn!(
+                        connection_id,
+                        authorization_action = ResourceAction::TaskRead.safe_name(),
+                        authorization_resource_kind = "task",
+                        error = %format!("{error:#}"),
+                        "task notification authorization unavailable"
+                    );
+                }
+            }
+        }
+        recipients
     }
 
     pub(super) async fn send_notification_to_connections<T: Serialize>(
@@ -49,26 +1003,41 @@ impl MessageProcessor {
             return;
         }
 
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    fn serialize_notification<T: Serialize>(&self, method: &str, payload: &T) -> Option<String> {
         let notification = match JsonRpcNotification::from_params(method, payload) {
             Ok(notification) => notification,
             Err(error) => {
                 error!(method, error = %error, "failed to encode notification");
-                return;
+                return None;
             }
         };
 
-        let serialized = match serde_json::to_string(&notification) {
-            Ok(payload) => payload,
+        match serde_json::to_string(&notification) {
+            Ok(payload) => Some(payload),
             Err(error) => {
                 error!(method, error = %error, "failed to serialize notification");
-                return;
+                None
             }
-        };
+        }
+    }
 
+    async fn send_serialized_notification_to_connections(
+        &self,
+        method: &str,
+        serialized: &str,
+        connection_ids: Vec<ConnectionId>,
+    ) {
         for target_connection_id in connection_ids {
             if let Err(error) = self
                 .session_manager
-                .send_text(target_connection_id, serialized.clone())
+                .send_text(target_connection_id, serialized.to_owned())
                 .await
             {
                 warn!(
@@ -103,4 +1072,18 @@ impl MessageProcessor {
         let payload = serde_json::to_string(value)?;
         self.session_manager.send_text(connection_id, payload).await
     }
+}
+
+fn retain_thread_subscribers(
+    subscribers: Vec<crate::thread::ThreadSubscriber>,
+    candidate_connection_ids: &[ConnectionId],
+) -> Vec<crate::thread::ThreadSubscriber> {
+    let candidate_connection_ids = candidate_connection_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    subscribers
+        .into_iter()
+        .filter(|subscriber| candidate_connection_ids.contains(&subscriber.connection_id))
+        .collect()
 }

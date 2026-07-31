@@ -260,6 +260,7 @@ pub fn thread_start_params(thread_id: String, workspace_id: String) -> ThreadSta
         mode: None,
         origin_kind: Some(pioneer_protocol::ThreadOriginKind::Collaborative),
         sidebar_visibility: None,
+        visibility: None,
         agent_nickname: None,
         agent_role: None,
     }
@@ -355,6 +356,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }

@@ -1,4 +1,5 @@
 mod agent_diff_event_compaction;
+mod authorization_legacy_backfill;
 mod cli_runtime_native_event_compaction;
 mod stable_skill_id_backfill;
 mod task_anchor_backfill;
@@ -134,6 +135,7 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
+        authorization_legacy_backfill::run(crud_store.as_ref()).await;
         stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
         task_anchor_backfill::run(crud_store.as_ref()).await;
         turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;

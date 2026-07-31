@@ -33,6 +33,64 @@ pub(crate) async fn load_active_agent_skill_overlay(
     Ok(entries)
 }
 
+pub(crate) async fn load_member_agent_skill_overlay(
+    store: &CrudStore,
+    principal_id: &pioneer_protocol::PrincipalId,
+    workspace_id: &str,
+) -> Result<Vec<AgentSkillRuntimeEntry>> {
+    let database = store.database_connection();
+    if pioneer_crud::find_workspace_membership(&database, principal_id, workspace_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to verify Member workspace membership for Agent skill overlay in \
+                 `{workspace_id}`"
+            )
+        })?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let active = load_active_agent_skill_overlay(store, workspace_id).await?;
+    let policies = store
+        .list_workspace_skill_policies(workspace_id)
+        .await
+        .with_context(|| {
+            format!("failed to load Agent skill policies for workspace `{workspace_id}`")
+        })?
+        .into_iter()
+        .map(|policy| (policy.skill_id, policy.enabled))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut eligible = Vec::with_capacity(active.len());
+    for entry in active {
+        if policies.get(&entry.skill_id) != Some(&Some(true)) {
+            continue;
+        }
+        let eligibility = pioneer_crud::derive_member_learned_version_eligibility(
+            &database,
+            workspace_id,
+            entry.version_id.as_str(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to derive Member eligibility for Agent skill version `{}`",
+                entry.version_id
+            )
+        })?;
+        match eligibility {
+            pioneer_crud::MemberLearnedVersionEligibility::Eligible => eligible.push(entry),
+            pioneer_crud::MemberLearnedVersionEligibility::Ineligible(
+                pioneer_crud::LearnedVersionIneligibleReason::SourceNotWorkspaceVisible,
+            ) => {
+                crate::authorization::record_private_self_improvement_source_rejection();
+            }
+            pioneer_crud::MemberLearnedVersionEligibility::Ineligible(_) => {}
+        }
+    }
+    Ok(eligible)
+}
+
 pub(crate) fn agent_skill_runtime_entry(
     snapshot: AgentSkillVersionSnapshotRecord,
 ) -> AgentSkillRuntimeEntry {
@@ -60,11 +118,16 @@ mod tests {
         FinalizeSelfImprovementRunResult, NewSelfImprovementRun, SelfImprovementFinalOutcome,
         SelfImprovementFinalizationAuthority,
     };
-    use pioneer_protocol::SkillId;
+    use pioneer_protocol::{PrincipalId, SkillId};
     use sea_orm::{ConnectionTrait, Database};
 
     const NOW: i64 = 1_900_400_000;
-    const WORKSPACE: &str = "ws_overlay";
+    const WORKSPACE: &str = "W0000000000000000000O";
+    const MEMBER_ID: &str = "P00000000000000000002";
+
+    fn member_id() -> PrincipalId {
+        PrincipalId::new(MEMBER_ID).expect("Member fixture ID must be valid")
+    }
 
     async fn active_store() -> CrudStore {
         let database = Database::connect("sqlite::memory:")
@@ -75,13 +138,31 @@ mod tests {
             .expect("migrations must apply");
         database
             .execute_unprepared(
-                "INSERT INTO workspace (id, name, is_active, is_current) VALUES \
-                 ('ws_overlay', 'Overlay', 1, 1); \
-                 INSERT INTO thread (
-                     id, workspace_id, preview, mode, model, model_provider, status, origin_kind
+                "INSERT INTO gateway_identity (
+                    id, singleton_key, identity_bootstrap_version, auth_schema_version
                  ) VALUES (
-                     'thread_overlay', 'ws_overlay', '', 'agent', 'model', 'provider',
-                     'active', 'user'
+                    'G00000000000000000001', 1, 1, 0
+                 ); \
+                 INSERT INTO gateway_principal (
+                    id, gateway_id, kind, role_key, status, display_name, nickname, nickname_key
+                 ) VALUES (
+                    'P00000000000000000002', 'G00000000000000000001', 'user', 'member',
+                    'active', 'Member', 'member', 'member'
+                 ); \
+                 INSERT INTO workspace (id, name, is_active, is_current) VALUES \
+                 ('W0000000000000000000O', 'Overlay', 1, 1); \
+                 INSERT INTO workspace_membership (
+                    principal_id, workspace_id, granted_by_actor_kind, created_at, updated_at
+                 ) VALUES (
+                    'P00000000000000000002', 'W0000000000000000000O', 'system',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                 ); \
+                 INSERT INTO thread (
+                     id, workspace_id, preview, mode, model, model_provider, status, origin_kind,
+                     access_class
+                 ) VALUES (
+                     'thread_overlay', 'W0000000000000000000O', '', 'agent', 'model', 'provider',
+                     'active', 'user', 'workspace'
                  ); \
                  INSERT INTO turn (id, thread_id, status, turn_kind, origin) VALUES \
                      ('turn_context', 'thread_overlay', 'completed', 'conversation', 'user'), \
@@ -99,7 +180,10 @@ mod tests {
                 "INSERT INTO self_improvement_source_turn (
                     workspace_id, thread_id, turn_id, terminal_event_id, terminal_at, created_at
                  ) VALUES (
-                    'ws_overlay', 'thread_overlay', 'turn_anchor', 'event_anchor',
+                    'W0000000000000000000O', 'thread_overlay', 'turn_anchor', 'event_anchor',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                 ), (
+                    'W0000000000000000000O', 'thread_overlay', 'turn_context', 'event_context',
                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                  )",
             )
@@ -202,6 +286,103 @@ mod tests {
             load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
                 .await
                 .expect("disabled overlay lookup must succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn member_overlay_requires_explicit_policy_and_workspace_only_provenance() {
+        use pioneer_crud::WorkspaceSkillPolicyRecord;
+        use sea_orm::ConnectionTrait;
+
+        let store = active_store().await;
+        let principal_id = member_id();
+        store
+            .database_connection()
+            .execute_unprepared(
+                "DELETE FROM workspace_membership \
+                 WHERE principal_id = 'P00000000000000000002' \
+                   AND workspace_id = 'W0000000000000000000O'",
+            )
+            .await
+            .expect("Member membership must be removable");
+        assert!(
+            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .await
+                .expect("missing workspace membership must fail closed without error")
+                .is_empty()
+        );
+        store
+            .database_connection()
+            .execute_unprepared(
+                "INSERT INTO workspace_membership (
+                    principal_id, workspace_id, granted_by_actor_kind, created_at, updated_at
+                 ) VALUES (
+                    'P00000000000000000002', 'W0000000000000000000O', 'system',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                 )",
+            )
+            .await
+            .expect("Member membership must be restorable");
+        store
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'",
+            )
+            .await
+            .expect("source thread must become workspace-visible");
+        assert!(
+            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .await
+                .expect("missing policy must fail closed without error")
+                .is_empty()
+        );
+        store
+            .upsert_workspace_skill_policy(
+                &WorkspaceSkillPolicyRecord {
+                    id: "member_overlay_policy".to_owned(),
+                    workspace_id: WORKSPACE.to_owned(),
+                    skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("skill id"),
+                    enabled: Some(true),
+                    allow_implicit_invocation: Some(true),
+                },
+                NOW + 5,
+            )
+            .await
+            .expect("explicit workspace policy must persist");
+        let eligible = load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            .await
+            .expect("workspace-only learned version must resolve");
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].version_id, "111111111111111111111");
+
+        store
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE thread SET access_class = 'private' WHERE id = 'thread_overlay'",
+            )
+            .await
+            .expect("source thread must become private");
+        assert!(
+            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .await
+                .expect("private provenance must fail closed without error")
+                .is_empty()
+        );
+        store
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'; \
+                 DELETE FROM workspace_membership \
+                 WHERE principal_id = 'P00000000000000000002' \
+                   AND workspace_id = 'W0000000000000000000O'",
+            )
+            .await
+            .expect("Member membership revoke must persist");
+        assert!(
+            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .await
+                .expect("revoked membership must invalidate overlay without error")
                 .is_empty()
         );
     }

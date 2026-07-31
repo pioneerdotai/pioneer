@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use pioneer_entity::task;
 use pioneer_protocol::{Task, TaskError, TaskResult, TaskStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Expr, OnConflict, Query, SelectStatement};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -15,6 +15,58 @@ use crate::repositories::ProjectionWriteOutcome;
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
 const DB_ID_LEN: usize = 21;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRootAccessFilter {
+    pub allowed_root_thread_ids: Vec<String>,
+}
+
+fn root_thread_condition(allowed_root_thread_ids: &[String]) -> Condition {
+    if allowed_root_thread_ids.is_empty() {
+        return Condition::all().add(Expr::cust("1 = 0"));
+    }
+
+    Condition::any()
+        .add(task::Column::CreatedByThreadId.is_in(allowed_root_thread_ids.to_vec()))
+        .add(
+            Condition::all()
+                .add(task::Column::OwnerKind.eq("thread"))
+                .add(task::Column::OwnerId.is_in(allowed_root_thread_ids.to_vec())),
+        )
+}
+
+pub(crate) fn accessible_task_ids(filter: &TaskRootAccessFilter) -> SelectStatement {
+    let accessible_root_ids = Query::select()
+        .column(task::Column::Id)
+        .from(task::Entity)
+        .and_where(task::Column::RootTaskId.is_null())
+        .cond_where(root_thread_condition(&filter.allowed_root_thread_ids))
+        .to_owned();
+
+    Query::select()
+        .column(task::Column::Id)
+        .from(task::Entity)
+        .cond_where(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(task::Column::RootTaskId.is_null())
+                        .add(root_thread_condition(&filter.allowed_root_thread_ids)),
+                )
+                .add(task::Column::RootTaskId.in_subquery(accessible_root_ids)),
+        )
+        .to_owned()
+}
+
+fn apply_root_access_filter(
+    query: sea_orm::Select<task::Entity>,
+    filter: Option<&TaskRootAccessFilter>,
+) -> sea_orm::Select<task::Entity> {
+    match filter {
+        Some(filter) => query.filter(task::Column::Id.in_subquery(accessible_task_ids(filter))),
+        None => query,
+    }
+}
 
 pub async fn upsert_task<C: ConnectionTrait>(db: &C, task_model: &Task) -> Result<()> {
     task::Entity::insert(active_model_from_task(task_model)?)
@@ -63,15 +115,19 @@ pub async fn find_task_by_id<C: ConnectionTrait>(
         .context("failed to query task by id")
 }
 
-pub async fn list_tasks_by_workspace_status<C: ConnectionTrait>(
+pub async fn list_tasks_by_workspace_status_scoped<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     status: Option<&str>,
     limit: Option<u64>,
+    access: Option<&TaskRootAccessFilter>,
 ) -> Result<Vec<task::Model>> {
-    let mut query = task::Entity::find()
-        .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .order_by_desc(task::Column::UpdatedAt);
+    let mut query = apply_root_access_filter(
+        task::Entity::find()
+            .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .order_by_desc(task::Column::UpdatedAt),
+        access,
+    );
 
     if let Some(status) = status {
         query = query.filter(task::Column::Status.eq(status.to_owned()));
@@ -83,20 +139,24 @@ pub async fn list_tasks_by_workspace_status<C: ConnectionTrait>(
     query
         .all(db)
         .await
-        .context("failed to list workspace tasks")
+        .context("failed to list root-authorized workspace tasks")
 }
 
-pub async fn list_tasks_by_owner<C: ConnectionTrait>(
+pub async fn list_tasks_by_owner_scoped<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     owner_kind: &str,
     owner_id: Option<&str>,
     limit: Option<u64>,
+    access: Option<&TaskRootAccessFilter>,
 ) -> Result<Vec<task::Model>> {
-    let mut query = task::Entity::find()
-        .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(task::Column::OwnerKind.eq(owner_kind.to_owned()))
-        .order_by_desc(task::Column::UpdatedAt);
+    let mut query = apply_root_access_filter(
+        task::Entity::find()
+            .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(task::Column::OwnerKind.eq(owner_kind.to_owned()))
+            .order_by_desc(task::Column::UpdatedAt),
+        access,
+    );
 
     query = match owner_id {
         Some(owner_id) => query.filter(task::Column::OwnerId.eq(owner_id.to_owned())),
@@ -106,19 +166,26 @@ pub async fn list_tasks_by_owner<C: ConnectionTrait>(
         query = query.limit(limit);
     }
 
-    query.all(db).await.context("failed to list owner tasks")
-}
-
-pub async fn list_tasks_by_parent<C: ConnectionTrait>(
-    db: &C,
-    parent_task_id: &str,
-) -> Result<Vec<task::Model>> {
-    task::Entity::find()
-        .filter(task::Column::ParentTaskId.eq(parent_task_id.to_owned()))
-        .order_by_asc(task::Column::CreatedAt)
+    query
         .all(db)
         .await
-        .context("failed to list child tasks")
+        .context("failed to list root-authorized owner tasks")
+}
+
+pub async fn list_tasks_by_parent_scoped<C: ConnectionTrait>(
+    db: &C,
+    parent_task_id: &str,
+    access: Option<&TaskRootAccessFilter>,
+) -> Result<Vec<task::Model>> {
+    apply_root_access_filter(
+        task::Entity::find()
+            .filter(task::Column::ParentTaskId.eq(parent_task_id.to_owned()))
+            .order_by_asc(task::Column::CreatedAt),
+        access,
+    )
+    .all(db)
+    .await
+    .context("failed to list root-authorized child tasks")
 }
 
 pub async fn list_tasks_by_root<C: ConnectionTrait>(
@@ -133,6 +200,21 @@ pub async fn list_tasks_by_root<C: ConnectionTrait>(
         .context("failed to list root task tree")
 }
 
+pub async fn list_tasks_by_root_scoped<C: ConnectionTrait>(
+    db: &C,
+    root_task_id: &str,
+    access: Option<&TaskRootAccessFilter>,
+) -> Result<Vec<task::Model>> {
+    apply_root_access_filter(
+        task::Entity::find()
+            .filter(task::Column::RootTaskId.eq(root_task_id.to_owned()))
+            .order_by_asc(task::Column::CreatedAt),
+        access,
+    )
+    .all(db)
+    .await
+    .context("failed to list root-authorized task tree")
+}
 pub async fn list_tasks_by_creator_turns<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,

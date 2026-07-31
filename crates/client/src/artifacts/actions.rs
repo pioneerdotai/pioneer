@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use pioneer_protocol::{ArtifactRef, ArtifactStatus, ArtifactSummary};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -196,6 +196,10 @@ impl ThreadArtifactActionState {
     pub fn clear_status(&mut self, artifact: &ArtifactRef) {
         self.status_by_artifact
             .remove(&artifact_version_key(artifact));
+    }
+
+    pub(crate) fn remove_keys(&mut self, keys: &HashSet<ArtifactVersionKey>) {
+        self.status_by_artifact.retain(|key, _| !keys.contains(key));
     }
 
     pub fn in_progress(&self, artifact: &ArtifactRef) -> bool {

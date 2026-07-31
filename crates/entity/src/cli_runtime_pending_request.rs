@@ -29,6 +29,13 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub resolved_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub initiating_principal_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub initiating_session_id: Option<String>,
+    pub initiating_session_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub authorization_context_fingerprint: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

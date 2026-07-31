@@ -62,6 +62,7 @@ impl MessageProcessor {
         params: SkillsUploadStartParams,
     ) {
         let connection_id = request_context.connection_id();
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -228,6 +229,10 @@ impl MessageProcessor {
             .await;
             return;
         }
+        self.skill_upload_owners
+            .lock()
+            .await
+            .insert(upload_id.clone(), authenticated_owner);
 
         let payload = SkillsUploadStartResponse {
             upload_id,
@@ -257,6 +262,7 @@ impl MessageProcessor {
         params: SkillsUploadFinishParams,
     ) {
         let connection_id = request_context.connection_id();
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -284,6 +290,13 @@ impl MessageProcessor {
             self.send_upload_not_found(connection_id, request_id).await;
             return;
         };
+        if !self
+            .skill_upload_owner_matches(upload.upload_id.as_str(), &authenticated_owner)
+            .await
+        {
+            self.send_upload_not_found(connection_id, request_id).await;
+            return;
+        }
 
         if let Err(error) =
             validate_upload_owner(&upload, workspace_id.as_str(), connection_id, now)
@@ -346,6 +359,10 @@ impl MessageProcessor {
                     .is_some()
                 {
                     let _ = remove_upload_payload(&upload);
+                    self.skill_upload_owners
+                        .lock()
+                        .await
+                        .remove(upload.upload_id.as_str());
                 }
                 self.send_error(
                     connection_id,
@@ -437,6 +454,7 @@ impl MessageProcessor {
         params: SkillsUploadAbortParams,
     ) {
         let connection_id = request_context.connection_id();
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -464,6 +482,13 @@ impl MessageProcessor {
             self.send_upload_not_found(connection_id, request_id).await;
             return;
         };
+        if !self
+            .skill_upload_owner_matches(upload.upload_id.as_str(), &authenticated_owner)
+            .await
+        {
+            self.send_upload_not_found(connection_id, request_id).await;
+            return;
+        }
 
         if let Err(error) =
             validate_upload_owner(&upload, workspace_id.as_str(), connection_id, now)
@@ -522,6 +547,10 @@ impl MessageProcessor {
             status: updated.status,
         };
         let _ = remove_upload_payload(&upload);
+        self.skill_upload_owners
+            .lock()
+            .await
+            .remove(upload.upload_id.as_str());
         self.send_result(connection_id, request_id, &payload, "skills/upload/abort")
             .await;
     }
@@ -532,6 +561,7 @@ impl MessageProcessor {
         frame: &[u8],
     ) {
         let connection_id = request_context.connection_id();
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let (header, chunk) = match parse_upload_chunk_frame(frame) {
             Ok(value) => value,
             Err(error) => {
@@ -555,6 +585,17 @@ impl MessageProcessor {
             );
             return;
         };
+        if !self
+            .skill_upload_owner_matches(upload.upload_id.as_str(), &authenticated_owner)
+            .await
+        {
+            warn!(
+                connection_id,
+                upload_id = header.upload_id.as_str(),
+                "upload chunk referenced a foreign authenticated context"
+            );
+            return;
+        }
 
         if let Err(error) =
             validate_upload_owner(&upload, header.workspace_id.as_str(), connection_id, now)
@@ -861,6 +902,10 @@ impl MessageProcessor {
         {
             Ok(Some(_)) => {
                 let _ = remove_upload_payload(&materialized.upload);
+                self.skill_upload_owners
+                    .lock()
+                    .await
+                    .remove(materialized.upload.upload_id.as_str());
             }
             Ok(None) => {}
             Err(error) => {
@@ -876,7 +921,7 @@ impl MessageProcessor {
 
     pub(super) async fn revalidate_finalized_upload_locked(
         &self,
-        connection_id: ConnectionId,
+        owner: &AuthenticatedTransferOwner,
         workspace_id: &str,
         upload_id: &str,
         request_id: &RequestId,
@@ -894,7 +939,19 @@ impl MessageProcessor {
                     json!({"upload_id": upload_id}),
                 )
             })?;
-        validate_upload_owner(&upload, workspace_id, connection_id, now)
+        if !self
+            .skill_upload_owner_matches(upload.upload_id.as_str(), owner)
+            .await
+        {
+            return Err(skills_error(
+                Some(request_id.clone()),
+                INVALID_PARAMS_CODE,
+                SKILLS_ERROR_UPLOAD_NOT_FOUND,
+                "upload was not found",
+                json!({}),
+            ));
+        }
+        validate_upload_owner(&upload, workspace_id, owner.connection_id, now)
             .map_err(|error| error.with_request_id(request_id.clone()))?;
         if upload.status != UPLOAD_STATUS_FINALIZED || upload.consumed_at_unix.is_some() {
             return Err(skills_error(
@@ -924,6 +981,7 @@ impl MessageProcessor {
         if updated.is_none() {
             bail!("upload `{upload_id}` is no longer finalized and unconsumed");
         }
+        self.skill_upload_owners.lock().await.remove(upload_id);
         Ok(())
     }
 
@@ -957,6 +1015,7 @@ impl MessageProcessor {
         {
             Ok(Some(_)) => {
                 let _ = remove_upload_payload(upload);
+                self.skill_upload_owners.lock().await.remove(upload_id);
             }
             Ok(None) => {}
             Err(error) => {
@@ -1022,6 +1081,10 @@ impl MessageProcessor {
                 {
                     Ok(Some(_)) => {
                         let _ = remove_upload_payload(&current);
+                        self.skill_upload_owners
+                            .lock()
+                            .await
+                            .remove(current.upload_id.as_str());
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1037,6 +1100,10 @@ impl MessageProcessor {
                 UPLOAD_STATUS_ABORTED | UPLOAD_STATUS_CONSUMED | UPLOAD_STATUS_EXPIRED
             ) {
                 let _ = remove_upload_payload(&current);
+                self.skill_upload_owners
+                    .lock()
+                    .await
+                    .remove(current.upload_id.as_str());
             }
         }
 
@@ -1170,6 +1237,18 @@ impl MessageProcessor {
                 None
             }
         }
+    }
+
+    async fn skill_upload_owner_matches(
+        &self,
+        upload_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> bool {
+        self.skill_upload_owners
+            .lock()
+            .await
+            .get(upload_id)
+            .is_some_and(|expected| expected == owner)
     }
 
     async fn send_upload_not_found(&self, connection_id: ConnectionId, request_id: RequestId) {

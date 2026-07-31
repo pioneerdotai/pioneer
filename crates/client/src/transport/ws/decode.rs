@@ -121,7 +121,9 @@ mod tests {
     use super::*;
     use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
     use crate::transport::ws::GatewayWsConnectSpec;
-    use pioneer_protocol::{GatewayNotification, TurnItem, WorkspaceChangeKind, constants::events};
+    use pioneer_protocol::{
+        AccessChangeKind, GatewayNotification, TurnItem, WorkspaceChangeKind, constants::events,
+    };
     use serde_json::json;
     use std::time::Duration;
 
@@ -332,6 +334,47 @@ mod tests {
         assert_eq!(notification.kind, WorkspaceChangeKind::Updated);
         assert_eq!(notification.workspace.id, "ws_123");
         assert_eq!(notification.workspace.name, "Renamed Workspace");
+    }
+
+    #[test]
+    fn decode_routes_minimal_access_changed_notification() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut pending_requests = PendingJsonRpcRequests::default();
+        let mut pending_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = HashMap::new();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": events::ACCESS_CHANGED,
+            "params": {
+                "authorization_revision": 19,
+                "workspace_id": "ws_revoked",
+                "change": "workspace_membership"
+            }
+        })
+        .to_string();
+
+        process_text_payload(
+            payload.as_str(),
+            17,
+            &mut pending_requests,
+            &mut pending_upload_chunks,
+            &mut pending_artifact_upload_chunks,
+            &event_tx,
+        );
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected websocket event");
+        let GatewayWsEvent::Notification {
+            notification: GatewayNotification::AccessChanged(notification),
+            ..
+        } = event
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!(notification.authorization_revision, 19);
+        assert_eq!(notification.workspace_id, "ws_revoked");
+        assert_eq!(notification.change, AccessChangeKind::WorkspaceMembership);
     }
 
     #[test]

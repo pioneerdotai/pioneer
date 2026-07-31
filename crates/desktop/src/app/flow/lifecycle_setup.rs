@@ -11,6 +11,7 @@ impl PioneerDesktop {
             &self.thread_coordinators,
             self.current_active_thread_id(),
         );
+        self.gateway.authorization_revision = None;
         self.thread_list_loading = plan.thread_list_loading;
         if plan.clear_active_thread {
             self.set_active_thread_id(None);

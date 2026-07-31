@@ -3,7 +3,8 @@ use pioneer_config::GatewayMemoryConfig;
 use pioneer_crud::CrudStore;
 use pioneer_memory::hooks::MemoryTurnContext;
 use pioneer_memory::{
-    MemoryOperationContext, MemoryService, MemoryServiceConfig, MemvidMemoryBackend,
+    MemoryOperationContext, MemoryReadPolicy, MemoryService, MemoryServiceConfig,
+    MemorySourceAccessPolicy, MemvidMemoryBackend,
 };
 use pioneer_protocol::MemoryActor;
 use std::path::Path;
@@ -106,21 +107,36 @@ impl GatewayMemoryRuntime {
         }
     }
 
-    pub(crate) fn operation_context_for_turn(
+    pub(crate) fn operation_context_for_authorized_turn(
         &self,
         turn: &MemoryTurnContext,
         actor: Option<MemoryActor>,
+        member_restricted: bool,
     ) -> MemoryOperationContext {
-        MemoryOperationContext {
+        let conversation_thread_id = turn.effective_conversation_thread_id().to_owned();
+        let mut context = MemoryOperationContext {
             workspace_id: Some(turn.workspace_id.clone()),
-            thread_id: Some(turn.effective_conversation_thread_id().to_owned()),
+            thread_id: Some(conversation_thread_id.clone()),
             task_id: turn.task_id.clone(),
             agent_id: turn.agent_id.clone(),
             actor,
             allow_global_user: self.context_defaults.allow_global_user,
             allow_global_agent: self.context_defaults.allow_global_agent,
             ..MemoryOperationContext::default()
+        };
+        if member_restricted {
+            context.allow_global_user = false;
+            context.allow_global_agent = false;
+            context.read_policy = Some(MemoryReadPolicy {
+                allow_normal: true,
+                allow_personal: false,
+                allow_secret_like: false,
+                allow_regulated: false,
+            });
+            context.source_access =
+                MemorySourceAccessPolicy::accessible_threads([conversation_thread_id]);
         }
+        context
     }
 }
 

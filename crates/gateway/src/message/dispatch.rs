@@ -1,4 +1,5 @@
 use super::*;
+use crate::message::artifacts::{ArtifactListAuthorization, ArtifactUploadAuthorization};
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams,
     ArtifactDownloadAbortParams, ArtifactDownloadChunkParams, ArtifactDownloadFinishParams,
@@ -6,12 +7,12 @@ use pioneer_protocol::{
     ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
     ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
     ArtifactUploadStartParams, AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams,
-    CLIRuntimeRefreshParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
-    GatewaySettingsGetParams, GatewaySettingsUpdateParams, McpInstallParams, McpListParams,
-    McpPolicySetParams, MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
-    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
-    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
+    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
+    CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
+    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
+    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
+    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPackInstallParams, SkillsPackUninstallParams,
@@ -26,6 +27,150 @@ use pioneer_protocol::{
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
 };
 use tracing::Instrument as _;
+
+use crate::authorization::{
+    AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
+    AuthorizedArtifact, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
+    AuthorizedWorkspace, AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy,
+    MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
+    ResourceResolverKind, external_error_for_decision, normal_method_entry,
+    record_authorization_unavailable, record_method_decision, record_method_decision_for_action,
+};
+
+enum RequestAdmission {
+    Superuser,
+    OwnSession(AuthorizedSession),
+    WorkspaceCollection(AuthorizedWorkspaceCollection),
+    Workspace(AuthorizedWorkspace),
+    ThreadCreate(AuthorizedWorkspace),
+    ThreadOpen(AuthorizedThread),
+    ThreadManage(AuthorizedThread),
+    ThreadParticipants(AuthorizedThread),
+    Thread(AuthorizedThread),
+    Turn(AuthorizedTurn),
+    Artifact(AuthorizedArtifact),
+    Task(AuthorizedTask),
+    TaskBatch(Vec<AuthorizedTask>),
+}
+
+impl RequestAdmission {
+    fn own_session(&self) -> Option<&AuthorizedSession> {
+        match self {
+            Self::OwnSession(proof) => Some(proof),
+            Self::Superuser
+            | Self::WorkspaceCollection(_)
+            | Self::Workspace(_)
+            | Self::ThreadCreate(_)
+            | Self::ThreadOpen(_)
+            | Self::ThreadManage(_)
+            | Self::ThreadParticipants(_)
+            | Self::Thread(_)
+            | Self::Turn(_)
+            | Self::Artifact(_)
+            | Self::Task(_)
+            | Self::TaskBatch(_) => None,
+        }
+    }
+
+    fn workspace_collection(&self) -> Option<&AuthorizedWorkspaceCollection> {
+        match self {
+            Self::WorkspaceCollection(proof) => Some(proof),
+            Self::Superuser
+            | Self::OwnSession(_)
+            | Self::Workspace(_)
+            | Self::ThreadCreate(_)
+            | Self::ThreadOpen(_)
+            | Self::ThreadManage(_)
+            | Self::ThreadParticipants(_)
+            | Self::Thread(_)
+            | Self::Turn(_)
+            | Self::Artifact(_)
+            | Self::Task(_)
+            | Self::TaskBatch(_) => None,
+        }
+    }
+
+    fn workspace(&self) -> Option<&AuthorizedWorkspace> {
+        match self {
+            Self::Workspace(proof) => Some(proof),
+            Self::Superuser
+            | Self::OwnSession(_)
+            | Self::WorkspaceCollection(_)
+            | Self::ThreadCreate(_)
+            | Self::ThreadOpen(_)
+            | Self::ThreadManage(_)
+            | Self::ThreadParticipants(_)
+            | Self::Thread(_)
+            | Self::Turn(_)
+            | Self::Artifact(_)
+            | Self::Task(_)
+            | Self::TaskBatch(_) => None,
+        }
+    }
+
+    fn thread_create(&self) -> Option<&AuthorizedWorkspace> {
+        match self {
+            Self::ThreadCreate(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn thread_open(&self) -> Option<&AuthorizedThread> {
+        match self {
+            Self::ThreadOpen(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn thread_manage(&self) -> Option<&AuthorizedThread> {
+        match self {
+            Self::ThreadManage(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn thread_participants(&self) -> Option<&AuthorizedThread> {
+        match self {
+            Self::ThreadParticipants(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn thread(&self) -> Option<&AuthorizedThread> {
+        match self {
+            Self::Thread(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn turn(&self) -> Option<&AuthorizedTurn> {
+        match self {
+            Self::Turn(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn artifact(&self) -> Option<&AuthorizedArtifact> {
+        match self {
+            Self::Artifact(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn task(&self) -> Option<&AuthorizedTask> {
+        match self {
+            Self::Task(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn task_batch(&self) -> Option<&[AuthorizedTask]> {
+        match self {
+            Self::TaskBatch(proofs) => Some(proofs.as_slice()),
+            _ => None,
+        }
+    }
+}
 
 // Keep every RPC branch in its own erased future. A single async block around the
 // whole dispatch match makes its generated poll function reserve stack space for
@@ -58,19 +203,13 @@ impl MessageProcessor {
         connection: &'a crate::request_context::ConnectionContext,
         payload: &'a str,
     ) -> MessageFuture<'a, ()> {
-        let authorization_decision =
-            crate::request_context::authorize_principal(connection.principal());
         let request_value = match serde_json::from_str::<JsonValue>(payload) {
             Ok(value) => value,
             Err(_) => {
                 let canonical_method =
                     crate::request_context::CanonicalMethod::rpc("jsonrpc/parse");
-                let span = crate::request_context::request_span(
-                    connection,
-                    None,
-                    &canonical_method,
-                    authorization_decision,
-                );
+                let span =
+                    crate::request_context::request_span(connection, None, &canonical_method);
                 return instrument_message_future(
                     message_future(async move {
                         warn!(
@@ -98,32 +237,6 @@ impl MessageProcessor {
             .and_then(JsonValue::as_str)
             .map(crate::request_context::CanonicalMethod::rpc)
             .unwrap_or_else(|| crate::request_context::CanonicalMethod::rpc(""));
-        if !authorization_decision.is_allowed() {
-            let span = crate::request_context::request_span(
-                connection,
-                request_id.as_ref(),
-                &canonical_method,
-                authorization_decision,
-            );
-            return instrument_message_future(
-                message_future(async move {
-                    warn!(
-                        rejection_reason = "unsupported_principal",
-                        "authorization denied for JSON-RPC request"
-                    );
-                    self.send_error(
-                        connection.connection_id(),
-                        JsonRpcErrorResponse::new(
-                            request_id,
-                            INVALID_REQUEST_CODE,
-                            "authenticated principal kind is not supported",
-                        ),
-                    )
-                    .await;
-                }),
-                span,
-            );
-        }
         let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
             Ok(request) => request,
             Err(error) => {
@@ -131,7 +244,6 @@ impl MessageProcessor {
                     connection,
                     request_id.as_ref(),
                     &canonical_method,
-                    authorization_decision,
                 );
                 return instrument_message_future(
                     message_future(async move {
@@ -181,29 +293,1845 @@ impl MessageProcessor {
             );
         }
 
-        // turn/start already exposes its handler future directly, so keep its parsing path
-        // synchronous instead of adding an otherwise unnecessary dispatch wrapper.
-        let dispatched = if request.method == methods::TURN_START {
-            self.dispatch_turn_start(context, request)
-        } else if request.method == methods::SETTINGS_UPDATE {
-            self.dispatch_settings_update(context, request)
-        } else {
-            self.process_request_inner(context, request)
-        };
+        let dispatched = message_future(async move {
+            let admission = match self.authorize_normal_request(&context, &request).await {
+                Ok(admission) => admission,
+                Err(response) => {
+                    self.send_error(context.connection_id(), response).await;
+                    return;
+                }
+            };
+
+            // turn/start already exposes its handler future directly, so keep its parsing path
+            // separate from the large dispatch match after central admission.
+            let handler = if request.method == methods::TURN_START {
+                self.dispatch_turn_start(context, request, admission)
+            } else if request.method == methods::SETTINGS_UPDATE {
+                self.dispatch_settings_update(context, request)
+            } else {
+                self.process_request_inner(context, request, admission)
+            };
+            handler.await;
+        });
 
         instrument_message_future(dispatched, span)
+    }
+
+    async fn resolve_task_request_proof(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request_id: &RequestId,
+        entry: &MethodAuthorizationEntry,
+        action_gate: &crate::authorization::ActionGateDecision,
+        resolver: &AuthorizationResolver,
+        task_id: &str,
+        expected_workspace_id: Option<&str>,
+        expected_root_thread_id: Option<&str>,
+    ) -> Result<AuthorizedTask, JsonRpcErrorResponse> {
+        let resolution = resolver
+            .authorize_task(
+                context.principal(),
+                action_gate,
+                entry.action,
+                task_id.trim(),
+                expected_workspace_id.map(str::trim),
+                expected_root_thread_id.map(str::trim),
+            )
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    entry.action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request_id.clone())
+            })?;
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(proof)
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request_id.clone()))
+            }
+        }
+    }
+
+    async fn authorize_task_collection_workspace(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request_id: &RequestId,
+        entry: &MethodAuthorizationEntry,
+        action_gate: &crate::authorization::ActionGateDecision,
+        resolver: &AuthorizationResolver,
+        workspace_id: &str,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let resolution = resolver
+            .authorize_workspace(
+                context.principal(),
+                action_gate,
+                entry.action,
+                workspace_id.trim(),
+            )
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    entry.action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request_id.clone())
+            })?;
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Workspace(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request_id.clone()))
+            }
+        }
+    }
+
+    async fn authorize_member_task_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &MethodAuthorizationEntry,
+        action_gate: &crate::authorization::ActionGateDecision,
+        resolver: &AuthorizationResolver,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let invalid_params = || {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision(entry, &decision);
+            AuthorizationExternalError::Validation.response(request.id.clone())
+        };
+
+        if request.method == methods::TASK_CREATE {
+            let params = serde_json::from_value::<TaskCreateParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| invalid_params())?;
+            let initiating_thread_id = params.created_by_thread_id.as_deref().or_else(|| {
+                (params.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then_some(params.owner_id.as_deref())
+                    .flatten()
+            });
+            let Some(initiating_thread_id) = initiating_thread_id else {
+                return Err(invalid_params());
+            };
+            let resolution = resolver
+                .authorize_thread(
+                    context.principal(),
+                    action_gate,
+                    entry.action,
+                    initiating_thread_id.trim(),
+                    Some(params.workspace_id.trim()),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    if let Some(parent_task_id) = params.parent_task_id.as_deref() {
+                        self.resolve_task_request_proof(
+                            context,
+                            &request.id,
+                            entry,
+                            action_gate,
+                            resolver,
+                            parent_task_id,
+                            Some(params.workspace_id.as_str()),
+                            Some(proof.thread_id()),
+                        )
+                        .await?;
+                    }
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Thread(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+
+        if request.method == methods::TASK_WAIT {
+            let params = serde_json::from_value::<TaskWaitParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| invalid_params())?;
+            if params.task_ids.is_empty() && params.run_ids.is_empty() {
+                return Err(invalid_params());
+            }
+            let mut task_ids = params.task_ids;
+            for run_id in params.run_ids {
+                let Some(run) =
+                    self.crud_store
+                        .get_task_run(run_id.trim())
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?
+                else {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        disclosure: entry.disclosure,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::NotFound.response(request.id.clone()));
+                };
+                task_ids.push(run.task_id);
+            }
+            task_ids.sort();
+            task_ids.dedup();
+            let mut proofs = Vec::with_capacity(task_ids.len());
+            for task_id in task_ids {
+                proofs.push(
+                    self.resolve_task_request_proof(
+                        context,
+                        &request.id,
+                        entry,
+                        action_gate,
+                        resolver,
+                        task_id.as_str(),
+                        None,
+                        None,
+                    )
+                    .await?,
+                );
+            }
+            return Ok(RequestAdmission::TaskBatch(proofs));
+        }
+
+        if request.method == methods::TASK_LIST {
+            let params = serde_json::from_value::<TaskListParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| invalid_params())?;
+            if let Some(task_id) = params
+                .parent_task_id
+                .as_deref()
+                .or(params.root_task_id.as_deref())
+            {
+                return self
+                    .resolve_task_request_proof(
+                        context,
+                        &request.id,
+                        entry,
+                        action_gate,
+                        resolver,
+                        task_id,
+                        Some(params.workspace_id.as_str()),
+                        None,
+                    )
+                    .await
+                    .map(RequestAdmission::Task);
+            }
+            return self
+                .authorize_task_collection_workspace(
+                    context,
+                    &request.id,
+                    entry,
+                    action_gate,
+                    resolver,
+                    params.workspace_id.as_str(),
+                )
+                .await;
+        }
+
+        if request.method == methods::TASK_AGENDA {
+            let params = serde_json::from_value::<TaskAgendaParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| invalid_params())?;
+            return self
+                .authorize_task_collection_workspace(
+                    context,
+                    &request.id,
+                    entry,
+                    action_gate,
+                    resolver,
+                    params.workspace_id.as_str(),
+                )
+                .await;
+        }
+
+        if request.method == methods::TASK_DELIVERIES {
+            let params = serde_json::from_value::<TaskDeliveriesParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| invalid_params())?;
+            let task_id = match (params.task_id.as_deref(), params.run_id.as_deref()) {
+                (Some(task_id), _) => Some(task_id.to_owned()),
+                (None, Some(run_id)) => {
+                    let run = self
+                        .crud_store
+                        .get_task_run(run_id.trim())
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?;
+                    let Some(run) = run else {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::MissingAuthoritativeResource,
+                            disclosure: entry.disclosure,
+                        };
+                        record_method_decision(entry, &decision);
+                        return Err(
+                            AuthorizationExternalError::NotFound.response(request.id.clone())
+                        );
+                    };
+                    Some(run.task_id)
+                }
+                (None, None) => None,
+            };
+            if let Some(task_id) = task_id {
+                return self
+                    .resolve_task_request_proof(
+                        context,
+                        &request.id,
+                        entry,
+                        action_gate,
+                        resolver,
+                        task_id.as_str(),
+                        Some(params.workspace_id.as_str()),
+                        None,
+                    )
+                    .await
+                    .map(RequestAdmission::Task);
+            }
+            return self
+                .authorize_task_collection_workspace(
+                    context,
+                    &request.id,
+                    entry,
+                    action_gate,
+                    resolver,
+                    params.workspace_id.as_str(),
+                )
+                .await;
+        }
+
+        let params = request.params.as_ref().and_then(JsonValue::as_object);
+        let task_id = params
+            .and_then(|params| params.get("task_id").or_else(|| params.get("taskId")))
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(invalid_params)?;
+        self.resolve_task_request_proof(
+            context,
+            &request.id,
+            entry,
+            action_gate,
+            resolver,
+            task_id,
+            None,
+            None,
+        )
+        .await
+        .map(RequestAdmission::Task)
+    }
+
+    async fn authorize_normal_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let entry = match normal_method_entry(request.method.as_str()) {
+            Ok(entry) => entry,
+            Err(RegistryLookupError::Unmapped) => {
+                return Err(JsonRpcErrorResponse::new(
+                    Some(request.id.clone()),
+                    METHOD_NOT_FOUND_CODE,
+                    "method not found",
+                ));
+            }
+            Err(RegistryLookupError::InvalidDefinition) => {
+                record_authorization_unavailable("unmapped", "unmapped", "authorization_registry");
+                return Err(AuthorizationExternalError::Unavailable.response(request.id.clone()));
+            }
+        };
+        let service = AuthorizationService::new();
+        if request.method == methods::THREAD_START {
+            return self
+                .authorize_thread_start_request(context, request, entry, &service)
+                .await;
+        }
+        let action_gate =
+            service.authorize_action(context.principal().kind, context.role_key(), entry.action);
+
+        if let crate::authorization::ActionGateDecision::Deny { reason, disclosure } = &action_gate
+        {
+            let decision = AuthorizationDecision::Deny {
+                reason: *reason,
+                disclosure: *disclosure,
+            };
+            record_method_decision(entry, &decision);
+            return Err(external_error_for_decision(&decision)
+                .expect("denied action gate has external mapping")
+                .response(request.id.clone()));
+        }
+
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        if !action_gate.is_final_allow()
+            && (entry.resolver == ResourceResolverKind::Task
+                || request.method == methods::TASK_CREATE)
+        {
+            return self
+                .authorize_member_task_request(context, request, entry, &action_gate, &resolver)
+                .await;
+        }
+        if matches!(
+            request.method.as_str(),
+            methods::ARTIFACT_UPLOAD_START
+                | methods::ARTIFACT_UPLOAD_FINISH
+                | methods::ARTIFACT_UPLOAD_ABORT
+                | methods::ARTIFACT_DOWNLOAD_START
+                | methods::ARTIFACT_DOWNLOAD_CHUNK
+                | methods::ARTIFACT_DOWNLOAD_FINISH
+                | methods::ARTIFACT_DOWNLOAD_ABORT
+        ) {
+            return self
+                .authorize_artifact_transfer_request(
+                    context,
+                    request,
+                    entry,
+                    &action_gate,
+                    &resolver,
+                )
+                .await;
+        }
+        if entry.resolver == ResourceResolverKind::Workspace
+            && !action_gate.is_final_allow()
+            && matches!(
+                request.method.as_str(),
+                methods::MEMORY_SEARCH
+                    | methods::MEMORY_GET
+                    | methods::MEMORY_LIST
+                    | methods::MEMORY_REMEMBER
+                    | methods::MEMORY_FORGET
+                    | methods::MEMORY_CANDIDATES_LIST
+                    | methods::MEMORY_CANDIDATES_GET
+                    | methods::MEMORY_CANDIDATES_DECIDE
+                    | methods::MEMORY_CANDIDATES_APPROVE
+                    | methods::MEMORY_CANDIDATES_REJECT
+                    | methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE
+                    | methods::MEMORY_CANDIDATES_MERGE
+                    | methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR
+            )
+        {
+            let Some(workspace_id) = self
+                .session_manager
+                .connection_workspace_id(context.connection_id())
+                .await
+            else {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    disclosure: entry.disclosure,
+                };
+                record_method_decision(entry, &decision);
+                return Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request.id.clone()));
+            };
+            let resolution = resolver
+                .authorize_workspace(
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                    workspace_id.as_str(),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Workspace(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if entry.resolver == ResourceResolverKind::Capability
+            && entry.action == ResourceAction::ProviderUse
+        {
+            let params = request.params.as_ref().and_then(JsonValue::as_object);
+            let workspace_id = match request.method.as_str() {
+                methods::VOICE_SESSION_START => params
+                    .and_then(|params| params.get("context"))
+                    .and_then(JsonValue::as_object)
+                    .and_then(|context| {
+                        context
+                            .get("workspace_id")
+                            .or_else(|| context.get("workspaceId"))
+                    })
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
+                methods::VOICE_SESSION_FINALIZE | methods::VOICE_SESSION_CANCEL => {
+                    let session_id = params
+                        .and_then(|params| {
+                            params.get("session_id").or_else(|| params.get("sessionId"))
+                        })
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    session_id.and_then(|session_id| {
+                        let owner = AuthenticatedTransferOwner::from_request_context(context);
+                        self.voice_sessions
+                            .lookup_authenticated_session(session_id, &owner)
+                            .ok()
+                            .map(|session| session.workspace_id)
+                    })
+                }
+                _ => params
+                    .and_then(|params| {
+                        params
+                            .get("workspace_id")
+                            .or_else(|| params.get("workspaceId"))
+                    })
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
+            };
+            let workspace_id = workspace_id.or_else(|| {
+                let owner = AuthenticatedTransferOwner::from_request_context(context);
+                self.voice_sessions
+                    .active_session_for_owner(&owner)
+                    .map(|session| session.workspace_id)
+            });
+            let workspace_id = match workspace_id {
+                Some(workspace_id) => Some(workspace_id),
+                None => {
+                    self.session_manager
+                        .connection_workspace_id(context.connection_id())
+                        .await
+                }
+            };
+            let Some(workspace_id) = workspace_id else {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    disclosure: entry.disclosure,
+                };
+                record_method_decision(entry, &decision);
+                return Err(AuthorizationExternalError::NotFound.response(request.id.clone()));
+            };
+            let resolution = resolver
+                .authorize_workspace(
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                    workspace_id.trim(),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Workspace(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        match entry.resolver {
+            ResourceResolverKind::WorkspaceCollection => {
+                let resolution = resolver.authorize_workspace_collection(
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                );
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::WorkspaceCollection(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Workspace if request.method == methods::WORKSPACE_SELECT => {
+                let params = serde_json::from_value::<WorkspaceSelectParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::Validation.response(request.id.clone())
+                })?;
+                let resolution = resolver
+                    .authorize_workspace(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        params.workspace_id.as_str(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Workspace(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Workspace if request.method == methods::THREAD_TREE => {
+                let params = serde_json::from_value::<ThreadTreeParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::Validation.response(request.id.clone())
+                })?;
+                let resolution = resolver
+                    .authorize_workspace(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        params.workspace_id.trim(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Workspace(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Workspace
+                if matches!(
+                    request.method.as_str(),
+                    methods::ARTIFACT_CAPABILITIES | methods::ARTIFACT_LIST | methods::SKILLS_LIST
+                ) =>
+            {
+                let workspace_id = if request.method == methods::ARTIFACT_CAPABILITIES {
+                    serde_json::from_value::<ArtifactCapabilitiesParams>(
+                        request.params.clone().unwrap_or_else(empty_object_value),
+                    )
+                    .map_err(|_| {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::ResourceScopeMismatch,
+                            disclosure: DisclosurePolicy::Validation,
+                        };
+                        record_method_decision(entry, &decision);
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .workspace_id
+                } else if request.method == methods::SKILLS_LIST {
+                    serde_json::from_value::<SkillListParams>(
+                        request.params.clone().unwrap_or_else(empty_object_value),
+                    )
+                    .map_err(|_| {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::ResourceScopeMismatch,
+                            disclosure: DisclosurePolicy::Validation,
+                        };
+                        record_method_decision(entry, &decision);
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .workspace_id
+                } else {
+                    serde_json::from_value::<ArtifactListParams>(
+                        request.params.clone().unwrap_or_else(empty_object_value),
+                    )
+                    .map_err(|_| {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::ResourceScopeMismatch,
+                            disclosure: DisclosurePolicy::Validation,
+                        };
+                        record_method_decision(entry, &decision);
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .workspace_id
+                };
+                let resolution = resolver
+                    .authorize_workspace(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        workspace_id.trim(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Workspace(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Thread if request.method == methods::THREAD_UPDATE => {
+                let params = serde_json::from_value::<ThreadUpdateParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::Validation.response(request.id.clone())
+                })?;
+                let resolution = resolver
+                    .authorize_thread(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        params.thread_id.trim(),
+                        Some(params.workspace_id.trim()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::ThreadManage(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Thread
+                if matches!(
+                    request.method.as_str(),
+                    methods::THREAD_PARTICIPANTS_LIST
+                        | methods::THREAD_PARTICIPANTS_ADD
+                        | methods::THREAD_PARTICIPANTS_REMOVE
+                ) =>
+            {
+                let params = request.params.as_ref().and_then(JsonValue::as_object);
+                let workspace_id = params
+                    .and_then(|params| params.get("workspace_id"))
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let thread_id = params
+                    .and_then(|params| params.get("thread_id"))
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let (Some(workspace_id), Some(thread_id)) = (workspace_id, thread_id) else {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+                };
+                let resolution = resolver
+                    .authorize_thread(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        thread_id.trim(),
+                        Some(workspace_id.trim()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::ThreadParticipants(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Thread
+                if matches!(
+                    request.method.as_str(),
+                    methods::CLI_RUNTIME_THREAD_BINDING_GET
+                        | methods::CLI_RUNTIME_THREAD_FORK
+                        | methods::CLI_RUNTIME_THREAD_COMPACT
+                        | methods::CLI_RUNTIME_REVIEW_START
+                ) =>
+            {
+                let params = request.params.clone().unwrap_or_else(empty_object_value);
+                let scope = match request.method.as_str() {
+                    methods::CLI_RUNTIME_THREAD_BINDING_GET => {
+                        serde_json::from_value::<CLIRuntimeThreadBindingGetParams>(params)
+                            .map(|params| (params.workspace_id, params.thread_id))
+                    }
+                    methods::CLI_RUNTIME_THREAD_FORK => {
+                        serde_json::from_value::<CLIRuntimeThreadForkParams>(params)
+                            .map(|params| (params.workspace_id, params.source_thread_id))
+                    }
+                    methods::CLI_RUNTIME_THREAD_COMPACT => {
+                        serde_json::from_value::<CLIRuntimeThreadCompactParams>(params)
+                            .map(|params| (params.workspace_id, params.thread_id))
+                    }
+                    methods::CLI_RUNTIME_REVIEW_START => {
+                        serde_json::from_value::<CLIRuntimeReviewStartParams>(params)
+                            .map(|params| (params.workspace_id, params.thread_id))
+                    }
+                    _ => unreachable!("guard restricts CLI runtime thread methods"),
+                }
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::Validation.response(request.id.clone())
+                })?;
+                let (workspace_id, thread_id) = scope;
+                if workspace_id.trim().is_empty() || thread_id.trim().is_empty() {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+                }
+                let resolution = resolver
+                    .authorize_thread(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        thread_id.trim(),
+                        Some(workspace_id.trim()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Thread(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::NotFound)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Thread
+                if matches!(
+                    request.method.as_str(),
+                    methods::THREAD_GET
+                        | methods::THREAD_TIMELINE_PAGE
+                        | methods::THREAD_UNSUBSCRIBE
+                        | methods::TURN_START
+                        | methods::ARTIFACT_LIST_FOR_THREAD
+                        | methods::ARTIFACT_LIST_FOR_MESSAGE
+                        | methods::THREAD_AGENTS_DOC_GET
+                        | methods::THREAD_AGENTS_DOC_SAVE
+                        | methods::THREAD_AGENTS_DOC_ARCHIVE
+                        | methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
+                ) =>
+            {
+                let params = request.params.as_ref().and_then(JsonValue::as_object);
+                let thread_id = params
+                    .and_then(|params| params.get("thread_id").or_else(|| params.get("threadId")))
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let Some(thread_id) = thread_id else {
+                    if action_gate.is_final_allow()
+                        && matches!(
+                            request.method.as_str(),
+                            methods::THREAD_AGENTS_DOC_GET
+                                | methods::THREAD_AGENTS_DOC_SAVE
+                                | methods::THREAD_AGENTS_DOC_ARCHIVE
+                        )
+                    {
+                        let decision = AuthorizationDecision::AllowSuperuser;
+                        record_method_decision(entry, &decision);
+                        return Ok(RequestAdmission::Superuser);
+                    }
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+                };
+                let expected_workspace_id = params
+                    .and_then(|params| {
+                        params
+                            .get("workspace_id")
+                            .or_else(|| params.get("workspaceId"))
+                    })
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let mut resolution = resolver
+                    .authorize_thread(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        thread_id.trim(),
+                        expected_workspace_id.map(str::trim),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                if resolution.denial().is_some()
+                    && matches!(
+                        request.method.as_str(),
+                        methods::THREAD_AGENTS_DOC_GET
+                            | methods::THREAD_AGENTS_DOC_SAVE
+                            | methods::THREAD_AGENTS_DOC_ARCHIVE
+                            | methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
+                    )
+                    && let Some(workspace_id) = expected_workspace_id
+                {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            context.principal(),
+                            &action_gate,
+                            entry.action,
+                            thread_id.trim(),
+                            workspace_id.trim(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?;
+                }
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Thread(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Turn => {
+                let params = request.params.as_ref().and_then(JsonValue::as_object);
+                let derives_scope_from_pending = matches!(
+                    request.method.as_str(),
+                    methods::TURN_PERMISSION_REQUEST_RESPOND | methods::CLI_RUNTIME_REQUEST_RESPOND
+                );
+                let pending_scope = if request.method == methods::TURN_PERMISSION_REQUEST_RESPOND {
+                    let request_id = params
+                        .and_then(|params| {
+                            params.get("request_id").or_else(|| params.get("requestId"))
+                        })
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let Some(request_id) = request_id else {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::ResourceScopeMismatch,
+                            disclosure: DisclosurePolicy::Validation,
+                        };
+                        record_method_decision(entry, &decision);
+                        return Err(
+                            AuthorizationExternalError::Validation.response(request.id.clone())
+                        );
+                    };
+                    self.native_permission_pending_requests
+                        .lock()
+                        .await
+                        .get(request_id.trim())
+                        .map(|pending| {
+                            (
+                                pending.workspace_id.clone(),
+                                pending.thread_id.clone(),
+                                pending.turn_id.clone(),
+                            )
+                        })
+                } else if request.method == methods::CLI_RUNTIME_REQUEST_RESPOND {
+                    let request_id = params
+                        .and_then(|params| {
+                            params.get("request_id").or_else(|| params.get("requestId"))
+                        })
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let requested_workspace_id = params
+                        .and_then(|params| {
+                            params
+                                .get("workspace_id")
+                                .or_else(|| params.get("workspaceId"))
+                        })
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let requested_runtime_id = params
+                        .and_then(|params| {
+                            params.get("runtime_id").or_else(|| params.get("runtimeId"))
+                        })
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let (
+                        Some(request_id),
+                        Some(requested_workspace_id),
+                        Some(requested_runtime_id),
+                    ) = (request_id, requested_workspace_id, requested_runtime_id)
+                    else {
+                        let decision = AuthorizationDecision::Deny {
+                            reason: DenyReason::ResourceScopeMismatch,
+                            disclosure: DisclosurePolicy::Validation,
+                        };
+                        record_method_decision(entry, &decision);
+                        return Err(
+                            AuthorizationExternalError::Validation.response(request.id.clone())
+                        );
+                    };
+                    self.crud_store
+                        .get_cli_runtime_pending_request(request_id.trim())
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?
+                        .filter(|pending| {
+                            pending.workspace_id == requested_workspace_id.trim()
+                                && pending.runtime_id == requested_runtime_id.trim()
+                        })
+                        .and_then(|pending| {
+                            pending
+                                .turn_id
+                                .map(|turn_id| (pending.workspace_id, pending.thread_id, turn_id))
+                        })
+                } else {
+                    None
+                };
+                let turn_id = pending_scope
+                    .as_ref()
+                    .map(|(_, _, turn_id)| turn_id.as_str())
+                    .or_else(|| {
+                        params
+                            .and_then(|params| {
+                                params.get("turn_id").or_else(|| params.get("turnId"))
+                            })
+                            .and_then(JsonValue::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                let thread_id = pending_scope
+                    .as_ref()
+                    .map(|(_, thread_id, _)| thread_id.as_str())
+                    .or_else(|| {
+                        params
+                            .and_then(|params| {
+                                params.get("thread_id").or_else(|| params.get("threadId"))
+                            })
+                            .and_then(JsonValue::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                let workspace_id = pending_scope
+                    .as_ref()
+                    .map(|(workspace_id, _, _)| workspace_id.as_str())
+                    .or_else(|| {
+                        params
+                            .and_then(|params| {
+                                params
+                                    .get("workspace_id")
+                                    .or_else(|| params.get("workspaceId"))
+                            })
+                            .and_then(JsonValue::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                let requires_explicit_thread = request.method != methods::ARTIFACT_LIST_FOR_TURN;
+                let Some(turn_id) = turn_id else {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: if derives_scope_from_pending {
+                            DenyReason::MissingAuthoritativeResource
+                        } else {
+                            DenyReason::ResourceScopeMismatch
+                        },
+                        disclosure: if derives_scope_from_pending {
+                            entry.disclosure
+                        } else {
+                            DisclosurePolicy::Validation
+                        },
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(external_error_for_decision(&decision)
+                        .unwrap_or(if derives_scope_from_pending {
+                            AuthorizationExternalError::NotFound
+                        } else {
+                            AuthorizationExternalError::Validation
+                        })
+                        .response(request.id.clone()));
+                };
+                if requires_explicit_thread && thread_id.is_none() {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+                }
+                let resolution = resolver
+                    .authorize_turn(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        turn_id.trim(),
+                        workspace_id.map(str::trim),
+                        thread_id.map(str::trim),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Turn(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::Artifact
+                if matches!(
+                    request.method.as_str(),
+                    methods::ARTIFACT_GET
+                        | methods::ARTIFACT_READ
+                        | methods::ARTIFACT_DELETE
+                        | methods::ARTIFACT_RESTORE
+                        | methods::ARTIFACT_BIND
+                ) =>
+            {
+                let params = request.params.as_ref().and_then(JsonValue::as_object);
+                let artifact_id = params
+                    .and_then(|params| {
+                        params
+                            .get("artifact_id")
+                            .or_else(|| params.get("artifactId"))
+                    })
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let workspace_id = params
+                    .and_then(|params| {
+                        params
+                            .get("workspace_id")
+                            .or_else(|| params.get("workspaceId"))
+                    })
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let thread_id = params
+                    .and_then(|params| params.get("thread_id").or_else(|| params.get("threadId")))
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let (Some(artifact_id), Some(workspace_id)) = (artifact_id, workspace_id) else {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+                };
+                let resolution = resolver
+                    .authorize_artifact(
+                        context.principal(),
+                        &action_gate,
+                        entry.action,
+                        artifact_id.trim(),
+                        Some(workspace_id.trim()),
+                        thread_id.map(str::trim),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                return match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision(entry, proof.decision());
+                        Ok(RequestAdmission::Artifact(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision(entry, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                };
+            }
+            ResourceResolverKind::OwnSession => {}
+            _ if action_gate.is_final_allow() => {
+                let decision = AuthorizationDecision::AllowSuperuser;
+                record_method_decision(entry, &decision);
+                return Ok(RequestAdmission::Superuser);
+            }
+            _ => {
+                // Resource families are admitted for Members only after their exact
+                // resolver/proof is connected by the owning Epic 4 phase.
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    disclosure: entry.disclosure,
+                };
+                record_method_decision(entry, &decision);
+                return Err(external_error_for_decision(&decision)
+                    .expect("resource denial has external mapping")
+                    .response(request.id.clone()));
+            }
+        }
+
+        let session_id = if request.method == methods::AUTH_SESSION_REVOKE {
+            let params = serde_json::from_value::<AuthSessionRevokeParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::ResourceScopeMismatch,
+                    disclosure: DisclosurePolicy::Validation,
+                };
+                record_method_decision(entry, &decision);
+                AuthorizationExternalError::Validation.response(request.id.clone())
+            })?;
+            params.session_id
+        } else {
+            context.principal().session_id.clone()
+        };
+
+        let resolution = resolver
+            .authorize_session(context.principal(), &action_gate, entry.action, &session_id)
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    entry.action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request.id.clone())
+            })?;
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::OwnSession(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::Forbidden)
+                    .response(request.id.clone()))
+            }
+        }
+    }
+
+    async fn authorize_artifact_transfer_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        action_gate: &crate::authorization::ActionGateDecision,
+        resolver: &AuthorizationResolver,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let validation = || {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision(entry, &decision);
+            AuthorizationExternalError::Validation.response(request.id.clone())
+        };
+        let unavailable = || {
+            record_authorization_unavailable(
+                entry.action.safe_name(),
+                entry.resolver.safe_name(),
+                entry.audit.safe_name(),
+            );
+            AuthorizationExternalError::Unavailable.response(request.id.clone())
+        };
+        let owner = AuthenticatedTransferOwner::from_request_context(context);
+
+        let resolution = if request.method == methods::ARTIFACT_UPLOAD_START {
+            let params = serde_json::from_value::<ArtifactUploadStartParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| validation())?;
+            if params.workspace_id.trim().is_empty() {
+                return Err(validation());
+            }
+            if let Some(turn_id) = params
+                .planned_turn_id
+                .as_deref()
+                .filter(|turn_id| !turn_id.trim().is_empty())
+            {
+                let Some(thread_id) = params
+                    .thread_id
+                    .as_deref()
+                    .filter(|thread_id| !thread_id.trim().is_empty())
+                else {
+                    return Err(validation());
+                };
+                let turn_action = ResourceAction::ThreadWrite;
+                let turn_gate = AuthorizationService::new().authorize_action(
+                    context.principal().kind,
+                    context.role_key(),
+                    turn_action,
+                );
+                return self.finish_turn_transfer_resolution(
+                    resolver
+                        .authorize_turn(
+                            context.principal(),
+                            &turn_gate,
+                            turn_action,
+                            turn_id.trim(),
+                            Some(params.workspace_id.trim()),
+                            Some(thread_id.trim()),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    entry,
+                    request.id.clone(),
+                );
+            }
+            if let Some(thread_id) = params
+                .thread_id
+                .as_deref()
+                .filter(|thread_id| !thread_id.trim().is_empty())
+            {
+                return self.finish_thread_transfer_resolution(
+                    resolver
+                        .authorize_thread(
+                            context.principal(),
+                            action_gate,
+                            entry.action,
+                            thread_id.trim(),
+                            Some(params.workspace_id.trim()),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    entry,
+                    request.id.clone(),
+                );
+            }
+            let resolution = resolver
+                .authorize_workspace(
+                    context.principal(),
+                    action_gate,
+                    entry.action,
+                    params.workspace_id.trim(),
+                )
+                .await
+                .map_err(|_| unavailable())?;
+            return self.finish_workspace_transfer_resolution(
+                resolution,
+                entry,
+                request.id.clone(),
+            );
+        } else if matches!(
+            request.method.as_str(),
+            methods::ARTIFACT_UPLOAD_FINISH | methods::ARTIFACT_UPLOAD_ABORT
+        ) {
+            let params = request.params.as_ref().and_then(JsonValue::as_object);
+            let workspace_id = params
+                .and_then(|value| {
+                    value
+                        .get("workspace_id")
+                        .or_else(|| value.get("workspaceId"))
+                })
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(validation)?;
+            let upload_id = params
+                .and_then(|value| value.get("upload_id").or_else(|| value.get("uploadId")))
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(validation)?;
+            let session = self
+                .artifact_uploads
+                .lookup_for_owner(
+                    &owner,
+                    workspace_id.trim(),
+                    upload_id.trim(),
+                    now_timestamp_secs(),
+                )
+                .await
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        disclosure: entry.disclosure,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::NotFound.response(request.id.clone())
+                })?;
+            if let (Some(thread_id), Some(turn_id)) = (
+                session.thread_id.as_deref(),
+                session.planned_turn_id.as_deref(),
+            ) {
+                let turn_action = ResourceAction::ThreadWrite;
+                let turn_gate = AuthorizationService::new().authorize_action(
+                    context.principal().kind,
+                    context.role_key(),
+                    turn_action,
+                );
+                return self.finish_turn_transfer_resolution(
+                    resolver
+                        .authorize_turn(
+                            context.principal(),
+                            &turn_gate,
+                            turn_action,
+                            turn_id,
+                            Some(session.workspace_id.as_str()),
+                            Some(thread_id),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    entry,
+                    request.id.clone(),
+                );
+            }
+            if let Some(thread_id) = session.thread_id.as_deref() {
+                return self.finish_thread_transfer_resolution(
+                    resolver
+                        .authorize_thread(
+                            context.principal(),
+                            action_gate,
+                            entry.action,
+                            thread_id,
+                            Some(session.workspace_id.as_str()),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    entry,
+                    request.id.clone(),
+                );
+            }
+            let resolution = resolver
+                .authorize_workspace(
+                    context.principal(),
+                    action_gate,
+                    entry.action,
+                    session.workspace_id.as_str(),
+                )
+                .await
+                .map_err(|_| unavailable())?;
+            return self.finish_workspace_transfer_resolution(
+                resolution,
+                entry,
+                request.id.clone(),
+            );
+        } else if request.method == methods::ARTIFACT_DOWNLOAD_START {
+            let params = serde_json::from_value::<ArtifactDownloadStartParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| validation())?;
+            resolver
+                .authorize_artifact(
+                    context.principal(),
+                    action_gate,
+                    entry.action,
+                    params.artifact_id.trim(),
+                    Some(params.workspace_id.trim()),
+                    None,
+                )
+                .await
+                .map_err(|_| unavailable())?
+        } else {
+            let params = request.params.as_ref().and_then(JsonValue::as_object);
+            let workspace_id = params
+                .and_then(|value| {
+                    value
+                        .get("workspace_id")
+                        .or_else(|| value.get("workspaceId"))
+                })
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(validation)?;
+            let download_id = params
+                .and_then(|value| value.get("download_id").or_else(|| value.get("downloadId")))
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(validation)?;
+            let session = self
+                .artifact_downloads
+                .get(
+                    &owner,
+                    workspace_id.trim(),
+                    download_id.trim(),
+                    now_timestamp_secs(),
+                )
+                .await
+                .map_err(|_| {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        disclosure: entry.disclosure,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::NotFound.response(request.id.clone())
+                })?;
+            resolver
+                .authorize_artifact(
+                    context.principal(),
+                    action_gate,
+                    entry.action,
+                    session.artifact_id.as_str(),
+                    Some(session.workspace_id.as_str()),
+                    None,
+                )
+                .await
+                .map_err(|_| unavailable())?
+        };
+
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Artifact(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request.id.clone()))
+            }
+        }
+    }
+
+    fn finish_thread_transfer_resolution(
+        &self,
+        resolution: ProofResolution<AuthorizedThread>,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        request_id: RequestId,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Thread(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request_id))
+            }
+        }
+    }
+
+    fn finish_workspace_transfer_resolution(
+        &self,
+        resolution: ProofResolution<AuthorizedWorkspace>,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        request_id: RequestId,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Workspace(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request_id))
+            }
+        }
+    }
+
+    fn finish_turn_transfer_resolution(
+        &self,
+        resolution: ProofResolution<AuthorizedTurn>,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        request_id: RequestId,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Turn(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request_id))
+            }
+        }
+    }
+
+    async fn authorize_thread_start_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        service: &AuthorizationService,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let params = serde_json::from_value::<ThreadStartParams>(
+            request.params.clone().unwrap_or_else(empty_object_value),
+        )
+        .map_err(|error| {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision_for_action(entry, ResourceAction::ThreadCreate, &decision);
+            JsonRpcErrorResponse::new(
+                Some(request.id.clone()),
+                INVALID_PARAMS_CODE,
+                format!("invalid params for `{}`: {error}", methods::THREAD_START),
+            )
+        })?;
+        if params.thread_id.trim().is_empty() || params.workspace_id.trim().is_empty() {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision_for_action(entry, ResourceAction::ThreadCreate, &decision);
+            return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+        }
+
+        let scope = pioneer_crud::resolve_thread_start_authorization_scope(
+            &self.crud_store.database_connection(),
+            params.thread_id.trim(),
+            params.workspace_id.trim(),
+        )
+        .await
+        .map_err(|_| {
+            record_authorization_unavailable(
+                ResourceAction::ThreadCreate.safe_name(),
+                entry.resolver.safe_name(),
+                entry.audit.safe_name(),
+            );
+            AuthorizationExternalError::Unavailable.response(request.id.clone())
+        })?;
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+
+        match scope {
+            pioneer_crud::ThreadStartAuthorizationScope::Missing => {
+                let action = ResourceAction::ThreadCreate;
+                let gate =
+                    service.authorize_action(context.principal().kind, context.role_key(), action);
+                let resolution = resolver
+                    .authorize_workspace(
+                        context.principal(),
+                        &gate,
+                        action,
+                        params.workspace_id.trim(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision_for_action(entry, action, proof.decision());
+                        Ok(RequestAdmission::ThreadCreate(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision_for_action(entry, action, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                }
+            }
+            pioneer_crud::ThreadStartAuthorizationScope::Existing => {
+                let action = ResourceAction::ThreadRead;
+                let gate =
+                    service.authorize_action(context.principal().kind, context.role_key(), action);
+                let resolution = resolver
+                    .authorize_thread(
+                        context.principal(),
+                        &gate,
+                        action,
+                        params.thread_id.trim(),
+                        Some(params.workspace_id.trim()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            action.safe_name(),
+                            entry.resolver.safe_name(),
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+                match resolution {
+                    ProofResolution::Authorized(proof) => {
+                        record_method_decision_for_action(entry, action, proof.decision());
+                        Ok(RequestAdmission::ThreadOpen(proof))
+                    }
+                    ProofResolution::Denied(decision) => {
+                        record_method_decision_for_action(entry, action, &decision);
+                        Err(external_error_for_decision(&decision)
+                            .unwrap_or(AuthorizationExternalError::Forbidden)
+                            .response(request.id.clone()))
+                    }
+                }
+            }
+            pioneer_crud::ThreadStartAuthorizationScope::ParentMismatch => {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::ResourceScopeMismatch,
+                    disclosure: DisclosurePolicy::NotFound,
+                };
+                record_method_decision_for_action(entry, ResourceAction::ThreadRead, &decision);
+                Err(AuthorizationExternalError::NotFound.response(request.id.clone()))
+            }
+        }
     }
 
     fn dispatch_turn_start<'a>(
         &'a self,
         context: crate::request_context::RequestContext,
         request: JsonRpcRequest,
+        admission: RequestAdmission,
     ) -> MessageFuture<'a, ()> {
         let connection_id = context.connection_id();
         let params_value = request.params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<TurnStartParams>(params_value) {
             Ok(params) => message_future(async move {
-                self.turn_start(&context, request.id, params).await;
+                let proof = admission
+                    .thread()
+                    .expect("central admission supplies thread proof for turn/start");
+                debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                self.turn_start(&context, proof, request.id, params).await;
             }),
             Err(error) => message_future(async move {
                 self.send_error(
@@ -295,6 +2223,7 @@ impl MessageProcessor {
         &'a self,
         context: crate::request_context::RequestContext,
         request: JsonRpcRequest,
+        admission: RequestAdmission,
     ) -> MessageFuture<'a, ()> {
         let connection_id = context.connection_id();
         let method = request.method.clone();
@@ -314,7 +2243,14 @@ impl MessageProcessor {
                         )
                         .await;
                     } else {
-                        self.auth_me(&context, request.id).await;
+                        self.auth_me(
+                            &context,
+                            admission
+                                .own_session()
+                                .expect("central admission supplies own-session proof"),
+                            request.id,
+                        )
+                        .await;
                     }
                 }
                 methods::AUTH_SESSION_LIST => {
@@ -331,14 +2267,29 @@ impl MessageProcessor {
                         )
                         .await;
                     } else {
-                        self.auth_session_list(&context, request.id).await;
+                        self.auth_session_list(
+                            &context,
+                            admission
+                                .own_session()
+                                .expect("central admission supplies own-session proof"),
+                            request.id,
+                        )
+                        .await;
                     }
                 }
                 methods::AUTH_SESSION_REVOKE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<AuthSessionRevokeParams>(params_value) {
                         Ok(params) => {
-                            self.auth_session_revoke(&context, request.id, params).await;
+                            self.auth_session_revoke(
+                                &context,
+                                admission
+                                    .own_session()
+                                    .expect("central admission supplies own-session proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -370,7 +2321,14 @@ impl MessageProcessor {
                         )
                         .await;
                     } else {
-                        self.auth_logout(&context, request.id).await;
+                        self.auth_logout(
+                            &context,
+                            admission
+                                .own_session()
+                                .expect("central admission supplies own-session proof"),
+                            request.id,
+                        )
+                        .await;
                     }
                 }
                 methods::AUTH_DEVICE_CREATE => {
@@ -387,14 +2345,29 @@ impl MessageProcessor {
                         )
                         .await;
                     } else {
-                        self.auth_device_create(&context, request.id).await;
+                        self.auth_device_create(
+                            &context,
+                            admission
+                                .own_session()
+                                .expect("central admission supplies own-session proof"),
+                            request.id,
+                        )
+                        .await;
                     }
                 }
                 methods::WORKSPACE_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceListParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_list(&context, request.id, params).await;
+                            self.workspace_list(
+                                &context,
+                                admission.workspace_collection().expect(
+                                    "central admission supplies workspace-collection proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -439,8 +2412,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceDefaultParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_default(&context, request.id, params)
-                                .await;
+                            self.workspace_default(
+                                &context,
+                                admission.workspace_collection().expect(
+                                    "central admission supplies workspace-collection proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -462,8 +2442,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceSelectParams>(params_value) {
                         Ok(params) => {
-                            self.workspace_select(&context, request.id, params)
-                                .await;
+                            self.workspace_select(
+                                &context,
+                                admission
+                                    .workspace()
+                                    .expect("central admission supplies workspace proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -750,7 +2737,25 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadStartParams>(params_value) {
                         Ok(params) => {
-                            self.thread_start(&context, request.id, params).await;
+                            if let Some(proof) = admission.thread_create() {
+                                self.thread_create_and_start(
+                                    &context,
+                                    proof,
+                                    request.id,
+                                    params,
+                                )
+                                .await;
+                            } else {
+                                self.thread_open(
+                                    &context,
+                                    admission
+                                        .thread_open()
+                                        .expect("central admission supplies exact thread proof"),
+                                    request.id,
+                                    params,
+                                )
+                                .await;
+                            }
                         }
                         Err(error) => {
                             self.send_error(
@@ -772,7 +2777,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
-                            self.thread_tree(&context, request.id, params).await;
+                            self.thread_tree(
+                                &context,
+                                admission
+                                    .workspace()
+                                    .expect("central admission supplies exact workspace proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -792,9 +2805,32 @@ impl MessageProcessor {
                 }
                 methods::THREAD_UPDATE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
+                    if ["creator", "created_by", "createdBy", "author"]
+                        .iter()
+                        .any(|field| params_value.get(field).is_some())
+                    {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "thread creator is server-owned and cannot be changed",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                     match serde_json::from_value::<ThreadUpdateParams>(params_value) {
                         Ok(params) => {
-                            self.thread_update(&context, request.id, params).await;
+                            self.thread_update(
+                                &context,
+                                admission
+                                    .thread_manage()
+                                    .expect("central admission supplies exact management proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -811,6 +2847,63 @@ impl MessageProcessor {
                             .await;
                         }
                     }
+                }
+                methods::THREAD_PARTICIPANTS_LIST
+                | methods::THREAD_PARTICIPANTS_ADD
+                | methods::THREAD_PARTICIPANTS_REMOVE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    let parsed = if method == methods::THREAD_PARTICIPANTS_LIST {
+                        serde_json::from_value::<ThreadParticipantsListParams>(params_value)
+                            .map(|params| {
+                                (
+                                    params.workspace_id,
+                                    params.thread_id,
+                                    super::thread_handlers::ThreadParticipantOperation::List,
+                                )
+                            })
+                    } else {
+                        serde_json::from_value::<ThreadParticipantMutationParams>(params_value)
+                            .map(|params| {
+                                let operation = if method == methods::THREAD_PARTICIPANTS_ADD {
+                                    super::thread_handlers::ThreadParticipantOperation::Add(
+                                        params.principal_id,
+                                    )
+                                } else {
+                                    super::thread_handlers::ThreadParticipantOperation::Remove(
+                                        params.principal_id,
+                                    )
+                                };
+                                (params.workspace_id, params.thread_id, operation)
+                            })
+                    };
+                    let (workspace_id, thread_id, operation) = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{method}`: {error}"
+                                    ),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    self.thread_participants(
+                        &context,
+                        admission
+                            .thread_participants()
+                            .expect("central admission supplies participant-management proof"),
+                        request.id,
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        operation,
+                    )
+                    .await;
                 }
                 methods::THREAD_MOVE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
@@ -907,7 +3000,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocGetParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_get(&context, request.id, params)
+                            self.thread_agents_doc_get(
+                                &context,
+                                request.id,
+                                params,
+                                admission.thread(),
+                            )
                                 .await;
                         }
                         Err(error) => {
@@ -930,7 +3028,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocSaveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_save(&context, request.id, params)
+                            self.thread_agents_doc_save(
+                                &context,
+                                request.id,
+                                params,
+                                admission.thread(),
+                            )
                                 .await;
                         }
                         Err(error) => {
@@ -953,7 +3056,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadAgentsDocArchiveParams>(params_value) {
                         Ok(params) => {
-                            self.thread_agents_doc_archive(&context, request.id, params)
+                            self.thread_agents_doc_archive(
+                                &context,
+                                request.id,
+                                params,
+                                admission.thread(),
+                            )
                                 .await;
                         }
                         Err(error) => {
@@ -981,6 +3089,7 @@ impl MessageProcessor {
                             self.thread_agents_doc_resolve_for_thread(&context,
                                 request.id,
                                 params,
+                                admission.thread(),
                             )
                             .await;
                         }
@@ -1004,7 +3113,11 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadGetParams>(params_value) {
                         Ok(params) => {
-                            self.thread_get(&context, request.id, params).await;
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_get(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1026,7 +3139,11 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTimelinePageParams>(params_value) {
                         Ok(params) => {
-                            self.thread_timeline_page(&context, request.id, params)
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_timeline_page(&context, proof, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1049,7 +3166,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnWorkPageParams>(params_value) {
                         Ok(params) => {
-                            self.turn_work_page(&context, request.id, params).await;
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_work_page(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1071,7 +3193,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnWorkItemsGetParams>(params_value) {
                         Ok(params) => {
-                            self.turn_work_items_get(&context, request.id, params)
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_work_items_get(&context, proof, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1094,7 +3221,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnCancelParams>(params_value) {
                         Ok(params) => {
-                            self.turn_cancel(&context, request.id, params).await;
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_cancel(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1116,7 +3248,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnResumeParams>(params_value) {
                         Ok(params) => {
-                            self.turn_resume(&context, request.id, params).await;
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_resume(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1144,7 +3281,12 @@ impl MessageProcessor {
 
                     match params {
                         Ok(params) => {
-                            self.turn_get(&context, request.id, params).await;
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_get(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1169,7 +3311,12 @@ impl MessageProcessor {
 
                     match params {
                         Ok(params) => {
-                            self.turn_items(&context, request.id, params).await;
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_items(&context, proof, request.id, params).await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -1192,7 +3339,15 @@ impl MessageProcessor {
                     match serde_json::from_value::<TurnPermissionRequestRespondParams>(params_value)
                     {
                         Ok(params) => {
-                            self.turn_permission_request_respond(&context, request.id, params)
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies pending-turn proof");
+                            self.turn_permission_request_respond(
+                                &context,
+                                proof,
+                                request.id,
+                                params,
+                            )
                                 .await;
                         }
                         Err(error) => {
@@ -1215,7 +3370,11 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadUnsubscribeParams>(params_value) {
                         Ok(params) => {
-                            self.thread_unsubscribe(&context, request.id, params)
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_unsubscribe(&context, proof, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -1605,8 +3764,13 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeRequestRespondParams>(params_value) {
                         Ok(params) => {
-                            self.cli_runtime_request_respond(&context, request.id, params)
-                                .await;
+                            self.cli_runtime_request_respond(
+                                &context,
+                                admission.turn(),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2189,7 +4353,13 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(&context,
+                            self.artifact_list(
+                                &context,
+                                ArtifactListAuthorization::Workspace(
+                                    admission
+                                        .workspace()
+                                        .expect("central admission supplies workspace proof"),
+                                ),
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST,
@@ -2216,7 +4386,13 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForThreadParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(&context,
+                            self.artifact_list(
+                                &context,
+                                ArtifactListAuthorization::Thread(
+                                    admission
+                                        .thread()
+                                        .expect("central admission supplies thread proof"),
+                                ),
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_THREAD,
@@ -2243,7 +4419,13 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForTurnParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(&context,
+                            self.artifact_list(
+                                &context,
+                                ArtifactListAuthorization::Turn(
+                                    admission
+                                        .turn()
+                                        .expect("central admission supplies turn proof"),
+                                ),
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_TURN,
@@ -2270,7 +4452,13 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForMessageParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_list(&context,
+                            self.artifact_list(
+                                &context,
+                                ArtifactListAuthorization::Thread(
+                                    admission
+                                        .thread()
+                                        .expect("central admission supplies thread proof"),
+                                ),
                                 request.id,
                                 params,
                                 methods::ARTIFACT_LIST_FOR_MESSAGE,
@@ -2296,7 +4484,17 @@ impl MessageProcessor {
                 methods::ARTIFACT_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactGetParams>(params_value) {
-                        Ok(params) => self.artifact_get(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.artifact_get(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2316,7 +4514,17 @@ impl MessageProcessor {
                 methods::ARTIFACT_READ => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactReadParams>(params_value) {
-                        Ok(params) => self.artifact_read(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.artifact_read(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2337,7 +4545,14 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDeleteParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_delete(&context, request.id, params)
+                            self.artifact_delete(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
                                 .await
                         }
                         Err(error) => {
@@ -2360,7 +4575,14 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactRestoreParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_restore(&context, request.id, params)
+                            self.artifact_restore(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
                                 .await
                         }
                         Err(error) => {
@@ -2382,7 +4604,17 @@ impl MessageProcessor {
                 methods::ARTIFACT_BIND => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactBindParams>(params_value) {
-                        Ok(params) => self.artifact_bind(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.artifact_bind(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2403,8 +4635,31 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadStartParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_start(&context, request.id, params)
-                                .await;
+                            let authorization = match (
+                                admission.workspace(),
+                                admission.thread(),
+                                admission.turn(),
+                            ) {
+                                (Some(proof), None, None) => {
+                                    ArtifactUploadAuthorization::Workspace(proof)
+                                }
+                                (None, Some(proof), None) => {
+                                    ArtifactUploadAuthorization::Thread(proof)
+                                }
+                                (None, None, Some(proof)) => {
+                                    ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                _ => unreachable!(
+                                    "central admission supplies one upload target proof"
+                                ),
+                            };
+                            self.artifact_upload_start(
+                                &context,
+                                authorization,
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2426,8 +4681,31 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadFinishParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_finish(&context, request.id, params)
-                                .await;
+                            let authorization = match (
+                                admission.workspace(),
+                                admission.thread(),
+                                admission.turn(),
+                            ) {
+                                (Some(proof), None, None) => {
+                                    ArtifactUploadAuthorization::Workspace(proof)
+                                }
+                                (None, Some(proof), None) => {
+                                    ArtifactUploadAuthorization::Thread(proof)
+                                }
+                                (None, None, Some(proof)) => {
+                                    ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                _ => unreachable!(
+                                    "central admission supplies one upload target proof"
+                                ),
+                            };
+                            self.artifact_upload_finish(
+                                &context,
+                                authorization,
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2449,8 +4727,31 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactUploadAbortParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_upload_abort(&context, request.id, params)
-                                .await;
+                            let authorization = match (
+                                admission.workspace(),
+                                admission.thread(),
+                                admission.turn(),
+                            ) {
+                                (Some(proof), None, None) => {
+                                    ArtifactUploadAuthorization::Workspace(proof)
+                                }
+                                (None, Some(proof), None) => {
+                                    ArtifactUploadAuthorization::Thread(proof)
+                                }
+                                (None, None, Some(proof)) => {
+                                    ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                _ => unreachable!(
+                                    "central admission supplies one upload target proof"
+                                ),
+                            };
+                            self.artifact_upload_abort(
+                                &context,
+                                authorization,
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2472,8 +4773,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadStartParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_start(&context, request.id, params)
-                                .await;
+                            self.artifact_download_start(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2495,8 +4803,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadChunkParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_chunk(&context, request.id, params)
-                                .await;
+                            self.artifact_download_chunk(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2518,8 +4833,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadFinishParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_finish(&context, request.id, params)
-                                .await;
+                            self.artifact_download_finish(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2541,8 +4863,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactDownloadAbortParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_download_abort(&context, request.id, params)
-                                .await;
+                            self.artifact_download_abort(
+                                &context,
+                                admission
+                                    .artifact()
+                                    .expect("central admission supplies artifact proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -2631,7 +4960,10 @@ impl MessageProcessor {
                 methods::TASK_CREATE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskCreateParams>(params_value) {
-                        Ok(params) => self.task_create(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_create(&context, admission.thread(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2651,7 +4983,10 @@ impl MessageProcessor {
                 methods::TASK_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskGetParams>(params_value) {
-                        Ok(params) => self.task_get(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_get(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2685,7 +5020,10 @@ impl MessageProcessor {
                 methods::TASK_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskTreeTaskParams>(params_value) {
-                        Ok(params) => self.task_tree(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_tree(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2702,7 +5040,10 @@ impl MessageProcessor {
                 methods::TASK_EVENTS => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskEventsParams>(params_value) {
-                        Ok(params) => self.task_events(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_events(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2722,7 +5063,15 @@ impl MessageProcessor {
                 methods::TASK_WAIT => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskWaitParams>(params_value) {
-                        Ok(params) => self.task_wait(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_wait(
+                                &context,
+                                admission.task_batch(),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2739,7 +5088,10 @@ impl MessageProcessor {
                 methods::TASK_ACCEPT => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskAcceptParams>(params_value) {
-                        Ok(params) => self.task_accept(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_accept(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2760,7 +5112,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskReviseParams>(params_value) {
                         Ok(params) => {
-                            message_future(self.task_revise(&context, request.id, params))
+                            message_future(self.task_revise(
+                                &context,
+                                admission.task(),
+                                request.id,
+                                params,
+                            ))
                                 .await
                         }
                         Err(error) => {
@@ -2782,7 +5139,10 @@ impl MessageProcessor {
                 methods::TASK_CANCEL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskCancelParams>(params_value) {
-                        Ok(params) => self.task_cancel(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_cancel(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2803,7 +5163,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskRescheduleParams>(params_value) {
                         Ok(params) => {
-                            self.task_reschedule(&context, request.id, params)
+                            self.task_reschedule(
+                                &context,
+                                admission.task(),
+                                request.id,
+                                params,
+                            )
                                 .await
                         }
                         Err(error) => {
@@ -2825,7 +5190,10 @@ impl MessageProcessor {
                 methods::TASK_PAUSE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskPauseParams>(params_value) {
-                        Ok(params) => self.task_pause(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_pause(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2845,7 +5213,10 @@ impl MessageProcessor {
                 methods::TASK_RESUME => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskResumeParams>(params_value) {
-                        Ok(params) => self.task_resume(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_resume(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -2908,7 +5279,10 @@ impl MessageProcessor {
                 methods::TASK_DETACH => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskDetachParams>(params_value) {
-                        Ok(params) => self.task_detach(&context, request.id, params).await,
+                        Ok(params) => {
+                            self.task_detach(&context, admission.task(), request.id, params)
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,
@@ -3613,6 +5987,10 @@ impl MessageProcessor {
         self.artifact_downloads
             .abort_connection(connection_id)
             .await;
+        self.skill_upload_owners
+            .lock()
+            .await
+            .retain(|_, owner| owner.connection_id != connection_id);
         let removed_voice_sessions = self.voice_sessions.cleanup_connection(connection_id);
         for session in &removed_voice_sessions {
             let _ = self

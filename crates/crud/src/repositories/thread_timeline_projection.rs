@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    thread_timeline_block, thread_timeline_projection_meta, turn_work_item_projection,
-    turn_work_projection,
+    cli_runtime_pending_request, thread_timeline_block, thread_timeline_projection_meta,
+    turn_work_item_projection, turn_work_projection,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{OnConflict, Query, SelectStatement};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Set,
 };
 
@@ -74,6 +74,18 @@ pub struct ThreadTimelineBlockRecord {
     pub metadata_json: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+}
+
+/// Exact execution owner allowed to observe CLI approval payloads embedded in
+/// an otherwise shared thread timeline.
+///
+/// `None` at the query boundary is reserved for an absolute Superuser. An
+/// ordinary Member always supplies both values, allowing the approval
+/// predicate to run in SQL before ordering and pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadTimelineApprovalScope {
+    pub initiating_principal_id: String,
+    pub initiating_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,11 +324,15 @@ pub async fn delete_thread_timeline_block<C: ConnectionTrait>(
 pub async fn list_thread_timeline_blocks_page<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
+    approval_scope: Option<&ThreadTimelineApprovalScope>,
     anchor: ProjectionPageAnchor<'_>,
     limit: u64,
 ) -> Result<Vec<thread_timeline_block::Model>> {
     let mut query = thread_timeline_block::Entity::find()
         .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()));
+    if let Some(approval_scope) = approval_scope {
+        query = query.filter(thread_timeline_approval_visibility(approval_scope));
+    }
 
     let reverse_after_load = matches!(
         anchor,
@@ -357,16 +373,48 @@ pub async fn list_thread_timeline_blocks_page<C: ConnectionTrait>(
 pub async fn find_thread_timeline_block_by_sort_key<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
+    approval_scope: Option<&ThreadTimelineApprovalScope>,
     sort_key: &str,
 ) -> Result<Option<thread_timeline_block::Model>> {
-    thread_timeline_block::Entity::find()
+    let mut query = thread_timeline_block::Entity::find()
         .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(thread_timeline_block::Column::SortKey.eq(sort_key.to_owned()))
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to query timeline block for thread `{thread_id}` sort key `{sort_key}`")
-        })
+        .filter(thread_timeline_block::Column::SortKey.eq(sort_key.to_owned()));
+    if let Some(approval_scope) = approval_scope {
+        query = query.filter(thread_timeline_approval_visibility(approval_scope));
+    }
+    query.one(db).await.with_context(|| {
+        format!("failed to query timeline block for thread `{thread_id}` sort key `{sort_key}`")
+    })
+}
+
+fn thread_timeline_approval_visibility(approval_scope: &ThreadTimelineApprovalScope) -> Condition {
+    Condition::any()
+        .add(thread_timeline_block::Column::BlockKind.ne(BLOCK_KIND_APPROVAL))
+        .add(
+            Condition::all()
+                .add(thread_timeline_block::Column::BlockKind.eq(BLOCK_KIND_APPROVAL))
+                .add(
+                    thread_timeline_block::Column::SourceKey
+                        .in_subquery(pending_request_ids_for_execution_owner(approval_scope)),
+                ),
+        )
+}
+
+fn pending_request_ids_for_execution_owner(
+    approval_scope: &ThreadTimelineApprovalScope,
+) -> SelectStatement {
+    Query::select()
+        .column(cli_runtime_pending_request::Column::RequestId)
+        .from(cli_runtime_pending_request::Entity)
+        .and_where(
+            cli_runtime_pending_request::Column::InitiatingPrincipalId
+                .eq(approval_scope.initiating_principal_id.clone()),
+        )
+        .and_where(
+            cli_runtime_pending_request::Column::InitiatingSessionId
+                .eq(approval_scope.initiating_session_id.clone()),
+        )
+        .to_owned()
 }
 
 pub async fn count_thread_timeline_blocks<C: ConnectionTrait>(

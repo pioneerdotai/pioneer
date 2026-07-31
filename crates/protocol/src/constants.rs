@@ -15,6 +15,9 @@ pub mod methods {
     pub const THREAD_TREE: &str = "thread/tree";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
+    pub const THREAD_PARTICIPANTS_LIST: &str = "thread/participants/list";
+    pub const THREAD_PARTICIPANTS_ADD: &str = "thread/participants/add";
+    pub const THREAD_PARTICIPANTS_REMOVE: &str = "thread/participants/remove";
     pub const THREAD_FOLDER_CREATE: &str = "thread/folder/create";
     pub const THREAD_FOLDER_MOVE: &str = "thread/folder/move";
     pub const THREAD_FOLDER_DELETE: &str = "thread/folder/delete";
@@ -126,14 +129,153 @@ pub mod methods {
     pub const ARTIFACT_DOWNLOAD_CHUNK: &str = "artifact/download/chunk";
     pub const ARTIFACT_DOWNLOAD_FINISH: &str = "artifact/download/finish";
     pub const ARTIFACT_DOWNLOAD_ABORT: &str = "artifact/download/abort";
+
+    /// Authenticated JSON-RPC methods accepted by the normal Gateway
+    /// transport. Restricted credential exchange methods are deliberately
+    /// excluded and listed in `RESTRICTED_AUTH_METHODS`.
+    pub const NORMAL_METHODS: &[&str] = &[
+        AUTH_ME,
+        AUTH_SESSION_LIST,
+        AUTH_SESSION_REVOKE,
+        AUTH_LOGOUT,
+        AUTH_DEVICE_CREATE,
+        WORKSPACE_LIST,
+        WORKSPACE_CREATE,
+        WORKSPACE_DEFAULT,
+        WORKSPACE_SELECT,
+        WORKSPACE_UPDATE,
+        THREAD_START,
+        THREAD_TREE,
+        THREAD_UPDATE,
+        THREAD_MOVE,
+        THREAD_PARTICIPANTS_LIST,
+        THREAD_PARTICIPANTS_ADD,
+        THREAD_PARTICIPANTS_REMOVE,
+        THREAD_FOLDER_CREATE,
+        THREAD_FOLDER_MOVE,
+        THREAD_FOLDER_DELETE,
+        THREAD_AGENTS_DOC_GET,
+        THREAD_AGENTS_DOC_SAVE,
+        THREAD_AGENTS_DOC_ARCHIVE,
+        THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
+        THREAD_GET,
+        THREAD_TIMELINE_PAGE,
+        THREAD_UNSUBSCRIBE,
+        TURN_START,
+        TURN_CANCEL,
+        TURN_RESUME,
+        TURN_GET,
+        TURN_ITEMS,
+        TURN_WORK_PAGE,
+        TURN_WORK_ITEMS_GET,
+        TURN_PERMISSION_REQUEST_RESPOND,
+        VOICE_STATUS,
+        VOICE_SESSION_START,
+        VOICE_SESSION_FINALIZE,
+        VOICE_SESSION_CANCEL,
+        PROVIDER_LIST,
+        PROVIDER_MODELS_LIST,
+        PROVIDER_EMBEDDING_MODELS_LIST,
+        PROVIDER_TRANSCRIPTION_MODELS_LIST,
+        PROVIDER_CONFIGURE,
+        PROVIDER_SET_API_KEY,
+        PROVIDER_DELETE_API_KEY,
+        CLI_RUNTIME_LIST,
+        CLI_RUNTIME_GET,
+        CLI_RUNTIME_STATUS,
+        CLI_RUNTIME_REFRESH,
+        CLI_RUNTIME_LIST_MODELS,
+        CLI_RUNTIME_THREAD_BINDING_GET,
+        CLI_RUNTIME_THREAD_FORK,
+        CLI_RUNTIME_THREAD_COMPACT,
+        CLI_RUNTIME_TURN_STEER,
+        CLI_RUNTIME_REVIEW_START,
+        CLI_RUNTIME_LOGIN_START,
+        CLI_RUNTIME_LOGIN_CANCEL,
+        CLI_RUNTIME_PROXY_SET,
+        CLI_RUNTIME_PROXY_DELETE,
+        CLI_RUNTIME_REQUEST_RESPOND,
+        SETTINGS_GET,
+        SETTINGS_UPDATE,
+        SKILLS_LIST,
+        SKILLS_INSTALL,
+        SKILLS_UPDATE,
+        SKILLS_UNINSTALL,
+        SKILLS_PACK_INSTALL,
+        SKILLS_PACK_UPDATE,
+        SKILLS_PACK_UNINSTALL,
+        SKILLS_HEALTH,
+        SKILLS_UPLOAD_START,
+        SKILLS_UPLOAD_FINISH,
+        SKILLS_UPLOAD_ABORT,
+        SKILLS_POLICY_LIST,
+        SKILLS_POLICY_SET,
+        MCP_LIST,
+        MCP_INSTALL,
+        MCP_POLICY_SET,
+        MCP_SERVER_RESTART,
+        MCP_UNINSTALL,
+        MCP_SERVER_DETAILS,
+        TASK_CREATE,
+        TASK_GET,
+        TASK_LIST,
+        TASK_TREE,
+        TASK_EVENTS,
+        TASK_WAIT,
+        TASK_ACCEPT,
+        TASK_REVISE,
+        TASK_CANCEL,
+        TASK_RESCHEDULE,
+        TASK_DETACH,
+        TASK_PAUSE,
+        TASK_RESUME,
+        TASK_AGENDA,
+        TASK_DELIVERIES,
+        MEMORY_SEARCH,
+        MEMORY_GET,
+        MEMORY_LIST,
+        MEMORY_REMEMBER,
+        MEMORY_FORGET,
+        MEMORY_CANDIDATES_LIST,
+        MEMORY_CANDIDATES_GET,
+        MEMORY_CANDIDATES_DECIDE,
+        MEMORY_CANDIDATES_APPROVE,
+        MEMORY_CANDIDATES_REJECT,
+        MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+        MEMORY_CANDIDATES_MERGE,
+        MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+        ARTIFACT_CAPABILITIES,
+        ARTIFACT_LIST,
+        ARTIFACT_LIST_FOR_THREAD,
+        ARTIFACT_LIST_FOR_TURN,
+        ARTIFACT_LIST_FOR_MESSAGE,
+        ARTIFACT_GET,
+        ARTIFACT_READ,
+        ARTIFACT_DELETE,
+        ARTIFACT_RESTORE,
+        ARTIFACT_BIND,
+        ARTIFACT_UPLOAD_START,
+        ARTIFACT_UPLOAD_FINISH,
+        ARTIFACT_UPLOAD_ABORT,
+        ARTIFACT_DOWNLOAD_START,
+        ARTIFACT_DOWNLOAD_CHUNK,
+        ARTIFACT_DOWNLOAD_FINISH,
+        ARTIFACT_DOWNLOAD_ABORT,
+    ];
+
+    /// Methods accepted only by the pre-authenticated credential exchange
+    /// transport. They must never be admitted through normal authorization.
+    pub const RESTRICTED_AUTH_METHODS: &[&str] = &[AUTH_REFRESH, AUTH_DEVICE_ACTIVATE];
 }
 
 pub mod events {
+    pub const ACCESS_CHANGED: &str = "access/changed";
     pub const AUTH_SESSION_REVOKED: &str = "auth/session_revoked";
     pub const AUTH_ACCESS_EXPIRING: &str = "auth/access_expiring";
     pub const WORKSPACE_CHANGED: &str = "workspace/changed";
     pub const THREAD_STARTED: &str = "thread/started";
     pub const THREAD_UPDATED: &str = "thread/updated";
+    pub const THREAD_PARTICIPANTS_CHANGED: &str = "thread/participants/changed";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
     pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";

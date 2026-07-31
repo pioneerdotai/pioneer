@@ -1,3 +1,4 @@
+mod access_invalidation;
 mod agent_runtime;
 mod artifact_finalization_diagnostics;
 mod artifact_registration;
@@ -124,9 +125,10 @@ use pioneer_protocol::{
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility,
-    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind, ThreadParticipantMutationParams,
+    ThreadParticipantsListParams, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
+    ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification, ThreadVisibility,
     ToolCallStatus, ToolStoragePayload, Turn, TurnBlockedNotification, TurnCancelParams,
     TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
     TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
@@ -168,6 +170,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::GatewayAuthService;
+use crate::authorization::{AccessChangeKind, AccessChangeSignal, AuthorizationInvalidationHub};
 use crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatTracker;
 use crate::cli_runtime::manager::{CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager};
 use crate::cli_runtime::skills::{
@@ -187,6 +190,42 @@ use crate::voice::session_buffer::GatewayVoiceSessionBufferStore;
 use crate::voice::session_store::GatewayVoiceSessionStore;
 use crate::voice::supervisor::VoiceInputSupervisor;
 use crate::workspace::{WorkspaceError, WorkspaceManager};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthenticatedTransferOwner {
+    pub(crate) principal_id: pioneer_protocol::PrincipalId,
+    pub(crate) auth_session_id: pioneer_protocol::AuthSessionId,
+    pub(crate) connection_id: ConnectionId,
+}
+
+impl AuthenticatedTransferOwner {
+    pub(crate) fn from_request_context(context: &RequestContext) -> Self {
+        Self {
+            principal_id: context.principal().principal_id.clone(),
+            auth_session_id: context.principal().session_id.clone(),
+            connection_id: context.connection_id(),
+        }
+    }
+}
+
+impl From<&AuthenticatedTransferOwner> for AuthenticatedTransferOwner {
+    fn from(owner: &AuthenticatedTransferOwner) -> Self {
+        owner.clone()
+    }
+}
+
+#[cfg(test)]
+impl From<ConnectionId> for AuthenticatedTransferOwner {
+    fn from(connection_id: ConnectionId) -> Self {
+        Self {
+            principal_id: pioneer_protocol::PrincipalId::new("P".repeat(21))
+                .expect("test principal id"),
+            auth_session_id: pioneer_protocol::AuthSessionId::new("S".repeat(21))
+                .expect("test auth session id"),
+            connection_id,
+        }
+    }
+}
 
 pub(crate) type MessageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -342,6 +381,7 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     auth_service: Option<Arc<GatewayAuthService>>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
@@ -405,6 +445,7 @@ pub struct MessageProcessor {
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    skill_upload_owners: Arc<Mutex<HashMap<String, AuthenticatedTransferOwner>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
     memory_runtime: Arc<GatewayMemoryRuntime>,
@@ -495,6 +536,10 @@ struct PendingNativePermissionApprovalRequest {
     workspace_id: String,
     thread_id: String,
     turn_id: String,
+    initiating_principal_id: pioneer_protocol::PrincipalId,
+    initiating_session_id: pioneer_protocol::AuthSessionId,
+    initiating_session_generation: i64,
+    authorization_context_fingerprint: String,
     request: TurnPermissionApprovalRequest,
     respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
 }
@@ -560,6 +605,7 @@ impl MessageProcessor {
             Err(_) => 0,
         };
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
+        let authorization_invalidation_hub = Arc::new(AuthorizationInvalidationHub::default());
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new_with_config(
             crud_store.clone(),
@@ -570,6 +616,7 @@ impl MessageProcessor {
             session_manager.clone(),
             gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
+            authorization_invalidation_hub.clone(),
         ));
         let normalized_tool_loop_config = tool_loop_config.normalized();
         let memory_loop_config =
@@ -587,15 +634,18 @@ impl MessageProcessor {
                 resilience_config.provider_stream_item_timeout,
             ),
         ));
-        let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
-            crud_store.clone(),
-            agent_manager.clone(),
-            provider_registry.clone(),
-            RecoveryPolicyRegistry::with_command_execution_timeout_config(
-                resilience_config.command_execution_timeout,
-            ),
-            normalized_tool_loop_config.clone(),
-        ));
+        let recovery_coordinator = Arc::new(
+            RecoveryCoordinator::new(
+                crud_store.clone(),
+                agent_manager.clone(),
+                provider_registry.clone(),
+                RecoveryPolicyRegistry::with_command_execution_timeout_config(
+                    resilience_config.command_execution_timeout,
+                ),
+                normalized_tool_loop_config.clone(),
+            )
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone()),
+        );
         let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
             resilience_config
                 .cli_runtime_command_heartbeat
@@ -661,6 +711,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            authorization_invalidation_hub,
             auth_service: None,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
@@ -714,6 +765,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
+            skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,
             memory_runtime,
@@ -795,7 +847,7 @@ impl MessageProcessor {
                     break;
                 };
                 processor
-                    .send_notification_to_all_connections(
+                    .send_gateway_management_notification(
                         events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
                         &GatewayRemoteAccessStatusChangedNotification { status },
                     )
@@ -855,7 +907,7 @@ impl MessageProcessor {
                     break;
                 };
                 processor
-                    .send_notification_to_all_connections(
+                    .send_gateway_management_notification(
                         events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
                         &GatewayVoiceInputStatusChangedNotification {
                             settings: settings.clone(),
@@ -872,6 +924,40 @@ impl MessageProcessor {
         &self,
     ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender{
         self.thread_episodic_vector_refill_status_tx.clone()
+    }
+
+    async fn publish_committed_authorization_invalidation(
+        &self,
+        kind: AccessChangeKind,
+        affected_principal_id: Option<pioneer_protocol::PrincipalId>,
+        workspace_id: impl Into<String>,
+        thread_id: Option<String>,
+    ) -> AccessChangeSignal {
+        let signal = self.authorization_invalidation_hub.publish(
+            kind,
+            affected_principal_id,
+            workspace_id,
+            thread_id,
+        );
+        self.apply_committed_authorization_invalidation(&signal)
+            .await;
+        signal
+    }
+
+    #[cfg(test)]
+    /// Simulates a committed membership mutation in lifecycle tests.
+    pub(crate) async fn publish_committed_workspace_membership_invalidation(
+        &self,
+        affected_principal_id: pioneer_protocol::PrincipalId,
+        workspace_id: impl Into<String>,
+    ) -> AccessChangeSignal {
+        self.publish_committed_authorization_invalidation(
+            AccessChangeKind::WorkspaceMembership,
+            Some(affected_principal_id),
+            workspace_id,
+            None,
+        )
+        .await
     }
 
     pub(crate) fn thread_episodic_workspace_refill_supervisor(
@@ -909,8 +995,7 @@ impl MessageProcessor {
                     total_bytes: event.total_bytes,
                 };
                 processor
-                    .send_notification_to_workspace_connections(
-                        workspace_id.as_str(),
+                    .send_gateway_management_notification(
                         events::GATEWAY_THREAD_EPISODIC_VECTOR_REFILL_STATUS_CHANGED,
                         &notification,
                     )
@@ -963,6 +1048,7 @@ impl MessageProcessor {
     }
 
     pub(crate) fn with_auth_service(mut self, service: Arc<GatewayAuthService>) -> Self {
+        self.mcp_service.set_auth_service(service.clone());
         self.auth_service = Some(service);
         self
     }
@@ -2179,6 +2265,26 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn load_agent_skill_overlay_for_member_turn(
+        &self,
+        principal_id: &pioneer_protocol::PrincipalId,
+        workspace_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<Vec<pioneer_skills::AgentSkillRuntimeEntry>> {
+        if self.self_improvement_supervisor.is_none() {
+            return Ok(Vec::new());
+        }
+        crate::self_improvement::overlay::load_member_agent_skill_overlay(
+            self.crud_store.as_ref(),
+            principal_id,
+            workspace_id,
+        )
+        .await
+        .with_context(|| {
+            format!("failed to materialize Member Agent skill overlay for turn `{turn_id}`")
+        })
+    }
+
     async fn user_message_payload_from_input_resolved(
         &self,
         workspace_id: &str,
@@ -2390,11 +2496,13 @@ impl MessageProcessor {
             pioneer_keystore::MemorySecretStore::new(),
         )));
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
+        let authorization_invalidation_hub = Arc::new(AuthorizationInvalidationHub::default());
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),
             gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
+            authorization_invalidation_hub.clone(),
         ));
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new(crud_store.clone()));
@@ -2496,13 +2604,16 @@ impl MessageProcessor {
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
         }
         .normalized();
-        let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
-            crud_store.clone(),
-            agent_manager.clone(),
-            provider_registry.clone(),
-            RecoveryPolicyRegistry::default(),
-            normalized_tool_loop_config.clone(),
-        ));
+        let recovery_coordinator = Arc::new(
+            RecoveryCoordinator::new(
+                crud_store.clone(),
+                agent_manager.clone(),
+                provider_registry.clone(),
+                RecoveryPolicyRegistry::default(),
+                normalized_tool_loop_config.clone(),
+            )
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone()),
+        );
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
@@ -2545,6 +2656,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            authorization_invalidation_hub,
             auth_service: None,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
@@ -2610,6 +2722,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
+            skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,
             memory_runtime,

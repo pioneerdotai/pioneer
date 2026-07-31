@@ -1,5 +1,9 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
+use crate::authorization::{
+    AuthorizationExternalError, AuthorizationResolver, AuthorizationService, ProofResolution,
+    ResourceAction,
+};
 use crate::cli_runtime::config::{
     claude_account_probe_config_from_instance_with_proxy,
     codex_account_probe_config_from_instance_with_proxy,
@@ -13,6 +17,7 @@ use crate::cli_runtime::manager::{
 };
 use crate::cli_runtime::mcp::readiness::CliRuntimeCapabilityPolicy;
 use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
+use crate::thread::ThreadSubscriptionIdentity;
 use anyhow::Context as AnyhowContext;
 use pioneer_cli_agent_runtime::claude::{
     ClaudeAccountProbeSnapshot, ClaudeAccountProbeStatus, ClaudeAccountSnapshot,
@@ -514,6 +519,43 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let create_action = ResourceAction::ThreadCreate;
+            let create_action_gate = AuthorizationService::new().authorize_action(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                create_action,
+            );
+            let create_authorization = match AuthorizationResolver::new((*self.crud_store).clone())
+                .authorize_workspace(
+                    request_context.principal(),
+                    &create_action_gate,
+                    create_action,
+                    workspace_id.as_str(),
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(authorization))
+                    if authorization.workspace_id() == workspace_id =>
+                {
+                    authorization
+                }
+                Ok(ProofResolution::Authorized(_)) | Ok(ProofResolution::Denied(_)) => {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::Unavailable.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
             let Some(source_thread) = self
                 .thread_manager
@@ -597,6 +639,39 @@ impl MessageProcessor {
                     return;
                 }
             }
+            let (mut fork_thread, fork_sandbox_mode) =
+                match self.thread_manager.prepare_new_user_thread(
+                    workspace_id.clone(),
+                    &ThreadStartParams {
+                        thread_id: params.fork_thread_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        name: params.name.clone().or_else(|| source_thread.name.clone()),
+                        model: Some(source_thread.model.clone()),
+                        model_provider: Some(source_thread.model_provider.clone()),
+                        sandbox: None,
+                        mode: Some(source_thread.mode),
+                        origin_kind: Some(ThreadOriginKind::User),
+                        sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                        visibility: None,
+                        agent_nickname: source_thread.agent_nickname.clone(),
+                        agent_role: source_thread.agent_role.clone(),
+                    },
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to prepare fork thread: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            fork_thread.visibility = Some(ThreadVisibility::Private);
 
             let binding = match self
                 .crud_store
@@ -766,24 +841,72 @@ impl MessageProcessor {
                 }
             };
 
+            let is_superuser = create_authorization.decision().is_absolute_superuser();
+            let persist_result = if is_superuser {
+                self.crud_store
+                    .create_superuser_thread(
+                        &fork_thread,
+                        request_context.persisted_actor(),
+                        pioneer_crud::PersistedThreadAccessClass::Private,
+                    )
+                    .await
+            } else {
+                self.crud_store
+                    .create_member_private_thread(
+                        &fork_thread,
+                        &request_context.principal().gateway_id,
+                        &request_context.principal().principal_id,
+                        request_context.persisted_actor(),
+                    )
+                    .await
+            };
+            if let Err(error) = persist_result {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to commit fork thread creation: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            if !is_superuser {
+                self.publish_committed_authorization_invalidation(
+                    AccessChangeKind::ThreadCreated,
+                    Some(request_context.principal().principal_id.clone()),
+                    workspace_id.clone(),
+                    Some(fork_thread.id.clone()),
+                )
+                .await;
+            }
+
             let outcome = match self
                 .thread_manager
-                .thread_start(
+                .thread_start_seeded_authenticated(
                     connection_id,
+                    ThreadSubscriptionIdentity::new(
+                        request_context.principal().principal_id.clone(),
+                        request_context.principal().session_id.clone(),
+                    ),
                     workspace_id.clone(),
                     ThreadStartParams {
-                        thread_id: params.fork_thread_id.clone(),
+                        thread_id: fork_thread.id.clone(),
                         workspace_id: workspace_id.clone(),
-                        name: params.name.clone().or_else(|| source_thread.name.clone()),
-                        model: Some(source_thread.model.clone()),
-                        model_provider: Some(source_thread.model_provider.clone()),
+                        name: None,
+                        model: None,
+                        model_provider: None,
                         sandbox: None,
-                        mode: Some(source_thread.mode),
-                        origin_kind: Some(ThreadOriginKind::User),
-                        sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
-                        agent_nickname: source_thread.agent_nickname.clone(),
-                        agent_role: source_thread.agent_role.clone(),
+                        mode: None,
+                        origin_kind: None,
+                        sidebar_visibility: None,
+                        visibility: None,
+                        agent_nickname: None,
+                        agent_role: None,
                     },
+                    Some(fork_thread),
+                    Some(fork_sandbox_mode),
                 )
                 .await
             {
@@ -794,30 +917,13 @@ impl MessageProcessor {
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to create fork thread: {error:#}"),
+                            format!("failed to publish committed fork thread: {error:#}"),
                         ),
                     )
                     .await;
                     return;
                 }
             };
-
-            if let Err(error) = self
-                .crud_store
-                .upsert_thread_model(&outcome.response.thread, request_context.persisted_actor())
-                .await
-            {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to persist fork thread: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
 
             let now = chrono::Utc::now().fixed_offset();
             let resume_cursor_json = match pioneer_crud::serialize_cli_runtime_json(&json!({
@@ -887,36 +993,13 @@ impl MessageProcessor {
             )
             .await;
 
-            let notification = match JsonRpcNotification::from_params(
+            self.send_notification_to_authorized_thread_connections(
+                outcome.response.thread.id.as_str(),
                 events::THREAD_STARTED,
                 &outcome.started_notification,
-            ) {
-                Ok(notification) => notification,
-                Err(error) => {
-                    error!(error = %error, "failed to encode fork thread/started notification");
-                    return;
-                }
-            };
-            match serde_json::to_string(&notification) {
-                Ok(payload) => {
-                    for notification_connection_id in outcome.started_notification_connection_ids {
-                        if let Err(error) = self
-                            .session_manager
-                            .send_text(notification_connection_id, payload.clone())
-                            .await
-                        {
-                            warn!(
-                                connection_id = notification_connection_id,
-                                error = %format!("{error:#}"),
-                                "failed to send fork thread/started notification"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    error!(error = %error, "failed to serialize fork thread/started notification");
-                }
-            }
+                outcome.started_notification_connection_ids,
+            )
+            .await;
             self.notify_thread_tree_changed(workspace_id).await;
         })
     }
@@ -1082,6 +1165,64 @@ impl MessageProcessor {
                             params.turn_id
                         ),
                     ),
+                )
+                .await;
+                return;
+            }
+            let Some(runtime_kind) =
+                cli_runtime_kind_config_from_stored_kind(turn_binding.runtime_kind.as_str())
+                    .map(cli_runtime_kind_from_config)
+            else {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            };
+            let continuation_is_authorized = match self
+                .load_turn_execution_authorization_context(params.turn_id.as_str())
+                .await
+            {
+                Ok(Some(context)) => {
+                    context
+                        .revalidate_for_turn_scope(
+                            self.crud_store.as_ref(),
+                            workspace_id.as_str(),
+                            params.thread_id.as_str(),
+                            params.turn_id.as_str(),
+                            ResourceAction::CliRuntimeUse,
+                            self.authorization_invalidation_hub.current_revision(),
+                        )
+                        .await
+                        .is_ok()
+                        && context
+                            .verify_cli_runtime_projection(
+                                workspace_id.as_str(),
+                                params.runtime_id.as_str(),
+                                runtime_kind,
+                            )
+                            .is_ok()
+                }
+                Ok(None) => crate::authorization::ensure_contextless_execution_is_trusted(
+                    self.crud_store.as_ref(),
+                    params.turn_id.as_str(),
+                )
+                .await
+                .is_ok(),
+                Err(_) => false,
+            };
+            let runtime_is_current = self.load_cli_runtime_instances().is_ok_and(|instances| {
+                instances.into_iter().any(|instance| {
+                    instance.id == params.runtime_id
+                        && instance.enabled
+                        && cli_runtime_kind_from_config(instance.kind) == runtime_kind
+                })
+            });
+            if !continuation_is_authorized || !runtime_is_current {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
                 )
                 .await;
                 return;
@@ -1553,6 +1694,7 @@ impl MessageProcessor {
     pub(super) async fn cli_runtime_request_respond(
         &self,
         request_context: &RequestContext,
+        authorization: Option<&crate::authorization::AuthorizedTurn>,
         request_id: RequestId,
         params: CLIRuntimeRequestRespondParams,
     ) {
@@ -1644,6 +1786,155 @@ impl MessageProcessor {
                         pending.status.as_str()
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+
+        if authorization.is_some_and(|authorization| {
+            authorization.workspace_id() != pending.workspace_id
+                || authorization.thread_id() != pending.thread_id
+                || pending
+                    .turn_id
+                    .as_deref()
+                    .is_none_or(|turn_id| authorization.turn_id() != turn_id)
+        }) {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+
+        if let Some(turn_id) = pending.turn_id.as_deref() {
+            let Some(binding) = pending.authorization_binding.as_ref() else {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            };
+            if request_context.principal().principal_id.as_str() != binding.initiating_principal_id
+                || request_context.principal().session_id.as_str() != binding.initiating_session_id
+            {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            let authorization_context = match self
+                .revalidate_execution_authorization_for_turn(
+                    pending.workspace_id.as_str(),
+                    pending.thread_id.as_str(),
+                    turn_id,
+                    crate::authorization::ResourceAction::CliRuntimeUse,
+                )
+                .await
+            {
+                Ok(context)
+                    if context.initiating_principal_id().as_str()
+                        == binding.initiating_principal_id
+                        && context.initiating_session_id().as_str()
+                            == binding.initiating_session_id
+                        && context
+                            .authorization_fingerprint()
+                            .is_ok_and(|fingerprint| {
+                                fingerprint == binding.authorization_context_fingerprint
+                            }) =>
+                {
+                    context
+                }
+                Ok(_) | Err(_) => {
+                    if let Err(error) = self
+                        .expire_cli_runtime_pending_request_as_stale(&pending)
+                        .await
+                    {
+                        warn!(
+                            request_id = pending.request_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to expire CLI request after authorization loss"
+                        );
+                    }
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let current_session = pioneer_crud::load_session(
+                &self.crud_store.database_connection(),
+                authorization_context.initiating_session_id(),
+            )
+            .await;
+            if !matches!(
+                current_session,
+                Ok(Some(session))
+                    if session.refresh_generation == binding.initiating_session_generation
+            ) {
+                if let Err(error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&pending)
+                    .await
+                {
+                    warn!(
+                        request_id = pending.request_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to expire CLI request after session generation changed"
+                    );
+                }
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            let runtime_kind =
+                cli_runtime_kind_config_from_stored_kind(pending.runtime_kind.as_str())
+                    .map(cli_runtime_kind_from_config);
+            let runtime_is_current = runtime_kind.is_some_and(|runtime_kind| {
+                authorization_context
+                    .verify_cli_runtime_projection(
+                        pending.workspace_id.as_str(),
+                        pending.runtime_id.as_str(),
+                        runtime_kind,
+                    )
+                    .is_ok()
+                    && self.load_cli_runtime_instances().is_ok_and(|instances| {
+                        instances.into_iter().any(|instance| {
+                            instance.id == pending.runtime_id
+                                && instance.enabled
+                                && cli_runtime_kind_from_config(instance.kind) == runtime_kind
+                        })
+                    })
+            });
+            if !runtime_is_current {
+                if let Err(error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&pending)
+                    .await
+                {
+                    warn!(
+                        request_id = pending.request_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to expire CLI request after runtime projection changed"
+                    );
+                }
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+        } else if request_context.principal().kind != pioneer_protocol::PrincipalKind::Superuser {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
@@ -1913,10 +2204,57 @@ impl MessageProcessor {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        let opened = self
-            .crud_store
-            .open_cli_runtime_pending_request(request)
-            .await?;
+        let opened = if let Some(turn_id) = request.turn_id.as_deref() {
+            let authorization_context = self
+                .revalidate_execution_authorization_for_turn(
+                    request.workspace_id.as_str(),
+                    request.thread_id.as_str(),
+                    turn_id,
+                    crate::authorization::ResourceAction::CliRuntimeUse,
+                )
+                .await
+                .context("CLI runtime request initiating authority is no longer active")?;
+            let runtime_kind =
+                cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str())
+                    .map(cli_runtime_kind_from_config)
+                    .context("CLI runtime request has an unsupported runtime kind")?;
+            authorization_context
+                .verify_cli_runtime_projection(
+                    request.workspace_id.as_str(),
+                    request.runtime_id.as_str(),
+                    runtime_kind,
+                )
+                .context("CLI runtime request is outside its immutable runtime projection")?;
+            let session = pioneer_crud::load_session(
+                &self.crud_store.database_connection(),
+                authorization_context.initiating_session_id(),
+            )
+            .await
+            .context("failed to load CLI runtime request initiating session")?
+            .context("CLI runtime request initiating session is missing")?;
+            if session.refresh_generation < 0 {
+                anyhow::bail!("CLI runtime request initiating session generation is invalid");
+            }
+            let binding = pioneer_crud::CliRuntimeRequestAuthorizationBinding {
+                initiating_principal_id: authorization_context
+                    .initiating_principal_id()
+                    .to_string(),
+                initiating_session_id: authorization_context.initiating_session_id().to_string(),
+                initiating_session_generation: session.refresh_generation,
+                authorization_context_fingerprint: authorization_context
+                    .authorization_fingerprint()
+                    .context("failed to fingerprint CLI runtime request authorization")?,
+            };
+            self.crud_store
+                .open_cli_runtime_pending_request_with_authorization(request, binding)
+                .await?
+        } else {
+            // Machine-level requests cannot be approved by a Member and have no
+            // user turn whose immutable authority could be bound here.
+            self.crud_store
+                .open_cli_runtime_pending_request(request)
+                .await?
+        };
         if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
             self.emit_cli_runtime_request_opened(opened.clone()).await;
         }
@@ -6699,7 +7037,96 @@ impl MessageProcessor {
         }
     }
 
-    async fn expire_cli_runtime_pending_request_as_stale(
+    pub(super) async fn expire_cli_runtime_pending_requests_without_current_authority(
+        &self,
+        workspace_id: &str,
+        affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
+    ) {
+        let pending_requests = match self
+            .crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                workspace_id: Some(workspace_id.to_owned()),
+                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    error = %format!("{error:#}"),
+                    "failed to list CLI runtime requests for authorization invalidation"
+                );
+                return;
+            }
+        };
+
+        for request in pending_requests {
+            let (Some(turn_id), Some(binding)) = (
+                request.turn_id.as_deref(),
+                request.authorization_binding.as_ref(),
+            ) else {
+                continue;
+            };
+            if affected_principal_id.is_some_and(|principal_id| {
+                principal_id.as_str() != binding.initiating_principal_id
+            }) {
+                continue;
+            }
+            let authority_is_current = match self
+                .revalidate_execution_authorization_for_turn(
+                    request.workspace_id.as_str(),
+                    request.thread_id.as_str(),
+                    turn_id,
+                    crate::authorization::ResourceAction::CliRuntimeUse,
+                )
+                .await
+            {
+                Ok(context)
+                    if context.initiating_principal_id().as_str()
+                        == binding.initiating_principal_id
+                        && context.initiating_session_id().as_str()
+                            == binding.initiating_session_id
+                        && context.authorization_fingerprint().is_ok_and(|current| {
+                            current == binding.authorization_context_fingerprint
+                        }) =>
+                {
+                    matches!(
+                        pioneer_crud::load_session(
+                            &self.crud_store.database_connection(),
+                            context.initiating_session_id(),
+                        )
+                        .await,
+                        Ok(Some(session))
+                            if session.refresh_generation
+                                == binding.initiating_session_generation
+                    )
+                }
+                Ok(_) | Err(_) => false,
+            };
+            if authority_is_current {
+                continue;
+            }
+            if let Err(error) = self
+                .expire_cli_runtime_pending_request_as_stale(&request)
+                .await
+            {
+                warn!(
+                    workspace_id = request.workspace_id.as_str(),
+                    runtime_id = request.runtime_id.as_str(),
+                    thread_id = request.thread_id.as_str(),
+                    turn_id,
+                    request_id = request.request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to expire CLI runtime request after authorization invalidation"
+                );
+            }
+        }
+    }
+
+    pub(super) async fn expire_cli_runtime_pending_request_as_stale(
         &self,
         request: &CliRuntimePendingRequestRecord,
     ) -> anyhow::Result<Option<CliRuntimePendingRequestRecord>> {
@@ -7420,8 +7847,8 @@ impl MessageProcessor {
         request: CliRuntimePendingRequestRecord,
     ) {
         let notification = cli_runtime_request_opened_notification_from_record(&request);
-        self.send_notification_to_workspace_connections(
-            request.workspace_id.as_str(),
+        self.send_cli_runtime_request_notification(
+            &request,
             events::CLI_RUNTIME_REQUEST_OPENED,
             &notification,
         )
@@ -7437,14 +7864,35 @@ impl MessageProcessor {
     ) {
         let notification =
             cli_runtime_request_resolved_notification_from_record(&request, resolution);
-        self.send_notification_to_workspace_connections(
-            request.workspace_id.as_str(),
+        self.send_cli_runtime_request_notification(
+            &request,
             events::CLI_RUNTIME_REQUEST_RESOLVED,
             &notification,
         )
         .await;
         self.notify_semantic_timeline_pending_request_changed(&request)
             .await;
+    }
+
+    async fn send_cli_runtime_request_notification<T: serde::Serialize>(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+        method: &str,
+        notification: &T,
+    ) {
+        if let Some(binding) = request.authorization_binding.as_ref() {
+            self.send_execution_owner_notification(
+                request.thread_id.as_str(),
+                binding.initiating_principal_id.as_str(),
+                binding.initiating_session_id.as_str(),
+                method,
+                notification,
+            )
+            .await;
+        } else {
+            self.send_gateway_management_notification(method, notification)
+                .await;
+        }
     }
 
     async fn validate_cli_runtime_workspace(

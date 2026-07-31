@@ -7,6 +7,7 @@ use serde_json::json;
 use std::time::Duration;
 
 use super::MessageProcessor;
+use crate::authorization::{AuthorizationResource, AuthorizedSession, ResourceAction};
 use crate::request_context::RequestContext;
 
 const AUTH_ERROR_JSONRPC_CODE: i64 = -32040;
@@ -16,8 +17,19 @@ impl MessageProcessor {
     pub(in crate::message) async fn auth_me(
         &self,
         context: &RequestContext,
+        authorization: &AuthorizedSession,
         request_id: RequestId,
     ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionReadOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
         let Some(service) = self.auth_service.as_ref() else {
             self.send_error(
                 context.connection_id(),
@@ -53,8 +65,19 @@ impl MessageProcessor {
     pub(in crate::message) async fn auth_session_list(
         &self,
         context: &RequestContext,
+        authorization: &AuthorizedSession,
         request_id: RequestId,
     ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionReadOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
         let Some(service) = self.auth_service.as_ref() else {
             self.send_auth_error(context, request_id, "auth_not_ready")
                 .await;
@@ -72,9 +95,20 @@ impl MessageProcessor {
     pub(in crate::message) async fn auth_session_revoke(
         &self,
         context: &RequestContext,
+        authorization: &AuthorizedSession,
         request_id: RequestId,
         params: AuthSessionRevokeParams,
     ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionRevokeOwn,
+            &params.session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
         let Some(service) = self.auth_service.as_ref() else {
             self.send_auth_error(context, request_id, "auth_not_ready")
                 .await;
@@ -110,8 +144,19 @@ impl MessageProcessor {
     pub(in crate::message) async fn auth_logout(
         &self,
         context: &RequestContext,
+        authorization: &AuthorizedSession,
         request_id: RequestId,
     ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionRevokeOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
         let Some(service) = self.auth_service.as_ref() else {
             self.send_auth_error(context, request_id, "auth_not_ready")
                 .await;
@@ -139,8 +184,19 @@ impl MessageProcessor {
     pub(in crate::message) async fn auth_device_create(
         &self,
         context: &RequestContext,
+        authorization: &AuthorizedSession,
         request_id: RequestId,
     ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionRevokeOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
         let Some(service) = self.auth_service.as_ref() else {
             self.send_auth_error(context, request_id, "auth_not_ready")
                 .await;
@@ -194,4 +250,23 @@ impl MessageProcessor {
         )
         .await;
     }
+}
+
+fn authorized_session_matches(
+    context: &RequestContext,
+    authorization: &AuthorizedSession,
+    action: ResourceAction,
+    session_id: &pioneer_protocol::AuthSessionId,
+) -> bool {
+    authorization.principal_id() == &context.principal().principal_id
+        && authorization.action() == action
+        && matches!(
+            authorization.resource(),
+            AuthorizationResource::Session {
+                principal_id,
+                session_id: authorized_session_id,
+            } if principal_id == &context.principal().principal_id
+                && authorized_session_id == session_id
+        )
+        && authorization.decision().is_allowed()
 }

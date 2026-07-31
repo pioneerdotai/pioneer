@@ -1,7 +1,9 @@
 use pioneer_crud::{
     IdentityInvariantRows, actor_ref_from_db, principal_kind_from_db, principal_status_from_db,
 };
-use pioneer_protocol::{GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus};
+use pioneer_protocol::{
+    GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -25,6 +27,8 @@ pub(crate) enum IdentityInvariantKind {
     MissingSuperuser,
     MultipleSuperusers,
     InvalidSuperuserState,
+    InvalidUserRole,
+    InvalidUserState,
     MissingActor,
     InvalidActorPair,
     DanglingPrincipalActor,
@@ -49,6 +53,8 @@ impl IdentityInvariantKind {
             Self::MissingSuperuser => "missing_superuser",
             Self::MultipleSuperusers => "multiple_superusers",
             Self::InvalidSuperuserState => "invalid_superuser_state",
+            Self::InvalidUserRole => "invalid_user_role",
+            Self::InvalidUserState => "invalid_user_state",
             Self::MissingActor => "missing_actor",
             Self::InvalidActorPair => "invalid_actor_pair",
             Self::DanglingPrincipalActor => "dangling_principal_actor",
@@ -214,6 +220,20 @@ pub(crate) fn validate_identity_invariants(
                     IdentityInvariantKind::InvalidSuperuserState,
                 );
             }
+        } else if kind == Some(PrincipalKind::User) {
+            let role = principal
+                .role_key
+                .as_deref()
+                .and_then(|value| RoleKey::new(value).ok());
+            if !role.as_ref().is_some_and(RoleKey::is_supported) {
+                push_violation(&mut violations, IdentityInvariantKind::InvalidUserRole);
+            }
+            if principal_id.is_none()
+                || principal_gateway_id.as_ref() != canonical_gateway_id.as_ref()
+                || status.is_none()
+            {
+                push_violation(&mut violations, IdentityInvariantKind::InvalidUserState);
+            }
         }
     }
 
@@ -291,6 +311,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 removed_at: None,
+                authorization_guard: 1,
             }],
             actor_references: vec![
                 ActorReferenceRow {
@@ -413,6 +434,21 @@ mod tests {
             (
                 IdentityInvariantKind::InvalidSuperuserState,
                 Box::new(|rows| rows.principals[0].role_key = Some("member".to_owned())),
+            ),
+            (
+                IdentityInvariantKind::InvalidUserRole,
+                Box::new(|rows| {
+                    rows.principals[0].kind = "user".to_owned();
+                    rows.principals[0].role_key = Some("viewer".to_owned());
+                }),
+            ),
+            (
+                IdentityInvariantKind::InvalidUserState,
+                Box::new(|rows| {
+                    rows.principals[0].kind = "user".to_owned();
+                    rows.principals[0].role_key = Some("member".to_owned());
+                    rows.principals[0].gateway_id = "G00000000000000000002".to_owned();
+                }),
             ),
             (
                 IdentityInvariantKind::MissingActor,

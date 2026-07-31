@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadParticipantSummary",
+  "type": "object",
+  "properties": {
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    }
+  },
+  "required": [
+    "principal_id"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

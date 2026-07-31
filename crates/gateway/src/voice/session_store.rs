@@ -1,3 +1,4 @@
+use crate::message::AuthenticatedTransferOwner;
 use crate::session::ConnectionId;
 use pioneer_protocol::{VoiceAudioFormat, VoiceError, VoiceErrorKind, VoiceSessionStartContext};
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ impl GatewayVoiceSessionState {
 pub(crate) struct GatewayVoiceSession {
     pub(crate) session_id: String,
     pub(crate) connection_id: ConnectionId,
+    pub(crate) owner: Option<AuthenticatedTransferOwner>,
     pub(crate) workspace_id: String,
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
@@ -87,6 +89,23 @@ impl GatewayVoiceSessionStore {
         Ok(!self.lock_sessions()?.is_empty())
     }
 
+    pub(crate) fn create_authenticated_session(
+        &self,
+        session_id: impl Into<String>,
+        owner: AuthenticatedTransferOwner,
+        context: VoiceSessionStartContext,
+        audio_format: VoiceAudioFormat,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        self.create_session_inner(
+            session_id.into(),
+            owner.connection_id,
+            Some(owner),
+            context,
+            audio_format,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn create_session(
         &self,
         session_id: impl Into<String>,
@@ -94,7 +113,23 @@ impl GatewayVoiceSessionStore {
         context: VoiceSessionStartContext,
         audio_format: VoiceAudioFormat,
     ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
-        let session_id = session_id.into();
+        self.create_session_inner(
+            session_id.into(),
+            connection_id,
+            None,
+            context,
+            audio_format,
+        )
+    }
+
+    fn create_session_inner(
+        &self,
+        session_id: String,
+        connection_id: ConnectionId,
+        owner: Option<AuthenticatedTransferOwner>,
+        context: VoiceSessionStartContext,
+        audio_format: VoiceAudioFormat,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
         let mut sessions = self.lock_sessions()?;
         if sessions.contains_key(session_id.as_str()) {
             return Err(session_error(
@@ -106,6 +141,7 @@ impl GatewayVoiceSessionStore {
         let session = GatewayVoiceSession {
             session_id: session_id.clone(),
             connection_id,
+            owner,
             workspace_id: context.workspace_id.clone(),
             thread_id: context.thread_id.clone(),
             turn_id: context.turn_id.clone(),
@@ -116,6 +152,23 @@ impl GatewayVoiceSessionStore {
         Ok(session)
     }
 
+    pub(crate) fn lookup_authenticated_session(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        let sessions = self.lock_sessions()?;
+        let session = sessions.get(session_id).ok_or_else(|| {
+            session_error(
+                GatewayVoiceSessionErrorKind::UnknownSession,
+                format!("voice session `{session_id}` is not active"),
+            )
+        })?;
+        ensure_authenticated_session_owner(session, owner)?;
+        Ok(session.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn lookup_session(
         &self,
         session_id: &str,
@@ -132,17 +185,72 @@ impl GatewayVoiceSessionStore {
         Ok(session.clone())
     }
 
-    pub(crate) fn active_session_for_connection(
+    pub(crate) fn active_session_for_owner(
         &self,
-        connection_id: ConnectionId,
+        owner: &AuthenticatedTransferOwner,
     ) -> Option<GatewayVoiceSession> {
         let sessions = self.lock_sessions().ok()?;
         sessions
             .values()
-            .find(|session| session.connection_id == connection_id)
+            .find(|session| session.owner.as_ref() == Some(owner))
             .cloned()
     }
 
+    pub(crate) fn mark_recording_authenticated(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        self.transition_authenticated_session(
+            session_id,
+            owner,
+            GatewayVoiceSessionState::Recording,
+        )
+    }
+
+    pub(crate) fn mark_finalizing_authenticated(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        self.transition_authenticated_session(
+            session_id,
+            owner,
+            GatewayVoiceSessionState::Finalizing,
+        )
+    }
+
+    pub(crate) fn mark_transcribing_authenticated(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        self.transition_authenticated_session(
+            session_id,
+            owner,
+            GatewayVoiceSessionState::Transcribing,
+        )
+    }
+
+    pub(crate) fn remove_authenticated_session(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        let mut sessions = self.lock_sessions()?;
+        let session = sessions.get(session_id).ok_or_else(|| {
+            session_error(
+                GatewayVoiceSessionErrorKind::UnknownSession,
+                format!("voice session `{session_id}` is not active"),
+            )
+        })?;
+        ensure_authenticated_session_owner(session, owner)?;
+        Ok(sessions
+            .remove(session_id)
+            .expect("session exists after lookup"))
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_recording(
         &self,
         session_id: &str,
@@ -155,6 +263,7 @@ impl GatewayVoiceSessionStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_finalizing(
         &self,
         session_id: &str,
@@ -167,6 +276,7 @@ impl GatewayVoiceSessionStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_transcribing(
         &self,
         session_id: &str,
@@ -179,6 +289,7 @@ impl GatewayVoiceSessionStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_session(
         &self,
         session_id: &str,
@@ -217,6 +328,30 @@ impl GatewayVoiceSessionStore {
             .collect()
     }
 
+    pub(crate) fn cleanup_connection_scope(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<GatewayVoiceSession>, GatewayVoiceSessionError> {
+        let mut sessions = self.lock_sessions()?;
+        let session_ids = sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (session.connection_id == connection_id
+                    && session.workspace_id == workspace_id
+                    && thread_id.is_none_or(|thread_id| session.thread_id == thread_id))
+                .then(|| session_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        Ok(session_ids
+            .into_iter()
+            .filter_map(|session_id| sessions.remove(session_id.as_str()))
+            .collect())
+    }
+
+    #[cfg(test)]
     fn transition_session(
         &self,
         session_id: &str,
@@ -245,6 +380,33 @@ impl GatewayVoiceSessionStore {
         Ok(session.clone())
     }
 
+    fn transition_authenticated_session(
+        &self,
+        session_id: &str,
+        owner: &AuthenticatedTransferOwner,
+        next_state: GatewayVoiceSessionState,
+    ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
+        let mut sessions = self.lock_sessions()?;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            session_error(
+                GatewayVoiceSessionErrorKind::UnknownSession,
+                format!("voice session `{session_id}` is not active"),
+            )
+        })?;
+        ensure_authenticated_session_owner(session, owner)?;
+        if !session.state.can_transition_to(next_state) {
+            return Err(session_error(
+                GatewayVoiceSessionErrorKind::InvalidTransition,
+                format!(
+                    "voice session `{session_id}` cannot transition from {:?} to {:?}",
+                    session.state, next_state
+                ),
+            ));
+        }
+        session.state = next_state;
+        Ok(session.clone())
+    }
+
     fn lock_sessions(
         &self,
     ) -> Result<
@@ -260,6 +422,7 @@ impl GatewayVoiceSessionStore {
     }
 }
 
+#[cfg(test)]
 fn ensure_session_owner(
     session: &GatewayVoiceSession,
     connection_id: ConnectionId,
@@ -272,6 +435,22 @@ fn ensure_session_owner(
         GatewayVoiceSessionErrorKind::OwnershipMismatch,
         format!(
             "voice session `{}` belongs to a different connection",
+            session.session_id
+        ),
+    ))
+}
+
+fn ensure_authenticated_session_owner(
+    session: &GatewayVoiceSession,
+    owner: &AuthenticatedTransferOwner,
+) -> Result<(), GatewayVoiceSessionError> {
+    if session.owner.as_ref() == Some(owner) {
+        return Ok(());
+    }
+    Err(session_error(
+        GatewayVoiceSessionErrorKind::OwnershipMismatch,
+        format!(
+            "voice session `{}` belongs to a different authenticated context",
             session.session_id
         ),
     ))
@@ -291,6 +470,22 @@ fn session_error(
 mod tests {
     use super::*;
     use pioneer_protocol::{VoiceAudioEncoding, VoiceAudioFormat};
+
+    fn authenticated_owner(
+        connection_id: ConnectionId,
+        principal_byte: char,
+        session_byte: char,
+    ) -> AuthenticatedTransferOwner {
+        AuthenticatedTransferOwner {
+            principal_id: pioneer_protocol::PrincipalId::new(principal_byte.to_string().repeat(21))
+                .expect("principal id"),
+            auth_session_id: pioneer_protocol::AuthSessionId::new(
+                session_byte.to_string().repeat(21),
+            )
+            .expect("auth session id"),
+            connection_id,
+        }
+    }
 
     #[test]
     fn create_lookup_and_transitions_preserve_context() {
@@ -356,6 +551,36 @@ mod tests {
         assert_eq!(
             foreign.into_voice_error().kind,
             VoiceErrorKind::InvalidSession
+        );
+    }
+
+    #[test]
+    fn authenticated_voice_session_rejects_same_connection_peer_principal_and_session() {
+        let store = GatewayVoiceSessionStore::default();
+        let owner = authenticated_owner(7, 'P', 'S');
+        store
+            .create_authenticated_session(
+                "voice_session_1",
+                owner.clone(),
+                test_context(),
+                target_format(),
+            )
+            .expect("create");
+
+        assert!(
+            store
+                .lookup_authenticated_session("voice_session_1", &authenticated_owner(7, 'Q', 'S'),)
+                .is_err()
+        );
+        assert!(
+            store
+                .lookup_authenticated_session("voice_session_1", &authenticated_owner(7, 'P', 'T'),)
+                .is_err()
+        );
+        assert!(
+            store
+                .lookup_authenticated_session("voice_session_1", &owner)
+                .is_ok()
         );
     }
 

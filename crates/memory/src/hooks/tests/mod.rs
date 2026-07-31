@@ -515,6 +515,7 @@ fn test_memory_turn_context() -> MemoryTurnContext {
         input_text: "remember my preference".to_owned(),
         task_id: None,
         agent_id: None,
+        principal_id: None,
     }
 }
 

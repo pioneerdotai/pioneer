@@ -23,6 +23,8 @@ pub struct Model {
     pub self_improvement_source_turns: HasMany<super::self_improvement_source_turn::Entity>,
     #[sea_orm(has_one)]
     pub self_improvement_workspace_state: HasOne<super::self_improvement_workspace_state::Entity>,
+    #[sea_orm(has_many, via = "workspace_membership")]
+    pub gateway_principals: HasMany<super::gateway_principal::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

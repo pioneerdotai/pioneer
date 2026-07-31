@@ -549,6 +549,12 @@ impl ArtifactRepository {
         let artifact_ids = if has_binding_filter {
             let mut query = artifact_binding::Entity::find()
                 .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id.to_owned()));
+            if let Some(authorized_artifact_ids) = &filter.authorized_artifact_ids {
+                query = query.filter(
+                    artifact_binding::Column::ArtifactId
+                        .is_in(non_empty_authorized_artifact_ids(authorized_artifact_ids)),
+                );
+            }
 
             let mut thread_ids = filter.thread_ids.clone();
             if let Some(thread_id) = &filter.thread_id {
@@ -594,12 +600,19 @@ impl ArtifactRepository {
             }
             artifact_ids
         } else {
-            artifact::Entity::find()
+            let mut query = artifact::Entity::find()
                 .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
                 .order_by_desc(artifact::Column::UpdatedAt)
                 .order_by_desc(artifact::Column::Id)
                 .limit(query_limit)
-                .offset(offset)
+                .offset(offset);
+            if let Some(authorized_artifact_ids) = &filter.authorized_artifact_ids {
+                query = query.filter(
+                    artifact::Column::Id
+                        .is_in(non_empty_authorized_artifact_ids(authorized_artifact_ids)),
+                );
+            }
+            query
                 .all(db)
                 .await
                 .map_err(|source| ArtifactCrudError::Database {
@@ -886,6 +899,14 @@ impl ArtifactRepository {
     }
 }
 
+fn non_empty_authorized_artifact_ids(ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        vec!["__no_authorized_artifact__".to_owned()]
+    } else {
+        ids.to_vec()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewArtifactBlobRecord {
     pub workspace_id: String,
@@ -932,6 +953,7 @@ pub struct ArtifactListFilterRecord {
     pub kinds: Vec<ArtifactKind>,
     pub thread_id: Option<String>,
     pub thread_ids: Vec<String>,
+    pub authorized_artifact_ids: Option<Vec<String>>,
     pub turn_id: Option<String>,
     pub message_id: Option<String>,
     pub task_id: Option<String>,

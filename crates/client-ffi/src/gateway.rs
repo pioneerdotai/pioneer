@@ -300,7 +300,7 @@ pub fn voice_input_plan_for_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_client::rpc::JsonRpcResponseSender;
+    use pioneer_client::rpc::{JsonRpcResponseError, JsonRpcResponseResult, JsonRpcResponseSender};
     use pioneer_protocol::{
         GatewayGeneralSettings, GatewayMemorySettings, GatewaySettingsSnapshot,
         GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
@@ -311,7 +311,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct ImmediateTransport {
-        response: Mutex<Option<Result<JsonValue, String>>>,
+        response: Mutex<Option<JsonRpcResponseResult>>,
         request: Mutex<Option<JsonValue>>,
     }
 
@@ -325,7 +325,7 @@ mod tests {
 
         fn error(message: impl Into<String>) -> Self {
             Self {
-                response: Mutex::new(Some(Err(message.into()))),
+                response: Mutex::new(Some(Err(JsonRpcResponseError::server(None, message, None)))),
                 request: Mutex::new(None),
             }
         }

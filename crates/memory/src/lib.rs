@@ -31,6 +31,7 @@ pub use config::{
 };
 pub use context::{
     MemoryActiveScopes, MemoryOperationContext, MemoryResolvedScopes, MemoryScopePriority,
+    MemorySourceAccessPolicy,
 };
 pub use debug::{
     MEMORY_DEBUG_TEXT_PREVIEW_MAX_CHARS, MEMORY_DEBUG_TRACE_MAX_EVENTS,

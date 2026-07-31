@@ -900,6 +900,7 @@ fn thread_start_params() -> ThreadStartParams {
         mode: None,
         origin_kind: None,
         sidebar_visibility: None,
+        visibility: None,
         agent_nickname: None,
         agent_role: None,
     }

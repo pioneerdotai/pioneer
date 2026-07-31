@@ -77,6 +77,16 @@ impl ThreadSidebarVisibility {
     }
 }
 
+/// User-selectable visibility for ordinary user threads.
+///
+/// Internal task/system threads deliberately have no public selectable value.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadVisibility {
+    Private,
+    Workspace,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct ThreadStartParams {
     pub thread_id: String,
@@ -95,6 +105,8 @@ pub struct ThreadStartParams {
     pub origin_kind: Option<ThreadOriginKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_visibility: Option<ThreadSidebarVisibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ThreadVisibility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_nickname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,11 +141,62 @@ pub struct ThreadUpdateParams {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ThreadVisibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadUpdateResponse {
     pub thread: Thread,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipantsListParams {
+    pub workspace_id: String,
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipantMutationParams {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub principal_id: crate::PrincipalId,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipantSummary {
+    pub principal_id: crate::PrincipalId,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipantsResponse {
+    pub workspace_id: String,
+    pub thread_id: String,
+    /// Compatibility list retained for clients predating participant summary
+    /// DTOs.
+    #[serde(default)]
+    pub participant_ids: Vec<crate::PrincipalId>,
+    #[serde(default)]
+    pub participants: Vec<ThreadParticipantSummary>,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadParticipantChangeKind {
+    Added,
+    Removed,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipantsChangedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub change: ThreadParticipantChangeKind,
+    pub principal_id: crate::PrincipalId,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -501,6 +564,8 @@ pub struct Thread {
     pub agent_nickname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ThreadVisibility>,
     pub turns: Vec<Turn>,
 }
 
@@ -537,9 +602,12 @@ pub struct ThreadTreeChangedNotification {
 #[cfg(test)]
 mod tests {
     use super::{
-        Thread, ThreadClosedNotification, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-        ThreadStartParams, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeParams,
-        ThreadUnsubscribeStatus,
+        Thread, ThreadClosedNotification, ThreadMode, ThreadOriginKind,
+        ThreadParticipantChangeKind, ThreadParticipantMutationParams, ThreadParticipantSummary,
+        ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
+        ThreadParticipantsResponse, ThreadSidebarVisibility, ThreadStartParams, ThreadStatus,
+        ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeStatus, ThreadUpdateParams,
+        ThreadVisibility,
     };
     use crate::{ThreadAgentsDocStatus, ThreadAgentsDocSummary};
     use serde_json::json;
@@ -694,6 +762,7 @@ mod tests {
 
         assert_eq!(thread.origin_kind, ThreadOriginKind::User);
         assert_eq!(thread.sidebar_visibility, ThreadSidebarVisibility::Visible);
+        assert_eq!(thread.visibility, None);
         assert_eq!(thread.status, ThreadStatus::Idle);
     }
 
@@ -727,5 +796,99 @@ mod tests {
             encoded,
             json!({"workspaceId": "ws_123", "threadId": "thr_123"})
         );
+    }
+
+    #[test]
+    fn thread_visibility_exposes_only_user_selectable_values() {
+        assert_eq!(
+            serde_json::to_value(ThreadVisibility::Private).unwrap(),
+            serde_json::json!("private")
+        );
+        assert_eq!(
+            serde_json::from_value::<ThreadVisibility>(serde_json::json!("workspace")).unwrap(),
+            ThreadVisibility::Workspace
+        );
+        assert!(serde_json::from_value::<ThreadVisibility>(serde_json::json!("internal")).is_err());
+    }
+
+    #[test]
+    fn visibility_fields_are_additive_and_internal_is_not_selectable() {
+        let start: ThreadStartParams = serde_json::from_value(json!({
+            "workspace_id": "ws_123",
+            "thread_id": "thr_123",
+            "visibility": "private"
+        }))
+        .expect("start visibility should decode");
+        assert_eq!(start.visibility, Some(ThreadVisibility::Private));
+
+        let update: ThreadUpdateParams = serde_json::from_value(json!({
+            "workspace_id": "ws_123",
+            "thread_id": "thr_123",
+            "visibility": "workspace",
+            "archived": false
+        }))
+        .expect("update visibility should decode");
+        assert_eq!(update.visibility, Some(ThreadVisibility::Workspace));
+        assert_eq!(update.archived, Some(false));
+
+        assert!(
+            serde_json::from_value::<ThreadUpdateParams>(json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "visibility": "internal"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn participant_contract_round_trips_only_safe_identifiers() {
+        let principal_id =
+            crate::PrincipalId::new("P00000000000000000001").expect("valid principal");
+        let list = ThreadParticipantsListParams {
+            workspace_id: "ws_123".to_owned(),
+            thread_id: "thr_123".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&list).expect("list should encode"),
+            json!({"workspace_id": "ws_123", "thread_id": "thr_123"})
+        );
+
+        let mutation = ThreadParticipantMutationParams {
+            workspace_id: list.workspace_id.clone(),
+            thread_id: list.thread_id.clone(),
+            principal_id: principal_id.clone(),
+        };
+        let mutation_value = serde_json::to_value(&mutation).expect("mutation should encode");
+        assert_eq!(mutation_value["principal_id"], json!(principal_id.as_str()));
+
+        let response = ThreadParticipantsResponse {
+            workspace_id: list.workspace_id,
+            thread_id: list.thread_id,
+            participant_ids: vec![principal_id.clone()],
+            participants: vec![ThreadParticipantSummary {
+                principal_id: principal_id.clone(),
+            }],
+            changed: true,
+        };
+        assert_eq!(
+            serde_json::from_value::<ThreadParticipantsResponse>(
+                serde_json::to_value(&response).expect("response should encode")
+            )
+            .expect("response should decode"),
+            response
+        );
+
+        let changed = ThreadParticipantsChangedNotification {
+            workspace_id: "ws_123".to_owned(),
+            thread_id: "thr_123".to_owned(),
+            change: ThreadParticipantChangeKind::Removed,
+            principal_id,
+        };
+        let changed_value = serde_json::to_value(changed).expect("notification should encode");
+        assert_eq!(changed_value["change"], json!("removed"));
+        for protected in ["display_name", "nickname", "role_key", "membership"] {
+            assert!(changed_value.get(protected).is_none());
+        }
     }
 }

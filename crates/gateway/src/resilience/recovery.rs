@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
     RestoredRecoveryTurnRequest, RetainedProviderHistoryMessage, ToolLoopConfig,
@@ -475,6 +475,7 @@ pub struct RecoveryCoordinator {
     agent_manager: Arc<AgentManager>,
     policy_registry: RecoveryPolicyRegistry,
     tool_loop_config: ToolLoopConfig,
+    authorization_invalidation_hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +679,18 @@ impl RecoveryCoordinator {
             agent_manager,
             policy_registry,
             tool_loop_config,
+            authorization_invalidation_hub: Arc::new(
+                crate::authorization::AuthorizationInvalidationHub::default(),
+            ),
         }
+    }
+
+    pub(crate) fn with_authorization_invalidation_hub(
+        mut self,
+        hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
+    ) -> Self {
+        self.authorization_invalidation_hub = hub;
+        self
     }
 
     fn provider_recovery_policy(&self, failure: &ProviderFailureDetails) -> ProviderRecoveryPolicy {
@@ -1858,6 +1870,48 @@ impl RecoveryCoordinator {
             return Ok(events);
         };
 
+        if let Err(error) = self
+            .revalidate_persisted_turn_execution_authorization(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                job.turn_id.as_str(),
+            )
+            .await
+        {
+            warn!(
+                turn_id = job.turn_id.as_str(),
+                error = %format!("{error:#}"),
+                "blocked recovery after initiating execution authority changed"
+            );
+            let reason =
+                "automatic recovery blocked because initiating authority is no longer active"
+                    .to_owned();
+            if self
+                .crud_store
+                .mark_claimed_recovery_job_terminal(
+                    job.id.as_str(),
+                    claim_token.as_str(),
+                    RecoveryJobStatus::Blocked,
+                    Some(reason.clone()),
+                    now_unix,
+                )
+                .await?
+            {
+                self.cancel_other_open_jobs_after_terminal_recovery(
+                    job.turn_id.as_str(),
+                    job.id.as_str(),
+                    now_unix,
+                )
+                .await?;
+                events.push(RecoveryCoordinatorEvent::RecoveryBlocked {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    reason,
+                });
+            }
+            return Ok(events);
+        }
+
         let execution_plan = self.build_attempt_plan(&job, attempt_number).await?;
 
         if let Some(message) = execution_plan.terminal_reason.clone() {
@@ -2417,6 +2471,23 @@ impl RecoveryCoordinator {
             ));
         }
 
+        if let Err(error) = self
+            .revalidate_persisted_turn_execution_authorization(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+            )
+            .await
+        {
+            return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                    error: format!(
+                        "failed to revalidate current skill projection before recovery: {error:#}"
+                    ),
+                },
+            ));
+        }
+
         let agent_skill_overlay =
             match crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
                 self.crud_store.as_ref(),
@@ -2533,6 +2604,117 @@ impl RecoveryCoordinator {
             }
         }
         Ok(RestoredRecoveryTurnRequestLookup::Available(request))
+    }
+
+    async fn revalidate_persisted_turn_execution_authorization(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        let Some(encoded) = self
+            .crud_store
+            .get_turn_execution_authorization_context(turn_id)
+            .await?
+        else {
+            crate::authorization::ensure_contextless_execution_is_trusted(
+                self.crud_store.as_ref(),
+                turn_id,
+            )
+            .await
+            .context("contextless recovery turn is not a trusted legacy execution")?;
+            return Ok(());
+        };
+        let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            encoded.as_str(),
+        )
+        .context("failed to decode persisted execution authorization")?;
+        let revalidated = context
+            .revalidate_for_turn_scope(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                crate::authorization::ResourceAction::ThreadWrite,
+                self.authorization_invalidation_hub.current_revision(),
+            )
+            .await
+            .context("current execution authorization no longer permits recovery")?;
+
+        let bindings = self
+            .crud_store
+            .find_turn_skill_bindings(turn_id)
+            .await
+            .context("failed to load persisted recovery skill bindings")?
+            .into_iter()
+            .map(|binding| pioneer_protocol::TurnSkillBinding {
+                skill_id: binding.skill_id,
+                skill_owner: binding.skill_owner,
+                skill_slug: binding.skill_slug,
+                skill_version: binding.skill_version,
+                fingerprint: binding.fingerprint,
+                source_kind: binding.source_kind,
+                resolved_reason: binding.resolved_reason,
+            })
+            .collect::<Vec<_>>();
+        if context.skill_projection().is_some() || !bindings.is_empty() {
+            context
+                .verify_skill_projection(workspace_id, bindings.as_slice())
+                .context("persisted recovery skill projection is stale or unbound")?;
+        }
+
+        if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
+            let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+                revalidated.principal().kind,
+                revalidated.principal().role_key.as_ref(),
+                crate::authorization::ResourceAction::SkillUse,
+            );
+            let resolver =
+                crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone());
+            let database = self.crud_store.database_connection();
+            let active_learned = self
+                .crud_store
+                .list_active_agent_skill_versions(workspace_id)
+                .await?
+                .into_iter()
+                .map(|version| (version.skill_id.clone(), version))
+                .collect::<HashMap<_, _>>();
+            for binding in &bindings {
+                let authorization = resolver
+                    .authorize_persisted_capability(
+                        revalidated.principal(),
+                        &action_gate,
+                        crate::authorization::ResourceAction::SkillUse,
+                        workspace_id,
+                        crate::authorization::CapabilityKind::Skill,
+                        binding.skill_id.as_str(),
+                    )
+                    .await?;
+                if !matches!(
+                    authorization,
+                    crate::authorization::ProofResolution::Authorized(_)
+                ) {
+                    bail!("current workspace policy no longer permits a projected recovery skill");
+                }
+                if binding.source_kind == "agent" {
+                    let active = active_learned
+                        .get(&binding.skill_id)
+                        .context("projected learned recovery skill is no longer active")?;
+                    if active.version.fingerprint != binding.fingerprint
+                        || pioneer_crud::derive_member_learned_version_eligibility(
+                            &database,
+                            workspace_id,
+                            active.version.id.as_str(),
+                        )
+                        .await?
+                            != pioneer_crud::MemberLearnedVersionEligibility::Eligible
+                    {
+                        bail!("projected learned recovery skill is no longer eligible");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4101,6 +4283,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
@@ -6638,6 +6821,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {
@@ -6768,6 +6952,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = pioneer_protocol::Turn {

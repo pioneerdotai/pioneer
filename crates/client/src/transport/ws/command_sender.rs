@@ -5,7 +5,8 @@ use crate::rpc::validation::{
     validate_task_review_target,
 };
 use crate::rpc::{
-    JsonRpcRequestTransport, RPC_REQUEST_TIMEOUT, RPC_UNSUBSCRIBE_TIMEOUT,
+    JsonRpcAuthorizationFailure, JsonRpcRequestTransport, RPC_REQUEST_TIMEOUT,
+    RPC_UNSUBSCRIBE_TIMEOUT, json_rpc_authorization_failure, json_rpc_response_error,
     send_json_rpc_request_typed,
 };
 use anyhow::{Result, anyhow};
@@ -96,6 +97,18 @@ where
 }
 
 fn sanitize_auth_rpc_error(error: anyhow::Error) -> anyhow::Error {
+    if let Some(machine_code) = json_rpc_response_error(&error)
+        .and_then(|response| response.machine_code())
+        .filter(|code| AUTH_ERROR_MACHINE_CODES.contains(code))
+    {
+        return anyhow!(machine_code.to_owned());
+    }
+    if json_rpc_authorization_failure(&error)
+        == Some(JsonRpcAuthorizationFailure::AuthenticationTerminal)
+    {
+        return anyhow!("authentication_terminal");
+    }
+
     let rendered = format!("{error:#}");
     let machine_code = AUTH_ERROR_MACHINE_CODES
         .iter()
@@ -232,7 +245,7 @@ where
         methods::THREAD_UPDATE,
     )?;
     require_condition(
-        params.name.is_some(),
+        params.name.is_some() || params.visibility.is_some() || params.archived.is_some(),
         "at least one field is required for thread/update",
     )?;
     require_optional_non_empty_field(params.name.as_deref(), "name", methods::THREAD_UPDATE)?;
@@ -2421,7 +2434,8 @@ mod tests {
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
         SkillHealthTarget, SkillId, SkillLifecycleSource, SkillPackId, TaskCancelScope,
-        TurnCapability, VoiceAudioEncoding, VoiceSessionStartContext, VoiceTurnContext, Workspace,
+        ThreadVisibility, TurnCapability, VoiceAudioEncoding, VoiceSessionStartContext,
+        VoiceTurnContext, Workspace,
     };
     use serde_json::json;
 
@@ -2483,6 +2497,24 @@ mod tests {
     #[test]
     fn auth_rpc_errors_preserve_machine_codes_without_peer_controlled_messages() {
         let secret = "eyJhbGciOiJIUzI1NiJ9.peer-controlled.signature";
+        let structured = sanitize_auth_rpc_error(anyhow::Error::new(
+            crate::rpc::JsonRpcResponseError::server(
+                Some(pioneer_protocol::AUTHENTICATION_TERMINAL_CODE),
+                format!("malicious peer echoed {secret}"),
+                Some("session_revoked".to_owned()),
+            ),
+        ));
+        assert_eq!(format!("{structured:#}"), "session_revoked");
+
+        let unknown_terminal = sanitize_auth_rpc_error(anyhow::Error::new(
+            crate::rpc::JsonRpcResponseError::server(
+                Some(pioneer_protocol::AUTHENTICATION_TERMINAL_CODE),
+                format!("malicious peer echoed {secret}"),
+                Some("future_terminal_reason".to_owned()),
+            ),
+        ));
+        assert_eq!(format!("{unknown_terminal:#}"), "authentication_terminal");
+
         let sanitized =
             sanitize_auth_rpc_error(anyhow!("malicious peer echoed {secret} [session_revoked]"));
         let rendered = format!("{sanitized:#}");
@@ -2720,6 +2752,7 @@ mod tests {
                         mode: None,
                         origin_kind: None,
                         sidebar_visibility: None,
+                        visibility: None,
                         agent_nickname: None,
                         agent_role: None,
                     },
@@ -2743,6 +2776,7 @@ mod tests {
                         mode: None,
                         origin_kind: None,
                         sidebar_visibility: None,
+                        visibility: None,
                         agent_nickname: None,
                         agent_role: None,
                     },
@@ -2760,12 +2794,38 @@ mod tests {
                         workspace_id: "ws_1".to_owned(),
                         thread_id: "thread_1".to_owned(),
                         name: None,
+                        visibility: None,
+                        archived: None,
                     },
                 )
                 .expect_err("thread update field should be required")
             ),
             "at least one field is required for thread/update"
         );
+    }
+
+    #[test]
+    fn ws_command_sender_accepts_visibility_or_archive_as_thread_update_fields() {
+        for params in [
+            ThreadUpdateParams {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thread_1".to_owned(),
+                name: None,
+                visibility: Some(ThreadVisibility::Private),
+                archived: None,
+            },
+            ThreadUpdateParams {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thread_1".to_owned(),
+                name: None,
+                visibility: None,
+                archived: Some(true),
+            },
+        ] {
+            let error = thread_update(&FakeTransport, params)
+                .expect_err("fake transport has no thread/update response");
+            assert_eq!(format!("{error:#}"), WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE);
+        }
     }
 
     #[test]
@@ -2872,6 +2932,7 @@ mod tests {
                     &PanicTransport,
                     ThreadAgentsDocGetParams {
                         workspace_id: " ".to_owned(),
+                        thread_id: None,
                         folder_id: None,
                     },
                 )

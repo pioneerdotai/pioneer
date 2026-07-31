@@ -395,6 +395,7 @@ impl MessageProcessor {
         params: SkillListParams,
     ) {
         let connection_id = request_context.connection_id();
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -421,7 +422,11 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to resolve skills runtime context",
-                        json!({"error": format!("{error:#}")}),
+                        if member {
+                            json!({})
+                        } else {
+                            json!({"error": format!("{error:#}")})
+                        },
                     ),
                 )
                 .await;
@@ -442,7 +447,11 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to load skills catalog",
-                        json!({"error": format!("{error:#}")}),
+                        if member {
+                            json!({})
+                        } else {
+                            json!({"error": format!("{error:#}")})
+                        },
                     ),
                 )
                 .await;
@@ -460,7 +469,11 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to load skill installations",
-                        json!({"error": format!("{error:#}")}),
+                        if member {
+                            json!({})
+                        } else {
+                            json!({"error": format!("{error:#}")})
+                        },
                     ),
                 )
                 .await;
@@ -474,7 +487,7 @@ impl MessageProcessor {
             .map(|row| (row.skill_id.clone(), row))
             .collect::<HashMap<_, _>>();
 
-        let pack_items = match self
+        let mut pack_items: Vec<SkillPackInstallationItem> = match self
             .crud_store
             .list_skill_pack_installations(workspace_id.as_str())
             .await
@@ -497,7 +510,11 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to load skill pack installations",
-                        json!({"error": format!("{error:#}")}),
+                        if member {
+                            json!({})
+                        } else {
+                            json!({"error": format!("{error:#}")})
+                        },
                     ),
                 )
                 .await;
@@ -519,13 +536,22 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
                         "failed to load workspace skill policies",
-                        json!({"error": format!("{error:#}")}),
+                        if member {
+                            json!({})
+                        } else {
+                            json!({"error": format!("{error:#}")})
+                        },
                     ),
                 )
                 .await;
                 return;
             }
         };
+        let member_enabled_skill_ids = workspace_policies
+            .iter()
+            .filter(|policy| policy.enabled == Some(true))
+            .map(|policy| policy.skill_id.clone())
+            .collect::<HashSet<_>>();
 
         let policy_set = self.build_policy_set(
             catalog.skills.as_slice(),
@@ -566,11 +592,18 @@ impl MessageProcessor {
         let mut response_items = catalog
             .skills
             .iter()
+            .filter(|skill| {
+                !member
+                    || (member_enabled_skill_ids.contains(&skill.identity.skill_id)
+                        && skill.is_available()
+                        && (matches!(skill.identity.source_kind, SkillSourceKind::System)
+                            || installation_by_id.contains_key(&skill.identity.skill_id)))
+            })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);
                 let is_system = matches!(&skill.identity.source_kind, SkillSourceKind::System);
                 let effective_policy = effective_policy_for_skill(skill, &policy_set);
-                let health = if params.include_health {
+                let health = if params.include_health && !member {
                     self.compute_skill_health_summary(skill, &context)
                 } else {
                     SkillHealthSummary {
@@ -616,13 +649,15 @@ impl MessageProcessor {
                         managed: is_system
                             || matches!(skill.identity.source_kind, SkillSourceKind::Registry),
                         installed: is_system || installation.is_some(),
-                        lifecycle_editable: !is_system,
-                        install_path: if is_system {
+                        lifecycle_editable: !member && !is_system,
+                        install_path: if member {
+                            None
+                        } else if is_system {
                             Some(skill.identity.skill_dir.clone())
                         } else {
                             installation.map(|item| item.install_path.clone())
                         },
-                        updated_at: if is_system {
+                        updated_at: if member || is_system {
                             None
                         } else {
                             installation.map(|item| item.updated_at_unix)
@@ -631,9 +666,8 @@ impl MessageProcessor {
                     policy: SkillPolicyState {
                         enabled: effective_policy.enabled,
                         allow_implicit_invocation: effective_policy.allow_implicit_invocation,
-                        allow_implicit_invocation_editable: skill_implicit_invocation_editable(
-                            skill,
-                        ),
+                        allow_implicit_invocation_editable: !member
+                            && skill_implicit_invocation_editable(skill),
                     },
                     health,
                     status,
@@ -649,6 +683,17 @@ impl MessageProcessor {
                 .then_with(|| left.slug.cmp(&right.slug))
                 .then_with(|| left.skill_id.cmp(&right.skill_id))
         });
+        if member {
+            let visible_pack_ids = response_items
+                .iter()
+                .filter_map(|item| item.pack.as_ref().map(|pack| pack.pack_id.clone()))
+                .collect::<HashSet<_>>();
+            pack_items.retain(|pack| visible_pack_ids.contains(&pack.id));
+            for pack in &mut pack_items {
+                pack.created_at = 0;
+                pack.updated_at = 0;
+            }
+        }
 
         let response_payload = SkillListResponse {
             snapshot_version: self.current_skills_snapshot_version(),

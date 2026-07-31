@@ -39,6 +39,59 @@ async fn migrated_store() -> (DatabaseConnection, CrudStore) {
     (database, store)
 }
 
+#[tokio::test]
+async fn frozen_source_is_revalidated_before_canonical_history_rendering() {
+    let (database, store) = migrated_store().await;
+    let source_thread = thread("ws_history_a", "thread_revalidated_source", START_AT);
+    let source_turn = turn("turn_revalidated_source");
+    start(
+        &store,
+        &source_thread,
+        &source_turn,
+        "private source sentinel",
+    )
+    .await;
+    complete(&store, &source_thread, source_turn, START_AT + 1).await;
+
+    let sources = store
+        .list_self_improvement_source_turns_after("ws_history_a", 0, 0, 10)
+        .await
+        .expect("workspace-visible source must be selected");
+    let frozen = frozen_range("ws_history_a", 0, sources);
+    database
+        .execute_unprepared(
+            "UPDATE thread SET access_class = 'private' \
+             WHERE id = 'thread_revalidated_source'",
+        )
+        .await
+        .expect("source visibility must change");
+    assert!(
+        store
+            .list_self_improvement_source_turns_after("ws_history_a", 0, 0, 10)
+            .await
+            .expect("source selection revalidation must succeed")
+            .is_empty(),
+        "private source must be removed before pagination/history hydration"
+    );
+    assert_eq!(
+        store
+            .self_improvement_source_head("ws_history_a")
+            .await
+            .expect("immutable source ledger head must remain readable"),
+        frozen.source_upper_inclusive,
+        "visibility filtering must not delete historical provenance"
+    );
+
+    let error = store
+        .list_canonical_turn_events_for_self_improvement(&frozen)
+        .await
+        .expect_err("cached source must be rejected after visibility loss");
+    assert!(
+        error.to_string().contains("no longer workspace-visible"),
+        "unexpected source revalidation error: {error:#}"
+    );
+}
+
 fn thread(workspace_id: &str, thread_id: &str, timestamp: i64) -> Thread {
     thread_with_origin(
         workspace_id,
@@ -72,6 +125,7 @@ fn thread_with_origin(
         sidebar_visibility,
         agent_nickname: None,
         agent_role: None,
+        visibility: None,
         turns: Vec::new(),
     }
 }
@@ -136,6 +190,23 @@ async fn start(store: &CrudStore, thread: &Thread, turn: &Turn, text: &str) {
         )
         .await
         .expect("turn start must persist");
+    if matches!(
+        thread.origin_kind,
+        ThreadOriginKind::Collaborative | ThreadOriginKind::DirectMessage | ThreadOriginKind::User
+    ) && thread.sidebar_visibility == ThreadSidebarVisibility::Visible
+    {
+        store
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    thread.id
+                )
+                .as_str(),
+            )
+            .await
+            .expect("canonical self-improvement fixture must be workspace-visible");
+    }
 }
 
 async fn complete(store: &CrudStore, thread: &Thread, mut turn: Turn, timestamp: i64) {

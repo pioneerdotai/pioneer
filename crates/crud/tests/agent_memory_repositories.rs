@@ -642,6 +642,7 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
             scopes: vec![scope(MemoryScopeKind::Workspace, "ws_memory_a")],
             categories: vec![MemoryCategory::ProjectFact],
             statuses: vec![MemoryCandidateStatus::Pending],
+            allowed_source_thread_ids: None,
             limit: None,
             workspace_guard: None,
         })

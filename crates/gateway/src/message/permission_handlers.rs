@@ -1,4 +1,5 @@
 use super::*;
+use crate::authorization::{AuthorizationExternalError, AuthorizedTurn};
 
 impl MessageProcessor {
     pub(super) async fn open_native_permission_request(
@@ -29,6 +30,84 @@ impl MessageProcessor {
                 });
             return;
         };
+        let authorization_context = match self
+            .revalidate_execution_authorization_for_turn(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                crate::authorization::ResourceAction::ThreadWrite,
+            )
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "denied permission request without current initiating authority"
+                );
+                let _ =
+                    request
+                        .respond_to
+                        .send(pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "turn authorization is no longer active".to_owned(),
+                        });
+                return;
+            }
+        };
+        let session =
+            match pioneer_crud::load_session(
+                &self.crud_store.database_connection(),
+                authorization_context.initiating_session_id(),
+            )
+            .await
+            {
+                Ok(Some(session)) if session.refresh_generation >= 0 => session,
+                Ok(_) => {
+                    let _ = request.respond_to.send(
+                        pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "turn authorization is no longer active".to_owned(),
+                        },
+                    );
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to bind permission request to initiating session generation"
+                    );
+                    let _ = request.respond_to.send(
+                        pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "turn authorization is unavailable".to_owned(),
+                        },
+                    );
+                    return;
+                }
+            };
+        let authorization_context_fingerprint =
+            match authorization_context.authorization_fingerprint() {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to fingerprint permission authorization context"
+                    );
+                    let _ = request.respond_to.send(
+                        pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "turn authorization is unavailable".to_owned(),
+                        },
+                    );
+                    return;
+                }
+            };
 
         let visible_thread_ids = self
             .native_permission_visible_thread_ids(thread_id.as_str())
@@ -51,6 +130,10 @@ impl MessageProcessor {
             workspace_id: workspace_id.clone(),
             thread_id,
             turn_id,
+            initiating_principal_id: authorization_context.initiating_principal_id().clone(),
+            initiating_session_id: authorization_context.initiating_session_id().clone(),
+            initiating_session_generation: session.refresh_generation,
+            authorization_context_fingerprint,
             request: protocol_request.clone(),
             respond_to: request.respond_to,
         };
@@ -66,8 +149,9 @@ impl MessageProcessor {
                 .send(pioneer_tools::PermissionApprovalResolution::Expired);
         }
 
-        self.send_notification_to_workspace_connections(
-            workspace_id.as_str(),
+        let notification_thread_ids = native_permission_notification_thread_ids(&protocol_request);
+        self.send_notification_to_thread_subscription_scopes(
+            notification_thread_ids.as_slice(),
             events::TURN_PERMISSION_REQUEST_OPENED,
             &TurnPermissionRequestOpenedNotification {
                 request: protocol_request,
@@ -101,7 +185,8 @@ impl MessageProcessor {
         requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
 
         for request in requests {
-            self.send_notification_to_connections(
+            self.send_notification_to_authorized_thread_connections(
+                thread_id,
                 events::TURN_PERMISSION_REQUEST_OPENED,
                 &TurnPermissionRequestOpenedNotification {
                     request: request.clone(),
@@ -117,7 +202,8 @@ impl MessageProcessor {
                 .get(request.request_id.as_str())
                 .is_some_and(|pending| pending.request == request);
             if !still_pending {
-                self.send_notification_to_connections(
+                self.send_notification_to_authorized_thread_connections(
+                    thread_id,
                     events::TURN_PERMISSION_REQUEST_RESOLVED,
                     &TurnPermissionRequestResolvedNotification {
                         request_id: request.request_id,
@@ -136,52 +222,164 @@ impl MessageProcessor {
     pub(super) async fn turn_permission_request_respond(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedTurn,
         request_id: RequestId,
         params: TurnPermissionRequestRespondParams,
     ) {
         let connection_id = request_context.connection_id();
-        let pending = self
-            .native_permission_pending_requests
-            .lock()
-            .await
-            .remove(params.request_id.as_str());
+        let pending_identity = {
+            let pending = self.native_permission_pending_requests.lock().await;
+            pending.get(params.request_id.as_str()).map(|pending| {
+                (
+                    pending.workspace_id.clone(),
+                    pending.thread_id.clone(),
+                    pending.turn_id.clone(),
+                    pending.initiating_principal_id.clone(),
+                    pending.initiating_session_id.clone(),
+                    pending.initiating_session_generation,
+                    pending.authorization_context_fingerprint.clone(),
+                )
+            })
+        };
 
-        let Some(pending) = pending else {
+        let Some((
+            pending_workspace_id,
+            pending_thread_id,
+            pending_turn_id,
+            initiating_principal_id,
+            initiating_session_id,
+            initiating_session_generation,
+            authorization_context_fingerprint,
+        )) = pending_identity
+        else {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("stale permission request `{}`", params.request_id),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         };
 
-        if let Some(connection_workspace_id) = self
-            .session_manager
-            .connection_workspace_id(connection_id)
-            .await
-            && connection_workspace_id != pending.workspace_id
+        if authorization.workspace_id() != pending_workspace_id
+            || authorization.thread_id() != pending_thread_id
+            || authorization.turn_id() != pending_turn_id
+            || request_context.principal().principal_id != initiating_principal_id
+            || request_context.principal().session_id != initiating_session_id
         {
-            let _ = pending
-                .respond_to
-                .send(pioneer_tools::PermissionApprovalResolution::Expired);
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "permission request `{}` belongs to workspace `{}`",
-                        params.request_id, pending.workspace_id
-                    ),
-                ),
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
         }
+
+        let current_context = match self
+            .revalidate_execution_authorization_for_turn(
+                pending_workspace_id.as_str(),
+                pending_thread_id.as_str(),
+                pending_turn_id.as_str(),
+                crate::authorization::ResourceAction::ThreadWrite,
+            )
+            .await
+        {
+            Ok(context)
+                if context.initiating_principal_id() == &initiating_principal_id
+                    && context.initiating_session_id() == &initiating_session_id
+                    && context
+                        .authorization_fingerprint()
+                        .is_ok_and(|current| current == authorization_context_fingerprint) =>
+            {
+                context
+            }
+            Ok(_) | Err(_) => {
+                self.expire_native_permission_request_after_authority_loss(
+                    params.request_id.as_str(),
+                    &pending_workspace_id,
+                    &pending_thread_id,
+                    &pending_turn_id,
+                    &initiating_principal_id,
+                    &initiating_session_id,
+                    initiating_session_generation,
+                    authorization_context_fingerprint.as_str(),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let current_session = pioneer_crud::load_session(
+            &self.crud_store.database_connection(),
+            current_context.initiating_session_id(),
+        )
+        .await;
+        if !matches!(
+            current_session,
+            Ok(Some(session)) if session.refresh_generation == initiating_session_generation
+        ) {
+            self.expire_native_permission_request_after_authority_loss(
+                params.request_id.as_str(),
+                &pending_workspace_id,
+                &pending_thread_id,
+                &pending_turn_id,
+                &initiating_principal_id,
+                &initiating_session_id,
+                initiating_session_generation,
+                authorization_context_fingerprint.as_str(),
+            )
+            .await;
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+
+        if let Some(connection_workspace_id) = self
+            .session_manager
+            .connection_workspace_id(connection_id)
+            .await
+            && connection_workspace_id != pending_workspace_id
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+
+        let pending = {
+            let mut requests = self.native_permission_pending_requests.lock().await;
+            let unchanged = requests
+                .get(params.request_id.as_str())
+                .is_some_and(|pending| {
+                    pending.workspace_id == pending_workspace_id
+                        && pending.thread_id == pending_thread_id
+                        && pending.turn_id == pending_turn_id
+                        && pending.initiating_principal_id == initiating_principal_id
+                        && pending.initiating_session_id == initiating_session_id
+                        && pending.initiating_session_generation == initiating_session_generation
+                        && pending.authorization_context_fingerprint
+                            == authorization_context_fingerprint
+                });
+            unchanged
+                .then(|| requests.remove(params.request_id.as_str()))
+                .flatten()
+        };
+        let Some(pending) = pending else {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        };
 
         let resolution = params.resolution;
         let _ = pending
@@ -195,6 +393,7 @@ impl MessageProcessor {
         self.send_turn_permission_response(connection_id, request_id, &response)
             .await;
 
+        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
         let workspace_id = pending.workspace_id.clone();
         let notification = TurnPermissionRequestResolvedNotification {
             request_id: params.request_id,
@@ -203,8 +402,8 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution,
         };
-        self.send_notification_to_workspace_connections(
-            workspace_id.as_str(),
+        self.send_notification_to_thread_subscription_scopes(
+            notification_thread_ids.as_slice(),
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
         )
@@ -226,6 +425,7 @@ impl MessageProcessor {
             .respond_to
             .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
 
+        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
         let workspace_id = pending.workspace_id.clone();
         let notification = TurnPermissionRequestResolvedNotification {
             request_id: request_id.to_owned(),
@@ -234,10 +434,143 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution: TurnPermissionApprovalResolution::Cancelled,
         };
-        self.send_notification_to_workspace_connections(
-            workspace_id.as_str(),
+        self.send_notification_to_thread_subscription_scopes(
+            notification_thread_ids.as_slice(),
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
+        )
+        .await;
+    }
+
+    pub(super) async fn expire_native_permission_requests_without_current_authority(
+        &self,
+        workspace_id: &str,
+        affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
+    ) {
+        let candidates = self
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .values()
+            .filter(|pending| {
+                pending.workspace_id == workspace_id
+                    && affected_principal_id
+                        .is_none_or(|principal_id| &pending.initiating_principal_id == principal_id)
+            })
+            .map(|pending| {
+                (
+                    pending.request.request_id.clone(),
+                    pending.workspace_id.clone(),
+                    pending.thread_id.clone(),
+                    pending.turn_id.clone(),
+                    pending.initiating_principal_id.clone(),
+                    pending.initiating_session_id.clone(),
+                    pending.initiating_session_generation,
+                    pending.authorization_context_fingerprint.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (
+            request_id,
+            pending_workspace_id,
+            pending_thread_id,
+            pending_turn_id,
+            initiating_principal_id,
+            initiating_session_id,
+            initiating_session_generation,
+            authorization_context_fingerprint,
+        ) in candidates
+        {
+            let authority_is_current = match self
+                .revalidate_execution_authorization_for_turn(
+                    pending_workspace_id.as_str(),
+                    pending_thread_id.as_str(),
+                    pending_turn_id.as_str(),
+                    crate::authorization::ResourceAction::ThreadWrite,
+                )
+                .await
+            {
+                Ok(context)
+                    if context.initiating_principal_id() == &initiating_principal_id
+                        && context.initiating_session_id() == &initiating_session_id
+                        && context
+                            .authorization_fingerprint()
+                            .is_ok_and(|current| current == authorization_context_fingerprint) =>
+                {
+                    matches!(
+                        pioneer_crud::load_session(
+                            &self.crud_store.database_connection(),
+                            context.initiating_session_id(),
+                        )
+                        .await,
+                        Ok(Some(session))
+                            if session.refresh_generation == initiating_session_generation
+                    )
+                }
+                Ok(_) | Err(_) => false,
+            };
+            if authority_is_current {
+                continue;
+            }
+            self.expire_native_permission_request_after_authority_loss(
+                request_id.as_str(),
+                pending_workspace_id.as_str(),
+                pending_thread_id.as_str(),
+                pending_turn_id.as_str(),
+                &initiating_principal_id,
+                &initiating_session_id,
+                initiating_session_generation,
+                authorization_context_fingerprint.as_str(),
+            )
+            .await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn expire_native_permission_request_after_authority_loss(
+        &self,
+        request_id: &str,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        initiating_principal_id: &pioneer_protocol::PrincipalId,
+        initiating_session_id: &pioneer_protocol::AuthSessionId,
+        initiating_session_generation: i64,
+        authorization_context_fingerprint: &str,
+    ) {
+        let pending = {
+            let mut requests = self.native_permission_pending_requests.lock().await;
+            let unchanged = requests.get(request_id).is_some_and(|pending| {
+                pending.workspace_id == workspace_id
+                    && pending.thread_id == thread_id
+                    && pending.turn_id == turn_id
+                    && &pending.initiating_principal_id == initiating_principal_id
+                    && &pending.initiating_session_id == initiating_session_id
+                    && pending.initiating_session_generation == initiating_session_generation
+                    && pending.authorization_context_fingerprint
+                        == authorization_context_fingerprint
+            });
+            unchanged.then(|| requests.remove(request_id)).flatten()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+
+        let _ = pending
+            .respond_to
+            .send(pioneer_tools::PermissionApprovalResolution::Expired);
+        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
+        self.send_notification_to_thread_subscription_scopes(
+            notification_thread_ids.as_slice(),
+            events::TURN_PERMISSION_REQUEST_RESOLVED,
+            &TurnPermissionRequestResolvedNotification {
+                request_id: request_id.to_owned(),
+                workspace_id: pending.workspace_id,
+                thread_id: pending.thread_id,
+                turn_id: pending.turn_id,
+                resolution: TurnPermissionApprovalResolution::Expired,
+            },
         )
         .await;
     }
@@ -306,6 +639,15 @@ impl MessageProcessor {
 
         visible_thread_ids
     }
+}
+
+fn native_permission_notification_thread_ids(
+    request: &TurnPermissionApprovalRequest,
+) -> Vec<String> {
+    let mut thread_ids = Vec::with_capacity(1 + request.visible_thread_ids.len());
+    thread_ids.push(request.thread_id.clone());
+    thread_ids.extend(request.visible_thread_ids.iter().cloned());
+    thread_ids
 }
 
 fn permission_approval_resolution_from_protocol(

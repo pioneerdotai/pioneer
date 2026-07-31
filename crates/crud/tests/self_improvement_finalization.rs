@@ -30,10 +30,11 @@ async fn setup() -> (DatabaseConnection, CrudStore) {
             INSERT INTO workspace (id, name, is_active, is_current)
             VALUES ('{WORKSPACE}', 'Finalize', 1, 1);
             INSERT INTO thread (
-                id, workspace_id, preview, mode, model, model_provider, status, origin_kind
+                id, workspace_id, preview, mode, model, model_provider, status, origin_kind,
+                access_class
             ) VALUES (
                 'thread_finalize', '{WORKSPACE}', '', 'agent', 'gpt-5.4', 'openai',
-                'active', 'user'
+                'active', 'user', 'workspace'
             );
             INSERT INTO turn (id, thread_id, status, turn_kind, origin)
             VALUES
@@ -55,6 +56,9 @@ async fn setup() -> (DatabaseConnection, CrudStore) {
                 workspace_id, thread_id, turn_id, terminal_event_id, terminal_at, created_at
             ) VALUES (
                 '{WORKSPACE}', 'thread_finalize', '{ANCHOR_TURN}', 'event_new_anchor',
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            ), (
+                '{WORKSPACE}', 'thread_finalize', '{CONTEXT_TURN}', 'event_context',
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             );
             "#
@@ -285,6 +289,44 @@ async fn accepted_create_is_atomic_active_and_idempotent() {
         )
         .await,
         1
+    );
+}
+
+#[tokio::test]
+async fn accepted_version_fails_closed_if_source_loses_workspace_visibility() {
+    let (database, store) = setup().await;
+    let input = claimed_input(&store).await;
+    database
+        .execute_unprepared(
+            "UPDATE thread SET access_class = 'private' WHERE id = 'thread_finalize'",
+        )
+        .await
+        .expect("source thread must become private");
+
+    assert_eq!(
+        store
+            .finalize_self_improvement_run(input, NOW + 3)
+            .await
+            .expect("visibility loss must be a safe stale outcome"),
+        FinalizeSelfImprovementRunResult::Stale
+    );
+    assert_eq!(
+        scalar_i64(
+            &database,
+            "SELECT COUNT(*) AS value FROM agent_skill_version"
+        )
+        .await,
+        0,
+        "a new version must not persist after source visibility loss"
+    );
+    assert_eq!(
+        scalar_i64(
+            &database,
+            "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
+        )
+        .await,
+        2,
+        "historical source provenance must remain inspectable"
     );
 }
 

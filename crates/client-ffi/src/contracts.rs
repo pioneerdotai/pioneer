@@ -140,7 +140,70 @@ pub fn reduce_gateway_ws_events_to_client_events(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::ClientFfiVoiceAudioChunkParams;
+    use pioneer_protocol::{JSONRPC_VERSION, JsonRpcNotification, constants::events};
+    use serde_json::json;
+
+    #[test]
+    fn access_changed_event_round_trip_is_additive_and_payload_safe() {
+        let notification =
+            GatewayNotification::AccessChanged(pioneer_protocol::AccessChangedNotification {
+                authorization_revision: 11,
+                workspace_id: "workspace_a".to_owned(),
+                thread_id: Some("thread_a".to_owned()),
+                change: pioneer_protocol::AccessChangeKind::ThreadParticipantRemoved,
+            });
+        let event = ClientEvent::GatewayNotification(notification);
+        let encoded = serde_json::to_value(&event).expect("client event JSON");
+        assert_eq!(
+            encoded,
+            json!({
+                "GatewayNotification": {
+                    "kind": "access_changed",
+                    "params": {
+                        "authorization_revision": 11,
+                        "workspace_id": "workspace_a",
+                        "thread_id": "thread_a",
+                        "change": "thread_participant_removed"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientEvent>(encoded).expect("client event round-trip"),
+            event
+        );
+    }
+
+    #[test]
+    fn future_access_change_kind_degrades_to_unknown_notification_at_bridge() {
+        let notification = GatewayNotification::from_jsonrpc(JsonRpcNotification {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: events::ACCESS_CHANGED.to_owned(),
+            params: Some(json!({
+                "authorization_revision": 12,
+                "workspace_id": "workspace_a",
+                "change": "future_access_change"
+            })),
+        })
+        .expect("notification fallback");
+
+        let events = reduce_gateway_ws_events_to_client_events(
+            [GatewayWsEvent::Notification {
+                connection_id: 1,
+                notification,
+            }],
+            ClientRuntimeWsEventContext::default(),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ClientEvent::GatewayNotification(GatewayNotification::Unknown(
+                unknown
+            ))] if unknown.method == events::ACCESS_CHANGED
+        ));
+    }
 
     #[test]
     fn mobile_nitro_voice_array_buffer_uses_the_shared_binary_frame_contract() {

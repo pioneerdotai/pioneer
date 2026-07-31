@@ -765,8 +765,7 @@ impl MessageProcessor {
             } => self.handle_turn_skills_resolved_event(thread_id, turn_id, bindings),
             event => message_future(async move {
                 let thread_id = durable_event_thread_id(&event).map(str::to_owned);
-                let committed =
-                    message_future(self.persist_durable_agent_event(event.clone())).await;
+                let committed = self.persist_durable_agent_event(event.clone()).await;
                 if committed {
                     if let AgentDurableEvent::ItemCompleted { notification } = &event {
                         self.ingest_committed_thread_item(notification).await;
@@ -805,12 +804,22 @@ impl MessageProcessor {
                 );
                 return false;
             }
-            self.persist_turn_skill_bindings(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                bindings.as_slice(),
-            )
-            .await;
+            if let Err(error) = self
+                .persist_turn_skill_projection(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    bindings.as_slice(),
+                )
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist and authorize exact turn skill projection"
+                );
+                return false;
+            }
             let committed_event = AgentDurableEvent::TurnSkillsResolved {
                 thread_id: thread_id.clone(),
                 turn_id,
@@ -909,12 +918,51 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn persist_turn_skill_bindings(
+    async fn persist_turn_skill_projection(
         &self,
         thread_id: &str,
         turn_id: &str,
         bindings: &[pioneer_protocol::TurnSkillBinding],
-    ) {
+    ) -> Result<()> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load execution authorization for skill projection")?;
+        let context = if let Some(mut context) = context {
+            let revalidated = context
+                .revalidate_for_turn_scope(
+                    self.crud_store.as_ref(),
+                    context.workspace_id(),
+                    thread_id,
+                    turn_id,
+                    crate::authorization::ResourceAction::ThreadWrite,
+                    self.authorization_invalidation_hub.current_revision(),
+                )
+                .await
+                .context("current execution authorization no longer permits skill use")?;
+            if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
+                self.revalidate_member_skill_bindings(
+                    revalidated.principal(),
+                    context.workspace_id(),
+                    bindings,
+                )
+                .await?;
+            }
+            let workspace_id = context.workspace_id().to_owned();
+            context
+                .bind_skill_projection(workspace_id.as_str(), bindings)
+                .context("failed to bind exact skill projection")?;
+            Some(context)
+        } else {
+            crate::authorization::ensure_contextless_execution_is_trusted(
+                self.crud_store.as_ref(),
+                turn_id,
+            )
+            .await
+            .context("contextless skill projection is not a trusted legacy execution")?;
+            None
+        };
+
         let event_timestamp = now_timestamp_secs();
         let binding_records = bindings
             .iter()
@@ -928,18 +976,349 @@ impl MessageProcessor {
                 resolved_reason: binding.resolved_reason.clone(),
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self
-            .crud_store
-            .replace_turn_skill_bindings(turn_id, binding_records.as_slice(), event_timestamp)
-            .await
+        if let Some(context) = context {
+            let encoded = context
+                .to_persisted_json()
+                .context("failed to encode skill-bound execution authorization")?;
+            self.crud_store
+                .replace_turn_skill_bindings_with_authorization_context(
+                    turn_id,
+                    binding_records.as_slice(),
+                    event_timestamp,
+                    encoded.as_str(),
+                )
+                .await
+                .context("failed to persist authorized turn skill projection")?;
+        } else {
+            self.crud_store
+                .replace_turn_skill_bindings(turn_id, binding_records.as_slice(), event_timestamp)
+                .await
+                .context("failed to persist exact turn skill bindings")?;
+        }
+        Ok(())
+    }
+
+    async fn revalidate_member_skill_bindings(
+        &self,
+        principal: &crate::auth::AuthenticatedSessionPrincipal,
+        workspace_id: &str,
+        bindings: &[pioneer_protocol::TurnSkillBinding],
+    ) -> Result<()> {
+        let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            crate::authorization::ResourceAction::SkillUse,
+        );
+        let resolver =
+            crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone());
+        let base_catalog = if bindings
+            .iter()
+            .any(|binding| binding.source_kind != "agent")
         {
-            warn!(
+            let context = self
+                .skills_runtime_context(workspace_id)
+                .context("failed to resolve current skills runtime context")?;
+            Some(
+                self.load_skills_catalog(workspace_id, &context)
+                    .await
+                    .context("failed to load current skills catalog")?,
+            )
+        } else {
+            None
+        };
+        let installations = self
+            .crud_store
+            .list_skill_installations()
+            .await
+            .context("failed to load current skill installations")?
+            .into_iter()
+            .map(|installation| (installation.skill_id.clone(), installation))
+            .collect::<HashMap<_, _>>();
+        let active_learned = self
+            .crud_store
+            .list_active_agent_skill_versions(workspace_id)
+            .await
+            .context("failed to load active learned skill versions")?
+            .into_iter()
+            .map(|version| (version.skill_id.clone(), version))
+            .collect::<HashMap<_, _>>();
+        let database = self.crud_store.database_connection();
+
+        for binding in bindings {
+            let authorization = resolver
+                .authorize_persisted_capability(
+                    principal,
+                    &action_gate,
+                    crate::authorization::ResourceAction::SkillUse,
+                    workspace_id,
+                    crate::authorization::CapabilityKind::Skill,
+                    binding.skill_id.as_str(),
+                )
+                .await
+                .context("failed to resolve current workspace skill policy")?;
+            if !matches!(
+                authorization,
+                crate::authorization::ProofResolution::Authorized(_)
+            ) {
+                bail!(
+                    "current workspace policy no longer permits skill `{}`",
+                    binding.skill_id
+                );
+            }
+
+            if binding.source_kind == "agent" {
+                let active = active_learned.get(&binding.skill_id).with_context(|| {
+                    format!("learned skill `{}` is no longer active", binding.skill_id)
+                })?;
+                let active_version = active.version.version_number.to_string();
+                if binding.skill_version.as_deref() != Some(active_version.as_str())
+                    || binding.fingerprint != active.version.fingerprint
+                {
+                    bail!(
+                        "learned skill `{}` no longer matches its immutable projection",
+                        binding.skill_id
+                    );
+                }
+                if pioneer_crud::derive_member_learned_version_eligibility(
+                    &database,
+                    workspace_id,
+                    active.version.id.as_str(),
+                )
+                .await
+                .context("failed to revalidate learned skill provenance")?
+                    != pioneer_crud::MemberLearnedVersionEligibility::Eligible
+                {
+                    bail!(
+                        "learned skill `{}` is not eligible for Member use",
+                        binding.skill_id
+                    );
+                }
+                continue;
+            }
+
+            let skill = base_catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog
+                        .skills
+                        .iter()
+                        .find(|skill| skill.identity.skill_id == binding.skill_id)
+                })
+                .with_context(|| format!("skill `{}` is no longer installed", binding.skill_id))?;
+            if !skill.is_available()
+                || skill.identity.fingerprint != binding.fingerprint
+                || skill.identity.version_hint != binding.skill_version
+                || skill.identity.source_kind.as_db_value() != binding.source_kind
+            {
+                bail!(
+                    "skill `{}` no longer matches its immutable projection",
+                    binding.skill_id
+                );
+            }
+            if !matches!(
+                skill.identity.source_kind,
+                pioneer_skills::SkillSourceKind::System
+            ) {
+                let installation = installations.get(&binding.skill_id).with_context(|| {
+                    format!("skill `{}` is no longer installed", binding.skill_id)
+                })?;
+                if installation.scope_key != workspace_id
+                    || installation.fingerprint != binding.fingerprint
+                    || installation.version != binding.skill_version
+                    || installation.source_kind != binding.source_kind
+                {
+                    bail!(
+                        "skill `{}` current installation differs from its projection",
+                        binding.skill_id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn revalidate_persisted_turn_skill_projection(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        let Some(context) = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load persisted execution authorization for skills")?
+        else {
+            crate::authorization::ensure_contextless_execution_is_trusted(
+                self.crud_store.as_ref(),
+                turn_id,
+            )
+            .await
+            .context("contextless skill continuation is not a trusted legacy execution")?;
+            return Ok(());
+        };
+        let bindings = self
+            .crud_store
+            .find_turn_skill_bindings(turn_id)
+            .await
+            .context("failed to load persisted turn skill bindings")?
+            .into_iter()
+            .map(|binding| pioneer_protocol::TurnSkillBinding {
+                skill_id: binding.skill_id,
+                skill_owner: binding.skill_owner,
+                skill_slug: binding.skill_slug,
+                skill_version: binding.skill_version,
+                fingerprint: binding.fingerprint,
+                source_kind: binding.source_kind,
+                resolved_reason: binding.resolved_reason,
+            })
+            .collect::<Vec<_>>();
+        context
+            .verify_skill_projection(context.workspace_id(), bindings.as_slice())
+            .context("persisted turn skill projection is stale or unbound")?;
+        let revalidated = context
+            .revalidate_for_turn_scope(
+                self.crud_store.as_ref(),
+                context.workspace_id(),
                 thread_id,
                 turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist turn skill bindings; continuing without persistence"
-            );
+                crate::authorization::ResourceAction::ThreadWrite,
+                self.authorization_invalidation_hub.current_revision(),
+            )
+            .await
+            .context("current execution authorization no longer permits skill continuation")?;
+        if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
+            self.revalidate_member_skill_bindings(
+                revalidated.principal(),
+                context.workspace_id(),
+                bindings.as_slice(),
+            )
+            .await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn authorize_persisted_turn_skill_continuation(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        skill_id: &pioneer_skills::SkillId,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.revalidate_persisted_turn_skill_projection(thread_id, turn_id)
+            .await?;
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load execution authorization for skill continuation")?
+            .context("skill continuation has no execution authorization context")?;
+        if context.workspace_id() != workspace_id {
+            bail!("skill continuation differs from its authorized execution boundary");
+        }
+        let exact_binding_exists = self
+            .crud_store
+            .find_turn_skill_bindings(turn_id)
+            .await
+            .context("failed to load exact skill continuation binding")?
+            .into_iter()
+            .any(|binding| binding.skill_id == *skill_id && binding.fingerprint == fingerprint);
+        if !exact_binding_exists {
+            bail!("requested skill is absent from the immutable turn projection");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn revalidate_execution_authorization_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<crate::authorization::ExecutionAuthorizationContext> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load execution authorization context")?
+            .context("turn has no initiating execution authorization context")?;
+        context
+            .revalidate_for_turn_scope(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                action,
+                self.authorization_invalidation_hub.current_revision(),
+            )
+            .await
+            .context("initiating authority no longer permits turn continuation")?;
+        Ok(context)
+    }
+
+    /// Revalidates the immutable authority envelope used by in-process tool
+    /// providers. Legacy System/Superuser turns may have no envelope; a
+    /// persisted Member initiator may never fall back to that unrestricted
+    /// boundary.
+    pub(crate) async fn revalidate_tool_execution_authorization(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        member_principal_hint: Option<&str>,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<Option<crate::authorization::RevalidatedExecutionAuthorization>> {
+        if let Some(context) = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load tool execution authorization context")?
+        {
+            let current = context
+                .revalidate_for_turn_scope(
+                    self.crud_store.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    action,
+                    self.authorization_invalidation_hub.current_revision(),
+                )
+                .await
+                .context("tool execution authority is no longer current")?;
+            if let Some(principal_id) = member_principal_hint
+                && current.principal().principal_id.as_str() != principal_id
+            {
+                anyhow::bail!("tool execution principal differs from its turn context");
+            }
+            return Ok(Some(current));
+        }
+
+        if member_principal_hint.is_some() {
+            anyhow::bail!("Member tool execution has no authorization context");
+        }
+
+        let Some((stored_workspace_id, _)) = self.crud_store.get_turn(thread_id, turn_id).await?
+        else {
+            // Synthetic internal providers and pre-persistence tests retain
+            // the legacy boundary only when they carry no Member identity.
+            return Ok(None);
+        };
+        if stored_workspace_id != workspace_id {
+            anyhow::bail!("tool turn is outside its declared workspace");
+        }
+
+        if let Some(pioneer_protocol::PersistedActorRef::Principal(principal_id)) =
+            pioneer_crud::find_turn_initiator(&self.crud_store.database_connection(), turn_id)
+                .await?
+        {
+            let principal = pioneer_crud::load_principal_by_id(
+                &self.crud_store.database_connection(),
+                &principal_id,
+            )
+            .await?
+            .context("tool turn initiator no longer exists")?;
+            if principal.kind == pioneer_protocol::PrincipalKind::User {
+                anyhow::bail!("Member tool execution has no authorization context");
+            }
+        }
+
+        Ok(None)
     }
 
     pub(super) async fn handle_snapshot_agent_event(
@@ -1061,13 +1440,16 @@ impl MessageProcessor {
         });
     }
 
-    async fn persist_durable_agent_event(&self, event: AgentDurableEvent) -> bool {
+    fn persist_durable_agent_event<'a>(
+        &'a self,
+        event: AgentDurableEvent,
+    ) -> MessageFuture<'a, bool> {
         match event {
             AgentDurableEvent::PromptManifestCompiled {
                 thread_id,
                 turn_id,
                 manifest,
-            } => {
+            } => message_future(async move {
                 self.thread_manager
                     .set_turn_prompt_manifest(
                         thread_id.as_str(),
@@ -1104,26 +1486,37 @@ impl MessageProcessor {
                         );
                     }
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TurnSkillsResolved {
                 thread_id,
                 turn_id,
                 bindings,
-            } => {
-                self.persist_turn_skill_bindings(
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    bindings.as_slice(),
-                )
-                .await;
-            }
+            } => message_future(async move {
+                if let Err(error) = self
+                    .persist_turn_skill_projection(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        bindings.as_slice(),
+                    )
+                    .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to persist durable turn skill projection"
+                    );
+                }
+                true
+            }),
             AgentDurableEvent::TurnCapabilitiesResolved {
                 thread_id,
                 turn_id,
                 accepted,
                 rejected,
                 mcp_bindings,
-            } => {
+            } => message_future(async move {
                 debug!(
                     thread_id,
                     turn_id,
@@ -1141,12 +1534,13 @@ impl MessageProcessor {
                         "turn capability resolution rejected selected capabilities"
                     );
                 }
-            }
+                true
+            }),
             AgentDurableEvent::SkillAuditEvents {
                 thread_id,
                 turn_id,
                 events,
-            } => {
+            } => message_future(async move {
                 let mut records = Vec::new();
                 let mut dependency_snapshots = Vec::new();
 
@@ -1219,8 +1613,9 @@ impl MessageProcessor {
                         );
                     }
                 }
-            }
-            AgentDurableEvent::TurnPermissionAudit { event } => {
+                true
+            }),
+            AgentDurableEvent::TurnPermissionAudit { event } => message_future(async move {
                 let event_timestamp = now_timestamp_secs();
                 if let Err(error) = self
                     .crud_store
@@ -1235,7 +1630,8 @@ impl MessageProcessor {
                     );
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TurnLlmContextAppended {
                 thread_id,
                 turn_id,
@@ -1246,7 +1642,7 @@ impl MessageProcessor {
                 tool_name,
                 payload,
                 output_policy_snapshot,
-            } => {
+            } => message_future(async move {
                 let sequence = self
                     .next_turn_llm_context_sequence(turn_id.as_str(), sequence)
                     .await;
@@ -1274,14 +1670,15 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TurnProviderHistoryAppended {
                 thread_id,
                 turn_id,
                 item_id,
                 sequence,
                 payload,
-            } => {
+            } => message_future(async move {
                 let sequence = self
                     .next_turn_llm_context_sequence(turn_id.as_str(), sequence)
                     .await;
@@ -1319,8 +1716,9 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-            }
-            AgentDurableEvent::ItemStarted { notification } => {
+                true
+            }),
+            AgentDurableEvent::ItemStarted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_started_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
@@ -1375,8 +1773,9 @@ impl MessageProcessor {
                     item_type = ?notification.item.item_type(),
                     "registered item attempt deadlines during item/started projection"
                 );
-            }
-            AgentDurableEvent::ItemCompleted { notification } => {
+                true
+            }),
+            AgentDurableEvent::ItemCompleted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
                 self.record_final_assistant_text_for_item(&notification)
@@ -1420,312 +1819,338 @@ impl MessageProcessor {
                     Some(notification.workspace_id.as_str()),
                 )
                 .await;
-            }
+                true
+            }),
             AgentDurableEvent::ItemToolRetryScheduled { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_item_tool_retry_scheduled(notification.clone(), event_timestamp)
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id,
-                        turn_id,
-                        format!("failed to persist item/tool/retry_scheduled: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_TOOL_RETRY_SCHEDULED,
-                    &notification,
-                )
-                .await;
-                self.notify_semantic_timeline_work_item_id_changed(
-                    notification.workspace_id.as_str(),
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    notification.item_id.as_str(),
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
-            }
-            AgentDurableEvent::ItemToolRetryResolved { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_item_tool_retry_resolved(notification.clone(), event_timestamp)
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id,
-                        turn_id,
-                        format!("failed to persist item/tool/retry_resolved: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_TOOL_RETRY_RESOLVED,
-                    &notification,
-                )
-                .await;
-                self.notify_semantic_timeline_work_item_id_changed(
-                    notification.workspace_id.as_str(),
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    notification.item_id.as_str(),
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
-            }
-            AgentDurableEvent::ItemToolRetryExhausted { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_item_tool_retry_exhausted(notification.clone(), event_timestamp)
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id,
-                        turn_id,
-                        format!("failed to persist item/tool/retry_exhausted: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_TOOL_RETRY_EXHAUSTED,
-                    &notification,
-                )
-                .await;
-                self.notify_semantic_timeline_work_item_id_changed(
-                    notification.workspace_id.as_str(),
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    notification.item_id.as_str(),
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
-            }
-            AgentDurableEvent::TurnToolLoopBudgetExceeded { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_tool_loop_budget_exceeded(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id,
-                        turn_id,
-                        format!("failed to persist turn/tool_loop/budget_exceeded: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_TOOL_LOOP_BUDGET_EXCEEDED,
-                    &notification,
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
-            }
-            AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_execution_window_started(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id.clone(),
-                        turn_id.clone(),
-                        format!("failed to persist turn/execution_window/started: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                let latest = match self
-                    .crud_store
-                    .latest_turn_execution_window(notification.turn_id.as_str())
-                    .await
-                {
-                    Ok(latest) => latest,
-                    Err(error) => {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to load latest execution window: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                };
-                if execution_window_can_create_after(latest.as_ref(), notification.window_index) {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
                     if let Err(error) = self
                         .crud_store
-                        .create_turn_execution_window(
-                            pioneer_crud::NewTurnExecutionWindowRecord {
-                                workspace_id: notification.workspace_id.clone(),
-                                thread_id: notification.thread_id.clone(),
-                                turn_id: notification.turn_id.clone(),
-                                window_index: notification.window_index,
-                                status: notification.status,
-                                exhaustion_reason: None,
-                                agent_round_count: 0,
-                                tool_call_count: 0,
-                                provider_token_count: 0,
-                                metadata_json: execution_window_started_metadata(
-                                    notification.window_id.as_str(),
-                                ),
-                                started_at: db_timestamp_from_unix_ms(
-                                    notification.started_at_unix_ms,
-                                ),
-                            },
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                        .materialize_item_tool_retry_scheduled(
+                            notification.clone(),
+                            event_timestamp,
                         )
                         .await
                     {
                         self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to create execution window: {error:#}"),
+                            thread_id,
+                            turn_id,
+                            format!("failed to persist item/tool/retry_scheduled: {error:#}"),
                         )
                         .await;
                         return false;
                     }
-                } else if latest
-                    .as_ref()
-                    .is_some_and(|window| window.window_index < notification.window_index)
-                {
-                    warn!(
-                        turn_id = %notification.turn_id,
-                        latest_window_index = latest.as_ref().map(|window| window.window_index),
-                        event_window_index = notification.window_index,
-                        "skipping out-of-order execution window started event"
-                    );
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_EXECUTION_WINDOW_STARTED,
-                    &notification,
-                )
-                .await;
-            }
-            AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
-                let thread_id = notification.thread_id.clone();
-                let turn_id = notification.turn_id.clone();
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_execution_window_exhausted(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id.clone(),
-                        turn_id.clone(),
-                        format!("failed to persist turn/execution_window/exhausted: {error:#}"),
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_TOOL_RETRY_SCHEDULED,
+                        &notification,
                     )
                     .await;
-                    return false;
-                }
-                let latest = match self
-                    .crud_store
-                    .latest_turn_execution_window(notification.turn_id.as_str())
-                    .await
-                {
-                    Ok(latest) => latest,
-                    Err(error) => {
+                    self.notify_semantic_timeline_work_item_id_changed(
+                        notification.workspace_id.as_str(),
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        notification.item_id.as_str(),
+                    )
+                    .await;
+                    self.notify_parent_timeline_changed_for_child_turn(
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        Some(notification.workspace_id.as_str()),
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::ItemToolRetryResolved { notification } => {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_item_tool_retry_resolved(notification.clone(), event_timestamp)
+                        .await
+                    {
                         self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to load execution window for exhaustion: {error:#}"),
+                            thread_id,
+                            turn_id,
+                            format!("failed to persist item/tool/retry_resolved: {error:#}"),
                         )
                         .await;
                         return false;
                     }
-                };
-                let window = if latest
-                    .as_ref()
-                    .is_some_and(|window| window.window_index == notification.window_index)
-                {
-                    latest
-                } else if execution_window_can_create_after(
-                    latest.as_ref(),
-                    notification.window_index,
-                ) {
-                    match self
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_TOOL_RETRY_RESOLVED,
+                        &notification,
+                    )
+                    .await;
+                    self.notify_semantic_timeline_work_item_id_changed(
+                        notification.workspace_id.as_str(),
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        notification.item_id.as_str(),
+                    )
+                    .await;
+                    self.notify_parent_timeline_changed_for_child_turn(
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        Some(notification.workspace_id.as_str()),
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::ItemToolRetryExhausted { notification } => {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
                         .crud_store
-                        .create_turn_execution_window(
-                            pioneer_crud::NewTurnExecutionWindowRecord {
-                                workspace_id: notification.workspace_id.clone(),
-                                thread_id: notification.thread_id.clone(),
-                                turn_id: notification.turn_id.clone(),
-                                window_index: notification.window_index,
-                                status: pioneer_protocol::ExecutionWindowStatus::Running,
-                                exhaustion_reason: None,
-                                agent_round_count: 0,
-                                tool_call_count: 0,
-                                provider_token_count: 0,
-                                metadata_json: execution_window_started_metadata(
-                                    notification.window_id.as_str(),
-                                ),
-                                started_at: db_timestamp_from_unix_ms(
-                                    notification.started_at_unix_ms,
-                                ),
-                            },
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                        .materialize_item_tool_retry_exhausted(
+                            notification.clone(),
+                            event_timestamp,
                         )
                         .await
                     {
-                        Ok(window) => Some(window),
+                        self.report_legacy_turn_failure(
+                            thread_id,
+                            turn_id,
+                            format!("failed to persist item/tool/retry_exhausted: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_TOOL_RETRY_EXHAUSTED,
+                        &notification,
+                    )
+                    .await;
+                    self.notify_semantic_timeline_work_item_id_changed(
+                        notification.workspace_id.as_str(),
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        notification.item_id.as_str(),
+                    )
+                    .await;
+                    self.notify_parent_timeline_changed_for_child_turn(
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        Some(notification.workspace_id.as_str()),
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::TurnToolLoopBudgetExceeded { notification } => {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_turn_tool_loop_budget_exceeded(
+                            notification.clone(),
+                            event_timestamp,
+                        )
+                        .await
+                    {
+                        self.report_legacy_turn_failure(
+                            thread_id,
+                            turn_id,
+                            format!("failed to persist turn/tool_loop/budget_exceeded: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_TOOL_LOOP_BUDGET_EXCEEDED,
+                        &notification,
+                    )
+                    .await;
+                    self.notify_parent_timeline_changed_for_child_turn(
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                        Some(notification.workspace_id.as_str()),
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_turn_execution_window_started(
+                            notification.clone(),
+                            event_timestamp,
+                        )
+                        .await
+                    {
+                        self.report_legacy_turn_failure(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to persist turn/execution_window/started: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    let latest = match self
+                        .crud_store
+                        .latest_turn_execution_window(notification.turn_id.as_str())
+                        .await
+                    {
+                        Ok(latest) => latest,
                         Err(error) => {
                             self.report_legacy_turn_failure(
+                                thread_id.clone(),
+                                turn_id.clone(),
+                                format!("failed to load latest execution window: {error:#}"),
+                            )
+                            .await;
+                            return false;
+                        }
+                    };
+                    if execution_window_can_create_after(latest.as_ref(), notification.window_index)
+                    {
+                        if let Err(error) = self
+                            .crud_store
+                            .create_turn_execution_window(
+                                pioneer_crud::NewTurnExecutionWindowRecord {
+                                    workspace_id: notification.workspace_id.clone(),
+                                    thread_id: notification.thread_id.clone(),
+                                    turn_id: notification.turn_id.clone(),
+                                    window_index: notification.window_index,
+                                    status: notification.status,
+                                    exhaustion_reason: None,
+                                    agent_round_count: 0,
+                                    tool_call_count: 0,
+                                    provider_token_count: 0,
+                                    metadata_json: execution_window_started_metadata(
+                                        notification.window_id.as_str(),
+                                    ),
+                                    started_at: db_timestamp_from_unix_ms(
+                                        notification.started_at_unix_ms,
+                                    ),
+                                },
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            )
+                            .await
+                        {
+                            self.report_legacy_turn_failure(
+                                thread_id.clone(),
+                                turn_id.clone(),
+                                format!("failed to create execution window: {error:#}"),
+                            )
+                            .await;
+                            return false;
+                        }
+                    } else if latest
+                        .as_ref()
+                        .is_some_and(|window| window.window_index < notification.window_index)
+                    {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            latest_window_index = latest.as_ref().map(|window| window.window_index),
+                            event_window_index = notification.window_index,
+                            "skipping out-of-order execution window started event"
+                        );
+                    }
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_EXECUTION_WINDOW_STARTED,
+                        &notification,
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+                message_future(async move {
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_turn_execution_window_exhausted(
+                            notification.clone(),
+                            event_timestamp,
+                        )
+                        .await
+                    {
+                        self.report_legacy_turn_failure(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to persist turn/execution_window/exhausted: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    let latest = match self
+                        .crud_store
+                        .latest_turn_execution_window(notification.turn_id.as_str())
+                        .await
+                    {
+                        Ok(latest) => latest,
+                        Err(error) => {
+                            self.report_legacy_turn_failure(
+                                thread_id.clone(),
+                                turn_id.clone(),
+                                format!(
+                                    "failed to load execution window for exhaustion: {error:#}"
+                                ),
+                            )
+                            .await;
+                            return false;
+                        }
+                    };
+                    let window = if latest
+                        .as_ref()
+                        .is_some_and(|window| window.window_index == notification.window_index)
+                    {
+                        latest
+                    } else if execution_window_can_create_after(
+                        latest.as_ref(),
+                        notification.window_index,
+                    ) {
+                        match self
+                            .crud_store
+                            .create_turn_execution_window(
+                                pioneer_crud::NewTurnExecutionWindowRecord {
+                                    workspace_id: notification.workspace_id.clone(),
+                                    thread_id: notification.thread_id.clone(),
+                                    turn_id: notification.turn_id.clone(),
+                                    window_index: notification.window_index,
+                                    status: pioneer_protocol::ExecutionWindowStatus::Running,
+                                    exhaustion_reason: None,
+                                    agent_round_count: 0,
+                                    tool_call_count: 0,
+                                    provider_token_count: 0,
+                                    metadata_json: execution_window_started_metadata(
+                                        notification.window_id.as_str(),
+                                    ),
+                                    started_at: db_timestamp_from_unix_ms(
+                                        notification.started_at_unix_ms,
+                                    ),
+                                },
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            )
+                            .await
+                        {
+                            Ok(window) => Some(window),
+                            Err(error) => {
+                                self.report_legacy_turn_failure(
                                 thread_id.clone(),
                                 turn_id.clone(),
                                 format!(
@@ -1733,63 +2158,65 @@ impl MessageProcessor {
                                 ),
                             )
                             .await;
-                            return false;
+                                return false;
+                            }
                         }
-                    }
-                } else {
-                    warn!(
-                        turn_id = %notification.turn_id,
-                        latest_window_index = latest.as_ref().map(|window| window.window_index),
-                        event_window_index = notification.window_index,
-                        "skipping out-of-order execution window exhausted event"
-                    );
-                    None
-                };
-                if let Some(window) = window
-                    && let Err(error) = self
-                        .crud_store
-                        .mark_turn_execution_window_exhausted(
-                            window.id.as_str(),
-                            notification.exhaustion_reason,
-                            pioneer_crud::TurnExecutionWindowStatsRecord {
-                                agent_round_count: notification.agent_round_count,
-                                tool_call_count: notification.tool_call_count,
-                                provider_token_count: notification
-                                    .provider_token_count
-                                    .unwrap_or(0),
-                                metadata_json: execution_window_exhausted_metadata(
-                                    notification.window_id.as_str(),
-                                    notification.limit,
-                                    notification.observed,
-                                    notification.reason.as_str(),
-                                ),
-                                completed_at: db_timestamp_from_unix_ms(
-                                    notification.exhausted_at_unix_ms,
-                                ),
-                                updated_at: now_db_timestamp(),
-                            },
+                    } else {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            latest_window_index = latest.as_ref().map(|window| window.window_index),
+                            event_window_index = notification.window_index,
+                            "skipping out-of-order execution window exhausted event"
+                        );
+                        None
+                    };
+                    if let Some(window) = window
+                        && let Err(error) = self
+                            .crud_store
+                            .mark_turn_execution_window_exhausted(
+                                window.id.as_str(),
+                                notification.exhaustion_reason,
+                                pioneer_crud::TurnExecutionWindowStatsRecord {
+                                    agent_round_count: notification.agent_round_count,
+                                    tool_call_count: notification.tool_call_count,
+                                    provider_token_count: notification
+                                        .provider_token_count
+                                        .unwrap_or(0),
+                                    metadata_json: execution_window_exhausted_metadata(
+                                        notification.window_id.as_str(),
+                                        notification.limit,
+                                        notification.observed,
+                                        notification.reason.as_str(),
+                                    ),
+                                    completed_at: db_timestamp_from_unix_ms(
+                                        notification.exhausted_at_unix_ms,
+                                    ),
+                                    updated_at: now_db_timestamp(),
+                                },
+                            )
+                            .await
+                    {
+                        self.report_legacy_turn_failure(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to mark execution window exhausted: {error:#}"),
                         )
-                        .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id.clone(),
-                        turn_id.clone(),
-                        format!("failed to mark execution window exhausted: {error:#}"),
+                        .await;
+                        return false;
+                    }
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_EXECUTION_WINDOW_EXHAUSTED,
+                        &notification,
                     )
                     .await;
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_EXECUTION_WINDOW_EXHAUSTED,
-                    &notification,
-                )
-                .await;
+                    true
+                })
             }
             AgentDurableEvent::TurnExecutionWindowCheckpointed {
                 notification,
                 payload,
-            } => {
+            } => message_future(async move {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
@@ -1934,153 +2361,161 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
-            }
+                true
+            }),
             AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_execution_window_continued(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        notification.thread_id.clone(),
-                        notification.turn_id.clone(),
-                        format!("failed to persist turn/execution_window/continued: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                match self
-                    .crud_store
-                    .latest_turn_execution_window(notification.turn_id.as_str())
-                    .await
-                {
-                    Ok(Some(window))
-                        if window.window_index == notification.previous_window_index =>
+                message_future(async move {
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_turn_execution_window_continued(
+                            notification.clone(),
+                            event_timestamp,
+                        )
+                        .await
                     {
-                        if let Err(error) = self
-                            .crud_store
-                            .mark_turn_execution_window_continued(
-                                window.id.as_str(),
-                                db_timestamp_from_unix_ms(notification.continued_at_unix_ms),
-                            )
-                            .await
+                        self.report_legacy_turn_failure(
+                            notification.thread_id.clone(),
+                            notification.turn_id.clone(),
+                            format!("failed to persist turn/execution_window/continued: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    match self
+                        .crud_store
+                        .latest_turn_execution_window(notification.turn_id.as_str())
+                        .await
+                    {
+                        Ok(Some(window))
+                            if window.window_index == notification.previous_window_index =>
                         {
+                            if let Err(error) = self
+                                .crud_store
+                                .mark_turn_execution_window_continued(
+                                    window.id.as_str(),
+                                    db_timestamp_from_unix_ms(notification.continued_at_unix_ms),
+                                )
+                                .await
+                            {
+                                self.report_legacy_turn_failure(
+                                    notification.thread_id.clone(),
+                                    notification.turn_id.clone(),
+                                    format!("failed to mark execution window continued: {error:#}"),
+                                )
+                                .await;
+                                return false;
+                            }
+                        }
+                        Ok(Some(window)) => {
+                            warn!(
+                                turn_id = %notification.turn_id,
+                                latest_window_index = window.window_index,
+                                previous_window_index = notification.previous_window_index,
+                                "skipping out-of-order execution window continued state update"
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(
+                                turn_id = %notification.turn_id,
+                                previous_window_index = notification.previous_window_index,
+                                "skipping execution window continued state update without stored window"
+                            );
+                        }
+                        Err(error) => {
                             self.report_legacy_turn_failure(
                                 notification.thread_id.clone(),
                                 notification.turn_id.clone(),
-                                format!("failed to mark execution window continued: {error:#}"),
+                                format!(
+                                    "failed to load execution window for continuation: {error:#}"
+                                ),
                             )
                             .await;
                             return false;
                         }
                     }
-                    Ok(Some(window)) => {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            latest_window_index = window.window_index,
-                            previous_window_index = notification.previous_window_index,
-                            "skipping out-of-order execution window continued state update"
-                        );
-                    }
-                    Ok(None) => {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            previous_window_index = notification.previous_window_index,
-                            "skipping execution window continued state update without stored window"
-                        );
-                    }
-                    Err(error) => {
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_EXECUTION_WINDOW_CONTINUED,
+                        &notification,
+                    )
+                    .await;
+                    true
+                })
+            }
+            AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
+                message_future(async move {
+                    let event_timestamp = now_timestamp_secs();
+                    if let Err(error) = self
+                        .crud_store
+                        .materialize_turn_execution_window_blocked(
+                            notification.clone(),
+                            event_timestamp,
+                        )
+                        .await
+                    {
                         self.report_legacy_turn_failure(
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),
-                            format!("failed to load execution window for continuation: {error:#}"),
+                            format!("failed to persist turn/execution_window/blocked: {error:#}"),
                         )
                         .await;
                         return false;
                     }
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_EXECUTION_WINDOW_CONTINUED,
-                    &notification,
-                )
-                .await;
-            }
-            AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
-                let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_execution_window_blocked(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        notification.thread_id.clone(),
-                        notification.turn_id.clone(),
-                        format!("failed to persist turn/execution_window/blocked: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                let latest = match self
-                    .crud_store
-                    .latest_turn_execution_window(notification.turn_id.as_str())
-                    .await
-                {
-                    Ok(latest) => latest,
-                    Err(error) => {
-                        self.report_legacy_turn_failure(
+                    let latest =
+                        match self
+                            .crud_store
+                            .latest_turn_execution_window(notification.turn_id.as_str())
+                            .await
+                        {
+                            Ok(latest) => latest,
+                            Err(error) => {
+                                self.report_legacy_turn_failure(
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),
                             format!("failed to load execution window for blocked state: {error:#}"),
                         )
                         .await;
-                        return false;
-                    }
-                };
-                let window = if latest
-                    .as_ref()
-                    .is_some_and(|window| window.window_index == notification.window_index)
-                {
-                    latest
-                } else if execution_window_can_create_after(
-                    latest.as_ref(),
-                    notification.window_index,
-                ) {
-                    match self
-                        .crud_store
-                        .create_turn_execution_window(
-                            pioneer_crud::NewTurnExecutionWindowRecord {
-                                workspace_id: notification.workspace_id.clone(),
-                                thread_id: notification.thread_id.clone(),
-                                turn_id: notification.turn_id.clone(),
-                                window_index: notification.window_index,
-                                status: pioneer_protocol::ExecutionWindowStatus::Running,
-                                exhaustion_reason: None,
-                                agent_round_count: 0,
-                                tool_call_count: 0,
-                                provider_token_count: 0,
-                                metadata_json: execution_window_started_metadata(
-                                    notification.window_id.as_str(),
-                                ),
-                                started_at: db_timestamp_from_unix_ms(
-                                    notification.blocked_at_unix_ms,
-                                ),
-                            },
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                        )
-                        .await
+                                return false;
+                            }
+                        };
+                    let window = if latest
+                        .as_ref()
+                        .is_some_and(|window| window.window_index == notification.window_index)
                     {
-                        Ok(window) => Some(window),
-                        Err(error) => {
-                            self.report_legacy_turn_failure(
+                        latest
+                    } else if execution_window_can_create_after(
+                        latest.as_ref(),
+                        notification.window_index,
+                    ) {
+                        match self
+                            .crud_store
+                            .create_turn_execution_window(
+                                pioneer_crud::NewTurnExecutionWindowRecord {
+                                    workspace_id: notification.workspace_id.clone(),
+                                    thread_id: notification.thread_id.clone(),
+                                    turn_id: notification.turn_id.clone(),
+                                    window_index: notification.window_index,
+                                    status: pioneer_protocol::ExecutionWindowStatus::Running,
+                                    exhaustion_reason: None,
+                                    agent_round_count: 0,
+                                    tool_call_count: 0,
+                                    provider_token_count: 0,
+                                    metadata_json: execution_window_started_metadata(
+                                        notification.window_id.as_str(),
+                                    ),
+                                    started_at: db_timestamp_from_unix_ms(
+                                        notification.blocked_at_unix_ms,
+                                    ),
+                                },
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            )
+                            .await
+                        {
+                            Ok(window) => Some(window),
+                            Err(error) => {
+                                self.report_legacy_turn_failure(
                                 notification.thread_id.clone(),
                                 notification.turn_id.clone(),
                                 format!(
@@ -2088,91 +2523,94 @@ impl MessageProcessor {
                                 ),
                             )
                             .await;
-                            return false;
+                                return false;
+                            }
                         }
-                    }
-                } else {
-                    warn!(
-                        turn_id = %notification.turn_id,
-                        latest_window_index = latest.as_ref().map(|window| window.window_index),
-                        event_window_index = notification.window_index,
-                        "skipping out-of-order execution window blocked state update"
-                    );
-                    None
-                };
-                if let Some(window) = window
-                    && let Err(error) = self
-                        .crud_store
-                        .mark_turn_execution_window_blocked(
-                            window.id.as_str(),
-                            notification.exhaustion_reason,
-                            pioneer_crud::TurnExecutionWindowStatsRecord {
-                                agent_round_count: 0,
-                                tool_call_count: notification.total_tool_calls,
-                                provider_token_count: 0,
-                                metadata_json: execution_window_blocked_metadata(
-                                    notification.window_id.as_str(),
-                                    notification.total_windows,
-                                    notification.total_tool_calls,
-                                    notification.reason.as_str(),
-                                ),
-                                completed_at: db_timestamp_from_unix_ms(
-                                    notification.blocked_at_unix_ms,
-                                ),
-                                updated_at: now_db_timestamp(),
-                            },
-                        )
-                        .await
-                {
-                    self.report_legacy_turn_failure(
-                        notification.thread_id.clone(),
-                        notification.turn_id.clone(),
-                        format!("failed to mark execution window blocked: {error:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-                if notification
-                    .reason
-                    .contains("execution window continuation could not resume")
-                {
-                    if !self
-                        .report_turn_failure(
+                    } else {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            latest_window_index = latest.as_ref().map(|window| window.window_index),
+                            event_window_index = notification.window_index,
+                            "skipping out-of-order execution window blocked state update"
+                        );
+                        None
+                    };
+                    if let Some(window) = window
+                        && let Err(error) = self
+                            .crud_store
+                            .mark_turn_execution_window_blocked(
+                                window.id.as_str(),
+                                notification.exhaustion_reason,
+                                pioneer_crud::TurnExecutionWindowStatsRecord {
+                                    agent_round_count: 0,
+                                    tool_call_count: notification.total_tool_calls,
+                                    provider_token_count: 0,
+                                    metadata_json: execution_window_blocked_metadata(
+                                        notification.window_id.as_str(),
+                                        notification.total_windows,
+                                        notification.total_tool_calls,
+                                        notification.reason.as_str(),
+                                    ),
+                                    completed_at: db_timestamp_from_unix_ms(
+                                        notification.blocked_at_unix_ms,
+                                    ),
+                                    updated_at: now_db_timestamp(),
+                                },
+                            )
+                            .await
+                    {
+                        self.report_legacy_turn_failure(
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),
-                            TurnFailureRecoveryKind::ExecutionWindowContinuation,
+                            format!("failed to mark execution window blocked: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    if notification
+                        .reason
+                        .contains("execution window continuation could not resume")
+                    {
+                        if !self
+                            .report_turn_failure(
+                                notification.thread_id.clone(),
+                                notification.turn_id.clone(),
+                                TurnFailureRecoveryKind::ExecutionWindowContinuation,
+                                notification.reason.clone(),
+                            )
+                            .await
+                        {
+                            return false;
+                        }
+                    } else if !self
+                        .mark_turn_blocked(
+                            notification.thread_id.clone(),
+                            notification.turn_id.clone(),
                             notification.reason.clone(),
                         )
                         .await
                     {
                         return false;
                     }
-                } else if !self
-                    .mark_turn_blocked(
-                        notification.thread_id.clone(),
-                        notification.turn_id.clone(),
-                        notification.reason.clone(),
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_EXECUTION_WINDOW_BLOCKED,
+                        &notification,
                     )
-                    .await
-                {
-                    return false;
-                }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_EXECUTION_WINDOW_BLOCKED,
-                    &notification,
-                )
-                .await;
+                    .await;
+                    true
+                })
             }
             AgentDurableEvent::TurnCompleted {
                 thread_id,
                 turn_id,
                 recovery,
-            } => {
+            } => message_future(async move {
                 if !message_future(self.complete_turn(thread_id, turn_id, recovery)).await {
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::ProviderFailureDetected {
                 thread_id,
                 turn_id,
@@ -2180,28 +2618,30 @@ impl MessageProcessor {
                 item_type,
                 failure,
                 recovery,
-            } => {
+            } => message_future(async move {
                 message_future(self.handle_provider_failure_detected(
                     thread_id, turn_id, item_id, item_type, failure, recovery,
                 ))
                 .await;
-            }
+                true
+            }),
             AgentDurableEvent::RecoveryAttemptSucceeded {
                 thread_id,
                 turn_id,
                 recovery,
-            } => {
+            } => message_future(async move {
                 message_future(
                     self.handle_recovery_attempt_succeeded(thread_id, turn_id, recovery),
                 )
                 .await;
-            }
+                true
+            }),
             AgentDurableEvent::TurnFailed {
                 thread_id,
                 turn_id,
                 error,
                 recovery,
-            } => {
+            } => message_future(async move {
                 if recovery.is_some() {
                     if !message_future(
                         self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery),
@@ -2220,13 +2660,14 @@ impl MessageProcessor {
                 {
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TurnBlocked {
                 thread_id,
                 turn_id,
                 reason,
                 recovery,
-            } => {
+            } => message_future(async move {
                 if recovery.is_none()
                     && reason.contains("execution window continuation could not resume")
                 {
@@ -2247,13 +2688,14 @@ impl MessageProcessor {
                 {
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TurnInterrupted {
                 thread_id,
                 turn_id,
                 reason,
                 recovery,
-            } => {
+            } => message_future(async move {
                 if !message_future(
                     self.mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, recovery),
                 )
@@ -2261,11 +2703,11 @@ impl MessageProcessor {
                 {
                     return false;
                 }
-            }
+                true
+            }),
             AgentDurableEvent::TaskEvent { .. }
-            | AgentDurableEvent::ThreadLineageCreated { .. } => return false,
+            | AgentDurableEvent::ThreadLineageCreated { .. } => message_future(async { false }),
         }
-        true
     }
 
     async fn record_final_assistant_text_for_item(
@@ -4146,7 +4588,8 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_connections(
+        self.send_notification_to_authorized_thread_connections(
+            turn_completed.thread_id.as_str(),
             events::TURN_COMPLETED,
             &turn_completed,
             finish_outcome.connection_ids,
@@ -4490,7 +4933,8 @@ impl MessageProcessor {
             );
         }
 
-        self.send_notification_to_connections(
+        self.send_notification_to_authorized_thread_connections(
+            turn_blocked.thread_id.as_str(),
             events::TURN_BLOCKED,
             &turn_blocked,
             finish_outcome.connection_ids,
@@ -4674,8 +5118,8 @@ impl MessageProcessor {
             );
         }
 
-        self.send_notification_to_workspace_connections(
-            workspace_id.as_str(),
+        self.send_notification_to_thread_subscribers(
+            thread_id.as_str(),
             events::TURN_BLOCKED,
             &turn_blocked,
         )
@@ -5039,7 +5483,8 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_connections(
+        self.send_notification_to_authorized_thread_connections(
+            turn_failed.thread_id.as_str(),
             events::TURN_FAILED,
             &turn_failed,
             finish_outcome.connection_ids,
@@ -5236,7 +5681,8 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_connections(
+        self.send_notification_to_authorized_thread_connections(
+            turn_failed.thread_id.as_str(),
             events::TURN_FAILED,
             &turn_failed,
             finish_outcome.connection_ids,

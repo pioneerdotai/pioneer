@@ -1,4 +1,5 @@
 use super::*;
+use crate::authorization::AuthorizationExternalError;
 
 impl MessageProcessor {
     pub(super) async fn provider_list(
@@ -19,6 +20,7 @@ impl MessageProcessor {
         else {
             return;
         };
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
 
         let provider_names = match self
             .gateway_secrets
@@ -26,13 +28,14 @@ impl MessageProcessor {
         {
             Ok(provider_names) => provider_names,
             Err(error) => {
+                let message = if member {
+                    "provider catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to list provider api keys: {error:#}")
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to list provider api keys: {error:#}"),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
                 return;
@@ -44,13 +47,14 @@ impl MessageProcessor {
         {
             Ok(provider_proxies) => provider_proxies,
             Err(error) => {
+                let message = if member {
+                    "provider catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to list provider proxies: {error:#}")
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to list provider proxies: {error:#}"),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
                 return;
@@ -59,13 +63,15 @@ impl MessageProcessor {
 
         let mut provider_configs = std::collections::BTreeMap::new();
         for name in provider_names {
-            provider_configs.insert(name, (true, None));
+            provider_configs.insert(name, (!member, None));
         }
         for (name, proxy_url) in provider_proxies {
             provider_configs
                 .entry(name)
-                .and_modify(|(_, existing_proxy)| *existing_proxy = Some(proxy_url.clone()))
-                .or_insert((false, Some(proxy_url)));
+                .and_modify(|(_, existing_proxy)| {
+                    *existing_proxy = (!member).then(|| proxy_url.clone())
+                })
+                .or_insert((false, (!member).then_some(proxy_url)));
         }
 
         // Local is built in, so there is no workspace secret or proxy from which to discover it.
@@ -147,6 +153,7 @@ impl MessageProcessor {
         else {
             return;
         };
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -163,6 +170,16 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if member
+            && !self.member_provider_is_configured(workspace_id.as_str(), params.provider.as_str())
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         let provider = match self
             .provider_registry
@@ -170,13 +187,14 @@ impl MessageProcessor {
         {
             Ok(p) => p,
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to create provider `{}`: {error:#}", params.provider)
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to create provider `{}`: {error:#}", params.provider),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
                 return;
@@ -220,16 +238,17 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!(
+                        "failed to list models for provider `{}`: {error:#}",
+                        params.provider
+                    )
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to list models for provider `{}`: {error:#}",
-                            params.provider
-                        ),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
             }
@@ -254,6 +273,7 @@ impl MessageProcessor {
         else {
             return;
         };
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -270,6 +290,16 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if member
+            && !self.member_provider_is_configured(workspace_id.as_str(), params.provider.as_str())
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         let provider = match self
             .provider_registry
@@ -277,13 +307,14 @@ impl MessageProcessor {
         {
             Ok(p) => p,
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to create provider `{}`: {error:#}", params.provider)
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to create provider `{}`: {error:#}", params.provider),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
                 return;
@@ -325,16 +356,17 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!(
+                        "failed to list embedding models for provider `{}`: {error:#}",
+                        params.provider
+                    )
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to list embedding models for provider `{}`: {error:#}",
-                            params.provider
-                        ),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
             }
@@ -359,6 +391,7 @@ impl MessageProcessor {
         else {
             return;
         };
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -375,6 +408,16 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if member
+            && !self.member_provider_is_configured(workspace_id.as_str(), params.provider.as_str())
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         let provider = match self
             .provider_registry
@@ -382,13 +425,14 @@ impl MessageProcessor {
         {
             Ok(provider) => provider,
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to create provider `{}`: {error:#}", params.provider)
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to create provider `{}`: {error:#}", params.provider),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
                 return;
@@ -430,16 +474,17 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                let message = if member {
+                    "provider model catalog is unavailable".to_owned()
+                } else {
+                    format!(
+                        "failed to list transcription models for provider `{}`: {error:#}",
+                        params.provider
+                    )
+                };
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to list transcription models for provider `{}`: {error:#}",
-                            params.provider
-                        ),
-                    ),
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                 )
                 .await;
             }
@@ -1431,6 +1476,22 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
         Some(workspace_id)
+    }
+
+    fn member_provider_is_configured(&self, workspace_id: &str, provider: &str) -> bool {
+        let Ok(provider) = self.gateway_secrets.normalize_provider_name(provider) else {
+            return false;
+        };
+        if provider == "local" {
+            return true;
+        }
+        self.gateway_secrets
+            .list_configured_workspace_provider_names(workspace_id)
+            .is_ok_and(|providers| providers.into_iter().any(|name| name == provider))
+            || self
+                .gateway_secrets
+                .list_workspace_provider_proxies(workspace_id)
+                .is_ok_and(|proxies| proxies.into_iter().any(|(name, _)| name == provider))
     }
 }
 

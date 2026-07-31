@@ -109,6 +109,13 @@ impl ThreadArtifactPreviewState {
         self.loading_by_artifact.remove(&key);
         self.failed_by_artifact.insert(key);
     }
+
+    pub(crate) fn remove_keys(&mut self, keys: &HashSet<ArtifactVersionKey>) {
+        self.image_paths_by_artifact
+            .retain(|key, _| !keys.contains(key));
+        self.loading_by_artifact.retain(|key| !keys.contains(key));
+        self.failed_by_artifact.retain(|key| !keys.contains(key));
+    }
 }
 
 pub fn thumbnail_preview(artifact: &ArtifactRef) -> Option<&ArtifactPreviewRef> {

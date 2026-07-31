@@ -51,11 +51,23 @@ impl TurnMcpPersistenceCoordinator {
             },
             bindings,
         };
-        let outcome = self
-            .crud_store
-            .replace_turn_mcp_projection(&replacement)
-            .await
-            .map_err(|error| persistence_error(format!("{error}")))?;
+        let authorization_context = self.bound_execution_authorization_context(request).await?;
+        let outcome = match authorization_context.as_deref() {
+            Some(context_json) => {
+                self.crud_store
+                    .replace_turn_mcp_projection_with_authorization_context(
+                        &replacement,
+                        context_json,
+                    )
+                    .await
+            }
+            None => {
+                self.crud_store
+                    .replace_turn_mcp_projection(&replacement)
+                    .await
+            }
+        }
+        .map_err(|error| persistence_error(format!("{error}")))?;
         Ok(AgentMcpPersistedProjection {
             turn_id: outcome.turn_id,
             manifest_hash: outcome.manifest_hash,
@@ -63,6 +75,59 @@ impl TurnMcpPersistenceCoordinator {
                 persistence_error("persisted projection returned a negative tool count")
             })?,
         })
+    }
+
+    async fn bound_execution_authorization_context(
+        &self,
+        request: &AgentMcpProjectionPersistenceRequest,
+    ) -> Result<Option<String>, AgentMcpProjectionPersistenceError> {
+        let Some(context_json) = self
+            .crud_store
+            .get_turn_execution_authorization_context(request.turn_id.as_str())
+            .await
+            .map_err(|error| {
+                persistence_error(format!(
+                    "failed to load execution authorization context for MCP projection: {error:#}"
+                ))
+            })?
+        else {
+            crate::authorization::ensure_contextless_execution_is_trusted(
+                self.crud_store.as_ref(),
+                request.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                persistence_error(format!(
+                    "contextless MCP projection is not a trusted legacy execution: {error:#}"
+                ))
+            })?;
+            return Ok(None);
+        };
+        let mut context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            context_json.as_str(),
+        )
+        .map_err(|error| {
+            persistence_error(format!(
+                "failed to restore execution authorization context for MCP projection: {error:#}"
+            ))
+        })?;
+        context
+            .bind_mcp_projection(
+                request.workspace_id.as_str(),
+                request.projection_version,
+                request.manifest_hash.as_str(),
+            )
+            .map_err(|error| {
+                persistence_error(format!(
+                    "failed to bind MCP projection to execution authorization: {error:#}"
+                ))
+            })?;
+        let bound_json = context.to_persisted_json().map_err(|error| {
+            persistence_error(format!(
+                "failed to serialize MCP-bound execution authorization context: {error:#}"
+            ))
+        })?;
+        Ok(Some(bound_json))
     }
 }
 

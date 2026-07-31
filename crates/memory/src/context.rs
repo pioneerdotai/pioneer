@@ -3,6 +3,45 @@ use pioneer_crud::{
     MemoryWorkspaceGuard, global_agent_memory_scope_key, workspace_agent_memory_scope_key,
 };
 use pioneer_protocol::{MemoryActor, MemoryScope, MemoryScopeKind};
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySourceAccessPolicy {
+    accessible_thread_ids: Option<BTreeSet<String>>,
+}
+
+impl MemorySourceAccessPolicy {
+    pub fn unrestricted() -> Self {
+        Self {
+            accessible_thread_ids: None,
+        }
+    }
+
+    pub fn accessible_threads(thread_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            accessible_thread_ids: Some(thread_ids.into_iter().collect()),
+        }
+    }
+
+    pub fn requires_authoritative_provenance(&self) -> bool {
+        self.accessible_thread_ids.is_some()
+    }
+
+    pub fn allows_source_thread(&self, source_thread_id: Option<&str>) -> bool {
+        match &self.accessible_thread_ids {
+            None => true,
+            Some(accessible_thread_ids) => source_thread_id
+                .filter(|thread_id| !thread_id.trim().is_empty())
+                .is_some_and(|thread_id| accessible_thread_ids.contains(thread_id)),
+        }
+    }
+
+    pub fn accessible_thread_ids(&self) -> Option<Vec<String>> {
+        self.accessible_thread_ids
+            .as_ref()
+            .map(|thread_ids| thread_ids.iter().cloned().collect())
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryOperationContext {
@@ -15,6 +54,7 @@ pub struct MemoryOperationContext {
     pub allow_global_user: bool,
     pub allow_global_agent: bool,
     pub read_policy: Option<MemoryReadPolicy>,
+    pub source_access: MemorySourceAccessPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +99,14 @@ impl MemoryOperationContext {
                 allow_global_user: self.allow_global_user,
                 allow_global_agent: self.allow_global_agent,
             })
+    }
+
+    pub fn allows_source_thread(&self, source_thread_id: Option<&str>) -> bool {
+        self.source_access.allows_source_thread(source_thread_id)
+    }
+
+    pub fn accessible_source_thread_ids(&self) -> Option<Vec<String>> {
+        self.source_access.accessible_thread_ids()
     }
 
     pub fn effective_scopes(&self, explicit_scopes: &[MemoryScope]) -> Vec<MemoryScope> {

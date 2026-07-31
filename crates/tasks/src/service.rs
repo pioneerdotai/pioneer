@@ -21,6 +21,7 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
 use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
+    TaskRootAccessFilter,
 };
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
@@ -2502,11 +2503,33 @@ impl TaskService {
         Ok(self.store.list_task_agenda(params).await?)
     }
 
+    pub async fn list_agenda_scoped(
+        &self,
+        params: TaskAgendaParams,
+        access: &TaskRootAccessFilter,
+    ) -> TaskRuntimeResult<TaskAgendaResponse> {
+        Ok(self
+            .store
+            .list_task_agenda_scoped(params, Some(access))
+            .await?)
+    }
+
     pub async fn list_deliveries(
         &self,
         params: TaskDeliveriesParams,
     ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
         Ok(self.store.list_task_deliveries(params).await?)
+    }
+
+    pub async fn list_deliveries_scoped(
+        &self,
+        params: TaskDeliveriesParams,
+        access: &TaskRootAccessFilter,
+    ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
+        Ok(self
+            .store
+            .list_task_deliveries_scoped(params, Some(access))
+            .await?)
     }
 
     pub async fn start_delivery(
@@ -2652,6 +2675,16 @@ impl TaskService {
     pub async fn list_tasks(&self, params: TaskListParams) -> TaskRuntimeResult<TaskListResponse> {
         Ok(TaskListResponse {
             tasks: self.store.list_tasks(params).await?,
+        })
+    }
+
+    pub async fn list_tasks_scoped(
+        &self,
+        params: TaskListParams,
+        access: &TaskRootAccessFilter,
+    ) -> TaskRuntimeResult<TaskListResponse> {
+        Ok(TaskListResponse {
+            tasks: self.store.list_tasks_scoped(params, Some(access)).await?,
         })
     }
 

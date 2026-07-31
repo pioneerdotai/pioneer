@@ -21,10 +21,33 @@ use tokio::sync::Mutex;
 pub(in crate::message) const ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC: &[u8; 4] = b"ARTU";
 const ARTIFACT_UPLOAD_TTL_SECS: i64 = 3600;
 
+pub(in crate::message) enum ArtifactUploadAuthorization<'a> {
+    Workspace(&'a crate::authorization::AuthorizedWorkspace),
+    Thread(&'a crate::authorization::AuthorizedThread),
+    Turn(&'a crate::authorization::AuthorizedTurn),
+}
+
+impl ArtifactUploadAuthorization<'_> {
+    fn permits(&self, workspace_id: &str, thread_id: Option<&str>, turn_id: Option<&str>) -> bool {
+        match (self, thread_id, turn_id) {
+            (Self::Workspace(proof), None, None) => proof.workspace_id() == workspace_id,
+            (Self::Thread(proof), Some(thread_id), None) => {
+                proof.workspace_id() == workspace_id && proof.thread_id() == thread_id
+            }
+            (Self::Turn(proof), Some(thread_id), Some(turn_id)) => {
+                proof.workspace_id() == workspace_id
+                    && proof.thread_id() == thread_id
+                    && proof.turn_id() == turn_id
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::message) struct ArtifactUploadSession {
     pub upload_id: String,
-    pub connection_id: ConnectionId,
+    pub owner: AuthenticatedTransferOwner,
     pub workspace_id: String,
     pub thread_id: Option<String>,
     pub planned_turn_id: Option<String>,
@@ -69,12 +92,16 @@ impl ArtifactUploadSessionManager {
         }
     }
 
-    pub async fn start(
+    pub async fn start<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         params: ArtifactUploadStartParams,
         now: i64,
-    ) -> Result<ArtifactUploadSession> {
+    ) -> Result<ArtifactUploadSession>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         self.prune_expired(now).await;
         let upload_id = pioneer_protocol::generate_id(21);
         let upload_dir = self
@@ -94,7 +121,7 @@ impl ArtifactUploadSessionManager {
 
         let session = ArtifactUploadSession {
             upload_id: upload_id.clone(),
-            connection_id,
+            owner,
             workspace_id: params.workspace_id,
             thread_id: params.thread_id,
             planned_turn_id: params.planned_turn_id,
@@ -116,19 +143,23 @@ impl ArtifactUploadSessionManager {
         Ok(session)
     }
 
-    pub async fn append_chunk(
+    pub async fn append_chunk<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         header: &ArtifactUploadChunkHeader,
         chunk: &[u8],
         now: i64,
-    ) -> Result<ArtifactUploadSession> {
+    ) -> Result<ArtifactUploadSession>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         self.prune_expired(now).await;
         let mut guard = self.sessions.lock().await;
         let session = guard
             .get_mut(header.upload_id.as_str())
             .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?;
-        validate_session_owner(session, connection_id, header.workspace_id.as_str(), now)?;
+        validate_session_owner(session, &owner, header.workspace_id.as_str(), now)?;
         if session.status != ArtifactUploadStatus::Receiving {
             bail!("artifact upload is not receiving chunks");
         }
@@ -150,20 +181,24 @@ impl ArtifactUploadSessionManager {
         Ok(session.clone())
     }
 
-    pub async fn finish(
+    pub async fn finish<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         workspace_id: &str,
         upload_id: &str,
         now: i64,
-    ) -> Result<ArtifactUploadFinishState> {
+    ) -> Result<ArtifactUploadFinishState>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         self.prune_expired(now).await;
         let session = {
             let mut guard = self.sessions.lock().await;
             let session = guard
                 .get_mut(upload_id)
                 .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?;
-            validate_session_owner(session, connection_id, workspace_id, now)?;
+            validate_session_owner(session, &owner, workspace_id, now)?;
             match &session.status {
                 ArtifactUploadStatus::Completed { artifact } => {
                     return Ok(ArtifactUploadFinishState::Completed(artifact.clone()));
@@ -214,13 +249,17 @@ impl ArtifactUploadSessionManager {
         }
     }
 
-    pub async fn abort(
+    pub async fn abort<O>(
         &self,
-        connection_id: ConnectionId,
+        owner: O,
         workspace_id: &str,
         upload_id: &str,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        O: Into<AuthenticatedTransferOwner>,
+    {
+        let owner = owner.into();
         self.prune_expired(now).await;
         let session = {
             let guard = self.sessions.lock().await;
@@ -229,7 +268,7 @@ impl ArtifactUploadSessionManager {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?
         };
-        validate_session_owner(&session, connection_id, workspace_id, now)?;
+        validate_session_owner(&session, &owner, workspace_id, now)?;
         self.abort_upload(upload_id).await;
         Ok(())
     }
@@ -239,13 +278,62 @@ impl ArtifactUploadSessionManager {
             let guard = self.sessions.lock().await;
             guard
                 .values()
-                .filter(|session| session.connection_id == connection_id)
+                .filter(|session| session.owner.connection_id == connection_id)
                 .map(|session| session.upload_id.clone())
                 .collect::<Vec<_>>()
         };
         for upload_id in upload_ids {
             self.abort_upload(upload_id.as_str()).await;
         }
+    }
+
+    pub async fn abort_connection_scope(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: Option<&str>,
+    ) -> usize {
+        let sessions = {
+            let mut guard = self.sessions.lock().await;
+            let upload_ids = guard
+                .values()
+                .filter(|session| {
+                    session.owner.connection_id == connection_id
+                        && session.workspace_id == workspace_id
+                        && thread_id
+                            .is_none_or(|thread_id| session.thread_id.as_deref() == Some(thread_id))
+                })
+                .map(|session| session.upload_id.clone())
+                .collect::<Vec<_>>();
+            upload_ids
+                .into_iter()
+                .filter_map(|upload_id| guard.remove(upload_id.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let removed = sessions.len();
+        for session in sessions {
+            remove_upload_temp(session.temp_path).await;
+        }
+        removed
+    }
+
+    pub async fn lookup_for_owner(
+        &self,
+        owner: &AuthenticatedTransferOwner,
+        workspace_id: &str,
+        upload_id: &str,
+        now: i64,
+    ) -> Result<ArtifactUploadSession> {
+        self.prune_expired(now).await;
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(upload_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?;
+        validate_session_owner(&session, owner, workspace_id, now)?;
+        Ok(session)
     }
 
     pub async fn prune_expired(&self, now: i64) -> usize {
@@ -285,13 +373,15 @@ async fn remove_upload_temp(temp_path: PathBuf) {
 }
 
 impl MessageProcessor {
-    pub(crate) async fn artifact_upload_start(
+    pub(in crate::message) async fn artifact_upload_start(
         &self,
         request_context: &RequestContext,
+        authorization: ArtifactUploadAuthorization<'_>,
         request_id: RequestId,
         mut params: ArtifactUploadStartParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -308,6 +398,18 @@ impl MessageProcessor {
             }
         };
         params.workspace_id = workspace_id;
+        if !authorization.permits(
+            params.workspace_id.as_str(),
+            params.thread_id.as_deref(),
+            params.planned_turn_id.as_deref(),
+        ) {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         if params.file_name.trim().is_empty()
             || params.client_attachment_id.trim().is_empty()
@@ -327,11 +429,7 @@ impl MessageProcessor {
         }
 
         let now = now_timestamp_secs();
-        let session = match self
-            .artifact_uploads
-            .start(connection_id, params, now)
-            .await
-        {
+        let session = match self.artifact_uploads.start(owner, params, now).await {
             Ok(session) => session,
             Err(error) => {
                 self.send_error(
@@ -363,13 +461,15 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(crate) async fn artifact_upload_finish(
+    pub(in crate::message) async fn artifact_upload_finish(
         &self,
         request_context: &RequestContext,
+        authorization: ArtifactUploadAuthorization<'_>,
         request_id: RequestId,
         params: ArtifactUploadFinishParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -389,7 +489,7 @@ impl MessageProcessor {
         let finish_state = match self
             .artifact_uploads
             .finish(
-                connection_id,
+                &owner,
                 workspace_id.as_str(),
                 params.upload_id.as_str(),
                 now,
@@ -427,6 +527,24 @@ impl MessageProcessor {
             }
             ArtifactUploadFinishState::Ready(session) => session,
         };
+        if !authorization.permits(
+            session.workspace_id.as_str(),
+            session.thread_id.as_deref(),
+            session.planned_turn_id.as_deref(),
+        ) || !self
+            .revalidate_artifact_upload_terminal(request_context, &session)
+            .await
+        {
+            self.artifact_uploads
+                .fail_finalizing(params.upload_id.as_str())
+                .await;
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
 
         let binding =
             session
@@ -529,13 +647,15 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(crate) async fn artifact_upload_abort(
+    pub(in crate::message) async fn artifact_upload_abort(
         &self,
         request_context: &RequestContext,
+        authorization: ArtifactUploadAuthorization<'_>,
         request_id: RequestId,
         params: ArtifactUploadAbortParams,
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -552,10 +672,46 @@ impl MessageProcessor {
             }
         };
         let now = now_timestamp_secs();
+        let session = match self
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                workspace_id.as_str(),
+                params.upload_id.as_str(),
+                now,
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!("artifact upload abort failed: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if !authorization.permits(
+            session.workspace_id.as_str(),
+            session.thread_id.as_deref(),
+            session.planned_turn_id.as_deref(),
+        ) {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         if let Err(error) = self
             .artifact_uploads
             .abort(
-                connection_id,
+                &owner,
                 workspace_id.as_str(),
                 params.upload_id.as_str(),
                 now,
@@ -592,6 +748,7 @@ impl MessageProcessor {
         frame: &[u8],
     ) {
         let connection_id = request_context.connection_id();
+        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let (header, chunk) = match parse_artifact_upload_chunk_frame(frame) {
             Ok(value) => value,
             Err(error) => {
@@ -602,7 +759,7 @@ impl MessageProcessor {
         let now = now_timestamp_secs();
         let updated = match self
             .artifact_uploads
-            .append_chunk(connection_id, &header, chunk, now)
+            .append_chunk(&owner, &header, chunk, now)
             .await
         {
             Ok(session) => session,
@@ -670,6 +827,72 @@ impl MessageProcessor {
         Ok(workspace_id)
     }
 
+    async fn revalidate_artifact_upload_terminal(
+        &self,
+        request_context: &RequestContext,
+        session: &ArtifactUploadSession,
+    ) -> bool {
+        let service = crate::authorization::AuthorizationService::new();
+        let action = if session.planned_turn_id.is_some() {
+            crate::authorization::ResourceAction::ThreadWrite
+        } else {
+            crate::authorization::ResourceAction::ArtifactWrite
+        };
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.role_key(),
+            action,
+        );
+        let resolver = crate::authorization::AuthorizationResolver::new((*self.crud_store).clone());
+        let resolution = if let (Some(thread_id), Some(turn_id)) = (
+            session.thread_id.as_deref(),
+            session.planned_turn_id.as_deref(),
+        ) {
+            resolver
+                .authorize_turn(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    turn_id,
+                    Some(session.workspace_id.as_str()),
+                    Some(thread_id),
+                )
+                .await
+                .map(|resolution| match resolution {
+                    crate::authorization::ProofResolution::Authorized(_) => true,
+                    crate::authorization::ProofResolution::Denied(_) => false,
+                })
+        } else if let Some(thread_id) = session.thread_id.as_deref() {
+            resolver
+                .authorize_thread(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    thread_id,
+                    Some(session.workspace_id.as_str()),
+                )
+                .await
+                .map(|resolution| match resolution {
+                    crate::authorization::ProofResolution::Authorized(_) => true,
+                    crate::authorization::ProofResolution::Denied(_) => false,
+                })
+        } else {
+            resolver
+                .authorize_workspace(
+                    request_context.principal(),
+                    &gate,
+                    action,
+                    session.workspace_id.as_str(),
+                )
+                .await
+                .map(|resolution| match resolution {
+                    crate::authorization::ProofResolution::Authorized(_) => true,
+                    crate::authorization::ProofResolution::Denied(_) => false,
+                })
+        };
+        resolution.unwrap_or(false)
+    }
+
     pub(in crate::message) async fn send_artifact_result<T: serde::Serialize>(
         &self,
         connection_id: ConnectionId,
@@ -731,11 +954,11 @@ pub(in crate::message) fn parse_artifact_upload_chunk_frame(
 
 fn validate_session_owner(
     session: &ArtifactUploadSession,
-    connection_id: ConnectionId,
+    owner: &AuthenticatedTransferOwner,
     workspace_id: &str,
     now: i64,
 ) -> Result<()> {
-    if session.workspace_id != workspace_id || session.connection_id != connection_id {
+    if session.workspace_id != workspace_id || session.owner != *owner {
         bail!("artifact upload not found");
     }
     if session.expires_at <= now {
@@ -857,6 +1080,22 @@ fn artifact_upload_source_kind_label(value: ArtifactUploadSourceKind) -> &'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authenticated_owner(
+        connection_id: ConnectionId,
+        principal_byte: char,
+        session_byte: char,
+    ) -> AuthenticatedTransferOwner {
+        AuthenticatedTransferOwner {
+            principal_id: pioneer_protocol::PrincipalId::new(principal_byte.to_string().repeat(21))
+                .expect("principal id"),
+            auth_session_id: pioneer_protocol::AuthSessionId::new(
+                session_byte.to_string().repeat(21),
+            )
+            .expect("auth session id"),
+            connection_id,
+        }
+    }
 
     #[test]
     fn artifact_upload_parse_valid_frame() {
@@ -995,6 +1234,48 @@ mod tests {
         };
 
         assert!(manager.append_chunk(8, &header, chunk, 11).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_session_is_principal_and_auth_session_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = ArtifactUploadSessionManager::new(temp.path().join("uploads"));
+        let chunk = b"hello";
+        let owner = authenticated_owner(7, 'P', 'S');
+        let session = manager
+            .start(
+                owner.clone(),
+                start_params("ws_a", sha256_bytes(chunk), chunk.len() as u64),
+                10,
+            )
+            .await
+            .expect("start upload");
+        let header = ArtifactUploadChunkHeader {
+            workspace_id: "ws_a".to_owned(),
+            upload_id: session.upload_id,
+            offset: 0,
+            len: chunk.len() as u64,
+            chunk_sha256: Some(sha256_bytes(chunk)),
+        };
+
+        assert!(
+            manager
+                .append_chunk(authenticated_owner(7, 'Q', 'S'), &header, chunk, 11)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .append_chunk(authenticated_owner(7, 'P', 'T'), &header, chunk, 11)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .append_chunk(owner, &header, chunk, 11)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

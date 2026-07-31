@@ -49,8 +49,9 @@ async fn insert_source(
             DatabaseBackend::Sqlite,
             "INSERT INTO thread (
                 id, workspace_id, preview, mode, model, model_provider, status, origin_kind,
-                created_at, updated_at
-             ) VALUES (?, ?, '', 'agent', 'gpt-test', 'fake', 'active', 'user', ?, ?)",
+                access_class, created_at, updated_at
+             ) VALUES (?, ?, '', 'agent', 'gpt-test', 'fake', 'active', 'user',
+                'workspace', ?, ?)",
             [
                 thread_id.clone().into(),
                 workspace_id.into(),

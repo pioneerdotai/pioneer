@@ -148,6 +148,20 @@ pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
     .await
 }
 
+pub async fn find_turn_initiator<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<PersistedActorRef>> {
+    let Some(turn) = find_turn_by_id(db, turn_id).await? else {
+        return Ok(None);
+    };
+    actor_ref_from_db(
+        turn.initiated_by_actor_kind.as_deref(),
+        turn.initiated_by_actor_id.as_deref(),
+    )
+    .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     db: &C,
@@ -214,6 +228,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         permission_profile_snapshot_json: Set(Some(permission_profile_columns.snapshot_json)),
         execution_security_snapshot_version: Set(None),
         execution_security_snapshot_json: Set(None),
+        execution_authorization_context_json: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })
@@ -256,6 +271,40 @@ pub async fn set_turn_execution_security_snapshot<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    snapshot: &TurnExecutionSecuritySnapshot,
+    authorization_context_json: &str,
+) -> Result<bool> {
+    let version = i32::try_from(snapshot.version)
+        .context("turn execution security snapshot version exceeds database integer range")?;
+    let snapshot_json = serde_json::to_string(snapshot)
+        .context("failed to serialize turn execution security snapshot to json")?;
+    let authorization_context_json = authorization_context_json.trim();
+    if authorization_context_json.is_empty() {
+        anyhow::bail!("execution authorization context must not be empty");
+    }
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotVersion,
+            Expr::value(version),
+        )
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::value(snapshot_json),
+        )
+        .col_expr(
+            turn::Column::ExecutionAuthorizationContextJson,
+            Expr::value(authorization_context_json.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution envelope")?;
+    Ok(update_result.rows_affected > 0)
+}
+
 pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -285,6 +334,37 @@ pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
         version,
         snapshot,
     }))
+}
+
+pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    context_json: &str,
+) -> Result<bool> {
+    let context_json = context_json.trim();
+    if context_json.is_empty() {
+        anyhow::bail!("execution authorization context must not be empty");
+    }
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionAuthorizationContextJson,
+            Expr::value(context_json.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution authorization context")?;
+    Ok(update_result.rows_affected > 0)
+}
+
+pub async fn find_turn_execution_authorization_context<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<String>> {
+    Ok(find_turn_by_id(db, turn_id)
+        .await?
+        .and_then(|model| model.execution_authorization_context_json)
+        .filter(|json| !json.trim().is_empty()))
 }
 
 fn build_turn_permission_profile_columns(

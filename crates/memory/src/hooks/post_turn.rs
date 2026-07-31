@@ -90,6 +90,13 @@ pub(super) fn memory_turn_context_from_post_turn_request(
             .agent_id
             .as_ref()
             .map(|id| id.as_str().to_owned()),
+        principal_id: request
+            .context
+            .actor
+            .as_ref()
+            .filter(|actor| actor.kind == pioneer_hooks::HookActorKind::User)
+            .and_then(|actor| actor.id.as_ref())
+            .map(|id| id.as_str().to_owned()),
     })
 }
 

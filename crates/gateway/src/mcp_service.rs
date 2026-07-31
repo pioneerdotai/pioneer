@@ -51,6 +51,12 @@ use crate::turn_mcp::{
     DEFAULT_MCP_TURN_TOOL_TIMEOUT_MS, MCP_TURN_PROJECTION_VERSION, McpProjectionLimits,
     McpResolutionDiagnostic, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
 };
+use crate::{
+    auth::GatewayAuthService,
+    authorization::{
+        ActionGateDecision, AuthorizationInvalidationHub, AuthorizationService, ResourceAction,
+    },
+};
 
 #[derive(Clone)]
 pub(crate) struct McpService {
@@ -59,7 +65,9 @@ pub(crate) struct McpService {
 
 struct McpServiceInner {
     crud_store: Arc<CrudStore>,
+    authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     session_manager: Arc<SessionManager>,
+    auth_service: RwLock<Option<Arc<GatewayAuthService>>>,
     gateway_secrets: Arc<GatewaySecrets>,
     snapshot_version: Arc<AtomicU64>,
     runtime_generation_counter: AtomicU64,
@@ -111,9 +119,11 @@ struct McpUpstreamCancellationGuard {
 
 impl Drop for ActiveMcpInvocationGuard {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.inner.active_invocations.lock() {
-            active.remove(&self.registration_id);
-        }
+        self.inner
+            .active_invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.registration_id);
     }
 }
 
@@ -201,12 +211,15 @@ impl McpService {
         session_manager: Arc<SessionManager>,
         gateway_secrets: Arc<GatewaySecrets>,
         snapshot_version: Arc<AtomicU64>,
+        authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     ) -> Self {
         let projection_persistence = TurnMcpPersistenceCoordinator::new(crud_store.clone());
         Self {
             inner: Arc::new(McpServiceInner {
                 crud_store,
+                authorization_invalidation_hub,
                 session_manager,
+                auth_service: RwLock::new(None),
                 gateway_secrets,
                 snapshot_version,
                 runtime_generation_counter: AtomicU64::new(runtime_generation_seed()),
@@ -225,6 +238,14 @@ impl McpService {
                 projection_limits: RwLock::new(McpProjectionLimits::default()),
             }),
         }
+    }
+
+    pub(crate) fn set_auth_service(&self, auth_service: Arc<GatewayAuthService>) {
+        *self
+            .inner
+            .auth_service
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth_service);
     }
 
     #[cfg(test)]
@@ -294,7 +315,12 @@ impl McpService {
 
     pub(crate) fn turn_mcp_invoker(&self) -> GatewayTurnMcpInvoker {
         let shared = Arc::new(self.clone());
-        GatewayTurnMcpInvoker::new(self.inner.crud_store.clone(), shared.clone(), shared)
+        GatewayTurnMcpInvoker::new(
+            self.inner.crud_store.clone(),
+            shared.clone(),
+            shared,
+            self.inner.authorization_invalidation_hub.clone(),
+        )
     }
 
     fn register_active_mcp_invocation(
@@ -309,8 +335,11 @@ impl McpService {
             .active_invocation_counter
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        if let Ok(mut active) = self.inner.active_invocations.lock() {
-            active.insert(
+        self.inner
+            .active_invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
                 registration_id,
                 ActiveMcpInvocation {
                     turn_id: turn_id.to_owned(),
@@ -319,7 +348,6 @@ impl McpService {
                     cancellation,
                 },
             );
-        }
         ActiveMcpInvocationGuard {
             inner: self.inner.clone(),
             registration_id,
@@ -348,19 +376,16 @@ impl McpService {
             .inner
             .active_invocations
             .lock()
-            .map(|active| {
-                active
-                    .values()
-                    .filter(|invocation| predicate(invocation))
-                    .map(|invocation| {
-                        (
-                            invocation.provider_call_id.clone(),
-                            invocation.cancellation.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|invocation| predicate(invocation))
+            .map(|invocation| {
+                (
+                    invocation.provider_call_id.clone(),
+                    invocation.cancellation.clone(),
+                )
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         for (provider_call_id, cancellation) in &cancellations {
             cancellation.cancel();
             tracing::debug!(provider_call_id, "cancelled active MCP invocation");
@@ -619,6 +644,8 @@ impl McpService {
         let mut explicit_tools_by_key = HashMap::<(String, String), Vec<&AgentMcpToolRef>>::new();
         let mut matched_server_capability_ids = HashSet::<String>::new();
         let mut matched_tool_capability_ids = HashSet::<String>::new();
+        let mut seen_server_capability_ids = HashSet::<String>::new();
+        let mut seen_tool_capability_ids = HashSet::<String>::new();
 
         for reference in explicit_servers {
             if reference.capability_id.trim().is_empty() || reference.name.trim().is_empty() {
@@ -638,6 +665,28 @@ impl McpService {
                         reference,
                         TurnCapabilityRejectedReason::ProviderUnsupported,
                         "Only workspace MCP servers can be attached to a turn.",
+                    ));
+                continue;
+            }
+            let expected_capability_id =
+                pioneer_protocol::mcp_server_capability_key(reference.scope_kind, &reference.name);
+            if reference.capability_id != expected_capability_id {
+                state
+                    .rejected_capabilities
+                    .push(reject_mcp_server_capability(
+                        reference,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "MCP server capability id does not match its exact server identity.",
+                    ));
+                continue;
+            }
+            if !seen_server_capability_ids.insert(reference.capability_id.clone()) {
+                state
+                    .rejected_capabilities
+                    .push(reject_mcp_server_capability(
+                        reference,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "MCP server capability is selected more than once.",
                     ));
                 continue;
             }
@@ -664,6 +713,27 @@ impl McpService {
                     reference,
                     TurnCapabilityRejectedReason::ProviderUnsupported,
                     "Only workspace MCP tools can be attached to a turn.",
+                ));
+                continue;
+            }
+            let expected_capability_id = pioneer_protocol::mcp_tool_capability_key(
+                reference.scope_kind,
+                &reference.server_name,
+                &reference.raw_tool_name,
+            );
+            if reference.capability_id != expected_capability_id {
+                state.rejected_capabilities.push(reject_mcp_tool_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::InvalidInput,
+                    "MCP tool capability id does not match its exact server/tool identity.",
+                ));
+                continue;
+            }
+            if !seen_tool_capability_ids.insert(reference.capability_id.clone()) {
+                state.rejected_capabilities.push(reject_mcp_tool_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::InvalidInput,
+                    "MCP tool capability is selected more than once.",
                 ));
                 continue;
             }
@@ -1763,12 +1833,8 @@ impl McpService {
                 status_reason: snapshot.status_reason.clone(),
             },
         };
-        self.send_notification_to_workspace_connections(
-            row.scope_key.as_str(),
-            events::MCP_SERVER_STATUS_CHANGED,
-            &notification,
-        )
-        .await;
+        self.send_management_notification(events::MCP_SERVER_STATUS_CHANGED, &notification)
+            .await;
     }
 
     async fn persist_catalog_and_notify(
@@ -1840,12 +1906,8 @@ impl McpService {
             resource_templates_count: catalog.resource_templates_count(),
             prompts_count: catalog.prompts_count(),
         };
-        self.send_notification_to_workspace_connections(
-            row.scope_key.as_str(),
-            events::MCP_SERVER_CATALOG_CHANGED,
-            &notification,
-        )
-        .await;
+        self.send_management_notification(events::MCP_SERVER_CATALOG_CHANGED, &notification)
+            .await;
     }
 
     async fn audit(
@@ -1934,18 +1996,18 @@ impl McpService {
             .saturating_add(1)
     }
 
-    async fn send_notification_to_workspace_connections<T: Serialize>(
-        &self,
-        workspace_id: &str,
-        method: &str,
-        payload: &T,
-    ) {
-        let connection_ids = self
-            .inner
-            .session_manager
-            .connection_ids_for_workspace(workspace_id)
+    async fn send_management_notification<T: Serialize>(&self, method: &str, payload: &T) {
+        let candidate_connection_ids = self.inner.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_management_notification_recipients(candidate_connection_ids)
             .await;
-        if connection_ids.is_empty() {
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_management_notification_recipients(initially_authorized_connection_ids)
+            .await;
+        if serialization_connection_ids.is_empty() {
             return;
         }
         let notification = match JsonRpcNotification::from_params(method, payload) {
@@ -1962,6 +2024,9 @@ impl McpService {
                 return;
             }
         };
+        let connection_ids = self
+            .authorized_management_notification_recipients(serialization_connection_ids)
+            .await;
         for connection_id in connection_ids {
             if let Err(error) = self
                 .inner
@@ -1977,6 +2042,47 @@ impl McpService {
                 );
             }
         }
+    }
+
+    async fn authorized_management_notification_recipients(
+        &self,
+        candidate_connection_ids: Vec<u64>,
+    ) -> Vec<u64> {
+        let auth_service = self
+            .inner
+            .auth_service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let authorization_service = AuthorizationService::new();
+        let mut connection_ids = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .inner
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            let action_gate = authorization_service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::McpManage,
+            );
+            if action_gate == ActionGateDecision::AllowSuperuser {
+                connection_ids.push(connection_id);
+            }
+        }
+        connection_ids
     }
 }
 
@@ -2638,15 +2744,21 @@ fn mcp_ref_key(value: &str) -> String {
 
 fn eligible_workspace_mcp_server_ref(reference: &AgentMcpServerRef) -> bool {
     reference.scope_kind == McpScopeKind::Workspace
-        && !reference.capability_id.trim().is_empty()
         && !reference.name.trim().is_empty()
+        && reference.capability_id
+            == pioneer_protocol::mcp_server_capability_key(reference.scope_kind, &reference.name)
 }
 
 fn eligible_workspace_mcp_tool_ref(reference: &AgentMcpToolRef) -> bool {
     reference.scope_kind == McpScopeKind::Workspace
-        && !reference.capability_id.trim().is_empty()
         && !reference.server_name.trim().is_empty()
         && !reference.raw_tool_name.trim().is_empty()
+        && reference.capability_id
+            == pioneer_protocol::mcp_tool_capability_key(
+                reference.scope_kind,
+                &reference.server_name,
+                &reference.raw_tool_name,
+            )
 }
 
 fn mcp_server_capability_kind(reference: &AgentMcpServerRef) -> TurnCapabilityKind {
@@ -2922,7 +3034,10 @@ fn runtime_generation_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthenticatedSessionPrincipal;
+    use crate::authorization::ExecutionAuthorizationContext;
     use crate::bootstrap::bootstrap;
+    use crate::session::test_support::authenticated_test_superuser;
     use crate::turn_mcp::invoker::{
         GatewayTurnMcpInvoker, TurnMcpInvocation, TurnMcpInvocationError,
         TurnMcpInvocationErrorCode, TurnMcpInvocationOrigin, TurnMcpInvoker,
@@ -2935,10 +3050,11 @@ mod tests {
     use pioneer_entity::turn;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_protocol::{
-        PermissionBehavior, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus, Turn, TurnExecutionSecuritySnapshot,
-        TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
-        TurnPermissionProfileSource, TurnStatus,
+        AuthSessionId, DeviceId, GatewayId, PermissionBehavior, PrincipalId, PrincipalKind,
+        RoleKey, SandboxMode, TaskEventPayload, TaskThreadLineage, Thread, ThreadMode,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn,
+        TurnExecutionSecuritySnapshot, TurnNetworkPolicySnapshot, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
     };
     use sea_orm::{ConnectionTrait, Database, EntityTrait};
     use std::collections::BTreeMap;
@@ -3250,6 +3366,7 @@ mod tests {
             Arc::new(SessionManager::new()),
             gateway_secrets.clone(),
             Arc::new(AtomicU64::new(1)),
+            Arc::new(AuthorizationInvalidationHub::default()),
         );
         (
             service,
@@ -3257,6 +3374,44 @@ mod tests {
             DEFAULT_WORKSPACE_ID.to_owned(),
             gateway_secrets,
         )
+    }
+
+    #[tokio::test]
+    async fn management_notifications_are_superuser_only() {
+        let (service, _, _) = test_mcp_service().await;
+        let session_manager = service.inner.session_manager.clone();
+
+        let (superuser_tx, mut superuser_rx) = mpsc::channel(2);
+        session_manager
+            .register_connection(superuser_tx, authenticated_test_superuser())
+            .await
+            .expect("register Superuser");
+
+        let mut member = authenticated_test_superuser().as_ref().clone();
+        member.principal_id =
+            PrincipalId::new("P0000000000000000000A").expect("Member principal id");
+        member.kind = PrincipalKind::User;
+        member.role_key = Some(RoleKey::member());
+        member.device_id = DeviceId::new("D0000000000000000000A").expect("Member device id");
+        member.session_id = AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+        let (member_tx, mut member_rx) = mpsc::channel(2);
+        session_manager
+            .register_connection(member_tx, Arc::new(member))
+            .await
+            .expect("register Member");
+
+        service
+            .send_management_notification("test/mcp-management", &json!({"name": "private-server"}))
+            .await;
+
+        assert!(
+            superuser_rx.recv().await.is_some(),
+            "Superuser must receive MCP management notifications"
+        );
+        assert!(
+            member_rx.try_recv().is_err(),
+            "Member must not receive MCP management, status, or catalog metadata"
+        );
     }
 
     async fn seed_started_turn(
@@ -3282,6 +3437,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -3458,7 +3614,7 @@ mod tests {
     }
 
     async fn wait_for_test_notification(notification: &tokio::sync::Notify, context: &str) {
-        tokio::time::timeout(Duration::from_secs(2), notification.notified())
+        tokio::time::timeout(Duration::from_secs(5), notification.notified())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {context}"));
     }
@@ -3522,8 +3678,8 @@ mod tests {
         connector: Arc<dyn McpRuntimeConnector>,
     ) -> TestTurnMcpInvokerFixture {
         let (service, crud_store, workspace_id) = test_mcp_service().await;
-        let thread_id = "thread_turn_mcp_invoker".to_owned();
-        let turn_id = "turn_turn_mcp_invoker".to_owned();
+        let thread_id = "T00000000000000000001".to_owned();
+        let turn_id = "U00000000000000000001".to_owned();
         seed_started_turn(
             &crud_store,
             workspace_id.as_str(),
@@ -3569,6 +3725,7 @@ mod tests {
             crud_store.clone(),
             Arc::new(service.clone()),
             execution.clone(),
+            service.inner.authorization_invalidation_hub.clone(),
         );
         TestTurnMcpInvokerFixture {
             service,
@@ -3581,6 +3738,127 @@ mod tests {
             execution,
             invoker,
         }
+    }
+
+    async fn authorize_turn_mcp_fixture_for_member(fixture: &TestTurnMcpInvokerFixture) {
+        const GATEWAY_ID: &str = "G00000000000000000001";
+        const PRINCIPAL_ID: &str = "P0000000000000000000A";
+        const DEVICE_ID: &str = "D0000000000000000000A";
+        const SESSION_ID: &str = "S0000000000000000000A";
+
+        fixture
+            .crud_store
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_identity(\
+                        id,singleton_key,identity_bootstrap_version,auth_schema_version,\
+                        created_at,updated_at\
+                     ) VALUES(\
+                        '{GATEWAY_ID}',1,1,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+                     );\
+                     INSERT INTO gateway_principal(\
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                        created_at,updated_at,removed_at\
+                     ) VALUES(\
+                        '{PRINCIPAL_ID}','{GATEWAY_ID}','user','member','active',\
+                        'MCP Member','mcp-member','mcp-member',\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     );\
+                     INSERT INTO workspace_membership(\
+                        principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                        created_at,updated_at\
+                     ) VALUES(\
+                        '{PRINCIPAL_ID}','{}','system',NULL,\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+                     );\
+                     UPDATE thread \
+                     SET access_class='private',\
+                         created_by_actor_kind='principal',\
+                         created_by_actor_id='{PRINCIPAL_ID}'\
+                     WHERE id='{}';\
+                     INSERT INTO thread_membership(\
+                        thread_id,principal_id,added_by_actor_kind,added_by_actor_id,\
+                        created_at,updated_at\
+                     ) VALUES(\
+                        '{}','{PRINCIPAL_ID}','system',NULL,\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+                     );\
+                     INSERT INTO device(\
+                        id,gateway_id,principal_id,installation_id,display_name,client_kind,\
+                        platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
+                     ) VALUES(\
+                        '{DEVICE_ID}','{GATEWAY_ID}','{PRINCIPAL_ID}','fixture-mcp-member',\
+                        'MCP Member Desktop','desktop','test','1','active',\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     );\
+                     INSERT INTO auth_session(\
+                        id,gateway_id,principal_id,device_id,token_family_id,\
+                        created_by_session_id,activation_token_hash,activation_locator_hash,\
+                        activation_failed_attempts,activation_expires_at,activated_at,status,\
+                        refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,\
+                        refresh_expires_at,revoked_at,revoke_reason\
+                     ) VALUES(\
+                        '{SESSION_ID}','{GATEWAY_ID}','{PRINCIPAL_ID}','{DEVICE_ID}',\
+                        'F0000000000000000000A',NULL,\
+                        X'000000000000000000000000000000000000000000000000000000000000000A',\
+                        X'100000000000000000000000000000000000000000000000000000000000000A',\
+                        0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                        datetime('now','+90 days'),NULL,NULL\
+                     );\
+                     UPDATE turn \
+                     SET initiated_by_actor_kind='principal',\
+                         initiated_by_actor_id='{PRINCIPAL_ID}'\
+                     WHERE id='{}';",
+                    fixture.workspace_id,
+                    fixture.thread_id,
+                    fixture.thread_id,
+                    fixture.turn_id,
+                )
+                .as_str(),
+            )
+            .await
+            .expect("Member MCP authorization foundation should persist");
+
+        let principal = AuthenticatedSessionPrincipal {
+            gateway_id: GatewayId::new(GATEWAY_ID).expect("test Gateway id"),
+            principal_id: PrincipalId::new(PRINCIPAL_ID).expect("test Member principal id"),
+            kind: PrincipalKind::User,
+            role_key: Some(RoleKey::member()),
+            device_id: DeviceId::new(DEVICE_ID).expect("test Member device id"),
+            session_id: AuthSessionId::new(SESSION_ID).expect("test Member session id"),
+            access_jti: "J0000000000000000000A".to_owned(),
+            access_expires_at_unix: u64::MAX,
+        };
+        let mut context = ExecutionAuthorizationContext::for_test(
+            &principal,
+            fixture.workspace_id.as_str(),
+            fixture.thread_id.as_str(),
+            &pioneer_protocol::compile_turn_permission_profile(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            None,
+        );
+        context
+            .bind_mcp_projection(
+                fixture.workspace_id.as_str(),
+                MCP_TURN_PROJECTION_VERSION,
+                fixture.manifest_hash.as_str(),
+            )
+            .expect("Member execution should bind the frozen MCP projection");
+        let context_json = context
+            .to_persisted_json()
+            .expect("Member MCP execution context should serialize");
+        fixture
+            .crud_store
+            .set_turn_execution_authorization_context(
+                fixture.turn_id.as_str(),
+                context_json.as_str(),
+            )
+            .await
+            .expect("Member MCP execution context should persist");
     }
 
     fn native_mcp_invocation(fixture: &TestTurnMcpInvokerFixture) -> TurnMcpInvocation {
@@ -3889,6 +4167,185 @@ mod tests {
             .expect_err("cross-scope invocation must fail before execution");
         assert_eq!(error.code, TurnMcpInvocationErrorCode::ScopeMismatch);
         assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_turn_mcp_policy_uses_server_name_and_revalidates_revocation() {
+        let fixture = turn_mcp_invoker_fixture().await;
+        authorize_turn_mcp_fixture_for_member(&fixture).await;
+        let binding = fixture
+            .crud_store
+            .list_turn_mcp_bindings(fixture.turn_id.as_str())
+            .await
+            .expect("Member MCP binding should load")
+            .remove(0);
+        assert_ne!(
+            binding.server_installation_id, binding.server_name,
+            "the regression requires distinct policy and frozen-installation identities"
+        );
+
+        fixture
+            .invoker
+            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+            .await
+            .expect("enabled workspace MCP policy should authorize the Member invocation");
+        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+
+        let mut installation = fixture
+            .crud_store
+            .find_mcp_server_installation(
+                "workspace",
+                fixture.workspace_id.as_str(),
+                binding.server_name.as_str(),
+            )
+            .await
+            .expect("Member MCP installation lookup should succeed")
+            .expect("Member MCP installation should exist");
+        installation.enabled = false;
+        fixture
+            .crud_store
+            .upsert_mcp_server_installation(&installation, 1_700_000_100)
+            .await
+            .expect("MCP policy revocation should persist");
+
+        let error = fixture
+            .invoker
+            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+            .await
+            .expect_err("revoked workspace MCP policy must deny the Member invocation");
+        assert_eq!(error.code, TurnMcpInvocationErrorCode::PermissionDenied);
+        assert_eq!(
+            fixture.execution.calls.load(Ordering::SeqCst),
+            1,
+            "revoked MCP policy must fail before tool execution"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_task_child_invokes_the_exact_mcp_projection_through_authorized_root_lineage() {
+        let fixture = turn_mcp_invoker_fixture().await;
+        authorize_turn_mcp_fixture_for_member(&fixture).await;
+
+        let child_thread_id = "T00000000000000000002";
+        let child_turn_id = "U00000000000000000002";
+        seed_started_turn(
+            fixture.crud_store.as_ref(),
+            fixture.workspace_id.as_str(),
+            child_thread_id,
+            child_turn_id,
+        )
+        .await;
+        fixture
+            .crud_store
+            .append_task_event(
+                TaskEventPayload::TaskThreadLineageCreated {
+                    task_id: "task_turn_mcp_task_child".to_owned(),
+                    run_id: "run_turn_mcp_task_child".to_owned(),
+                    lineage: TaskThreadLineage {
+                        child_thread_id: child_thread_id.to_owned(),
+                        parent_thread_id: fixture.thread_id.clone(),
+                        root_thread_id: fixture.thread_id.clone(),
+                        depth: 1,
+                        origin_kind: Some("task_run".to_owned()),
+                        created_by_thread_id: Some(fixture.thread_id.clone()),
+                        created_by_turn_id: Some(fixture.turn_id.clone()),
+                        created_at: 1_700_000_001,
+                    },
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("task child lineage should persist");
+
+        let child_projection = fixture
+            .service
+            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                workspace_id: fixture.workspace_id.clone(),
+                turn_id: child_turn_id.to_owned(),
+                explicit_servers: Vec::new(),
+                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
+            })
+            .await
+            .expect("task child MCP projection should resolve");
+        assert_eq!(
+            child_projection.manifest_hash, fixture.manifest_hash,
+            "the child must inherit the exact immutable MCP capability projection"
+        );
+        fixture
+            .service
+            .persist_resolved_mcp_turn_projection(&child_projection)
+            .await
+            .expect("task child MCP projection should persist");
+        fixture
+            .crud_store
+            .set_turn_execution_security_snapshot(
+                child_turn_id,
+                &TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    std::env::temp_dir().display().to_string(),
+                    1_700_000_000_002,
+                ),
+            )
+            .await
+            .expect("task child security snapshot should persist");
+        let parent_context = fixture
+            .crud_store
+            .get_turn_execution_authorization_context(fixture.turn_id.as_str())
+            .await
+            .expect("parent execution authorization context should load")
+            .expect("parent execution authorization context should exist");
+        fixture
+            .crud_store
+            .set_turn_execution_authorization_context(child_turn_id, parent_context.as_str())
+            .await
+            .expect("task child execution authorization context should persist");
+
+        let mut invocation = native_mcp_invocation(&fixture);
+        invocation.thread_id = child_thread_id.to_owned();
+        invocation.turn_id = child_turn_id.to_owned();
+        fixture
+            .invoker
+            .invoke(invocation, CancellationToken::new())
+            .await
+            .expect("authorized task child should invoke its exact frozen MCP projection");
+        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_mcp_invoker_rejects_projection_not_bound_to_execution_context() {
+        let fixture = turn_mcp_invoker_fixture().await;
+        let context = json!({
+            "version": 1,
+            "initiating_principal_id": "P0000000000000000000A",
+            "initiating_session_id": "S0000000000000000000A",
+            "workspace_id": fixture.workspace_id.as_str(),
+            "root_thread_id": fixture.thread_id.as_str(),
+            "policy_revision": 1,
+            "capability_projection_fingerprint": "a".repeat(64),
+            "permission_profile_cap": pioneer_protocol::task_permission_cap_for_mode(
+                TurnPermissionMode::Supervised,
+            ),
+            "mcp_projection": {
+                "version": MCP_TURN_PROJECTION_VERSION,
+                "manifest_hash": "b".repeat(64),
+            },
+        })
+        .to_string();
+        fixture
+            .crud_store
+            .set_turn_execution_authorization_context(fixture.turn_id.as_str(), context.as_str())
+            .await
+            .expect("spoofed execution projection should persist for the negative test");
+
+        let error = fixture
+            .invoker
+            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+            .await
+            .expect_err("projection not bound to execution must fail before execution");
+        assert_eq!(
+            error.code,
+            TurnMcpInvocationErrorCode::ProjectionUnavailable
+        );
+        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4463,6 +4920,32 @@ mod tests {
 
         assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
         assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+    }
+
+    #[tokio::test]
+    async fn poisoned_active_invocation_registry_still_fails_closed_on_revoke() {
+        let (service, _, _) = test_mcp_service().await;
+        let inner = service.inner.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = inner
+                .active_invocations
+                .lock()
+                .expect("registry should begin healthy");
+            panic!("poison active invocation registry");
+        }));
+
+        let cancellation = CancellationToken::new();
+        let _guard = service.register_active_mcp_invocation(
+            "turn-poisoned-registry",
+            "installation-poisoned-registry",
+            "call-poisoned-registry",
+            cancellation.clone(),
+        );
+        assert_eq!(
+            service.cancel_turn_mcp_invocations("turn-poisoned-registry"),
+            1
+        );
+        assert!(cancellation.is_cancelled());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

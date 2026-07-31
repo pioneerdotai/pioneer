@@ -1,40 +1,12 @@
 use std::sync::Arc;
 
-use pioneer_protocol::{PersistedActorRef, PrincipalKind, RequestId};
+use pioneer_protocol::{PersistedActorRef, RequestId, RoleKey};
 
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::session::ConnectionId;
 
 const UNKNOWN_RPC_METHOD: &str = "rpc/unknown";
 const MAX_CANONICAL_RPC_METHOD_LEN: usize = 128;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorizationDecision {
-    AllowSuperuser,
-    DenyUnsupportedPrincipal,
-}
-
-impl AuthorizationDecision {
-    pub(crate) const fn is_allowed(self) -> bool {
-        matches!(self, Self::AllowSuperuser)
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::AllowSuperuser => "allow_superuser",
-            Self::DenyUnsupportedPrincipal => "deny_unsupported_principal",
-        }
-    }
-}
-
-pub(crate) fn authorize_principal(
-    principal: &AuthenticatedSessionPrincipal,
-) -> AuthorizationDecision {
-    match principal.kind {
-        PrincipalKind::Superuser => AuthorizationDecision::AllowSuperuser,
-        _ => AuthorizationDecision::DenyUnsupportedPrincipal,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionContext {
@@ -120,6 +92,10 @@ impl RequestContext {
         self.connection.principal()
     }
 
+    pub(crate) fn role_key(&self) -> Option<&RoleKey> {
+        self.principal().role_key.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedSessionPrincipal> {
         self.connection.principal_arc()
@@ -137,16 +113,11 @@ impl RequestContext {
         PersistedActorRef::Principal(self.principal().principal_id.clone())
     }
 
-    pub(crate) fn authorization_decision(&self) -> AuthorizationDecision {
-        authorize_principal(self.principal())
-    }
-
     pub(crate) fn request_span(&self) -> tracing::Span {
         request_span(
             self.connection(),
             self.request_id(),
             self.canonical_method(),
-            self.authorization_decision(),
         )
     }
 }
@@ -155,7 +126,6 @@ pub(crate) fn request_span(
     connection: &ConnectionContext,
     request_id: Option<&RequestId>,
     canonical_method: &CanonicalMethod,
-    authorization_decision: AuthorizationDecision,
 ) -> tracing::Span {
     let principal = connection.principal();
     tracing::debug_span!(
@@ -163,12 +133,13 @@ pub(crate) fn request_span(
         gateway_id = %principal.gateway_id,
         principal_id = %principal.principal_id,
         principal_kind = ?principal.kind,
+        role_key = principal.role_key.as_ref().map(RoleKey::as_str).unwrap_or("none"),
         device_id = %principal.device_id,
         auth_session_id = %principal.session_id,
         connection_id = connection.connection_id(),
         canonical_method = canonical_method.as_str(),
         request_id = request_id.map(RequestId::as_str).unwrap_or("unavailable"),
-        authorization_decision = authorization_decision.as_str(),
+        authorization_state = "pending",
     )
 }
 
@@ -184,10 +155,7 @@ fn is_canonical_rpc_method(method: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AuthorizationDecision, CanonicalMethod, ConnectionContext, RequestContext,
-        authorize_principal,
-    };
+    use super::{CanonicalMethod, ConnectionContext, RequestContext};
     use crate::auth::AuthenticatedSessionPrincipal;
     use pioneer_protocol::{
         AuthSessionId, DeviceId, GatewayId, PersistedActorRef, PrincipalId, PrincipalKind,
@@ -301,24 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn authorization_allows_only_superuser_and_fails_user_closed() {
-        let superuser = principal('P');
-        assert_eq!(
-            authorize_principal(superuser.as_ref()),
-            AuthorizationDecision::AllowSuperuser
-        );
-
-        let mut user = (*principal('U')).clone();
-        user.kind = PrincipalKind::User;
-        assert_eq!(
-            authorize_principal(&user),
-            AuthorizationDecision::DenyUnsupportedPrincipal
-        );
-        assert!(!AuthorizationDecision::DenyUnsupportedPrincipal.is_allowed());
-        assert!(AuthorizationDecision::AllowSuperuser.is_allowed());
-    }
-
-    #[test]
     fn request_span_has_bounded_identity_fields_and_never_logs_payload_or_credentials() {
         let principal = principal('P');
         let connection = ConnectionContext::new(42, principal);
@@ -347,12 +297,7 @@ mod tests {
                 tracing::debug!("request dispatch test");
             }
             {
-                let span = super::request_span(
-                    &connection,
-                    None,
-                    &malicious_method,
-                    AuthorizationDecision::AllowSuperuser,
-                );
+                let span = super::request_span(&connection, None, &malicious_method);
                 let _guard = span.enter();
                 tracing::warn!("request rejection test");
             }
@@ -364,12 +309,13 @@ mod tests {
             "gateway_id=G",
             "principal_id=P",
             "principal_kind=Superuser",
+            "role_key=\"none\"",
             "device_id=D",
             "auth_session_id=S",
             "connection_id=42",
             "canonical_method=\"workspace/list\"",
             "request_id=\"RRRRRRRRRRRRRRRRRRRRR\"",
-            "authorization_decision=\"allow_superuser\"",
+            "authorization_state=\"pending\"",
             "canonical_method=\"rpc/unknown\"",
         ] {
             assert!(

@@ -367,6 +367,17 @@ impl ThreadAgentsDocRepository {
         workspace_id: &str,
         thread_id: &str,
     ) -> ThreadAgentsDocResult<Option<ResolvedThreadAgentsDocRecord>> {
+        let folder_id = self.folder_for_thread(db, workspace_id, thread_id).await?;
+        self.resolve_for_folder(db, workspace_id, folder_id.as_deref())
+            .await
+    }
+
+    pub async fn folder_for_thread<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> ThreadAgentsDocResult<Option<String>> {
         let placement = thread_placement::Entity::find_by_id(thread_id.to_owned())
             .one(db)
             .await
@@ -384,12 +395,10 @@ impl ThreadAgentsDocRepository {
                     ),
                 });
             }
-            return self
-                .resolve_for_folder(db, workspace_id, placement.folder_id.as_deref())
-                .await;
+            return Ok(placement.folder_id);
         }
 
-        self.resolve_for_folder(db, workspace_id, None).await
+        Ok(None)
     }
 
     pub async fn scope_context<C: ConnectionTrait>(

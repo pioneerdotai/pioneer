@@ -124,7 +124,22 @@ pub async fn replace_turn_mcp_projection(
     db: &DatabaseConnection,
     replacement: &TurnMcpProjectionReplacement,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
-    replace_turn_mcp_projection_inner(db, replacement, AtomicProjectionReplaceFault::None).await
+    replace_turn_mcp_projection_inner(db, replacement, None, AtomicProjectionReplaceFault::None)
+        .await
+}
+
+pub async fn replace_turn_mcp_projection_with_authorization_context(
+    db: &DatabaseConnection,
+    replacement: &TurnMcpProjectionReplacement,
+    authorization_context_json: &str,
+) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
+    replace_turn_mcp_projection_inner(
+        db,
+        replacement,
+        Some(authorization_context_json),
+        AtomicProjectionReplaceFault::None,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,12 +156,13 @@ pub(crate) async fn replace_turn_mcp_projection_with_fault(
     replacement: &TurnMcpProjectionReplacement,
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
-    replace_turn_mcp_projection_inner(db, replacement, fault).await
+    replace_turn_mcp_projection_inner(db, replacement, None, fault).await
 }
 
 async fn replace_turn_mcp_projection_inner(
     db: &DatabaseConnection,
     replacement: &TurnMcpProjectionReplacement,
+    authorization_context_json: Option<&str>,
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
     validate_replacement_shape(replacement)?;
@@ -155,7 +171,27 @@ async fn replace_turn_mcp_projection_inner(
         .await
         .map_err(|error| TurnMcpProjectionPersistenceError::storage("begin", error))?;
 
-    let result = replace_in_transaction(&transaction, replacement, fault).await;
+    let result = async {
+        let outcome = replace_in_transaction(&transaction, replacement, fault).await?;
+        if let Some(context_json) = authorization_context_json {
+            let updated = crate::repositories::turn::set_turn_execution_authorization_context(
+                &transaction,
+                replacement.projection.turn_id.as_str(),
+                context_json,
+            )
+            .await
+            .map_err(|error| {
+                TurnMcpProjectionPersistenceError::storage("authorization_context_update", error)
+            })?;
+            if !updated {
+                return Err(TurnMcpProjectionPersistenceError::TurnNotFound {
+                    turn_id: replacement.projection.turn_id.clone(),
+                });
+            }
+        }
+        Ok(outcome)
+    }
+    .await;
     match result {
         Ok(outcome) => {
             transaction

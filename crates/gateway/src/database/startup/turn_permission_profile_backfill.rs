@@ -726,6 +726,7 @@ mod tests {
             status: Set("idle".to_owned()),
             origin_kind: Set("user".to_owned()),
             sidebar_visibility: Set("visible".to_owned()),
+            access_class: Set("private".to_owned()),
             agent_nickname: Set(None),
             agent_role: Set(None),
             created_by_actor_id: Set(None),
@@ -762,6 +763,7 @@ mod tests {
             permission_profile_snapshot_json: Set(None),
             execution_security_snapshot_version: Set(None),
             execution_security_snapshot_json: Set(None),
+            execution_authorization_context_json: Set(None),
         })
         .exec(&connection)
         .await
@@ -873,6 +875,7 @@ mod tests {
                 serde_json::to_string(&synthetic_snapshot)
                     .expect("synthetic security snapshot should serialize"),
             )),
+            execution_authorization_context_json: Set(None),
         })
         .exec(&connection)
         .await

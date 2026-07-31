@@ -1209,6 +1209,8 @@ pub(crate) struct WorkspaceEpisodicRecallRequest {
     pub max_total_candidates: u32,
     pub max_prompt_chars: u32,
     pub policy_context: ThreadEpisodicRecallPolicyContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessible_thread_ids: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1397,14 +1399,30 @@ impl WorkspaceEpisodicRecallService {
         let limit = (request.max_threads.max(1) as u64)
             .saturating_mul(8)
             .max(16);
-        let entries = match self
-            .crud_store
-            .list_thread_episodic_thread_directory_entries_for_workspace(
-                request.workspace_id.as_str(),
-                limit,
-            )
-            .await
-        {
+        let allowed_thread_ids = request
+            .accessible_thread_ids
+            .as_ref()
+            .map(|thread_ids| thread_ids.iter().cloned().collect::<Vec<_>>());
+        let entries_result = match allowed_thread_ids.as_deref() {
+            Some(thread_ids) => {
+                self.crud_store
+                    .list_thread_episodic_thread_directory_entries_for_workspace_scoped(
+                        request.workspace_id.as_str(),
+                        thread_ids,
+                        limit,
+                    )
+                    .await
+            }
+            None => {
+                self.crud_store
+                    .list_thread_episodic_thread_directory_entries_for_workspace(
+                        request.workspace_id.as_str(),
+                        limit,
+                    )
+                    .await
+            }
+        };
+        let entries = match entries_result {
             Ok(entries) => entries,
             Err(error) => {
                 return (
@@ -1419,6 +1437,14 @@ impl WorkspaceEpisodicRecallService {
         let mut candidates = Vec::new();
         for entry in entries {
             if entry.thread_id == request.current_thread_id {
+                suppressed_thread_ids.push(entry.thread_id);
+                continue;
+            }
+            if request
+                .accessible_thread_ids
+                .as_ref()
+                .is_some_and(|thread_ids| !thread_ids.contains(entry.thread_id.as_str()))
+            {
                 suppressed_thread_ids.push(entry.thread_id);
                 continue;
             }
@@ -4870,6 +4896,7 @@ mod tests {
                 context_recall_allowed: true,
                 include_sensitive_context: false,
             },
+            accessible_thread_ids: None,
         };
 
         let request_json =
@@ -7316,6 +7343,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         };
         let turn = Turn {
@@ -9167,6 +9195,7 @@ mod tests {
                     context_recall_allowed: true,
                     include_sensitive_context: false,
                 },
+                accessible_thread_ids: None,
             }
         }
 
@@ -9651,6 +9680,70 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn eval_member_directory_acl_precedes_candidate_page_limit() {
+            let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+            let allowed_thread_id = "allowed_older_thread";
+            upsert_eval_directory_entry(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                allowed_thread_id,
+                Some("authorized workspace context"),
+                1,
+                ThreadEpisodicThreadDirectoryVisibility::Visible,
+                ThreadEpisodicThreadDirectoryStatus::Active,
+                None,
+                None,
+                1_700_000_001,
+            )
+            .await;
+
+            // max_threads=1 reads at most 16 directory rows. These newer,
+            // inaccessible rows would crowd the authorized candidate out if
+            // ACL were applied only after the bounded query.
+            for index in 0..16 {
+                let denied_thread_id = format!("private_newer_{index}");
+                upsert_eval_directory_entry(
+                    crud_store.as_ref(),
+                    workspace_id.as_str(),
+                    denied_thread_id.as_str(),
+                    Some("inaccessible private context"),
+                    1,
+                    ThreadEpisodicThreadDirectoryVisibility::Visible,
+                    ThreadEpisodicThreadDirectoryStatus::Active,
+                    None,
+                    None,
+                    1_700_000_100 + index,
+                )
+                .await;
+            }
+
+            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(Vec::new()));
+            let current = Arc::new(ThreadEpisodicRecallService::new(
+                crud_store.clone(),
+                backend,
+            ));
+            let service = WorkspaceEpisodicRecallService::new(crud_store, current);
+            let mut request = workspace_request(
+                workspace_id.as_str(),
+                "current_thread",
+                WorkspaceEpisodicRecallMode::WorkspaceThreads,
+                "workspace context",
+            );
+            request.max_threads = 1;
+            request.accessible_thread_ids = Some(BTreeSet::from([allowed_thread_id.to_owned()]));
+
+            let (candidates, _, _) = service.select_workspace_thread_candidates(&request).await;
+
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.thread_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![allowed_thread_id]
+            );
+        }
+
+        #[tokio::test]
         async fn eval_workspace_directory_upsert_updates_lightweight_metadata() {
             let (crud_store, workspace_id) = setup_thread_episodic_store().await;
             let first = upsert_eval_directory_entry(
@@ -9872,6 +9965,8 @@ mod tests {
             );
             request.intent_source = Some(WorkspaceEpisodicRecallIntentSource::UserExplicit);
             request.max_threads = 1;
+            let mut denied_request = request.clone();
+            denied_request.accessible_thread_ids = Some(BTreeSet::new());
             let output = service.search_workspace_threads(request).await;
 
             assert_eq!(output.hits.len(), 1);
@@ -9892,6 +9987,15 @@ mod tests {
             .expect("workspace prompt");
             assert!(prompt.contains("Workspace thread context:"));
             assert!(prompt.contains("source_thread=workspace_candidate_eval"));
+
+            let denied = service.search_workspace_threads(denied_request).await;
+            assert!(denied.hits.is_empty());
+            assert!(denied.searched_thread_ids.is_empty());
+            assert!(
+                denied.suppressed_thread_ids.is_empty(),
+                "ACL-scoped directory selection must not disclose inaccessible thread ids"
+            );
+            assert_eq!(backend.search_requests().await.len(), 1);
         }
 
         #[test]

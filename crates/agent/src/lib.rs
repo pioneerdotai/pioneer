@@ -32,7 +32,7 @@ use pioneer_provider::{
 #[cfg(test)]
 use pioneer_skills::SkillAuditEvent;
 use pioneer_skills::{
-    AgentSkillRuntimeEntry, SkillCatalogSnapshot, SkillPolicyKey, SkillTrustLevel,
+    AgentSkillRuntimeEntry, SkillCatalogSnapshot, SkillId, SkillPolicyKey, SkillTrustLevel,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -466,12 +466,28 @@ pub struct TurnToolMaterialization {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillContinuationAuthorizationContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub skill_id: SkillId,
+    pub fingerprint: String,
+}
+
 #[async_trait::async_trait]
 pub trait TurnToolProvider: Send + Sync {
     async fn materialize_turn_tools(
         &self,
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String>;
+
+    async fn authorize_skill_continuation(
+        &self,
+        _context: SkillContinuationAuthorizationContext,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

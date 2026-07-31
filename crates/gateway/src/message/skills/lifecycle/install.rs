@@ -61,6 +61,7 @@ impl MessageProcessor {
         params: SkillsInstallParams,
     ) {
         let connection_id = request_context.connection_id();
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -218,7 +219,7 @@ impl MessageProcessor {
         let write_guard = self.acquire_skills_write_lock().await;
         if let Err(error) = self
             .revalidate_finalized_upload_locked(
-                connection_id,
+                &authenticated_owner,
                 workspace_id.as_str(),
                 materialized.upload.upload_id.as_str(),
                 &request_id,

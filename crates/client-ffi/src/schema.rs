@@ -84,6 +84,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadEventResult
         ),
         schema_doc!(
+            "client_access_changed_lifecycle.json",
+            crate::active_thread::ClientAccessChangedLifecycle
+        ),
+        schema_doc!(
             "client_active_thread_open_request.json",
             crate::active_thread::ClientActiveThreadOpenRequest
         ),
@@ -662,6 +666,7 @@ mod tests {
     fn auth_ffi_contracts_are_registered_and_client_events_are_secret_free() {
         let documents = client_ffi_schema_documents();
         for expected in [
+            "client_access_changed_lifecycle.json",
             "client_auth_refresh_request.json",
             "client_auth_activate_device_request.json",
             "client_auth_session_cleanup_request.json",
@@ -695,7 +700,13 @@ mod tests {
             .find(|document| document.file_name == "client_event.json")
             .expect("ClientEvent schema");
         let schema = serde_json::to_string(&event.schema).expect("event schema serializes");
-        for forbidden in ["access_token", "refresh_token", "activation_code"] {
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "activation_code",
+            "authorization_proof",
+            "policy_reason",
+        ] {
             assert!(
                 !schema.contains(forbidden),
                 "ClientEvent exposes secret field `{forbidden}`"

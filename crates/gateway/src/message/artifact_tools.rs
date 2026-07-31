@@ -4,14 +4,17 @@ use super::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pioneer_agent::{
-    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
-    TurnToolMaterialization, TurnToolProvider,
+    SkillContinuationAuthorizationContext, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use pioneer_artifacts::{
+    ARTIFACT_PREPARE_TOOL, ARTIFACT_READ_TOOL, ARTIFACT_REGISTER_TOOL, ArtifactReadToolParams,
     ArtifactToolContext, ArtifactToolHandler, ArtifactToolNotification,
     ArtifactToolNotificationSink, ArtifactToolState, artifact_tool_specs,
 };
-use pioneer_tools::ToolExtensionBundle;
+use pioneer_tools::{
+    ToolError, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutput, ToolPayload,
+};
 use std::sync::{Arc, Weak};
 use tracing::warn;
 
@@ -54,21 +57,36 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String> {
         let processor = self.processor()?;
+        processor
+            .revalidate_tool_execution_authorization(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+                None,
+                crate::authorization::ResourceAction::ThreadRead,
+            )
+            .await
+            .map_err(|_| "artifacts are unavailable for the current execution".to_owned())?;
         let artifact_state = processor
             .artifact_tool_state_for_turn(context.turn_id.as_str())
             .await;
-        let artifact_handler = Arc::new(ArtifactToolHandler::new(
-            processor.artifact_service.clone(),
-            ArtifactToolContext {
-                workspace_id: context.workspace_id,
-                thread_id: context.thread_id,
-                turn_id: context.turn_id,
-            },
-            artifact_state,
-            Arc::new(GatewayArtifactToolNotificationSink {
-                processor: processor.clone(),
-            }),
-        ));
+        let artifact_context = ArtifactToolContext {
+            workspace_id: context.workspace_id,
+            thread_id: context.thread_id,
+            turn_id: context.turn_id,
+        };
+        let artifact_handler = Arc::new(GatewayAuthorizedArtifactToolHandler {
+            processor: processor.clone(),
+            context: artifact_context.clone(),
+            inner: Arc::new(ArtifactToolHandler::new(
+                processor.artifact_service.clone(),
+                artifact_context,
+                artifact_state,
+                Arc::new(GatewayArtifactToolNotificationSink {
+                    processor: processor.clone(),
+                }),
+            )),
+        });
 
         let mut bundle = ToolExtensionBundle::default();
         for configured in artifact_tool_specs() {
@@ -82,6 +100,150 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             diagnostics: Vec::new(),
         })
     }
+
+    async fn authorize_skill_continuation(
+        &self,
+        context: SkillContinuationAuthorizationContext,
+    ) -> Result<(), String> {
+        let processor = self.processor()?;
+        if let Err(error) = processor
+            .authorize_persisted_turn_skill_continuation(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+                &context.skill_id,
+                context.fingerprint.as_str(),
+            )
+            .await
+        {
+            warn!(
+                workspace_id = context.workspace_id,
+                thread_id = context.thread_id,
+                turn_id = context.turn_id,
+                skill_id = %context.skill_id,
+                error = %format!("{error:#}"),
+                "skill continuation authorization failed"
+            );
+            return Err("skill is no longer authorized for this turn".to_owned());
+        }
+        Ok(())
+    }
+}
+
+struct GatewayAuthorizedArtifactToolHandler {
+    processor: Arc<MessageProcessor>,
+    context: ArtifactToolContext,
+    inner: Arc<ArtifactToolHandler>,
+}
+
+#[async_trait]
+impl ToolHandler for GatewayAuthorizedArtifactToolHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        trace: pioneer_tools::ToolEventTrace,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let (thread_action, artifact_action) = match invocation.tool_name.as_str() {
+            ARTIFACT_READ_TOOL => (
+                crate::authorization::ResourceAction::ThreadRead,
+                crate::authorization::ResourceAction::ArtifactRead,
+            ),
+            ARTIFACT_PREPARE_TOOL | ARTIFACT_REGISTER_TOOL => (
+                crate::authorization::ResourceAction::ThreadWrite,
+                crate::authorization::ResourceAction::ArtifactWrite,
+            ),
+            _ => return self.inner.handle(invocation, trace).await,
+        };
+        let current = self
+            .processor
+            .revalidate_tool_execution_authorization(
+                self.context.workspace_id.as_str(),
+                self.context.thread_id.as_str(),
+                self.context.turn_id.as_str(),
+                None,
+                thread_action,
+            )
+            .await
+            .map_err(|_| artifact_tool_authorization_error())?;
+
+        if let Some(current) = current.as_ref() {
+            crate::authorization::record_tool_decision(
+                artifact_action,
+                "artifact",
+                current.authorization().decision(),
+            );
+        }
+
+        if invocation.tool_name == ARTIFACT_READ_TOOL
+            && let Some(current) = current
+            && current.principal().kind == pioneer_protocol::PrincipalKind::User
+        {
+            let artifact_id = artifact_read_id(&invocation)?;
+            let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+                current.principal().kind,
+                current.principal().role_key.as_ref(),
+                crate::authorization::ResourceAction::ArtifactRead,
+            );
+            match crate::authorization::AuthorizationResolver::new(
+                self.processor.crud_store.as_ref().clone(),
+            )
+            .authorize_artifact(
+                current.principal(),
+                &action_gate,
+                crate::authorization::ResourceAction::ArtifactRead,
+                artifact_id.as_str(),
+                Some(current.authorization().workspace_id()),
+                Some(current.authorization().thread_id()),
+            )
+            .await
+            {
+                Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
+                    crate::authorization::record_tool_decision(
+                        crate::authorization::ResourceAction::ArtifactRead,
+                        "artifact",
+                        proof.decision(),
+                    );
+                }
+                Ok(crate::authorization::ProofResolution::Denied(decision)) => {
+                    crate::authorization::record_tool_decision(
+                        crate::authorization::ResourceAction::ArtifactRead,
+                        "artifact",
+                        &decision,
+                    );
+                    return Err(artifact_tool_authorization_error());
+                }
+                Err(_) => {
+                    crate::authorization::record_authorization_unavailable(
+                        crate::authorization::ResourceAction::ArtifactRead.safe_name(),
+                        "artifact",
+                        "tool",
+                    );
+                    return Err(artifact_tool_authorization_error());
+                }
+            }
+        }
+
+        self.inner.handle(invocation, trace).await
+    }
+}
+
+fn artifact_read_id(invocation: &ToolInvocation) -> Result<String, ToolError> {
+    let ToolPayload::Function { arguments } = &invocation.payload else {
+        return Err(ToolError::invalid_arguments(
+            "artifact_read requires function arguments",
+        ));
+    };
+    let params: ArtifactReadToolParams = serde_json::from_value(arguments.clone())
+        .map_err(|_| ToolError::invalid_arguments("artifact_read arguments are invalid"))?;
+    let artifact_id = params.artifact_id.trim();
+    if artifact_id.is_empty() {
+        return Err(ToolError::invalid_arguments("artifactId must not be empty"));
+    }
+    Ok(artifact_id.to_owned())
+}
+
+fn artifact_tool_authorization_error() -> ToolError {
+    ToolError::execution_failed("artifact is unavailable for the current execution")
 }
 
 #[async_trait]

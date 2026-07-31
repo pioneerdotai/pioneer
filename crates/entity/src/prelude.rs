@@ -68,6 +68,7 @@ pub use super::thread_episodic_recall_events::Entity as ThreadEpisodicRecallEven
 pub use super::thread_episodic_thread_directory::Entity as ThreadEpisodicThreadDirectory;
 pub use super::thread_folder::Entity as ThreadFolder;
 pub use super::thread_lineage::Entity as ThreadLineage;
+pub use super::thread_membership::Entity as ThreadMembership;
 pub use super::thread_placement::Entity as ThreadPlacement;
 pub use super::thread_sandox_policy::Entity as ThreadSandoxPolicy;
 pub use super::thread_timeline_block::Entity as ThreadTimelineBlock;
@@ -94,3 +95,4 @@ pub use super::turn_status_history::Entity as TurnStatusHistory;
 pub use super::turn_work_item_projection::Entity as TurnWorkItemProjection;
 pub use super::turn_work_projection::Entity as TurnWorkProjection;
 pub use super::workspace::Entity as Workspace;
+pub use super::workspace_membership::Entity as WorkspaceMembership;

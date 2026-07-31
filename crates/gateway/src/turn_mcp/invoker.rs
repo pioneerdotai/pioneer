@@ -8,6 +8,11 @@ use std::fmt;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::authorization::{
+    AuthorizationInvalidationHub, AuthorizationResolver, AuthorizationService, CapabilityKind,
+    ExecutionAuthorizationContext, ProofResolution, ResourceAction,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TurnMcpInvocationOrigin {
@@ -164,6 +169,7 @@ pub(crate) struct GatewayTurnMcpInvoker {
     crud_store: Arc<CrudStore>,
     runtime_view: Arc<dyn TurnMcpRuntimeView>,
     execution: Arc<dyn TurnMcpValidatedExecution>,
+    authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
 }
 
 impl GatewayTurnMcpInvoker {
@@ -171,11 +177,13 @@ impl GatewayTurnMcpInvoker {
         crud_store: Arc<CrudStore>,
         runtime_view: Arc<dyn TurnMcpRuntimeView>,
         execution: Arc<dyn TurnMcpValidatedExecution>,
+        authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     ) -> Self {
         Self {
             crud_store,
             runtime_view,
             execution,
+            authorization_invalidation_hub,
         }
     }
 
@@ -254,6 +262,8 @@ impl GatewayTurnMcpInvoker {
             ));
         }
 
+        self.revalidate_execution_authorization(&invocation, &projection, &binding)
+            .await?;
         self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
             .await?;
         let current_tool = self
@@ -268,6 +278,98 @@ impl GatewayTurnMcpInvoker {
             binding,
             current_tool,
         })
+    }
+
+    async fn revalidate_execution_authorization(
+        &self,
+        invocation: &TurnMcpInvocation,
+        projection: &pioneer_crud::TurnMcpProjectionRecord,
+        binding: &TurnMcpBindingRecord,
+    ) -> Result<(), TurnMcpInvocationError> {
+        let Some(context_json) = self
+            .crud_store
+            .get_turn_execution_authorization_context(invocation.turn_id.as_str())
+            .await
+            .map_err(|_| internal_error("failed to load MCP execution authorization context"))?
+        else {
+            crate::authorization::ensure_contextless_execution_is_trusted(
+                self.crud_store.as_ref(),
+                invocation.turn_id.as_str(),
+            )
+            .await
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP execution authorization context is unavailable",
+                )
+            })?;
+            return Ok(());
+        };
+        let context = ExecutionAuthorizationContext::from_persisted_json(context_json.as_str())
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP execution authorization context is invalid",
+                )
+            })?;
+        let projection_version = u32::try_from(projection.projection_version).map_err(|_| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                "MCP projection version is invalid",
+            )
+        })?;
+        context
+            .verify_mcp_projection(
+                invocation.workspace_id.as_str(),
+                projection_version,
+                projection.manifest_hash.as_str(),
+            )
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP projection is stale or is not bound to this execution",
+                )
+            })?;
+        let revalidated = context
+            .revalidate_for_turn_scope(
+                self.crud_store.as_ref(),
+                invocation.workspace_id.as_str(),
+                invocation.thread_id.as_str(),
+                invocation.turn_id.as_str(),
+                ResourceAction::ThreadWrite,
+                self.authorization_invalidation_hub.current_revision(),
+            )
+            .await
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::PermissionDenied,
+                    "current execution authorization no longer permits MCP use",
+                )
+            })?;
+
+        let action_gate = AuthorizationService::new().authorize_action(
+            revalidated.principal().kind,
+            revalidated.principal().role_key.as_ref(),
+            ResourceAction::McpUse,
+        );
+        let capability = AuthorizationResolver::new(self.crud_store.as_ref().clone())
+            .authorize_persisted_capability(
+                revalidated.principal(),
+                &action_gate,
+                ResourceAction::McpUse,
+                invocation.workspace_id.as_str(),
+                CapabilityKind::McpServer,
+                binding.server_name.as_str(),
+            )
+            .await
+            .map_err(|_| internal_error("failed to revalidate current MCP workspace policy"))?;
+        if !matches!(capability, ProofResolution::Authorized(_)) {
+            return Err(invocation_error(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "current MCP workspace policy no longer permits this server",
+            ));
+        }
+        Ok(())
     }
 
     async fn validate_origin_session(

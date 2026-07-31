@@ -7,7 +7,7 @@ use pioneer_entity::{
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokeReason, AuthSessionStatus, ClientInstallationDescriptor,
     ClientKind, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
-    PrincipalId, RefreshCredentialId, TokenFamilyId,
+    PrincipalId, RefreshCredentialId, RoleKey, TokenFamilyId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -899,6 +899,14 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         {
             violations.push(format!("device `{}` has mismatched ownership", row.id));
         }
+        if matches!(row.status.as_str(), "pending" | "active")
+            && owner.is_none_or(|owner| !is_supported_active_auth_owner(owner))
+        {
+            violations.push(format!(
+                "device `{}` has an inactive or unsupported owner",
+                row.id
+            ));
+        }
         let valid_state = match row.status.as_str() {
             "pending" => metadata_absent && row.last_seen_at.is_none() && row.revoked_at.is_none(),
             "active" => metadata_present && row.last_seen_at.is_some() && row.revoked_at.is_none(),
@@ -951,6 +959,14 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
             })
         {
             violations.push(format!("session `{}` has mismatched ownership", row.id));
+        }
+        if matches!(row.status.as_str(), "pending" | "active")
+            && owner.is_none_or(|owner| !is_supported_active_auth_owner(owner))
+        {
+            violations.push(format!(
+                "session `{}` has an inactive or unsupported owner",
+                row.id
+            ));
         }
         if let Some(creator_session_id) = row.created_by_session_id.as_deref() {
             let creator = session_by_id.get(creator_session_id);
@@ -1161,6 +1177,21 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         violations.push("additional auth persistence violations omitted".to_owned());
     }
     Ok(AuthPersistenceInvariantReport { violations })
+}
+
+fn is_supported_active_auth_owner(owner: &gateway_principal::Model) -> bool {
+    if owner.status != "active" {
+        return false;
+    }
+    match owner.kind.as_str() {
+        "superuser" => owner.role_key.is_none(),
+        "user" => owner
+            .role_key
+            .as_deref()
+            .and_then(|value| RoleKey::new(value).ok())
+            .is_some_and(|role| role.is_supported()),
+        _ => false,
+    }
 }
 
 async fn scan_auth_schema_invariants<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
@@ -1564,6 +1595,32 @@ mod tests {
                 .iter()
                 .any(|value| value.contains("idx_auth_refresh_token_hash"))
         );
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_rejects_active_sessions_for_inactive_or_unsupported_members() {
+        for mutation in [
+            "UPDATE gateway_principal SET kind='user', role_key='member', status='suspended'",
+            "UPDATE gateway_principal SET kind='user', role_key='member', status='removed'",
+            "UPDATE gateway_principal SET kind='user', role_key=NULL, status='active'",
+            "UPDATE gateway_principal SET kind='user', role_key='viewer', status='active'",
+        ] {
+            let db = valid_auth_fixture().await;
+            db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+                .await
+                .unwrap();
+            db.execute_unprepared(mutation).await.unwrap();
+
+            let report = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(
+                report
+                    .violations
+                    .iter()
+                    .any(|value| value.contains("inactive or unsupported owner")),
+                "expected owner violation for `{mutation}`, got {:?}",
+                report.violations
+            );
+        }
     }
 
     #[tokio::test]

@@ -224,6 +224,8 @@ pub struct MemoryCurrentThreadRecallRequest {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub query: String,
     #[serde(default)]
     pub targets: Vec<MemoryRecallTarget>,
@@ -236,6 +238,8 @@ pub struct MemoryCurrentThreadRecallRequest {
 pub struct MemoryRelatedThreadRecallRequest {
     pub workspace_id: String,
     pub current_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub query: String,
     #[serde(default)]
     pub targets: Vec<MemoryRecallTarget>,
@@ -248,6 +252,8 @@ pub struct MemoryRelatedThreadRecallRequest {
 pub struct MemoryWorkspaceThreadRecallRequest {
     pub workspace_id: String,
     pub current_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub query: String,
     #[serde(default)]
     pub targets: Vec<MemoryRecallTarget>,

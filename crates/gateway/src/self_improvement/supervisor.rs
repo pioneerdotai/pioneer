@@ -2236,6 +2236,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }
@@ -2293,6 +2294,17 @@ mod tests {
             )
             .await
             .expect("source turn start must project");
+        store
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    thread_id
+                )
+                .as_str(),
+            )
+            .await
+            .expect("self-improvement source fixture must be workspace-visible");
         let persisted = turn::Entity::find_by_id(turn_id)
             .one(&store.database_connection())
             .await

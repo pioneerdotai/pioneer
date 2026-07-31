@@ -295,6 +295,16 @@
           "type": "integer",
           "format": "int64"
         },
+        "visibility": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadVisibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -358,6 +368,14 @@
         "Active",
         "Idle",
         "Closed"
+      ]
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
       ]
     },
     "ToolPermissionPolicySnapshot": {

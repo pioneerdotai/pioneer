@@ -66,6 +66,8 @@ pub struct ArtifactListFilter {
     pub kinds: Vec<ArtifactKind>,
     pub thread_id: Option<String>,
     pub thread_ids: Vec<String>,
+    /// Gateway-owned authorization candidate set applied before pagination.
+    pub authorized_artifact_ids: Option<Vec<String>>,
     pub turn_id: Option<String>,
     pub message_id: Option<String>,
     pub task_id: Option<String>,

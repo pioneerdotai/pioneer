@@ -1172,6 +1172,39 @@ pub async fn list_thread_directory_entries_for_workspace<C: ConnectionTrait>(
         })
 }
 
+/// Lists the exact authorized cross-thread recall candidates with the
+/// allow-list applied before ordering and pagination.
+///
+/// The caller derives `allowed_thread_ids` from current control-plane ACL.
+/// Keeping the predicate in SQL prevents inaccessible directory rows from
+/// crowding accessible candidates out of the bounded recall page.
+pub async fn list_thread_directory_entries_for_workspace_scoped<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    allowed_thread_ids: &[String],
+    limit: u64,
+) -> Result<Vec<thread_episodic_thread_directory::Model>> {
+    if allowed_thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    thread_episodic_thread_directory::Entity::find()
+        .filter(thread_episodic_thread_directory::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_thread_directory::Column::ThreadId.is_in(allowed_thread_ids.to_vec()),
+        )
+        .order_by_desc(thread_episodic_thread_directory::Column::LastIndexedAt)
+        .order_by_desc(thread_episodic_thread_directory::Column::ThreadUpdatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to list authorized thread episodic directory entries for workspace \
+                 `{workspace_id}`"
+            )
+        })
+}
+
 pub async fn count_active_items_for_thread<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

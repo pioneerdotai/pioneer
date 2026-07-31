@@ -795,6 +795,7 @@ async fn execute_episodic_active_recall_mode(
                     workspace_id: context.workspace_id.clone(),
                     thread_id: context.effective_conversation_thread_id().to_owned(),
                     turn_id: context.turn_id.clone(),
+                    principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,
@@ -809,6 +810,7 @@ async fn execute_episodic_active_recall_mode(
                 provider.recall_related_threads(MemoryRelatedThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
+                    principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,
@@ -823,6 +825,7 @@ async fn execute_episodic_active_recall_mode(
                 provider.recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
+                    principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,

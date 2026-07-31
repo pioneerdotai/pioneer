@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
-    SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStartedNotification,
-    ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, Turn, TurnKind,
-    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    AuthSessionId, PrincipalId, SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification,
+    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStartedNotification, ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    Turn, TurnKind, TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
@@ -76,13 +76,34 @@ pub struct TurnFinishOutcome {
 pub struct ThreadUnsubscribeOutcome {
     pub response: ThreadUnsubscribeResponse,
     pub closed_notification: Option<ThreadClosedNotification>,
-    pub closed_notification_connection_ids: Vec<ConnectionId>,
+    pub(crate) closed_notification_subscribers: Vec<ThreadSubscriber>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadSubscriptionIdentity {
+    pub(crate) principal_id: PrincipalId,
+    pub(crate) session_id: AuthSessionId,
+}
+
+impl ThreadSubscriptionIdentity {
+    pub(crate) fn new(principal_id: PrincipalId, session_id: AuthSessionId) -> Self {
+        Self {
+            principal_id,
+            session_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadSubscriber {
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) identity: ThreadSubscriptionIdentity,
 }
 
 struct ThreadEntry {
     thread: Thread,
     sandbox_mode: SandboxMode,
-    connection_ids: HashSet<ConnectionId>,
+    subscribers: HashMap<ConnectionId, ThreadSubscriptionIdentity>,
 }
 
 #[derive(Default)]
@@ -116,16 +137,116 @@ impl ThreadManager {
         )
     }
 
+    /// Validates and materializes a new user-addressable thread without
+    /// publishing it into the in-memory subscription graph.
+    ///
+    /// The caller must durably commit the thread (and any creator membership)
+    /// before passing the returned seed to `thread_start_seeded`.
+    pub(crate) fn prepare_new_user_thread(
+        &self,
+        workspace_id: String,
+        params: &ThreadStartParams,
+    ) -> Result<(Thread, SandboxMode)> {
+        let thread_id = params.thread_id.trim();
+        if thread_id.is_empty() {
+            bail!("`thread_id` is required for `thread/start`");
+        }
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() {
+            bail!("`workspace_id` is required for `thread/start`");
+        }
+        if matches!(
+            params.origin_kind,
+            Some(ThreadOriginKind::TaskRun | ThreadOriginKind::System)
+        ) || matches!(
+            params.sidebar_visibility,
+            Some(ThreadSidebarVisibility::Hidden)
+        ) {
+            bail!("internal thread attributes are not accepted by `thread/start`");
+        }
+
+        let trimmed_optional =
+            |field: &'static str, value: Option<&str>| -> Result<Option<String>> {
+                value
+                    .map(|value| {
+                        let value = value.trim();
+                        if value.is_empty() {
+                            bail!("`{field}` cannot be empty for `thread/start`");
+                        }
+                        Ok(value.to_owned())
+                    })
+                    .transpose()
+            };
+        let name = trimmed_optional("name", params.name.as_deref())?;
+        let model = trimmed_optional("model", params.model.as_deref())?
+            .unwrap_or_else(|| self.default_model.clone());
+        let model_provider = trimmed_optional("model_provider", params.model_provider.as_deref())?
+            .unwrap_or_else(|| self.default_model_provider.clone());
+        let now = unix_timestamp_secs()? as i64;
+        let sandbox_mode = params.sandbox.unwrap_or(DEFAULT_SANDBOX_MODE);
+
+        Ok((
+            Thread {
+                id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                name,
+                preview: String::new(),
+                mode: params.mode.unwrap_or(DEFAULT_THREAD_MODE),
+                model,
+                model_provider,
+                reasoning_effort: None,
+                created_at: now,
+                updated_at: now,
+                status: ThreadStatus::Idle,
+                origin_kind: params.origin_kind.unwrap_or(ThreadOriginKind::User),
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: params.agent_nickname.clone(),
+                agent_role: params.agent_role.clone(),
+                visibility: None,
+                turns: Vec::new(),
+            },
+            sandbox_mode,
+        ))
+    }
+
+    #[cfg(test)]
     pub async fn thread_start(
         &self,
         connection_id: ConnectionId,
         workspace_id: String,
         params: ThreadStartParams,
     ) -> Result<ThreadStartOutcome> {
-        self.thread_start_with_seed(Some(connection_id), workspace_id, params, None, None)
-            .await
+        self.thread_start_authenticated(
+            connection_id,
+            test_subscription_identity(connection_id),
+            workspace_id,
+            params,
+        )
+        .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn thread_start_authenticated(
+        &self,
+        connection_id: ConnectionId,
+        identity: ThreadSubscriptionIdentity,
+        workspace_id: String,
+        params: ThreadStartParams,
+    ) -> Result<ThreadStartOutcome> {
+        self.thread_start_with_seed(
+            Some(ThreadSubscriber {
+                connection_id,
+                identity,
+            }),
+            workspace_id,
+            params,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn thread_start_seeded(
         &self,
         connection_id: ConnectionId,
@@ -134,8 +255,31 @@ impl ThreadManager {
         seed_thread: Option<Thread>,
         seed_sandbox_mode: Option<SandboxMode>,
     ) -> Result<ThreadStartOutcome> {
+        self.thread_start_seeded_authenticated(
+            connection_id,
+            test_subscription_identity(connection_id),
+            workspace_id,
+            params,
+            seed_thread,
+            seed_sandbox_mode,
+        )
+        .await
+    }
+
+    pub(crate) async fn thread_start_seeded_authenticated(
+        &self,
+        connection_id: ConnectionId,
+        identity: ThreadSubscriptionIdentity,
+        workspace_id: String,
+        params: ThreadStartParams,
+        seed_thread: Option<Thread>,
+        seed_sandbox_mode: Option<SandboxMode>,
+    ) -> Result<ThreadStartOutcome> {
         self.thread_start_with_seed(
-            Some(connection_id),
+            Some(ThreadSubscriber {
+                connection_id,
+                identity,
+            }),
             workspace_id,
             params,
             seed_thread,
@@ -195,7 +339,7 @@ impl ThreadManager {
             ThreadEntry {
                 thread,
                 sandbox_mode: sandbox_mode.unwrap_or(DEFAULT_SANDBOX_MODE),
-                connection_ids: HashSet::new(),
+                subscribers: HashMap::new(),
             },
         );
         Ok(())
@@ -203,7 +347,7 @@ impl ThreadManager {
 
     async fn thread_start_with_seed(
         &self,
-        connection_id: Option<ConnectionId>,
+        subscriber: Option<ThreadSubscriber>,
         workspace_id: String,
         params: ThreadStartParams,
         seed_thread: Option<Thread>,
@@ -280,10 +424,10 @@ impl ThreadManager {
                     );
                 }
 
-                if let Some(connection_id) = connection_id {
+                if let Some(subscriber) = subscriber.as_ref() {
                     state
                         .thread_ids_by_connection
-                        .entry(connection_id)
+                        .entry(subscriber.connection_id)
                         .or_default()
                         .insert(thread_id.clone());
                 }
@@ -292,8 +436,10 @@ impl ThreadManager {
                     .threads
                     .get_mut(thread_id.as_str())
                     .expect("thread should still exist");
-                if let Some(connection_id) = connection_id {
-                    existing_entry.connection_ids.insert(connection_id);
+                if let Some(subscriber) = subscriber.as_ref() {
+                    existing_entry
+                        .subscribers
+                        .insert(subscriber.connection_id, subscriber.identity.clone());
                 }
 
                 if let Some(seed_thread) = seed_thread.as_ref() {
@@ -365,28 +511,32 @@ impl ThreadManager {
                             .unwrap_or(ThreadSidebarVisibility::Visible),
                         agent_nickname: requested_agent_nickname,
                         agent_role: requested_agent_role,
+                        visibility: None,
                         turns: Vec::new(),
                     }
                 };
 
                 let sandbox_mode = seed_sandbox_mode.unwrap_or(sandbox_mode);
 
-                if let Some(connection_id) = connection_id {
+                if let Some(subscriber) = subscriber.as_ref() {
                     state
                         .thread_ids_by_connection
-                        .entry(connection_id)
+                        .entry(subscriber.connection_id)
                         .or_default()
                         .insert(thread_id.clone());
                 }
-                let connection_ids = connection_id
-                    .map(|connection_id| HashSet::from([connection_id]))
+                let subscribers = subscriber
+                    .as_ref()
+                    .map(|subscriber| {
+                        HashMap::from([(subscriber.connection_id, subscriber.identity.clone())])
+                    })
                     .unwrap_or_default();
                 state.threads.insert(
                     thread_id,
                     ThreadEntry {
                         thread: thread.clone(),
                         sandbox_mode,
-                        connection_ids,
+                        subscribers,
                     },
                 );
 
@@ -402,7 +552,10 @@ impl ThreadManager {
         Ok(ThreadStartOutcome {
             response,
             started_notification: ThreadStartedNotification { thread },
-            started_notification_connection_ids: connection_id.into_iter().collect(),
+            started_notification_connection_ids: subscriber
+                .into_iter()
+                .map(|subscriber| subscriber.connection_id)
+                .collect(),
         })
     }
 
@@ -435,6 +588,20 @@ impl ThreadManager {
             .filter(|entry| thread_visible_to_connection(entry, connection_id))
             .map(|entry| entry.thread.clone())
             .collect()
+    }
+
+    /// Returns whether a currently materialized empty draft is visible to the
+    /// requested connection. Non-draft and non-materialized threads return
+    /// `None` so persisted listing policy remains authoritative for them.
+    pub async fn empty_draft_visibility_for_connection(
+        &self,
+        thread_id: &str,
+        connection_id: ConnectionId,
+    ) -> Option<bool> {
+        let state = self.state.read().await;
+        let entry = state.threads.get(thread_id)?;
+        is_empty_unnamed_draft_thread(&entry.thread)
+            .then(|| thread_visible_to_connection(entry, Some(connection_id)))
     }
 
     pub async fn turn_start(
@@ -515,7 +682,7 @@ impl ThreadManager {
         };
 
         if let Some(connection_id) = connection_id
-            && !entry.connection_ids.contains(&connection_id)
+            && !entry.subscribers.contains_key(&connection_id)
         {
             bail!("connection `{connection_id}` is not subscribed to thread `{thread_id}`");
         }
@@ -584,7 +751,7 @@ impl ThreadManager {
 
         let response = TurnStartResponse { turn };
 
-        let started_notification_connection_ids = entry.connection_ids.iter().copied().collect();
+        let started_notification_connection_ids = entry.subscribers.keys().copied().collect();
 
         let materialization = TurnStartMaterialization {
             thread: entry.thread.clone(),
@@ -674,7 +841,7 @@ impl ThreadManager {
             thread_id: thread_id.to_owned(),
             workspace_id: entry.thread.workspace_id.clone(),
             turn: turn.clone(),
-            connection_ids: entry.connection_ids.iter().copied().collect(),
+            connection_ids: entry.subscribers.keys().copied().collect(),
             rollback_context: TurnFinishRollbackContext {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -712,8 +879,121 @@ impl ThreadManager {
         state
             .threads
             .get(thread_id)
-            .map(|entry| entry.connection_ids.iter().copied().collect())
+            .map(|entry| entry.subscribers.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) async fn subscribed_connections(&self, thread_id: &str) -> Vec<ThreadSubscriber> {
+        let state = self.state.read().await;
+        state
+            .threads
+            .get(thread_id)
+            .map(|entry| {
+                entry
+                    .subscribers
+                    .iter()
+                    .map(|(connection_id, identity)| ThreadSubscriber {
+                        connection_id: *connection_id,
+                        identity: identity.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn subscribed_connections_for_candidates(
+        &self,
+        thread_id: &str,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ThreadSubscriber> {
+        let state = self.state.read().await;
+        let Some(entry) = state.threads.get(thread_id) else {
+            return Vec::new();
+        };
+
+        candidate_connection_ids
+            .into_iter()
+            .filter_map(|connection_id| {
+                entry
+                    .subscribers
+                    .get(&connection_id)
+                    .cloned()
+                    .map(|identity| ThreadSubscriber {
+                        connection_id,
+                        identity,
+                    })
+            })
+            .collect()
+    }
+
+    /// Removes only subscriptions in the committed authorization scope.
+    ///
+    /// A workspace-wide access loss removes every thread subscription in that
+    /// workspace for the connection. A thread-scoped loss removes only the
+    /// exact thread. Unrelated subscriptions and active background turns are
+    /// preserved.
+    pub(crate) async fn evict_connection_scope(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: Option<&str>,
+    ) -> Vec<ThreadSubscriber> {
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() {
+            return Vec::new();
+        }
+
+        let mut state = self.state.write().await;
+        let candidates = state
+            .thread_ids_by_connection
+            .get(&connection_id)
+            .into_iter()
+            .flat_map(|thread_ids| thread_ids.iter())
+            .filter_map(|candidate_thread_id| {
+                let entry = state.threads.get(candidate_thread_id)?;
+                (entry.thread.workspace_id == workspace_id
+                    && thread_id.is_none_or(|thread_id| thread_id == candidate_thread_id))
+                .then(|| candidate_thread_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut removed = Vec::with_capacity(candidates.len());
+
+        for candidate_thread_id in candidates {
+            let identity = state
+                .threads
+                .get_mut(candidate_thread_id.as_str())
+                .and_then(|entry| entry.subscribers.remove(&connection_id));
+            if let Some(identity) = identity {
+                removed.push(ThreadSubscriber {
+                    connection_id,
+                    identity,
+                });
+            }
+            if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
+                thread_ids.remove(candidate_thread_id.as_str());
+            }
+            let remove_thread =
+                state
+                    .threads
+                    .get(candidate_thread_id.as_str())
+                    .is_some_and(|entry| {
+                        entry.subscribers.is_empty()
+                            && !has_in_progress_conversation_turn(&entry.thread)
+                    });
+            if remove_thread {
+                state.threads.remove(candidate_thread_id.as_str());
+            }
+        }
+
+        if state
+            .thread_ids_by_connection
+            .get(&connection_id)
+            .is_some_and(HashSet::is_empty)
+        {
+            state.thread_ids_by_connection.remove(&connection_id);
+        }
+
+        removed
     }
 
     pub async fn turn_get(&self, thread_id: &str, turn_id: &str) -> Option<(String, Turn)> {
@@ -751,7 +1031,7 @@ impl ThreadManager {
             return false;
         };
 
-        if !entry.connection_ids.is_empty() || has_in_progress_conversation_turn(&entry.thread) {
+        if !entry.subscribers.is_empty() || has_in_progress_conversation_turn(&entry.thread) {
             return false;
         }
 
@@ -772,8 +1052,8 @@ impl ThreadManager {
         for thread_id in thread_ids {
             let should_remove = match state.threads.get_mut(&thread_id) {
                 Some(entry) => {
-                    entry.connection_ids.remove(&connection_id);
-                    entry.connection_ids.is_empty()
+                    entry.subscribers.remove(&connection_id);
+                    entry.subscribers.is_empty()
                         && !has_in_progress_conversation_turn(&entry.thread)
                 }
                 None => false,
@@ -801,19 +1081,19 @@ impl ThreadManager {
                     status: ThreadUnsubscribeStatus::NotLoaded,
                 },
                 closed_notification: None,
-                closed_notification_connection_ids: Vec::new(),
+                closed_notification_subscribers: Vec::new(),
             };
         };
 
-        if !entry.connection_ids.remove(&connection_id) {
+        let Some(removed_identity) = entry.subscribers.remove(&connection_id) else {
             return ThreadUnsubscribeOutcome {
                 response: ThreadUnsubscribeResponse {
                     status: ThreadUnsubscribeStatus::NotSubscribed,
                 },
                 closed_notification: None,
-                closed_notification_connection_ids: Vec::new(),
+                closed_notification_subscribers: Vec::new(),
             };
-        }
+        };
 
         if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
             thread_ids.remove(thread_id);
@@ -823,7 +1103,7 @@ impl ThreadManager {
         }
 
         let should_remove_thread = state.threads.get(thread_id).is_some_and(|entry| {
-            entry.connection_ids.is_empty() && !has_in_progress_conversation_turn(&entry.thread)
+            entry.subscribers.is_empty() && !has_in_progress_conversation_turn(&entry.thread)
         });
 
         let closed_notification = if should_remove_thread {
@@ -846,8 +1126,11 @@ impl ThreadManager {
                 status: ThreadUnsubscribeStatus::Unsubscribed,
             },
             closed_notification,
-            closed_notification_connection_ids: if should_remove_thread {
-                vec![connection_id]
+            closed_notification_subscribers: if should_remove_thread {
+                vec![ThreadSubscriber {
+                    connection_id,
+                    identity: removed_identity,
+                }]
             } else {
                 Vec::new()
             },
@@ -876,11 +1159,11 @@ fn thread_visible_to_connection(entry: &ThreadEntry, connection_id: Option<Conne
         return true;
     }
 
-    if entry.connection_ids.is_empty() {
+    if entry.subscribers.is_empty() {
         return true;
     }
 
-    connection_id.is_some_and(|connection_id| entry.connection_ids.contains(&connection_id))
+    connection_id.is_some_and(|connection_id| entry.subscribers.contains_key(&connection_id))
 }
 
 fn is_empty_unnamed_draft_thread(thread: &Thread) -> bool {
@@ -933,7 +1216,9 @@ impl ThreadManager {
             return false;
         };
 
-        entry.connection_ids.insert(connection_id);
+        entry
+            .subscribers
+            .insert(connection_id, test_subscription_identity(connection_id));
         state
             .thread_ids_by_connection
             .entry(connection_id)
@@ -945,6 +1230,15 @@ impl ThreadManager {
     pub(crate) async fn has_thread(&self, thread_id: &str) -> bool {
         self.state.read().await.threads.contains_key(thread_id)
     }
+}
+
+#[cfg(test)]
+fn test_subscription_identity(connection_id: ConnectionId) -> ThreadSubscriptionIdentity {
+    let _ = connection_id;
+    ThreadSubscriptionIdentity::new(
+        PrincipalId::new("P00000000000000000001").expect("test principal id"),
+        AuthSessionId::new("S00000000000000000001").expect("test auth session id"),
+    )
 }
 
 #[cfg(test)]
@@ -969,6 +1263,7 @@ mod tests {
             mode: None,
             origin_kind: None,
             sidebar_visibility: None,
+            visibility: None,
             agent_nickname: None,
             agent_role: None,
         }
@@ -987,6 +1282,7 @@ mod tests {
             mode: Some(ThreadMode::Chat),
             origin_kind: None,
             sidebar_visibility: None,
+            visibility: None,
             agent_nickname: None,
             agent_role: None,
         };
@@ -1071,6 +1367,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: vec![pioneer_protocol::Turn {
                 id: "turn_000000000000000099".to_owned(),
                 status: TurnStatus::Completed,
@@ -1151,6 +1448,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: vec![pioneer_protocol::Turn {
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
@@ -1201,6 +1499,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: vec![pioneer_protocol::Turn {
                 id: task_turn_id.to_owned(),
                 status: TurnStatus::InProgress,

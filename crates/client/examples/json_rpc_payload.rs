@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         decode_json_rpc_response_value(&response).expect("response should include id");
     assert_eq!(response_id, request.id.as_str());
     assert_eq!(
-        result.map_err(anyhow::Error::msg)?,
+        result.map_err(anyhow::Error::new)?,
         json!({"workspaces": []})
     );
 

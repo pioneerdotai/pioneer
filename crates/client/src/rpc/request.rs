@@ -1,10 +1,14 @@
 //! JSON-RPC request lifecycle primitives.
 
 use anyhow::{Context, Result, anyhow};
-use pioneer_protocol::{JSONRPC_VERSION, JsonRpcRequest, REQUEST_ID_LEN, RequestId, generate_id};
+use pioneer_protocol::{
+    AUTHENTICATION_TERMINAL_CODE, FORBIDDEN_CODE, JSONRPC_VERSION, JsonRpcRequest, NOT_FOUND_CODE,
+    REQUEST_ID_LEN, RequestId, generate_id,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -20,7 +24,100 @@ pub struct JsonRpcRequestPayload {
     pub payload: String,
 }
 
-pub type JsonRpcResponseResult = std::result::Result<JsonValue, String>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonRpcAuthorizationFailure {
+    AuthenticationTerminal,
+    Forbidden,
+    InaccessibleResource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsonRpcResponseError {
+    Transport {
+        message: String,
+    },
+    InvalidResponse,
+    Server {
+        code: Option<i64>,
+        message: String,
+        machine_code: Option<String>,
+    },
+}
+
+impl JsonRpcResponseError {
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::Transport {
+            message: message.into(),
+        }
+    }
+
+    pub fn server(
+        code: Option<i64>,
+        message: impl Into<String>,
+        machine_code: Option<String>,
+    ) -> Self {
+        Self::Server {
+            code,
+            message: message.into(),
+            machine_code,
+        }
+    }
+
+    pub fn authorization_failure(&self) -> Option<JsonRpcAuthorizationFailure> {
+        match self {
+            Self::Server { code, .. } if *code == Some(AUTHENTICATION_TERMINAL_CODE) => {
+                Some(JsonRpcAuthorizationFailure::AuthenticationTerminal)
+            }
+            Self::Server { code, .. } if *code == Some(FORBIDDEN_CODE) => {
+                Some(JsonRpcAuthorizationFailure::Forbidden)
+            }
+            Self::Server { code, .. } if *code == Some(NOT_FOUND_CODE) => {
+                Some(JsonRpcAuthorizationFailure::InaccessibleResource)
+            }
+            Self::Transport { .. } | Self::InvalidResponse | Self::Server { .. } => None,
+        }
+    }
+
+    pub fn machine_code(&self) -> Option<&str> {
+        match self {
+            Self::Server { machine_code, .. } => machine_code.as_deref(),
+            Self::Transport { .. } | Self::InvalidResponse => None,
+        }
+    }
+}
+
+impl fmt::Display for JsonRpcResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport { message } => formatter.write_str(message),
+            Self::InvalidResponse => formatter.write_str(INVALID_JSON_RPC_RESPONSE_PAYLOAD_MESSAGE),
+            Self::Server {
+                code,
+                message,
+                machine_code,
+            } => match self.authorization_failure() {
+                Some(JsonRpcAuthorizationFailure::AuthenticationTerminal) => {
+                    formatter.write_str("authentication_terminal")
+                }
+                Some(JsonRpcAuthorizationFailure::Forbidden) => formatter.write_str("forbidden"),
+                Some(JsonRpcAuthorizationFailure::InaccessibleResource) => {
+                    formatter.write_str("not_found")
+                }
+                None => match machine_code {
+                    Some(machine_code) => write!(formatter, "{message} [{machine_code}]"),
+                    None => match code {
+                        Some(code) => write!(formatter, "{message} [{code}]"),
+                        None => formatter.write_str(message),
+                    },
+                },
+            },
+        }
+    }
+}
+
+impl std::error::Error for JsonRpcResponseError {}
+
+pub type JsonRpcResponseResult = std::result::Result<JsonValue, JsonRpcResponseError>;
 pub type JsonRpcResponseSender = Sender<JsonRpcResponseResult>;
 
 pub trait JsonRpcRequestTransport {
@@ -53,7 +150,7 @@ impl PendingJsonRpcRequests {
     pub fn fail_all(&mut self, error: &str) -> usize {
         let count = self.pending.len();
         for (_, response_tx) in self.pending.drain() {
-            let _ = response_tx.send(Err(error.to_owned()));
+            let _ = response_tx.send(Err(JsonRpcResponseError::transport(error)));
         }
         count
     }
@@ -109,20 +206,35 @@ pub fn decode_json_rpc_response_value(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(JSON_RPC_REQUEST_FAILED_MESSAGE);
-        let code = error
+        let code = error.get("code").and_then(serde_json::Value::as_i64);
+        let machine_code = error
             .get("data")
             .and_then(|data| data.get("code"))
-            .and_then(serde_json::Value::as_str);
-        let message = code
-            .map(|code| format!("{message} [{code}]"))
-            .unwrap_or_else(|| message.to_owned());
-        return Some((response_id, Err(message)));
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        return Some((
+            response_id,
+            Err(JsonRpcResponseError::server(code, message, machine_code)),
+        ));
     }
 
-    Some((
-        response_id,
-        Err(INVALID_JSON_RPC_RESPONSE_PAYLOAD_MESSAGE.to_owned()),
-    ))
+    Some((response_id, Err(JsonRpcResponseError::InvalidResponse)))
+}
+
+pub fn json_rpc_authorization_failure(
+    error: &anyhow::Error,
+) -> Option<JsonRpcAuthorizationFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<JsonRpcResponseError>()
+            .and_then(JsonRpcResponseError::authorization_failure)
+    })
+}
+
+pub fn json_rpc_response_error(error: &anyhow::Error) -> Option<&JsonRpcResponseError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<JsonRpcResponseError>())
 }
 
 pub fn deserialize_json_rpc_result<T>(method: &str, result: JsonValue) -> Result<T>
@@ -164,7 +276,7 @@ where
         .recv_timeout(timeout)
         .map_err(|_| anyhow!("{}", request_timeout_message(method)))?;
 
-    response.map_err(anyhow::Error::msg)
+    response.map_err(anyhow::Error::new)
 }
 
 pub fn send_json_rpc_request_typed<TResponse, TParams, TTransport>(
@@ -238,11 +350,11 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(
             first_rx.recv().expect("first response"),
-            Err("websocket closed".to_owned())
+            Err(JsonRpcResponseError::transport("websocket closed"))
         );
         assert_eq!(
             second_rx.recv().expect("second response"),
-            Err("websocket closed".to_owned())
+            Err(JsonRpcResponseError::transport("websocket closed"))
         );
     }
 
@@ -260,19 +372,27 @@ mod tests {
                 "id": "request-1",
                 "error": {"message": "boom"}
             })),
-            Some(("request-1".to_owned(), Err("boom".to_owned())))
+            Some((
+                "request-1".to_owned(),
+                Err(JsonRpcResponseError::server(None, "boom", None))
+            ))
         );
         assert_eq!(
             decode_json_rpc_response_value(&json!({
                 "id": "request-1",
                 "error": {
+                    "code": -32001,
                     "message": "session is no longer active",
                     "data": {"code": "session_revoked"}
                 }
             })),
             Some((
                 "request-1".to_owned(),
-                Err("session is no longer active [session_revoked]".to_owned())
+                Err(JsonRpcResponseError::server(
+                    Some(-32001),
+                    "session is no longer active",
+                    Some("session_revoked".to_owned())
+                ))
             ))
         );
         assert_eq!(
@@ -282,7 +402,11 @@ mod tests {
             })),
             Some((
                 "request-1".to_owned(),
-                Err(JSON_RPC_REQUEST_FAILED_MESSAGE.to_owned())
+                Err(JsonRpcResponseError::server(
+                    None,
+                    JSON_RPC_REQUEST_FAILED_MESSAGE,
+                    None
+                ))
             ))
         );
         assert_eq!(
@@ -291,7 +415,7 @@ mod tests {
             })),
             Some((
                 "request-1".to_owned(),
-                Err(INVALID_JSON_RPC_RESPONSE_PAYLOAD_MESSAGE.to_owned())
+                Err(JsonRpcResponseError::InvalidResponse)
             ))
         );
         assert_eq!(
@@ -300,6 +424,43 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn rpc_authorization_failures_use_numeric_codes_not_peer_messages() {
+        for (code, expected, rendered) in [
+            (
+                AUTHENTICATION_TERMINAL_CODE,
+                JsonRpcAuthorizationFailure::AuthenticationTerminal,
+                "authentication_terminal",
+            ),
+            (
+                FORBIDDEN_CODE,
+                JsonRpcAuthorizationFailure::Forbidden,
+                "forbidden",
+            ),
+            (
+                NOT_FOUND_CODE,
+                JsonRpcAuthorizationFailure::InaccessibleResource,
+                "not_found",
+            ),
+        ] {
+            let (_, response) = decode_json_rpc_response_value(&json!({
+                "id": "request-1",
+                "error": {
+                    "code": code,
+                    "message": "peer-controlled secret should not escape",
+                    "data": {"code": "peer_controlled"}
+                }
+            }))
+            .expect("response");
+            let response_error = response.expect_err("authorization error");
+            assert_eq!(response_error.authorization_failure(), Some(expected));
+            assert_eq!(response_error.to_string(), rendered);
+
+            let error = anyhow::Error::new(response_error);
+            assert_eq!(json_rpc_authorization_failure(&error), Some(expected));
+        }
     }
 
     #[derive(Debug, serde::Deserialize, PartialEq)]
@@ -350,7 +511,7 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(
             response_rx.recv().expect("response"),
-            Err("websocket closed".to_owned())
+            Err(JsonRpcResponseError::transport("websocket closed"))
         );
     }
 

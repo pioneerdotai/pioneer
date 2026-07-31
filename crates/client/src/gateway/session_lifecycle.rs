@@ -405,6 +405,7 @@ impl SessionLifecycle {
 
 pub fn terminal_reason_from_auth_code(code: &str) -> Option<SessionTerminalReason> {
     match code {
+        "authentication_terminal" => Some(SessionTerminalReason::AuthenticationRequired),
         "session_revoked" => Some(SessionTerminalReason::SessionRevoked),
         "session_expired" => Some(SessionTerminalReason::SessionExpired),
         "session_compromised" => Some(SessionTerminalReason::SessionCompromised),
@@ -639,6 +640,10 @@ mod tests {
             assert_eq!(terminal_reason_from_auth_code(code), None);
         }
         assert!(!auth_code_requires_refresh("session_expired"));
+        assert_eq!(
+            terminal_reason_from_auth_code("authentication_terminal"),
+            Some(SessionTerminalReason::AuthenticationRequired)
+        );
         assert_eq!(
             terminal_reason_from_auth_code("session_expired"),
             Some(SessionTerminalReason::SessionExpired)

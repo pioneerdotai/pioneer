@@ -386,6 +386,72 @@ impl PioneerDesktop {
         self.cli_runtime_thread_bindings.clear();
     }
 
+    pub(in crate::app) fn clear_workspace_capability_projections(&mut self) {
+        self.reset_thread_start_state();
+        self.clear_thread_start_queue();
+        self.clear_turn_resume_queue();
+        self.providers.clear_for_workspace_switch();
+        self.mcp_servers.clear();
+        self.mcp_selected_server_id = None;
+        self.mcp_server_details = None;
+        self.mcp_loading = false;
+        self.mcp_details_loading = false;
+        self.mcp_error = None;
+        self.mcp_refresh_requested = false;
+        self.mcp_details_refresh_requested = false;
+        self.mcp_pending_actions.clear();
+        self.installed_skills.clear();
+        self.skills_catalog.clear();
+        self.skills_management = Default::default();
+        self.skills_health_details.clear();
+        self.skills_loading = false;
+        self.skills_error = None;
+        self.skills_refresh_requested = false;
+        self.skills_pending_actions.clear();
+        self.selected_skill_target = None;
+        self.composer_capabilities.clear();
+        self.composer_skill_selections.clear();
+        self.composer_attachments.clear();
+        self.composer_selected_provider = None;
+        self.composer_selected_model = None;
+        self.composer_selected_reasoning_effort = None;
+        self.composer_model_display_cache.clear();
+        self.composer_model_display_loading_key = None;
+        if !matches!(
+            self.main_content_view,
+            MainContentView::Settings | MainContentView::Threads
+        ) {
+            self.main_content_view = MainContentView::Threads;
+        }
+    }
+
+    /// Clears every server-authorized projection before a connection begins a
+    /// new authorization epoch. Endpoint registry and device-session state are
+    /// deliberately owned by the Gateway coordinator and remain untouched.
+    pub(in crate::app) fn clear_authorization_epoch_cache(&mut self) {
+        self.workspaces.clear();
+        self.workspaces_error = None;
+        self.set_active_thread_id(None);
+        self.clear_thread_conversations();
+        self.last_active_thread_by_workspace.clear();
+        self.draft_thread_by_workspace.clear();
+        self.task_thread_navigation_stack.clear();
+        self.ready_turn_resume_threads.clear();
+        self.ready_turn_resume_thread_set.clear();
+        self.thread_artifacts = Default::default();
+        self.show_thread_artifacts_sidebar = false;
+        self.active_agents_doc_editor_scope = None;
+        self.agents_doc_editor = None;
+        self.thread_tree_selected_node_id = None;
+        *self.thread_timeline_view_state.borrow_mut() = Default::default();
+        self.thread_timeline_item_expanded.borrow_mut().clear();
+        self.thread_timeline_terminal_item.borrow_mut().clear();
+        *self.code_highlight_cache.borrow_mut() = Default::default();
+        self.task_review_actions = Default::default();
+        self.gateway.settings = None;
+        self.clear_workspace_capability_projections();
+    }
+
     pub(in crate::app) fn set_cli_runtime_thread_binding(
         &mut self,
         thread_id: String,

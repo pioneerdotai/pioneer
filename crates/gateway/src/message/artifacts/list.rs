@@ -1,4 +1,8 @@
 use super::super::*;
+use crate::authorization::{
+    AuthorizationExternalError, AuthorizedArtifact, AuthorizedThread, AuthorizedTurn,
+    AuthorizedWorkspace, ResourceAction,
+};
 use pioneer_artifacts::ArtifactListFilter;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactDeleteParams, ArtifactDeleteResponse,
@@ -6,15 +10,81 @@ use pioneer_protocol::{
     ArtifactRestoreParams, ArtifactRestoreResponse, ThreadArtifactsChangedNotification,
 };
 
+pub(in crate::message) enum ArtifactListAuthorization<'a> {
+    Workspace(&'a AuthorizedWorkspace),
+    Thread(&'a AuthorizedThread),
+    Turn(&'a AuthorizedTurn),
+}
+
+impl ArtifactListAuthorization<'_> {
+    fn workspace_id(&self) -> &str {
+        match self {
+            Self::Workspace(proof) => proof.workspace_id(),
+            Self::Thread(proof) => proof.workspace_id(),
+            Self::Turn(proof) => proof.workspace_id(),
+        }
+    }
+
+    fn principal_id(&self) -> &pioneer_protocol::PrincipalId {
+        match self {
+            Self::Workspace(proof) => proof.principal_id(),
+            Self::Thread(proof) => proof.principal_id(),
+            Self::Turn(proof) => proof.principal_id(),
+        }
+    }
+
+    fn is_superuser(&self) -> bool {
+        match self {
+            Self::Workspace(proof) => proof.decision().is_absolute_superuser(),
+            Self::Thread(proof) => proof.decision().is_absolute_superuser(),
+            Self::Turn(proof) => proof.decision().is_absolute_superuser(),
+        }
+    }
+
+    fn action(&self) -> ResourceAction {
+        match self {
+            Self::Workspace(proof) => proof.action(),
+            Self::Thread(proof) => proof.action(),
+            Self::Turn(proof) => proof.action(),
+        }
+    }
+
+    fn validates_params(&self, params: &ArtifactListParams) -> bool {
+        if self.workspace_id() != params.workspace_id.trim() {
+            return false;
+        }
+        match self {
+            Self::Workspace(_) => true,
+            Self::Thread(proof) => params
+                .thread_id
+                .as_deref()
+                .is_some_and(|thread_id| thread_id.trim() == proof.thread_id()),
+            Self::Turn(proof) => params
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_id.trim() == proof.turn_id()),
+        }
+    }
+}
+
 impl MessageProcessor {
-    pub(crate) async fn artifact_list(
+    pub(in crate::message) async fn artifact_list(
         &self,
         request_context: &RequestContext,
+        authorization: ArtifactListAuthorization<'_>,
         request_id: RequestId,
         params: ArtifactListParams,
         method: &'static str,
     ) {
         let connection_id = request_context.connection_id();
+        if !authorization.validates_params(&params) {
+            self.send_error(
+                connection_id,
+                crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -31,18 +101,23 @@ impl MessageProcessor {
             }
         };
 
-        if let Err(error) = self
-            .validate_artifact_list_scope(&workspace_id, &params, method)
-            .await
-        {
+        if let Err(error) = self.validate_artifact_list_scope(&params, method) {
             self.send_error(connection_id, error.with_request_id(request_id))
                 .await;
             return;
         }
 
-        let filter = match self.filter_from_artifact_list_params(params, method).await {
+        let mut filter = match self.filter_from_artifact_list_params(params, method).await {
             Ok(filter) => filter,
             Err(error) => {
+                if !authorization.is_superuser() {
+                    self.send_error(
+                        connection_id,
+                        artifact_list_authorization_unavailable(&authorization, request_id),
+                    )
+                    .await;
+                    return;
+                }
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -55,6 +130,92 @@ impl MessageProcessor {
                 return;
             }
         };
+        if !authorization.is_superuser() {
+            let authorized_roots = match &authorization {
+                ArtifactListAuthorization::Workspace(_) => {
+                    let threads = match pioneer_crud::list_accessible_threads_for_principal(
+                        &self.crud_store.database_connection(),
+                        authorization.principal_id(),
+                        workspace_id.as_str(),
+                        u64::MAX,
+                    )
+                    .await
+                    {
+                        Ok(threads) => threads,
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                artifact_list_authorization_unavailable(&authorization, request_id),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let mut roots = Vec::with_capacity(threads.len());
+                    for thread in threads {
+                        match self.artifact_thread_scope_ids(thread.id.as_str()).await {
+                            Ok(thread_ids) => roots.push(thread_ids),
+                            Err(_) => {
+                                self.send_error(
+                                    connection_id,
+                                    artifact_list_authorization_unavailable(
+                                        &authorization,
+                                        request_id,
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    roots
+                }
+                ArtifactListAuthorization::Thread(proof) => {
+                    match self.artifact_thread_scope_ids(proof.thread_id()).await {
+                        Ok(thread_ids) => vec![thread_ids],
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                artifact_list_authorization_unavailable(&authorization, request_id),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                ArtifactListAuthorization::Turn(proof) => {
+                    match self.artifact_thread_scope_ids(proof.thread_id()).await {
+                        Ok(thread_ids) => vec![thread_ids],
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                artifact_list_authorization_unavailable(&authorization, request_id),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+            };
+            filter.authorized_artifact_ids = match self
+                .crud_store
+                .list_artifact_ids_for_authorized_thread_roots(
+                    workspace_id.as_str(),
+                    authorized_roots.as_slice(),
+                )
+                .await
+            {
+                Ok(artifact_ids) => Some(artifact_ids),
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        artifact_list_authorization_unavailable(&authorization, request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+        }
         let page = match self
             .artifact_service
             .list_artifacts(&workspace_id, filter)
@@ -90,10 +251,21 @@ impl MessageProcessor {
     pub(crate) async fn artifact_get(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactGetParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.workspace_id() != params.workspace_id.trim()
+            || authorization.artifact_id() != params.artifact_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -145,10 +317,64 @@ impl MessageProcessor {
     pub(crate) async fn artifact_bind(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactBindParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.workspace_id() != params.workspace_id.trim()
+            || authorization.artifact_id() != params.artifact_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+        let target_root = match pioneer_crud::resolve_artifact_binding_authorization_root(
+            &self.crud_store.database_connection(),
+            authorization.workspace_id(),
+            params.thread_id.as_deref().map(str::trim),
+            params.turn_id.as_deref().map(str::trim),
+            params.task_id.as_deref().map(str::trim),
+            params.task_run_id.as_deref().map(str::trim),
+        )
+        .await
+        {
+            Ok(Some(root)) => root,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                crate::authorization::record_authorization_unavailable(
+                    authorization.action().safe_name(),
+                    "artifact",
+                    "mutation",
+                );
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        if !authorization.decision().is_absolute_superuser()
+            && authorization.thread_id() != Some(target_root.as_str())
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -215,10 +441,21 @@ impl MessageProcessor {
     pub(crate) async fn artifact_delete(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactDeleteParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.workspace_id() != params.workspace_id.trim()
+            || authorization.artifact_id() != params.artifact_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -268,10 +505,21 @@ impl MessageProcessor {
     pub(crate) async fn artifact_restore(
         &self,
         request_context: &RequestContext,
+        authorization: &AuthorizedArtifact,
         request_id: RequestId,
         params: ArtifactRestoreParams,
     ) {
         let connection_id = request_context.connection_id();
+        if authorization.workspace_id() != params.workspace_id.trim()
+            || authorization.artifact_id() != params.artifact_id.trim()
+        {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
         let workspace_id = match self
             .validate_artifact_workspace(
                 connection_id,
@@ -318,26 +566,14 @@ impl MessageProcessor {
         }
     }
 
-    async fn validate_artifact_list_scope(
+    fn validate_artifact_list_scope(
         &self,
-        workspace_id: &str,
         params: &ArtifactListParams,
         method: &str,
     ) -> Result<(), ArtifactScopeError> {
         match method {
             methods::ARTIFACT_LIST_FOR_THREAD => {
-                let thread_id = required_scope("thread_id", params.thread_id.as_deref())?;
-                let thread = self
-                    .crud_store
-                    .get_thread_by_id(thread_id)
-                    .await
-                    .map_err(|error| ArtifactScopeError(error.to_string()))?
-                    .ok_or_else(|| ArtifactScopeError(format!("thread `{thread_id}` not found")))?;
-                if thread.workspace_id != workspace_id {
-                    return Err(ArtifactScopeError(format!(
-                        "thread `{thread_id}` does not belong to workspace `{workspace_id}`"
-                    )));
-                }
+                required_scope("thread_id", params.thread_id.as_deref())?;
             }
             methods::ARTIFACT_LIST_FOR_TURN => {
                 required_scope("turn_id", params.turn_id.as_deref())?;
@@ -471,6 +707,18 @@ impl MessageProcessor {
     }
 }
 
+fn artifact_list_authorization_unavailable(
+    authorization: &ArtifactListAuthorization<'_>,
+    request_id: RequestId,
+) -> JsonRpcErrorResponse {
+    crate::authorization::record_authorization_unavailable(
+        authorization.action().safe_name(),
+        "artifact",
+        "read",
+    );
+    AuthorizationExternalError::Unavailable.response(request_id)
+}
+
 fn filter_from_params(params: ArtifactListParams) -> ArtifactListFilter {
     ArtifactListFilter {
         limit: params.limit,
@@ -479,6 +727,7 @@ fn filter_from_params(params: ArtifactListParams) -> ArtifactListFilter {
         kinds: params.kinds,
         thread_id: params.thread_id,
         thread_ids: Vec::new(),
+        authorized_artifact_ids: None,
         turn_id: params.turn_id,
         message_id: params.message_id,
         task_id: params.task_id,

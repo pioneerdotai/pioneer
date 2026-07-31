@@ -28,6 +28,9 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub created_by_actor_id: Option<String>,
     pub created_by_actor_kind: Option<String>,
+    pub access_class: String,
+    #[sea_orm(has_many, via = "thread_membership")]
+    pub gateway_principals: HasMany<super::gateway_principal::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -59,7 +59,8 @@ use crate::{
     voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::{
-    ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification,
+    AccessChangedNotification, ArtifactSummary, GatewayNotification,
+    GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     GatewayVoiceInputStatusChangedNotification, Workspace, WorkspaceChangedNotification,
 };
@@ -114,6 +115,7 @@ impl Default for ClientRuntimeNotificationContext<'_> {
 
 #[derive(Clone, Debug)]
 pub enum ClientRuntimeNotification {
+    AccessChanged(AccessChangedNotification),
     ThreadStarted(ThreadStartedReduction),
     TurnLifecycle(TurnLifecycleReduction),
     ConversationEvent(ConversationEventReduction),
@@ -349,6 +351,9 @@ pub fn reduce_gateway_notification(
     context: ClientRuntimeNotificationContext<'_>,
 ) -> Option<ClientRuntimeNotification> {
     match notification {
+        GatewayNotification::AccessChanged(notification) => {
+            Some(ClientRuntimeNotification::AccessChanged(notification))
+        }
         GatewayNotification::ThreadStarted(notification) => Some(
             ClientRuntimeNotification::ThreadStarted(reduce_thread_started_notification(
                 notification,
@@ -660,6 +665,7 @@ pub fn reduce_gateway_notification(
         }
         GatewayNotification::AuthSessionRevoked(_)
         | GatewayNotification::AuthAccessExpiring(_)
+        | GatewayNotification::ThreadParticipantsChanged(_)
         | GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
@@ -712,9 +718,9 @@ mod tests {
         transport::ws::GatewayWsConnectSpec,
     };
     use pioneer_protocol::{
-        GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
-        GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
-        GatewayThreadEpisodicVectorRefillStatus,
+        AccessChangeKind, AccessChangedNotification, GatewayRemoteAccessErrorKind,
+        GatewayRemoteAccessState, GatewayRemoteAccessStatusChangedNotification,
+        GatewayRemoteAccessStatusSnapshot, GatewayThreadEpisodicVectorRefillStatus,
         GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputProvider,
         GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot, GatewayVoiceInputSettings,
         GatewayVoiceInputStatusChangedNotification, SkillsChangedNotification,
@@ -999,6 +1005,26 @@ mod tests {
             Some("ws_b")
         );
         assert!(preference.queue_thread_list_refresh);
+    }
+
+    #[test]
+    fn runtime_routes_access_changed_without_promoting_it_to_a_client_grant() {
+        let notification = AccessChangedNotification {
+            authorization_revision: 12,
+            workspace_id: "ws_a".to_owned(),
+            thread_id: Some("thread_a".to_owned()),
+            change: AccessChangeKind::ThreadVisibility,
+        };
+
+        let reduced = reduce_gateway_notification(
+            GatewayNotification::AccessChanged(notification.clone()),
+            ClientRuntimeNotificationContext::default(),
+        );
+
+        let Some(ClientRuntimeNotification::AccessChanged(actual)) = reduced else {
+            panic!("expected access changed notification");
+        };
+        assert_eq!(actual, notification);
     }
 
     #[test]

@@ -44,4 +44,22 @@ impl PioneerDesktop {
             );
         }
     }
+
+    pub(in crate::app::flow) fn clear_persisted_active_gateway_workspace_id(&mut self) {
+        let Some(runtime) = self.gateway.runtime.as_mut() else {
+            return;
+        };
+        let gateway_id = runtime.active_gateway_id().map(str::to_owned);
+        let Some(gateway_id) = gateway_id else {
+            return;
+        };
+
+        if let Err(error) = runtime.set_gateway_workspace_id(gateway_id.as_str(), None) {
+            warn!(
+                gateway_id = gateway_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to clear inaccessible gateway workspace id"
+            );
+        }
+    }
 }

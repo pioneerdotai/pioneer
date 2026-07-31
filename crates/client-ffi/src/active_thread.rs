@@ -2,8 +2,11 @@ use crate::contracts::ClientEvent;
 use crate::threads::ClientThreadTreeSnapshot;
 use pioneer_client::{
     ClientError, ClientResult,
-    cli_runtime::approvals::reduce_pending_request_thread_closed_cleanup,
-    cli_runtime::approvals::{PendingRequest, PendingRequestState},
+    authorization::{ThreadAuthorizationScope, plan_access_changed},
+    cli_runtime::approvals::{
+        PendingRequest, PendingRequestState, PendingRequestsReduction,
+        reduce_pending_request_thread_closed_cleanup,
+    },
     composer::{
         attachments::ComposerAttachment,
         capabilities::{ComposerCapability, plan_composer_submission},
@@ -55,9 +58,10 @@ use pioneer_client::{
     },
 };
 use pioneer_protocol::{
-    AgentExecutionBackend, GatewayNotification, RuntimeSummary, Thread, ThreadGetParams,
-    ThreadMode, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
-    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    AccessChangeKind, AccessChangedNotification, AgentExecutionBackend, GatewayNotification,
+    RuntimeSummary, Thread, ThreadGetParams, ThreadMode, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, TimelinePageAnchor, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 use pioneer_protocol::{ThreadComposerExecutionMode, TurnPermissionMode};
 use serde::{Deserialize, Serialize};
@@ -121,10 +125,29 @@ pub struct ClientActiveThreadEventRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClientActiveThreadEventResult {
     pub snapshot: ClientActiveThreadSnapshot,
     pub semantic_timeline_patch: SemanticTimelineCachePatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_changed: Option<ClientAccessChangedLifecycle>,
+}
+
+/// Payload-safe bridge projection of the shared Rust access-change plan.
+///
+/// This lifecycle DTO omits thread identifiers and protected cache keys.
+/// First-party shells may pair it with the minimal `AccessChangedNotification`
+/// to evict an exact thread cache after access has been lost.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientAccessChangedLifecycle {
+    pub authorization_revision: u64,
+    pub workspace_id: String,
+    pub change: AccessChangeKind,
+    pub applied: bool,
+    pub active_scope_cleared: bool,
+    pub active_thread_cleared: bool,
+    pub refresh_workspace_catalog: bool,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -274,6 +297,7 @@ struct ClientFfiActiveThreadInner {
     draft_thread_by_workspace: HashMap<String, String>,
     last_active_thread_by_workspace: HashMap<String, String>,
     session_revision: u64,
+    authorization_revision: Option<u64>,
     coordinators: HashMap<String, ThreadCoordinator>,
     semantic_timelines: SemanticTimelineState,
     pending_requests: PendingRequestState,
@@ -296,7 +320,29 @@ enum SemanticTimelineReconcileRequest {
     },
 }
 
+#[derive(Default)]
+struct ClientFfiNotificationReduction {
+    semantic_timeline_patch: SemanticTimelineCachePatch,
+    access_changed: Option<ClientAccessChangedLifecycle>,
+}
+
 impl ClientFfiActiveThreadState {
+    /// Starts a new server authorization epoch without touching endpoint or
+    /// device-session state owned by the outer runtime.
+    ///
+    /// A reconnect can miss access-change notifications emitted while the
+    /// transport was down. Protected projections therefore cannot survive as
+    /// readable cache across the boundary; the shell reloads them from
+    /// current-ACL endpoints after the connection becomes ready.
+    pub fn begin_authorization_epoch(&self) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+        clear_authorization_derived_state(&mut inner);
+        Ok(())
+    }
+
     pub fn ensure_workspace_draft(
         &self,
         runtime: &ClientRuntime,
@@ -452,11 +498,11 @@ impl ClientFfiActiveThreadState {
             }
             _ => None,
         };
-        let semantic_timeline_patch =
+        let notification_reduction =
             if let ClientEvent::GatewayNotification(notification) = request.event {
                 self.apply_gateway_notification(runtime, notification)?
             } else {
-                SemanticTimelineCachePatch::default()
+                ClientFfiNotificationReduction::default()
             };
 
         let snapshot = {
@@ -472,7 +518,8 @@ impl ClientFfiActiveThreadState {
 
         Ok(ClientActiveThreadEventResult {
             snapshot,
-            semantic_timeline_patch,
+            semantic_timeline_patch: notification_reduction.semantic_timeline_patch,
+            access_changed: notification_reduction.access_changed,
         })
     }
 
@@ -936,19 +983,7 @@ impl ClientFfiActiveThreadState {
                 .inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            let plan = client_state_reducers::plan_gateway_switch_cleanup(
-                &inner.coordinators,
-                inner.active_thread_id.as_deref(),
-            );
-            let thread_ids = thread_ids_from_effects(plan.effects);
-            clear_active_thread(&mut inner);
-            inner.draft_thread_by_workspace.clear();
-            inner.last_active_thread_by_workspace.clear();
-            inner.coordinators.clear();
-            inner.semantic_timelines = Default::default();
-            inner.pending_requests = Default::default();
-            thread_session::bump_session_revision(&mut inner.session_revision);
-            thread_ids
+            clear_authorization_derived_state(&mut inner)
         };
 
         let sender = runtime.ws_command_sender();
@@ -1069,7 +1104,15 @@ impl ClientFfiActiveThreadState {
         &self,
         runtime: &ClientRuntime,
         notification: GatewayNotification,
-    ) -> anyhow::Result<SemanticTimelineCachePatch> {
+    ) -> anyhow::Result<ClientFfiNotificationReduction> {
+        if let GatewayNotification::AccessChanged(notification) = notification {
+            let access_changed = self.apply_access_changed(runtime, &notification)?;
+            return Ok(ClientFfiNotificationReduction {
+                access_changed: Some(access_changed),
+                ..Default::default()
+            });
+        }
+
         let (active_thread_id, active_workspace_id, notification_thread_workspace_matches) = {
             let inner = self
                 .inner
@@ -1108,10 +1151,17 @@ impl ClientFfiActiveThreadState {
         };
 
         let Some(reduction) = runtime.reduce_gateway_notification(notification, context) else {
-            return Ok(SemanticTimelineCachePatch::default());
+            return Ok(ClientFfiNotificationReduction::default());
         };
 
         let semantic_timeline_patch = match reduction {
+            ClientRuntimeNotification::AccessChanged(notification) => {
+                let access_changed = self.apply_access_changed(runtime, &notification)?;
+                return Ok(ClientFfiNotificationReduction {
+                    access_changed: Some(access_changed),
+                    ..Default::default()
+                });
+            }
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 let mut inner = self
                     .inner
@@ -1261,7 +1311,105 @@ impl ClientFfiActiveThreadState {
             }
         };
 
-        Ok(semantic_timeline_patch)
+        Ok(ClientFfiNotificationReduction {
+            semantic_timeline_patch,
+            access_changed: None,
+        })
+    }
+
+    fn apply_access_changed(
+        &self,
+        runtime: &ClientRuntime,
+        notification: &AccessChangedNotification,
+    ) -> anyhow::Result<ClientAccessChangedLifecycle> {
+        let plan = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            let active_workspace_id = inner
+                .active_thread_id
+                .as_deref()
+                .and_then(|thread_id| inner.coordinators.get(thread_id))
+                .map(|coordinator| coordinator.workspace_id.clone());
+            let known_threads = inner
+                .coordinators
+                .iter()
+                .map(|(thread_id, coordinator)| ThreadAuthorizationScope {
+                    thread_id: thread_id.clone(),
+                    workspace_id: coordinator.workspace_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            let plan = plan_access_changed(
+                notification,
+                inner.authorization_revision,
+                active_workspace_id.as_deref(),
+                inner.active_thread_id.as_deref(),
+                known_threads.as_slice(),
+            );
+
+            if plan.apply {
+                inner.authorization_revision = Some(plan.authorization_revision);
+                let previous_session_revision = inner.session_revision;
+
+                for thread_id in &plan.invalidate_thread_ids {
+                    remove_thread_session_state(&mut inner, thread_id.as_str());
+                }
+                let workspace_wide =
+                    plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
+                let draft_removed = workspace_wide
+                    && inner
+                        .draft_thread_by_workspace
+                        .remove(plan.workspace_id.as_str())
+                        .is_some();
+                let last_active_removed = workspace_wide
+                    && inner
+                        .last_active_thread_by_workspace
+                        .remove(plan.workspace_id.as_str())
+                        .is_some();
+                if plan.clear_active_thread {
+                    clear_active_thread(&mut inner);
+                }
+                if workspace_wide {
+                    inner
+                        .pending_requests
+                        .apply(PendingRequestsReduction::ClearWorkspace {
+                            workspace_id: plan.workspace_id.clone(),
+                        });
+                }
+
+                if (draft_removed || last_active_removed)
+                    && inner.session_revision == previous_session_revision
+                {
+                    thread_session::bump_session_revision(&mut inner.session_revision);
+                }
+            }
+
+            plan
+        };
+
+        if plan.apply {
+            let sender = runtime.ws_command_sender();
+            for thread_id in &plan.invalidate_thread_ids {
+                // Access has already been removed from local state. The remote
+                // unsubscribe is deliberately best-effort because Gateway ACL
+                // filtering remains authoritative after revocation.
+                let _ = ws_commands::thread_unsubscribe(&sender, thread_id.clone());
+            }
+        }
+
+        Ok(ClientAccessChangedLifecycle {
+            authorization_revision: plan.authorization_revision,
+            workspace_id: plan.workspace_id,
+            change: plan.change,
+            applied: plan.apply,
+            active_scope_cleared: plan.clear_active_workspace,
+            active_thread_cleared: plan.clear_active_thread,
+            refresh_workspace_catalog: plan
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ClientEffect::RefreshWorkspaceList)),
+        })
     }
 
     fn reconcile_semantic_timeline(
@@ -1400,6 +1548,23 @@ fn semantic_timeline_reconcile_requests(
             }]
         }
     }
+}
+
+fn clear_authorization_derived_state(inner: &mut ClientFfiActiveThreadInner) -> Vec<String> {
+    let plan = client_state_reducers::plan_gateway_switch_cleanup(
+        &inner.coordinators,
+        inner.active_thread_id.as_deref(),
+    );
+    let thread_ids = thread_ids_from_effects(plan.effects);
+    clear_active_thread(inner);
+    inner.draft_thread_by_workspace.clear();
+    inner.last_active_thread_by_workspace.clear();
+    inner.coordinators.clear();
+    inner.semantic_timelines = Default::default();
+    inner.pending_requests = Default::default();
+    inner.authorization_revision = None;
+    thread_session::bump_session_revision(&mut inner.session_revision);
+    thread_ids
 }
 
 fn thread_ids_from_effects(effects: Vec<ClientEffect>) -> Vec<String> {
@@ -2086,6 +2251,7 @@ mod tests {
             sidebar_visibility: ThreadSidebarVisibility::Visible,
             agent_nickname: None,
             agent_role: None,
+            visibility: None,
             turns: Vec::new(),
         }
     }
@@ -2512,6 +2678,262 @@ mod tests {
 
         assert_eq!(snapshot.pending_requests.len(), 1);
         assert_eq!(snapshot.pending_requests[0].request_id, "req_a");
+    }
+
+    #[test]
+    fn access_change_uses_shared_plan_and_clears_only_the_affected_workspace() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.active_thread_id = Some("thread_revoked".to_owned());
+            inner.coordinators.insert(
+                "thread_allowed".to_owned(),
+                ThreadCoordinator::new(thread("thread_allowed", "workspace_allowed")),
+            );
+            inner.coordinators.insert(
+                "thread_revoked".to_owned(),
+                ThreadCoordinator::new(thread("thread_revoked", "workspace_revoked")),
+            );
+            inner
+                .draft_thread_by_workspace
+                .insert("workspace_revoked".to_owned(), "thread_revoked".to_owned());
+            inner
+                .last_active_thread_by_workspace
+                .insert("workspace_allowed".to_owned(), "thread_allowed".to_owned());
+            inner
+                .semantic_timelines
+                .thread_mut("thread_allowed".to_owned());
+            inner
+                .semantic_timelines
+                .thread_mut("thread_revoked".to_owned());
+            inner
+                .pending_requests
+                .apply(PendingRequestsReduction::Opened(pending_request(
+                    "request_allowed",
+                    "workspace_allowed",
+                    "thread_allowed",
+                )));
+            inner
+                .pending_requests
+                .apply(PendingRequestsReduction::Opened(pending_request(
+                    "request_revoked",
+                    "workspace_revoked",
+                    "thread_revoked",
+                )));
+        }
+
+        let lifecycle = state
+            .apply_access_changed(
+                &ClientRuntime::default(),
+                &AccessChangedNotification {
+                    authorization_revision: 7,
+                    workspace_id: "workspace_revoked".to_owned(),
+                    thread_id: None,
+                    change: AccessChangeKind::WorkspaceMembership,
+                },
+            )
+            .expect("access change");
+
+        assert!(lifecycle.applied);
+        assert!(lifecycle.active_scope_cleared);
+        assert!(lifecycle.refresh_workspace_catalog);
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(7));
+        assert!(inner.active_thread_id.is_none());
+        assert!(inner.coordinators.contains_key("thread_allowed"));
+        assert!(!inner.coordinators.contains_key("thread_revoked"));
+        assert!(
+            inner
+                .semantic_timelines
+                .threads_by_id
+                .contains_key("thread_allowed")
+        );
+        assert!(
+            !inner
+                .semantic_timelines
+                .threads_by_id
+                .contains_key("thread_revoked")
+        );
+        assert_eq!(inner.pending_requests.requests().len(), 1);
+        assert_eq!(
+            inner.pending_requests.requests()[0].workspace_id,
+            "workspace_allowed"
+        );
+        assert_eq!(
+            inner
+                .last_active_thread_by_workspace
+                .get("workspace_allowed")
+                .map(String::as_str),
+            Some("thread_allowed")
+        );
+
+        let encoded = serde_json::to_value(&lifecycle).expect("bridge lifecycle JSON");
+        let encoded_text = encoded.to_string();
+        assert!(!encoded_text.contains("thread_revoked"));
+        assert!(!encoded_text.contains("request_revoked"));
+        assert!(!encoded_text.contains("protected"));
+        assert_eq!(
+            serde_json::from_value::<ClientAccessChangedLifecycle>(encoded)
+                .expect("bridge lifecycle round-trip"),
+            lifecycle
+        );
+    }
+
+    #[test]
+    fn thread_access_change_clears_active_thread_without_clearing_workspace_scope() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.active_thread_id = Some("thread_revoked".to_owned());
+            inner.coordinators.insert(
+                "thread_revoked".to_owned(),
+                ThreadCoordinator::new(thread("thread_revoked", "workspace_affected")),
+            );
+            inner.coordinators.insert(
+                "thread_kept".to_owned(),
+                ThreadCoordinator::new(thread("thread_kept", "workspace_affected")),
+            );
+            inner
+                .draft_thread_by_workspace
+                .insert("workspace_affected".to_owned(), "thread_kept".to_owned());
+            inner
+                .last_active_thread_by_workspace
+                .insert("workspace_affected".to_owned(), "thread_kept".to_owned());
+            inner
+                .pending_requests
+                .apply(PendingRequestsReduction::Opened(pending_request(
+                    "request_revoked",
+                    "workspace_affected",
+                    "thread_revoked",
+                )));
+            inner
+                .pending_requests
+                .apply(PendingRequestsReduction::Opened(pending_request(
+                    "request_kept",
+                    "workspace_affected",
+                    "thread_kept",
+                )));
+        }
+
+        let lifecycle = state
+            .apply_access_changed(
+                &ClientRuntime::default(),
+                &AccessChangedNotification {
+                    authorization_revision: 8,
+                    workspace_id: "workspace_affected".to_owned(),
+                    thread_id: Some("thread_revoked".to_owned()),
+                    change: AccessChangeKind::ThreadParticipantRemoved,
+                },
+            )
+            .expect("thread access change");
+
+        assert!(lifecycle.applied);
+        assert!(!lifecycle.active_scope_cleared);
+        assert!(lifecycle.active_thread_cleared);
+        assert!(lifecycle.refresh_workspace_catalog);
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(8));
+        assert!(inner.active_thread_id.is_none());
+        assert!(!inner.coordinators.contains_key("thread_revoked"));
+        assert!(inner.coordinators.contains_key("thread_kept"));
+        assert_eq!(
+            inner
+                .draft_thread_by_workspace
+                .get("workspace_affected")
+                .map(String::as_str),
+            Some("thread_kept")
+        );
+        assert_eq!(
+            inner
+                .last_active_thread_by_workspace
+                .get("workspace_affected")
+                .map(String::as_str),
+            Some("thread_kept")
+        );
+        assert_eq!(inner.pending_requests.requests().len(), 1);
+        assert_eq!(
+            inner.pending_requests.requests()[0].thread_id.as_deref(),
+            Some("thread_kept")
+        );
+    }
+
+    #[test]
+    fn stale_access_change_is_reported_without_mutating_ffi_state() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.authorization_revision = Some(9);
+            inner.active_thread_id = Some("thread_current".to_owned());
+            inner.coordinators.insert(
+                "thread_current".to_owned(),
+                ThreadCoordinator::new(thread("thread_current", "workspace_current")),
+            );
+        }
+
+        let lifecycle = state
+            .apply_access_changed(
+                &ClientRuntime::default(),
+                &AccessChangedNotification {
+                    authorization_revision: 8,
+                    workspace_id: "workspace_current".to_owned(),
+                    thread_id: Some("thread_current".to_owned()),
+                    change: AccessChangeKind::ThreadVisibility,
+                },
+            )
+            .expect("stale access change");
+
+        assert!(!lifecycle.applied);
+        assert!(!lifecycle.active_scope_cleared);
+        assert!(!lifecycle.refresh_workspace_catalog);
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(9));
+        assert_eq!(inner.active_thread_id.as_deref(), Some("thread_current"));
+        assert!(inner.coordinators.contains_key("thread_current"));
+    }
+
+    #[test]
+    fn new_authorization_epoch_drops_protected_cache_but_not_outer_session_state() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.authorization_revision = Some(91);
+            inner.active_thread_id = Some("thread_protected".to_owned());
+            inner.draft_thread_by_workspace.insert(
+                "workspace_protected".to_owned(),
+                "thread_protected".to_owned(),
+            );
+            inner.last_active_thread_by_workspace.insert(
+                "workspace_protected".to_owned(),
+                "thread_protected".to_owned(),
+            );
+            inner.coordinators.insert(
+                "thread_protected".to_owned(),
+                ThreadCoordinator::new(thread("thread_protected", "workspace_protected")),
+            );
+            inner
+                .semantic_timelines
+                .thread_mut("thread_protected".to_owned());
+            inner
+                .pending_requests
+                .apply(PendingRequestsReduction::Opened(pending_request(
+                    "request_protected",
+                    "workspace_protected",
+                    "thread_protected",
+                )));
+        }
+
+        state
+            .begin_authorization_epoch()
+            .expect("begin authorization epoch");
+
+        let inner = state.inner.lock().expect("active thread state");
+        assert!(inner.authorization_revision.is_none());
+        assert!(inner.active_thread_id.is_none());
+        assert!(inner.draft_thread_by_workspace.is_empty());
+        assert!(inner.last_active_thread_by_workspace.is_empty());
+        assert!(inner.coordinators.is_empty());
+        assert!(inner.semantic_timelines.threads_by_id.is_empty());
+        assert!(inner.pending_requests.requests().is_empty());
     }
 
     #[test]
