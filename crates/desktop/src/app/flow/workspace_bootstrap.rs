@@ -28,6 +28,15 @@ pub(crate) fn resolve_workspace_id_for_thread_start(
     }
 }
 
+fn workspace_id_for_connection_bootstrap(
+    active_thread_workspace_id: Option<&str>,
+    persisted_workspace_id: Option<&str>,
+) -> Option<String> {
+    active_thread_workspace_id
+        .or(persisted_workspace_id)
+        .map(str::to_owned)
+}
+
 impl PioneerDesktop {
     fn apply_workspace_bootstrap_success_reduction(
         &mut self,
@@ -70,12 +79,19 @@ impl PioneerDesktop {
         self.set_workspaces_loading(true);
         self.set_workspaces_error(None);
 
-        let persisted_workspace_id = self
+        // A refreshed access token creates a new server-side connection. Keep
+        // that connection scoped to the thread which is still open in the UI;
+        // the registry value can lag behind an already-open legacy thread.
+        let active_thread_workspace_id = self
+            .current_active_thread_id()
+            .and_then(|thread_id| self.thread_workspace_id(thread_id));
+        let runtime_workspace_id = self
             .gateway
             .runtime
             .as_ref()
-            .and_then(GatewayRuntime::active_workspace_id)
-            .map(str::to_owned);
+            .and_then(GatewayRuntime::active_workspace_id);
+        let persisted_workspace_id =
+            workspace_id_for_connection_bootstrap(active_thread_workspace_id, runtime_workspace_id);
         let ws_sender = self.gateway.ws_command_sender.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -128,5 +144,23 @@ impl PioneerDesktop {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_id_for_connection_bootstrap;
+
+    #[test]
+    fn connection_bootstrap_keeps_the_open_threads_workspace() {
+        assert_eq!(
+            workspace_id_for_connection_bootstrap(Some("thread_ws"), Some("registry_ws"))
+                .as_deref(),
+            Some("thread_ws")
+        );
+        assert_eq!(
+            workspace_id_for_connection_bootstrap(None, Some("registry_ws")).as_deref(),
+            Some("registry_ws")
+        );
     }
 }

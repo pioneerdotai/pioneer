@@ -329,6 +329,7 @@ pub struct PioneerDesktop {
     pub(super) thread_list_loading: bool,
     pub(super) thread_list_refresh_requested: bool,
     pub(super) active_thread_id: Option<String>,
+    pub(super) active_thread_resubscribe_pending: bool,
     pub(super) draft_thread_id: Option<String>,
     pub(super) task_thread_navigation_stack: Vec<TaskThreadNavigationEntry>,
     pub(super) preferred_workspace_id: Option<String>,

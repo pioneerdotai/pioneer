@@ -862,6 +862,17 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<VoiceSessionStartParams>(input_json)
             .map_err(|error| format!("invalid voice session start params: {error}"))?;
 
+        // Voice sessions are scoped to both workspace and thread on the active
+        // connection. Always restore that scope first so a recent workspace
+        // switch or access-token rotation cannot start Voice on a stale socket.
+        self.active_thread
+            .ensure_thread_subscription(
+                &self.client_runtime,
+                params.context.thread_id.as_str(),
+                params.context.workspace_id.clone(),
+            )
+            .map_err(|error| format!("{error:#}"))?;
+
         self.client_runtime
             .ws_command_sender()
             .voice_session_start(params)

@@ -86,6 +86,7 @@ impl PioneerDesktop {
             thread_list_loading: false,
             thread_list_refresh_requested: false,
             active_thread_id: None,
+            active_thread_resubscribe_pending: false,
             draft_thread_id: None,
             task_thread_navigation_stack: Vec::new(),
             preferred_workspace_id: None,

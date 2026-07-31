@@ -224,8 +224,13 @@ impl PioneerDesktop {
         let selector_disabled = self.gateway.connecting
             || self.gateway.connection_state.is_transitioning()
             || self.gateway.connection_state != GatewayConnectionState::Connected
-            || self.workspace_action_in_progress();
-        let show_spinner = self.workspaces_loading() || self.workspace_action_in_progress();
+            || self.gateway.session_refresh_in_flight
+            || self.workspace_action_in_progress()
+            || self.desktop_voice_context_locked()
+            || self.composer_upload_in_progress;
+        // A user-initiated switch is optimistic: keep showing the newly selected
+        // workspace while its server scope is synchronized in the background.
+        let show_spinner = self.workspaces_loading();
         let workspace_selector_subtitle = t!("workspace.selector_label").to_string();
         let workspaces_loading = self.workspaces_loading();
         let workspace_error = self.workspaces_error().map(str::to_owned);

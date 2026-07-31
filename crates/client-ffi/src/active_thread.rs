@@ -548,7 +548,7 @@ impl ClientFfiActiveThreadState {
     ) -> anyhow::Result<ClientActiveThreadSendTextResult> {
         let ClientActiveThreadSendTextRequest {
             thread_id,
-            workspace_id: _workspace_id,
+            workspace_id: requested_workspace_id,
             text,
             selected_model,
             selected_provider,
@@ -584,6 +584,21 @@ impl ClientFfiActiveThreadState {
                     .unwrap_or(ThreadComposerExecutionMode::ForegroundTurn),
             )
         };
+        if let Some(requested_workspace_id) = requested_workspace_id.as_deref() {
+            if requested_workspace_id != workspace_id {
+                return Err(anyhow::anyhow!(
+                    "active thread workspace `{workspace_id}` does not match composer workspace `{requested_workspace_id}`"
+                ));
+            }
+        }
+
+        // A planned access-token rotation replaces the WebSocket connection. The
+        // replacement connection has no thread subscriptions, even though the
+        // client-side thread coordinator is still warm. Re-establish the
+        // authoritative workspace scope and subscription before any composer
+        // preparation or optimistic local mutation.
+        self.ensure_thread_subscription(runtime, thread_id.as_str(), workspace_id.clone())?;
+
         let selection = {
             let inner = self
                 .inner
@@ -951,7 +966,7 @@ impl ClientFfiActiveThreadState {
         })
     }
 
-    fn ensure_thread_subscription(
+    pub(crate) fn ensure_thread_subscription(
         &self,
         runtime: &ClientRuntime,
         thread_id: &str,

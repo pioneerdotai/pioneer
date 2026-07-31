@@ -119,7 +119,7 @@ impl PioneerDesktop {
 
         if self.gateway.connection_state.is_transitioning()
             || self.workspaces_loading
-            || self.thread_list_loading
+            || (self.thread_list_loading && self.current_active_thread_id().is_none())
             || self.thread_start_requested
             || self.thread_start.in_progress
             || self.thread_start.pending_thread_id.is_some()

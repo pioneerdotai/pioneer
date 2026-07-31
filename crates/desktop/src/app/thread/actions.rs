@@ -11,10 +11,13 @@ use pioneer_client::composer::turn_prepare::{
     self as composer_turn_prepare, PrepareComposerTurnRequest,
 };
 use pioneer_client::providers::list as provider_list;
+use pioneer_client::threads::start as thread_start;
 use pioneer_client::turns::{cancel as turn_cancel, start as turn_start, steer as turn_steer};
 use pioneer_protocol::{ArtifactRef, CLIRuntimeRequestResolvedNotification};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tracing::warn;
+
+const COMPOSER_SESSION_READY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 impl PioneerDesktop {
     pub(super) fn steer_active_cli_runtime_turn(
@@ -346,6 +349,14 @@ impl PioneerDesktop {
                 let workspace_id_for_prepare = workspace_id.clone();
 
                 async move {
+                    while this
+                        .update_in(&mut cx, |view, _, _| {
+                            view.gateway.session_refresh_in_flight
+                        })
+                        .unwrap_or(false)
+                    {
+                        Timer::after(COMPOSER_SESSION_READY_RETRY_DELAY).await;
+                    }
                     let prepare_result = cx
                         .background_spawn(async move {
                             upload_sender.prepare_composer_turn(PrepareComposerTurnRequest {
@@ -406,7 +417,11 @@ impl PioneerDesktop {
                                 prepared,
                             );
 
-                        view.composer_upload_in_progress = reduction.composer_upload_in_progress;
+                        // Keep the existing Composer loading state through the
+                        // authoritative thread/start + turn/start handoff. This
+                        // also prevents a token rotation from replacing the
+                        // connection between those two requests.
+                        view.composer_upload_in_progress = true;
                         if reduction.clear_composer_upload_error {
                             view.composer_upload_error = None;
                         }
@@ -449,6 +464,7 @@ impl PioneerDesktop {
 
                         let Some(conversation) = view.thread_conversation_mut(thread_id.as_str())
                         else {
+                            view.composer_upload_in_progress = false;
                             cx.notify();
                             return;
                         };
@@ -473,9 +489,14 @@ impl PioneerDesktop {
                             let mut cx = cx.clone();
                             let thread_id_for_update = send_context.thread_id.clone();
                             let send_context_for_update = send_context.clone();
+                            let workspace_id_for_preflight = workspace_id_for_update.clone();
                             async move {
                                 let result = cx
                                     .background_spawn(async move {
+                                        ws_sender.thread_start(thread_start::thread_start_params(
+                                            send_context.thread_id.clone(),
+                                            workspace_id_for_preflight,
+                                        ))?;
                                         ws_sender.turn_start(
                                             turn_start::turn_start_params_from_plan(
                                                 turn_start_params_plan,
@@ -485,6 +506,7 @@ impl PioneerDesktop {
                                     .await;
 
                                 let _ = this.update(&mut cx, |view, cx| {
+                                    view.composer_upload_in_progress = false;
                                     let reduction = match result {
                                         Ok(response) => turn_start::reduce_turn_start_send_success(
                                             send_context_for_update,
@@ -507,6 +529,7 @@ impl PioneerDesktop {
                                         let Some(conversation) = view
                                             .thread_conversation_mut(thread_id_for_update.as_str())
                                         else {
+                                            cx.notify();
                                             return;
                                         };
                                         for event in &events {

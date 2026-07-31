@@ -100,6 +100,20 @@ impl PioneerDesktop {
         self.apply_gateway_ws_event_batch(applicable, cx);
     }
 
+    pub(in crate::app::flow) fn replay_deferred_gateway_ws_notifications(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let active_connection_id = self.gateway.ws_connection_id;
+        let applicable = self
+            .gateway
+            .deferred_ws_events
+            .drain(..)
+            .filter(|event| should_replay_after_silent_replacement(active_connection_id, event))
+            .collect::<Vec<_>>();
+        self.apply_gateway_ws_event_batch(applicable, cx);
+    }
+
     pub(in crate::app::flow) fn discard_deferred_gateway_ws_events(&mut self) {
         self.gateway.deferred_ws_events.clear();
     }
@@ -351,6 +365,14 @@ fn partition_gateway_ws_events(
     applicable
 }
 
+fn should_replay_after_silent_replacement(
+    active_connection_id: Option<u64>,
+    event: &GatewayWsEvent,
+) -> bool {
+    pioneer_client::transport::ws::should_apply_ws_event(active_connection_id, event)
+        && matches!(event, GatewayWsEvent::Notification { .. })
+}
+
 struct DesktopPostEventSink<'a, 'cx> {
     app: &'a mut PioneerDesktop,
     cx: &'a mut Context<'cx, PioneerDesktop>,
@@ -406,6 +428,8 @@ impl ClientRuntimePostEventSink for DesktopPostEventSink<'_, '_> {
 mod tests {
     use super::*;
     use pioneer_client::gateway::types::GatewayEndpointKind;
+    use pioneer_protocol::{GatewayNotification, UnknownGatewayNotification};
+    use serde_json::json;
 
     fn connecting(connection_id: u64) -> GatewayWsEvent {
         GatewayWsEvent::Connecting {
@@ -446,5 +470,33 @@ mod tests {
                 .map(pioneer_client::transport::ws::event_connection_id),
             Some(2)
         );
+    }
+
+    #[test]
+    fn silent_replacement_keeps_notifications_without_replaying_lifecycle() {
+        let notification = GatewayWsEvent::Notification {
+            connection_id: 8,
+            notification: GatewayNotification::Unknown(UnknownGatewayNotification {
+                method: "test.notification".to_owned(),
+                workspace_id: None,
+                thread_id: None,
+                turn_id: None,
+                item_id: None,
+                params: json!({}),
+            }),
+        };
+
+        assert!(!should_replay_after_silent_replacement(
+            Some(8),
+            &connecting(8)
+        ));
+        assert!(should_replay_after_silent_replacement(
+            Some(8),
+            &notification
+        ));
+        assert!(!should_replay_after_silent_replacement(
+            Some(7),
+            &notification
+        ));
     }
 }

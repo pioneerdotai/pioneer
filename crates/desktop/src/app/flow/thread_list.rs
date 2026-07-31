@@ -38,12 +38,16 @@ impl PioneerDesktop {
             self.set_preferred_workspace_id(Some(workspace_id));
         }
         if let Some(action) = reduction.ensure_thread_subscription {
-            self.ensure_thread_subscription(
-                action.thread_id,
-                action.workspace_id,
-                connection_id,
-                cx,
-            );
+            let targets_active_thread =
+                self.current_active_thread_id() == Some(action.thread_id.as_str());
+            if !targets_active_thread || self.active_thread_resubscribe_pending {
+                self.ensure_thread_subscription(
+                    action.thread_id,
+                    action.workspace_id,
+                    connection_id,
+                    cx,
+                );
+            }
         }
         if let Some(thread_id) = reduction.ensure_thread_timeline_loaded {
             self.ensure_thread_semantic_timeline_loaded(thread_id.as_str(), cx);
@@ -266,6 +270,10 @@ impl PioneerDesktop {
                         Ok(response) => {
                             let active_thread_id =
                                 view.current_active_thread_id().map(str::to_owned);
+                            let active_thread_workspace_id = active_thread_id
+                                .as_deref()
+                                .and_then(|thread_id| view.thread_workspace_id(thread_id))
+                                .map(str::to_owned);
                             let (existing_draft_thread_id, existing_draft_thread_workspace_id) =
                                 if active_thread_id.is_none() {
                                     let draft_thread_id = view.resolve_existing_draft_thread_id();
@@ -281,6 +289,8 @@ impl PioneerDesktop {
                                 response,
                                 thread_tree::ThreadTreeRefreshContext {
                                     active_thread_id: active_thread_id.as_deref(),
+                                    active_thread_workspace_id: active_thread_workspace_id
+                                        .as_deref(),
                                     existing_draft_thread_id: existing_draft_thread_id.as_deref(),
                                     existing_draft_thread_workspace_id:
                                         existing_draft_thread_workspace_id.as_deref(),
@@ -314,9 +324,15 @@ impl PioneerDesktop {
                             );
                             let active_thread_id =
                                 view.current_active_thread_id().map(str::to_owned);
+                            let active_thread_workspace_id = active_thread_id
+                                .as_deref()
+                                .and_then(|thread_id| view.thread_workspace_id(thread_id))
+                                .map(str::to_owned);
                             let reduction = thread_tree::reduce_thread_tree_refresh_failure(
                                 thread_tree::ThreadTreeRefreshContext {
                                     active_thread_id: active_thread_id.as_deref(),
+                                    active_thread_workspace_id: active_thread_workspace_id
+                                        .as_deref(),
                                     existing_draft_thread_id: None,
                                     existing_draft_thread_workspace_id: None,
                                     has_known_threads_for_workspace: view
@@ -345,6 +361,10 @@ impl PioneerDesktop {
             || self.gateway.ws_connection_id != Some(connection_id)
         {
             return;
+        }
+
+        if self.current_active_thread_id() == Some(thread_id.as_str()) {
+            self.active_thread_resubscribe_pending = true;
         }
 
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -377,6 +397,12 @@ impl PioneerDesktop {
                                 reduction.thread_id.as_str(),
                                 reduction.workspace_id.as_str(),
                             );
+                            if view.current_active_thread_id() == Some(reduction.thread_id.as_str())
+                            {
+                                view.active_thread_resubscribe_pending = false;
+                                view.reconcile_semantic_timeline_after_reconnect(cx);
+                                view.refresh_desktop_voice_status(cx);
+                            }
                         }
                         Err(error) => {
                             warn!(

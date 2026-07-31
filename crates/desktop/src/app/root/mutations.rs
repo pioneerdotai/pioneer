@@ -24,6 +24,8 @@ impl PioneerDesktop {
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
         let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
         if changed {
+            self.active_thread_resubscribe_pending = self.active_thread_id.is_some()
+                && self.gateway.connection_state == GatewayConnectionState::Connected;
             self.reset_composer_model_selection_for_active_thread();
         }
     }

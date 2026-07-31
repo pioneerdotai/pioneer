@@ -181,6 +181,7 @@ pub enum ThreadFolderDeletePlan {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadTreeRefreshContext<'a> {
     pub active_thread_id: Option<&'a str>,
+    pub active_thread_workspace_id: Option<&'a str>,
     pub existing_draft_thread_id: Option<&'a str>,
     pub existing_draft_thread_workspace_id: Option<&'a str>,
     pub has_known_threads_for_workspace: bool,
@@ -231,6 +232,12 @@ pub fn reduce_thread_tree_refresh_success(
     match context.active_thread_id {
         Some(active_thread_id) => {
             ensure_thread_timeline_loaded = Some(active_thread_id.to_owned());
+            if let Some(workspace_id) = context.active_thread_workspace_id {
+                ensure_thread_subscription = Some(ThreadTreeThreadAction {
+                    thread_id: active_thread_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                });
+            }
         }
         None => {
             if let Some(draft_thread_id) = context.existing_draft_thread_id {
@@ -1209,6 +1216,7 @@ mod tests {
             },
             ThreadTreeRefreshContext {
                 active_thread_id: None,
+                active_thread_workspace_id: None,
                 existing_draft_thread_id: Some("thread_draft"),
                 existing_draft_thread_workspace_id: Some("ws_a"),
                 has_known_threads_for_workspace: false,
@@ -1245,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_tree_refresh_success_loads_active_thread_timeline_without_starting_thread() {
+    fn thread_tree_refresh_success_restores_active_thread_subscription_and_timeline() {
         let reduction = reduce_thread_tree_refresh_success(
             ThreadTreeResponse {
                 workspace_id: "ws_a".to_owned(),
@@ -1256,6 +1264,7 @@ mod tests {
             },
             ThreadTreeRefreshContext {
                 active_thread_id: Some("thread_active"),
+                active_thread_workspace_id: Some("ws_a"),
                 existing_draft_thread_id: Some("thread_draft"),
                 existing_draft_thread_workspace_id: Some("ws_a"),
                 has_known_threads_for_workspace: true,
@@ -1264,7 +1273,13 @@ mod tests {
 
         assert_eq!(reduction.set_active_thread_id, None);
         assert_eq!(reduction.set_preferred_workspace_id, None);
-        assert_eq!(reduction.ensure_thread_subscription, None);
+        assert_eq!(
+            reduction.ensure_thread_subscription,
+            Some(ThreadTreeThreadAction {
+                thread_id: "thread_active".to_owned(),
+                workspace_id: "ws_a".to_owned(),
+            })
+        );
         assert_eq!(
             reduction.ensure_thread_timeline_loaded.as_deref(),
             Some("thread_active")
@@ -1278,6 +1293,7 @@ mod tests {
     fn thread_tree_refresh_failure_starts_thread_only_when_workspace_is_empty_and_inactive() {
         let start = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
             active_thread_id: None,
+            active_thread_workspace_id: None,
             existing_draft_thread_id: None,
             existing_draft_thread_workspace_id: None,
             has_known_threads_for_workspace: false,
@@ -1287,6 +1303,7 @@ mod tests {
 
         let active = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
             active_thread_id: Some("thread_active"),
+            active_thread_workspace_id: Some("ws_a"),
             existing_draft_thread_id: None,
             existing_draft_thread_workspace_id: None,
             has_known_threads_for_workspace: false,
@@ -1295,6 +1312,7 @@ mod tests {
 
         let known_threads = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
             active_thread_id: None,
+            active_thread_workspace_id: None,
             existing_draft_thread_id: None,
             existing_draft_thread_workspace_id: None,
             has_known_threads_for_workspace: true,

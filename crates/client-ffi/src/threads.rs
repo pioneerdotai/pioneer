@@ -88,6 +88,7 @@ where
         response,
         ThreadTreeRefreshContext {
             active_thread_id: request.active_thread_id.as_deref(),
+            active_thread_workspace_id: None,
             existing_draft_thread_id: existing_draft_thread_id.as_deref(),
             existing_draft_thread_workspace_id: existing_draft_thread_workspace_id.as_deref(),
             has_known_threads_for_workspace: request.has_known_threads_for_workspace,

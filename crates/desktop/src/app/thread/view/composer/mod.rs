@@ -11,6 +11,10 @@ use pioneer_client::composer::turn_prepare::{
     ComposerSubmitAvailabilityInput, can_submit_composer_message,
 };
 
+fn desktop_composer_transport_ready(connection_state: GatewayConnectionState) -> bool {
+    connection_state == GatewayConnectionState::Connected
+}
+
 impl PioneerDesktop {
     pub(in crate::app::thread) fn desktop_microphone_error_message(&self) -> Option<String> {
         self.desktop_voice_error_message()
@@ -22,7 +26,7 @@ impl PioneerDesktop {
         let composer_text = self.composer_state.read(cx).value();
         let effective_capabilities = self.effective_composer_capabilities();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {
-            gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
+            gateway_connected: desktop_composer_transport_ready(self.gateway.connection_state),
             upload_in_progress: self.composer_upload_in_progress,
             has_active_thread: self.current_active_thread_id().is_some(),
             has_complete_model_selection: self.has_complete_composer_model_selection(),
@@ -34,5 +38,20 @@ impl PioneerDesktop {
             has_capabilities: !effective_capabilities.is_empty()
                 || !self.composer_skill_selections.is_empty(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_transport_tracks_the_connection_not_background_workspace_sync() {
+        assert!(desktop_composer_transport_ready(
+            GatewayConnectionState::Connected
+        ));
+        assert!(!desktop_composer_transport_ready(
+            GatewayConnectionState::Reconnecting
+        ));
     }
 }

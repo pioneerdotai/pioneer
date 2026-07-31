@@ -143,6 +143,7 @@ impl PioneerDesktop {
                                 app.current_active_thread_id(),
                             );
                             app.apply_thread_start_bootstrap_reduction(reduction);
+                            app.active_thread_resubscribe_pending = false;
                         }
                         Err(error) => {
                             let error_message = format!("{error:#}");

@@ -24,6 +24,7 @@ use pioneer_client::{
         turn_prepare::{self, PrepareVoiceComposerSnapshotRequest},
     },
     providers::list as provider_list,
+    threads::start as thread_start,
     turns::start as turn_start,
     voice::{VoiceFinalizeUiAction, reduce_voice_session_finalize_response},
 };
@@ -33,6 +34,7 @@ use tracing::warn;
 
 const DESKTOP_VOICE_HOLD_RADIUS: Pixels = px(16.);
 const DESKTOP_VOICE_STATUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DESKTOP_VOICE_SESSION_READY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DesktopVoiceEntryAvailability {
@@ -184,8 +186,9 @@ impl PioneerDesktop {
         desktop_voice_entry_availability_for_context(
             DesktopVoiceEntryContext {
                 voice_composer_idle: !self.desktop_voice_composer.is_active(),
-                gateway_connected: self.gateway.connection_state
-                    == GatewayConnectionState::Connected,
+                gateway_connected: super::desktop_composer_transport_ready(
+                    self.gateway.connection_state,
+                ),
                 active_thread: self.current_active_thread_id().is_some(),
                 model_selected: self.has_complete_composer_model_selection(),
                 conversation_can_submit: self
@@ -314,29 +317,96 @@ impl PioneerDesktop {
             cli_runtime_options: None,
         };
 
-        let mut flow =
-            DesktopVoiceCaptureFlow::new(PlatformDesktopAudioInputBackend, gateway_sender);
-        if let Err(error) = flow.start(
-            &self.desktop_microphone_gate,
-            DesktopVoiceCaptureConfig::default(),
-            VoiceSessionStartContext {
-                workspace_id,
-                thread_id,
-                turn_id,
-            },
-        ) {
-            self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
-            cx.notify();
-            return;
-        }
+        let preflight_sender = gateway_sender.clone();
+        let microphone_gate = self.desktop_microphone_gate.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                while this
+                    .update(&mut cx, |view, _| view.gateway.session_refresh_in_flight)
+                    .unwrap_or(false)
+                {
+                    Timer::after(DESKTOP_VOICE_SESSION_READY_RETRY_DELAY).await;
+                }
+                let preflight_result = cx
+                    .background_spawn({
+                        let thread_id = thread_id.clone();
+                        let workspace_id = workspace_id.clone();
+                        async move {
+                            preflight_sender.thread_start(thread_start::thread_start_params(
+                                thread_id,
+                                workspace_id,
+                            ))
+                        }
+                    })
+                    .await;
 
-        self.desktop_voice_prepare_request = Some(prepare_request);
-        self.desktop_voice_capture = Some(flow);
-        self.desktop_voice_composer = DesktopVoiceComposerState::Holding {
-            target,
-            candidate: DesktopVoiceReleaseCandidate::Send,
-        };
-        cx.notify();
+                let _ = this.update(&mut cx, |view, cx| {
+                    let (candidate, release_requested) = match view.desktop_voice_composer {
+                        DesktopVoiceComposerState::Preparing {
+                            candidate,
+                            release_requested,
+                            ..
+                        } => (candidate, release_requested),
+                        _ => return,
+                    };
+
+                    if let Err(error) = preflight_result {
+                        view.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                            kind: DesktopVoiceCaptureErrorKind::GatewaySession,
+                            message: format!("{error:#}"),
+                        };
+                        cx.notify();
+                        return;
+                    }
+
+                    if view.current_active_thread_id() != Some(thread_id.as_str())
+                        || view.thread_workspace_id(thread_id.as_str())
+                            != Some(workspace_id.as_str())
+                    {
+                        view.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+                        cx.notify();
+                        return;
+                    }
+
+                    if release_requested && candidate == DesktopVoiceReleaseCandidate::Cancel {
+                        view.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+                        cx.notify();
+                        return;
+                    }
+
+                    let mut flow = DesktopVoiceCaptureFlow::new(
+                        PlatformDesktopAudioInputBackend,
+                        gateway_sender,
+                    );
+                    if let Err(error) = flow.start(
+                        &microphone_gate,
+                        DesktopVoiceCaptureConfig::default(),
+                        VoiceSessionStartContext {
+                            workspace_id: workspace_id.clone(),
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                    ) {
+                        view.desktop_voice_composer =
+                            desktop_voice_error_state_from_capture_error(error);
+                        cx.notify();
+                        return;
+                    }
+
+                    view.desktop_voice_prepare_request = Some(prepare_request);
+                    view.desktop_voice_capture = Some(flow);
+                    view.desktop_voice_composer =
+                        DesktopVoiceComposerState::Holding { target, candidate };
+                    if release_requested {
+                        view.finish_desktop_voice_hold_send(cx);
+                    } else {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     pub(super) fn update_desktop_voice_hold_pointer(
