@@ -442,6 +442,15 @@ impl ClientFfiActiveThreadState {
         runtime: &ClientRuntime,
         request: ClientActiveThreadEventRequest,
     ) -> anyhow::Result<ClientActiveThreadEventResult> {
+        // Workspace notifications can update an inactive parent while its child is active.
+        // Return the affected thread projection so every UI cache stays live without
+        // changing the native active-thread selection.
+        let affected_thread_id = match &request.event {
+            ClientEvent::GatewayNotification(notification) => {
+                notification_thread_id(notification).map(str::to_owned)
+            }
+            _ => None,
+        };
         let semantic_timeline_patch =
             if let ClientEvent::GatewayNotification(notification) = request.event {
                 self.apply_gateway_notification(runtime, notification)?
@@ -449,9 +458,16 @@ impl ClientFfiActiveThreadState {
                 SemanticTimelineCachePatch::default()
             };
 
-        let snapshot = self.snapshot(ClientActiveThreadSnapshotRequest {
-            expanded_keys: request.expanded_keys,
-        })?;
+        let snapshot = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            let thread_id = affected_thread_id
+                .as_deref()
+                .or(inner.active_thread_id.as_deref());
+            snapshot_for_thread_from_inner(&inner, thread_id, request.expanded_keys.as_slice())
+        };
 
         Ok(ClientActiveThreadEventResult {
             snapshot,
@@ -1495,7 +1511,15 @@ fn snapshot_from_inner(
     inner: &ClientFfiActiveThreadInner,
     expanded_keys: &[String],
 ) -> ClientActiveThreadSnapshot {
-    let Some(thread_id) = inner.active_thread_id.as_deref() else {
+    snapshot_for_thread_from_inner(inner, inner.active_thread_id.as_deref(), expanded_keys)
+}
+
+fn snapshot_for_thread_from_inner(
+    inner: &ClientFfiActiveThreadInner,
+    thread_id: Option<&str>,
+    expanded_keys: &[String],
+) -> ClientActiveThreadSnapshot {
+    let Some(thread_id) = thread_id else {
         return ClientActiveThreadSnapshot {
             session_revision: inner.session_revision,
             ..Default::default()
@@ -1858,10 +1882,19 @@ fn notification_thread_id(notification: &GatewayNotification) -> Option<&str> {
         GatewayNotification::ThreadStarted(notification) => Some(notification.thread.id.as_str()),
         GatewayNotification::ThreadUpdated(notification) => Some(notification.thread.id.as_str()),
         GatewayNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
+        GatewayNotification::ThreadTimelineBlocksChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         GatewayNotification::TurnStarted(notification) => Some(notification.thread_id.as_str()),
         GatewayNotification::TurnCompleted(notification) => Some(notification.thread_id.as_str()),
         GatewayNotification::TurnFailed(notification) => Some(notification.thread_id.as_str()),
         GatewayNotification::TurnBlocked(notification) => Some(notification.thread_id.as_str()),
+        GatewayNotification::TurnWorkItemsChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        GatewayNotification::TurnWorkStateChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         GatewayNotification::ItemStarted(notification) => Some(notification.thread_id.as_str()),
         GatewayNotification::ItemDelta(notification) => Some(notification.thread_id.as_str()),
         GatewayNotification::ItemCompleted(notification) => Some(notification.thread_id.as_str()),
@@ -2310,18 +2343,17 @@ mod tests {
 
     #[test]
     fn semantic_block_change_reconciles_parent_timeline_even_when_it_is_not_active() {
+        let notification = ThreadTimelineBlocksChangedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "parent_thread".to_owned(),
+            changed_block_ids: vec!["parent_answer".to_owned()],
+            removed_block_ids: Vec::new(),
+            before_cursor: None,
+            after_cursor: None,
+            reason: TimelineChangeReason::LiveEvent,
+        };
         let requests = semantic_timeline_reconcile_requests(
-            &SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(
-                ThreadTimelineBlocksChangedNotification {
-                    workspace_id: "ws_a".to_owned(),
-                    thread_id: "parent_thread".to_owned(),
-                    changed_block_ids: vec!["parent_answer".to_owned()],
-                    removed_block_ids: Vec::new(),
-                    before_cursor: None,
-                    after_cursor: None,
-                    reason: TimelineChangeReason::LiveEvent,
-                },
-            ),
+            &SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification.clone()),
         );
 
         assert_eq!(
@@ -2330,6 +2362,26 @@ mod tests {
                 thread_id: "parent_thread".to_owned(),
             }]
         );
+
+        let mut inner = ClientFfiActiveThreadInner {
+            active_thread_id: Some("child_thread".to_owned()),
+            ..Default::default()
+        };
+        inner.coordinators.insert(
+            "parent_thread".to_owned(),
+            ThreadCoordinator::new(thread("parent_thread", "ws_a")),
+        );
+        inner.coordinators.insert(
+            "child_thread".to_owned(),
+            ThreadCoordinator::new(thread("child_thread", "ws_a")),
+        );
+        let event = GatewayNotification::ThreadTimelineBlocksChanged(notification);
+        let affected_thread_id = notification_thread_id(&event);
+        let snapshot = snapshot_for_thread_from_inner(&inner, affected_thread_id, &[]);
+
+        assert_eq!(affected_thread_id, Some("parent_thread"));
+        assert_eq!(snapshot.thread_id.as_deref(), Some("parent_thread"));
+        assert_eq!(inner.active_thread_id.as_deref(), Some("child_thread"));
     }
 
     #[test]
