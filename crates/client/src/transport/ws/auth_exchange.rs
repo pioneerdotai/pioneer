@@ -32,6 +32,11 @@ const MAX_AUTH_EXCHANGE_RESPONSE_BYTES: usize = 256 * 1024;
 pub enum AuthExchangeErrorKind {
     InvalidEndpoint,
     CredentialMethodMismatch,
+    /// The transport failed before the JSON-RPC request was dispatched.
+    ///
+    /// Retrying a one-use refresh credential is safe for this kind because
+    /// the Gateway could not have rotated it yet.
+    TransportBeforeRequest,
     Timeout,
     Transport,
     Protocol,
@@ -43,6 +48,7 @@ impl AuthExchangeErrorKind {
         match self {
             Self::InvalidEndpoint => "invalid_auth_endpoint",
             Self::CredentialMethodMismatch => "auth_credential_method_mismatch",
+            Self::TransportBeforeRequest => "auth_exchange_transport_before_request",
             Self::Timeout => "auth_exchange_timeout",
             Self::Transport => "auth_exchange_transport_failed",
             Self::Protocol => "auth_exchange_protocol_failed",
@@ -244,20 +250,20 @@ impl AuthExchangeClient {
         .await
         .map_err(|_| {
             AuthExchangeError::new(
-                AuthExchangeErrorKind::Timeout,
+                AuthExchangeErrorKind::TransportBeforeRequest,
                 "Gateway authentication handshake timed out",
             )
         })?
         .map_err(|error| {
             AuthExchangeError::new(
-                AuthExchangeErrorKind::Transport,
+                AuthExchangeErrorKind::TransportBeforeRequest,
                 format!("Gateway connection failed: {error}"),
             )
         })?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(AuthExchangeError::new(
-                AuthExchangeErrorKind::Timeout,
+                AuthExchangeErrorKind::TransportBeforeRequest,
                 "Gateway authentication exchange timed out",
             ));
         }
@@ -718,6 +724,10 @@ mod tests {
             "auth_credential_method_mismatch"
         );
         assert_eq!(
+            AuthExchangeErrorKind::TransportBeforeRequest.code(),
+            "auth_exchange_transport_before_request"
+        );
+        assert_eq!(
             AuthExchangeErrorKind::Timeout.code(),
             "auth_exchange_timeout"
         );
@@ -733,6 +743,24 @@ mod tests {
             AuthExchangeErrorKind::Server.code(),
             "auth_exchange_server_failed"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_known_to_precede_request_dispatch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let result = AuthExchangeClient::new(Duration::from_secs(1))
+            .connect_with_credential(format!("ws://{address}").as_str(), "credential")
+            .await;
+        let error = match result {
+            Ok(_) => panic!("closed local port unexpectedly accepted a WebSocket connection"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, AuthExchangeErrorKind::TransportBeforeRequest);
+        assert_eq!(error.kind.code(), "auth_exchange_transport_before_request");
     }
 
     #[tokio::test]

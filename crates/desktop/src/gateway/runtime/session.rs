@@ -398,7 +398,12 @@ impl GatewayRuntime {
         ) {
             Ok(refresh) => refresh,
             Err(error) => {
-                let reason = terminal_reason_for_refresh_error(&error);
+                let Some(reason) = terminal_reason_for_refresh_error(&error) else {
+                    // The restricted transport proves that the refresh RPC
+                    // was never dispatched. Keep the durable predecessor and
+                    // let the normal connection recovery retry it later.
+                    return Err(anyhow::Error::new(error));
+                };
                 let event = match reason {
                     SessionTerminalReason::RefreshOutcomeUnknown => {
                         SessionLifecycleEvent::RefreshTransportLost { intent_id }
@@ -685,21 +690,24 @@ fn validate_gateway_session_identity(
     None
 }
 
-fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> SessionTerminalReason {
+fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> Option<SessionTerminalReason> {
     if let Some(reason) = error
         .code
         .as_deref()
         .and_then(terminal_reason_from_auth_code)
     {
-        return reason;
+        return Some(reason);
     }
     match error.kind {
+        AuthExchangeErrorKind::TransportBeforeRequest => None,
         AuthExchangeErrorKind::Timeout
         | AuthExchangeErrorKind::Transport
-        | AuthExchangeErrorKind::Protocol => SessionTerminalReason::RefreshOutcomeUnknown,
-        AuthExchangeErrorKind::InvalidEndpoint => SessionTerminalReason::GatewayIdentityMismatch,
+        | AuthExchangeErrorKind::Protocol => Some(SessionTerminalReason::RefreshOutcomeUnknown),
+        AuthExchangeErrorKind::InvalidEndpoint => {
+            Some(SessionTerminalReason::GatewayIdentityMismatch)
+        }
         AuthExchangeErrorKind::CredentialMethodMismatch | AuthExchangeErrorKind::Server => {
-            SessionTerminalReason::RefreshCredentialInvalid
+            Some(SessionTerminalReason::RefreshCredentialInvalid)
         }
     }
 }
@@ -1068,6 +1076,30 @@ mod tests {
                 Ok(refresh_grant(1))
             })
             .expect("refresh after mutation");
+    }
+
+    #[test]
+    fn pre_dispatch_refresh_failure_keeps_the_durable_credential_retryable() {
+        let (mut runtime, _, endpoint_id) = fixture();
+        let first = runtime
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+                assert_eq!(raw, refresh_token(0));
+                Err(AuthExchangeError {
+                    kind: AuthExchangeErrorKind::TransportBeforeRequest,
+                    code: None,
+                    message: "Gateway connection failed before request dispatch".to_owned(),
+                })
+            })
+            .expect_err("pre-dispatch failure must remain transient");
+        assert!(format!("{first:#}").contains("before request dispatch"));
+
+        let second = runtime
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+                assert_eq!(raw, refresh_token(0));
+                Ok(refresh_grant(1))
+            })
+            .expect("the unchanged durable credential must be retryable");
+        assert!(matches!(second, DesktopSessionPreparation::Ready(_)));
     }
 
     #[test]
