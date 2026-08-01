@@ -312,6 +312,7 @@ enum SemanticTimelineReconcileRequest {
     TurnWorkNewest {
         thread_id: String,
         turn_id: String,
+        merge_mode: WorkPageMergeMode,
     },
     TurnWorkItems {
         thread_id: String,
@@ -1435,7 +1436,11 @@ impl ClientFfiActiveThreadState {
                     };
                     let _ = self.apply_thread_timeline_page(page, merge_mode);
                 }
-                SemanticTimelineReconcileRequest::TurnWorkNewest { thread_id, turn_id } => {
+                SemanticTimelineReconcileRequest::TurnWorkNewest {
+                    thread_id,
+                    turn_id,
+                    merge_mode,
+                } => {
                     let Ok(page) = ws_commands::turn_work_page(
                         &runtime.ws_command_sender(),
                         TurnWorkPageParams {
@@ -1447,7 +1452,7 @@ impl ClientFfiActiveThreadState {
                     ) else {
                         continue;
                     };
-                    let _ = self.apply_turn_work_page(page, WorkPageMergeMode::Reset);
+                    let _ = self.apply_turn_work_page(page, merge_mode);
                 }
                 SemanticTimelineReconcileRequest::TurnWorkItems {
                     thread_id,
@@ -1538,6 +1543,7 @@ fn semantic_timeline_reconcile_requests(
             requests.push(SemanticTimelineReconcileRequest::TurnWorkNewest {
                 thread_id: notification.thread_id.clone(),
                 turn_id: notification.turn_id.clone(),
+                merge_mode: WorkPageMergeMode::MergeAfter,
             });
             requests
         }
@@ -1545,6 +1551,7 @@ fn semantic_timeline_reconcile_requests(
             vec![SemanticTimelineReconcileRequest::TurnWorkNewest {
                 thread_id: notification.thread_id.clone(),
                 turn_id: notification.turn_id.clone(),
+                merge_mode: WorkPageMergeMode::MergeAfter,
             }]
         }
     }
@@ -2218,7 +2225,8 @@ mod tests {
         CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, SkillId,
         ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
         ThreadTimelineBlocksChangedNotification, TimelineChangeReason, Turn, TurnKind, TurnOrigin,
-        TurnPermissionApprovalRequest, TurnStatus, TurnWorkItemsChangedNotification,
+        TurnPermissionApprovalRequest, TurnStatus, TurnWorkBlock, TurnWorkItemsChangedNotification,
+        TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification,
     };
     use serde_json::json;
 
@@ -2582,8 +2590,49 @@ mod tests {
                 SemanticTimelineReconcileRequest::TurnWorkNewest {
                     thread_id: "parent_thread".to_owned(),
                     turn_id: "parent_turn".to_owned(),
+                    merge_mode: WorkPageMergeMode::MergeAfter,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn semantic_work_state_reconciliation_preserves_loaded_work_range() {
+        let requests = semantic_timeline_reconcile_requests(
+            &SemanticTimelineLiveUpdate::TurnWorkStateChanged(TurnWorkStateChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                thread_id: "parent_thread".to_owned(),
+                turn_id: "parent_turn".to_owned(),
+                source_high_watermark: 2,
+                projection_updated_at_unix_micros: 2,
+                work: TurnWorkBlock {
+                    turn_id: "parent_turn".to_owned(),
+                    presentation: TurnWorkPresentation::ExpandedLive,
+                    state: TurnWorkState::Running,
+                    started_at_unix_ms: Some(1),
+                    completed_at_unix_ms: None,
+                    elapsed_ms: Some(1),
+                    work_count: 100,
+                    visible_work_count: 100,
+                    hidden_work_count: 0,
+                    has_more_before: true,
+                    has_more_after: false,
+                    before_cursor: None,
+                    after_cursor: None,
+                    first_work_item_id: Some("work_000".to_owned()),
+                    last_work_item_id: Some("work_099".to_owned()),
+                },
+                reason: TimelineChangeReason::LiveEvent,
+            }),
+        );
+
+        assert_eq!(
+            requests,
+            vec![SemanticTimelineReconcileRequest::TurnWorkNewest {
+                thread_id: "parent_thread".to_owned(),
+                turn_id: "parent_turn".to_owned(),
+                merge_mode: WorkPageMergeMode::MergeAfter,
+            }]
         );
     }
 
