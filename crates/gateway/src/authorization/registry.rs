@@ -19,7 +19,6 @@ pub(crate) enum ResourceResolverKind {
     InvitationCollection,
     Invitation,
     MemberDirectory,
-    DirectoryPrincipal,
     MemberPrincipal,
 }
 
@@ -39,7 +38,6 @@ impl ResourceResolverKind {
             Self::InvitationCollection => "invitation_collection",
             Self::Invitation => "invitation",
             Self::MemberDirectory => "member_directory",
-            Self::DirectoryPrincipal => "directory_principal",
             Self::MemberPrincipal => "member_principal",
         }
     }
@@ -95,16 +93,16 @@ use AuthorizationAuditClass::{Authentication, Execution, Management, Mutation, R
 use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
     ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
-    InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberAvatarRead,
-    MemberDeviceCreate, MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend,
+    InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberDeviceCreate,
+    MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend,
     MemoryRead, MemoryWrite, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn,
     SkillManage, SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
     ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate, WorkspaceList,
     WorkspaceManage, WorkspaceMemberAdd, WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
 };
 use ResourceResolverKind::{
-    Artifact, Capability, DirectoryPrincipal, Gateway, Invitation, InvitationCollection,
-    InvitationGrantSet, MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn,
+    Artifact, Capability, Gateway, Invitation, InvitationCollection, InvitationGrantSet,
+    MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn,
     Workspace, WorkspaceCollection,
 };
 
@@ -134,13 +132,6 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         MEMBER_LIST,
         MemberDirectoryList,
         MemberDirectory,
-        NotFound,
-        Read,
-    ),
-    method_entry(
-        MEMBER_AVATAR_GET,
-        MemberAvatarRead,
-        DirectoryPrincipal,
         NotFound,
         Read,
     ),
@@ -723,7 +714,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Read,
     ),
     method_entry(ARTIFACT_GET, ArtifactRead, Artifact, NotFound, Read),
-    method_entry(ARTIFACT_READ, ArtifactRead, Artifact, NotFound, Read),
+    method_entry(
+        ARTIFACT_VIEW_GRANT_CREATE,
+        ArtifactRead,
+        Artifact,
+        NotFound,
+        Read,
+    ),
     method_entry(
         ARTIFACT_DELETE,
         ArtifactDelete,
@@ -759,34 +756,6 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Artifact,
         NotFound,
         Mutation,
-    ),
-    method_entry(
-        ARTIFACT_DOWNLOAD_START,
-        ArtifactRead,
-        Artifact,
-        NotFound,
-        Read,
-    ),
-    method_entry(
-        ARTIFACT_DOWNLOAD_CHUNK,
-        ArtifactRead,
-        Artifact,
-        NotFound,
-        Read,
-    ),
-    method_entry(
-        ARTIFACT_DOWNLOAD_FINISH,
-        ArtifactRead,
-        Artifact,
-        NotFound,
-        Read,
-    ),
-    method_entry(
-        ARTIFACT_DOWNLOAD_ABORT,
-        ArtifactRead,
-        Artifact,
-        NotFound,
-        Read,
     ),
 ];
 
@@ -946,7 +915,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 139);
+        assert_eq!(registry.len(), 134);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());
@@ -1011,18 +980,22 @@ mod tests {
 
     #[test]
     fn stale_and_unknown_method_names_fail_closed() {
-        assert_eq!(
-            normal_method_entry(methods::TASK_UPDATE),
-            Err(RegistryLookupError::Unmapped)
-        );
-        assert_eq!(
-            normal_method_entry("future/unregistered"),
-            Err(RegistryLookupError::Unmapped)
-        );
-        assert_eq!(
-            normal_method_entry("workspace/list\nforged"),
-            Err(RegistryLookupError::Unmapped)
-        );
+        for method in [
+            methods::TASK_UPDATE,
+            "artifact/read",
+            "artifact/download/start",
+            "artifact/download/chunk",
+            "artifact/download/finish",
+            "artifact/download/abort",
+            "future/unregistered",
+            "workspace/list\nforged",
+        ] {
+            assert_eq!(
+                normal_method_entry(method),
+                Err(RegistryLookupError::Unmapped),
+                "legacy or unknown method {method} must fail closed",
+            );
+        }
     }
 
     #[test]
@@ -1057,6 +1030,10 @@ mod tests {
 
         assert_eq!(BINARY_INGRESS_REGISTRY.len(), registry.len());
         assert_eq!(registry, public);
+        assert_eq!(
+            BinaryIngressKind::ALL.map(BinaryIngressKind::safe_name),
+            ["artifact/upload/chunk", "skills/upload/chunk", "voice/chunk"],
+        );
         for kind in BinaryIngressKind::ALL {
             let entry = binary_ingress_entry(kind).expect("registered binary ingress");
             assert!(entry.reauthorize_each_frame);

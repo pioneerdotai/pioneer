@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use axum::extract::ws::{CloseFrame, Message};
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokedNotification, AuthSessionTerminationReason,
     JsonRpcNotification, PrincipalId, constants::events,
@@ -8,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::request_context::ConnectionContext;
@@ -241,24 +241,6 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn send_binary(&self, connection_id: ConnectionId, payload: Vec<u8>) -> Result<()> {
-        let sender = {
-            self.connections
-                .read()
-                .await
-                .get(&connection_id)
-                .map(|connection| connection.sender.clone())
-                .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
-        };
-
-        if sender.send(Message::Binary(payload.into())).await.is_err() {
-            self.unregister_connection(connection_id).await;
-            return Err(anyhow!("connection `{connection_id}` channel is closed"));
-        }
-
-        Ok(())
-    }
-
     pub async fn connection_ids_for_session(
         &self,
         session_id: &AuthSessionId,
@@ -326,12 +308,10 @@ impl SessionManager {
                 if let Ok(notification) = notification {
                     let _ = sender.try_send(Message::Text(notification.into()));
                 }
-                let _ = sender.try_send(Message::Close(Some(
-                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4403),
-                            reason: reason.as_str().into(),
-                        },
-                    )));
+                let _ = sender.try_send(Message::Close(Some(CloseFrame {
+                    code: 4403,
+                    reason: reason.as_str().into(),
+                })));
                 let _ = termination_tx.send(Some(reason));
             }
             self.unregister_connection(connection_id).await;
@@ -366,7 +346,7 @@ mod tests {
     use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use tokio_tungstenite::tungstenite::Message;
+    use axum::extract::ws::Message;
 
     fn peer_session_principal() -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
         let mut principal = (*authenticated_test_superuser()).clone();
@@ -390,24 +370,6 @@ mod tests {
             .expect("send_text should succeed");
 
         assert_eq!(rx.recv().await, Some(Message::Text("ping".into())));
-    }
-
-    #[tokio::test]
-    async fn send_binary_reaches_registered_connection() {
-        let manager = SessionManager::new();
-        let (tx, mut rx) = mpsc::channel(4);
-
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        manager
-            .send_binary(connection_id, b"payload".to_vec())
-            .await
-            .expect("send_binary should succeed");
-
-        assert_eq!(
-            rx.recv().await,
-            Some(Message::Binary(b"payload".to_vec().into()))
-        );
     }
 
     #[tokio::test]

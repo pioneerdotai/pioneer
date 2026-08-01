@@ -1,4 +1,4 @@
 mod cursor;
 mod service;
 
-pub(crate) use service::{MemberService, MemberServiceError};
+pub(crate) use service::{MemberAvatarSnapshot, MemberService, MemberServiceError};

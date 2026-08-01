@@ -1,6 +1,6 @@
 //! Artifact file action state and helpers.
 
-use crate::artifacts::download::{ArtifactDownloadRequest, ArtifactDownloadResult};
+use crate::artifacts::http_download::{ArtifactHttpDownloadRequest, ArtifactHttpDownloadResult};
 use crate::platform::{ArtifactFileOpener, ClientPath};
 use anyhow::{Context as _, Result, anyhow, bail};
 use pioneer_protocol::{ArtifactRef, ArtifactStatus, ArtifactSummary};
@@ -30,7 +30,10 @@ pub struct ArtifactLocalFile {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ArtifactActionStatus {
     Queued,
-    Downloading,
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
     Verifying,
     Opening,
     Revealing,
@@ -65,13 +68,6 @@ impl ArtifactCachedDownload {
     }
 }
 
-pub trait ArtifactCachedDownloadClient {
-    fn download_artifact_to_cache(
-        &self,
-        request: ArtifactDownloadRequest,
-    ) -> Result<ArtifactDownloadResult>;
-}
-
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ArtifactFileActionBlockReason {
@@ -82,9 +78,12 @@ pub enum ArtifactFileActionBlockReason {
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum ArtifactDownloadRequestPlanError {
+pub enum ArtifactHttpDownloadRequestPlanError {
     MissingGatewayProfile,
     MissingWorkspaceId,
+    MissingVersionId,
+    MissingSize,
+    MissingSha256,
 }
 
 pub fn artifact_version_key(artifact: &ArtifactRef) -> ArtifactVersionKey {
@@ -111,23 +110,41 @@ pub fn artifact_download_block_reason(
     None
 }
 
-pub fn plan_artifact_download_request(
+pub fn plan_artifact_http_download_request(
     gateway_profile_id: Option<String>,
     summary: &ArtifactSummary,
-) -> std::result::Result<ArtifactDownloadRequest, ArtifactDownloadRequestPlanError> {
+) -> std::result::Result<ArtifactHttpDownloadRequest, ArtifactHttpDownloadRequestPlanError> {
     let gateway_profile_id = gateway_profile_id
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .ok_or(ArtifactDownloadRequestPlanError::MissingGatewayProfile)?;
+        .ok_or(ArtifactHttpDownloadRequestPlanError::MissingGatewayProfile)?;
     if summary.workspace_id.trim().is_empty() {
-        return Err(ArtifactDownloadRequestPlanError::MissingWorkspaceId);
+        return Err(ArtifactHttpDownloadRequestPlanError::MissingWorkspaceId);
     }
-
-    Ok(ArtifactDownloadRequest {
+    let version_id = summary
+        .artifact
+        .version_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ArtifactHttpDownloadRequestPlanError::MissingVersionId)?;
+    let expected_size_bytes = summary
+        .artifact
+        .size_bytes
+        .ok_or(ArtifactHttpDownloadRequestPlanError::MissingSize)?;
+    let expected_sha256 = summary
+        .artifact
+        .sha256
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ArtifactHttpDownloadRequestPlanError::MissingSha256)?;
+    Ok(ArtifactHttpDownloadRequest {
         gateway_profile_id,
         workspace_id: summary.workspace_id.clone(),
         artifact_id: summary.artifact.artifact_id.clone(),
-        version_id: summary.artifact.version_id.clone(),
+        version_id,
+        display_name: summary.artifact.display_name.clone(),
+        expected_size_bytes,
+        expected_sha256,
     })
 }
 
@@ -139,8 +156,8 @@ pub fn local_file_from_cached_download(download: &ArtifactCachedDownload) -> Art
     }
 }
 
-pub fn cached_download_from_download_result(
-    result: &ArtifactDownloadResult,
+pub fn cached_download_from_http_download_result(
+    result: &ArtifactHttpDownloadResult,
 ) -> ArtifactCachedDownload {
     ArtifactCachedDownload::new(
         result.local_path.as_path().to_owned(),
@@ -149,35 +166,13 @@ pub fn cached_download_from_download_result(
     )
 }
 
-pub fn local_file_from_download_result(result: &ArtifactDownloadResult) -> ArtifactLocalFile {
-    local_file_from_cached_download(&cached_download_from_download_result(result))
-}
-
-pub fn ensure_artifact_local_copy_for_open<C: ArtifactCachedDownloadClient>(
-    client: &C,
-    request: ArtifactDownloadRequest,
-    artifact: &ArtifactRef,
-    existing: Option<&ArtifactLocalFile>,
-) -> Result<ArtifactLocalFile> {
-    if let Some(existing) = existing
-        && existing_local_file_is_verified(existing, artifact)?
-    {
-        return Ok(existing.clone());
-    }
-
-    let result = client.download_artifact_to_cache(request)?;
-    let download = cached_download_from_download_result(&result);
-    verify_cached_download(&download)?;
-    Ok(local_file_from_cached_download(&download))
-}
-
-pub fn copy_download_result_to_destination(
-    result: &ArtifactDownloadResult,
+pub fn copy_http_download_result_to_destination(
+    result: &ArtifactHttpDownloadResult,
     display_name: &str,
     destination_dir: &Path,
 ) -> Result<ArtifactLocalFile> {
     copy_cached_download_to_destination(
-        &cached_download_from_download_result(result),
+        &cached_download_from_http_download_result(result),
         display_name,
         destination_dir,
     )
@@ -434,9 +429,7 @@ fn reject_path_traversal(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::ClientPath;
     use pioneer_protocol::{ArtifactCreatedByKind, ArtifactKind, ArtifactStatus};
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     #[test]
@@ -547,10 +540,19 @@ mod tests {
         assert!(state.status(&artifact).is_none());
         assert!(!state.in_progress(&artifact));
 
-        state.set_status(&artifact, ArtifactActionStatus::Downloading);
+        state.set_status(
+            &artifact,
+            ArtifactActionStatus::Downloading {
+                downloaded_bytes: 4,
+                total_bytes: 10,
+            },
+        );
         assert_eq!(
             state.status(&artifact),
-            Some(&ArtifactActionStatus::Downloading)
+            Some(&ArtifactActionStatus::Downloading {
+                downloaded_bytes: 4,
+                total_bytes: 10,
+            })
         );
         assert!(state.in_progress(&artifact));
 
@@ -588,96 +590,53 @@ mod tests {
     }
 
     #[test]
-    fn artifact_download_request_planning_validates_gateway_and_workspace() {
-        let summary = artifact_summary(artifact_ref("art_1", "artifact.txt", None, None));
+    fn http_download_request_planning_requires_immutable_version_metadata() {
+        let bytes = b"artifact bytes";
+        let digest = sha256_bytes(bytes);
+        let summary = artifact_summary(artifact_ref(
+            "art_1",
+            "artifact.txt",
+            Some(bytes.len() as u64),
+            Some(digest.clone()),
+        ));
 
-        let request =
-            plan_artifact_download_request(Some(" remote-1 ".to_owned()), &summary).expect("plan");
+        let request = plan_artifact_http_download_request(
+            Some(" remote-1 ".to_owned()),
+            &summary,
+        )
+        .expect("HTTP plan");
 
         assert_eq!(request.gateway_profile_id, "remote-1");
         assert_eq!(request.workspace_id, "ws_1");
         assert_eq!(request.artifact_id, "art_1");
-        assert_eq!(request.version_id.as_deref(), Some("ver_1"));
+        assert_eq!(request.version_id, "ver_1");
+        assert_eq!(request.display_name, "artifact.txt");
+        assert_eq!(request.expected_size_bytes, bytes.len() as u64);
+        assert_eq!(request.expected_sha256, digest);
 
+        let mut missing_version = summary.clone();
+        missing_version.artifact.version_id = None;
         assert_eq!(
-            plan_artifact_download_request(None, &summary).expect_err("missing gateway"),
-            ArtifactDownloadRequestPlanError::MissingGatewayProfile
+            plan_artifact_http_download_request(Some("remote-1".to_owned()), &missing_version)
+                .expect_err("missing version"),
+            ArtifactHttpDownloadRequestPlanError::MissingVersionId
         );
 
-        let mut missing_workspace = summary;
-        missing_workspace.workspace_id = "  ".to_owned();
+        let mut missing_size = summary.clone();
+        missing_size.artifact.size_bytes = None;
         assert_eq!(
-            plan_artifact_download_request(Some("remote-1".to_owned()), &missing_workspace)
-                .expect_err("missing workspace"),
-            ArtifactDownloadRequestPlanError::MissingWorkspaceId
-        );
-    }
-
-    #[test]
-    fn ensure_local_copy_for_open_downloads_and_reuses_verified_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let bytes = b"artifact bytes";
-        let cache_path = temp.path().join("cache.bin");
-        fs::write(cache_path.as_path(), bytes).expect("write cache");
-        let client = FakeDownloadClient {
-            result: ArtifactDownloadResult {
-                local_path: ClientPath::new(cache_path.clone()),
-                artifact: artifact_ref(
-                    "art_1",
-                    "artifact.txt",
-                    Some(bytes.len() as u64),
-                    Some(sha256_bytes(bytes)),
-                ),
-                size_bytes: bytes.len() as u64,
-                sha256: sha256_bytes(bytes),
-            },
-            calls: Default::default(),
-        };
-        let artifact = artifact_ref(
-            "art_1",
-            "artifact.txt",
-            Some(bytes.len() as u64),
-            Some(sha256_bytes(bytes)),
+            plan_artifact_http_download_request(Some("remote-1".to_owned()), &missing_size)
+                .expect_err("missing size"),
+            ArtifactHttpDownloadRequestPlanError::MissingSize
         );
 
-        let local_file = ensure_artifact_local_copy_for_open(
-            &client,
-            download_request("art_1"),
-            &artifact,
-            None,
-        )
-        .expect("local copy");
-
-        assert_eq!(local_file.path, cache_path);
-        assert_eq!(*client.calls.borrow(), 1);
-
-        let reused = ensure_artifact_local_copy_for_open(
-            &client,
-            download_request("art_1"),
-            &artifact,
-            Some(&local_file),
-        )
-        .expect("reused local copy");
-
-        assert_eq!(reused.path, local_file.path);
-        assert_eq!(*client.calls.borrow(), 1);
-    }
-
-    #[derive(Clone)]
-    struct FakeDownloadClient {
-        result: ArtifactDownloadResult,
-        calls: std::rc::Rc<RefCell<usize>>,
-    }
-
-    impl ArtifactCachedDownloadClient for FakeDownloadClient {
-        fn download_artifact_to_cache(
-            &self,
-            request: ArtifactDownloadRequest,
-        ) -> Result<ArtifactDownloadResult> {
-            assert_eq!(request.artifact_id, self.result.artifact.artifact_id);
-            *self.calls.borrow_mut() += 1;
-            Ok(self.result.clone())
-        }
+        let mut missing_sha = summary;
+        missing_sha.artifact.sha256 = None;
+        assert_eq!(
+            plan_artifact_http_download_request(Some("remote-1".to_owned()), &missing_sha)
+                .expect_err("missing SHA"),
+            ArtifactHttpDownloadRequestPlanError::MissingSha256
+        );
     }
 
     fn cached_download(local_path: PathBuf, bytes: &[u8]) -> ArtifactCachedDownload {
@@ -714,15 +673,6 @@ mod tests {
             updated_at: 1,
             bindings: Vec::new(),
             metadata: BTreeMap::new(),
-        }
-    }
-
-    fn download_request(artifact_id: &str) -> ArtifactDownloadRequest {
-        ArtifactDownloadRequest {
-            gateway_profile_id: "remote".to_owned(),
-            workspace_id: "ws_1".to_owned(),
-            artifact_id: artifact_id.to_owned(),
-            version_id: Some("ver_1".to_owned()),
         }
     }
 

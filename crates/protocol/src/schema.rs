@@ -15,21 +15,18 @@ use crate::artifact::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactBindingSummary, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactDeleteParams,
-    ArtifactDeleteResponse, ArtifactDeletedNotification, ArtifactDownloadAbortParams,
-    ArtifactDownloadAbortResponse, ArtifactDownloadCapabilities, ArtifactDownloadChunkHeader,
-    ArtifactDownloadChunkParams, ArtifactDownloadChunkResponse, ArtifactDownloadFinishParams,
-    ArtifactDownloadFinishResponse, ArtifactDownloadProgressNotification,
-    ArtifactDownloadStartParams, ArtifactDownloadStartResponse, ArtifactGetParams,
-    ArtifactGetResponse, ArtifactKind, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactDeleteResponse, ArtifactDeletedNotification, ArtifactGetParams, ArtifactGetResponse,
+    ArtifactKind, ArtifactListForMessageParams, ArtifactListForThreadParams,
     ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactPrepareKind,
     ArtifactPrepareParams, ArtifactPrepareResponse, ArtifactPreviewRef, ArtifactProjectionKind,
-    ArtifactProjectionStatus, ArtifactProjectionUpdatedNotification, ArtifactReadParams,
-    ArtifactReadResponse, ArtifactRef, ArtifactRegisterParams, ArtifactRegisterResponse,
+    ArtifactProjectionStatus, ArtifactProjectionUpdatedNotification, ArtifactRef,
+    ArtifactRegisterParams, ArtifactRegisterResponse,
     ArtifactRestoreParams, ArtifactRestoreResponse, ArtifactRole, ArtifactStatus, ArtifactSummary,
     ArtifactUpdatedNotification, ArtifactUploadAbortParams, ArtifactUploadAbortResponse,
     ArtifactUploadCapabilities, ArtifactUploadChunkAckNotification, ArtifactUploadChunkHeader,
     ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadProgressNotification,
     ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse, ArtifactViewGrantDisposition,
     ThreadArtifactsChangedNotification,
 };
 
@@ -334,10 +331,6 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "artifact_upload_capabilities.json",
             ArtifactUploadCapabilities
         ),
-        schema_doc!(
-            "artifact_download_capabilities.json",
-            ArtifactDownloadCapabilities
-        ),
         schema_doc!("artifact_list_params.json", ArtifactListParams),
         schema_doc!(
             "artifact_list_for_thread_params.json",
@@ -354,8 +347,18 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("artifact_list_response.json", ArtifactListResponse),
         schema_doc!("artifact_get_params.json", ArtifactGetParams),
         schema_doc!("artifact_get_response.json", ArtifactGetResponse),
-        schema_doc!("artifact_read_params.json", ArtifactReadParams),
-        schema_doc!("artifact_read_response.json", ArtifactReadResponse),
+        schema_doc!(
+            "artifact_view_grant_disposition.json",
+            ArtifactViewGrantDisposition
+        ),
+        schema_doc!(
+            "artifact_view_grant_create_params.json",
+            ArtifactViewGrantCreateParams
+        ),
+        schema_doc!(
+            "artifact_view_grant_create_response.json",
+            ArtifactViewGrantCreateResponse
+        ),
         schema_doc!(
             "artifact_upload_start_params.json",
             ArtifactUploadStartParams
@@ -388,42 +391,6 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "artifact_upload_abort_response.json",
             ArtifactUploadAbortResponse
         ),
-        schema_doc!(
-            "artifact_download_start_params.json",
-            ArtifactDownloadStartParams
-        ),
-        schema_doc!(
-            "artifact_download_start_response.json",
-            ArtifactDownloadStartResponse
-        ),
-        schema_doc!(
-            "artifact_download_chunk_params.json",
-            ArtifactDownloadChunkParams
-        ),
-        schema_doc!(
-            "artifact_download_chunk_header.json",
-            ArtifactDownloadChunkHeader
-        ),
-        schema_doc!(
-            "artifact_download_chunk_response.json",
-            ArtifactDownloadChunkResponse
-        ),
-        schema_doc!(
-            "artifact_download_finish_params.json",
-            ArtifactDownloadFinishParams
-        ),
-        schema_doc!(
-            "artifact_download_finish_response.json",
-            ArtifactDownloadFinishResponse
-        ),
-        schema_doc!(
-            "artifact_download_abort_params.json",
-            ArtifactDownloadAbortParams
-        ),
-        schema_doc!(
-            "artifact_download_abort_response.json",
-            ArtifactDownloadAbortResponse
-        ),
         schema_doc!("artifact_bind_params.json", ArtifactBindParams),
         schema_doc!("artifact_bind_response.json", ArtifactBindResponse),
         schema_doc!("artifact_delete_params.json", ArtifactDeleteParams),
@@ -453,10 +420,6 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "artifact_upload_progress_notification.json",
             ArtifactUploadProgressNotification
-        ),
-        schema_doc!(
-            "artifact_download_progress_notification.json",
-            ArtifactDownloadProgressNotification
         ),
         schema_doc!("memory_scope_kind.json", MemoryScopeKind),
         schema_doc!("memory_scope.json", MemoryScope),

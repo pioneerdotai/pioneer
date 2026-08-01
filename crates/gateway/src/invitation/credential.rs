@@ -138,7 +138,7 @@ mod tests {
         let service = InvitationCredentialService::new(&key).unwrap();
         let issued = service.issue();
         let now = chrono::DateTime::from_timestamp(
-            crate::authorization_test_support::EPIC5_TEST_NOW_UNIX as i64,
+            crate::tests::authorization::EPIC5_TEST_NOW_UNIX as i64,
             0,
         )
         .unwrap()

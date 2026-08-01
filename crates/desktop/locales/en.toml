@@ -169,19 +169,31 @@ output = "Output"
 
 [artifacts.action]
 attach_tooltip = "Use this artifact as input in the composer"
+cancel_tooltip = "Cancel download"
 download_tooltip = "Download this artifact to this computer"
-open_tooltip = "Open a verified local copy"
+open_tooltip = "Open a secure streamed view"
 reveal_tooltip = "Reveal the local copy"
 
 [artifacts.action.error]
 no_gateway = "No active gateway"
 no_workspace = "Artifact workspace is missing"
 not_connected = "Gateway is not connected"
+authentication = "Your Gateway session must be authenticated again"
+cancelled = "Artifact download was cancelled"
+disk_full = "There is not enough disk space to download this artifact"
+download_failed = "Artifact download failed"
+grant_expired = "The secure view expired; try Open again"
+integrity = "The downloaded artifact failed integrity verification"
+invalid_artifact = "Artifact version metadata is incomplete"
+local_copy_invalid = "The local copy is missing or no longer valid"
+reconfigure = "The active Gateway endpoint must be reconfigured"
+revoked = "This artifact is no longer available"
+viewer_failed = "The system viewer could not be opened"
 
 [artifacts.action.status]
 downloading = "Downloading to this computer..."
 failed = "Artifact action failed"
-opening = "Opening local copy..."
+opening = "Opening secure view..."
 queued = "Waiting for destination..."
 revealing = "Revealing local copy..."
 verifying = "Verifying local copy..."

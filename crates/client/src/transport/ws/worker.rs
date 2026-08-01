@@ -36,7 +36,7 @@ pub fn connected_event(connection_id: u64, spec: &GatewayWsConnectSpec) -> Gatew
         connection_id,
         endpoint_id: spec.endpoint_id.clone(),
         endpoint_name: spec.endpoint_name.clone(),
-        address: spec.address.clone(),
+        gateway_base_url: spec.gateway_base_url.clone(),
     }
 }
 
@@ -50,7 +50,7 @@ pub fn disconnected_event(
         endpoint_id: spec.endpoint_id.clone(),
         endpoint_name: spec.endpoint_name.clone(),
         endpoint_kind: spec.endpoint_kind,
-        address: spec.address.clone(),
+        gateway_base_url: spec.gateway_base_url.clone(),
         reason,
     }
 }
@@ -65,7 +65,7 @@ pub fn connect_failed_event(
         endpoint_id: spec.endpoint_id.clone(),
         endpoint_name: spec.endpoint_name.clone(),
         endpoint_kind: spec.endpoint_kind,
-        address: spec.address.clone(),
+        gateway_base_url: spec.gateway_base_url.clone(),
         error,
     }
 }
@@ -154,7 +154,7 @@ mod tests {
             endpoint_id: "remote".to_owned(),
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            address: "127.0.0.1:22000".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:22000").unwrap(),
             auth_token: None,
             session: None,
             timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),
@@ -177,9 +177,9 @@ mod tests {
             connected_event(7, &spec),
             GatewayWsEvent::Connected {
                 connection_id: 7,
-                address,
+                gateway_base_url,
                 ..
-            } if address == "127.0.0.1:22000"
+            } if gateway_base_url.as_str() == "http://127.0.0.1:22000/"
         ));
         assert!(matches!(
             connect_failed_event(7, &spec, "boom".to_owned()),

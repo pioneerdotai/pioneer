@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use config::{Config, ConfigError, File, FileFormat};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
@@ -40,6 +41,8 @@ pub struct GatewayConfig {
     pub legacy_service_names: Vec<String>,
     pub listen_addr: String,
     pub outbound_queue_capacity: usize,
+    #[serde(default)]
+    pub trusted_proxy_peers: Vec<IpAddr>,
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
     #[serde(default)]
@@ -266,6 +269,32 @@ pub struct GatewayArtifactsConfig {
     pub readable_copy_ttl_secs: u64,
     #[serde(default = "default_gateway_artifacts_quota_warn_at_percent")]
     pub quota_warn_at_percent: u8,
+    #[serde(default = "default_gateway_artifacts_http_streams_global")]
+    pub http_streams_global: usize,
+    #[serde(default = "default_gateway_artifacts_http_streams_per_session")]
+    pub http_streams_per_session: usize,
+    #[serde(default = "default_gateway_artifacts_http_open_handles")]
+    pub http_open_handles: usize,
+    #[serde(default = "default_gateway_artifacts_http_max_single_range_bytes")]
+    pub http_max_single_range_bytes: u64,
+    #[serde(default = "default_gateway_artifacts_http_tiny_range_bytes")]
+    pub http_tiny_range_bytes: u64,
+    #[serde(default = "default_gateway_artifacts_http_tiny_range_window_secs")]
+    pub http_tiny_range_window_secs: u64,
+    #[serde(default = "default_gateway_artifacts_http_tiny_range_max_requests")]
+    pub http_tiny_range_max_requests: usize,
+    #[serde(default = "default_gateway_artifacts_http_open_timeout_secs")]
+    pub http_open_timeout_secs: u64,
+    #[serde(default = "default_gateway_artifacts_http_body_idle_timeout_secs")]
+    pub http_body_idle_timeout_secs: u64,
+    #[serde(default = "default_gateway_artifacts_view_grant_ttl_secs")]
+    pub view_grant_ttl_secs: u64,
+    #[serde(default = "default_gateway_artifacts_view_grants_global")]
+    pub view_grants_global: usize,
+    #[serde(default = "default_gateway_artifacts_view_grants_per_session")]
+    pub view_grants_per_session: usize,
+    #[serde(default = "default_gateway_artifacts_view_grant_streams")]
+    pub view_grant_streams: usize,
 }
 
 impl Default for GatewayArtifactsConfig {
@@ -280,6 +309,23 @@ impl Default for GatewayArtifactsConfig {
             output_dir_ttl_secs: default_gateway_artifacts_output_dir_ttl_secs(),
             readable_copy_ttl_secs: default_gateway_artifacts_readable_copy_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
+            http_streams_global: default_gateway_artifacts_http_streams_global(),
+            http_streams_per_session: default_gateway_artifacts_http_streams_per_session(),
+            http_open_handles: default_gateway_artifacts_http_open_handles(),
+            http_max_single_range_bytes:
+                default_gateway_artifacts_http_max_single_range_bytes(),
+            http_tiny_range_bytes: default_gateway_artifacts_http_tiny_range_bytes(),
+            http_tiny_range_window_secs:
+                default_gateway_artifacts_http_tiny_range_window_secs(),
+            http_tiny_range_max_requests:
+                default_gateway_artifacts_http_tiny_range_max_requests(),
+            http_open_timeout_secs: default_gateway_artifacts_http_open_timeout_secs(),
+            http_body_idle_timeout_secs:
+                default_gateway_artifacts_http_body_idle_timeout_secs(),
+            view_grant_ttl_secs: default_gateway_artifacts_view_grant_ttl_secs(),
+            view_grants_global: default_gateway_artifacts_view_grants_global(),
+            view_grants_per_session: default_gateway_artifacts_view_grants_per_session(),
+            view_grant_streams: default_gateway_artifacts_view_grant_streams(),
         }
     }
 }
@@ -2534,6 +2580,58 @@ const fn default_gateway_artifacts_quota_warn_at_percent() -> u8 {
     80
 }
 
+const fn default_gateway_artifacts_http_streams_global() -> usize {
+    32
+}
+
+const fn default_gateway_artifacts_http_streams_per_session() -> usize {
+    4
+}
+
+const fn default_gateway_artifacts_http_open_handles() -> usize {
+    32
+}
+
+const fn default_gateway_artifacts_http_max_single_range_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+const fn default_gateway_artifacts_http_tiny_range_bytes() -> u64 {
+    4 * 1024
+}
+
+const fn default_gateway_artifacts_http_tiny_range_window_secs() -> u64 {
+    10
+}
+
+const fn default_gateway_artifacts_http_tiny_range_max_requests() -> usize {
+    32
+}
+
+const fn default_gateway_artifacts_http_open_timeout_secs() -> u64 {
+    15
+}
+
+const fn default_gateway_artifacts_http_body_idle_timeout_secs() -> u64 {
+    30
+}
+
+const fn default_gateway_artifacts_view_grant_ttl_secs() -> u64 {
+    3 * 60
+}
+
+const fn default_gateway_artifacts_view_grants_global() -> usize {
+    4_096
+}
+
+const fn default_gateway_artifacts_view_grants_per_session() -> usize {
+    16
+}
+
+const fn default_gateway_artifacts_view_grant_streams() -> usize {
+    4
+}
+
 const fn default_skills_enabled() -> bool {
     true
 }
@@ -2771,7 +2869,6 @@ pub struct GatewayRuntimeConfig {
     pub ws_reconnect_jitter_percent: u8,
     pub registry_file_name: String,
     pub local_gateway_id: String,
-    pub registry_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

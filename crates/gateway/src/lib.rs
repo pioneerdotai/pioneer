@@ -9,8 +9,6 @@ mod artifact_prompt_refs;
 mod attachment;
 mod auth;
 pub(crate) mod authorization;
-#[cfg(test)]
-mod authorization_test_support;
 mod bootstrap;
 pub mod claude_mcp_conformance;
 #[doc(hidden)]
@@ -35,6 +33,8 @@ mod message;
 mod operations;
 mod permissions;
 mod prompt_hooks;
+#[cfg(test)]
+mod tests;
 mod request_context;
 mod resilience;
 mod secrets;
@@ -1148,7 +1148,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod runtime_tests {
     use super::{
         create_voice_input_supervisor, execution_windows_config_from_gateway_tools_config,
         expand_home_directory_templates, memory_loop_config_from_gateway_memory_config,

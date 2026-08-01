@@ -1,30 +1,30 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::path::Path;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use pioneer_crud::{
     ArtifactBindingTargetRecord, ArtifactListFilterRecord, CrudStore, IngestArtifactMetadataRecord,
     NewArtifactBlobRecord,
 };
 use pioneer_protocol::{
-    ArtifactBindingSummary, ArtifactProjectionKind, ArtifactReadParams, ArtifactReadResponse,
-    ArtifactRef, ArtifactStatus, ArtifactSummary,
+    ArtifactBindingSummary, ArtifactProjectionKind, ArtifactRef, ArtifactStatus, ArtifactSummary,
 };
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 
-use crate::blob_store::{ArtifactBlobInput, ArtifactBlobStore};
+use crate::blob_store::{ArtifactBlobInput, ArtifactBlobStore, ArtifactReadHandle};
 use crate::error::{ArtifactError, ArtifactLocalPathRejectionKind, ArtifactResult};
 use crate::gc::{
     ArtifactGcPlan, ArtifactGcPolicy, ArtifactGcReport, execute_gc_with_policy, plan_gc_with_policy,
 };
+use crate::ids::is_lower_hex_sha256;
 use crate::mime::{
-    MAX_MIME_SNIFF_BYTES, classify_kind, detect_mime_from_bytes, display_name_with_mime_extension,
-    effective_mime_type as choose_effective_mime_type, normalize_mime_type, record_mime_metadata,
-    sanitize_display_name,
+    MAX_MIME_SNIFF_BYTES, OCTET_STREAM, classify_kind, detect_mime_from_bytes,
+    display_name_with_mime_extension, effective_mime_type as choose_effective_mime_type,
+    is_safe_visible_name, normalize_mime_type, record_mime_metadata, sanitize_display_name,
 };
 use crate::models::{
     ArtifactListFilter, ArtifactListPage, BindArtifactRequest, IngestArtifactBytesRequest,
@@ -46,18 +46,139 @@ pub struct ArtifactService {
     gc_policy: ArtifactGcPolicy,
 }
 
+/// Domain-owned bounded read used by the agent artifact tool.
+///
+/// This is intentionally not a JSON-RPC DTO: native clients read artifact
+/// content through authenticated HTTP storage routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadSnapshot {
-    pub artifact: ArtifactRef,
+pub struct ArtifactBoundedReadRequest {
     pub workspace_id: String,
     pub artifact_id: String,
-    pub artifact_version_id: String,
-    pub blob_id: String,
-    pub storage_key: String,
-    pub display_name: String,
-    pub mime_type: Option<String>,
-    pub size_bytes: u64,
+    pub version_id: Option<String>,
+    pub projection_kind: Option<ArtifactProjectionKind>,
+    pub offset: Option<u64>,
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactBoundedReadResult {
+    pub artifact: ArtifactRef,
+    pub offset: u64,
+    pub len: u64,
+    pub total_size_bytes: u64,
     pub sha256: String,
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactContentKind {
+    Original {
+        blob_id: String,
+    },
+    Projection {
+        projection_id: String,
+        projection_kind: ArtifactProjectionKind,
+        blob_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactContentSnapshot {
+    artifact: ArtifactRef,
+    workspace_id: String,
+    artifact_id: String,
+    artifact_version_id: String,
+    content_kind: ArtifactContentKind,
+    storage_key: String,
+    safe_display_name: String,
+    effective_mime_type: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+impl ArtifactContentSnapshot {
+    pub fn artifact(&self) -> &ArtifactRef {
+        &self.artifact
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    pub fn artifact_version_id(&self) -> &str {
+        &self.artifact_version_id
+    }
+
+    pub fn content_kind(&self) -> &ArtifactContentKind {
+        &self.content_kind
+    }
+
+    pub fn safe_display_name(&self) -> &str {
+        &self.safe_display_name
+    }
+
+    pub fn effective_mime_type(&self) -> &str {
+        &self.effective_mime_type
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+#[derive(Debug)]
+pub struct ArtifactContentReader {
+    reader: tokio::io::Take<ArtifactReadHandle>,
+    offset: u64,
+    length: u64,
+}
+
+impl ArtifactContentReader {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn remaining(&self) -> u64 {
+        self.reader.limit()
+    }
+}
+
+impl AsyncRead for ArtifactContentReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let remaining_before = self.reader.limit();
+        let capacity_before = buffer.remaining();
+        let filled_before = buffer.filled().len();
+        match Pin::new(&mut self.reader).poll_read(cx, buffer) {
+            Poll::Ready(Ok(()))
+                if remaining_before > 0
+                    && capacity_before > 0
+                    && buffer.filled().len() == filled_before =>
+            {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "artifact content ended before the immutable snapshot length",
+                )))
+            }
+            result => result,
+        }
+    }
 }
 
 struct ArtifactReadBlobDescriptor {
@@ -500,11 +621,11 @@ impl ArtifactService {
         .await
     }
 
-    pub async fn read_artifact(
+    pub async fn read_bounded_artifact(
         &self,
-        params: ArtifactReadParams,
+        params: ArtifactBoundedReadRequest,
         max_read_bytes: u64,
-    ) -> ArtifactResult<ArtifactReadResponse> {
+    ) -> ArtifactResult<ArtifactBoundedReadResult> {
         validate_workspace_id(&params.workspace_id)?;
         validate_non_empty("artifact_id", &params.artifact_id)?;
         let max_read_bytes = max_read_bytes.max(1);
@@ -559,13 +680,13 @@ impl ArtifactService {
             })?;
         let len = u64::try_from(bytes.len()).unwrap_or_default();
 
-        Ok(ArtifactReadResponse {
+        Ok(ArtifactBoundedReadResult {
             artifact: summary.artifact,
             offset,
             len,
             total_size_bytes,
             sha256: blob.sha256,
-            content_base64: BASE64.encode(bytes),
+            bytes,
             truncated: offset.saturating_add(len) < total_size_bytes,
         })
     }
@@ -612,74 +733,157 @@ impl ArtifactService {
             .check_workspace_headroom(&usage, incoming_bytes)
     }
 
-    pub async fn download_snapshot(
+    pub async fn exact_content_snapshot(
         &self,
         workspace_id: &str,
         artifact_id: &str,
-        version_id: Option<&str>,
-    ) -> ArtifactResult<ArtifactDownloadSnapshot> {
+        artifact_version_id: &str,
+    ) -> ArtifactResult<ArtifactContentSnapshot> {
         validate_workspace_id(workspace_id)?;
         validate_non_empty("artifact_id", artifact_id)?;
+        validate_non_empty("artifact_version_id", artifact_version_id)?;
         let summary = self
-            .get_artifact(workspace_id, artifact_id, version_id)
+            .get_artifact(workspace_id, artifact_id, Some(artifact_version_id))
             .await?;
-        if summary.artifact.status != ArtifactStatus::Ready {
-            return Err(ArtifactError::InvalidRequest {
-                message: format!(
-                    "artifact `{artifact_id}` is not ready for download: {:?}",
-                    summary.artifact.status
-                ),
-            });
-        }
-
+        require_ready_exact_artifact(
+            &summary.artifact,
+            workspace_id,
+            artifact_id,
+            artifact_version_id,
+        )?;
         let blob = self
             .store
-            .get_artifact_version_blob(workspace_id, artifact_id, version_id)
+            .get_artifact_version_blob(workspace_id, artifact_id, Some(artifact_version_id))
             .await?;
-        let size_bytes = blob.size_bytes;
 
-        Ok(ArtifactDownloadSnapshot {
+        let snapshot = ArtifactContentSnapshot {
             artifact: summary.artifact.clone(),
-            workspace_id: workspace_id.to_owned(),
-            artifact_id: artifact_id.to_owned(),
+            workspace_id: blob.workspace_id,
+            artifact_id: blob.artifact_id,
             artifact_version_id: blob.artifact_version_id,
-            blob_id: blob.blob_id,
+            content_kind: ArtifactContentKind::Original {
+                blob_id: blob.blob_id,
+            },
             storage_key: blob.storage_key,
-            display_name: display_name_with_mime_extension(
-                summary.artifact.display_name,
+            safe_display_name: display_name_with_mime_extension(
+                sanitize_display_name(summary.artifact.display_name.as_str()),
                 summary.artifact.mime_type.as_deref(),
             ),
-            mime_type: summary.artifact.mime_type,
-            size_bytes,
+            effective_mime_type: normalized_effective_mime(
+                summary.artifact.mime_type.as_deref(),
+            ),
+            size_bytes: blob.size_bytes,
             sha256: blob.sha256,
-        })
+        };
+        validate_content_snapshot(&snapshot)?;
+        Ok(snapshot)
     }
 
-    pub async fn read_blob_range(
+    pub async fn exact_projection_snapshot(
         &self,
         workspace_id: &str,
-        storage_key: &str,
-        offset: u64,
-        len: u64,
-    ) -> ArtifactResult<Vec<u8>> {
+        artifact_id: &str,
+        artifact_version_id: &str,
+        projection_kind: ArtifactProjectionKind,
+    ) -> ArtifactResult<ArtifactContentSnapshot> {
         validate_workspace_id(workspace_id)?;
-        let handle = self.blob_store.open_read(workspace_id, storage_key).await?;
-        let mut file = handle.into_inner();
-        file.seek(std::io::SeekFrom::Start(offset))
+        validate_non_empty("artifact_id", artifact_id)?;
+        validate_non_empty("artifact_version_id", artifact_version_id)?;
+        let summary = self
+            .get_artifact(workspace_id, artifact_id, Some(artifact_version_id))
+            .await?;
+        require_ready_exact_artifact(
+            &summary.artifact,
+            workspace_id,
+            artifact_id,
+            artifact_version_id,
+        )?;
+        let blob = self
+            .store
+            .get_artifact_projection_blob(
+                workspace_id,
+                artifact_id,
+                Some(artifact_version_id),
+                projection_kind,
+            )
+            .await?;
+        let effective_mime_type = normalized_effective_mime(blob.mime_type.as_deref());
+        let projection_label = match projection_kind {
+            ArtifactProjectionKind::PlainText => "plain-text",
+            ArtifactProjectionKind::Thumbnail => "thumbnail",
+            ArtifactProjectionKind::JsonSummary => "summary",
+            ArtifactProjectionKind::PdfText => "pdf-text",
+        };
+        let safe_display_name = display_name_with_mime_extension(
+            sanitize_display_name(
+                format!("{}.{}", summary.artifact.display_name, projection_label).as_str(),
+            ),
+            Some(effective_mime_type.as_str()),
+        );
+        let snapshot = ArtifactContentSnapshot {
+            artifact: summary.artifact,
+            workspace_id: blob.workspace_id,
+            artifact_id: blob.artifact_id,
+            artifact_version_id: blob.artifact_version_id,
+            content_kind: ArtifactContentKind::Projection {
+                projection_id: blob.projection_id,
+                projection_kind: blob.projection_kind,
+                blob_id: blob.blob_id,
+            },
+            storage_key: blob.storage_key,
+            safe_display_name,
+            effective_mime_type,
+            size_bytes: blob.size_bytes,
+            sha256: blob.sha256,
+        };
+        validate_content_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub async fn open_content(
+        &self,
+        snapshot: &ArtifactContentSnapshot,
+    ) -> ArtifactResult<ArtifactReadHandle> {
+        validate_content_snapshot(snapshot)?;
+        let handle = self
+            .blob_store
+            .open_read(snapshot.workspace_id(), snapshot.storage_key.as_str())
+            .await?;
+        if handle.storage_key() != snapshot.storage_key
+            || handle.size_bytes() != snapshot.size_bytes
+        {
+            return Err(content_invariant("opened blob metadata mismatch"));
+        }
+        Ok(handle)
+    }
+
+    pub async fn open_content_range(
+        &self,
+        snapshot: &ArtifactContentSnapshot,
+        offset: u64,
+        length: u64,
+    ) -> ArtifactResult<ArtifactContentReader> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| content_invariant("content range overflow"))?;
+        if offset > snapshot.size_bytes || end > snapshot.size_bytes {
+            return Err(ArtifactError::InvalidRequest {
+                message: "artifact content range is outside the immutable snapshot".to_owned(),
+            });
+        }
+        let mut handle = self.open_content(snapshot).await?;
+        handle
+            .seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(|source| ArtifactError::Io {
-                message: "failed to seek artifact blob".to_owned(),
+                message: "failed to seek immutable artifact content".to_owned(),
                 source,
             })?;
-        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
-        file.take(len)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|source| ArtifactError::Io {
-                message: "failed to read artifact blob".to_owned(),
-                source,
-            })?;
-        Ok(bytes)
+        Ok(ArtifactContentReader {
+            reader: handle.take(length),
+            offset,
+            length,
+        })
     }
 
     pub async fn delete_artifact(
@@ -728,6 +932,80 @@ impl ArtifactService {
             .await?;
         Ok(ArtifactStatus::Ready)
     }
+}
+
+fn require_ready_exact_artifact(
+    artifact: &ArtifactRef,
+    workspace_id: &str,
+    artifact_id: &str,
+    artifact_version_id: &str,
+) -> ArtifactResult<()> {
+    if artifact.status != ArtifactStatus::Ready {
+        return Err(ArtifactError::InvalidRequest {
+            message: "artifact content is not ready".to_owned(),
+        });
+    }
+    if workspace_id.trim().is_empty()
+        || artifact.artifact_id != artifact_id
+        || artifact.version_id.as_deref() != Some(artifact_version_id)
+    {
+        return Err(content_invariant("artifact identity mismatch"));
+    }
+    Ok(())
+}
+
+fn normalized_effective_mime(mime_type: Option<&str>) -> String {
+    mime_type
+        .map(normalize_mime_type)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OCTET_STREAM.to_owned())
+}
+
+fn validate_content_snapshot(snapshot: &ArtifactContentSnapshot) -> ArtifactResult<()> {
+    if snapshot.workspace_id.trim().is_empty()
+        || snapshot.artifact_id.trim().is_empty()
+        || snapshot.artifact_version_id.trim().is_empty()
+        || snapshot.storage_key.trim().is_empty()
+        || snapshot.storage_key.chars().any(char::is_control)
+    {
+        return Err(content_invariant("content identity metadata is invalid"));
+    }
+    require_ready_exact_artifact(
+        &snapshot.artifact,
+        snapshot.workspace_id.as_str(),
+        snapshot.artifact_id.as_str(),
+        snapshot.artifact_version_id.as_str(),
+    )?;
+    if !is_lower_hex_sha256(snapshot.sha256.as_str())
+        || snapshot.effective_mime_type.trim().is_empty()
+        || !is_safe_visible_name(snapshot.safe_display_name.as_str())
+    {
+        return Err(content_invariant("immutable content metadata is invalid"));
+    }
+    match &snapshot.content_kind {
+        ArtifactContentKind::Original { blob_id } => {
+            if blob_id.trim().is_empty()
+                || snapshot.artifact.size_bytes != Some(snapshot.size_bytes)
+                || snapshot.artifact.sha256.as_deref() != Some(snapshot.sha256.as_str())
+            {
+                return Err(content_invariant("original content metadata mismatch"));
+            }
+        }
+        ArtifactContentKind::Projection {
+            projection_id,
+            blob_id,
+            ..
+        } => {
+            if projection_id.trim().is_empty() || blob_id.trim().is_empty() {
+                return Err(content_invariant("projection content metadata mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn content_invariant(reason: &'static str) -> ArtifactError {
+    ArtifactError::ContentInvariant { reason }
 }
 
 fn validate_ingest_request(request: &IngestArtifactBytesRequest) -> ArtifactResult<()> {
@@ -889,6 +1167,8 @@ mod tests {
     use std::io::Cursor;
     use std::io::ErrorKind;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use migration::{Migrator, MigratorTrait};
@@ -1083,16 +1363,16 @@ mod tests {
             .expect("ingest image");
         let snapshot = harness
             .service
-            .download_snapshot(
+            .exact_content_snapshot(
                 "ws_a",
                 summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
+                summary.artifact.version_id.as_deref().expect("exact version"),
             )
             .await
-            .expect("download snapshot");
+            .expect("content snapshot");
 
         assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
-        assert_eq!(snapshot.display_name, "auto.ru_screenshot.png");
+        assert_eq!(snapshot.safe_display_name(), "auto.ru_screenshot.png");
     }
 
     #[tokio::test]
@@ -1237,6 +1517,40 @@ mod tests {
         assert_eq!(projections[0].text_content, None);
         assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
 
+        let projection_snapshot = harness
+            .service
+            .exact_projection_snapshot(
+                "ws_a",
+                summary.artifact.artifact_id.as_str(),
+                summary.artifact.version_id.as_deref().expect("version"),
+                ArtifactProjectionKind::Thumbnail,
+            )
+            .await
+            .expect("exact projection snapshot");
+        assert_eq!(projection_snapshot.effective_mime_type(), "image/png");
+        assert!(matches!(
+            projection_snapshot.content_kind(),
+            ArtifactContentKind::Projection {
+                projection_kind: ArtifactProjectionKind::Thumbnail,
+                ..
+            }
+        ));
+        let mut projection_reader = harness
+            .service
+            .open_content_range(
+                &projection_snapshot,
+                0,
+                projection_snapshot.size_bytes(),
+            )
+            .await
+            .expect("open projection stream");
+        let mut projection_bytes = Vec::new();
+        projection_reader
+            .read_to_end(&mut projection_bytes)
+            .await
+            .expect("stream projection");
+        assert_eq!(projection_bytes.len() as u64, projection_snapshot.size_bytes());
+
         let preview = summary.artifact.preview.expect("thumbnail preview");
         assert_eq!(preview.projection_kind, ArtifactProjectionKind::Thumbnail);
         assert_eq!(preview.status, ArtifactProjectionStatus::Ready);
@@ -1247,8 +1561,8 @@ mod tests {
 
         let thumbnail_read = harness
             .service
-            .read_artifact(
-                ArtifactReadParams {
+            .read_bounded_artifact(
+                ArtifactBoundedReadRequest {
                     workspace_id: "ws_a".to_owned(),
                     artifact_id: summary.artifact.artifact_id.clone(),
                     version_id: summary.artifact.version_id.clone(),
@@ -1265,7 +1579,7 @@ mod tests {
             preview.size_bytes.expect("preview size")
         );
         assert_eq!(thumbnail_read.sha256, preview.sha256.expect("preview sha"));
-        assert!(!thumbnail_read.content_base64.is_empty());
+        assert!(!thumbnail_read.bytes.is_empty());
         assert!(!thumbnail_read.truncated);
 
         let usage = harness
@@ -1914,7 +2228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_snapshot_resolves_version_blob_and_read_range() {
+    async fn exact_content_snapshot_streams_a_bounded_range() {
         let harness = setup().await;
         let created = harness
             .service
@@ -1928,34 +2242,186 @@ mod tests {
             .await
             .expect("ingest bytes");
 
-        let snapshot = harness
+        let content = harness
             .service
-            .download_snapshot(
+            .exact_content_snapshot(
                 "ws_a",
                 created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref(),
+                created.artifact.version_id.as_deref().expect("exact version"),
             )
             .await
-            .expect("download snapshot");
-
-        assert_eq!(snapshot.artifact_id, created.artifact.artifact_id);
-        assert_eq!(
-            Some(snapshot.artifact_version_id.as_str()),
-            created.artifact.version_id.as_deref()
-        );
-        assert_eq!(snapshot.size_bytes, 14);
-
-        let bytes = harness
+            .expect("exact content snapshot");
+        let mut reader = harness
             .service
-            .read_blob_range(
+            .open_content_range(&content, 6, "download".len() as u64)
+            .await
+            .expect("open bounded content range");
+        let mut streamed = Vec::new();
+        reader
+            .read_to_end(&mut streamed)
+            .await
+            .expect("stream bounded range");
+        assert_eq!(streamed, b"download");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn content_open_fails_closed_for_missing_mismatch_and_short_read() {
+        let harness = setup().await;
+        let created = harness
+            .service
+            .ingest_bytes(ingest_request(
                 "ws_a",
-                snapshot.storage_key.as_str(),
-                6,
-                "download".len() as u64,
+                "thr_a",
+                "turn_a",
+                b"immutable bytes",
+                "immutable.txt",
+            ))
+            .await
+            .expect("ingest bytes");
+        let snapshot = harness
+            .service
+            .exact_content_snapshot(
+                "ws_a",
+                created.artifact.artifact_id.as_str(),
+                created.artifact.version_id.as_deref().expect("version"),
             )
             .await
-            .expect("read blob range");
-        assert_eq!(bytes, b"download");
+            .expect("snapshot");
+
+        let missing = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: snapshot.storage_key.clone(),
+                mode: FakeReadMode::Missing,
+            }),
+        );
+        assert!(matches!(
+            missing.open_content(&snapshot).await,
+            Err(ArtifactError::ReadMissingBlob { .. })
+        ));
+
+        let mismatched = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: snapshot.storage_key.clone(),
+                mode: FakeReadMode::Bytes {
+                    bytes: b"immutable bytes".to_vec(),
+                    advertised_size: snapshot.size_bytes(),
+                    storage_key_override: Some("opaque-mismatched-key".to_owned()),
+                },
+            }),
+        );
+        assert!(matches!(
+            mismatched.open_content(&snapshot).await,
+            Err(ArtifactError::ContentInvariant { .. })
+        ));
+
+        let short = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: snapshot.storage_key.clone(),
+                mode: FakeReadMode::Bytes {
+                    bytes: b"short".to_vec(),
+                    advertised_size: snapshot.size_bytes(),
+                    storage_key_override: None,
+                },
+            }),
+        );
+        let mut reader = short
+            .open_content_range(&snapshot, 0, snapshot.size_bytes())
+            .await
+            .expect("metadata permits open");
+        let mut bytes = Vec::new();
+        let error = reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect_err("short immutable content must fail");
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn dropping_bounded_reader_cancels_backend_without_materializing_content() {
+        let harness = setup().await;
+        let created = harness
+            .service
+            .ingest_bytes(ingest_request(
+                "ws_a", "thr_a", "turn_a", b"x", "pending.txt",
+            ))
+            .await
+            .expect("ingest bytes");
+        let snapshot = harness
+            .service
+            .exact_content_snapshot(
+                "ws_a",
+                created.artifact.artifact_id.as_str(),
+                created.artifact.version_id.as_deref().expect("version"),
+            )
+            .await
+            .expect("snapshot");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let service = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: snapshot.storage_key.clone(),
+                mode: FakeReadMode::Pending {
+                    dropped: dropped.clone(),
+                },
+            }),
+        );
+
+        let reader = service
+            .open_content_range(&snapshot, 0, 1)
+            .await
+            .expect("open pending reader");
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(reader);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn large_logical_content_range_has_constant_allocation() {
+        let harness = setup().await;
+        let created = harness
+            .service
+            .ingest_bytes(ingest_request(
+                "ws_a", "thr_a", "turn_a", b"seed", "large.bin",
+            ))
+            .await
+            .expect("ingest seed");
+        let mut snapshot = harness
+            .service
+            .exact_content_snapshot(
+                "ws_a",
+                created.artifact.artifact_id.as_str(),
+                created.artifact.version_id.as_deref().expect("version"),
+            )
+            .await
+            .expect("snapshot");
+        let logical_size = 8_u64 * 1024 * 1024 * 1024 * 1024;
+        snapshot.size_bytes = logical_size;
+        snapshot.artifact.size_bytes = Some(logical_size);
+        let service = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: snapshot.storage_key.clone(),
+                mode: FakeReadMode::LogicalZeros {
+                    size_bytes: logical_size,
+                },
+            }),
+        );
+
+        let mut reader = service
+            .open_content_range(&snapshot, logical_size - 32, 32)
+            .await
+            .expect("open tail range");
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read logical tail");
+        assert_eq!(bytes, vec![0; 32]);
+        assert_eq!(reader.length(), 32);
     }
 
     #[tokio::test]
@@ -2390,6 +2856,237 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex::encode(hasher.finalize())
+    }
+
+    #[derive(Debug, Clone)]
+    enum FakeReadMode {
+        Bytes {
+            bytes: Vec<u8>,
+            advertised_size: u64,
+            storage_key_override: Option<String>,
+        },
+        Missing,
+        Pending {
+            dropped: Arc<AtomicBool>,
+        },
+        LogicalZeros {
+            size_bytes: u64,
+        },
+    }
+
+    #[derive(Debug)]
+    struct FakeReadBlobStore {
+        storage_key: String,
+        mode: FakeReadMode,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactBlobStore for FakeReadBlobStore {
+        async fn put_bytes(
+            &self,
+            _workspace_id: &str,
+            _input: ArtifactBlobInput,
+        ) -> ArtifactResult<StoredArtifactBlob> {
+            Err(ArtifactError::Io {
+                message: "fake read store is read-only".to_owned(),
+                source: ErrorKind::Unsupported.into(),
+            })
+        }
+
+        async fn open_read(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<ArtifactReadHandle> {
+            match &self.mode {
+                FakeReadMode::Bytes {
+                    bytes,
+                    advertised_size,
+                    storage_key_override,
+                } => Ok(ArtifactReadHandle::new(
+                    MemoryReader::new(bytes.clone()),
+                    storage_key_override
+                        .clone()
+                        .unwrap_or_else(|| self.storage_key.clone()),
+                    *advertised_size,
+                )),
+                FakeReadMode::Missing => Err(ArtifactError::ReadMissingBlob {
+                    storage_key: self.storage_key.clone(),
+                }),
+                FakeReadMode::Pending { dropped } => Ok(ArtifactReadHandle::new(
+                    PendingReader {
+                        dropped: dropped.clone(),
+                    },
+                    self.storage_key.clone(),
+                    1,
+                )),
+                FakeReadMode::LogicalZeros { size_bytes } => Ok(ArtifactReadHandle::new(
+                    LogicalZeroReader::new(*size_bytes),
+                    self.storage_key.clone(),
+                    *size_bytes,
+                )),
+            }
+        }
+
+        async fn delete_unreferenced(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<()> {
+            Ok(())
+        }
+
+        async fn materialize_readable_copy(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+            _safe_name: &str,
+        ) -> ArtifactResult<std::path::PathBuf> {
+            Err(ArtifactError::ReadMissingBlob {
+                storage_key: self.storage_key.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemoryReader {
+        bytes: Vec<u8>,
+        position: u64,
+    }
+
+    impl MemoryReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { bytes, position: 0 }
+        }
+    }
+
+    impl AsyncRead for MemoryReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let start = usize::try_from(self.position).unwrap_or(usize::MAX);
+            if start >= self.bytes.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let read = buffer.remaining().min(self.bytes.len() - start);
+            buffer.put_slice(&self.bytes[start..start + read]);
+            self.position = self.position.saturating_add(read as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for MemoryReader {
+        fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+            self.position = resolve_fake_seek(self.bytes.len() as u64, self.position, position)?;
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(self.position))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LogicalZeroReader {
+        size_bytes: u64,
+        position: u64,
+    }
+
+    impl LogicalZeroReader {
+        fn new(size_bytes: u64) -> Self {
+            Self {
+                size_bytes,
+                position: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for LogicalZeroReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let remaining = self.size_bytes.saturating_sub(self.position);
+            let read = buffer
+                .remaining()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            if read > 0 {
+                buffer.initialize_unfilled_to(read).fill(0);
+                buffer.advance(read);
+                self.position = self.position.saturating_add(read as u64);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for LogicalZeroReader {
+        fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+            self.position = resolve_fake_seek(self.size_bytes, self.position, position)?;
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(self.position))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingReader {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for PendingReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncSeek for PendingReader {
+        fn start_seek(self: Pin<&mut Self>, _position: std::io::SeekFrom) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    fn resolve_fake_seek(
+        size_bytes: u64,
+        current: u64,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<u64> {
+        let target = match position {
+            std::io::SeekFrom::Start(offset) => i128::from(offset),
+            std::io::SeekFrom::Current(offset) => i128::from(current) + i128::from(offset),
+            std::io::SeekFrom::End(offset) => i128::from(size_bytes) + i128::from(offset),
+        };
+        if !(0..=i128::from(u64::MAX)).contains(&target) {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        Ok(target as u64)
     }
 
     #[derive(Debug)]

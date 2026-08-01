@@ -4013,7 +4013,7 @@ mod tests {
 
     #[tokio::test]
     async fn member_task_tools_reject_foreign_private_task_ids() {
-        use crate::authorization_test_support::{
+        use crate::tests::authorization::{
             IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID,
             WORKSPACE_RED_ID,
         };

@@ -1,8 +1,8 @@
 //! Active gateway profile and operation epoch state.
 
 use super::{
-    connectivity::normalize_address,
-    registry::remote_index_by_address,
+    endpoint::GatewayBaseUrl,
+    registry::remote_index_by_gateway_base_url,
     timings::GatewayWsTimings,
     types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry},
 };
@@ -31,9 +31,9 @@ pub enum GatewaySetupAction {
 pub enum GatewayProfileError {
     EndpointNotFound { id: String },
     LocalGatewayDeleteUnsupported,
-    DuplicateRemoteAddress { address: String },
-    InvalidAddress { address: String, reason: String },
-    SessionBoundAddressChange { endpoint_id: String },
+    DuplicateGatewayBaseUrl { gateway_base_url: GatewayBaseUrl },
+    InvalidGatewayBaseUrl { reason: String },
+    SessionBoundGatewayBaseUrlChange { endpoint_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,17 +227,19 @@ pub fn plan_add_remote_gateway_profile(
     registry: &GatewayRegistry,
     new_endpoint_id: String,
     name: &str,
-    address: &str,
+    gateway_base_url: &str,
     default_remote_name: String,
 ) -> Result<AddRemoteGatewayProfilePlan, GatewayProfileError> {
-    let address = normalize_remote_gateway_address(address)?;
+    let gateway_base_url = normalize_remote_gateway_base_url(gateway_base_url)?;
 
-    if let Some(existing_index) = remote_index_by_address(registry, address.as_str(), None) {
+    if let Some(existing_index) =
+        remote_index_by_gateway_base_url(registry, &gateway_base_url, None)
+    {
         let previous_endpoint = registry.remotes[existing_index].clone();
         let endpoint_name = remote_gateway_name_or_default(name, previous_endpoint.name.clone());
         let mut endpoint = previous_endpoint.clone();
         endpoint.name = endpoint_name;
-        endpoint.address = address;
+        endpoint.gateway_base_url = gateway_base_url;
         return Ok(AddRemoteGatewayProfilePlan::UpdateExisting {
             index: existing_index,
             previous_endpoint,
@@ -249,7 +251,7 @@ pub fn plan_add_remote_gateway_profile(
     let endpoint = GatewayEndpoint {
         id: new_endpoint_id,
         name: endpoint_name,
-        address,
+        gateway_base_url,
         kind: GatewayEndpointKind::Remote,
         session_ref: None,
         server_gateway_id: None,
@@ -304,21 +306,21 @@ pub fn plan_update_remote_gateway_profile(
     registry: &GatewayRegistry,
     id: &str,
     name: &str,
-    address: &str,
+    gateway_base_url: &str,
     default_remote_name: String,
 ) -> Result<UpdateRemoteGatewayProfilePlan, GatewayProfileError> {
-    let address = normalize_remote_gateway_address(address)?;
+    let gateway_base_url = normalize_remote_gateway_base_url(gateway_base_url)?;
     let Some(existing_index) = registry.remotes.iter().position(|remote| remote.id == id) else {
         return Err(GatewayProfileError::EndpointNotFound { id: id.to_owned() });
     };
 
-    if remote_index_by_address(registry, address.as_str(), Some(id)).is_some() {
-        return Err(GatewayProfileError::DuplicateRemoteAddress { address });
+    if remote_index_by_gateway_base_url(registry, &gateway_base_url, Some(id)).is_some() {
+        return Err(GatewayProfileError::DuplicateGatewayBaseUrl { gateway_base_url });
     }
 
     let previous_endpoint = registry.remotes[existing_index].clone();
-    if previous_endpoint.session_ref.is_some() && address != previous_endpoint.address {
-        return Err(GatewayProfileError::SessionBoundAddressChange {
+    if previous_endpoint.session_ref.is_some() && gateway_base_url != previous_endpoint.gateway_base_url {
+        return Err(GatewayProfileError::SessionBoundGatewayBaseUrlChange {
             endpoint_id: id.to_owned(),
         });
     }
@@ -326,7 +328,7 @@ pub fn plan_update_remote_gateway_profile(
 
     let mut endpoint = previous_endpoint.clone();
     endpoint.name = endpoint_name;
-    endpoint.address = address;
+    endpoint.gateway_base_url = gateway_base_url;
     endpoint.kind = GatewayEndpointKind::Remote;
     endpoint.service_name = None;
 
@@ -421,10 +423,13 @@ pub fn ws_timings_for_endpoint(
     timings
 }
 
-fn normalize_remote_gateway_address(address: &str) -> Result<String, GatewayProfileError> {
-    normalize_address(address).map_err(|error| GatewayProfileError::InvalidAddress {
-        address: address.trim().to_owned(),
-        reason: error.to_string(),
+fn normalize_remote_gateway_base_url(
+    gateway_base_url: &str,
+) -> Result<GatewayBaseUrl, GatewayProfileError> {
+    GatewayBaseUrl::parse_presentation(gateway_base_url).map_err(|error| {
+        GatewayProfileError::InvalidGatewayBaseUrl {
+            reason: error.to_string(),
+        }
     })
 }
 
@@ -444,15 +449,15 @@ impl fmt::Display for GatewayProfileError {
             Self::LocalGatewayDeleteUnsupported => {
                 write!(f, "local gateway cannot be deleted")
             }
-            Self::DuplicateRemoteAddress { address } => {
-                write!(f, "gateway address `{address}` already exists")
+            Self::DuplicateGatewayBaseUrl { gateway_base_url } => {
+                write!(f, "Gateway base URL `{gateway_base_url}` already exists")
             }
-            Self::InvalidAddress { address, reason } => {
-                write!(f, "invalid gateway address `{address}`: {reason}")
+            Self::InvalidGatewayBaseUrl { reason } => {
+                write!(f, "invalid Gateway base URL: {reason}")
             }
-            Self::SessionBoundAddressChange { endpoint_id } => write!(
+            Self::SessionBoundGatewayBaseUrlChange { endpoint_id } => write!(
                 f,
-                "session-bound Gateway endpoint `{endpoint_id}` cannot change address without reauthentication"
+                "session-bound Gateway endpoint `{endpoint_id}` cannot change its base URL without reauthentication"
             ),
         }
     }

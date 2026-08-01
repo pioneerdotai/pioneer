@@ -3,43 +3,14 @@
   "title": "ArtifactCapabilitiesResponse",
   "type": "object",
   "properties": {
-    "download": {
-      "$ref": "#/$defs/ArtifactDownloadCapabilities"
-    },
     "upload": {
       "$ref": "#/$defs/ArtifactUploadCapabilities"
     }
   },
   "required": [
-    "upload",
-    "download"
+    "upload"
   ],
   "$defs": {
-    "ArtifactDownloadCapabilities": {
-      "type": "object",
-      "properties": {
-        "max_chunk_size_bytes": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_concurrent_downloads": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "recommended_chunk_size_bytes": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "recommended_chunk_size_bytes",
-        "max_chunk_size_bytes",
-        "max_concurrent_downloads"
-      ]
-    },
     "ArtifactUploadCapabilities": {
       "type": "object",
       "properties": {

@@ -2201,9 +2201,6 @@ fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str>
         GatewayNotification::ArtifactUploadProgress(notification) => {
             Some(notification.workspace_id.as_str())
         }
-        GatewayNotification::ArtifactDownloadProgress(notification) => {
-            Some(notification.workspace_id.as_str())
-        }
         GatewayNotification::SkillsChanged(notification) => {
             Some(notification.workspace_id.as_str())
         }

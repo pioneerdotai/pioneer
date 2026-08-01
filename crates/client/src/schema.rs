@@ -58,16 +58,24 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::artifacts::actions::ArtifactActionStatus
         ),
         schema_doc!(
-            "artifact_download_request_plan_error.json",
-            crate::artifacts::actions::ArtifactDownloadRequestPlanError
+            "artifact_http_download_request_plan_error.json",
+            crate::artifacts::actions::ArtifactHttpDownloadRequestPlanError
         ),
         schema_doc!(
-            "artifact_download_request.json",
-            crate::artifacts::download::ArtifactDownloadRequest
+            "artifact_http_download_error.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadError
         ),
         schema_doc!(
-            "artifact_download_result.json",
-            crate::artifacts::download::ArtifactDownloadResult
+            "artifact_http_download_progress.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadProgress
+        ),
+        schema_doc!(
+            "artifact_http_download_request.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadRequest
+        ),
+        schema_doc!(
+            "artifact_http_download_result.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadResult
         ),
         schema_doc!(
             "artifact_file_action_block_reason.json",
@@ -1224,14 +1232,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "member_list_response.json",
             pioneer_protocol::MemberListResponse
-        ),
-        schema_doc!(
-            "member_avatar_get_params.json",
-            pioneer_protocol::MemberAvatarGetParams
-        ),
-        schema_doc!(
-            "member_avatar_get_response.json",
-            pioneer_protocol::MemberAvatarGetResponse
         ),
         schema_doc!(
             "member_suspend_params.json",

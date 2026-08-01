@@ -14,12 +14,10 @@ use pioneer_protocol::constants::methods;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactCapabilitiesParams,
     ArtifactCapabilitiesResponse, ArtifactDeleteParams, ArtifactDeleteResponse,
-    ArtifactDownloadAbortParams, ArtifactDownloadAbortResponse, ArtifactDownloadChunkParams,
-    ArtifactDownloadChunkResponse, ArtifactDownloadFinishParams, ArtifactDownloadFinishResponse,
-    ArtifactDownloadStartParams, ArtifactDownloadStartResponse, ArtifactGetParams,
-    ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
-    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactReadParams,
-    ArtifactReadResponse, ArtifactRestoreParams, ArtifactRestoreResponse,
+    ArtifactGetParams, ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactRestoreParams,
+    ArtifactRestoreResponse,
+    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
     ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadFinishParams,
     ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
     AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthSessionListResponse,
@@ -39,8 +37,8 @@ use pioneer_protocol::{
     InvitationRevokeResponse, McpInstallParams, McpInstallResponse, McpListParams, McpListResponse,
     McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse,
     McpServerRestartParams, McpServerRestartResponse, McpUninstallParams, McpUninstallResponse,
-    MemberAvatarGetParams, MemberAvatarGetResponse, MemberDeviceCreateParams,
-    MemberDeviceCreateResponse, MemberListParams, MemberListResponse, MemberMutationResponse,
+    MemberDeviceCreateParams, MemberDeviceCreateResponse, MemberListParams, MemberListResponse,
+    MemberMutationResponse,
     MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, ProviderConfigureParams,
     ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
@@ -228,21 +226,6 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::MEMBER_LIST,
-        &params,
-        RPC_REQUEST_TIMEOUT,
-    )
-}
-
-pub fn member_avatar_get<TTransport>(
-    transport: &TTransport,
-    params: MemberAvatarGetParams,
-) -> Result<MemberAvatarGetResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    send_json_rpc_request_typed(
-        transport,
-        methods::MEMBER_AVATAR_GET,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2285,27 +2268,31 @@ where
     )
 }
 
-pub fn artifact_read<TTransport>(
+pub fn artifact_view_grant_create<TTransport>(
     transport: &TTransport,
-    params: ArtifactReadParams,
-) -> Result<ArtifactReadResponse>
+    params: ArtifactViewGrantCreateParams,
+) -> Result<ArtifactViewGrantCreateResponse>
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
     require_non_empty_field(
         params.workspace_id.as_str(),
         "workspace_id",
-        methods::ARTIFACT_READ,
+        methods::ARTIFACT_VIEW_GRANT_CREATE,
     )?;
     require_non_empty_field(
         params.artifact_id.as_str(),
         "artifact_id",
-        methods::ARTIFACT_READ,
+        methods::ARTIFACT_VIEW_GRANT_CREATE,
     )?;
-
+    require_non_empty_field(
+        params.version_id.as_str(),
+        "version_id",
+        methods::ARTIFACT_VIEW_GRANT_CREATE,
+    )?;
     send_json_rpc_request_typed(
         transport,
-        methods::ARTIFACT_READ,
+        methods::ARTIFACT_VIEW_GRANT_CREATE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2411,114 +2398,6 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::ARTIFACT_BIND,
-        &params,
-        RPC_REQUEST_TIMEOUT,
-    )
-}
-
-pub fn artifact_download_start<TTransport>(
-    transport: &TTransport,
-    params: ArtifactDownloadStartParams,
-) -> Result<ArtifactDownloadStartResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    require_non_empty_field(
-        params.workspace_id.as_str(),
-        "workspace_id",
-        methods::ARTIFACT_DOWNLOAD_START,
-    )?;
-    require_non_empty_field(
-        params.artifact_id.as_str(),
-        "artifact_id",
-        methods::ARTIFACT_DOWNLOAD_START,
-    )?;
-
-    send_json_rpc_request_typed(
-        transport,
-        methods::ARTIFACT_DOWNLOAD_START,
-        &params,
-        RPC_REQUEST_TIMEOUT,
-    )
-}
-
-pub fn artifact_download_chunk<TTransport>(
-    transport: &TTransport,
-    params: ArtifactDownloadChunkParams,
-) -> Result<ArtifactDownloadChunkResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    require_non_empty_field(
-        params.workspace_id.as_str(),
-        "workspace_id",
-        methods::ARTIFACT_DOWNLOAD_CHUNK,
-    )?;
-    require_non_empty_field(
-        params.download_id.as_str(),
-        "download_id",
-        methods::ARTIFACT_DOWNLOAD_CHUNK,
-    )?;
-    require_condition(
-        params.len > 0,
-        "len must be positive for artifact/download/chunk",
-    )?;
-
-    send_json_rpc_request_typed(
-        transport,
-        methods::ARTIFACT_DOWNLOAD_CHUNK,
-        &params,
-        RPC_REQUEST_TIMEOUT,
-    )
-}
-
-pub fn artifact_download_finish<TTransport>(
-    transport: &TTransport,
-    params: ArtifactDownloadFinishParams,
-) -> Result<ArtifactDownloadFinishResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    require_non_empty_field(
-        params.workspace_id.as_str(),
-        "workspace_id",
-        methods::ARTIFACT_DOWNLOAD_FINISH,
-    )?;
-    require_non_empty_field(
-        params.download_id.as_str(),
-        "download_id",
-        methods::ARTIFACT_DOWNLOAD_FINISH,
-    )?;
-
-    send_json_rpc_request_typed(
-        transport,
-        methods::ARTIFACT_DOWNLOAD_FINISH,
-        &params,
-        RPC_REQUEST_TIMEOUT,
-    )
-}
-
-pub fn artifact_download_abort<TTransport>(
-    transport: &TTransport,
-    params: ArtifactDownloadAbortParams,
-) -> Result<ArtifactDownloadAbortResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    require_non_empty_field(
-        params.workspace_id.as_str(),
-        "workspace_id",
-        methods::ARTIFACT_DOWNLOAD_ABORT,
-    )?;
-    require_non_empty_field(
-        params.download_id.as_str(),
-        "download_id",
-        methods::ARTIFACT_DOWNLOAD_ABORT,
-    )?;
-
-    send_json_rpc_request_typed(
-        transport,
-        methods::ARTIFACT_DOWNLOAD_ABORT,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2715,7 +2594,6 @@ mod tests {
         let _ = invitation_list(&transport, InvitationListParams::default());
         let _ = invitation_revoke(&transport, params(json!({"invitation_id": invitation_id})));
         let _ = member_list(&transport, MemberListParams::default());
-        let _ = member_avatar_get(&transport, params(json!({"principal_id": principal_id})));
         let _ = member_suspend(&transport, params(json!({"principal_id": principal_id})));
         let _ = member_restore(&transport, params(json!({"principal_id": principal_id})));
         let _ = member_remove(&transport, params(json!({"principal_id": principal_id})));
@@ -2747,7 +2625,6 @@ mod tests {
                 methods::INVITE_LIST,
                 methods::INVITE_REVOKE,
                 methods::MEMBER_LIST,
-                methods::MEMBER_AVATAR_GET,
                 methods::MEMBER_SUSPEND,
                 methods::MEMBER_RESTORE,
                 methods::MEMBER_REMOVE,
@@ -3698,22 +3575,6 @@ mod tests {
                 .expect_err("thread id should be required")
             ),
             "thread_id is required for artifact/list/thread"
-        );
-        assert_eq!(
-            format!(
-                "{:#}",
-                artifact_download_chunk(
-                    &PanicTransport,
-                    ArtifactDownloadChunkParams {
-                        workspace_id: "ws_1".to_owned(),
-                        download_id: "download_1".to_owned(),
-                        offset: 0,
-                        len: 0,
-                    },
-                )
-                .expect_err("len should be positive")
-            ),
-            "len must be positive for artifact/download/chunk"
         );
         assert_eq!(
             format!(

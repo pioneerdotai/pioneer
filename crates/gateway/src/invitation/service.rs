@@ -1417,7 +1417,7 @@ mod tests {
         AuthorizationResolver, AuthorizationService, AuthorizedMemberPrincipal,
         AuthorizedWorkspace, ProofResolution,
     };
-    use crate::authorization_test_support::{
+    use crate::tests::authorization::{
         IsolatedEpic4Harness, MEMBER_A_ID, WORKSPACE_BLUE_ID, WORKSPACE_GREEN_ID, WORKSPACE_RED_ID,
     };
     use crate::member::MemberService;
@@ -1474,7 +1474,7 @@ mod tests {
     fn member_b() -> AuthenticatedSessionPrincipal {
         AuthenticatedSessionPrincipal {
             gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
-            principal_id: PrincipalId::new(crate::authorization_test_support::MEMBER_B_ID).unwrap(),
+            principal_id: PrincipalId::new(crate::tests::authorization::MEMBER_B_ID).unwrap(),
             kind: PrincipalKind::User,
             role_key: Some(RoleKey::member()),
             device_id: DeviceId::new("D0000000000000000000B").unwrap(),

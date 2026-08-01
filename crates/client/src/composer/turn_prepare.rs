@@ -978,8 +978,8 @@ mod tests {
     use crate::platform::{ClientFileMetadata, ClientFileSystem, ClientPath};
     use crate::{ClientError, ClientResult};
     use pioneer_protocol::{
-        ArtifactCapabilitiesResponse, ArtifactDownloadCapabilities, ArtifactKind, ArtifactStatus,
-        ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadCapabilities,
+        ArtifactCapabilitiesResponse, ArtifactKind, ArtifactStatus, ArtifactUploadAbortParams,
+        ArtifactUploadAbortResponse, ArtifactUploadCapabilities,
         ArtifactUploadChunkAckNotification, ArtifactUploadFinishParams,
         ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
         SkillId, SkillPackId,
@@ -1017,11 +1017,6 @@ mod tests {
                 max_chunk_size_bytes: 1024,
                 max_file_size_bytes: 1024 * 1024,
                 max_files_per_turn: 16,
-            },
-            download: ArtifactDownloadCapabilities {
-                recommended_chunk_size_bytes: 1024,
-                max_chunk_size_bytes: 1024,
-                max_concurrent_downloads: 2,
             },
         }
     }

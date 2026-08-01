@@ -4,7 +4,9 @@
 //! Client domain logic remains in `pioneer-client`.
 
 mod active_thread;
+mod artifacts;
 mod auth;
+mod avatars;
 mod composer;
 mod contracts;
 mod diagnostics;
@@ -27,6 +29,14 @@ use active_thread::{
     ClientActiveThreadUnsubscribeRequest, ClientActiveThreadUnsubscribeResult,
     ClientEnsureWorkspaceDraftRequest, ClientFfiActiveThreadState,
     ClientPrepareVoiceComposerSnapshotRequest,
+};
+use artifacts::{
+    ClientArtifactDownloadCancelResult, ClientArtifactDownloadOperationRequest,
+    ClientArtifactDownloadProgressResult, ClientArtifactDownloadRequest,
+    ClientArtifactDownloadResult, ClientArtifactTargetRequest, ClientArtifactViewOpenResult,
+};
+use avatars::{
+    ClientFfiAvatarCache, ClientMemberAvatarCacheRequest, ClientMemberAvatarCacheResult,
 };
 use auth::{
     ClientAuthDeviceActivateRequest, ClientAuthRefreshRequest,
@@ -60,11 +70,13 @@ use contracts::{
 use diagnostics::{ClientDiagnosticEvent, ClientFfiDiagnostics};
 use gateway::{
     AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanActivateGatewayRequest,
-    PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest,
-    PlanUpdateRemoteGatewayRequest, RemoteGatewayValidationRequest, gateway_settings_error_code,
+    LoadGatewayRegistryRequest, LoadGatewayRegistryResult, PlanAddRemoteGatewayRequest,
+    PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest, PlanUpdateRemoteGatewayRequest,
+    RemoteGatewayValidationRequest, gateway_settings_error_code,
     gateway_settings_get_for_bridge, gateway_settings_update_for_bridge,
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
-    plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
+    load_gateway_registry_request, plan_add_remote_gateway_request,
+    plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
     provider_list_transcription_models_for_bridge, validate_remote_gateway_request,
     voice_input_plan_for_bridge,
@@ -173,6 +185,8 @@ struct ClientFfiRuntime {
     diagnostics: ClientFfiDiagnostics,
     gateway_session_lifecycles:
         Mutex<HashMap<String, pioneer_client::gateway::session_lifecycle::SessionLifecycle>>,
+    artifact_downloads: artifacts::ClientFfiArtifactDownloads,
+    avatar_cache: ClientFfiAvatarCache,
     invitation_commit_sequence: AtomicU64,
     invitation_commits:
         Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
@@ -301,6 +315,15 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("invalid gateway add remote planning request: {error}"))?;
 
         plan_add_remote_gateway_request(request).map_err(|error| error.to_string())
+    }
+
+    fn gateway_load_registry_v3(
+        &self,
+        input_json: &str,
+    ) -> Result<LoadGatewayRegistryResult, String> {
+        let request = serde_json::from_str::<LoadGatewayRegistryRequest>(input_json)
+            .map_err(|_| "invalid Gateway registry load request".to_owned())?;
+        load_gateway_registry_request(request).map_err(|error| error.to_string())
     }
 
     fn gateway_plan_add_and_activate_remote_registry(
@@ -447,7 +470,7 @@ impl ClientFfiRuntime {
             .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
         runtime
             .block_on(client.refresh(
-                &request.address,
+                &request.gateway_base_url,
                 request.credential.expose_secret(),
                 request.params,
             ))
@@ -470,7 +493,7 @@ impl ClientFfiRuntime {
             .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
         runtime
             .block_on(client.activate_device(
-                &request.address,
+                &request.gateway_base_url,
                 request.credential.expose_secret(),
                 request.params,
             ))
@@ -493,7 +516,7 @@ impl ClientFfiRuntime {
             .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
         runtime
             .block_on(client.cleanup_session_once(
-                &request.address,
+                &request.gateway_base_url,
                 request.access_token.expose_secret(),
                 request.session_id,
             ))
@@ -852,16 +875,24 @@ impl ClientFfiRuntime {
             .map_err(administration_rpc_error)
     }
 
-    fn member_avatar_get(
+    fn member_avatar_cache(
         &self,
         input_json: &str,
-    ) -> Result<pioneer_protocol::MemberAvatarGetResponse, ClientFfiError> {
-        let params = parse_normal_params(input_json, "member avatar get")?;
+    ) -> Result<ClientMemberAvatarCacheResult, ClientFfiError> {
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_avatar_get(params)
-            .map_err(administration_rpc_error)
+        let request = serde_json::from_str::<ClientMemberAvatarCacheRequest>(input_json).map_err(
+            |_| {
+                ClientFfiError::new(
+                    "invalid member avatar cache request",
+                    "avatar_invalid_request",
+                )
+            },
+        )?;
+        self.avatar_cache.resolve(
+            &self.client_runtime.ws_command_sender(),
+            self.native_cache_runtime_home()?,
+            request,
+        )
     }
 
     fn member_suspend(
@@ -1009,6 +1040,9 @@ impl ClientFfiRuntime {
 
             if !events.is_empty() {
                 if contains_session_termination(events.as_slice()) {
+                    if let Ok(runtime_home) = self.native_cache_runtime_home() {
+                        self.avatar_cache.invalidate_all(runtime_home.as_path());
+                    }
                     self.invitation_commits
                         .lock()
                         .map_err(|_| "invitation commit state is unavailable".to_owned())?
@@ -1025,6 +1059,10 @@ impl ClientFfiRuntime {
     }
 
     fn gateway_disconnect(&self) -> Result<ClientFfiGatewayDisconnectResult, String> {
+        self.artifact_downloads.cancel_all();
+        if let Ok(runtime_home) = self.native_cache_runtime_home() {
+            self.avatar_cache.invalidate_all(runtime_home.as_path());
+        }
         self.client_runtime
             .ws_command_sender()
             .disconnect()
@@ -1041,6 +1079,99 @@ impl ClientFfiRuntime {
             .map_err(|_| "invitation commit state is unavailable".to_owned())?
             .clear();
         Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
+    }
+
+    fn artifact_view_open(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientArtifactViewOpenResult, ClientFfiError> {
+        self.require_initialized_and_connected()?;
+        let request = serde_json::from_str::<ClientArtifactTargetRequest>(input_json).map_err(
+            |_| {
+                ClientFfiError::new(
+                    "invalid artifact view request",
+                    artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                )
+            },
+        )?;
+        artifacts::open_artifact_view(&self.client_runtime.ws_command_sender(), request)
+    }
+
+    fn artifact_download(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientArtifactDownloadResult, ClientFfiError> {
+        self.require_initialized_and_connected()?;
+        let request = serde_json::from_str::<ClientArtifactDownloadRequest>(input_json).map_err(
+            |_| {
+                ClientFfiError::new(
+                    "invalid artifact download request",
+                    artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                )
+            },
+        )?;
+        let runtime_home = self.native_cache_runtime_home()?;
+        artifacts::download_artifact(
+            &self.client_runtime.ws_command_sender(),
+            &self.artifact_downloads,
+            runtime_home,
+            request,
+        )
+    }
+
+    fn artifact_download_progress(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientArtifactDownloadProgressResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json).map_err(
+                |_| {
+                    ClientFfiError::new(
+                        "invalid artifact download progress request",
+                        artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                    )
+                },
+            )?;
+        self.artifact_downloads.progress(request)
+    }
+
+    fn artifact_download_cancel(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientArtifactDownloadCancelResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json).map_err(
+                |_| {
+                    ClientFfiError::new(
+                        "invalid artifact download cancel request",
+                        artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                    )
+                },
+            )?;
+        self.artifact_downloads.cancel(request)
+    }
+
+    fn native_cache_runtime_home(&self) -> Result<std::path::PathBuf, ClientFfiError> {
+        let config = self.config.lock().map_err(|_| {
+            ClientFfiError::new(
+                "client ffi config lock is poisoned",
+                ClientFfiError::GENERIC_CODE,
+            )
+        })?;
+        let app_data_dir = config
+            .as_ref()
+            .and_then(|config| config.app_data_dir.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ClientFfiError::new(
+                    "native app data directory is required for private file caches",
+                    artifacts::ARTIFACT_RECONFIGURATION_CODE,
+                )
+            })?;
+        Ok(std::path::PathBuf::from(app_data_dir))
     }
 
     fn gateway_settings_get(
@@ -2258,6 +2389,10 @@ ffi_client_json_method!(
     gateway_plan_add_remote
 );
 ffi_client_json_method!(
+    pioneer_client_ffi_gateway_load_registry_v3,
+    gateway_load_registry_v3
+);
+ffi_client_json_method!(
     pioneer_client_ffi_gateway_plan_add_and_activate_remote_registry,
     gateway_plan_add_and_activate_remote_registry
 );
@@ -2345,7 +2480,7 @@ ffi_client_json_typed_method!(pioneer_client_ffi_invitation_create, invitation_c
 ffi_client_json_typed_method!(pioneer_client_ffi_invitation_list, invitation_list);
 ffi_client_json_typed_method!(pioneer_client_ffi_invitation_revoke, invitation_revoke);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_list, member_list);
-ffi_client_json_typed_method!(pioneer_client_ffi_member_avatar_get, member_avatar_get);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_avatar_cache, member_avatar_cache);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_suspend, member_suspend);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_restore, member_restore);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_remove, member_remove);
@@ -2376,6 +2511,16 @@ ffi_client_json_typed_method!(
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_settings_update,
     gateway_settings_update
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_artifact_view_open, artifact_view_open);
+ffi_client_json_typed_method!(pioneer_client_ffi_artifact_download, artifact_download);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_artifact_download_progress,
+    artifact_download_progress
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_artifact_download_cancel,
+    artifact_download_cancel
 );
 ffi_client_json_method!(pioneer_client_ffi_workspace_bootstrap, workspace_bootstrap);
 ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
@@ -2945,7 +3090,7 @@ mod tests {
         let error = runtime
             .gateway_auth_refresh(
                 serde_json::json!({
-                    "address": "ws://localhost:17878",
+                    "gateway_base_url": "http://localhost:17878/",
                     "credential": secret,
                     "params": {"unexpected": true}
                 })
@@ -3329,7 +3474,7 @@ mod tests {
     fn gateway_validation_uses_shared_request_contract() {
         let runtime = ClientFfiRuntime::default();
         let error = runtime
-            .gateway_validate_remote(r#"{"address":"127.0.0.1:23000","timeout_ms":0}"#)
+            .gateway_validate_remote(r#"{"gateway_base_url":"127.0.0.1:23000","timeout_ms":0}"#)
             .expect_err("zero timeout should fail");
 
         assert!(error.contains("timeout must be positive"));
@@ -3454,12 +3599,12 @@ mod tests {
             .gateway_plan_add_remote(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": null,
                         "local": {
                             "id": "local",
                             "name": "Local",
-                            "address": "127.0.0.1:17878",
+                            "gateway_base_url": "http://127.0.0.1:17878/",
                             "kind": "local",
                             "workspace_id": null,
                             "service_name": null
@@ -3467,7 +3612,7 @@ mod tests {
                         "remotes": []
                     },
                     "name": " Remote ",
-                    "address": "127.0.0.1:23000",
+                    "gateway_base_url": "http://127.0.0.1:23000/",
                     "new_endpoint_id": "remote-one",
                     "default_remote_name": "Remote 1"
                 })
@@ -3488,12 +3633,12 @@ mod tests {
             .gateway_plan_add_and_activate_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": null,
                         "remotes": []
                     },
                     "name": " Remote ",
-                    "address": "127.0.0.1:23000",
+                    "gateway_base_url": "http://127.0.0.1:23000/",
                     "new_endpoint_id": "remote-one",
                     "default_remote_name": "Remote 1"
                 })
@@ -3519,12 +3664,12 @@ mod tests {
             .gateway_plan_activate_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": null,
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
-                            "address": "127.0.0.1:23000",
+                            "gateway_base_url": "http://127.0.0.1:23000/",
                             "kind": "remote",
                             "workspace_id": null,
                             "service_name": null
@@ -3551,12 +3696,12 @@ mod tests {
             .gateway_plan_update_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": "remote-one",
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
-                            "address": "127.0.0.1:23000",
+                            "gateway_base_url": "http://127.0.0.1:23000/",
                             "kind": "remote",
                             "workspace_id": null,
                             "service_name": null
@@ -3564,7 +3709,7 @@ mod tests {
                     },
                     "gateway_id": "remote-one",
                     "name": "Renamed",
-                    "address": "127.0.0.1:24000",
+                    "gateway_base_url": "http://127.0.0.1:24000/",
                     "default_remote_name": "Remote 1"
                 })
                 .to_string()
@@ -3573,8 +3718,14 @@ mod tests {
             .expect("plan update remote registry");
 
         assert_eq!(result.endpoint.name, "Renamed");
-        assert_eq!(result.endpoint.address, "127.0.0.1:24000");
-        assert_eq!(result.previous_endpoint.address, "127.0.0.1:23000");
+        assert_eq!(
+            result.endpoint.gateway_base_url.as_str(),
+            "http://127.0.0.1:24000/"
+        );
+        assert_eq!(
+            result.previous_endpoint.gateway_base_url.as_str(),
+            "http://127.0.0.1:23000/"
+        );
     }
 
     #[test]
@@ -3584,13 +3735,13 @@ mod tests {
             .gateway_plan_delete_remote_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": "remote-one",
                         "remotes": [
                             {
                                 "id": "remote-one",
                                 "name": "One",
-                                "address": "127.0.0.1:23000",
+                                "gateway_base_url": "http://127.0.0.1:23000/",
                                 "kind": "remote",
                                 "workspace_id": null,
                                 "service_name": null
@@ -3598,7 +3749,7 @@ mod tests {
                             {
                                 "id": "remote-two",
                                 "name": "Two",
-                                "address": "127.0.0.1:24000",
+                                "gateway_base_url": "http://127.0.0.1:24000/",
                                 "kind": "remote",
                                 "workspace_id": null,
                                 "service_name": null
@@ -3627,12 +3778,12 @@ mod tests {
             .gateway_plan_set_workspace_registry(
                 serde_json::json!({
                     "registry": {
-                        "version": 2,
+                        "version": 3,
                         "active_gateway_id": "remote-one",
                         "remotes": [{
                             "id": "remote-one",
                             "name": "Remote",
-                            "address": "127.0.0.1:23000",
+                            "gateway_base_url": "http://127.0.0.1:23000/",
                             "kind": "remote",
                             "workspace_id": null,
                             "service_name": null

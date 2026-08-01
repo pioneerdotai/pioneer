@@ -76,7 +76,12 @@ impl PioneerDesktop {
         let form_state =
             cx.new(|cx| GatewaySetupFormState::new(window, cx, initial_operation.clone()));
         form_state.update(cx, |state, cx| {
-            state.set_inputs(window, cx, endpoint.name.clone(), endpoint.address.clone());
+            state.set_inputs(
+                window,
+                cx,
+                endpoint.name.clone(),
+                endpoint.gateway_base_url.to_string(),
+            );
         });
 
         let endpoint_id = endpoint.id.clone();
@@ -149,7 +154,7 @@ impl PioneerDesktop {
             cx.new(|cx| GatewaySetupFormState::new(window, cx, initial_operation.clone()));
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
-        let endpoint_address = endpoint.address.clone();
+        let endpoint_address = endpoint.gateway_base_url.to_string();
 
         window.open_dialog(cx, move |dialog, window, cx| {
             form_state.update(cx, |state, cx| {
@@ -189,7 +194,7 @@ impl PioneerDesktop {
                             GatewaySetupFormMode::ReauthenticateGateway {
                                 endpoint_id: endpoint_id.clone(),
                                 name: endpoint_name.clone(),
-                                address: endpoint_address.clone(),
+                                gateway_base_url: endpoint_address.clone(),
                                 close_dialog_on_success: true,
                             },
                             desktop_entity.clone(),

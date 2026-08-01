@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use pioneer_protocol::{PersistedActorRef, RequestId, RoleKey};
@@ -12,6 +13,68 @@ const MAX_CANONICAL_RPC_METHOD_LEN: usize = 128;
 pub(crate) struct ConnectionContext {
     connection_id: ConnectionId,
     principal: Arc<AuthenticatedSessionPrincipal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceTransport {
+    WebSocket,
+    HttpStorage,
+}
+
+impl SourceTransport {
+    pub(crate) const fn safe_name(self) -> &'static str {
+        match self {
+            Self::WebSocket => "websocket",
+            Self::HttpStorage => "http_storage",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestNetworkContext {
+    Unavailable,
+    DirectPeer(SocketAddr),
+    TrustedProxy { client_ip: IpAddr },
+}
+
+impl RequestNetworkContext {
+    pub(crate) const fn direct(peer: SocketAddr) -> Self {
+        Self::DirectPeer(peer)
+    }
+
+    pub(crate) const fn client_ip(self) -> Option<IpAddr> {
+        match self {
+            Self::Unavailable => None,
+            Self::DirectPeer(peer) => Some(peer.ip()),
+            Self::TrustedProxy { client_ip, .. } => Some(client_ip),
+        }
+    }
+
+    pub(crate) const fn safe_source(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::DirectPeer(_) => "direct_peer",
+            Self::TrustedProxy { .. } => "trusted_proxy",
+        }
+    }
+
+    const fn safe_address_family(self) -> &'static str {
+        match self.client_ip() {
+            Some(IpAddr::V4(_)) => "ipv4",
+            Some(IpAddr::V6(_)) => "ipv6",
+            None => "unavailable",
+        }
+    }
+}
+
+impl std::fmt::Debug for RequestNetworkContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestNetworkContext")
+            .field("source", &self.safe_source())
+            .field("address_family", &self.safe_address_family())
+            .finish()
+    }
 }
 
 impl ConnectionContext {
@@ -60,11 +123,107 @@ impl CanonicalMethod {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct AuthenticatedRequestContext {
+    principal: Arc<AuthenticatedSessionPrincipal>,
+    request_id: Option<RequestId>,
+    source_transport: SourceTransport,
+    network: RequestNetworkContext,
+    operation: CanonicalMethod,
+}
+
+impl AuthenticatedRequestContext {
+    pub(crate) fn new(
+        principal: Arc<AuthenticatedSessionPrincipal>,
+        request_id: Option<RequestId>,
+        source_transport: SourceTransport,
+        network: RequestNetworkContext,
+        operation: CanonicalMethod,
+    ) -> Self {
+        Self {
+            principal,
+            request_id,
+            source_transport,
+            network,
+            operation,
+        }
+    }
+
+    pub(crate) fn principal(&self) -> &AuthenticatedSessionPrincipal {
+        self.principal.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedSessionPrincipal> {
+        &self.principal
+    }
+
+    pub(crate) fn role_key(&self) -> Option<&RoleKey> {
+        self.principal().role_key.as_ref()
+    }
+
+    pub(crate) fn request_id(&self) -> Option<&RequestId> {
+        self.request_id.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn source_transport(&self) -> SourceTransport {
+        self.source_transport
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn network(&self) -> RequestNetworkContext {
+        self.network
+    }
+
+    pub(crate) fn canonical_operation(&self) -> &CanonicalMethod {
+        &self.operation
+    }
+
+    pub(crate) fn persisted_actor(&self) -> PersistedActorRef {
+        PersistedActorRef::Principal(self.principal().principal_id.clone())
+    }
+
+    pub(crate) fn request_span(&self) -> tracing::Span {
+        let principal = self.principal();
+        tracing::debug_span!(
+            "gateway_authenticated_request",
+            gateway_id = %principal.gateway_id,
+            principal_id = %principal.principal_id,
+            principal_kind = ?principal.kind,
+            role_key = principal.role_key.as_ref().map(RoleKey::as_str).unwrap_or("none"),
+            device_id = %principal.device_id,
+            auth_session_id = %principal.session_id,
+            source_transport = self.source_transport.safe_name(),
+            client_address_source = self.network.safe_source(),
+            client_address_family = self.network.safe_address_family(),
+            canonical_operation = self.operation.as_str(),
+            request_id = self.request_id().map(RequestId::as_str).unwrap_or("unavailable"),
+            authorization_state = "pending",
+        )
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedRequestContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedRequestContext")
+            .field("gateway_id", &self.principal.gateway_id)
+            .field("principal_id", &self.principal.principal_id)
+            .field("device_id", &self.principal.device_id)
+            .field("session_id", &self.principal.session_id)
+            .field("request_id", &self.request_id)
+            .field("source_transport", &self.source_transport)
+            .field("network", &self.network)
+            .field("canonical_operation", &self.operation.as_str())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RequestContext {
     connection: ConnectionContext,
-    request_id: Option<RequestId>,
-    method: CanonicalMethod,
+    authenticated: AuthenticatedRequestContext,
 }
 
 impl RequestContext {
@@ -73,10 +232,16 @@ impl RequestContext {
         request_id: Option<RequestId>,
         method: CanonicalMethod,
     ) -> Self {
+        let authenticated = AuthenticatedRequestContext::new(
+            connection.principal.clone(),
+            request_id,
+            SourceTransport::WebSocket,
+            RequestNetworkContext::Unavailable,
+            method,
+        );
         Self {
             connection: connection.clone(),
-            request_id,
-            method,
+            authenticated,
         }
     }
 
@@ -89,28 +254,28 @@ impl RequestContext {
     }
 
     pub(crate) fn principal(&self) -> &AuthenticatedSessionPrincipal {
-        self.connection.principal()
+        self.authenticated.principal()
     }
 
     pub(crate) fn role_key(&self) -> Option<&RoleKey> {
-        self.principal().role_key.as_ref()
+        self.authenticated.role_key()
     }
 
     #[cfg(test)]
     pub(crate) fn principal_arc(&self) -> &Arc<AuthenticatedSessionPrincipal> {
-        self.connection.principal_arc()
+        self.authenticated.principal_arc()
     }
 
     pub(crate) fn request_id(&self) -> Option<&RequestId> {
-        self.request_id.as_ref()
+        self.authenticated.request_id()
     }
 
     pub(crate) fn canonical_method(&self) -> &CanonicalMethod {
-        &self.method
+        self.authenticated.canonical_operation()
     }
 
     pub(crate) fn persisted_actor(&self) -> PersistedActorRef {
-        PersistedActorRef::Principal(self.principal().principal_id.clone())
+        self.authenticated.persisted_actor()
     }
 
     pub(crate) fn request_span(&self) -> tracing::Span {
@@ -155,7 +320,10 @@ fn is_canonical_rpc_method(method: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalMethod, ConnectionContext, RequestContext};
+    use super::{
+        AuthenticatedRequestContext, CanonicalMethod, ConnectionContext, RequestContext,
+        RequestNetworkContext, SourceTransport,
+    };
     use crate::auth::AuthenticatedSessionPrincipal;
     use pioneer_protocol::{
         AuthSessionId, DeviceId, GatewayId, PersistedActorRef, PrincipalId, PrincipalKind,
@@ -201,6 +369,38 @@ mod tests {
             access_jti: "J".repeat(21),
             access_expires_at_unix: u64::MAX,
         })
+    }
+
+    #[test]
+    fn authenticated_http_context_has_actor_metadata_without_connection_state() {
+        let principal = principal('P');
+        let request_id = RequestId::new("R".repeat(21)).expect("request id");
+        let peer = "192.0.2.42:43100".parse().expect("peer address");
+        let context = AuthenticatedRequestContext::new(
+            principal.clone(),
+            Some(request_id.clone()),
+            SourceTransport::HttpStorage,
+            RequestNetworkContext::direct(peer),
+            CanonicalMethod::binary("storage/artifact/content"),
+        );
+
+        assert!(Arc::ptr_eq(context.principal_arc(), &principal));
+        assert_eq!(context.request_id(), Some(&request_id));
+        assert_eq!(context.source_transport(), SourceTransport::HttpStorage);
+        assert_eq!(context.network().client_ip(), Some(peer.ip()));
+        assert_eq!(
+            context.persisted_actor(),
+            PersistedActorRef::Principal(principal.principal_id.clone())
+        );
+        assert_eq!(
+            context.canonical_operation().as_str(),
+            "storage/artifact/content"
+        );
+
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("192.0.2.42"));
+        assert!(!debug.contains(principal.access_jti.as_str()));
+        assert!(debug.contains("direct_peer"));
     }
 
     #[test]

@@ -3,7 +3,6 @@ use super::{
 };
 use crate::gateway::timings::GatewayWsTimings;
 use futures_util::{SinkExt, StreamExt};
-use pioneer_client::artifacts::download::ArtifactDownloadRequest;
 use pioneer_client::composer::{
     attachments::{ComposerAttachment, ComposerAttachmentKind, ComposerAttachmentUploadState},
     turn_prepare::PrepareComposerTurnRequest,
@@ -17,7 +16,6 @@ use pioneer_protocol::{
     constants::events, generate_id,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,7 +36,7 @@ fn skill_upload_chunk_sends_binary_frame_and_receives_ack() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("upload-chunk", "Upload Chunk", server.address.as_str());
+    let spec = connect_spec("upload-chunk", "Upload Chunk", server.gateway_base_url.as_str());
 
     let _connection_id = sender
         .connect_and_wait(spec)
@@ -70,7 +68,7 @@ fn artifact_capabilities_request_receives_response() {
     let spec = connect_spec(
         "artifact-capabilities",
         "Artifact Capabilities",
-        server.address.as_str(),
+        server.gateway_base_url.as_str(),
     );
 
     let _connection_id = sender
@@ -97,7 +95,7 @@ fn artifact_upload_chunk_sends_binary_frame_and_receives_ack() {
     let spec = connect_spec(
         "artifact-upload-chunk",
         "Artifact Upload Chunk",
-        server.address.as_str(),
+        server.gateway_base_url.as_str(),
     );
 
     let _connection_id = sender
@@ -131,7 +129,7 @@ fn prepare_composer_turn_uploads_small_fixture_and_returns_artifact_input() {
     let spec = connect_spec(
         "artifact-upload-file",
         "Artifact Upload File",
-        server.address.as_str(),
+        server.gateway_base_url.as_str(),
     );
     let temp = tempfile::tempdir().expect("temp dir");
     let file_path = temp.path().join("fixture.txt");
@@ -173,102 +171,11 @@ fn prepare_composer_turn_uploads_small_fixture_and_returns_artifact_input() {
 }
 
 #[test]
-fn artifact_download_writes_verified_cache_file() {
-    let mut server = TestWsServer::spawn("127.0.0.1:0");
-    let client = GatewayWsClient::new();
-    let sender = client.command_sender();
-    let spec = connect_spec(
-        "artifact-download-file",
-        "Artifact Download File",
-        server.address.as_str(),
-    );
-    let temp = tempfile::tempdir().expect("temp dir");
-
-    let _connection_id = sender
-        .connect_and_wait(spec)
-        .expect("expected connect_and_wait to succeed");
-    let result = sender
-        .download_artifact_to_cache_with_runtime_home(
-            ArtifactDownloadRequest {
-                gateway_profile_id: "remote/test".to_owned(),
-                workspace_id: TEST_WORKSPACE_ID.to_owned(),
-                artifact_id: "artifact_download_result".to_owned(),
-                version_id: Some("artifact_download_version_1".to_owned()),
-            },
-            temp.path().to_path_buf(),
-        )
-        .expect("artifact download");
-
-    assert_eq!(result.artifact.artifact_id, "artifact_download_result");
-    assert_eq!(result.size_bytes, artifact_download_fixture().len() as u64);
-    assert_eq!(
-        std::fs::read(result.local_path.as_path()).expect("read downloaded file"),
-        artifact_download_fixture()
-    );
-    assert_eq!(result.sha256, sha256_hex(artifact_download_fixture()));
-    assert!(
-        !result
-            .local_path
-            .as_path()
-            .with_file_name("download.txt.part")
-            .exists()
-    );
-
-    let _ = sender.shutdown();
-    server.stop();
-}
-
-#[test]
-fn artifact_download_interrupted_download_removes_part_file() {
-    let mut server = TestWsServer::spawn("127.0.0.1:0");
-    let client = GatewayWsClient::new();
-    let sender = client.command_sender();
-    let spec = connect_spec(
-        "artifact-download-corrupt",
-        "Artifact Download Corrupt",
-        server.address.as_str(),
-    );
-    let temp = tempfile::tempdir().expect("temp dir");
-
-    let _connection_id = sender
-        .connect_and_wait(spec)
-        .expect("expected connect_and_wait to succeed");
-    let error = sender
-        .download_artifact_to_cache_with_runtime_home(
-            ArtifactDownloadRequest {
-                gateway_profile_id: "remote/test".to_owned(),
-                workspace_id: TEST_WORKSPACE_ID.to_owned(),
-                artifact_id: "artifact_download_corrupt".to_owned(),
-                version_id: Some("artifact_download_version_1".to_owned()),
-            },
-            temp.path().to_path_buf(),
-        )
-        .expect_err("corrupt download should fail");
-
-    assert!(error.to_string().contains("identity mismatch"));
-    let part_path = temp
-        .path()
-        .join("downloads")
-        .join("gateways")
-        .join("remote_test")
-        .join("workspaces")
-        .join(TEST_WORKSPACE_ID)
-        .join("artifacts")
-        .join("artifact_download_corrupt")
-        .join("artifact_download_version_1")
-        .join("download.txt.part");
-    assert!(!part_path.exists());
-
-    let _ = sender.shutdown();
-    server.stop();
-}
-
-#[test]
 fn connect_and_wait_reports_connected_event() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("remote-1", "Remote 1", server.address.as_str());
+    let spec = connect_spec("remote-1", "Remote 1", server.gateway_base_url.as_str());
 
     let connection_id = sender
         .connect_and_wait(spec)
@@ -293,10 +200,10 @@ fn connect_and_wait_reports_connected_event() {
 #[test]
 fn reconnects_after_server_returns() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
-    let address = server.address.clone();
+    let gateway_base_url = server.gateway_base_url.clone();
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("remote-reconnect", "Remote Reconnect", address.as_str());
+    let spec = connect_spec("remote-reconnect", "Remote Reconnect", gateway_base_url.as_str());
 
     let connection_id = sender
         .connect_with_retry(spec)
@@ -324,7 +231,7 @@ fn reconnects_after_server_returns() {
         )
     });
 
-    let mut restarted = TestWsServer::spawn(address.as_str());
+    let mut restarted = TestWsServer::spawn(gateway_base_url.as_str());
 
     let _connected_again = wait_for_event(&client, Duration::from_secs(3), |event| {
         matches!(
@@ -345,7 +252,7 @@ fn dropping_client_clone_does_not_shutdown_worker() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("remote-clone", "Remote Clone", server.address.as_str());
+    let spec = connect_spec("remote-clone", "Remote Clone", server.gateway_base_url.as_str());
 
     {
         let transient_clone = client.clone();
@@ -402,7 +309,7 @@ fn switch_during_reconnect_stops_old_connection_stream() {
         .connect_and_wait(connect_spec(
             "remote-new",
             "Remote New",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected second connect_and_wait to succeed");
 
@@ -440,7 +347,7 @@ fn thread_start_request_receives_response_and_started_notification() {
         .connect_and_wait(connect_spec(
             "remote-thread-start",
             "Remote Thread Start",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -480,7 +387,7 @@ fn turn_start_request_receives_response_and_started_notification() {
         .connect_and_wait(connect_spec(
             "remote-turn-start",
             "Remote Turn Start",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -555,7 +462,7 @@ fn turn_start_request_sends_reasoning_effort() {
         .connect_and_wait(connect_spec(
             "remote-turn-reasoning",
             "Remote Turn Reasoning",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -607,7 +514,7 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
         .connect_and_wait(connect_spec(
             "remote-turn-cli-effort",
             "Remote Turn CLI Effort",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -670,7 +577,7 @@ fn turn_start_request_sends_permission_profile_selection() {
         .connect_and_wait(connect_spec(
             "remote-turn-permissions",
             "Remote Turn Permissions",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -717,7 +624,7 @@ fn thread_unsubscribe_request_receives_response_and_closed_notification() {
         .connect_and_wait(connect_spec(
             "remote-thread-unsubscribe",
             "Remote Thread Unsubscribe",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -756,7 +663,7 @@ fn thread_start_retry_succeeds_without_reconnect_after_temporary_error() {
         .connect_and_wait(connect_spec(
             "remote-thread-retry",
             "Remote Thread Retry",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected connect_and_wait to succeed");
 
@@ -819,14 +726,14 @@ fn concurrent_clients_receive_broadcast_thread_started_events() {
         .connect_and_wait(connect_spec(
             "remote-a",
             "Remote A",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected client A to connect");
     let connection_b = sender_b
         .connect_and_wait(connect_spec(
             "remote-b",
             "Remote B",
-            server.address.as_str(),
+            server.gateway_base_url.as_str(),
         ))
         .expect("expected client B to connect");
 
@@ -870,12 +777,16 @@ fn concurrent_clients_receive_broadcast_thread_started_events() {
     server.stop();
 }
 
-fn connect_spec(endpoint_id: &str, endpoint_name: &str, address: &str) -> GatewayWsConnectSpec {
+fn connect_spec(endpoint_id: &str, endpoint_name: &str, gateway_base_url: &str) -> GatewayWsConnectSpec {
     GatewayWsConnectSpec {
         endpoint_id: endpoint_id.to_owned(),
         endpoint_name: endpoint_name.to_owned(),
         endpoint_kind: GatewayEndpointKind::Remote,
-        address: address.to_owned(),
+        gateway_base_url:
+            pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                gateway_base_url,
+            )
+            .unwrap(),
         auth_token: None,
         session: None,
         timings: GatewayWsTimings {
@@ -935,13 +846,13 @@ fn default_turn_permission_profile_json() -> serde_json::Value {
 
 fn reserve_unused_local_address() -> String {
     let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to reserve local test address");
-    let address = listener
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to reserve local test gateway_base_url");
+    let gateway_base_url = listener
         .local_addr()
-        .expect("failed to resolve reserved local test address")
+        .expect("failed to resolve reserved local test gateway_base_url")
         .to_string();
     drop(listener);
-    address
+    gateway_base_url
 }
 
 fn wait_for_event(
@@ -1021,37 +932,8 @@ fn wait_for_recorded_request(
     }
 }
 
-fn artifact_download_fixture() -> &'static [u8] {
-    b"hello artifact download"
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn artifact_download_frame(offset: u64, chunk: &[u8], final_chunk: bool) -> Vec<u8> {
-    let header = json!({
-        "workspace_id": TEST_WORKSPACE_ID,
-        "download_id": "artifact_download_1",
-        "artifact_id": "artifact_download_result",
-        "version_id": "artifact_download_version_1",
-        "offset": offset,
-        "len": chunk.len() as u64,
-        "total_size_bytes": artifact_download_fixture().len() as u64,
-        "chunk_sha256": sha256_hex(chunk),
-        "final_chunk": final_chunk
-    });
-    let header_bytes = serde_json::to_vec(&header).expect("encode download header");
-    let mut frame = Vec::new();
-    frame.extend_from_slice(b"ARTD");
-    frame.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
-    frame.extend_from_slice(header_bytes.as_slice());
-    frame.extend_from_slice(chunk);
-    frame
-}
-
 struct TestWsServer {
-    address: String,
+    gateway_base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -1087,7 +969,7 @@ impl TestWsServer {
                         .expect("failed to get local ws server addr");
                     address_tx
                         .send(local_addr)
-                        .expect("failed to send ws server address");
+                        .expect("failed to send ws server gateway_base_url");
 
                     let mut shutdown_rx = shutdown_rx;
                     loop {
@@ -1285,102 +1167,6 @@ impl TestWsServer {
                                                             "id": request_id,
                                                             "result": {
                                                                 "upload_id": upload_id,
-                                                                "status": "aborted"
-                                                            }
-                                                        });
-                                                        let _ = writer
-                                                            .send(Message::Text(response.to_string().into()))
-                                                            .await;
-                                                    }
-                                                    "artifact/download/start" => {
-                                                        let response = json!({
-                                                            "jsonrpc": "2.0",
-                                                            "id": request_id,
-                                                            "result": {
-                                                                "download_id": "artifact_download_1",
-                                                                "artifact": {
-                                                                    "artifact_id": "artifact_download_result",
-                                                                    "version_id": "artifact_download_version_1",
-                                                                    "display_name": "download.txt",
-                                                                    "kind": "text",
-                                                                    "mime_type": "text/plain",
-                                                                    "size_bytes": artifact_download_fixture().len(),
-                                                                    "sha256": sha256_hex(artifact_download_fixture()),
-                                                                    "status": "ready",
-                                                                    "preview": null
-                                                                },
-                                                                "file_name": "download.txt",
-                                                                "size_bytes": artifact_download_fixture().len(),
-                                                                "sha256": sha256_hex(artifact_download_fixture()),
-                                                                "recommended_chunk_size_bytes": 5,
-                                                                "max_chunk_size_bytes": 8,
-                                                                "expires_at_unix": 1_700_000_000i64
-                                                            }
-                                                        });
-                                                        let _ = writer
-                                                            .send(Message::Text(response.to_string().into()))
-                                                            .await;
-                                                    }
-                                                    "artifact/download/chunk" => {
-                                                        let params = request
-                                                            .get("params")
-                                                            .cloned()
-                                                            .unwrap_or_else(|| json!({}));
-                                                        let offset = params
-                                                            .get("offset")
-                                                            .and_then(serde_json::Value::as_u64)
-                                                            .unwrap_or(0);
-                                                        let len = params
-                                                            .get("len")
-                                                            .and_then(serde_json::Value::as_u64)
-                                                            .unwrap_or(0);
-                                                        let response = json!({
-                                                            "jsonrpc": "2.0",
-                                                            "id": request_id,
-                                                            "result": {
-                                                                "download_id": "artifact_download_1",
-                                                                "offset": offset,
-                                                                "len": len,
-                                                                "queued": true
-                                                            }
-                                                        });
-                                                        let _ = writer
-                                                            .send(Message::Text(response.to_string().into()))
-                                                            .await;
-
-                                                        let fixture = artifact_download_fixture();
-                                                        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-                                                        let end = start.saturating_add(usize::try_from(len).unwrap_or(0));
-                                                        if end <= fixture.len() {
-                                                            let frame = artifact_download_frame(
-                                                                offset,
-                                                                &fixture[start..end],
-                                                                end == fixture.len(),
-                                                            );
-                                                            let _ = writer
-                                                                .send(Message::Binary(frame.into()))
-                                                                .await;
-                                                        }
-                                                    }
-                                                    "artifact/download/finish" => {
-                                                        let response = json!({
-                                                            "jsonrpc": "2.0",
-                                                            "id": request_id,
-                                                            "result": {
-                                                                "download_id": "artifact_download_1",
-                                                                "status": "finished"
-                                                            }
-                                                        });
-                                                        let _ = writer
-                                                            .send(Message::Text(response.to_string().into()))
-                                                            .await;
-                                                    }
-                                                    "artifact/download/abort" => {
-                                                        let response = json!({
-                                                            "jsonrpc": "2.0",
-                                                            "id": request_id,
-                                                            "result": {
-                                                                "download_id": "artifact_download_1",
                                                                 "status": "aborted"
                                                             }
                                                         });
@@ -1653,13 +1439,13 @@ impl TestWsServer {
                 });
         });
 
-        let address = address_rx
+        let gateway_base_url = address_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("timed out waiting for test ws server address")
+            .expect("timed out waiting for test ws server gateway_base_url")
             .to_string();
 
         Self {
-            address,
+            gateway_base_url,
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
         }
@@ -1676,7 +1462,7 @@ impl TestWsServer {
 }
 
 struct BroadcastThreadStartedWsServer {
-    address: String,
+    gateway_base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -1697,7 +1483,7 @@ impl BroadcastThreadStartedWsServer {
                         .expect("failed to get local broadcast ws server addr");
                     address_tx
                         .send(local_addr)
-                        .expect("failed to send broadcast ws server address");
+                        .expect("failed to send broadcast ws server gateway_base_url");
 
                     let peers: Arc<Mutex<Vec<tokio_mpsc::UnboundedSender<Message>>>> =
                         Arc::new(Mutex::new(Vec::new()));
@@ -1838,13 +1624,13 @@ impl BroadcastThreadStartedWsServer {
                 });
         });
 
-        let address = address_rx
+        let gateway_base_url = address_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("timed out waiting for broadcast ws server address")
+            .expect("timed out waiting for broadcast ws server gateway_base_url")
             .to_string();
 
         Self {
-            address,
+            gateway_base_url,
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
         }
@@ -1861,7 +1647,7 @@ impl BroadcastThreadStartedWsServer {
 }
 
 struct TemporaryThreadStartFailureWsServer {
-    address: String,
+    gateway_base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -1882,7 +1668,7 @@ impl TemporaryThreadStartFailureWsServer {
                         .expect("failed to get local temporary failure ws server addr");
                     address_tx
                         .send(local_addr)
-                        .expect("failed to send temporary failure ws server address");
+                        .expect("failed to send temporary failure ws server gateway_base_url");
 
                     let start_attempts = Arc::new(AtomicUsize::new(0));
                     let mut shutdown_rx = shutdown_rx;
@@ -2035,13 +1821,13 @@ impl TemporaryThreadStartFailureWsServer {
                 });
         });
 
-        let address = address_rx
+        let gateway_base_url = address_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("timed out waiting for temporary failure ws server address")
+            .expect("timed out waiting for temporary failure ws server gateway_base_url")
             .to_string();
 
         Self {
-            address,
+            gateway_base_url,
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
         }

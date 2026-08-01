@@ -6,7 +6,9 @@ use crate::{
     cli_runtime::approvals::{
         PendingRequestsReduction, reduce_pending_request_thread_closed_cleanup,
     },
-    gateway::{runtime::ActiveGatewayState, types::GatewayEndpointKind},
+    gateway::{
+        endpoint::GatewayBaseUrl, runtime::ActiveGatewayState, types::GatewayEndpointKind,
+    },
     notifications::effects::ClientEffect,
     state::client_state::{ClientState, ThreadAgentsDocSummaryKey},
     threads::{
@@ -205,20 +207,20 @@ pub enum GatewayStatusMessage {
     },
     ConnectedEndpoint {
         endpoint_name: String,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
     },
     Connected,
     NotConfigured,
     Unavailable,
     LocalStopped {
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
     },
     RemoteUnavailable {
         endpoint_name: String,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
     },
     LocalConflictAt {
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
     },
     LocalConflict,
     FailedCheck {
@@ -241,19 +243,19 @@ pub enum GatewayStatusTextUpdate {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GatewayStatusEndpoint {
     pub name: String,
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub kind: GatewayEndpointKind,
 }
 
 impl GatewayStatusEndpoint {
     pub fn new(
         name: impl Into<String>,
-        address: impl Into<String>,
+        gateway_base_url: GatewayBaseUrl,
         kind: GatewayEndpointKind,
     ) -> Self {
         Self {
             name: name.into(),
-            address: address.into(),
+            gateway_base_url,
             kind,
         }
     }
@@ -363,7 +365,7 @@ fn connected_gateway_status(
     match active_endpoint {
         Some(active) => GatewayStatusMessage::ConnectedEndpoint {
             endpoint_name: active.name,
-            address: active.address,
+            gateway_base_url: active.gateway_base_url,
         },
         None => GatewayStatusMessage::Connected,
     }
@@ -373,7 +375,7 @@ fn unreachable_gateway_status(
     active_endpoint: Option<GatewayStatusEndpoint>,
 ) -> GatewayStatusMessage {
     match active_endpoint {
-        Some(active) => unavailable_gateway_status(active.name, active.kind, active.address),
+        Some(active) => unavailable_gateway_status(active.name, active.kind, active.gateway_base_url),
         None => GatewayStatusMessage::Unavailable,
     }
 }
@@ -383,7 +385,7 @@ fn local_conflict_gateway_status(
 ) -> GatewayStatusMessage {
     match active_endpoint {
         Some(active) => GatewayStatusMessage::LocalConflictAt {
-            address: active.address,
+            gateway_base_url: active.gateway_base_url,
         },
         None => GatewayStatusMessage::LocalConflict,
     }
@@ -397,7 +399,7 @@ pub enum GatewayConnectionEvent {
     },
     Connected {
         endpoint_name: String,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         queue_skills_refresh: bool,
     },
     Reconnecting {
@@ -410,14 +412,14 @@ pub enum GatewayConnectionEvent {
     Disconnected {
         endpoint_name: String,
         endpoint_kind: GatewayEndpointKind,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         reason: String,
         should_resume_in_flight_turn: bool,
     },
     ConnectFailed {
         endpoint_name: String,
         endpoint_kind: GatewayEndpointKind,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         error: String,
         should_resume_in_flight_turn: bool,
     },
@@ -527,7 +529,7 @@ pub fn reduce_gateway_connection_event(
         },
         GatewayConnectionEvent::Connected {
             endpoint_name,
-            address,
+            gateway_base_url,
             queue_skills_refresh,
         } => {
             let mut effects = vec![
@@ -543,7 +545,7 @@ pub fn reduce_gateway_connection_event(
             GatewayConnectionReduction {
                 status: GatewayStatusMessage::ConnectedEndpoint {
                     endpoint_name,
-                    address,
+                    gateway_base_url,
                 },
                 status_level: GatewayStatusLevel::Connected,
                 connection_state: GatewayConnectionState::Connected,
@@ -587,11 +589,11 @@ pub fn reduce_gateway_connection_event(
         GatewayConnectionEvent::Disconnected {
             endpoint_name,
             endpoint_kind,
-            address,
+            gateway_base_url,
             reason,
             should_resume_in_flight_turn,
         } => GatewayConnectionReduction {
-            status: unavailable_gateway_status(endpoint_name, endpoint_kind, address),
+            status: unavailable_gateway_status(endpoint_name, endpoint_kind, gateway_base_url),
             status_level: GatewayStatusLevel::Failed,
             connection_state: GatewayConnectionState::Disconnected,
             gateway_error: Some(reason),
@@ -608,11 +610,11 @@ pub fn reduce_gateway_connection_event(
         GatewayConnectionEvent::ConnectFailed {
             endpoint_name,
             endpoint_kind,
-            address,
+            gateway_base_url,
             error,
             should_resume_in_flight_turn,
         } => GatewayConnectionReduction {
-            status: unavailable_gateway_status(endpoint_name, endpoint_kind, address),
+            status: unavailable_gateway_status(endpoint_name, endpoint_kind, gateway_base_url),
             status_level: GatewayStatusLevel::Failed,
             connection_state: GatewayConnectionState::Disconnected,
             gateway_error: Some(error),
@@ -716,13 +718,13 @@ fn gateway_disconnected_settings_update() -> GatewaySettingsConnectionUpdate {
 fn unavailable_gateway_status(
     endpoint_name: String,
     endpoint_kind: GatewayEndpointKind,
-    address: String,
+    gateway_base_url: GatewayBaseUrl,
 ) -> GatewayStatusMessage {
     match endpoint_kind {
-        GatewayEndpointKind::Local => GatewayStatusMessage::LocalStopped { address },
+        GatewayEndpointKind::Local => GatewayStatusMessage::LocalStopped { gateway_base_url },
         GatewayEndpointKind::Remote => GatewayStatusMessage::RemoteUnavailable {
             endpoint_name,
-            address,
+            gateway_base_url,
         },
     }
 }
@@ -1159,7 +1161,7 @@ mod tests {
     fn connection_reducer_projects_connected_effects() {
         let reduction = reduce_gateway_connection_event(GatewayConnectionEvent::Connected {
             endpoint_name: "Local".to_owned(),
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             queue_skills_refresh: true,
         });
 
@@ -1167,7 +1169,7 @@ mod tests {
             reduction.status,
             GatewayStatusMessage::ConnectedEndpoint {
                 endpoint_name: "Local".to_owned(),
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             }
         );
         assert_eq!(reduction.status_level, GatewayStatusLevel::Connected);
@@ -1316,7 +1318,7 @@ mod tests {
             runtime_state: Some(Ok(ActiveGatewayState::Connected)),
             active_endpoint: Some(GatewayStatusEndpoint::new(
                 "Remote",
-                "https://gateway.example",
+                GatewayBaseUrl::parse_presentation("https://gateway.example").unwrap(),
                 GatewayEndpointKind::Remote,
             )),
             has_ready_ws_connection: true,
@@ -1328,7 +1330,7 @@ mod tests {
             GatewayStatusProjection {
                 status: GatewayStatusTextUpdate::Set(GatewayStatusMessage::ConnectedEndpoint {
                     endpoint_name: "Remote".to_owned(),
-                    address: "https://gateway.example".to_owned(),
+                    gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("https://gateway.example").unwrap(),
                 }),
                 status_level: GatewayStatusLevel::Connected,
                 connection_state: GatewayConnectionState::Connected,
@@ -1342,7 +1344,7 @@ mod tests {
             runtime_state: Some(Ok(ActiveGatewayState::Unreachable)),
             active_endpoint: Some(GatewayStatusEndpoint::new(
                 "Local",
-                "127.0.0.1:17878",
+                GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
                 GatewayEndpointKind::Local,
             )),
             has_ready_ws_connection: false,
@@ -1352,7 +1354,7 @@ mod tests {
         assert_eq!(
             unreachable.status,
             GatewayStatusTextUpdate::Set(GatewayStatusMessage::LocalStopped {
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             })
         );
         assert_eq!(unreachable.status_level, GatewayStatusLevel::Failed);
@@ -1449,7 +1451,7 @@ mod tests {
         let reduction = reduce_gateway_connection_event(GatewayConnectionEvent::Disconnected {
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            address: "example.test".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("example.test").unwrap(),
             reason: "closed".to_owned(),
             should_resume_in_flight_turn: false,
         });
@@ -1458,7 +1460,7 @@ mod tests {
             reduction.status,
             GatewayStatusMessage::RemoteUnavailable {
                 endpoint_name: "Remote".to_owned(),
-                address: "example.test".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("example.test").unwrap(),
             }
         );
         assert_eq!(reduction.status_level, GatewayStatusLevel::Failed);

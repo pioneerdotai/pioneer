@@ -111,32 +111,32 @@ pub(in crate::app::flow) fn gateway_status_message_text(status: &GatewayStatusMe
         GatewayStatusMessage::Connected => t!("gateway.status.connected").to_string(),
         GatewayStatusMessage::ConnectedEndpoint {
             endpoint_name,
-            address,
+            gateway_base_url,
         } => format!(
             "{}: {} ({})",
             t!("gateway.status.connected"),
             endpoint_name.as_str(),
-            address.as_str()
+            gateway_base_url.as_str()
         ),
-        GatewayStatusMessage::LocalStopped { address } => t!(
+        GatewayStatusMessage::LocalStopped { gateway_base_url } => t!(
             "gateway.status.local_stopped",
-            gateway_address = address.as_str()
+            gateway_address = gateway_base_url.as_str()
         )
         .to_string(),
         GatewayStatusMessage::RemoteUnavailable {
             endpoint_name,
-            address,
+            gateway_base_url,
         } => t!(
             "gateway.status.remote_unavailable",
             gateway_name = endpoint_name.as_str(),
-            gateway_address = address.as_str()
+            gateway_address = gateway_base_url.as_str()
         )
         .to_string(),
         GatewayStatusMessage::NotConfigured => t!("gateway.status.not_configured").to_string(),
         GatewayStatusMessage::Unavailable => t!("gateway.status.unavailable").to_string(),
-        GatewayStatusMessage::LocalConflictAt { address } => t!(
+        GatewayStatusMessage::LocalConflictAt { gateway_base_url } => t!(
             "gateway.status.local_conflict_at",
-            gateway_address = address.as_str()
+            gateway_address = gateway_base_url.as_str()
         )
         .to_string(),
         GatewayStatusMessage::LocalConflict => t!("gateway.status.local_conflict").to_string(),

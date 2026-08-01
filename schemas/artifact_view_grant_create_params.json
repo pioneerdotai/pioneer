@@ -1,26 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ArtifactReadParams",
+  "title": "ArtifactViewGrantCreateParams",
   "type": "object",
   "properties": {
     "artifact_id": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
-    "max_bytes": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0
-    },
-    "offset": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0
+    "disposition": {
+      "$ref": "#/$defs/ArtifactViewGrantDisposition"
     },
     "projection_kind": {
       "anyOf": [
@@ -33,18 +22,21 @@
       ]
     },
     "version_id": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "workspace_id": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     }
   },
   "required": [
     "workspace_id",
-    "artifact_id"
+    "artifact_id",
+    "version_id",
+    "disposition"
   ],
   "$defs": {
     "ArtifactProjectionKind": {
@@ -54,6 +46,13 @@
         "thumbnail",
         "json_summary",
         "pdf_text"
+      ]
+    },
+    "ArtifactViewGrantDisposition": {
+      "type": "string",
+      "enum": [
+        "inline",
+        "attachment"
       ]
     }
   }

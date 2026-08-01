@@ -84,6 +84,9 @@ pub enum ArtifactError {
     ReadMissingBlob {
         storage_key: String,
     },
+    ContentInvariant {
+        reason: &'static str,
+    },
     MaterializedPathEscape {
         path: PathBuf,
         root: PathBuf,
@@ -213,6 +216,9 @@ impl fmt::Display for ArtifactError {
             ),
             ArtifactError::ReadMissingBlob { storage_key } => {
                 write!(f, "artifact blob not found: {storage_key}")
+            }
+            ArtifactError::ContentInvariant { reason } => {
+                write!(f, "artifact content invariant failed: {reason}")
             }
             ArtifactError::MaterializedPathEscape { path, root } => write!(
                 f,

@@ -1,5 +1,4 @@
 use crate::ClientResult;
-pub use crate::artifacts::download::ArtifactDownloadCache as ArtifactCache;
 use crate::error::ClientError;
 use sha2::{Digest, Sha256};
 use std::{

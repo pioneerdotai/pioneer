@@ -149,7 +149,7 @@ impl PioneerDesktop {
                 .map(|active| {
                     GatewayStatusEndpoint::new(
                         active.name.clone(),
-                        active.address.clone(),
+                        active.gateway_base_url.clone(),
                         active.kind,
                     )
                 })

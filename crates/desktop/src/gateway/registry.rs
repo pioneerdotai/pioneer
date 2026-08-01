@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
-use pioneer_client::gateway::connectivity::resolve_gateway_socket_addrs;
+use pioneer_client::gateway::endpoint::GatewayBaseUrl;
+use pioneer_client::gateway::migration::{GatewayRegistryLoad, load_registry_json};
 use pioneer_client::gateway::registry::{
-    GATEWAY_REGISTRY_V2, GatewayLocalRegistryConfig, GatewayRegistryConfig,
+    CURRENT_GATEWAY_REGISTRY_VERSION, GatewayLocalRegistryConfig, GatewayRegistryConfig,
     default_registry as default_client_registry, normalize_registry as normalize_client_registry,
     setup_required as client_setup_required,
 };
-use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
+use pioneer_client::gateway::types::GatewayRegistry;
 use pioneer_config::AppConfig;
 use pioneer_keystore::{ensure_private_file, ensure_private_runtime_dir};
 use pioneer_protocol::generate_id;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -18,8 +19,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const LEGACY_GATEWAY_REGISTRY_V1: u32 = 1;
-const REGISTRY_UPGRADE_STATE_VERSION: u32 = 1;
 const INSTALLATION_ID_LEN: usize = 21;
 static REGISTRY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -28,112 +27,68 @@ struct RegistryVersion {
     version: u32,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GatewayRegistryV1 {
-    version: u32,
-    active_gateway_id: Option<String>,
-    #[serde(default)]
-    local: Option<GatewayEndpointV1>,
-    #[serde(default)]
-    remotes: Vec<GatewayEndpointV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GatewayEndpointV1 {
-    id: String,
-    name: String,
-    address: String,
-    kind: GatewayEndpointKind,
-    #[serde(default, rename = "auth_token_ref")]
-    _auth_token_ref: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    service_name: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GatewayRegistryUpgradeState {
-    version: u32,
-    installation_id: String,
-}
-
+#[derive(Debug)]
 pub(crate) struct LoadedGatewayRegistry {
     pub(crate) registry: GatewayRegistry,
-    pub(crate) upgrade_pending: bool,
 }
+
+#[derive(Debug)]
+pub(crate) struct GatewayRegistryReconfigurationRequired {
+    pub(crate) endpoint_ids: Vec<String>,
+}
+
+impl std::fmt::Display for GatewayRegistryReconfigurationRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Gateway registry endpoints require reconfiguration: {}",
+            self.endpoint_ids.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for GatewayRegistryReconfigurationRequired {}
 
 pub(crate) fn load_registry_for_runtime(
     path: &Path,
     config: &AppConfig,
 ) -> Result<LoadedGatewayRegistry> {
-    let mut upgrade_pending = false;
     let mut registry = if path.exists() {
         let path_display = path.display().to_string();
         let content = fs::read_to_string(path).with_context(|| {
             t!("errors.registry.read_failed", path = path_display.as_str()).to_string()
         })?;
-        let current_registry_version = current_registry_version(config);
         let version = toml::from_str::<RegistryVersion>(&content)
             .with_context(|| {
                 t!("errors.registry.parse_failed", path = path_display.as_str()).to_string()
             })?
             .version;
-        if version < current_registry_version {
-            if version != LEGACY_GATEWAY_REGISTRY_V1 {
-                anyhow::bail!(
-                    "{}",
-                    t!(
-                        "errors.registry.unsupported_version",
-                        version = version,
-                        path = path_display.as_str(),
-                        current_registry_version = current_registry_version
-                    )
-                );
-            }
-            upgrade_pending = true;
-            migrate_registry_v1(content.as_str(), path, config)?
-        } else if version > current_registry_version {
+        if version == CURRENT_GATEWAY_REGISTRY_VERSION {
+            toml::from_str::<GatewayRegistry>(&content).with_context(|| {
+                t!("errors.registry.parse_failed", path = path_display.as_str()).to_string()
+            })?
+        } else if version == 2 {
+            migrate_registry_v2(content.as_str(), path)?
+        } else {
             anyhow::bail!(
                 "{}",
                 t!(
                     "errors.registry.unsupported_version",
                     version = version,
                     path = path_display.as_str(),
-                    current_registry_version = current_registry_version
-                )
-            );
-        } else {
-            let registry = toml::from_str::<GatewayRegistry>(&content).with_context(|| {
-                t!("errors.registry.parse_failed", path = path_display.as_str()).to_string()
-            })?;
-            if let Some(state) = load_registry_upgrade_state(path)? {
-                validate_registry_upgrade_state(&state, &registry, path)?;
-                upgrade_pending = true;
-            }
-            registry
+                        current_registry_version = CURRENT_GATEWAY_REGISTRY_VERSION
+                    )
+                );
         }
     } else {
-        let mut registry = default_registry(config)?;
-        if let Some(state) = load_registry_upgrade_state(path)? {
-            registry.installation_id = Some(state.installation_id);
-            upgrade_pending = true;
-        }
-        registry
+        default_registry(config)?
     };
 
     normalize_registry(&mut registry, config)?;
     ensure_installation_id(&mut registry);
-    if !upgrade_pending {
-        save_registry(path, &registry)?;
-    }
+    save_registry(path, &registry)?;
 
-    Ok(LoadedGatewayRegistry {
-        registry,
-        upgrade_pending,
-    })
+    Ok(LoadedGatewayRegistry { registry })
 }
 
 #[cfg(test)]
@@ -148,31 +103,6 @@ pub(crate) fn save_registry(path: &Path, registry: &GatewayRegistry) -> Result<(
     write_private_registry_file(path, content.as_str()).with_context(|| {
         t!("errors.registry.write_failed", path = path_display.as_str()).to_string()
     })
-}
-
-pub(crate) fn complete_registry_upgrade(path: &Path) -> Result<()> {
-    let state_path = registry_upgrade_state_path(path);
-    match fs::remove_file(&state_path) {
-        Ok(()) => {
-            let parent = state_path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            sync_registry_parent(parent).with_context(|| {
-                format!(
-                    "failed to sync completed Gateway registry upgrade state removal in {}",
-                    parent.display()
-                )
-            })
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to remove completed Gateway registry upgrade state {}",
-                state_path.display()
-            )
-        }),
-    }
 }
 
 pub(crate) fn default_registry(config: &AppConfig) -> Result<GatewayRegistry> {
@@ -203,153 +133,36 @@ fn ensure_installation_id(registry: &mut GatewayRegistry) {
     }
 }
 
-fn migrate_registry_v1(content: &str, path: &Path, config: &AppConfig) -> Result<GatewayRegistry> {
-    let legacy = toml::from_str::<GatewayRegistryV1>(content).with_context(|| {
-        format!(
-            "failed to parse Gateway registry v1 `{}` for upgrade",
-            path.display()
-        )
-    })?;
-    if legacy.version != LEGACY_GATEWAY_REGISTRY_V1 {
-        anyhow::bail!(
-            "Gateway registry v1 decoder received version `{}` from `{}`",
-            legacy.version,
-            path.display()
-        );
-    }
-
-    let local_gateway_id = local_gateway_id(config);
-    let local_workspace_id = legacy
-        .local
-        .as_ref()
-        .filter(|endpoint| {
-            endpoint.kind == GatewayEndpointKind::Local && endpoint.id.trim() == local_gateway_id
-        })
-        .and_then(|endpoint| endpoint.workspace_id.clone());
-    let mut registry = default_registry(config)?;
-    registry.installation_id = Some(load_or_create_registry_upgrade_installation_id(path)?);
-    if let Some(local) = registry.local.as_mut() {
-        local.workspace_id = local_workspace_id;
-    }
-    registry.remotes = legacy
-        .remotes
-        .into_iter()
-        .filter(|endpoint| endpoint.kind == GatewayEndpointKind::Remote)
-        .map(|endpoint| GatewayEndpoint {
-            id: endpoint.id,
-            name: endpoint.name,
-            address: endpoint.address,
-            kind: GatewayEndpointKind::Remote,
-            session_ref: None,
-            server_gateway_id: None,
-            workspace_id: endpoint.workspace_id,
-            service_name: endpoint.service_name,
-        })
-        .collect();
-    registry.active_gateway_id = legacy.active_gateway_id;
-    Ok(registry)
-}
-
-fn load_or_create_registry_upgrade_installation_id(path: &Path) -> Result<String> {
-    if let Some(state) = load_registry_upgrade_state(path)? {
-        return Ok(state.installation_id);
-    }
-
-    let state_path = registry_upgrade_state_path(path);
-    let state = GatewayRegistryUpgradeState {
-        version: REGISTRY_UPGRADE_STATE_VERSION,
-        installation_id: generate_id(INSTALLATION_ID_LEN),
-    };
-    let content = toml::to_string_pretty(&state)
-        .context("failed to encode Gateway registry upgrade state")?;
-    write_private_registry_file(&state_path, content.as_str()).with_context(|| {
-        format!(
-            "failed to persist Gateway registry upgrade state {}",
-            state_path.display()
-        )
-    })?;
-    Ok(state.installation_id)
-}
-
-fn load_registry_upgrade_state(path: &Path) -> Result<Option<GatewayRegistryUpgradeState>> {
-    let state_path = registry_upgrade_state_path(path);
-    let content = match fs::read_to_string(&state_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to read Gateway registry upgrade state {}",
-                    state_path.display()
-                )
-            });
+fn migrate_registry_v2(content: &str, path: &Path) -> Result<GatewayRegistry> {
+    let legacy: toml::Value = toml::from_str(content)
+        .with_context(|| format!("failed to parse Gateway registry v2 `{}`", path.display()))?;
+    let json = serde_json::to_string(&legacy)
+        .context("failed to project Gateway registry v2 into the migration boundary")?;
+    match load_registry_json(json.as_str()).map_err(anyhow::Error::new)? {
+        GatewayRegistryLoad::Migrated(registry) => Ok(registry),
+        GatewayRegistryLoad::ReconfigurationRequired { endpoint_ids } => {
+            Err(GatewayRegistryReconfigurationRequired { endpoint_ids }.into())
         }
-    };
-    let state =
-        toml::from_str::<GatewayRegistryUpgradeState>(content.as_str()).with_context(|| {
-            format!(
-                "failed to parse Gateway registry upgrade state {}",
-                state_path.display()
-            )
-        })?;
-    if state.version != REGISTRY_UPGRADE_STATE_VERSION {
-        anyhow::bail!(
-            "unsupported Gateway registry upgrade state version `{}` in `{}`",
-            state.version,
-            state_path.display()
-        );
+        GatewayRegistryLoad::Current(_) => {
+            anyhow::bail!("Gateway registry v2 migration returned a v3 document")
+        }
     }
-    validate_upgrade_installation_id(state.installation_id.as_str(), &state_path)?;
-    Ok(Some(state))
-}
-
-fn validate_registry_upgrade_state(
-    state: &GatewayRegistryUpgradeState,
-    registry: &GatewayRegistry,
-    path: &Path,
-) -> Result<()> {
-    if registry.installation_id.as_deref() != Some(state.installation_id.as_str()) {
-        anyhow::bail!(
-            "Gateway registry upgrade state does not match the installation id in `{}`",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_upgrade_installation_id(value: &str, path: &Path) -> Result<()> {
-    if value.len() != INSTALLATION_ID_LEN || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        anyhow::bail!(
-            "invalid Gateway registry upgrade installation id in `{}`",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn registry_upgrade_state_path(path: &Path) -> std::path::PathBuf {
-    path.with_extension("upgrade-v2")
 }
 
 fn registry_config(config: &AppConfig) -> Result<GatewayRegistryConfig> {
     let local_gateway_id = local_gateway_id(config);
-    let local_address = resolve_gateway_socket_addrs(config.gateway.listen_addr.as_str())
-        .context("failed to derive the local Gateway client address")?
-        .into_iter()
-        .next()
-        .context("local Gateway listen address did not resolve")?
-        .to_string();
+    let local_gateway_base_url =
+        GatewayBaseUrl::from_local_listen_addr(config.gateway.listen_addr.as_str())
+            .context("failed to derive the local Gateway client base URL")?;
 
     Ok(GatewayRegistryConfig {
-        version: current_registry_version(config),
         local: Some(GatewayLocalRegistryConfig {
             gateway_id: local_gateway_id.to_owned(),
             name: t!("gateway.endpoint.local_name").to_string(),
-            // A bind address such as 0.0.0.0 is not a safe authenticated
+            // A bind gateway_base_url such as 0.0.0.0 is not a safe authenticated
             // client destination. The shared resolver maps unspecified binds
             // to loopback while preserving the configured port.
-            address: local_address,
+            gateway_base_url: local_gateway_base_url,
             service_name: Some(config.gateway.service_name.trim().to_owned()),
         }),
     })
@@ -357,11 +170,6 @@ fn registry_config(config: &AppConfig) -> Result<GatewayRegistryConfig> {
 
 fn local_gateway_id(config: &AppConfig) -> &str {
     config.desktop.gateway.local_gateway_id.trim()
-}
-
-fn current_registry_version(config: &AppConfig) -> u32 {
-    debug_assert_eq!(config.desktop.gateway.registry_version, GATEWAY_REGISTRY_V2);
-    config.desktop.gateway.registry_version
 }
 
 fn write_private_registry_file(path: &Path, content: &str) -> Result<()> {

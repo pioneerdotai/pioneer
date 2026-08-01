@@ -114,16 +114,16 @@
             "ConnectedEndpoint": {
               "type": "object",
               "properties": {
-                "address": {
+                "endpoint_name": {
                   "type": "string"
                 },
-                "endpoint_name": {
+                "gateway_base_url": {
                   "type": "string"
                 }
               },
               "required": [
                 "endpoint_name",
-                "address"
+                "gateway_base_url"
               ]
             }
           },
@@ -138,12 +138,12 @@
             "LocalStopped": {
               "type": "object",
               "properties": {
-                "address": {
+                "gateway_base_url": {
                   "type": "string"
                 }
               },
               "required": [
-                "address"
+                "gateway_base_url"
               ]
             }
           },
@@ -158,16 +158,16 @@
             "RemoteUnavailable": {
               "type": "object",
               "properties": {
-                "address": {
+                "endpoint_name": {
                   "type": "string"
                 },
-                "endpoint_name": {
+                "gateway_base_url": {
                   "type": "string"
                 }
               },
               "required": [
                 "endpoint_name",
-                "address"
+                "gateway_base_url"
               ]
             }
           },
@@ -182,12 +182,12 @@
             "LocalConflictAt": {
               "type": "object",
               "properties": {
-                "address": {
+                "gateway_base_url": {
                   "type": "string"
                 }
               },
               "required": [
-                "address"
+                "gateway_base_url"
               ]
             }
           },

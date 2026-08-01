@@ -17,6 +17,7 @@ required-features = ["schema"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 flate2.workspace = true
 hex.workspace = true
@@ -24,6 +25,7 @@ mime_guess.workspace = true
 pioneer-protocol.workspace = true
 pioneer-skills.workspace = true
 qrcode.workspace = true
+reqwest.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +33,7 @@ sha2.workspace = true
 shell-words.workspace = true
 tar.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
 futures-util.workspace = true

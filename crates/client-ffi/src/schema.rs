@@ -23,6 +23,46 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "client_artifact_target_request.json",
+            crate::artifacts::ClientArtifactTargetRequest
+        ),
+        schema_doc!(
+            "client_artifact_view_open_result.json",
+            crate::artifacts::ClientArtifactViewOpenResult
+        ),
+        schema_doc!(
+            "client_artifact_download_request.json",
+            crate::artifacts::ClientArtifactDownloadRequest
+        ),
+        schema_doc!(
+            "client_artifact_download_operation_request.json",
+            crate::artifacts::ClientArtifactDownloadOperationRequest
+        ),
+        schema_doc!(
+            "client_artifact_download_result.json",
+            crate::artifacts::ClientArtifactDownloadResult
+        ),
+        schema_doc!(
+            "client_artifact_download_state.json",
+            crate::artifacts::ClientArtifactDownloadState
+        ),
+        schema_doc!(
+            "client_artifact_download_progress_result.json",
+            crate::artifacts::ClientArtifactDownloadProgressResult
+        ),
+        schema_doc!(
+            "client_artifact_download_cancel_result.json",
+            crate::artifacts::ClientArtifactDownloadCancelResult
+        ),
+        schema_doc!(
+            "client_member_avatar_cache_request.json",
+            crate::avatars::ClientMemberAvatarCacheRequest
+        ),
+        schema_doc!(
+            "client_member_avatar_cache_result.json",
+            crate::avatars::ClientMemberAvatarCacheResult
+        ),
+        schema_doc!(
             "add_and_activate_remote_gateway_registry_plan.json",
             crate::gateway::AddAndActivateRemoteGatewayRegistryPlan
         ),
@@ -554,6 +594,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "plan_activate_gateway_request.json",
             crate::gateway::PlanActivateGatewayRequest
+        ),
+        schema_doc!(
+            "load_gateway_registry_request.json",
+            crate::gateway::LoadGatewayRegistryRequest
+        ),
+        schema_doc!(
+            "load_gateway_registry_result.json",
+            crate::gateway::LoadGatewayRegistryResult
         ),
         schema_doc!(
             "plan_add_remote_gateway_request.json",

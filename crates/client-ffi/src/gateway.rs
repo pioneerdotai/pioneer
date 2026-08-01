@@ -1,4 +1,5 @@
 use pioneer_client::gateway::{
+    migration::{GatewayRegistryLoad, GatewayRegistryLoadError, load_registry_json},
     runtime::GatewayProfileError,
     setup::{
         ActivateGatewayRegistryPlan, AddRemoteGatewayApplyMode, AddRemoteGatewayInput,
@@ -8,7 +9,7 @@ use pioneer_client::gateway::{
         generated_remote_gateway_endpoint_id, plan_activate_gateway_registry,
         plan_add_remote_gateway, plan_delete_remote_gateway_registry,
         plan_set_gateway_workspace_registry, plan_update_remote_gateway_registry,
-        validate_remote_gateway_address,
+        validate_remote_gateway_base_url,
     },
     types::{GatewayEndpoint, GatewayRegistry},
 };
@@ -40,7 +41,7 @@ pub const VOICE_RECONFIGURATION_BUSY_CODE: &str = "voice_reconfiguration_busy";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteGatewayValidationRequest {
-    pub address: String,
+    pub gateway_base_url: String,
     pub timeout_ms: u64,
 }
 
@@ -50,7 +51,7 @@ pub struct RemoteGatewayValidationRequest {
 pub struct PlanAddRemoteGatewayRequest {
     pub registry: GatewayRegistry,
     pub name: String,
-    pub address: String,
+    pub gateway_base_url: String,
     pub new_endpoint_id: Option<String>,
     pub default_remote_name: String,
 }
@@ -96,7 +97,7 @@ pub struct PlanUpdateRemoteGatewayRequest {
     pub registry: GatewayRegistry,
     pub gateway_id: String,
     pub name: String,
-    pub address: String,
+    pub gateway_base_url: String,
     pub default_remote_name: String,
 }
 
@@ -110,6 +111,36 @@ pub struct PlanDeleteRemoteGatewayRequest {
     pub local_gateway_id: Option<String>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadGatewayRegistryRequest {
+    pub document: String,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LoadGatewayRegistryResult {
+    Current { registry: GatewayRegistry },
+    Migrated { registry: GatewayRegistry },
+    ReconfigurationRequired { endpoint_ids: Vec<String> },
+}
+
+pub fn load_gateway_registry_request(
+    request: LoadGatewayRegistryRequest,
+) -> Result<LoadGatewayRegistryResult, GatewayRegistryLoadError> {
+    Ok(match load_registry_json(request.document.as_str())? {
+        GatewayRegistryLoad::Current(registry) => LoadGatewayRegistryResult::Current { registry },
+        GatewayRegistryLoad::Migrated(registry) => {
+            LoadGatewayRegistryResult::Migrated { registry }
+        }
+        GatewayRegistryLoad::ReconfigurationRequired { endpoint_ids } => {
+            LoadGatewayRegistryResult::ReconfigurationRequired { endpoint_ids }
+        }
+    })
+}
+
 pub fn validate_remote_gateway_request(
     request: &RemoteGatewayValidationRequest,
 ) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
@@ -119,8 +150,8 @@ pub fn validate_remote_gateway_request(
         });
     }
 
-    validate_remote_gateway_address(
-        request.address.as_str(),
+    validate_remote_gateway_base_url(
+        request.gateway_base_url.as_str(),
         Duration::from_millis(request.timeout_ms),
     )
 }
@@ -140,7 +171,7 @@ pub fn plan_add_remote_gateway_request(
         &request.registry,
         AddRemoteGatewayInput {
             name: request.name.as_str(),
-            address: request.address.as_str(),
+            gateway_base_url: request.gateway_base_url.as_str(),
             new_endpoint_id,
             default_remote_name: request.default_remote_name,
         },
@@ -168,7 +199,7 @@ pub fn plan_add_and_activate_remote_gateway_registry_request(
         &registry,
         AddRemoteGatewayInput {
             name: request.name.as_str(),
-            address: request.address.as_str(),
+            gateway_base_url: request.gateway_base_url.as_str(),
             new_endpoint_id,
             default_remote_name: request.default_remote_name,
         },
@@ -207,7 +238,7 @@ pub fn plan_update_remote_gateway_registry_request(
         registry,
         gateway_id,
         name,
-        address,
+        gateway_base_url,
         default_remote_name,
     } = request;
 
@@ -216,7 +247,7 @@ pub fn plan_update_remote_gateway_registry_request(
         UpdateRemoteGatewayRegistryInput {
             gateway_id: gateway_id.as_str(),
             name: name.as_str(),
-            address: address.as_str(),
+            gateway_base_url: gateway_base_url.as_str(),
             default_remote_name,
         },
     )
@@ -630,5 +661,40 @@ mod tests {
                 reason: pioneer_client::settings::voice::VoiceInputSettingsPlanRejection::InvalidProvider
             }
         ));
+    }
+
+    #[test]
+    fn registry_migration_result_is_typed_and_secret_free() {
+        let result = load_gateway_registry_request(LoadGatewayRegistryRequest {
+            document: r#"{
+                "version":2,
+                "active_gateway_id":"custom",
+                "remotes":[{"id":"custom","name":"Custom","address":"wss://relay.example/socket","kind":"remote"}]
+            }"#
+            .to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            LoadGatewayRegistryResult::ReconfigurationRequired {
+                endpoint_ids: vec!["custom".to_owned()]
+            }
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("wss://"));
+        assert!(!encoded.contains("credential"));
+    }
+
+    #[test]
+    fn endpoint_requests_reject_unknown_legacy_fields() {
+        let result = serde_json::from_value::<PlanAddRemoteGatewayRequest>(json!({
+            "registry": {"version": 3, "active_gateway_id": null, "remotes": []},
+            "name": "Remote",
+            "gateway_base_url": "https://relay.example/",
+            "new_endpoint_id": null,
+            "default_remote_name": "Remote",
+            "legacy_ws_url": "wss://legacy.example/socket"
+        }));
+        assert!(result.is_err());
     }
 }

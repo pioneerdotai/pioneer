@@ -20,6 +20,9 @@ impl MessageProcessor {
         &self,
         signal: &AccessChangeSignal,
     ) {
+        // The signal exists only after the ACL mutation commits. Cancel the
+        // exact principal/workspace HTTP scope before any further delivery.
+        self.cancel_http_streams_for_access_change(signal);
         self.expire_native_permission_requests_without_current_authority(
             signal.workspace_id.as_str(),
             signal.affected_principal_id.as_ref(),
@@ -138,14 +141,6 @@ impl MessageProcessor {
                         eviction_thread_id,
                     )
                     .await;
-                self.artifact_downloads
-                    .abort_connection_scope(
-                        connection_id,
-                        signal.workspace_id.as_str(),
-                        eviction_thread_id,
-                    )
-                    .await;
-
                 let removed_voice_sessions = match self.voice_sessions.cleanup_connection_scope(
                     connection_id,
                     signal.workspace_id.as_str(),

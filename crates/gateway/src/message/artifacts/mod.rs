@@ -1,8 +1,7 @@
 pub(super) mod capabilities;
-pub(super) mod download;
 pub(super) mod list;
-pub(super) mod read;
 pub(super) mod upload;
+pub(super) mod view_grant;
 
 pub(in crate::message) use list::ArtifactListAuthorization;
 pub(in crate::message) use upload::{

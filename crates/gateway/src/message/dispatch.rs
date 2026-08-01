@@ -1,18 +1,18 @@
 use super::*;
 use crate::message::artifacts::{ArtifactListAuthorization, ArtifactUploadAuthorization};
 use pioneer_protocol::{
-    ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams,
-    ArtifactDownloadAbortParams, ArtifactDownloadChunkParams, ArtifactDownloadFinishParams,
-    ArtifactDownloadStartParams, ArtifactGetParams, ArtifactListForMessageParams,
-    ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
+    ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams, ArtifactGetParams,
+    ArtifactListForMessageParams,
+    ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams,
     ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
-    ArtifactUploadStartParams, AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams,
+    ArtifactUploadStartParams, ArtifactViewGrantCreateParams, AuthSessionRevokeParams,
+    CLIRuntimeGetParams, CLIRuntimeListParams,
     CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
     CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
     InvitationCreateParams, InvitationListParams, InvitationRevokeParams, McpInstallParams,
-    McpListParams, McpPolicySetParams, MemberAvatarGetParams, MemberDeviceCreateParams,
-    MemberListParams, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
+    McpListParams, McpPolicySetParams, MemberDeviceCreateParams, MemberListParams,
+    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
     MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
     MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
     MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
@@ -35,8 +35,8 @@ use tracing::Instrument as _;
 use crate::authorization::{
     AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
     AuthorizedArtifact, AuthorizedInvitation, AuthorizedInvitationCollection,
-    AuthorizedInvitationGrants, AuthorizedMemberAvatar, AuthorizedMemberDirectory,
-    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
+    AuthorizedInvitationGrants, AuthorizedMemberDirectory, AuthorizedMemberPrincipal,
+    AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
     AuthorizedWorkspace, AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy,
     MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
     ResourceResolverKind, external_error_for_decision, normal_method_entry,
@@ -49,7 +49,6 @@ enum RequestAdmission {
     InvitationCollection(AuthorizedInvitationCollection),
     Invitation(AuthorizedInvitation),
     MemberDirectory(AuthorizedMemberDirectory),
-    MemberAvatar(AuthorizedMemberAvatar),
     MemberPrincipal(AuthorizedMemberPrincipal),
     OwnSession(AuthorizedSession),
     WorkspaceCollection(AuthorizedWorkspaceCollection),
@@ -174,13 +173,6 @@ impl RequestAdmission {
     fn member_directory(&self) -> Option<&AuthorizedMemberDirectory> {
         match self {
             Self::MemberDirectory(proof) => Some(proof),
-            _ => None,
-        }
-    }
-
-    fn member_avatar(&self) -> Option<&AuthorizedMemberAvatar> {
-        match self {
-            Self::MemberAvatar(proof) => Some(proof),
             _ => None,
         }
     }
@@ -795,41 +787,6 @@ impl MessageProcessor {
                 }
             };
         }
-        if request.method == methods::MEMBER_AVATAR_GET {
-            let params = serde_json::from_value::<MemberAvatarGetParams>(
-                request.params.clone().unwrap_or_else(empty_object_value),
-            )
-            .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?;
-            let database = self.crud_store.database_connection();
-            let resolution = resolver
-                .authorize_member_avatar(
-                    &database,
-                    context.principal(),
-                    &action_gate,
-                    &params.principal_id,
-                )
-                .await
-                .map_err(|_| {
-                    record_authorization_unavailable(
-                        entry.action.safe_name(),
-                        entry.resolver.safe_name(),
-                        entry.audit.safe_name(),
-                    );
-                    AuthorizationExternalError::Unavailable.response(request.id.clone())
-                })?;
-            return match resolution {
-                ProofResolution::Authorized(proof) => {
-                    record_method_decision(entry, proof.decision());
-                    Ok(RequestAdmission::MemberAvatar(proof))
-                }
-                ProofResolution::Denied(decision) => {
-                    record_method_decision(entry, &decision);
-                    Err(external_error_for_decision(&decision)
-                        .unwrap_or(AuthorizationExternalError::NotFound)
-                        .response(request.id.clone()))
-                }
-            };
-        }
         if matches!(
             request.method.as_str(),
             methods::MEMBER_SUSPEND
@@ -1004,10 +961,6 @@ impl MessageProcessor {
             methods::ARTIFACT_UPLOAD_START
                 | methods::ARTIFACT_UPLOAD_FINISH
                 | methods::ARTIFACT_UPLOAD_ABORT
-                | methods::ARTIFACT_DOWNLOAD_START
-                | methods::ARTIFACT_DOWNLOAD_CHUNK
-                | methods::ARTIFACT_DOWNLOAD_FINISH
-                | methods::ARTIFACT_DOWNLOAD_ABORT
         ) {
             return self
                 .authorize_artifact_transfer_request(
@@ -1823,7 +1776,7 @@ impl MessageProcessor {
                 if matches!(
                     request.method.as_str(),
                     methods::ARTIFACT_GET
-                        | methods::ARTIFACT_READ
+                        | methods::ARTIFACT_VIEW_GRANT_CREATE
                         | methods::ARTIFACT_DELETE
                         | methods::ARTIFACT_RESTORE
                         | methods::ARTIFACT_BIND
@@ -1977,7 +1930,7 @@ impl MessageProcessor {
         };
         let owner = AuthenticatedTransferOwner::from_request_context(context);
 
-        let resolution = if request.method == methods::ARTIFACT_UPLOAD_START {
+        if request.method == methods::ARTIFACT_UPLOAD_START {
             let params = serde_json::from_value::<ArtifactUploadStartParams>(
                 request.params.clone().unwrap_or_else(empty_object_value),
             )
@@ -2053,10 +2006,13 @@ impl MessageProcessor {
                 entry,
                 request.id.clone(),
             );
-        } else if matches!(
+        }
+        if !matches!(
             request.method.as_str(),
             methods::ARTIFACT_UPLOAD_FINISH | methods::ARTIFACT_UPLOAD_ABORT
         ) {
+            return Err(validation());
+        }
             let params = request.params.as_ref().and_then(JsonValue::as_object);
             let workspace_id = params
                 .and_then(|value| {
@@ -2140,85 +2096,11 @@ impl MessageProcessor {
                 )
                 .await
                 .map_err(|_| unavailable())?;
-            return self.finish_workspace_transfer_resolution(
+            self.finish_workspace_transfer_resolution(
                 resolution,
                 entry,
                 request.id.clone(),
-            );
-        } else if request.method == methods::ARTIFACT_DOWNLOAD_START {
-            let params = serde_json::from_value::<ArtifactDownloadStartParams>(
-                request.params.clone().unwrap_or_else(empty_object_value),
             )
-            .map_err(|_| validation())?;
-            resolver
-                .authorize_artifact(
-                    context.principal(),
-                    action_gate,
-                    entry.action,
-                    params.artifact_id.trim(),
-                    Some(params.workspace_id.trim()),
-                    None,
-                )
-                .await
-                .map_err(|_| unavailable())?
-        } else {
-            let params = request.params.as_ref().and_then(JsonValue::as_object);
-            let workspace_id = params
-                .and_then(|value| {
-                    value
-                        .get("workspace_id")
-                        .or_else(|| value.get("workspaceId"))
-                })
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(validation)?;
-            let download_id = params
-                .and_then(|value| value.get("download_id").or_else(|| value.get("downloadId")))
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(validation)?;
-            let session = self
-                .artifact_downloads
-                .get(
-                    &owner,
-                    workspace_id.trim(),
-                    download_id.trim(),
-                    now_timestamp_secs(),
-                )
-                .await
-                .map_err(|_| {
-                    let decision = AuthorizationDecision::Deny {
-                        reason: DenyReason::MissingAuthoritativeResource,
-                        disclosure: entry.disclosure,
-                    };
-                    record_method_decision(entry, &decision);
-                    AuthorizationExternalError::NotFound.response(request.id.clone())
-                })?;
-            resolver
-                .authorize_artifact(
-                    context.principal(),
-                    action_gate,
-                    entry.action,
-                    session.artifact_id.as_str(),
-                    Some(session.workspace_id.as_str()),
-                    None,
-                )
-                .await
-                .map_err(|_| unavailable())?
-        };
-
-        match resolution {
-            ProofResolution::Authorized(proof) => {
-                record_method_decision(entry, proof.decision());
-                Ok(RequestAdmission::Artifact(proof))
-            }
-            ProofResolution::Denied(decision) => {
-                record_method_decision(entry, &decision);
-                Err(external_error_for_decision(&decision)
-                    .unwrap_or(AuthorizationExternalError::NotFound)
-                    .response(request.id.clone()))
-            }
-        }
     }
 
     fn finish_thread_transfer_resolution(
@@ -2621,33 +2503,6 @@ impl MessageProcessor {
                                     Some(request.id),
                                     INVALID_PARAMS_CODE,
                                     format!("invalid params for `{}`: {error}", methods::MEMBER_LIST),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::MEMBER_AVATAR_GET => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<MemberAvatarGetParams>(params_value) {
-                        Ok(params) => {
-                            self.member_avatar_get(
-                                &context,
-                                admission.member_avatar().expect(
-                                    "central admission supplies member avatar proof",
-                                ),
-                                request.id,
-                                params,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!("invalid params for `{}`: {error}", methods::MEMBER_AVATAR_GET),
                                 ),
                             )
                             .await;
@@ -5134,11 +4989,11 @@ impl MessageProcessor {
                         }
                     }
                 }
-                methods::ARTIFACT_READ => {
+                methods::ARTIFACT_VIEW_GRANT_CREATE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ArtifactReadParams>(params_value) {
+                    match serde_json::from_value::<ArtifactViewGrantCreateParams>(params_value) {
                         Ok(params) => {
-                            self.artifact_read(
+                            self.artifact_view_grant_create(
                                 &context,
                                 admission
                                     .artifact()
@@ -5156,7 +5011,7 @@ impl MessageProcessor {
                                     INVALID_PARAMS_CODE,
                                     format!(
                                         "invalid params for `{}`: {error}",
-                                        methods::ARTIFACT_READ
+                                        methods::ARTIFACT_VIEW_GRANT_CREATE
                                     ),
                                 ),
                             )
@@ -5385,126 +5240,6 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::ARTIFACT_UPLOAD_ABORT
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::ARTIFACT_DOWNLOAD_START => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ArtifactDownloadStartParams>(params_value) {
-                        Ok(params) => {
-                            self.artifact_download_start(
-                                &context,
-                                admission
-                                    .artifact()
-                                    .expect("central admission supplies artifact proof"),
-                                request.id,
-                                params,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::ARTIFACT_DOWNLOAD_START
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::ARTIFACT_DOWNLOAD_CHUNK => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ArtifactDownloadChunkParams>(params_value) {
-                        Ok(params) => {
-                            self.artifact_download_chunk(
-                                &context,
-                                admission
-                                    .artifact()
-                                    .expect("central admission supplies artifact proof"),
-                                request.id,
-                                params,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::ARTIFACT_DOWNLOAD_CHUNK
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::ARTIFACT_DOWNLOAD_FINISH => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ArtifactDownloadFinishParams>(params_value) {
-                        Ok(params) => {
-                            self.artifact_download_finish(
-                                &context,
-                                admission
-                                    .artifact()
-                                    .expect("central admission supplies artifact proof"),
-                                request.id,
-                                params,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::ARTIFACT_DOWNLOAD_FINISH
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::ARTIFACT_DOWNLOAD_ABORT => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ArtifactDownloadAbortParams>(params_value) {
-                        Ok(params) => {
-                            self.artifact_download_abort(
-                                &context,
-                                admission
-                                    .artifact()
-                                    .expect("central admission supplies artifact proof"),
-                                request.id,
-                                params,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::ARTIFACT_DOWNLOAD_ABORT
                                     ),
                                 ),
                             )
@@ -6607,9 +6342,6 @@ impl MessageProcessor {
 
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
         self.artifact_uploads.abort_connection(connection_id).await;
-        self.artifact_downloads
-            .abort_connection(connection_id)
-            .await;
         self.skill_upload_owners
             .lock()
             .await

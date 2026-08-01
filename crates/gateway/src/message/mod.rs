@@ -162,7 +162,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
@@ -385,6 +385,8 @@ pub struct MessageProcessor {
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+    http_stream_registry: Arc<StdRwLock<Option<Weak<crate::transport::HttpStreamRegistry>>>>,
+    view_grant_service: Arc<StdRwLock<Option<Weak<crate::transport::ViewGrantService>>>>,
     auth_service: Option<Arc<GatewayAuthService>>,
     epic5_rate_limits: Arc<crate::epic5_observability::Epic5RateLimits>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
@@ -462,7 +464,6 @@ pub struct MessageProcessor {
     thread_episodic_storage_root: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
-    artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
     thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
     thread_episodic_index_executor: Arc<ThreadEpisodicIndexExecutor>,
     thread_episodic_embedding_provider_resolver:
@@ -669,8 +670,6 @@ impl MessageProcessor {
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
-        let artifact_downloads =
-            Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
             Arc::new(MemvidThreadEpisodicBackend::new());
         let thread_episodic_embedding_provider_resolver = Arc::new(
@@ -717,6 +716,8 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
+            http_stream_registry: Arc::new(StdRwLock::new(None)),
+            view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
             epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
             cli_runtime_manager: None,
@@ -784,7 +785,6 @@ impl MessageProcessor {
             thread_episodic_storage_root,
             artifact_service,
             artifact_uploads,
-            artifact_downloads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
                 StoreThreadEpisodicIngestor::with_config(
                     crud_store,
@@ -1059,6 +1059,73 @@ impl MessageProcessor {
         self.epic5_rate_limits = service.epic5_rate_limits();
         self.auth_service = Some(service);
         self
+    }
+
+    pub(crate) fn member_service(&self) -> crate::member::MemberService {
+        crate::member::MemberService::with_rate_limits(
+            (*self.crud_store).clone(),
+            self.gateway_secrets.clone(),
+            self.epic5_rate_limits.clone(),
+        )
+    }
+
+    pub(crate) fn set_http_stream_registry(
+        &self,
+        registry: Arc<crate::transport::HttpStreamRegistry>,
+    ) {
+        *self
+            .http_stream_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&registry));
+    }
+
+    pub(crate) fn set_view_grant_service(
+        &self,
+        service: Arc<crate::transport::ViewGrantService>,
+    ) {
+        *self
+            .view_grant_service
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&service));
+    }
+
+    pub(in crate::message) fn view_grant_service(
+        &self,
+    ) -> Option<Arc<crate::transport::ViewGrantService>> {
+        self.view_grant_service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn cancel_http_artifact_streams(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+    ) -> usize {
+        self.http_stream_registry()
+            .map(|registry| registry.cancel_artifact(workspace_id, artifact_id))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn cancel_http_streams_for_access_change(
+        &self,
+        signal: &AccessChangeSignal,
+    ) -> usize {
+        self.http_stream_registry()
+            .map(|registry| registry.cancel_authorization_signal(signal))
+            .unwrap_or(0)
+    }
+
+    fn http_stream_registry(
+        &self,
+    ) -> Option<Arc<crate::transport::HttpStreamRegistry>> {
+        self.http_stream_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
     }
 
     pub(crate) fn with_invitation_endpoint(mut self, endpoint: impl Into<Arc<str>>) -> Self {
@@ -2530,8 +2597,6 @@ impl MessageProcessor {
                 .join("artifacts")
                 .join("upload_sessions"),
         ));
-        let artifact_downloads =
-            Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         let normalized_tool_loop_config = ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
@@ -2670,6 +2735,8 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
+            http_stream_registry: Arc::new(StdRwLock::new(None)),
+            view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
             epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
             cli_runtime_manager: None,
@@ -2749,7 +2816,6 @@ impl MessageProcessor {
             thread_episodic_storage_root,
             artifact_service,
             artifact_uploads,
-            artifact_downloads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
                 StoreThreadEpisodicIngestor::new(crud_store),
             ))),

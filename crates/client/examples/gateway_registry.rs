@@ -1,4 +1,5 @@
 use pioneer_client::gateway::{
+    endpoint::GatewayBaseUrl,
     registry::{
         GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
         setup_required,
@@ -8,11 +9,10 @@ use pioneer_client::gateway::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayRegistryConfig {
-        version: 2,
         local: Some(GatewayLocalRegistryConfig {
             gateway_id: "local".to_owned(),
             name: "Local Gateway".to_owned(),
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("127.0.0.1:17878")?,
             service_name: Some("com.pioneer.gateway".to_owned()),
         }),
     };
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.remotes.push(GatewayEndpoint {
         id: "remote-a".to_owned(),
         name: "  ".to_owned(),
-        address: "gateway.example.com".to_owned(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation("gateway.example.com")?,
         kind: GatewayEndpointKind::Local,
         session_ref: None,
         server_gateway_id: None,
@@ -44,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(registry.remotes.len(), 1);
     assert_eq!(registry.remotes[0].kind, GatewayEndpointKind::Remote);
     assert_eq!(registry.remotes[0].name, "Remote Gateway 1");
-    assert_eq!(registry.remotes[0].address, "gateway.example.com:17878");
+    assert_eq!(
+        registry.remotes[0].gateway_base_url.as_str(),
+        "http://gateway.example.com/"
+    );
     assert_eq!(registry.remotes[0].workspace_id.as_deref(), Some("ws_1"));
     assert_eq!(registry.remotes[0].service_name, None);
 

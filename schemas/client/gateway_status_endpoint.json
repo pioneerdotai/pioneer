@@ -3,7 +3,7 @@
   "title": "GatewayStatusEndpoint",
   "type": "object",
   "properties": {
-    "address": {
+    "gateway_base_url": {
       "type": "string"
     },
     "kind": {
@@ -15,7 +15,7 @@
   },
   "required": [
     "name",
-    "address",
+    "gateway_base_url",
     "kind"
   ],
   "$defs": {

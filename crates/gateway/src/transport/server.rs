@@ -1,166 +1,24 @@
-use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
-use std::net::{IpAddr, Shutdown, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use tracing::debug;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use futures_util::{SinkExt, StreamExt};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{AuthAccessExpiringNotification, JsonRpcNotification, constants::events};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
+use super::http::{GatewayHttpState, gateway_router};
 use super::restricted::{RestrictedExchangeOutcome, run as run_restricted_exchange};
-use crate::auth::AuthenticatedSessionPrincipal;
-use crate::auth::{
-    AuthAdmissionService, AuthError, CapturedAdmission, GatewayAuthService, RestrictedAdmission,
-};
+use super::ws::admission::AdmittedConnection;
+use crate::auth::{AuthenticatedSessionPrincipal, GatewayAuthService};
 use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
-const MAX_AUTH_IN_FLIGHT_PER_ADDRESS: usize = 8;
-const MAX_AUTH_IN_FLIGHT_GLOBAL: usize = 512;
-const MAX_AUTH_TRACKED_ADDRESSES: usize = 1_024;
-const MAX_AUTH_FAILURE_PENALTY_STEPS: u32 = 10;
-const AUTH_FAILURE_PENALTY_STEP: Duration = Duration::from_millis(25);
-const AUTH_FAILURE_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const ACCESS_CLOSE_GRACE: Duration = Duration::from_millis(250);
-
-#[derive(Default)]
-struct AuthAbuseState {
-    addresses: HashMap<IpAddr, AuthAddressState>,
-    total_in_flight: usize,
-    gateway_failed_attempts: u32,
-    gateway_last_failure: Option<Instant>,
-}
-
-struct AuthAddressState {
-    in_flight: usize,
-    failed_attempts: u32,
-    last_touched: Instant,
-}
-
-#[derive(Default)]
-struct AuthAbuseLimiter {
-    state: Mutex<AuthAbuseState>,
-}
-
-struct AuthAttemptPermit {
-    limiter: Arc<AuthAbuseLimiter>,
-    address: IpAddr,
-    penalty: Duration,
-}
-
-impl AuthAbuseLimiter {
-    fn try_acquire(self: &Arc<Self>, address: IpAddr) -> Option<AuthAttemptPermit> {
-        let now = Instant::now();
-        let mut state = self.state.lock().ok()?;
-        state.addresses.retain(|_, entry| {
-            entry.in_flight > 0
-                || now.saturating_duration_since(entry.last_touched) < AUTH_FAILURE_STATE_TTL
-        });
-        if state.gateway_last_failure.is_some_and(|last_failure| {
-            now.saturating_duration_since(last_failure) >= AUTH_FAILURE_STATE_TTL
-        }) {
-            state.gateway_failed_attempts = 0;
-            state.gateway_last_failure = None;
-        }
-        if state.total_in_flight >= MAX_AUTH_IN_FLIGHT_GLOBAL {
-            return None;
-        }
-        if !state.addresses.contains_key(&address)
-            && state.addresses.len() >= MAX_AUTH_TRACKED_ADDRESSES
-        {
-            let oldest_idle = state
-                .addresses
-                .iter()
-                .filter(|(_, entry)| entry.in_flight == 0)
-                .min_by_key(|(_, entry)| entry.last_touched)
-                .map(|(address, _)| *address);
-            if let Some(oldest_idle) = oldest_idle {
-                state.addresses.remove(&oldest_idle);
-            } else {
-                return None;
-            }
-        }
-        let address_penalty_steps = {
-            let entry = state.addresses.entry(address).or_insert(AuthAddressState {
-                in_flight: 0,
-                failed_attempts: 0,
-                last_touched: now,
-            });
-            if entry.in_flight >= MAX_AUTH_IN_FLIGHT_PER_ADDRESS {
-                return None;
-            }
-            let penalty_steps = entry.failed_attempts.min(MAX_AUTH_FAILURE_PENALTY_STEPS);
-            entry.in_flight += 1;
-            entry.last_touched = now;
-            penalty_steps
-        };
-        let penalty_steps = address_penalty_steps
-            .max(state.gateway_failed_attempts)
-            .min(MAX_AUTH_FAILURE_PENALTY_STEPS);
-        state.total_in_flight += 1;
-        Some(AuthAttemptPermit {
-            limiter: self.clone(),
-            address,
-            penalty: AUTH_FAILURE_PENALTY_STEP.saturating_mul(penalty_steps),
-        })
-    }
-}
-
-impl AuthAttemptPermit {
-    fn penalty(&self) -> Duration {
-        self.penalty
-    }
-
-    fn record_success(&self) {
-        if let Ok(mut state) = self.limiter.state.lock()
-            && let Some(entry) = state.addresses.get_mut(&self.address)
-        {
-            entry.failed_attempts = 0;
-            entry.last_touched = Instant::now();
-        }
-    }
-
-    fn record_failure(&self) {
-        if let Ok(mut state) = self.limiter.state.lock() {
-            let now = Instant::now();
-            if let Some(entry) = state.addresses.get_mut(&self.address) {
-                entry.failed_attempts = entry
-                    .failed_attempts
-                    .saturating_add(1)
-                    .min(MAX_AUTH_FAILURE_PENALTY_STEPS);
-                entry.last_touched = now;
-            }
-            state.gateway_failed_attempts = state
-                .gateway_failed_attempts
-                .saturating_add(1)
-                .min(MAX_AUTH_FAILURE_PENALTY_STEPS);
-            state.gateway_last_failure = Some(now);
-        }
-    }
-}
-
-impl Drop for AuthAttemptPermit {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.limiter.state.lock() {
-            if let Some(entry) = state.addresses.get_mut(&self.address) {
-                entry.in_flight = entry.in_flight.saturating_sub(1);
-                entry.last_touched = Instant::now();
-            }
-            state.total_in_flight = state.total_in_flight.saturating_sub(1);
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct GatewayServerHandle {
@@ -185,34 +43,38 @@ impl GatewayServerHandle {
 
 pub async fn spawn_server(
     config: AppConfig,
-    auth: AuthAdmissionService,
+    auth: crate::auth::AuthAdmissionService,
     auth_service: Arc<GatewayAuthService>,
     message_processor: Arc<MessageProcessor>,
     session_manager: Arc<SessionManager>,
 ) -> Result<GatewayServerHandle> {
     let addr = config.gateway.listen_addr.clone();
-
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind gateway server to {addr}"))?;
-
     let local_addr = listener
         .local_addr()
         .context("failed to read bound gateway server address")?;
 
+    let state = GatewayHttpState::new(
+        config,
+        auth,
+        auth_service,
+        message_processor,
+        session_manager,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid view-grant configuration: {error:?}"))?;
+    let app = gateway_router(state.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
+    state.set_ready(true);
     let join_handle = tokio::spawn(async move {
-        run_accept_loop(
+        axum::serve(
             listener,
-            shutdown_rx,
-            config,
-            auth,
-            auth_service,
-            message_processor,
-            session_manager,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx, state))
         .await
+        .context("Axum Gateway server failed")
     });
 
     Ok(GatewayServerHandle {
@@ -222,141 +84,52 @@ pub async fn spawn_server(
     })
 }
 
-async fn run_accept_loop(
-    listener: TcpListener,
+async fn shutdown_signal(
     mut shutdown_rx: watch::Receiver<bool>,
-    config: AppConfig,
-    auth: AuthAdmissionService,
-    auth_service: Arc<GatewayAuthService>,
-    message_processor: Arc<MessageProcessor>,
-    session_manager: Arc<SessionManager>,
-) -> Result<()> {
-    let mut connection_tasks = JoinSet::new();
-    let auth_abuse_limiter = Arc::new(AuthAbuseLimiter::default());
-
+    state: GatewayHttpState,
+) {
     loop {
-        let config = config.clone();
-        let auth = auth.clone();
-        let auth_service = auth_service.clone();
-        let message_processor = message_processor.clone();
-        let session_manager = session_manager.clone();
-        let auth_abuse_limiter = auth_abuse_limiter.clone();
-
-        tokio::select! {
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
-                    break;
-                }
-            }
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, peer_addr)) => {
-                        connection_tasks.spawn(async move {
-                            let _ = handle_connection(
-                                stream,
-                                peer_addr,
-                                config,
-                                auth,
-                                auth_service,
-                                message_processor,
-                                session_manager,
-                                auth_abuse_limiter,
-                            )
-                            .await;
-                        });
-                    }
-                    Err(error) => {
-                        return Err(anyhow::anyhow!("gateway accept failed: {error}"));
-                    }
-                }
-            }
+        if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
+            break;
         }
     }
-
-    connection_tasks.abort_all();
-    while connection_tasks.join_next().await.is_some() {}
-
-    Ok(())
+    state.set_ready(false);
+    state.active_connections.cancel_all().await;
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    peer_addr: SocketAddr,
-    config: AppConfig,
-    auth: AuthAdmissionService,
-    auth_service: Arc<GatewayAuthService>,
-    message_processor: Arc<MessageProcessor>,
-    session_manager: Arc<SessionManager>,
-    auth_abuse_limiter: Arc<AuthAbuseLimiter>,
+pub(super) async fn run_admitted_connection(
+    ws: WebSocket,
+    state: GatewayHttpState,
+    admission: AdmittedConnection,
+    mut server_cancellation: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (stream, shutdown_handle) = duplicate_shutdown_handle(stream)?;
-    let auth_attempt = auth_abuse_limiter
-        .try_acquire(peer_addr.ip())
-        .context("Gateway authentication concurrency limit reached")?;
-    if !auth_attempt.penalty().is_zero() {
-        tokio::time::sleep(auth_attempt.penalty()).await;
-    }
-
-    let admission_capture = Arc::new(OnceLock::new());
-    let callback_capture = admission_capture.clone();
-    let handshake_deadline = Duration::from_secs(config.gateway.auth.auth_exchange_timeout_seconds);
-    let ws = match tokio::time::timeout(
-        handshake_deadline,
-        accept_hdr_async(stream, move |request: &Request, response: Response| {
-            capture_admission(auth.capture_request(request), callback_capture.as_ref())?;
-            Ok(response)
-        }),
-    )
-    .await
-    {
-        Ok(Ok(ws)) => ws,
-        Ok(Err(error)) => {
-            auth_attempt.record_failure();
-            return Err(error).context("websocket handshake failed");
-        }
-        Err(_) => {
-            auth_attempt.record_failure();
-            anyhow::bail!("websocket authentication handshake timed out");
-        }
-    };
-    let admission = match read_captured_admission(admission_capture) {
-        Ok(admission) => admission,
-        Err(error) => {
-            auth_attempt.record_failure();
-            return Err(error);
-        }
-    };
-
     match admission {
-        CapturedAdmission::Access(credential) => {
-            match auth_service.authenticate_access(credential).await {
-                Ok(principal) => {
-                    auth_attempt.record_success();
-                    drop(auth_attempt);
-                    run_normal_connection(
-                        ws,
-                        shutdown_handle,
-                        config,
-                        principal,
-                        auth_service,
-                        message_processor,
-                        session_manager,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    auth_attempt.record_failure();
-                    close_with_auth_reason(ws, 4401, error.code().as_str()).await
-                }
-            }
+        AdmittedConnection::Normal(principal) => {
+            run_normal_connection(
+                ws,
+                state.config,
+                principal,
+                state.auth_service,
+                state.message_processor,
+                state.session_manager,
+                server_cancellation,
+            )
+            .await
         }
-        CapturedAdmission::Restricted(restricted) => {
-            drop(shutdown_handle);
-            let deadline = Duration::from_secs(config.gateway.auth.auth_exchange_timeout_seconds);
-            let result = handle_restricted_admission(ws, restricted, deadline, auth_service).await;
-            match result {
-                Ok(RestrictedExchangeOutcome::Succeeded) => auth_attempt.record_success(),
-                Ok(RestrictedExchangeOutcome::Failed) | Err(_) => auth_attempt.record_failure(),
+        AdmittedConnection::Restricted { admission, permit } => {
+            let deadline = Duration::from_secs(
+                state.config.gateway.auth.auth_exchange_timeout_seconds,
+            );
+            let result = tokio::select! {
+                result = run_restricted_exchange(ws, admission, deadline, state.auth_service) => {
+                    result.map(Some)
+                }
+                _ = wait_for_cancellation(&mut server_cancellation) => Ok(None),
+            };
+            match &result {
+                Ok(Some(RestrictedExchangeOutcome::Succeeded)) => permit.record_success(),
+                Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => permit.record_failure(),
+                Ok(None) => {}
             }
             result.map(|_| ())
         }
@@ -364,18 +137,16 @@ async fn handle_connection(
 }
 
 async fn run_normal_connection(
-    ws: WebSocketStream<TcpStream>,
-    shutdown_handle: std::net::TcpStream,
+    ws: WebSocket,
     config: AppConfig,
     principal: Arc<AuthenticatedSessionPrincipal>,
     auth_service: Arc<GatewayAuthService>,
     message_processor: Arc<MessageProcessor>,
     session_manager: Arc<SessionManager>,
+    mut server_cancellation: watch::Receiver<bool>,
 ) -> Result<()> {
     let (mut ws_writer, mut ws_reader) = ws.split();
-
     let queue_capacity = config.gateway.outbound_queue_capacity.max(1);
-
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(queue_capacity);
 
     let connection_id = session_manager
@@ -429,7 +200,6 @@ async fn run_normal_connection(
     let access_lease_outbound = outbound_tx.clone();
     let access_lease_task = tokio::spawn(async move {
         enforce_access_lease(
-            shutdown_handle,
             access_lease_outbound,
             access_lease_principal,
             connection_id,
@@ -443,10 +213,14 @@ async fn run_normal_connection(
 
     let mut writer_task = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
+            let terminal = matches!(message, Message::Close(_));
             ws_writer
                 .send(message)
                 .await
                 .context("websocket write failed")?;
+            if terminal {
+                return Ok::<(), anyhow::Error>(());
+            }
         }
         ws_writer.close().await.context("websocket close failed")?;
         Ok::<(), anyhow::Error>(())
@@ -457,6 +231,13 @@ async fn run_normal_connection(
             let payload = tokio::select! {
                 termination = termination_rx.changed() => {
                     let _ = termination;
+                    break;
+                }
+                _ = wait_for_cancellation(&mut server_cancellation) => {
+                    let _ = outbound_tx.try_send(Message::Close(Some(CloseFrame {
+                        code: 1012,
+                        reason: "server_shutdown".into(),
+                    })));
                     break;
                 }
                 changed = access_expired_rx.changed() => {
@@ -475,12 +256,7 @@ async fn run_normal_connection(
             let Some(payload) = payload else {
                 break;
             };
-            let message = match payload {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(anyhow::anyhow!("websocket read failed: {error}"));
-                }
-            };
+            let message = payload.context("websocket read failed")?;
 
             match message {
                 Message::Text(payload) => {
@@ -490,7 +266,7 @@ async fn run_normal_connection(
                         send_outbound(
                             &outbound_tx,
                             Message::Close(Some(CloseFrame {
-                                code: CloseCode::from(4401),
+                                code: 4401,
                                 reason: reason.into(),
                             })),
                         )
@@ -508,7 +284,7 @@ async fn run_normal_connection(
                         send_outbound(
                             &outbound_tx,
                             Message::Close(Some(CloseFrame {
-                                code: CloseCode::from(4401),
+                                code: 4401,
                                 reason: reason.into(),
                             })),
                         )
@@ -519,15 +295,9 @@ async fn run_normal_connection(
                         .process_binary_frame(&connection_context, payload.as_ref())
                         .await;
                 }
-                Message::Ping(payload) => {
-                    send_outbound(&outbound_tx, Message::Pong(payload)).await?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(frame) => {
-                    send_outbound(&outbound_tx, Message::Close(frame)).await?;
-                    break;
-                }
-                Message::Frame(_) => {}
+                // Axum automatically emits Pong for Ping and the close reply for peer Close.
+                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Close(_) => break,
             }
         }
         Ok(())
@@ -553,7 +323,6 @@ async fn run_normal_connection(
 }
 
 async fn enforce_access_lease(
-    shutdown_handle: std::net::TcpStream,
     outbound_tx: mpsc::Sender<Message>,
     principal: AuthenticatedSessionPrincipal,
     connection_id: u64,
@@ -581,13 +350,13 @@ async fn enforce_access_lease(
                     let _ = outbound_tx.try_send(Message::Text(notification.into()));
                 }
             }
-            _ = wait_for_lease_cancellation(&mut cancellation_rx) => return,
+            _ = wait_for_cancellation(&mut cancellation_rx) => return,
         }
     }
 
     tokio::select! {
         _ = tokio::time::sleep_until(expiry_deadline) => {}
-        _ = wait_for_lease_cancellation(&mut cancellation_rx) => return,
+        _ = wait_for_cancellation(&mut cancellation_rx) => return,
     }
 
     let _ = access_expired_tx.send(true);
@@ -601,40 +370,18 @@ async fn enforce_access_lease(
         outcome = "connection_closed",
         reason = "access_expired",
     );
-
-    let close_queued = outbound_tx
-        .try_send(Message::Close(Some(CloseFrame {
-            code: CloseCode::from(4401),
-            reason: "access_expired".into(),
-        })))
-        .is_ok();
-    if close_queued {
-        tokio::time::sleep(ACCESS_CLOSE_GRACE).await;
-    }
-    let _ = shutdown_handle.shutdown(Shutdown::Both);
+    let _ = outbound_tx.try_send(Message::Close(Some(CloseFrame {
+        code: 4401,
+        reason: "access_expired".into(),
+    })));
 }
 
-async fn wait_for_lease_cancellation(cancellation_rx: &mut watch::Receiver<bool>) {
+async fn wait_for_cancellation(cancellation_rx: &mut watch::Receiver<bool>) {
     loop {
-        if *cancellation_rx.borrow() {
-            return;
-        }
-        if cancellation_rx.changed().await.is_err() {
+        if *cancellation_rx.borrow() || cancellation_rx.changed().await.is_err() {
             return;
         }
     }
-}
-
-fn duplicate_shutdown_handle(stream: TcpStream) -> Result<(TcpStream, std::net::TcpStream)> {
-    let stream = stream
-        .into_std()
-        .context("failed to convert Gateway socket for lease enforcement")?;
-    let shutdown_handle = stream
-        .try_clone()
-        .context("failed to duplicate Gateway socket for lease enforcement")?;
-    let stream =
-        TcpStream::from_std(stream).context("failed to restore asynchronous Gateway socket")?;
-    Ok((stream, shutdown_handle))
 }
 
 fn remaining_access_duration(expires_at_unix: u64, now_since_epoch: Duration) -> Result<Duration> {
@@ -662,28 +409,6 @@ async fn normal_ingress_lease_failure(
         })
 }
 
-async fn handle_restricted_admission(
-    ws: WebSocketStream<TcpStream>,
-    admission: RestrictedAdmission,
-    deadline: Duration,
-    executor: Arc<GatewayAuthService>,
-) -> Result<RestrictedExchangeOutcome> {
-    run_restricted_exchange(ws, admission, deadline, executor).await
-}
-
-async fn close_with_auth_reason(
-    mut ws: WebSocketStream<TcpStream>,
-    code: u16,
-    reason: &'static str,
-) -> Result<()> {
-    ws.close(Some(CloseFrame {
-        code: CloseCode::from(code),
-        reason: reason.into(),
-    }))
-    .await
-    .context("failed to close rejected auth connection")
-}
-
 async fn send_outbound(sender: &mpsc::Sender<Message>, message: Message) -> Result<()> {
     sender
         .send(message)
@@ -691,260 +416,91 @@ async fn send_outbound(sender: &mpsc::Sender<Message>, message: Message) -> Resu
         .map_err(|_| anyhow::anyhow!("outbound channel closed"))
 }
 
-fn unauthorized_response(message: &str) -> ErrorResponse {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Some(message.to_owned()))
-        .expect("failed to build unauthorized websocket handshake response")
-}
-
-fn capture_admission(
-    admission: std::result::Result<CapturedAdmission, AuthError>,
-    capture: &OnceLock<CapturedAdmission>,
-) -> std::result::Result<(), ErrorResponse> {
-    let admission = match admission {
-        Ok(admission) => admission,
-        Err(error) => {
-            debug!(
-                code = error.code().as_str(),
-                "websocket auth rejected request"
-            );
-            return Err(unauthorized_response("missing or invalid bearer token"));
-        }
-    };
-
-    capture.set(admission).map_err(|_| {
-        debug!("websocket authentication attempted duplicate admission capture");
-        internal_error_response("websocket authentication state error")
-    })
-}
-
-fn read_captured_admission(capture: Arc<OnceLock<CapturedAdmission>>) -> Result<CapturedAdmission> {
-    Arc::try_unwrap(capture)
-        .map_err(|_| anyhow::anyhow!("websocket auth admission capture leaked across connections"))?
-        .into_inner()
-        .context("websocket handshake completed without an auth admission")
-}
-
-fn internal_error_response(message: &str) -> ErrorResponse {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Some(message.to_owned()))
-        .expect("failed to build internal websocket handshake response")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        AUTH_FAILURE_STATE_TTL, AuthAbuseLimiter, MAX_AUTH_IN_FLIGHT_PER_ADDRESS,
-        capture_admission, duplicate_shutdown_handle, enforce_access_lease,
-        read_captured_admission, remaining_access_duration,
-    };
-    use crate::auth::{
-        AccessCredential, AccessJwtSubject, AuthError, AuthErrorCode,
-        AuthenticatedSessionPrincipal, CapturedAdmission, PresentedCredential,
-        RefreshExchangeContext, RestrictedAdmission, RestrictedAuthContext,
-    };
-    use crate::session::SessionManager;
-    use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind};
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, OnceLock};
-    use std::time::{Duration, Instant};
-    use tokio::io::AsyncReadExt;
-    use tokio::sync::{mpsc, watch};
-    use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::tungstenite::http::StatusCode;
+    use futures_util::FutureExt;
 
-    #[tokio::test]
-    async fn failed_or_restricted_admission_cannot_register_a_normal_connection() {
-        let capture = OnceLock::new();
-        let manager = SessionManager::new();
-
-        let response = capture_admission(
-            Err(AuthError::new(AuthErrorCode::InvalidCredential)),
-            &capture,
-        )
-        .expect_err("invalid auth must reject the handshake");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(capture.get().is_none());
-        assert!(manager.connection_ids().await.is_empty());
-
-        let restricted = restricted_refresh();
-        let capture = Arc::new(OnceLock::new());
-        capture_admission(Ok(restricted), capture.as_ref()).unwrap();
-        assert!(matches!(
-            read_captured_admission(capture).unwrap(),
-            CapturedAdmission::Restricted(_)
-        ));
-        assert!(manager.connection_ids().await.is_empty());
-    }
-
-    #[test]
-    fn duplicate_and_missing_capture_fail_closed() {
-        let capture = OnceLock::new();
-        capture_admission(Ok(access("P00000000000000000001")), &capture).unwrap();
-
-        let duplicate = capture_admission(Ok(access("P00000000000000000002")), &capture)
-            .expect_err("duplicate capture must fail");
-        assert_eq!(duplicate.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(read_captured_admission(Arc::new(OnceLock::new())).is_err());
-    }
-
-    #[test]
-    fn concurrent_handshakes_use_connection_local_capture_cells() {
-        let capture_a = Arc::new(OnceLock::new());
-        let capture_b = Arc::new(OnceLock::new());
-
-        std::thread::scope(|scope| {
-            let capture_a = capture_a.clone();
-            scope.spawn(move || {
-                capture_admission(Ok(access("P00000000000000000001")), capture_a.as_ref()).unwrap();
-            });
-            let capture_b = capture_b.clone();
-            scope.spawn(move || {
-                capture_admission(Ok(access("P00000000000000000002")), capture_b.as_ref()).unwrap();
-            });
-        });
-
-        let CapturedAdmission::Access(access_a) = read_captured_admission(capture_a).unwrap()
-        else {
-            panic!("expected access capture")
-        };
-        let CapturedAdmission::Access(access_b) = read_captured_admission(capture_b).unwrap()
-        else {
-            panic!("expected access capture")
-        };
-        assert_eq!(
-            access_a.subject.principal_id.as_str(),
-            "P00000000000000000001"
-        );
-        assert_eq!(
-            access_b.subject.principal_id.as_str(),
-            "P00000000000000000002"
-        );
-    }
+    use super::*;
 
     #[test]
     fn access_deadline_uses_exact_expiry_boundary() {
         assert_eq!(
-            remaining_access_duration(101, std::time::Duration::from_millis(100_250)).unwrap(),
-            std::time::Duration::from_millis(750)
+            remaining_access_duration(101, Duration::from_millis(100_250)).unwrap(),
+            Duration::from_millis(750)
         );
-        assert!(remaining_access_duration(100, std::time::Duration::from_secs(100)).is_err());
-        assert!(remaining_access_duration(99, std::time::Duration::from_secs(100)).is_err());
-    }
-
-    #[tokio::test]
-    async fn access_expiry_hard_closes_socket_when_outbound_queue_is_full() {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let (server, shutdown_handle) = duplicate_shutdown_handle(server).unwrap();
-
-        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
-        outbound_tx
-            .try_send(Message::Ping(Vec::new().into()))
-            .unwrap();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let (expired_tx, mut expired_rx) = watch::channel(false);
-        let principal = AuthenticatedSessionPrincipal {
-            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
-            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
-            kind: PrincipalKind::Superuser,
-            role_key: None,
-            device_id: DeviceId::new("D00000000000000000001").unwrap(),
-            session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
-            access_jti: "J00000000000000000001".to_owned(),
-            access_expires_at_unix: 1,
-        };
-
-        let lease = tokio::spawn(enforce_access_lease(
-            shutdown_handle,
-            outbound_tx,
-            principal,
-            1,
-            Duration::from_millis(20),
-            Duration::from_millis(20),
-            cancel_rx,
-            expired_tx,
-        ));
-        expired_rx.changed().await.unwrap();
-        assert!(*expired_rx.borrow());
-
-        let mut byte = [0_u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
-            .await
-            .expect("socket must close at access expiry")
-            .unwrap();
-        assert_eq!(read, 0);
-
-        lease.await.unwrap();
-        assert!(outbound_rx.try_recv().is_ok());
-        drop(server);
+        assert!(remaining_access_duration(100, Duration::from_secs(100)).is_err());
+        assert!(remaining_access_duration(99, Duration::from_secs(100)).is_err());
     }
 
     #[test]
-    fn auth_abuse_limiter_bounds_parallel_attempts_and_tracks_ip_and_gateway_failures() {
-        let limiter = Arc::new(AuthAbuseLimiter::default());
-        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let permits = (0..MAX_AUTH_IN_FLIGHT_PER_ADDRESS)
-            .map(|_| limiter.try_acquire(address).expect("bounded permit"))
-            .collect::<Vec<_>>();
-        assert!(limiter.try_acquire(address).is_none());
-        drop(permits);
-
-        let first = limiter.try_acquire(address).expect("first failure permit");
-        first.record_failure();
-        drop(first);
-        let penalized = limiter.try_acquire(address).expect("penalized permit");
-        assert!(!penalized.penalty().is_zero());
-        penalized.record_success();
-        drop(penalized);
-        let gateway_penalized = limiter
-            .try_acquire(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
-            .expect("gateway-wide penalized permit");
-        assert!(!gateway_penalized.penalty().is_zero());
-        drop(gateway_penalized);
-
-        let mut state = limiter.state.lock().unwrap();
-        state.gateway_last_failure =
-            Some(Instant::now() - AUTH_FAILURE_STATE_TTL - Duration::from_millis(1));
-        drop(state);
-        let reset = limiter
-            .try_acquire(address)
-            .expect("expired penalty permit");
-        assert!(reset.penalty().is_zero());
-    }
-
-    fn access(principal_id: &str) -> CapturedAdmission {
-        CapturedAdmission::Access(AccessCredential {
-            subject: AccessJwtSubject {
-                gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
-                principal_id: PrincipalId::new(principal_id).unwrap(),
-                device_id: DeviceId::new("D00000000000000000001").unwrap(),
-                session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
-            },
-            jti: "J00000000000000000001".to_owned(),
-            issued_at_unix: 1,
-            expires_at_unix: 2,
-        })
-    }
-
-    fn restricted_refresh() -> CapturedAdmission {
-        let credential = format!(
-            "{}{}",
-            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
-            "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
+    fn access_warning_never_moves_expiry_deadline() {
+        assert_eq!(
+            remaining_access_warning_duration(Duration::from_secs(30), 10),
+            Duration::from_secs(20)
         );
-        CapturedAdmission::Restricted(RestrictedAdmission::new(
-            PresentedCredential::classify(&credential).unwrap(),
-            RestrictedAuthContext::Refresh(RefreshExchangeContext),
-        ))
+        assert_eq!(
+            remaining_access_warning_duration(Duration::from_secs(5), 10),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_backpressure_is_bounded_and_peer_drop_is_terminal() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Message::Text("first".into()))
+            .await
+            .expect("prime bounded queue");
+
+        let pending = send_outbound(&sender, Message::Text("second".into()));
+        tokio::pin!(pending);
+        assert!(pending.as_mut().now_or_never().is_none());
+        assert!(matches!(receiver.recv().await, Some(Message::Text(_))));
+        pending.await.expect("writer progress releases backpressure");
+
+        drop(receiver);
+        assert!(send_outbound(&sender, Message::Close(None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_is_deterministic_for_signal_and_owner_drop() {
+        let (signal_tx, mut signal_rx) = watch::channel(false);
+        signal_tx.send(true).unwrap();
+        wait_for_cancellation(&mut signal_rx).await;
+
+        let (owner_tx, mut owner_rx) = watch::channel(false);
+        drop(owner_tx);
+        wait_for_cancellation(&mut owner_rx).await;
+    }
+
+    #[tokio::test]
+    async fn access_lease_cancellation_releases_task_without_wall_clock_wait() {
+        let principal = AuthenticatedSessionPrincipal {
+            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000061").unwrap(),
+            principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000061").unwrap(),
+            kind: pioneer_protocol::PrincipalKind::Superuser,
+            role_key: None,
+            device_id: pioneer_protocol::DeviceId::new("D00000000000000000061").unwrap(),
+            session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000061").unwrap(),
+            access_jti: "J00000000000000000061".to_owned(),
+            access_expires_at_unix: 10_000,
+        };
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (expired_tx, expired_rx) = watch::channel(false);
+        let task = tokio::spawn(enforce_access_lease(
+            outbound_tx,
+            principal,
+            61,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            cancel_rx,
+            expired_tx,
+        ));
+
+        cancel_tx.send(true).unwrap();
+        task.await.unwrap();
+        assert!(!*expired_rx.borrow());
+        assert!(outbound_rx.try_recv().is_err());
     }
 }

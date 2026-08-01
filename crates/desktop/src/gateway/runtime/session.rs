@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use pioneer_client::{
+    gateway::endpoint::GatewayBaseUrl,
     gateway::runtime as client_gateway_runtime,
     gateway::session_lifecycle::{
         GatewaySessionMetadata, SessionLifecycle, SessionLifecycleEffect, SessionLifecycleEvent,
@@ -148,8 +149,8 @@ impl GatewayRuntime {
             endpoint_id,
             &mut refresh_slot,
             exchange_refresh,
-            |address, access_token, session_id| {
-                revoke_session_best_effort(address, access_token, session_id, cleanup_timeout)
+            |gateway_base_url, access_token, session_id| {
+                revoke_session_best_effort(gateway_base_url, access_token, session_id, cleanup_timeout)
             },
         )
     }
@@ -161,7 +162,11 @@ impl GatewayRuntime {
         refresh: F,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(&str, &str, Duration) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
+        F: FnOnce(
+            &GatewayBaseUrl,
+            &str,
+            Duration,
+        ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
     {
         if let Some(reason) = self.terminal_sessions.get(endpoint_id).copied() {
             return Ok(DesktopSessionPreparation::Terminal(
@@ -302,8 +307,12 @@ impl GatewayRuntime {
         cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(&str, &str, Duration) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
-        C: FnMut(&str, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
+        F: FnOnce(
+            &GatewayBaseUrl,
+            &str,
+            Duration,
+        ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
+        C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
     {
         let endpoint = self
             .endpoint_by_id(endpoint_id)
@@ -382,8 +391,12 @@ impl GatewayRuntime {
         mut cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(&str, &str, Duration) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
-        C: FnMut(&str, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
+        F: FnOnce(
+            &GatewayBaseUrl,
+            &str,
+            Duration,
+        ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
+        C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
     {
         let mut lifecycle = SessionLifecycle::default();
         let SessionLifecycleEffect::BeginRefresh { intent_id, .. } = lifecycle.reduce(
@@ -392,7 +405,7 @@ impl GatewayRuntime {
             bail!("shared session lifecycle did not request cold-start refresh");
         };
         let refresh = match refresh(
-            endpoint.address.as_str(),
+            &endpoint.gateway_base_url,
             stored.refresh_token.expose_secret(),
             self.timings.startup_timeout,
         ) {
@@ -430,7 +443,7 @@ impl GatewayRuntime {
             Ok(result) => result,
             Err(_) => {
                 let _ = cleanup_session(
-                    endpoint.address.as_str(),
+                    &endpoint.gateway_base_url,
                     cleanup_access.expose_secret(),
                     &cleanup_session_id,
                 );
@@ -468,7 +481,7 @@ impl GatewayRuntime {
         mut cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
-        C: FnMut(&str, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
+        C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
     {
         let next_metadata = metadata(&session);
         let SessionLifecycleEffect::PersistRefreshBeforeAccess { .. } =
@@ -486,7 +499,7 @@ impl GatewayRuntime {
             Some(format!("{} session", endpoint.name)),
         ) {
             let _ = cleanup_session(
-                endpoint.address.as_str(),
+                &endpoint.gateway_base_url,
                 access.access_token.expose_secret(),
                 &session.session_id,
             );
@@ -532,7 +545,7 @@ impl GatewayRuntime {
                 endpoint_id: endpoint.id,
                 endpoint_name: endpoint.name,
                 endpoint_kind: endpoint.kind,
-                address: endpoint.address,
+                gateway_base_url: endpoint.gateway_base_url,
                 identity: GatewayWsSessionIdentity {
                     server_gateway_id: session.gateway_id,
                     session_id: session.session_id,
@@ -581,7 +594,7 @@ impl GatewayRuntime {
 }
 
 fn exchange_refresh(
-    address: &str,
+    gateway_base_url: &GatewayBaseUrl,
     credential: &str,
     timeout: Duration,
 ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError> {
@@ -594,7 +607,7 @@ fn exchange_refresh(
             message: "failed to initialize desktop refresh runtime".to_owned(),
         })?;
     runtime.block_on(AuthExchangeClient::new(timeout).refresh(
-        address,
+        gateway_base_url,
         credential,
         AuthRefreshParams {
             refresh_request_id: generate_id(pioneer_protocol::REQUEST_ID_LEN),
@@ -798,7 +811,11 @@ mod tests {
         let local = registry.local.as_mut().unwrap();
         local.id = endpoint_id.clone();
         local.kind = GatewayEndpointKind::Local;
-        local.address = "ws://localhost:17878".to_owned();
+        local.gateway_base_url =
+            pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "http://localhost:17878",
+            )
+            .unwrap();
         local.session_ref = Some(endpoint_id.clone());
         local.server_gateway_id = Some(gateway_id());
         registry.active_gateway_id = Some(endpoint_id.clone());
@@ -814,7 +831,6 @@ mod tests {
                 ws_timings,
                 registry_path: std::env::temp_dir().join("unused-session-runtime-registry"),
                 registry,
-                registry_upgrade_pending: false,
                 secrets,
                 terminal_sessions: HashMap::new(),
                 access_expiries: HashMap::new(),
@@ -1022,7 +1038,6 @@ mod tests {
             ws_timings: first.ws_timings,
             registry_path: first.registry_path.clone(),
             registry: first.registry.clone(),
-            registry_upgrade_pending: false,
             secrets: DesktopSecrets::new(store),
             terminal_sessions: HashMap::new(),
             access_expiries: HashMap::new(),
@@ -1217,7 +1232,6 @@ mod tests {
             ws_timings: first.ws_timings,
             registry_path: first.registry_path.clone(),
             registry: first.registry.clone(),
-            registry_upgrade_pending: false,
             secrets: DesktopSecrets::new(store),
             terminal_sessions: HashMap::new(),
             access_expiries: HashMap::new(),

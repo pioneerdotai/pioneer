@@ -10,6 +10,8 @@ mod code_highlight;
 mod components;
 mod gateway;
 mod menu;
+#[cfg(test)]
+mod tests;
 mod settings;
 mod state;
 mod theme;
@@ -192,32 +194,5 @@ fn print_version_probe(probe: VersionProbe) {
                 "version": env!("CARGO_PKG_VERSION"),
             })
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{VersionProbe, version_probe_from_args};
-
-    #[test]
-    fn version_probe_does_not_require_window_startup() {
-        assert_eq!(
-            version_probe_from_args(["--version".to_owned()]),
-            Some(VersionProbe::Plain)
-        );
-        assert_eq!(
-            version_probe_from_args(["-V".to_owned()]),
-            Some(VersionProbe::Plain)
-        );
-        assert_eq!(
-            version_probe_from_args(["--version".to_owned(), "--json".to_owned()]),
-            Some(VersionProbe::Json)
-        );
-        assert_eq!(
-            version_probe_from_args(["--json".to_owned(), "-V".to_owned()]),
-            Some(VersionProbe::Json)
-        );
-        assert_eq!(version_probe_from_args(["--help".to_owned()]), None);
-        assert_eq!(version_probe_from_args(Vec::<String>::new()), None);
     }
 }

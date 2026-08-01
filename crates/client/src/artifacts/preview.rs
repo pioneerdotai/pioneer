@@ -1,19 +1,24 @@
-//! Artifact preview state and cache helpers.
+//! Artifact preview state, authenticated HTTP projection reads, and cache helpers.
 
 use crate::artifacts::actions::{ArtifactVersionKey, artifact_version_key};
-use anyhow::{Context as _, Result, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use pioneer_protocol::{
-    ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactReadParams,
-    ArtifactReadResponse, ArtifactRef,
+use crate::artifacts::http_download::encode_path_segment;
+use crate::transport::http::{
+    GatewayHttpError, GatewayHttpRequest, GatewayHttpResponse, GatewayHttpSession,
 };
+use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
+use pioneer_protocol::{
+    ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactRef,
+};
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
+use tokio_util::sync::CancellationToken;
 
 pub const ARTIFACT_PREVIEW_MAX_BYTES: u64 = 512 * 1024;
 pub const ARTIFACT_PREVIEW_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -31,6 +36,123 @@ pub struct ArtifactPreviewImagePaths {
 pub struct ArtifactPreviewReadData {
     pub bytes: Vec<u8>,
     pub sha256: String,
+}
+
+#[async_trait]
+trait ArtifactPreviewHttp: Send + Sync {
+    async fn execute(
+        &self,
+        request: GatewayHttpRequest,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<GatewayHttpResponse, GatewayHttpError>;
+}
+
+#[async_trait]
+impl ArtifactPreviewHttp for GatewayHttpSession {
+    async fn execute(
+        &self,
+        request: GatewayHttpRequest,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<GatewayHttpResponse, GatewayHttpError> {
+        GatewayHttpSession::execute(self, request, cancellation).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ArtifactHttpPreviewService {
+    http: Arc<dyn ArtifactPreviewHttp>,
+}
+
+impl ArtifactHttpPreviewService {
+    pub fn new(http: GatewayHttpSession) -> Self {
+        Self {
+            http: Arc::new(http),
+        }
+    }
+
+    pub async fn fetch_thumbnail(
+        &self,
+        workspace_id: &str,
+        artifact: &ArtifactRef,
+        cancellation: CancellationToken,
+    ) -> Result<ArtifactPreviewReadData> {
+        let preview = thumbnail_preview(artifact)
+            .ok_or_else(|| anyhow::anyhow!("artifact has no ready thumbnail projection"))?;
+        let version_id = artifact
+            .version_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("artifact thumbnail requires an exact version"))?;
+        for (field, value) in [
+            ("workspace_id", workspace_id),
+            ("artifact_id", artifact.artifact_id.as_str()),
+            ("version_id", version_id),
+        ] {
+            if value.trim().is_empty() || value.len() > 512 || value.contains('\0') {
+                bail!("invalid {field} for artifact thumbnail");
+            }
+        }
+        let expected_size = preview
+            .size_bytes
+            .filter(|size| *size > 0 && *size <= ARTIFACT_PREVIEW_MAX_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("artifact thumbnail size is invalid"))?;
+        let expected_sha256 = preview
+            .sha256
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .filter(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| anyhow::anyhow!("artifact thumbnail sha256 is invalid"))?;
+        let path = format!(
+            "storage/workspaces/{}/artifacts/{}/versions/{}/projections/thumbnail",
+            encode_path_segment(workspace_id),
+            encode_path_segment(artifact.artifact_id.as_str()),
+            encode_path_segment(version_id),
+        );
+        let mut response = self
+            .http
+            .execute(GatewayHttpRequest::get(path)?, cancellation.clone())
+            .await?;
+        let expected_etag = format!("\"sha256-{expected_sha256}\"");
+        if response.head.status != 200
+            || response.head.content_length != Some(expected_size)
+            || response.head.etag.as_deref() != Some(expected_etag.as_str())
+            || preview.mime_type.as_deref().is_some_and(|expected| {
+                response.head.content_type.as_deref() != Some(expected)
+            })
+        {
+            bail!("artifact thumbnail response metadata mismatch");
+        }
+
+        let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or_default());
+        while let Some(chunk) = response.body.next_chunk().await {
+            let chunk = chunk?;
+            if cancellation.is_cancelled()
+                || bytes.len().saturating_add(chunk.len())
+                    > usize::try_from(expected_size).unwrap_or(usize::MAX)
+            {
+                bail!("artifact thumbnail response exceeded its immutable size");
+            }
+            bytes.extend_from_slice(chunk.as_slice());
+        }
+        if bytes.len() as u64 != expected_size {
+            bail!("artifact thumbnail response length mismatch");
+        }
+        let actual_sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
+        if actual_sha256 != expected_sha256 {
+            bail!("artifact thumbnail sha256 mismatch");
+        }
+        Ok(ArtifactPreviewReadData {
+            bytes,
+            sha256: expected_sha256,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_http(http: Arc<dyn ArtifactPreviewHttp>) -> Self {
+        Self { http }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,58 +252,13 @@ pub fn thumbnail_preview(artifact: &ArtifactRef) -> Option<&ArtifactPreviewRef> 
     }
 }
 
-pub fn artifact_thumbnail_read_params(
-    workspace_id: impl Into<String>,
-    artifact: &ArtifactRef,
-    max_bytes: u64,
-) -> ArtifactReadParams {
-    ArtifactReadParams {
-        workspace_id: workspace_id.into(),
-        artifact_id: artifact.artifact_id.clone(),
-        version_id: artifact.version_id.clone(),
-        projection_kind: Some(ArtifactProjectionKind::Thumbnail),
-        offset: Some(0),
-        max_bytes: Some(max_bytes),
-    }
-}
-
-pub fn decode_artifact_preview_read_response(
-    response: &ArtifactReadResponse,
-    expected_sha256: Option<&str>,
-) -> Result<ArtifactPreviewReadData> {
-    if response.truncated {
-        bail!("artifact thumbnail preview read was truncated");
-    }
-    if response.len == 0 {
-        bail!("artifact thumbnail preview was empty");
-    }
-    if expected_sha256.is_some_and(|sha256| sha256 != response.sha256) {
-        bail!("artifact thumbnail preview sha256 mismatch");
-    }
-
-    let bytes = BASE64
-        .decode(response.content_base64.as_bytes())
-        .context("failed to decode artifact thumbnail preview")?;
-    let decoded_len = u64::try_from(bytes.len()).unwrap_or_default();
-    if decoded_len != response.len || decoded_len != response.total_size_bytes {
-        bail!("artifact thumbnail preview length mismatch");
-    }
-
-    Ok(ArtifactPreviewReadData {
-        bytes,
-        sha256: response.sha256.clone(),
-    })
-}
-
 pub fn write_artifact_preview_cache_files<R: ArtifactPreviewImageRenderer>(
     renderer: &R,
     runtime_home: &Path,
     workspace_id: &str,
     artifact: &ArtifactRef,
-    expected_sha256: Option<&str>,
-    response: &ArtifactReadResponse,
+    preview_data: &ArtifactPreviewReadData,
 ) -> Result<ArtifactPreviewImagePaths> {
-    let preview_data = decode_artifact_preview_read_response(response, expected_sha256)?;
     let image_paths = artifact_preview_cache_paths(
         runtime_home,
         workspace_id,
@@ -451,7 +528,10 @@ mod tests {
         ArtifactKind, ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus,
         ArtifactStatus,
     };
-    use std::cell::RefCell;
+    use crate::transport::http::{
+        GatewayHttpBody, GatewayHttpMethod, GatewayHttpResponseHead,
+    };
+    use std::{cell::RefCell, sync::Mutex as StdMutex};
 
     #[test]
     fn artifact_preview_cache_prune_keeps_cache_under_size_limit() {
@@ -511,42 +591,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn artifact_preview_read_response_decodes_and_validates_content() {
-        let bytes = b"preview bytes";
-        let response = ArtifactReadResponse {
-            artifact: preview_artifact("art_preview"),
-            offset: 0,
-            len: bytes.len() as u64,
-            total_size_bytes: bytes.len() as u64,
-            sha256: "thumb_sha".to_owned(),
-            content_base64: BASE64.encode(bytes.as_slice()),
-            truncated: false,
-        };
+    #[tokio::test]
+    async fn artifact_preview_fetches_exact_authenticated_http_projection() {
+        let bytes = b"preview bytes".to_vec();
+        let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
+        let mut artifact = preview_artifact("art/preview");
+        let preview = artifact.preview.as_mut().expect("preview");
+        preview.size_bytes = Some(bytes.len() as u64);
+        preview.sha256 = Some(sha256.clone());
+        let http = Arc::new(FakePreviewHttp::new(GatewayHttpResponse {
+            head: GatewayHttpResponseHead {
+                status: 200,
+                request_id: Some("request-preview".to_owned()),
+                etag: Some(format!("\"sha256-{sha256}\"")),
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                content_type: Some("image/png".to_owned()),
+                content_disposition: Some("inline".to_owned()),
+            },
+            body: GatewayHttpBody::from_test_chunks(
+                vec![Ok(bytes.clone())],
+                CancellationToken::new(),
+            ),
+        }));
+        let service = ArtifactHttpPreviewService::with_http(http.clone());
 
-        let decoded = decode_artifact_preview_read_response(&response, Some("thumb_sha"))
-            .expect("decode preview response");
+        let result = service
+            .fetch_thumbnail("ws preview", &artifact, CancellationToken::new())
+            .await
+            .expect("HTTP preview");
 
-        assert_eq!(decoded.bytes, bytes);
-        assert_eq!(decoded.sha256, "thumb_sha");
-
-        let mismatch = decode_artifact_preview_read_response(&response, Some("different_sha"))
-            .expect_err("sha mismatch");
-        assert!(mismatch.to_string().contains("sha256 mismatch"));
+        assert_eq!(result.bytes, bytes);
+        assert_eq!(result.sha256, sha256);
+        assert_eq!(
+            http.requests(),
+            vec![(
+                GatewayHttpMethod::Get,
+                "storage/workspaces/ws%20preview/artifacts/art%2Fpreview/versions/v1/projections/thumbnail"
+                    .to_owned(),
+            )]
+        );
     }
 
     #[test]
     fn artifact_preview_cache_writer_uses_shared_paths_and_variant_sizes() {
         let temp = tempfile::tempdir().expect("temp dir");
         let artifact = preview_artifact("art_preview");
-        let response = ArtifactReadResponse {
-            artifact: artifact.clone(),
-            offset: 0,
-            len: 13,
-            total_size_bytes: 13,
+        let preview_data = ArtifactPreviewReadData {
+            bytes: b"preview bytes".to_vec(),
             sha256: "thumb_sha".to_owned(),
-            content_base64: BASE64.encode(b"preview bytes"),
-            truncated: false,
         };
         let renderer = FakePreviewRenderer::default();
 
@@ -555,8 +648,7 @@ mod tests {
             temp.path(),
             "ws",
             &artifact,
-            Some("thumb_sha"),
-            &response,
+            &preview_data,
         )
         .expect("write preview cache");
 
@@ -610,6 +702,43 @@ mod tests {
     #[derive(Default)]
     struct FakePreviewRenderer {
         calls: RefCell<Vec<(PathBuf, u32, u32)>>,
+    }
+
+    struct FakePreviewHttp {
+        response: StdMutex<Option<GatewayHttpResponse>>,
+        requests: StdMutex<Vec<(GatewayHttpMethod, String)>>,
+    }
+
+    impl FakePreviewHttp {
+        fn new(response: GatewayHttpResponse) -> Self {
+            Self {
+                response: StdMutex::new(Some(response)),
+                requests: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<(GatewayHttpMethod, String)> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactPreviewHttp for FakePreviewHttp {
+        async fn execute(
+            &self,
+            request: GatewayHttpRequest,
+            _cancellation: CancellationToken,
+        ) -> std::result::Result<GatewayHttpResponse, GatewayHttpError> {
+            self.requests.lock().expect("requests lock").push((
+                request.method(),
+                request.storage_path().to_owned(),
+            ));
+            self.response
+                .lock()
+                .expect("response lock")
+                .take()
+                .ok_or(GatewayHttpError::InvalidResponse)
+        }
     }
 
     impl ArtifactPreviewImageRenderer for FakePreviewRenderer {

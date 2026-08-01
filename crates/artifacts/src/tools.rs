@@ -3,14 +3,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
     ArtifactCreatedNotification, ArtifactKind, ArtifactPrepareKind, ArtifactPrepareParams,
     ArtifactPrepareResponse, ArtifactProjectionKind, ArtifactProjectionUpdatedNotification,
-    ArtifactReadParams, ArtifactRegisterParams, ArtifactRegisterResponse, ArtifactRole,
-    ArtifactSummary, ThreadArtifactsChangedNotification, constants::events,
+    ArtifactRegisterParams, ArtifactRegisterResponse, ArtifactRole, ArtifactSummary,
+    ThreadArtifactsChangedNotification, constants::events,
 };
 use pioneer_provider::AttachmentDataSource;
 use pioneer_tools::{
@@ -25,8 +24,9 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactProjectionRecord, ArtifactRegistrationCandidate, ArtifactRegistrationContext,
-    ArtifactRegistrationSource, ArtifactService, PIONEER_ARTIFACT_OUTPUT_DIR_ENV,
+    ArtifactBoundedReadRequest, ArtifactProjectionRecord, ArtifactRegistrationCandidate,
+    ArtifactRegistrationContext, ArtifactRegistrationSource, ArtifactService,
+    PIONEER_ARTIFACT_OUTPUT_DIR_ENV,
     mime::display_name_with_mime_extension,
 };
 
@@ -360,8 +360,8 @@ impl ArtifactToolHandler {
         let projection_kind = input.projection_kind;
         let response = self
             .artifact_service
-            .read_artifact(
-                ArtifactReadParams {
+            .read_bounded_artifact(
+                ArtifactBoundedReadRequest {
                     workspace_id: self.context.workspace_id.clone(),
                     artifact_id: input.artifact_id,
                     version_id: input.version_id,
@@ -374,16 +374,11 @@ impl ArtifactToolHandler {
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
-        let bytes = BASE64
-            .decode(response.content_base64.as_bytes())
-            .map_err(|error| {
-                ToolError::internal(format!("failed to decode artifact bytes: {error}"))
-            })?;
         let text = artifact_read_text(
             response.artifact.kind,
             response.artifact.mime_type.as_deref(),
             projection_kind,
-            bytes.as_slice(),
+            response.bytes.as_slice(),
         );
         let attachment = if text.is_none() {
             Some(
@@ -2186,6 +2181,55 @@ mod tests {
             artifact_read_text(ArtifactKind::Image, Some("image/jpeg"), None, b"jpeg"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_read_tool_uses_domain_bounded_bytes_without_client_rpc_dto() {
+        let service = Arc::new(artifact_register_service(temp_output_dir("read-runtime")).await);
+        let summary = service
+            .ingest_bytes(crate::IngestArtifactBytesRequest {
+                workspace_id: "ws_artifact_register".to_owned(),
+                primary_thread_id: Some("thr_artifact_register".to_owned()),
+                bytes: b"hello bounded artifact".to_vec(),
+                display_name: "bounded.txt".to_owned(),
+                kind: ArtifactKind::Text,
+                mime_type: Some("text/plain".to_owned()),
+                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Agent,
+                created_by_actor_id: Some("agent_test".to_owned()),
+                binding: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("ingest bounded artifact");
+        let handler = ArtifactToolHandler::new(
+            service,
+            artifact_register_context(),
+            Arc::new(ArtifactToolState::default()),
+            Arc::new(NoopArtifactToolNotificationSink),
+        );
+        let mut read = invocation(
+            None,
+            serde_json::json!({
+                "artifactId": summary.artifact.artifact_id,
+                "offset": 6,
+                "maxBytes": 7
+            }),
+            "call_read",
+        );
+        read.tool_name = ARTIFACT_READ_TOOL.to_owned();
+
+        let output = handler
+            .handle(read, trace())
+            .await
+            .expect("bounded artifact read")
+            .raw_json();
+
+        assert_eq!(output["offset"], 6);
+        assert_eq!(output["len"], 7);
+        assert_eq!(output["text"], "bounded");
+        assert_eq!(output["nextOffset"], 13);
+        assert_eq!(output["truncated"], true);
+        assert!(output.get("content_base64").is_none());
     }
 
     #[test]

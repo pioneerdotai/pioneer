@@ -6,10 +6,37 @@
       "type": "string",
       "enum": [
         "Queued",
-        "Downloading",
         "Verifying",
         "Opening",
         "Revealing"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Downloading": {
+          "type": "object",
+          "properties": {
+            "downloaded_bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "downloaded_bytes",
+            "total_bytes"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Downloading"
       ]
     },
     {

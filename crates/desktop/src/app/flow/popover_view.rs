@@ -32,7 +32,7 @@ impl PioneerDesktop {
             .or_else(|| gateway_endpoints.first());
 
         let gateway_trigger_label = active_gateway
-            .map(|endpoint| format!("{} ({})", endpoint.name, endpoint.address))
+            .map(|endpoint| format!("{} ({})", endpoint.name, endpoint.gateway_base_url))
             .unwrap_or_else(|| t!("gateway.status.connecting").to_string());
 
         let gateway_hover_status = self.gateway.status.clone();
@@ -248,19 +248,19 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
-        let endpoint_address = endpoint.address.clone();
+        let endpoint_address = endpoint.gateway_base_url.clone();
         let requires_reauthentication = endpoint.kind == GatewayEndpointKind::Remote
             && endpoint.session_ref.is_none()
             && endpoint.server_gateway_id.is_none();
         let subtitle = match endpoint.kind {
             GatewayEndpointKind::Local => t!(
                 "gateway.endpoint.local_with_address",
-                address = endpoint_address
+                gateway_base_url = endpoint_address
             )
             .to_string(),
             GatewayEndpointKind::Remote => t!(
                 "gateway.endpoint.remote_with_address",
-                address = endpoint_address
+                gateway_base_url = endpoint_address
             )
             .to_string(),
         };

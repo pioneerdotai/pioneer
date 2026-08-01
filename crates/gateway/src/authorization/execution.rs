@@ -1223,7 +1223,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_context_revalidates_current_session_and_acl() {
-        use crate::authorization_test_support::{IsolatedEpic4Harness, MEMBER_A_ID};
+        use crate::tests::authorization::{IsolatedEpic4Harness, MEMBER_A_ID};
         use sea_orm::ConnectionTrait;
 
         let harness = IsolatedEpic4Harness::new()
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_context_rejects_revoked_initiating_session() {
-        use crate::authorization_test_support::{
+        use crate::tests::authorization::{
             IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID,
         };
         use sea_orm::ConnectionTrait;

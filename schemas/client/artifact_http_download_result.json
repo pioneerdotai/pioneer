@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactHttpDownloadResult",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "local_path": {
+      "$ref": "#/$defs/ClientPath"
+    },
+    "sha256": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "version_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "local_path",
+    "artifact_id",
+    "version_id",
+    "size_bytes",
+    "sha256"
+  ],
+  "$defs": {
+    "ClientPath": {
+      "type": "string"
+    }
+  }
+}

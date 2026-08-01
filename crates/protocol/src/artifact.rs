@@ -98,6 +98,13 @@ pub enum ArtifactProjectionStatus {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ArtifactViewGrantDisposition {
+    Inline,
+    Attachment,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactUploadSourceKind {
     UserComposer,
     DragDrop,
@@ -252,7 +259,6 @@ pub struct ArtifactCapabilitiesParams {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactCapabilitiesResponse {
     pub upload: ArtifactUploadCapabilities,
-    pub download: ArtifactDownloadCapabilities,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -262,13 +268,6 @@ pub struct ArtifactUploadCapabilities {
     pub max_chunk_size_bytes: u64,
     pub max_file_size_bytes: u64,
     pub max_files_per_turn: u64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadCapabilities {
-    pub recommended_chunk_size_bytes: u64,
-    pub max_chunk_size_bytes: u64,
-    pub max_concurrent_downloads: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
@@ -320,28 +319,23 @@ pub struct ArtifactGetResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactReadParams {
+pub struct ArtifactViewGrantCreateParams {
+    #[schemars(length(min = 1, max = 128))]
     pub workspace_id: String,
+    #[schemars(length(min = 1, max = 128))]
     pub artifact_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version_id: Option<String>,
+    #[schemars(length(min = 1, max = 128))]
+    pub version_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_kind: Option<ArtifactProjectionKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bytes: Option<u64>,
+    pub disposition: ArtifactViewGrantDisposition,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactReadResponse {
-    pub artifact: ArtifactRef,
-    pub offset: u64,
-    pub len: u64,
-    pub total_size_bytes: u64,
-    pub sha256: String,
-    pub content_base64: String,
-    pub truncated: bool,
+pub struct ArtifactViewGrantCreateResponse {
+    #[schemars(length(min = 58, max = 58))]
+    pub relative_url: String,
+    pub expires_at: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -410,81 +404,6 @@ pub struct ArtifactUploadAbortParams {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactUploadAbortResponse {
     pub upload_id: String,
-    pub status: String,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadStartParams {
-    pub workspace_id: String,
-    pub artifact_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preferred_chunk_size_bytes: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadStartResponse {
-    pub download_id: String,
-    pub artifact: ArtifactRef,
-    pub file_name: String,
-    pub size_bytes: u64,
-    pub sha256: String,
-    pub recommended_chunk_size_bytes: u64,
-    pub max_chunk_size_bytes: u64,
-    pub expires_at_unix: i64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadChunkParams {
-    pub workspace_id: String,
-    pub download_id: String,
-    pub offset: u64,
-    pub len: u64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadChunkHeader {
-    pub workspace_id: String,
-    pub download_id: String,
-    pub artifact_id: String,
-    pub version_id: String,
-    pub offset: u64,
-    pub len: u64,
-    pub total_size_bytes: u64,
-    pub chunk_sha256: String,
-    pub final_chunk: bool,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadChunkResponse {
-    pub download_id: String,
-    pub offset: u64,
-    pub len: u64,
-    pub queued: bool,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadFinishParams {
-    pub workspace_id: String,
-    pub download_id: String,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadFinishResponse {
-    pub download_id: String,
-    pub status: String,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadAbortParams {
-    pub workspace_id: String,
-    pub download_id: String,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadAbortResponse {
-    pub download_id: String,
     pub status: String,
 }
 
@@ -594,15 +513,6 @@ pub struct ArtifactUploadProgressNotification {
     pub next_offset: u64,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactDownloadProgressNotification {
-    pub workspace_id: String,
-    pub download_id: String,
-    pub artifact_id: String,
-    pub received_bytes: u64,
-    pub total_size_bytes: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_and_download_chunk_headers_round_trip() {
+    fn upload_chunk_header_round_trips() {
         let upload = ArtifactUploadChunkHeader {
             workspace_id: "ws_1".to_owned(),
             upload_id: "up_1".to_owned(),
@@ -654,30 +564,15 @@ mod tests {
             upload
         );
 
-        let download = ArtifactDownloadChunkHeader {
-            workspace_id: "ws_1".to_owned(),
-            download_id: "dl_1".to_owned(),
-            artifact_id: "art_1".to_owned(),
-            version_id: "av_1".to_owned(),
-            offset: 0,
-            len: 7,
-            total_size_bytes: 7,
-            chunk_sha256: "c".repeat(64),
-            final_chunk: true,
-        };
-        let download_json = serde_json::to_value(&download).expect("download header encode");
-        assert_eq!(download_json["download_id"], json!("dl_1"));
-        assert_eq!(download_json["final_chunk"], json!(true));
-        assert_eq!(
-            serde_json::from_value::<ArtifactDownloadChunkHeader>(download_json)
-                .expect("download header decode"),
-            download
-        );
     }
 
     #[test]
     fn constants_include_artifact_methods_and_events() {
         assert_eq!(constants::methods::ARTIFACT_LIST, "artifact/list");
+        assert_eq!(
+            constants::methods::ARTIFACT_VIEW_GRANT_CREATE,
+            "artifact/view_grant/create"
+        );
         assert_eq!(
             constants::methods::ARTIFACT_LIST_FOR_THREAD,
             "artifact/list/thread"
@@ -694,10 +589,6 @@ mod tests {
             constants::methods::ARTIFACT_UPLOAD_START,
             "artifact/upload/start"
         );
-        assert_eq!(
-            constants::methods::ARTIFACT_DOWNLOAD_CHUNK,
-            "artifact/download/chunk"
-        );
         assert_eq!(constants::events::ARTIFACT_CREATED, "artifact/created");
         assert_eq!(
             constants::events::THREAD_ARTIFACTS_CHANGED,
@@ -711,10 +602,35 @@ mod tests {
             constants::events::ARTIFACT_UPLOAD_PROGRESS,
             "artifact/upload/progress"
         );
+    }
+
+    #[test]
+    fn view_grant_contract_requires_exact_version_and_relative_url() {
+        let params = ArtifactViewGrantCreateParams {
+            workspace_id: "workspace-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            version_id: "version-1".to_owned(),
+            projection_kind: Some(ArtifactProjectionKind::Thumbnail),
+            disposition: ArtifactViewGrantDisposition::Inline,
+        };
+        let encoded = serde_json::to_value(&params).unwrap();
+        assert_eq!(encoded["version_id"], "version-1");
+        assert_eq!(encoded["disposition"], "inline");
         assert_eq!(
-            constants::events::ARTIFACT_DOWNLOAD_PROGRESS,
-            "artifact/download/progress"
+            serde_json::from_value::<ArtifactViewGrantCreateParams>(encoded).unwrap(),
+            params
         );
+
+        let response = ArtifactViewGrantCreateResponse {
+            relative_url: format!("/storage/views/{}", "a".repeat(43)),
+            expires_at: 1_180,
+        };
+        let response_json = serde_json::to_value(&response).unwrap();
+        assert!(response_json["relative_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("/storage/views/"));
+        assert_eq!(response_json["expires_at"], 1_180);
     }
 
     #[test]
@@ -732,10 +648,7 @@ mod tests {
             "artifact_upload_start_params.json",
             "artifact_upload_chunk_header.json",
             "artifact_upload_chunk_ack_notification.json",
-            "artifact_download_start_params.json",
-            "artifact_download_chunk_header.json",
             "artifact_created_notification.json",
-            "artifact_download_progress_notification.json",
         ] {
             assert!(
                 schema_names.iter().any(|name| *name == expected),

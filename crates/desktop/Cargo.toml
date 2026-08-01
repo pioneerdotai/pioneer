@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 pioneer-config.workspace = true
@@ -31,6 +32,7 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 rust-i18n.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 sys-locale.workspace = true

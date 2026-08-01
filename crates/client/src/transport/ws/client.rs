@@ -3,14 +3,10 @@
 use super::{
     GatewayWsConnectSpec, GatewayWsEvent,
     decode::{
-        fail_pending_artifact_download_chunks, fail_pending_artifact_upload_chunks,
-        fail_pending_requests, fail_pending_upload_chunks, process_text_payload, upload_ack_key,
+        fail_pending_artifact_upload_chunks, fail_pending_requests, fail_pending_upload_chunks,
+        process_text_payload, upload_ack_key,
     },
-    download::{
-        ArtifactDownloadChunkPayload, artifact_download_chunk_key,
-        process_artifact_download_binary_frame,
-    },
-    rpc::{build_ws_request, normalize_ws_url},
+    rpc::build_ws_request,
     worker::{
         WEBSOCKET_CLOSED_BY_PEER_MESSAGE, WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE,
         WEBSOCKET_PONG_TIMEOUT_MESSAGE, WEBSOCKET_STREAM_ENDED_MESSAGE, connect_failed_event,
@@ -69,12 +65,6 @@ pub enum GatewayWsCommand {
     VoiceBinaryChunk {
         payload: Vec<u8>,
     },
-    ArtifactDownloadRegisterChunk {
-        download_id: String,
-        offset: u64,
-        response_tx: Sender<std::result::Result<ArtifactDownloadChunkPayload, String>>,
-        registered_tx: Sender<std::result::Result<(), String>>,
-    },
     Disconnect,
     Shutdown,
 }
@@ -99,12 +89,6 @@ enum ConnectionRpcCommand {
     },
     VoiceBinaryChunk {
         payload: Vec<u8>,
-    },
-    ArtifactDownloadRegisterChunk {
-        download_id: String,
-        offset: u64,
-        response_tx: Sender<std::result::Result<ArtifactDownloadChunkPayload, String>>,
-        registered_tx: Sender<std::result::Result<(), String>>,
     },
 }
 
@@ -281,32 +265,6 @@ async fn run_worker(
                     .rpc_tx
                     .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });
             }
-            GatewayWsCommand::ArtifactDownloadRegisterChunk {
-                download_id,
-                offset,
-                response_tx,
-                registered_tx,
-            } => {
-                let Some(connection_task) = connection_task.as_mut() else {
-                    let _ = registered_tx.send(Err("websocket is not connected".to_owned()));
-                    continue;
-                };
-
-                let fallback_tx = registered_tx.clone();
-                if connection_task
-                    .rpc_tx
-                    .send(ConnectionRpcCommand::ArtifactDownloadRegisterChunk {
-                        download_id,
-                        offset,
-                        response_tx,
-                        registered_tx,
-                    })
-                    .is_err()
-                {
-                    let _ = fallback_tx
-                        .send(Err("websocket connection task is unavailable".to_owned()));
-                }
-            }
             GatewayWsCommand::Disconnect => {
                 abort_connection_task(&mut connection_task).await;
             }
@@ -427,9 +385,8 @@ type GatewayWebSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_websocket(spec: &GatewayWsConnectSpec) -> Result<GatewayWebSocket> {
-    let ws_url = normalize_ws_url(spec.address.as_str());
     let request = build_ws_request(
-        ws_url.as_str(),
+        &spec.gateway_base_url,
         spec.auth_token
             .as_ref()
             .map(AuthSecretString::expose_secret),
@@ -458,7 +415,6 @@ async fn monitor_connection(
     let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
-    let mut pending_artifact_download_chunks = HashMap::new();
 
     let disconnect_reason = loop {
         tokio::select! {
@@ -510,11 +466,6 @@ async fn monitor_connection(
                             break format!("websocket voice binary write failed: {error}");
                         }
                     }
-                    Some(ConnectionRpcCommand::ArtifactDownloadRegisterChunk { download_id, offset, response_tx, registered_tx }) => {
-                        let key = artifact_download_chunk_key(download_id.as_str(), offset);
-                        pending_artifact_download_chunks.insert(key, response_tx);
-                        let _ = registered_tx.send(Ok(()));
-                    }
                     None => {
                         break WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned();
                     }
@@ -556,12 +507,7 @@ async fn monitor_connection(
                             break notification.reason.as_str().to_owned();
                         }
                     }
-                    Some(Ok(Message::Binary(payload))) => {
-                        let _ = process_artifact_download_binary_frame(
-                            payload.as_ref(),
-                            &mut pending_artifact_download_chunks,
-                        );
-                    }
+                    Some(Ok(Message::Binary(_))) => {}
                     Some(Ok(Message::Frame(_))) => {}
                     Some(Err(error)) => {
                         break websocket_read_failed_message(error);
@@ -580,10 +526,6 @@ async fn monitor_connection(
         &mut pending_artifact_upload_chunks,
         disconnect_reason.as_str(),
     );
-    fail_pending_artifact_download_chunks(
-        &mut pending_artifact_download_chunks,
-        disconnect_reason.as_str(),
-    );
     disconnect_reason
 }
 
@@ -596,9 +538,10 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     #[test]
+    #[ignore = "opens a real listener; excluded from the hermetic test suite"]
     fn ws_client_worker_connects_and_emits_events() {
-        let address = reserve_unused_local_address();
-        let server = TestWsServer::start(address.clone());
+        let gateway_base_url = reserve_unused_local_address();
+        let server = TestWsServer::start(gateway_base_url.clone());
         let (command_tx, command_rx) = unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         spawn_worker(command_rx, event_tx);
@@ -607,7 +550,7 @@ mod tests {
         command_tx
             .send(GatewayWsCommand::Connect {
                 connection_id: 7,
-                spec: connect_spec(address),
+                spec: connect_spec(gateway_base_url),
                 initial_result_tx: Some(initial_tx),
                 retry_initial_failure: false,
             })
@@ -647,12 +590,15 @@ mod tests {
         server.join();
     }
 
-    fn connect_spec(address: String) -> GatewayWsConnectSpec {
+    fn connect_spec(gateway_base_url: String) -> GatewayWsConnectSpec {
         GatewayWsConnectSpec {
             endpoint_id: "local".to_owned(),
             endpoint_name: "Local".to_owned(),
             endpoint_kind: GatewayEndpointKind::Local,
-            address,
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                gateway_base_url.as_str(),
+            )
+            .unwrap(),
             auth_token: None,
             session: None,
             timings: GatewayWsTimings::from_millis(500, 200, 1_000, 10, 50, 0).expect("timings"),
@@ -669,12 +615,12 @@ mod tests {
     }
 
     impl TestWsServer {
-        fn start(address: String) -> Self {
+        fn start(gateway_base_url: String) -> Self {
             let (ready_tx, ready_rx) = mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let runtime = Runtime::new().expect("server runtime");
                 runtime.block_on(async move {
-                    let listener = match TcpListener::bind(address.as_str()).await {
+                    let listener = match TcpListener::bind(gateway_base_url.as_str()).await {
                         Ok(listener) => listener,
                         Err(error) => {
                             let _ = ready_tx.send(Err(format!("bind server failed: {error}")));
@@ -701,7 +647,7 @@ mod tests {
 
     #[test]
     fn expired_session_spec_is_never_connected_or_retried() {
-        let mut spec = connect_spec("ws://127.0.0.1:17878".to_owned());
+        let mut spec = connect_spec("http://127.0.0.1:17878".to_owned());
         spec.session = Some(crate::transport::ws::GatewayWsSessionIdentity {
             server_gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
             session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000001").unwrap(),

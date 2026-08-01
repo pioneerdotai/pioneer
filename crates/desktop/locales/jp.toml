@@ -169,19 +169,31 @@ output = "出力"
 
 [artifacts.action]
 attach_tooltip = "このアーティファクトをコンポーザーの入力として使用"
+cancel_tooltip = "ダウンロードをキャンセル"
 download_tooltip = "このアーティファクトをこのコンピューターにダウンロード"
-open_tooltip = "検証済みのローカルコピーを開く"
+open_tooltip = "安全なストリーミング表示を開く"
 reveal_tooltip = "ローカルコピーを表示"
 
 [artifacts.action.error]
 no_gateway = "アクティブなゲートウェイがありません"
 no_workspace = "アーティファクトのワークスペースがありません"
 not_connected = "ゲートウェイが接続されていません"
+authentication = "ゲートウェイセッションに再ログインしてください"
+cancelled = "アーティファクトのダウンロードをキャンセルしました"
+disk_full = "ダウンロードに必要な空き容量がありません"
+download_failed = "アーティファクトのダウンロードに失敗しました"
+grant_expired = "安全な表示リンクの期限が切れました。再度開いてください"
+integrity = "ダウンロードの整合性確認に失敗しました"
+invalid_artifact = "アーティファクトのバージョン情報が不完全です"
+local_copy_invalid = "ローカルコピーがないか無効です"
+reconfigure = "アクティブなゲートウェイを再設定してください"
+revoked = "このアーティファクトは利用できません"
+viewer_failed = "システムビューアーを開けませんでした"
 
 [artifacts.action.status]
 downloading = "このコンピューターにダウンロード中..."
 failed = "アーティファクト操作に失敗しました"
-opening = "ローカルコピーを開いています..."
+opening = "安全な表示を開いています..."
 queued = "保存先を待機中..."
 revealing = "ローカルコピーを表示中..."
 verifying = "ローカルコピーを検証中..."

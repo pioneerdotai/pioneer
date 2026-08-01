@@ -260,6 +260,10 @@ impl PioneerDesktop {
         let created_at = format_timestamp(summary.created_at);
         let action_status = self.thread_artifacts.action_status(artifact).cloned();
         let action_in_progress = self.thread_artifacts.action_in_progress(artifact);
+        let download_can_cancel = matches!(
+            action_status,
+            Some(ThreadArtifactActionStatus::Downloading { .. })
+        );
         let can_download = artifact.status == ArtifactStatus::Ready
             && self.gateway.connection_state == GatewayConnectionState::Connected
             && !action_in_progress;
@@ -415,7 +419,19 @@ impl PioneerDesktop {
                         cx,
                     )
                 },
-            ]))
+            ]).when(download_can_cancel, |this| {
+                let artifact = artifact.clone();
+                this.child(artifact_action_button(
+                    Button::new("artifact-cancel-download-action")
+                        .icon(IconName::Close)
+                        .tooltip(t!("artifacts.action.cancel_tooltip").to_string())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.cancel_thread_artifact_download(artifact.clone(), cx);
+                        })),
+                    true,
+                    cx,
+                ))
+            }))
             .into_any_element()
     }
 
@@ -604,9 +620,19 @@ fn render_thread_artifact_action_status(
 fn action_status_label(status: &ThreadArtifactActionStatus) -> String {
     match status {
         ThreadArtifactActionStatus::Queued => t!("artifacts.action.status.queued").to_string(),
-        ThreadArtifactActionStatus::Downloading => {
-            t!("artifacts.action.status.downloading").to_string()
-        }
+        ThreadArtifactActionStatus::Downloading {
+            downloaded_bytes,
+            total_bytes,
+        } => format!(
+            "{} {}%",
+            t!("artifacts.action.status.downloading"),
+            if *total_bytes == 0 {
+                100
+            } else {
+                downloaded_bytes.saturating_mul(100) / total_bytes
+            }
+            .min(100)
+        ),
         ThreadArtifactActionStatus::Verifying => {
             t!("artifacts.action.status.verifying").to_string()
         }

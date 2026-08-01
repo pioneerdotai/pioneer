@@ -12,7 +12,6 @@ pub mod methods {
     pub const INVITE_PREVIEW: &str = "invite/preview";
     pub const INVITE_ACCEPT: &str = "invite/accept";
     pub const MEMBER_LIST: &str = "member/list";
-    pub const MEMBER_AVATAR_GET: &str = "member/avatar/get";
     pub const MEMBER_SUSPEND: &str = "member/suspend";
     pub const MEMBER_RESTORE: &str = "member/restore";
     pub const MEMBER_REMOVE: &str = "member/remove";
@@ -132,17 +131,13 @@ pub mod methods {
     pub const ARTIFACT_LIST_FOR_TURN: &str = "artifact/list/turn";
     pub const ARTIFACT_LIST_FOR_MESSAGE: &str = "artifact/list/message";
     pub const ARTIFACT_GET: &str = "artifact/get";
-    pub const ARTIFACT_READ: &str = "artifact/read";
+    pub const ARTIFACT_VIEW_GRANT_CREATE: &str = "artifact/view_grant/create";
     pub const ARTIFACT_DELETE: &str = "artifact/delete";
     pub const ARTIFACT_RESTORE: &str = "artifact/restore";
     pub const ARTIFACT_BIND: &str = "artifact/bind";
     pub const ARTIFACT_UPLOAD_START: &str = "artifact/upload/start";
     pub const ARTIFACT_UPLOAD_FINISH: &str = "artifact/upload/finish";
     pub const ARTIFACT_UPLOAD_ABORT: &str = "artifact/upload/abort";
-    pub const ARTIFACT_DOWNLOAD_START: &str = "artifact/download/start";
-    pub const ARTIFACT_DOWNLOAD_CHUNK: &str = "artifact/download/chunk";
-    pub const ARTIFACT_DOWNLOAD_FINISH: &str = "artifact/download/finish";
-    pub const ARTIFACT_DOWNLOAD_ABORT: &str = "artifact/download/abort";
 
     /// Authenticated JSON-RPC methods accepted by the normal Gateway
     /// transport. Restricted credential exchange methods are deliberately
@@ -157,7 +152,6 @@ pub mod methods {
         INVITE_LIST,
         INVITE_REVOKE,
         MEMBER_LIST,
-        MEMBER_AVATAR_GET,
         MEMBER_SUSPEND,
         MEMBER_RESTORE,
         MEMBER_REMOVE,
@@ -276,17 +270,13 @@ pub mod methods {
         ARTIFACT_LIST_FOR_TURN,
         ARTIFACT_LIST_FOR_MESSAGE,
         ARTIFACT_GET,
-        ARTIFACT_READ,
+        ARTIFACT_VIEW_GRANT_CREATE,
         ARTIFACT_DELETE,
         ARTIFACT_RESTORE,
         ARTIFACT_BIND,
         ARTIFACT_UPLOAD_START,
         ARTIFACT_UPLOAD_FINISH,
         ARTIFACT_UPLOAD_ABORT,
-        ARTIFACT_DOWNLOAD_START,
-        ARTIFACT_DOWNLOAD_CHUNK,
-        ARTIFACT_DOWNLOAD_FINISH,
-        ARTIFACT_DOWNLOAD_ABORT,
     ];
 
     /// Methods accepted only by the pre-authenticated credential exchange
@@ -419,7 +409,6 @@ pub mod events {
     pub const ARTIFACT_PROJECTION_UPDATED: &str = "artifact/projection/updated";
     pub const ARTIFACT_UPLOAD_CHUNK_ACK: &str = "artifact/upload/chunk_ack";
     pub const ARTIFACT_UPLOAD_PROGRESS: &str = "artifact/upload/progress";
-    pub const ARTIFACT_DOWNLOAD_PROGRESS: &str = "artifact/download/progress";
 }
 
 #[cfg(test)]
@@ -433,7 +422,6 @@ mod tests {
             "invite/list",
             "invite/revoke",
             "member/list",
-            "member/avatar/get",
             "member/suspend",
             "member/restore",
             "member/remove",

@@ -588,6 +588,7 @@ mod tests {
                 service_name: "com.pioneer.gateway".to_owned(),
                 legacy_service_names: Vec::new(),
                 listen_addr: "0.0.0.0:17878".to_owned(),
+                trusted_proxy_peers: Vec::new(),
                 outbound_queue_capacity: 128,
                 keepawake: false,
                 preflight_model: Default::default(),
@@ -649,7 +650,6 @@ mod tests {
                     ws_reconnect_jitter_percent: 20,
                     registry_file_name: "gateway_registry.toml".to_owned(),
                     local_gateway_id: "local".to_owned(),
-                    registry_version: 2,
                 },
             },
         }

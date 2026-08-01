@@ -1,7 +1,7 @@
 use pioneer_protocol::{
     AuthSessionId, AuthSessionTerminationReason, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
-    InvitationId, JsonRpcErrorResponse, JsonRpcResponse, MemberAvatarGetParams,
-    MemberChangedNotification, MemberDeviceCreateParams, MemberDeviceCreateResponse,
+    InvitationId, JsonRpcErrorResponse, JsonRpcResponse, MemberChangedNotification,
+    MemberDeviceCreateParams, MemberDeviceCreateResponse,
     MemberListParams, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, PrincipalId,
     RequestId, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
     WorkspaceMemberRemoveParams, WorkspaceMembersChangedNotification, constants::events,
@@ -11,8 +11,8 @@ use tracing::warn;
 
 use crate::auth::AuthErrorCode;
 use crate::authorization::{
-    AccessChangeKind, AuthorizationExternalError, AuthorizedMemberAvatar,
-    AuthorizedMemberDirectory, AuthorizedMemberPrincipal, AuthorizedWorkspace,
+    AccessChangeKind, AuthorizationExternalError, AuthorizedMemberDirectory,
+    AuthorizedMemberPrincipal, AuthorizedWorkspace,
     external_error_for_decision,
 };
 use crate::epic5_observability::{Epic5Operation, Epic5Outcome, record_latency, record_outcome};
@@ -266,30 +266,6 @@ impl MessageProcessor {
         );
         match service
             .list(context.principal(), authorization, params)
-            .await
-        {
-            Ok(result) => self.send_member_result(context, request_id, &result).await,
-            Err(error) => {
-                self.send_member_service_error(context, request_id, error)
-                    .await
-            }
-        }
-    }
-
-    pub(in crate::message) async fn member_avatar_get(
-        &self,
-        context: &RequestContext,
-        authorization: &AuthorizedMemberAvatar,
-        request_id: RequestId,
-        params: MemberAvatarGetParams,
-    ) {
-        let service = MemberService::with_rate_limits(
-            (*self.crud_store).clone(),
-            self.gateway_secrets.clone(),
-            self.epic5_rate_limits.clone(),
-        );
-        match service
-            .avatar_get(context.principal(), authorization, params)
             .await
         {
             Ok(result) => self.send_member_result(context, request_id, &result).await,

@@ -96,12 +96,12 @@ impl GatewaySetupFormState {
         window: &mut Window,
         cx: &mut Context<Self>,
         name: String,
-        address: String,
+        gateway_base_url: String,
     ) {
         self.name_input_state
             .update(cx, |state, cx| state.set_value(name.clone(), window, cx));
         self.address_input_state
-            .update(cx, |state, cx| state.set_value(address.clone(), window, cx));
+            .update(cx, |state, cx| state.set_value(gateway_base_url.clone(), window, cx));
         self.activation_input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
@@ -212,7 +212,7 @@ pub(crate) fn render_gateway_setup_form(
 
     let mut form = v_form();
 
-    if let GatewaySetupFormMode::ReauthenticateGateway { name, address, .. } = &mode {
+    if let GatewaySetupFormMode::ReauthenticateGateway { name, gateway_base_url, .. } = &mode {
         form = form
             .child(
                 field()
@@ -222,7 +222,7 @@ pub(crate) fn render_gateway_setup_form(
             .child(
                 field()
                     .label(t!("common.address").to_string())
-                    .child(render_readonly_gateway_value(address.clone(), cx)),
+                    .child(render_readonly_gateway_value(gateway_base_url.clone(), cx)),
             );
     } else {
         form = form
@@ -383,7 +383,7 @@ fn render_gateway_setup_form_actions(
                 let activation_input_state = activation_input_state.clone();
                 move |_, window, cx| {
                     let name = name_input_state.read(cx).value().to_string();
-                    let address = address_input_state.read(cx).value().to_string();
+                    let gateway_base_url = address_input_state.read(cx).value().to_string();
                     let activation_code = activation_input_state.read(cx).value().to_string();
                     let _ = desktop_entity.update(cx, |view, cx| {
                         if let GatewaySetupFormMode::EditGateway { endpoint_id } = &mode {
@@ -392,7 +392,7 @@ fn render_gateway_setup_form_actions(
                                 cx,
                                 endpoint_id.clone(),
                                 name.clone(),
-                                address.clone(),
+                                gateway_base_url.clone(),
                                 Some(form_state.clone()),
                             );
                         } else if let GatewaySetupFormMode::ReauthenticateGateway {
@@ -415,7 +415,7 @@ fn render_gateway_setup_form_actions(
                                 cx,
                                 source,
                                 name.clone(),
-                                address.clone(),
+                                gateway_base_url.clone(),
                                 activation_code.clone(),
                                 Some(form_state.clone()),
                             );

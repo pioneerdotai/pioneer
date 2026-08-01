@@ -34,7 +34,7 @@ impl PioneerDesktop {
                 GatewaySetupFormMode::ReauthenticateGateway {
                     endpoint_id: endpoint.id,
                     name: endpoint.name,
-                    address: endpoint.address,
+                    gateway_base_url: endpoint.gateway_base_url.to_string(),
                     close_dialog_on_success: false,
                 },
             )

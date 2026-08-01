@@ -4,6 +4,7 @@ mod editor;
 mod flow;
 mod gateway_setup;
 mod initial;
+mod member_avatars;
 mod mcp;
 mod providers;
 mod root;

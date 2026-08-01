@@ -1,8 +1,8 @@
 use crate::constants::events;
 use crate::{
     AccessChangedNotification, ArtifactCreatedNotification, ArtifactDeletedNotification,
-    ArtifactDownloadProgressNotification, ArtifactProjectionUpdatedNotification,
-    ArtifactUpdatedNotification, ArtifactUploadProgressNotification,
+    ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
+    ArtifactUploadProgressNotification,
     AuthAccessExpiringNotification, AuthSessionRevokedNotification,
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification,
     CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolvedNotification,
@@ -118,7 +118,6 @@ pub enum GatewayNotification {
     ThreadArtifactsChanged(ThreadArtifactsChangedNotification),
     ArtifactProjectionUpdated(ArtifactProjectionUpdatedNotification),
     ArtifactUploadProgress(ArtifactUploadProgressNotification),
-    ArtifactDownloadProgress(ArtifactDownloadProgressNotification),
     TaskCreated(TaskCreatedNotification),
     TaskScheduled(TaskScheduledNotification),
     TaskQueued(TaskQueuedNotification),
@@ -543,11 +542,6 @@ impl GatewayNotification {
                 serde_json::from_value::<ArtifactUploadProgressNotification>(params)
                     .ok()
                     .map(Self::ArtifactUploadProgress)
-            }
-            events::ARTIFACT_DOWNLOAD_PROGRESS => {
-                serde_json::from_value::<ArtifactDownloadProgressNotification>(params)
-                    .ok()
-                    .map(Self::ArtifactDownloadProgress)
             }
             events::TASK_CREATED => serde_json::from_value::<TaskCreatedNotification>(params)
                 .ok()

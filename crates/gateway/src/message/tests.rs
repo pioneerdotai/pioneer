@@ -163,7 +163,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
-use tokio_tungstenite::tungstenite::Message;
+use axum::extract::ws::Message;
 
 mod member_client_harness;
 
@@ -12784,60 +12784,6 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
         .await
         .expect("start unrelated upload");
 
-    let artifact_ref = |artifact_id: &str| pioneer_protocol::ArtifactRef {
-        artifact_id: artifact_id.to_owned(),
-        version_id: Some(format!("{artifact_id}-version")),
-        display_name: format!("{artifact_id}.txt"),
-        kind: pioneer_protocol::ArtifactKind::Text,
-        mime_type: Some("text/plain".to_owned()),
-        size_bytes: Some(1),
-        sha256: Some("22".repeat(32)),
-        status: pioneer_protocol::ArtifactStatus::Ready,
-        preview: None,
-    };
-    let affected_download = processor
-        .artifact_downloads
-        .start_scoped(
-            &owner,
-            pioneer_artifacts::ArtifactDownloadSnapshot {
-                artifact: artifact_ref("artifact-affected"),
-                workspace_id: affected_workspace_id.clone(),
-                artifact_id: "artifact-affected".to_owned(),
-                artifact_version_id: "artifact-affected-version".to_owned(),
-                blob_id: "blob-affected".to_owned(),
-                storage_key: "storage-affected".to_owned(),
-                display_name: "affected.txt".to_owned(),
-                mime_type: Some("text/plain".to_owned()),
-                size_bytes: 1,
-                sha256: "22".repeat(32),
-            },
-            Some(AFFECTED_THREAD_ID.to_owned()),
-            now,
-        )
-        .await
-        .expect("start affected download");
-    let unrelated_download = processor
-        .artifact_downloads
-        .start_scoped(
-            &owner,
-            pioneer_artifacts::ArtifactDownloadSnapshot {
-                artifact: artifact_ref("artifact-unrelated"),
-                workspace_id: unrelated_workspace_id.to_owned(),
-                artifact_id: "artifact-unrelated".to_owned(),
-                artifact_version_id: "artifact-unrelated-version".to_owned(),
-                blob_id: "blob-unrelated".to_owned(),
-                storage_key: "storage-unrelated".to_owned(),
-                display_name: "unrelated.txt".to_owned(),
-                mime_type: Some("text/plain".to_owned()),
-                size_bytes: 1,
-                sha256: "33".repeat(32),
-            },
-            Some(UNRELATED_THREAD_ID.to_owned()),
-            now,
-        )
-        .await
-        .expect("start unrelated download");
-
     let audio_format = VoiceAudioFormat {
         sample_rate_hz: pioneer_protocol::VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
         channels: pioneer_protocol::VOICE_AUDIO_TARGET_CHANNELS,
@@ -13049,30 +12995,6 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
                 &owner,
                 unrelated_workspace_id,
                 unrelated_upload.upload_id.as_str(),
-                now,
-            )
-            .await
-            .is_ok()
-    );
-    assert!(
-        processor
-            .artifact_downloads
-            .get(
-                &owner,
-                affected_workspace_id.as_str(),
-                affected_download.download_id.as_str(),
-                now,
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        processor
-            .artifact_downloads
-            .get(
-                &owner,
-                unrelated_workspace_id,
-                unrelated_download.download_id.as_str(),
                 now,
             )
             .await
@@ -13645,32 +13567,6 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
         serde_json::from_value(get_response.result).expect("artifact/get response should decode");
     assert_eq!(get.artifact.bindings.len(), 1);
 
-    let read_id = generate_test_request_id("artifactread", "range");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": read_id,
-                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "artifact_id": artifact.artifact_id,
-                    "offset": 6,
-                    "max_bytes": 4
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let read_response = recv_response_by_id(&mut rx, read_id.as_str()).await;
-    let read: pioneer_protocol::ArtifactReadResponse =
-        serde_json::from_value(read_response.result).expect("artifact/read response should decode");
-    assert_eq!(read.offset, 6);
-    assert_eq!(read.len, 4);
-    assert_eq!(read.content_base64, "YXJ0aQ==");
-    assert!(read.truncated);
-
     let bind_id = generate_test_request_id("artifactbind", "second");
     processor
         .process_request_for_connection(
@@ -13954,67 +13850,7 @@ async fn artifact_list_for_thread_includes_child_thread_subtree() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn artifact_read_caps_oversized_json_request() {
-    let (tx, mut rx) = mpsc::channel(8);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    );
-    materialize_artifact_api_thread(
-        crud_store.as_ref(),
-        workspace_id.as_str(),
-        "thr_artifact_read_cap",
-        "turn_artifact_read_cap",
-    )
-    .await;
-    let artifact = ingest_bound_test_artifact(
-        &processor,
-        workspace_id.as_str(),
-        "thr_artifact_read_cap",
-        "turn_artifact_read_cap",
-        "msg_artifact_read_cap",
-        "large.txt",
-        vec![b'a'; 1024 * 1024 + 16],
-    )
-    .await;
-
-    let read_id = generate_test_request_id("artifactread", "capped");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": read_id,
-                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "artifact_id": artifact.artifact_id,
-                    "max_bytes": 2 * 1024 * 1024
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let response = recv_response_by_id(&mut rx, read_id.as_str()).await;
-    let read: pioneer_protocol::ArtifactReadResponse =
-        serde_json::from_value(response.result).expect("artifact/read response should decode");
-    assert_eq!(read.len, 1024 * 1024);
-    assert!(read.truncated);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn artifact_get_and_read_reject_cross_workspace_artifact() {
+async fn artifact_get_rejects_cross_workspace_artifact() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -14072,24 +13908,6 @@ async fn artifact_get_and_read_reject_cross_workspace_artifact() {
     let get_error = recv_error_by_id(&mut rx, get_id.as_str()).await;
     assert_eq!(get_error.error.message, "not_found");
 
-    let read_id = generate_test_request_id("artifactread", "foreign");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": read_id,
-                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "artifact_id": artifact.artifact_id
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let read_error = recv_error_by_id(&mut rx, read_id.as_str()).await;
-    assert_eq!(read_error.error.message, "not_found");
 }
 
 #[test]

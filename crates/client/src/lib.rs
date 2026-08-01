@@ -69,6 +69,7 @@
 pub mod administration;
 pub mod agents_doc;
 pub mod artifacts;
+pub mod avatars;
 pub mod authorization;
 pub mod cli_runtime;
 pub mod composer;

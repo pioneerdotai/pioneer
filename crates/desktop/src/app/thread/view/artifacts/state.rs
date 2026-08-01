@@ -12,7 +12,7 @@ use pioneer_client::artifacts::{
     presentation as client_artifact_presentation, preview as client_artifact_preview,
     state as client_artifact_state,
 };
-use pioneer_protocol::{ArtifactReadResponse, ArtifactRef};
+use pioneer_protocol::ArtifactRef;
 use std::{fs, io::Cursor, path::Path, time::Duration};
 use tracing::{debug, warn};
 
@@ -225,23 +225,21 @@ impl PioneerDesktop {
             return;
         }
 
-        let Some(preview) = client_artifact_preview::thumbnail_preview(artifact) else {
+        let Some(_) = client_artifact_preview::thumbnail_preview(artifact) else {
             return;
         };
         let Some(connection_id) = self.gateway.ws_connection_id else {
             return;
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
         let workspace_id = workspace_id.to_owned();
         let artifact = artifact.clone();
-        let expected_preview_sha256 = preview.sha256.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 
             async move {
-                let should_start = this
+                let http_client = this
                     .update(&mut cx, |view, cx| {
                         if view.gateway.ws_connection_id != Some(connection_id)
                             || view.gateway.connection_state != GatewayConnectionState::Connected
@@ -249,32 +247,38 @@ impl PioneerDesktop {
                                 .thread_artifacts
                                 .mark_preview_loading_if_needed(&artifact)
                         {
-                            return false;
+                            return None;
                         }
+                        let http_client = match view.active_gateway_http_client() {
+                            Ok(http_client) => http_client,
+                            Err(_) => {
+                                view.thread_artifacts.apply_preview_failed(&artifact);
+                                cx.notify();
+                                return None;
+                            }
+                        };
                         cx.notify();
-                        true
+                        Some(http_client)
                     })
-                    .unwrap_or(false);
-                if !should_start {
+                    .ok()
+                    .flatten();
+                let Some(http_client) = http_client else {
                     return;
-                }
+                };
 
                 let request_artifact = artifact.clone();
                 let request_workspace_id = workspace_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        let response = ws_sender.artifact_read(
-                            client_artifact_preview::artifact_thumbnail_read_params(
-                                request_workspace_id,
-                                &request_artifact,
-                                client_artifact_preview::ARTIFACT_PREVIEW_MAX_BYTES,
-                            ),
+                        let preview_data = http_client.fetch_artifact_thumbnail(
+                            request_workspace_id.as_str(),
+                            &request_artifact,
+                            tokio_util::sync::CancellationToken::new(),
                         )?;
                         let image_path = write_artifact_preview_cache_file(
                             workspace_id.as_str(),
                             &request_artifact,
-                            expected_preview_sha256.as_deref(),
-                            &response,
+                            &preview_data,
                         )?;
                         Ok::<_, anyhow::Error>(image_path)
                     })
@@ -354,16 +358,14 @@ impl PioneerDesktop {
 fn write_artifact_preview_cache_file(
     workspace_id: &str,
     artifact: &ArtifactRef,
-    expected_sha256: Option<&str>,
-    response: &ArtifactReadResponse,
+    preview_data: &client_artifact_preview::ArtifactPreviewReadData,
 ) -> Result<ThreadArtifactPreviewImagePaths> {
     let runtime_home = desktop_state::runtime_home_dir()?;
     write_artifact_preview_cache_files(
         runtime_home.as_path(),
         workspace_id,
         artifact,
-        expected_sha256,
-        response,
+        preview_data,
     )
 }
 
@@ -371,16 +373,14 @@ fn write_artifact_preview_cache_files(
     runtime_home: &Path,
     workspace_id: &str,
     artifact: &ArtifactRef,
-    expected_sha256: Option<&str>,
-    response: &ArtifactReadResponse,
+    preview_data: &client_artifact_preview::ArtifactPreviewReadData,
 ) -> Result<ThreadArtifactPreviewImagePaths> {
     client_artifact_preview::write_artifact_preview_cache_files(
         &DesktopArtifactPreviewImageRenderer,
         runtime_home,
         workspace_id,
         artifact,
-        expected_sha256,
-        response,
+        preview_data,
     )
 }
 
@@ -485,11 +485,9 @@ pub(super) fn format_artifact_size(size_bytes: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64;
     use pioneer_protocol::{
         ArtifactKind, ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus,
-        ArtifactReadResponse, ArtifactRef, ArtifactStatus,
+        ArtifactRef, ArtifactStatus,
     };
 
     #[test]
@@ -503,22 +501,16 @@ mod tests {
             .write_to(&mut encoded, ImageFormat::Png)
             .expect("encode source");
         let bytes = encoded.into_inner();
-        let response = ArtifactReadResponse {
-            artifact: artifact.clone(),
-            offset: 0,
-            len: bytes.len() as u64,
-            total_size_bytes: bytes.len() as u64,
+        let preview_data = client_artifact_preview::ArtifactPreviewReadData {
+            bytes,
             sha256: "thumb_sha".to_owned(),
-            content_base64: BASE64.encode(bytes.as_slice()),
-            truncated: false,
         };
 
         let image_paths = write_artifact_preview_cache_files(
             temp.path(),
             "ws",
             &artifact,
-            Some("thumb_sha"),
-            &response,
+            &preview_data,
         )
         .expect("write preview variants");
 

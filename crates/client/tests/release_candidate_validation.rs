@@ -1,5 +1,8 @@
 use pioneer_client::{
     gateway::{
+        endpoint::{
+            GatewayBaseUrl, PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
+        },
         registry::{
             GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
         },
@@ -17,8 +20,7 @@ use pioneer_client::{
         expand_turn_work, flatten_semantic_timeline,
     },
     transport::ws::{
-        GatewayWsConnectSpec, GatewayWsEvent, rpc::build_ws_request, rpc::normalize_ws_url,
-        should_apply_ws_event, worker,
+        GatewayWsConnectSpec, GatewayWsEvent, rpc::build_ws_request, should_apply_ws_event, worker,
     },
 };
 use pioneer_protocol::{
@@ -37,7 +39,10 @@ fn remote_spec() -> GatewayWsConnectSpec {
         endpoint_id: "remote-prod".to_owned(),
         endpoint_name: "Remote Prod".to_owned(),
         endpoint_kind: GatewayEndpointKind::Remote,
-        address: "wss://gateway.example.com/socket".to_owned(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation(
+            "https://gateway.example.com/pioneer",
+        )
+        .unwrap(),
         auth_token: Some(pioneer_protocol::AuthSecretString::new("remote-token")),
         session: None,
         timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 5_000, 0).expect("timings"),
@@ -358,11 +363,10 @@ fn reconnect_resume_chaos_filters_stale_ws_events_and_bounds_resume_retries() {
 #[test]
 fn remote_gateway_session_access_smoke_builds_authenticated_ws_request() {
     let config = GatewayRegistryConfig {
-        version: 2,
         local: Some(GatewayLocalRegistryConfig {
             gateway_id: "local".to_owned(),
             name: "Local Gateway".to_owned(),
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             service_name: Some("com.pioneer.gateway".to_owned()),
         }),
     };
@@ -370,7 +374,10 @@ fn remote_gateway_session_access_smoke_builds_authenticated_ws_request() {
     registry.remotes.push(GatewayEndpoint {
         id: "remote-prod".to_owned(),
         name: "Remote Prod".to_owned(),
-        address: "wss://gateway.example.com/socket".to_owned(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation(
+            "https://gateway.example.com/pioneer",
+        )
+        .unwrap(),
         kind: GatewayEndpointKind::Local,
         session_ref: Some("remote-prod".to_owned()),
         server_gateway_id: Some(
@@ -390,13 +397,19 @@ fn remote_gateway_session_access_smoke_builds_authenticated_ws_request() {
     assert_eq!(remote.service_name, None);
     assert_eq!(remote.session_ref.as_deref(), Some("remote-prod"));
 
-    let ws_url = normalize_ws_url(remote.address.as_str());
-    let request =
-        build_ws_request(ws_url.as_str(), Some(" short-lived-access ")).expect("ws request");
+    let request = build_ws_request(&remote.gateway_base_url, Some(" short-lived-access "))
+        .expect("ws request");
 
     assert_eq!(
         request.uri().to_string(),
-        "wss://gateway.example.com/socket"
+        "wss://gateway.example.com/pioneer/"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get(PIONEER_PROTOCOL_VERSION_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(PIONEER_PROTOCOL_VERSION)
     );
     assert_eq!(
         request

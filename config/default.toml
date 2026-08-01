@@ -17,6 +17,10 @@ settings_file_name = "gateway-settings.toml"
 service_name = "com.pioneer.gateway"
 listen_addr = "0.0.0.0:17878"
 outbound_queue_capacity = 128
+# Forwarded client-address headers are ignored unless the immediate peer IP is
+# listed here. Keep empty for direct/LAN use. A trusted edge must replace (not
+# append to) Forwarded/X-Forwarded-For with one client IP.
+trusted_proxy_peers = []
 keepawake = false
 preflight_model = "thread"
 
@@ -39,6 +43,19 @@ gc_grace_secs = 86400
 output_dir_ttl_secs = 86400
 readable_copy_ttl_secs = 86400
 quota_warn_at_percent = 80
+http_streams_global = 32
+http_streams_per_session = 4
+http_open_handles = 32
+http_max_single_range_bytes = 134217728
+http_tiny_range_bytes = 4096
+http_tiny_range_window_secs = 10
+http_tiny_range_max_requests = 32
+http_open_timeout_secs = 15
+http_body_idle_timeout_secs = 30
+view_grant_ttl_secs = 180
+view_grants_global = 4096
+view_grants_per_session = 16
+view_grant_streams = 4
 
 [gateway.resilience.command_execution]
 lease_secs = 600
@@ -306,4 +323,3 @@ ws_reconnect_max_ms = 10000
 ws_reconnect_jitter_percent = 20
 registry_file_name = "gateway-registry.toml"
 local_gateway_id = "local"
-registry_version = 2

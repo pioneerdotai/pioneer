@@ -60,9 +60,6 @@ impl PioneerDesktop {
         let client_runtime = ClientRuntime::new();
         let gateway_ws_command_sender = client_runtime.ws_command_sender();
         let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
-        if let Ok(runtime_home) = state::runtime_home_dir() {
-            let _ = gateway_ws_command_sender.set_artifact_cache_root(runtime_home);
-        }
 
         let mut view = Self {
             thread_coordinators: HashMap::new(),
@@ -168,6 +165,7 @@ impl PioneerDesktop {
             semantic_timeline_pending: HashMap::new(),
             task_review_actions: TaskReviewActionState::default(),
             thread_artifacts: ThreadArtifactsState::default(),
+            artifact_download_cancellations: HashMap::new(),
             show_thread_artifacts_sidebar: false,
             thread_artifacts_sidebar_width: px(340.),
             ready_turn_resume_threads: VecDeque::new(),
@@ -179,6 +177,7 @@ impl PioneerDesktop {
                 runtime: None,
                 client_runtime,
                 ws_command_sender: gateway_ws_command_sender,
+                http_client: None,
                 ws_connection_id: None,
                 deferred_ws_events: VecDeque::new(),
                 connection_epoch: 0,

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use axum::extract::ws::Message;
 use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
 use super::{ConnectionId, SessionManager};
 use crate::auth::AuthenticatedSessionPrincipal;

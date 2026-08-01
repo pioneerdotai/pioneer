@@ -169,19 +169,31 @@ output = "Ausgabe"
 
 [artifacts.action]
 attach_tooltip = "Dieses Artefakt als Eingabe im Composer verwenden"
+cancel_tooltip = "Download abbrechen"
 download_tooltip = "Dieses Artefakt auf diesen Computer herunterladen"
-open_tooltip = "Eine verifizierte lokale Kopie oeffnen"
+open_tooltip = "Sichere Streaming-Ansicht oeffnen"
 reveal_tooltip = "Die lokale Kopie im Dateimanager anzeigen"
 
 [artifacts.action.error]
 no_gateway = "Kein aktives Gateway"
 no_workspace = "Arbeitsbereich des Artefakts fehlt"
 not_connected = "Gateway ist nicht verbunden"
+authentication = "Die Gateway-Sitzung muss erneut authentifiziert werden"
+cancelled = "Der Artefakt-Download wurde abgebrochen"
+disk_full = "Nicht genug Speicherplatz fuer diesen Download"
+download_failed = "Der Artefakt-Download ist fehlgeschlagen"
+grant_expired = "Die sichere Ansicht ist abgelaufen; erneut oeffnen"
+integrity = "Die Integritaetspruefung des Downloads ist fehlgeschlagen"
+invalid_artifact = "Versionsdaten des Artefakts sind unvollstaendig"
+local_copy_invalid = "Die lokale Kopie fehlt oder ist ungueltig"
+reconfigure = "Der aktive Gateway-Endpunkt muss neu konfiguriert werden"
+revoked = "Dieses Artefakt ist nicht mehr verfuegbar"
+viewer_failed = "Der Systembetrachter konnte nicht geoeffnet werden"
 
 [artifacts.action.status]
 downloading = "Wird auf diesen Computer heruntergeladen..."
 failed = "Artefakt-Aktion fehlgeschlagen"
-opening = "Lokale Kopie wird geoeffnet..."
+opening = "Sichere Ansicht wird geoeffnet..."
 queued = "Warte auf Ziel..."
 revealing = "Lokale Kopie wird angezeigt..."
 verifying = "Lokale Kopie wird verifiziert..."

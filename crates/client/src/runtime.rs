@@ -269,12 +269,12 @@ pub fn reduce_gateway_ws_event(
         )),
         GatewayWsEvent::Connected {
             endpoint_name,
-            address,
+            gateway_base_url,
             ..
         } => ClientRuntimeWsEvent::Connection(reduce_gateway_connection_event(
             GatewayConnectionEvent::Connected {
                 endpoint_name,
-                address,
+                gateway_base_url,
                 queue_skills_refresh: context.queue_skills_refresh,
             },
         )),
@@ -296,14 +296,14 @@ pub fn reduce_gateway_ws_event(
         GatewayWsEvent::Disconnected {
             endpoint_name,
             endpoint_kind,
-            address,
+            gateway_base_url,
             reason,
             ..
         } => ClientRuntimeWsEvent::Connection(reduce_gateway_connection_event(
             GatewayConnectionEvent::Disconnected {
                 endpoint_name,
                 endpoint_kind,
-                address,
+                gateway_base_url,
                 reason,
                 should_resume_in_flight_turn: context.should_resume_in_flight_turn,
             },
@@ -311,14 +311,14 @@ pub fn reduce_gateway_ws_event(
         GatewayWsEvent::ConnectFailed {
             endpoint_name,
             endpoint_kind,
-            address,
+            gateway_base_url,
             error,
             ..
         } => ClientRuntimeWsEvent::Connection(reduce_gateway_connection_event(
             GatewayConnectionEvent::ConnectFailed {
                 endpoint_name,
                 endpoint_kind,
-                address,
+                gateway_base_url,
                 error,
                 should_resume_in_flight_turn: context.should_resume_in_flight_turn,
             },
@@ -689,7 +689,6 @@ pub fn reduce_gateway_notification(
         | GatewayNotification::SkillsUploadChunkAck(_)
         | GatewayNotification::ArtifactProjectionUpdated(_)
         | GatewayNotification::ArtifactUploadProgress(_)
-        | GatewayNotification::ArtifactDownloadProgress(_)
         | GatewayNotification::TaskCreated(_)
         | GatewayNotification::TaskScheduled(_)
         | GatewayNotification::TaskQueued(_)
@@ -765,7 +764,7 @@ mod tests {
             endpoint_id: endpoint_id.to_owned(),
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             auth_token: None,
             session: None,
             timings: timings(),
@@ -841,7 +840,7 @@ mod tests {
                 connection_id: 1,
                 endpoint_id: "old".to_owned(),
                 endpoint_name: "Old".to_owned(),
-                address: "127.0.0.1:1".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:1").unwrap(),
             }),
         );
         assert!(events.is_empty());
@@ -852,7 +851,7 @@ mod tests {
                 connection_id: 2,
                 endpoint_id: "new".to_owned(),
                 endpoint_name: "New".to_owned(),
-                address: "127.0.0.1:2".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:2").unwrap(),
             }),
         );
         assert_eq!(events.len(), 1);
@@ -864,7 +863,7 @@ mod tests {
             connection_id: 7,
             endpoint_id: "remote".to_owned(),
             endpoint_name: "Remote".to_owned(),
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
         };
 
         let reduced = reduce_gateway_ws_event(

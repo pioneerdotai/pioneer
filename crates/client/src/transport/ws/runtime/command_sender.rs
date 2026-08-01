@@ -3,12 +3,6 @@ use crate::composer::turn_prepare as client_composer_turn_prepare;
 use crate::transport::ws::command_sender as client_ws_commands;
 use crate::{
     artifacts::{
-        actions::ArtifactCachedDownloadClient,
-        download::{
-            self as client_artifact_download, ArtifactDownloadChunkWaiter,
-            ArtifactDownloadFileCache, ArtifactDownloadRequest, ArtifactDownloadResult,
-            ArtifactDownloadTransport,
-        },
         upload::ArtifactUploadTransport,
     },
     platform::ClientFileSystem,
@@ -80,59 +74,6 @@ impl client_composer_turn_prepare::ComposerTurnPrepareTransport for GatewayWsCom
     }
 }
 
-impl ArtifactDownloadTransport for GatewayWsCommandSender {
-    fn artifact_download_start(
-        &self,
-        params: ArtifactDownloadStartParams,
-    ) -> Result<ArtifactDownloadStartResponse> {
-        GatewayWsCommandSender::artifact_download_start(self, params)
-    }
-
-    fn register_artifact_download_chunk(
-        &self,
-        download_id: &str,
-        offset: u64,
-    ) -> Result<Box<dyn ArtifactDownloadChunkWaiter>> {
-        Ok(Box::new(GatewayWsArtifactDownloadChunkWaiter {
-            response_rx: GatewayWsCommandSender::register_artifact_download_chunk(
-                self,
-                download_id,
-                offset,
-            )?,
-        }))
-    }
-
-    fn artifact_download_chunk(
-        &self,
-        params: ArtifactDownloadChunkParams,
-    ) -> Result<ArtifactDownloadChunkResponse> {
-        GatewayWsCommandSender::artifact_download_chunk(self, params)
-    }
-
-    fn artifact_download_finish(
-        &self,
-        params: ArtifactDownloadFinishParams,
-    ) -> Result<ArtifactDownloadFinishResponse> {
-        GatewayWsCommandSender::artifact_download_finish(self, params)
-    }
-
-    fn artifact_download_abort(
-        &self,
-        params: ArtifactDownloadAbortParams,
-    ) -> Result<ArtifactDownloadAbortResponse> {
-        GatewayWsCommandSender::artifact_download_abort(self, params)
-    }
-}
-
-impl ArtifactCachedDownloadClient for GatewayWsCommandSender {
-    fn download_artifact_to_cache(
-        &self,
-        request: ArtifactDownloadRequest,
-    ) -> Result<ArtifactDownloadResult> {
-        GatewayWsCommandSender::download_artifact_to_cache(self, request)
-    }
-}
-
 impl SkillSnapshotTransport for GatewayWsCommandSender {
     fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         GatewayWsCommandSender::skills_list(self, params)
@@ -146,6 +87,7 @@ impl SkillSnapshotTransport for GatewayWsCommandSender {
 impl GatewayWsCommandSender {
     pub fn connect_and_wait(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_access = http_access_from_spec(&spec, connection_id);
 
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -162,11 +104,14 @@ impl GatewayWsCommandSender {
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped initial connect result"))?;
 
-        result.map(|_| connection_id).map_err(anyhow::Error::msg)
+        result.map_err(anyhow::Error::msg)?;
+        self.replace_http_session_access(session_access)?;
+        Ok(connection_id)
     }
 
     pub fn connect_with_retry(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_access = http_access_from_spec(&spec, connection_id);
 
         self.command_tx
             .send(GatewayWsCommand::Connect {
@@ -177,11 +122,18 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        // The Desktop action gate additionally requires a Connected event, so
+        // this snapshot cannot authorize HTTP while the retrying WS is merely
+        // connecting. Publishing it here keeps the sender as the single owner
+        // of the ephemeral credential without copying it into shell state.
+        self.replace_http_session_access(session_access)?;
+
         Ok(connection_id)
     }
 
     pub fn replace_access_and_wait(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_access = http_access_from_spec(&spec, connection_id);
         let (result_tx, result_rx) = mpsc::channel();
         self.command_tx
             .send(GatewayWsCommand::Replace {
@@ -194,19 +146,40 @@ impl GatewayWsCommandSender {
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped access replacement result"))?
             .map_err(anyhow::Error::msg)?;
+        self.replace_http_session_access(session_access)?;
         Ok(connection_id)
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Shutdown)
             .map_err(|_| anyhow!("websocket worker is not available"))
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Disconnect)
             .map_err(|_| anyhow!("websocket worker is not available"))
+    }
+
+    pub fn current_gateway_http_access(
+        &self,
+    ) -> std::result::Result<GatewayHttpAccess, GatewayHttpAuthorityError> {
+        self.session_access
+            .lock()
+            .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?
+            .clone()
+            .ok_or(GatewayHttpAuthorityError::TemporarilyUnavailable)
+    }
+
+    fn replace_http_session_access(&self, access: Option<GatewayHttpAccess>) -> Result<()> {
+        *self
+            .session_access
+            .lock()
+            .map_err(|_| anyhow!("Gateway session access lock is poisoned"))? = access;
+        Ok(())
     }
 
     pub fn auth_me(&self) -> Result<AuthMeResponse> {
@@ -252,13 +225,6 @@ impl GatewayWsCommandSender {
 
     pub fn member_list(&self, params: MemberListParams) -> Result<MemberListResponse> {
         client_ws_commands::member_list(self, params)
-    }
-
-    pub fn member_avatar_get(
-        &self,
-        params: MemberAvatarGetParams,
-    ) -> Result<MemberAvatarGetResponse> {
-        client_ws_commands::member_avatar_get(self, params)
     }
 
     pub fn member_suspend(&self, params: MemberSuspendParams) -> Result<MemberMutationResponse> {
@@ -743,9 +709,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::artifact_get(self, params)
     }
 
-    pub fn artifact_read(&self, params: ArtifactReadParams) -> Result<ArtifactReadResponse> {
-        client_ws_commands::artifact_read(self, params)
+    pub fn artifact_view_grant_create(
+        &self,
+        params: ArtifactViewGrantCreateParams,
+    ) -> Result<ArtifactViewGrantCreateResponse> {
+        client_ws_commands::artifact_view_grant_create(self, params)
     }
+
     pub fn artifact_delete(&self, params: ArtifactDeleteParams) -> Result<ArtifactDeleteResponse> {
         client_ws_commands::artifact_delete(self, params)
     }
@@ -757,88 +727,6 @@ impl GatewayWsCommandSender {
     }
     pub fn artifact_bind(&self, params: ArtifactBindParams) -> Result<ArtifactBindResponse> {
         client_ws_commands::artifact_bind(self, params)
-    }
-
-    pub fn artifact_download_start(
-        &self,
-        params: ArtifactDownloadStartParams,
-    ) -> Result<ArtifactDownloadStartResponse> {
-        client_ws_commands::artifact_download_start(self, params)
-    }
-
-    pub fn artifact_download_chunk(
-        &self,
-        params: ArtifactDownloadChunkParams,
-    ) -> Result<ArtifactDownloadChunkResponse> {
-        client_ws_commands::artifact_download_chunk(self, params)
-    }
-
-    pub fn artifact_download_finish(
-        &self,
-        params: ArtifactDownloadFinishParams,
-    ) -> Result<ArtifactDownloadFinishResponse> {
-        client_ws_commands::artifact_download_finish(self, params)
-    }
-
-    pub fn artifact_download_abort(
-        &self,
-        params: ArtifactDownloadAbortParams,
-    ) -> Result<ArtifactDownloadAbortResponse> {
-        client_ws_commands::artifact_download_abort(self, params)
-    }
-    pub fn download_artifact_to_cache(
-        &self,
-        request: ArtifactDownloadRequest,
-    ) -> Result<ArtifactDownloadResult> {
-        let runtime_home = self
-            .artifact_cache_root
-            .lock()
-            .map_err(|_| anyhow!("artifact cache root lock is poisoned"))?
-            .clone()
-            .ok_or_else(|| anyhow!("artifact cache root is not configured"))?;
-        self.download_artifact_to_cache_with_runtime_home(request, runtime_home)
-    }
-
-    pub fn download_artifact_to_cache_with_runtime_home(
-        &self,
-        request: ArtifactDownloadRequest,
-        runtime_home: PathBuf,
-    ) -> Result<ArtifactDownloadResult> {
-        client_artifact_download::download_artifact_to_cache(
-            self,
-            &ArtifactDownloadFileCache::new(runtime_home),
-            request,
-        )
-    }
-
-    pub fn set_artifact_cache_root(&self, runtime_home: PathBuf) -> Result<()> {
-        *self
-            .artifact_cache_root
-            .lock()
-            .map_err(|_| anyhow!("artifact cache root lock is poisoned"))? = Some(runtime_home);
-        Ok(())
-    }
-
-    fn register_artifact_download_chunk(
-        &self,
-        download_id: &str,
-        offset: u64,
-    ) -> Result<Receiver<std::result::Result<ArtifactDownloadChunkPayload, String>>> {
-        let (response_tx, response_rx) = mpsc::channel();
-        let (registered_tx, registered_rx) = mpsc::channel();
-        self.command_tx
-            .send(GatewayWsCommand::ArtifactDownloadRegisterChunk {
-                download_id: download_id.to_owned(),
-                offset,
-                response_tx,
-                registered_tx,
-            })
-            .map_err(|_| anyhow!("websocket worker is not available"))?;
-        registered_rx
-            .recv_timeout(RPC_REQUEST_TIMEOUT)
-            .map_err(|_| anyhow!("timed out registering artifact download chunk waiter"))?
-            .map_err(anyhow::Error::msg)?;
-        Ok(response_rx)
     }
 
     pub fn artifact_upload_start(
@@ -1005,18 +893,18 @@ impl GatewayWsCommandSender {
     }
 }
 
-struct GatewayWsArtifactDownloadChunkWaiter {
-    response_rx: Receiver<std::result::Result<ArtifactDownloadChunkPayload, String>>,
-}
-
-impl ArtifactDownloadChunkWaiter for GatewayWsArtifactDownloadChunkWaiter {
-    fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<crate::transport::ws::download::ArtifactDownloadChunkPayload> {
-        self.response_rx
-            .recv_timeout(timeout)
-            .map_err(|_| anyhow!("timed out waiting for artifact download chunk"))?
-            .map_err(anyhow::Error::msg)
-    }
+fn http_access_from_spec(
+    spec: &GatewayWsConnectSpec,
+    generation: u64,
+) -> Option<GatewayHttpAccess> {
+    let session = spec.session.as_ref()?;
+    let access_token = spec.auth_token.clone()?;
+    Some(GatewayHttpAccess {
+        gateway_base_url: spec.gateway_base_url.clone(),
+        gateway_id: session.server_gateway_id.clone(),
+        session_id: session.session_id.clone(),
+        generation,
+        access_expires_at_unix: session.access_expires_at_unix,
+        access_token,
+    })
 }

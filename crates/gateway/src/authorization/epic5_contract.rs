@@ -21,7 +21,7 @@ struct OperationContract {
     post_commit: &'static str,
 }
 
-const OPERATIONS: [OperationContract; 14] = [
+const OPERATIONS: [OperationContract; 13] = [
     OperationContract {
         method: "invite/create",
         admission: "normal",
@@ -80,21 +80,6 @@ const OPERATIONS: [OperationContract; 14] = [
         rate_limit: "ordinary_authenticated_read",
         transaction_owner: "member_administration_service",
         concurrency: "current_acl_snapshot",
-        post_commit: "none",
-    },
-    OperationContract {
-        method: "member/avatar/get",
-        admission: "normal",
-        action: "member_avatar_read",
-        resource: "visible_directory_principal",
-        superuser: "allow_any_principal",
-        member: "allow_visible_directory_principal_only",
-        restricted_invitee: "deny",
-        disclosure: "epic4_anti_idor",
-        audit: "none",
-        rate_limit: "bounded_avatar_read",
-        transaction_owner: "member_administration_service",
-        concurrency: "current_directory_scope",
         post_commit: "none",
     },
     OperationContract {
@@ -234,12 +219,11 @@ const OPERATIONS: [OperationContract; 14] = [
     },
 ];
 
-const EXPECTED_NORMAL_METHODS: [&str; 12] = [
+const EXPECTED_NORMAL_METHODS: [&str; 11] = [
     "invite/create",
     "invite/list",
     "invite/revoke",
     "member/list",
-    "member/avatar/get",
     "member/suspend",
     "member/restore",
     "member/remove",
@@ -291,12 +275,11 @@ const REQUIRED_RACES: [&str; 7] = [
 /// Each frozen ingress has one implementation owner and one in-process test
 /// seam. Keeping this beside the policy matrix prevents a later phase from
 /// silently dropping a method or deferring it outside Epic 5.
-const IMPLEMENTATION_OWNERS: [(&str, &str, &str); 14] = [
+const IMPLEMENTATION_OWNERS: [(&str, &str, &str); 13] = [
     ("invite/create", "P02-WP03", "invitation_service_tests"),
     ("invite/list", "P02-WP04", "invitation_service_tests"),
     ("invite/revoke", "P02-WP04", "invitation_service_tests"),
     ("member/list", "P04-WP01", "member_directory_tests"),
-    ("member/avatar/get", "P04-WP01", "member_avatar_tests"),
     ("member/suspend", "P05-WP01", "member_lifecycle_tests"),
     ("member/restore", "P05-WP02", "member_lifecycle_tests"),
     ("member/remove", "P05-WP03", "member_lifecycle_tests"),

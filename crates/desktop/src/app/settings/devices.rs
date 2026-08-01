@@ -4,7 +4,9 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{button::*, clipboard::Clipboard, spinner::Spinner, theme::ActiveTheme, *};
-use pioneer_client::gateway::device_activation::DeviceActivationQrPresentation;
+use pioneer_client::gateway::{
+    device_activation::DeviceActivationQrPresentation, endpoint::GatewayBaseUrl,
+};
 use pioneer_protocol::{
     AuthSessionListItem, AuthSessionRevokeParams, AuthSessionStatus, ClientKind, DeviceStatus,
 };
@@ -310,7 +312,7 @@ impl PioneerDesktop {
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.active_gateway().cloned())
-            .map(|endpoint| endpoint.address);
+            .map(|endpoint| endpoint.gateway_base_url);
         let activation_state = cx.new(|_| DeviceActivationDialogState {
             phase: DeviceActivationDialogPhase::Loading,
         });
@@ -335,7 +337,7 @@ impl PioneerDesktop {
 
     fn request_desktop_activation(
         &mut self,
-        endpoint_address: String,
+        endpoint_address: GatewayBaseUrl,
         activation_state: Entity<DeviceActivationDialogState>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -355,7 +357,7 @@ impl PioneerDesktop {
                             let created = sender.auth_device_create()?;
                             let session_id = created.session_id.clone();
                             match DeviceActivationQrPresentation::from_created_device(
-                                endpoint_address,
+                                &endpoint_address,
                                 created,
                             ) {
                                 Ok(presentation) => Ok(presentation),
@@ -385,7 +387,7 @@ impl PioneerDesktop {
     fn open_activation_dialog(
         &mut self,
         activation_state: Entity<DeviceActivationDialogState>,
-        endpoint_address: Option<String>,
+        endpoint_address: Option<GatewayBaseUrl>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

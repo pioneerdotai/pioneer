@@ -169,19 +169,31 @@ output = "Salida"
 
 [artifacts.action]
 attach_tooltip = "Usar este artefacto como entrada en el compositor"
+cancel_tooltip = "Cancelar descarga"
 download_tooltip = "Descargar este artefacto a este equipo"
-open_tooltip = "Abrir una copia local verificada"
+open_tooltip = "Abrir una vista segura en streaming"
 reveal_tooltip = "Mostrar la copia local"
 
 [artifacts.action.error]
 no_gateway = "No hay una pasarela activa"
 no_workspace = "Falta el espacio de trabajo del artefacto"
 not_connected = "La pasarela no esta conectada"
+authentication = "La sesion de la pasarela debe autenticarse de nuevo"
+cancelled = "Se cancelo la descarga del artefacto"
+disk_full = "No hay suficiente espacio para descargar este artefacto"
+download_failed = "Fallo la descarga del artefacto"
+grant_expired = "La vista segura caduco; vuelve a abrirla"
+integrity = "El artefacto descargado no supero la verificacion"
+invalid_artifact = "Faltan datos de la version del artefacto"
+local_copy_invalid = "La copia local falta o ya no es valida"
+reconfigure = "El endpoint activo debe configurarse de nuevo"
+revoked = "Este artefacto ya no esta disponible"
+viewer_failed = "No se pudo abrir el visor del sistema"
 
 [artifacts.action.status]
 downloading = "Descargando a este equipo..."
 failed = "La accion del artefacto fallo"
-opening = "Abriendo copia local..."
+opening = "Abriendo vista segura..."
 queued = "Esperando destino..."
 revealing = "Mostrando copia local..."
 verifying = "Verificando copia local..."

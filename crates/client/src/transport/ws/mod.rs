@@ -1,6 +1,8 @@
 //! WebSocket transport client.
 
-use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
+use crate::gateway::{
+    endpoint::GatewayBaseUrl, timings::GatewayWsTimings, types::GatewayEndpointKind,
+};
 use pioneer_protocol::GatewayNotification;
 use pioneer_protocol::{AuthSecretString, AuthSessionId, DeviceId, GatewayId};
 
@@ -9,7 +11,6 @@ pub mod backoff;
 pub mod client;
 pub mod command_sender;
 pub mod decode;
-pub mod download;
 pub mod frames;
 pub mod rpc;
 pub mod runtime;
@@ -22,7 +23,7 @@ pub struct GatewayWsConnectSpec {
     pub endpoint_id: String,
     pub endpoint_name: String,
     pub endpoint_kind: GatewayEndpointKind,
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub auth_token: Option<AuthSecretString>,
     pub session: Option<GatewayWsSessionIdentity>,
     pub timings: GatewayWsTimings,
@@ -35,7 +36,7 @@ impl std::fmt::Debug for GatewayWsConnectSpec {
             .field("endpoint_id", &self.endpoint_id)
             .field("endpoint_name", &self.endpoint_name)
             .field("endpoint_kind", &self.endpoint_kind)
-            .field("address", &self.address)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field(
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[redacted]"),
@@ -61,7 +62,7 @@ pub struct GatewayWsSessionSpec {
     pub endpoint_id: String,
     pub endpoint_name: String,
     pub endpoint_kind: GatewayEndpointKind,
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub identity: GatewayWsSessionIdentity,
     pub access_token: AuthSecretString,
     pub timings: GatewayWsTimings,
@@ -73,7 +74,7 @@ impl GatewayWsSessionSpec {
             endpoint_id: self.endpoint_id,
             endpoint_name: self.endpoint_name,
             endpoint_kind: self.endpoint_kind,
-            address: self.address,
+            gateway_base_url: self.gateway_base_url,
             auth_token: Some(self.access_token),
             session: Some(self.identity),
             timings: self.timings,
@@ -94,7 +95,7 @@ pub enum GatewayWsEvent {
         connection_id: u64,
         endpoint_id: String,
         endpoint_name: String,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
     },
     Reconnecting {
         connection_id: u64,
@@ -109,7 +110,7 @@ pub enum GatewayWsEvent {
         endpoint_id: String,
         endpoint_name: String,
         endpoint_kind: GatewayEndpointKind,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         reason: String,
     },
     ConnectFailed {
@@ -117,7 +118,7 @@ pub enum GatewayWsEvent {
         endpoint_id: String,
         endpoint_name: String,
         endpoint_kind: GatewayEndpointKind,
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         error: String,
     },
     Notification {
@@ -171,7 +172,7 @@ mod tests {
                 connection_id: 7,
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
             },
             GatewayWsEvent::Reconnecting {
                 connection_id: 7,
@@ -186,7 +187,7 @@ mod tests {
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
                 endpoint_kind: GatewayEndpointKind::Local,
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
                 reason: "closed".to_owned(),
             },
             GatewayWsEvent::ConnectFailed {
@@ -194,7 +195,7 @@ mod tests {
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
                 endpoint_kind: GatewayEndpointKind::Local,
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
                 error: "refused".to_owned(),
             },
             GatewayWsEvent::Notification {
@@ -214,7 +215,7 @@ mod tests {
             connection_id: 7,
             endpoint_id: "local".to_owned(),
             endpoint_name: "Local".to_owned(),
-            address: "127.0.0.1:17878".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
         };
 
         assert!(should_apply_ws_event(Some(7), &event));

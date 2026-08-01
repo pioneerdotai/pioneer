@@ -1,7 +1,8 @@
 //! Shared gateway setup workflows.
 
 use super::{
-    connectivity::{GatewayAddressError, is_gateway_reachable, normalize_address},
+    connectivity::{GatewayAddressError, is_gateway_reachable},
+    endpoint::{GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity},
     runtime::{
         AddRemoteGatewayProfilePlan, GatewayProfileError, activate_gateway,
         apply_add_remote_gateway_profile_plan, apply_delete_remote_gateway_profile_plan,
@@ -20,14 +21,27 @@ use std::{error::Error, fmt, time::Duration};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RemoteGatewayValidation {
-    Reachable { address: String },
-    Unreachable { address: String },
+    Reachable {
+        gateway_base_url: GatewayBaseUrl,
+        transport_security: GatewayTransportSecurity,
+    },
+    Unreachable {
+        gateway_base_url: GatewayBaseUrl,
+        transport_security: GatewayTransportSecurity,
+    },
 }
 
 impl RemoteGatewayValidation {
-    pub fn address(&self) -> &str {
+    pub fn gateway_base_url(&self) -> &GatewayBaseUrl {
         match self {
-            Self::Reachable { address } | Self::Unreachable { address } => address.as_str(),
+            Self::Reachable {
+                gateway_base_url, ..
+            }
+            | Self::Unreachable {
+                gateway_base_url, ..
+            } => {
+                gateway_base_url
+            }
         }
     }
 
@@ -41,9 +55,9 @@ pub enum RemoteGatewayValidationError {
     InvalidTimeout {
         timeout_ms: u64,
     },
-    InvalidAddress(GatewayAddressError),
+    InvalidGatewayBaseUrl(GatewayBaseUrlError),
     ResolveFailed {
-        address: String,
+        gateway_base_url: GatewayBaseUrl,
         source: GatewayAddressError,
     },
 }
@@ -85,7 +99,7 @@ pub struct DeleteRemoteGatewayRegistryPlan {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AddRemoteGatewayInput<'a> {
     pub name: &'a str,
-    pub address: &'a str,
+    pub gateway_base_url: &'a str,
     pub new_endpoint_id: String,
     pub default_remote_name: String,
 }
@@ -94,7 +108,7 @@ pub struct AddRemoteGatewayInput<'a> {
 pub struct UpdateRemoteGatewayRegistryInput<'a> {
     pub gateway_id: &'a str,
     pub name: &'a str,
-    pub address: &'a str,
+    pub gateway_base_url: &'a str,
     pub default_remote_name: String,
 }
 
@@ -177,23 +191,31 @@ pub fn generated_remote_gateway_endpoint_id() -> String {
     format!("remote-{}", generate_id(8))
 }
 
-pub fn validate_remote_gateway_address(
-    address: &str,
+pub fn validate_remote_gateway_base_url(
+    gateway_base_url: &str,
     connect_timeout: Duration,
 ) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
-    let address =
-        normalize_address(address).map_err(RemoteGatewayValidationError::InvalidAddress)?;
-    let reachable = is_gateway_reachable(address.as_str(), connect_timeout).map_err(|source| {
+    let gateway_base_url = GatewayBaseUrl::parse_presentation(gateway_base_url)
+        .map_err(RemoteGatewayValidationError::InvalidGatewayBaseUrl)?;
+    let reachable = is_gateway_reachable(&gateway_base_url, connect_timeout).map_err(|source| {
         RemoteGatewayValidationError::ResolveFailed {
-            address: address.clone(),
+            gateway_base_url: gateway_base_url.clone(),
             source,
         }
     })?;
 
     if reachable {
-        Ok(RemoteGatewayValidation::Reachable { address })
+        let transport_security = gateway_base_url.transport_security();
+        Ok(RemoteGatewayValidation::Reachable {
+            gateway_base_url,
+            transport_security,
+        })
     } else {
-        Ok(RemoteGatewayValidation::Unreachable { address })
+        let transport_security = gateway_base_url.transport_security();
+        Ok(RemoteGatewayValidation::Unreachable {
+            gateway_base_url,
+            transport_security,
+        })
     }
 }
 
@@ -205,7 +227,7 @@ pub fn plan_add_remote_gateway(
         registry,
         input.new_endpoint_id,
         input.name,
-        input.address,
+        input.gateway_base_url,
         input.default_remote_name,
     )?;
 
@@ -267,7 +289,7 @@ pub fn plan_update_remote_gateway_registry(
         &next_registry,
         input.gateway_id,
         input.name,
-        input.address,
+        input.gateway_base_url,
         input.default_remote_name,
     )?;
 
@@ -316,13 +338,8 @@ impl fmt::Display for RemoteGatewayValidationError {
                     "remote gateway validation timeout must be positive, got {timeout_ms} ms"
                 )
             }
-            Self::InvalidAddress(error) => write!(f, "{error}"),
-            Self::ResolveFailed { address, source } => {
-                write!(
-                    f,
-                    "failed to resolve remote gateway address `{address}`: {source}"
-                )
-            }
+            Self::InvalidGatewayBaseUrl(error) => write!(f, "{error}"),
+            Self::ResolveFailed { source, .. } => write!(f, "failed to resolve Gateway: {source}"),
         }
     }
 }

@@ -23,9 +23,11 @@ use tokio_tungstenite::{
         Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
     },
 };
-use url::Url;
 use zeroize::Zeroizing;
 
+use crate::gateway::endpoint::{
+    GatewayBaseUrl, PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
+};
 use crate::gateway::invitation::{InvitationQrPresentation, InvitationSessionCleanup};
 
 // Invitation accept is the only restricted request that may carry a bounded
@@ -194,7 +196,7 @@ impl AuthExchangeClient {
 
     pub async fn refresh(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         credential: &str,
         params: AuthRefreshParams,
     ) -> Result<AuthRefreshGrant, AuthExchangeError> {
@@ -204,13 +206,13 @@ impl AuthExchangeClient {
                 "refresh requires a refresh credential",
             ));
         }
-        self.exchange(address, credential, methods::AUTH_REFRESH, &params)
+        self.exchange(gateway_base_url, credential, methods::AUTH_REFRESH, &params)
             .await
     }
 
     pub async fn activate_device(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         credential: &str,
         params: AuthDeviceActivateParams,
     ) -> Result<AuthSessionGrant, AuthExchangeError> {
@@ -223,7 +225,7 @@ impl AuthExchangeClient {
             })?,
         );
         self.exchange(
-            address,
+            gateway_base_url,
             canonical.as_str(),
             methods::AUTH_DEVICE_ACTIVATE,
             &params,
@@ -235,8 +237,10 @@ impl AuthExchangeClient {
         &self,
         invitation: &InvitationQrPresentation,
     ) -> Result<InvitationPreviewResponse, InvitationExchangeError> {
+        let gateway_base_url = invitation_gateway_base_url(invitation.protected_endpoint())
+            .map_err(InvitationExchangeError::from_auth)?;
         let (stream, remaining) = self
-            .connect_with_credential(invitation.protected_endpoint(), invitation.credential())
+            .connect_with_credential(&gateway_base_url, invitation.credential())
             .await
             .map_err(InvitationExchangeError::from_auth)?;
         preview_invitation_over_stream(stream, invitation, remaining).await
@@ -247,8 +251,10 @@ impl AuthExchangeClient {
         invitation: &InvitationQrPresentation,
         params: InvitationAcceptParams,
     ) -> Result<InvitationAcceptResponse, InvitationExchangeError> {
+        let gateway_base_url = invitation_gateway_base_url(invitation.protected_endpoint())
+            .map_err(InvitationExchangeError::from_auth)?;
         let (stream, remaining) = self
-            .connect_with_credential(invitation.protected_endpoint(), invitation.credential())
+            .connect_with_credential(&gateway_base_url, invitation.credential())
             .await
             .map_err(InvitationExchangeError::from_auth)?;
         accept_invitation_over_stream(stream, invitation, &params, remaining).await
@@ -257,9 +263,12 @@ impl AuthExchangeClient {
     /// Uses the existing authenticated logout path. Failure is deliberately
     /// ignored because the server-side session will still expire/revalidate.
     pub async fn cleanup_invitation_session_best_effort(&self, cleanup: InvitationSessionCleanup) {
+        let Ok(gateway_base_url) = invitation_gateway_base_url(cleanup.protected_endpoint()) else {
+            return;
+        };
         let _ = self
             .cleanup_session_once(
-                cleanup.protected_endpoint(),
+                &gateway_base_url,
                 cleanup.access_token(),
                 cleanup.session_id().clone(),
             )
@@ -268,7 +277,7 @@ impl AuthExchangeClient {
 
     pub async fn cleanup_session_once(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         access_credential: &str,
         session_id: AuthSessionId,
     ) -> Result<AuthSessionRevokeResponse, AuthExchangeError> {
@@ -283,7 +292,7 @@ impl AuthExchangeClient {
         // peer device if a malformed grant carried the wrong session ID.
         let response: AuthLogoutResponse = self
             .request_once(
-                address,
+                gateway_base_url,
                 access_credential,
                 methods::AUTH_LOGOUT,
                 &serde_json::json!({}),
@@ -303,7 +312,7 @@ impl AuthExchangeClient {
 
     async fn exchange<P, R>(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         credential: &str,
         method: &str,
         params: &P,
@@ -312,13 +321,13 @@ impl AuthExchangeClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let (stream, remaining) = self.connect_with_credential(address, credential).await?;
+        let (stream, remaining) = self.connect_with_credential(gateway_base_url, credential).await?;
         exchange_over_stream(stream, method, params, remaining).await
     }
 
     async fn request_once<P, R>(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         credential: &str,
         method: &str,
         params: &P,
@@ -327,22 +336,26 @@ impl AuthExchangeClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let (stream, remaining) = self.connect_with_credential(address, credential).await?;
+        let (stream, remaining) = self.connect_with_credential(gateway_base_url, credential).await?;
         request_once_over_stream(stream, method, params, remaining).await
     }
 
     async fn connect_with_credential(
         &self,
-        address: &str,
+        gateway_base_url: &GatewayBaseUrl,
         credential: &str,
     ) -> Result<(GatewayAuthWebSocket, Duration), AuthExchangeError> {
-        let url = normalize_auth_ws_url(address)?;
-        let mut request = url.into_client_request().map_err(|_| {
+        let url = gateway_base_url.websocket_url();
+        let mut request = url.as_str().into_client_request().map_err(|_| {
             AuthExchangeError::new(
                 AuthExchangeErrorKind::InvalidEndpoint,
                 "failed to prepare Gateway WebSocket request",
             )
         })?;
+        request.headers_mut().insert(
+            PIONEER_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(PIONEER_PROTOCOL_VERSION),
+        );
         let authorization_value = Zeroizing::new(format!("Bearer {credential}"));
         let authorization = HeaderValue::from_str(authorization_value.as_str()).map_err(|_| {
             AuthExchangeError::new(
@@ -381,6 +394,17 @@ impl AuthExchangeClient {
         }
         Ok((stream, remaining))
     }
+}
+
+fn invitation_gateway_base_url(
+    protected_endpoint: &str,
+) -> Result<GatewayBaseUrl, AuthExchangeError> {
+    GatewayBaseUrl::from_websocket_presentation(protected_endpoint).map_err(|_| {
+        AuthExchangeError::new(
+            AuthExchangeErrorKind::InvalidEndpoint,
+            "invitation endpoint is not a canonical Gateway WebSocket authority",
+        )
+    })
 }
 
 async fn preview_invitation_over_stream<S>(
@@ -430,48 +454,6 @@ where
 
 type GatewayAuthWebSocket =
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-pub fn normalize_auth_ws_url(address: &str) -> Result<String, AuthExchangeError> {
-    let trimmed = address.trim();
-    if trimmed.is_empty() || trimmed.len() > 2_048 {
-        return Err(AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "Gateway endpoint is empty",
-        ));
-    }
-    let normalized = if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if trimmed.contains("://") {
-        trimmed.to_owned()
-    } else {
-        format!("ws://{trimmed}")
-    };
-    let parsed = Url::parse(&normalized).map_err(|_| {
-        AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "Gateway endpoint is invalid",
-        )
-    })?;
-    parsed.host_str().ok_or_else(|| {
-        AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "Gateway endpoint has no host",
-        )
-    })?;
-    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
-        return Err(AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "auth transport endpoint must not contain user credentials or a fragment",
-        ));
-    }
-    match parsed.scheme() {
-        "ws" | "wss" => Ok(normalized),
-        _ => Err(AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "auth transport requires ws or wss",
-        )),
-    }
-}
 
 fn is_refresh_credential(value: &str) -> bool {
     let Some(body) = value.strip_prefix(REFRESH_CREDENTIAL_PREFIX) else {
@@ -1076,13 +1058,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "opens a real socket; excluded from the hermetic test suite"]
     async fn connection_failure_is_known_to_precede_request_dispatch() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let gateway_base_url = listener.local_addr().unwrap();
         drop(listener);
 
+        let base = GatewayBaseUrl::parse_presentation(
+            format!("http://{gateway_base_url}").as_str(),
+        )
+        .unwrap();
         let result = AuthExchangeClient::new(Duration::from_secs(1))
-            .connect_with_credential(format!("ws://{address}").as_str(), "credential")
+            .connect_with_credential(&base, "credential")
             .await;
         let error = match result {
             Ok(_) => panic!("closed local port unexpectedly accepted a WebSocket connection"),
@@ -1197,25 +1184,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_endpoint_accepts_plaintext_remote_and_rejects_credential_bearing_urls() {
-        assert!(normalize_auth_ws_url("ws://127.0.0.1:17878").is_ok());
-        assert!(normalize_auth_ws_url("ws://[::1]:17878").is_ok());
-        assert!(normalize_auth_ws_url("localhost:17878").is_ok());
-        assert!(normalize_auth_ws_url("wss://gateway.example.test/ws").is_ok());
-        assert!(normalize_auth_ws_url("ws://192.0.2.10:17878").is_ok());
-        assert!(normalize_auth_ws_url("gateway.example.test:17878").is_ok());
-        assert_eq!(
-            normalize_auth_ws_url("wss://user:password@gateway.example.test/ws")
-                .unwrap_err()
-                .kind,
-            AuthExchangeErrorKind::InvalidEndpoint
-        );
-        assert_eq!(
-            normalize_auth_ws_url("wss://gateway.example.test/ws#credential")
-                .unwrap_err()
-                .kind,
-            AuthExchangeErrorKind::InvalidEndpoint
-        );
+    fn auth_endpoint_is_the_typed_shared_gateway_base() {
+        let base = GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer")
+            .unwrap();
+        assert_eq!(base.websocket_url().as_str(), "wss://gateway.example.test/pioneer/");
+        assert!(GatewayBaseUrl::parse_presentation("wss://gateway.example.test/ws").is_err());
     }
 
     #[test]

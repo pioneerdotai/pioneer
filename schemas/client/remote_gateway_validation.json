@@ -5,34 +5,52 @@
     {
       "type": "object",
       "properties": {
-        "address": {
+        "gateway_base_url": {
           "type": "string"
         },
         "state": {
           "type": "string",
           "const": "reachable"
+        },
+        "transport_security": {
+          "$ref": "#/$defs/GatewayTransportSecurity"
         }
       },
       "required": [
         "state",
-        "address"
+        "gateway_base_url",
+        "transport_security"
       ]
     },
     {
       "type": "object",
       "properties": {
-        "address": {
+        "gateway_base_url": {
           "type": "string"
         },
         "state": {
           "type": "string",
           "const": "unreachable"
+        },
+        "transport_security": {
+          "$ref": "#/$defs/GatewayTransportSecurity"
         }
       },
       "required": [
         "state",
-        "address"
+        "gateway_base_url",
+        "transport_security"
       ]
     }
-  ]
+  ],
+  "$defs": {
+    "GatewayTransportSecurity": {
+      "type": "string",
+      "enum": [
+        "loopback_plaintext",
+        "remote_plaintext",
+        "tls"
+      ]
+    }
+  }
 }

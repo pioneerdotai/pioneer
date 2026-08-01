@@ -120,22 +120,36 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "artifact_download_request_plan_error.json",
-            crate::artifacts::actions::ArtifactDownloadRequestPlanError,
+            "artifact_http_download_request_plan_error.json",
+            crate::artifacts::actions::ArtifactHttpDownloadRequestPlanError,
             Domain::Artifacts,
             Kind::ActionPlan,
             Stability::Provisional
         ),
         contract_type!(
-            "artifact_download_request.json",
-            crate::artifacts::download::ArtifactDownloadRequest,
+            "artifact_http_download_error.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadError,
+            Domain::Artifacts,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_http_download_progress.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadProgress,
+            Domain::Artifacts,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_http_download_request.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadRequest,
             Domain::Artifacts,
             Kind::ActionPlan,
             Stability::Provisional
         ),
         contract_type!(
-            "artifact_download_result.json",
-            crate::artifacts::download::ArtifactDownloadResult,
+            "artifact_http_download_result.json",
+            crate::artifacts::http_download::ArtifactHttpDownloadResult,
             Domain::Artifacts,
             Kind::ActionPlan,
             Stability::Provisional
@@ -2190,20 +2204,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "member_list_response.json",
             pioneer_protocol::MemberListResponse,
-            Domain::Connection,
-            Kind::Snapshot,
-            Stability::Stable
-        ),
-        contract_type!(
-            "member_avatar_get_params.json",
-            pioneer_protocol::MemberAvatarGetParams,
-            Domain::Connection,
-            Kind::Command,
-            Stability::Stable
-        ),
-        contract_type!(
-            "member_avatar_get_response.json",
-            pioneer_protocol::MemberAvatarGetResponse,
             Domain::Connection,
             Kind::Snapshot,
             Stability::Stable

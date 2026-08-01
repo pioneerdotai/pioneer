@@ -4630,6 +4630,7 @@ model = "legacy-model"
             service_name: "com.pioneer.gateway".to_owned(),
             legacy_service_names: Vec::new(),
             listen_addr: "0.0.0.0:17878".to_owned(),
+            trusted_proxy_peers: Vec::new(),
             outbound_queue_capacity: 128,
             keepawake,
             preflight_model: Default::default(),

@@ -1,4 +1,4 @@
-use crate::gateway::connectivity::is_gateway_reachable;
+use crate::gateway::connectivity::is_local_gateway_reachable;
 use crate::gateway::control::{
     GatewayInstallWarning, is_configured_service_active, managed_gateway_install,
     update_gateway_service_from_desktop_binary,
@@ -25,7 +25,8 @@ impl GatewayRuntime {
         let listen_addr = self.config.gateway.listen_addr.as_str();
 
         let service_active = is_configured_service_active(service_name)?;
-        let gateway_reachable = is_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
+        let gateway_reachable =
+            is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
 
         info!(
             managed_by = %managed_by_label(&install.managed_by),
@@ -45,9 +46,7 @@ impl GatewayRuntime {
         }
 
         self.registry.active_gateway_id = Some(self.local_gateway_id().to_owned());
-        if !self.registry_upgrade_pending() {
-            save_registry(&self.registry_path, &self.registry)?;
-        }
+        save_registry(&self.registry_path, &self.registry)?;
         Ok(())
     }
 }

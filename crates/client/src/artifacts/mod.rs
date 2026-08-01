@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod download;
+pub mod http_download;
 pub mod presentation;
 pub mod preview;
 pub mod state;

@@ -2,7 +2,6 @@
 
 use super::{
     GatewayWsEvent,
-    download::ArtifactDownloadChunkPayload,
     frames::{fail_pending_transfer_chunks, upload_chunk_key},
 };
 use crate::rpc::{
@@ -106,15 +105,6 @@ pub fn fail_pending_artifact_upload_chunks(
     fail_pending_transfer_chunks(pending_upload_chunks, error);
 }
 
-pub fn fail_pending_artifact_download_chunks(
-    pending_download_chunks: &mut HashMap<
-        String,
-        Sender<std::result::Result<ArtifactDownloadChunkPayload, String>>,
-    >,
-    error: &str,
-) {
-    fail_pending_transfer_chunks(pending_download_chunks, error);
-}
 
 #[cfg(test)]
 mod tests {
@@ -132,7 +122,7 @@ mod tests {
             endpoint_id: "remote".to_owned(),
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            address: "127.0.0.1:22000".to_owned(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:22000").unwrap(),
             auth_token: None,
             session: None,
             timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),

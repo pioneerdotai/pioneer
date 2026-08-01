@@ -64,8 +64,8 @@ pub(crate) struct GatewayAuthService {
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
     opaque_credentials: OpaqueCredentialFactory,
+    disconnect_hooks: std::sync::RwLock<Vec<Arc<dyn AuthSessionDisconnectHook>>>,
     epic5_rate_limits: Arc<Epic5RateLimits>,
-    disconnect_hook: std::sync::RwLock<Option<Arc<dyn AuthSessionDisconnectHook>>>,
     invitation_accept_hook: std::sync::RwLock<Option<Arc<dyn InvitationAcceptPostCommitHook>>>,
     #[cfg(test)]
     activation_failpoint: std::sync::atomic::AtomicU8,
@@ -187,8 +187,8 @@ impl GatewayAuthService {
             database,
             config,
             identity,
+            disconnect_hooks: std::sync::RwLock::new(Vec::new()),
             epic5_rate_limits: Arc::new(Epic5RateLimits::default()),
-            disconnect_hook: std::sync::RwLock::new(None),
             invitation_accept_hook: std::sync::RwLock::new(None),
             #[cfg(test)]
             activation_failpoint: std::sync::atomic::AtomicU8::new(0),
@@ -602,11 +602,19 @@ impl GatewayAuthService {
     }
 
     pub(crate) fn set_disconnect_hook(&self, hook: Arc<dyn AuthSessionDisconnectHook>) {
-        let mut disconnect_hook = self
-            .disconnect_hook
+        let mut disconnect_hooks = self
+            .disconnect_hooks
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *disconnect_hook = Some(hook);
+        disconnect_hooks.clear();
+        disconnect_hooks.push(hook);
+    }
+
+    pub(crate) fn add_disconnect_hook(&self, hook: Arc<dyn AuthSessionDisconnectHook>) {
+        self.disconnect_hooks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(hook);
     }
 
     pub(crate) fn set_invitation_accept_post_commit_hook(
@@ -647,12 +655,12 @@ impl GatewayAuthService {
         session_id: &AuthSessionId,
         reason: AuthSessionTerminationReason,
     ) {
-        let hook = self
-            .disconnect_hook
+        let hooks = self
+            .disconnect_hooks
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(hook) = hook {
+        for hook in hooks {
             hook.disconnect_session(session_id, reason).await;
         }
     }
@@ -750,6 +758,70 @@ impl GatewayAuthService {
                 },
                 role_key,
             },
+        })
+    }
+
+    pub(crate) async fn resolve_active_view_grant_principal(
+        &self,
+        gateway_id: &pioneer_protocol::GatewayId,
+        principal_id: &pioneer_protocol::PrincipalId,
+        session_id: &AuthSessionId,
+    ) -> Result<AuthenticatedSessionPrincipal, AuthError> {
+        if gateway_id != &self.identity.gateway.id {
+            return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
+        }
+        let now_unix =
+            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let session = load_session(&self.database, session_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if session.gateway_id != gateway_id.as_str()
+            || session.principal_id != principal_id.as_str()
+        {
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+        if session.status == "expired" {
+            return Err(AuthError::new(AuthErrorCode::SessionExpired));
+        }
+        if session.status != "active" {
+            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+        }
+        let refresh_expires_at = session
+            .refresh_expires_at
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if datetime(now_unix)? >= refresh_expires_at {
+            return Err(AuthError::new(AuthErrorCode::SessionExpired));
+        }
+
+        let device_id = DeviceId::new(session.device_id)
+            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let device = load_device(&self.database, &device_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let owner = load_principal_by_id(&self.database, principal_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if device.status != "active"
+            || device.gateway_id != gateway_id.as_str()
+            || device.principal_id != principal_id.as_str()
+            || owner.gateway_id.as_str() != gateway_id.as_str()
+        {
+            return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+        }
+        let role_key =
+            validate_authenticated_principal(owner.kind, owner.status, owner.role_key.as_deref())?;
+        Ok(AuthenticatedSessionPrincipal {
+            gateway_id: gateway_id.clone(),
+            principal_id: principal_id.clone(),
+            kind: owner.kind,
+            role_key,
+            device_id,
+            session_id: session_id.clone(),
+            access_jti: "view-grant".to_owned(),
+            access_expires_at_unix: timestamp(refresh_expires_at)?,
         })
     }
 

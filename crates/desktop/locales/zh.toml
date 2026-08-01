@@ -169,19 +169,31 @@ output = "输出"
 
 [artifacts.action]
 attach_tooltip = "将此工件作为输入用于编辑器"
+cancel_tooltip = "取消下载"
 download_tooltip = "将此工件下载到这台电脑"
-open_tooltip = "打开已验证的本地副本"
+open_tooltip = "打开安全流式预览"
 reveal_tooltip = "显示本地副本"
 
 [artifacts.action.error]
 no_gateway = "没有活动网关"
 no_workspace = "缺少工件工作区"
 not_connected = "网关未连接"
+authentication = "请重新登录网关会话"
+cancelled = "工件下载已取消"
+disk_full = "磁盘空间不足，无法下载此工件"
+download_failed = "工件下载失败"
+grant_expired = "安全预览已过期，请重新打开"
+integrity = "下载文件未通过完整性校验"
+invalid_artifact = "工件版本信息不完整"
+local_copy_invalid = "本地副本不存在或已失效"
+reconfigure = "需要重新配置当前网关地址"
+revoked = "此工件已不可用"
+viewer_failed = "无法打开系统查看器"
 
 [artifacts.action.status]
 downloading = "正在下载到这台电脑..."
 failed = "工件操作失败"
-opening = "正在打开本地副本..."
+opening = "正在打开安全预览..."
 queued = "正在等待目标位置..."
 revealing = "正在显示本地副本..."
 verifying = "正在验证本地副本..."

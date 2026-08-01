@@ -8,10 +8,10 @@ pub(crate) use session::{DesktopSessionConnectionOutcome, DesktopSessionPreparat
 use crate::gateway::activation::{
     activate_device_session, provision_endpoint_session, revoke_session_best_effort,
 };
-use crate::gateway::connectivity::validate_remote_gateway_address;
+use crate::gateway::connectivity::validate_remote_gateway_base_url;
 use crate::gateway::control::{GatewayInstallWarning, create_local_pending_device_session};
 use crate::gateway::registry::{
-    complete_registry_upgrade, load_registry_for_runtime, save_registry, setup_required,
+    load_registry_for_runtime, save_registry, setup_required,
 };
 use crate::gateway::secrets::DesktopSecrets;
 use crate::gateway::timings::{
@@ -52,7 +52,6 @@ pub struct GatewayRuntime {
     ws_timings: GatewayWsTimings,
     registry_path: PathBuf,
     registry: GatewayRegistry,
-    registry_upgrade_pending: bool,
     secrets: DesktopSecrets,
     terminal_sessions:
         HashMap<String, pioneer_client::gateway::session_lifecycle::SessionTerminalReason>,
@@ -72,32 +71,23 @@ impl GatewayRuntime {
         let secrets = DesktopSecrets::open(&runtime_home)?;
         let loaded_registry = load_registry_for_runtime(&registry_path, &config)?;
 
-        let mut runtime = Self {
+        let runtime = Self {
             config,
             timings,
             ws_timings,
             registry_path,
             registry: loaded_registry.registry,
-            registry_upgrade_pending: loaded_registry.upgrade_pending,
             secrets,
             terminal_sessions: HashMap::new(),
             access_expiries: HashMap::new(),
         };
-        if runtime.registry_upgrade_pending {
-            runtime.resume_registry_upgrade_from_durable_session()?;
-        } else {
-            runtime.purge_retired_desktop_credentials();
-        }
+        runtime.purge_retired_desktop_credentials();
 
         Ok(runtime)
     }
 
     pub fn setup_required(&self) -> bool {
         setup_required(&self.registry)
-    }
-
-    pub(crate) fn registry_upgrade_pending(&self) -> bool {
-        self.registry_upgrade_pending
     }
 
     pub fn local_gateway_update_required() -> bool {
@@ -124,7 +114,7 @@ impl GatewayRuntime {
             return Ok(true);
         }
 
-        crate::gateway::connectivity::is_gateway_reachable(
+        crate::gateway::connectivity::is_local_gateway_reachable(
             self.config.gateway.listen_addr.as_str(),
             self.timings.connect_timeout,
         )
@@ -170,15 +160,14 @@ impl GatewayRuntime {
             endpoint_id,
             activation_code,
             &self.secrets,
-            |address, credential, params| {
-                activate_device_session(address, credential, params, timeout)
+            |gateway_base_url, credential, params| {
+                activate_device_session(gateway_base_url, credential, params, timeout)
             },
-            |address, access_token, session_id| {
-                revoke_session_best_effort(address, access_token, session_id, timeout)
+            |gateway_base_url, access_token, session_id| {
+                revoke_session_best_effort(gateway_base_url, access_token, session_id, timeout)
             },
             |registry| save_registry(registry_path.as_path(), registry),
         )?;
-        self.complete_registry_upgrade_after_session_cutover();
         Ok(())
     }
 
@@ -248,16 +237,17 @@ impl GatewayRuntime {
     pub fn add_remote_gateway(
         &mut self,
         name: &str,
-        address: &str,
+        gateway_base_url: &str,
         activation_code: Option<&str>,
     ) -> Result<GatewayEndpoint> {
-        let address = validate_remote_gateway_address(address, self.timings.connect_timeout)?;
+        let gateway_base_url =
+            validate_remote_gateway_base_url(gateway_base_url, self.timings.connect_timeout)?;
 
         let change = client_gateway_setup::plan_add_remote_gateway(
             &self.registry,
             client_gateway_setup::AddRemoteGatewayInput {
                 name,
-                address: address.as_str(),
+                gateway_base_url: gateway_base_url.as_str(),
                 new_endpoint_id: client_gateway_setup::generated_remote_gateway_endpoint_id(),
                 default_remote_name: t!(
                     "gateway.endpoint.remote_name",
@@ -334,7 +324,7 @@ impl GatewayRuntime {
         &mut self,
         id: &str,
         name: &str,
-        address: &str,
+        gateway_base_url: &str,
     ) -> Result<GatewayEndpoint> {
         let _session_mutation = self.begin_session_mutation(id)?;
         let default_index = self
@@ -349,7 +339,7 @@ impl GatewayRuntime {
             client_gateway_setup::UpdateRemoteGatewayRegistryInput {
                 gateway_id: id,
                 name,
-                address,
+                gateway_base_url,
                 default_remote_name: t!("gateway.endpoint.remote_name", index = default_index)
                     .to_string(),
             },
@@ -432,117 +422,6 @@ impl GatewayRuntime {
         }
     }
 
-    fn complete_registry_upgrade_after_session_cutover(&mut self) {
-        if !self.registry_upgrade_pending {
-            self.purge_retired_desktop_credentials();
-            return;
-        }
-
-        match complete_registry_upgrade(&self.registry_path) {
-            Ok(()) => {
-                self.registry_upgrade_pending = false;
-                self.purge_retired_desktop_credentials();
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "failed to finalize the Gateway registry upgrade; the durable device session will be adopted and cleanup retried on the next Desktop start"
-                );
-            }
-        }
-    }
-
-    fn resume_registry_upgrade_from_durable_session(&mut self) -> Result<()> {
-        if self
-            .adopt_durable_registry_sessions()
-            .context("failed to adopt a durable device session while resuming registry upgrade")?
-        {
-            self.complete_registry_upgrade_after_session_cutover();
-        }
-        Ok(())
-    }
-
-    fn adopt_durable_registry_sessions(&mut self) -> Result<bool> {
-        let installation_id = self
-            .registry
-            .installation_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("pending Gateway registry upgrade has no installation id")?
-            .to_owned();
-        let endpoint_ids = self
-            .registry
-            .local
-            .iter()
-            .chain(self.registry.remotes.iter())
-            .map(|endpoint| endpoint.id.clone())
-            .collect::<Vec<_>>();
-        let mut next_registry = self.registry.clone();
-        let mut changed = false;
-        let mut found_durable_session = false;
-
-        for endpoint_id in endpoint_ids {
-            let endpoint = client_gateway_runtime::endpoint_by_id(&next_registry, &endpoint_id)
-                .with_context(|| {
-                    format!(
-                        "Gateway endpoint `{endpoint_id}` disappeared while resuming registry upgrade"
-                    )
-                })?
-                .clone();
-            let (session_ref, expected_gateway_id) =
-                match (&endpoint.session_ref, &endpoint.server_gateway_id) {
-                    (Some(session_ref), Some(gateway_id)) => {
-                        (session_ref.clone(), Some(gateway_id.clone()))
-                    }
-                    (None, None) => (endpoint.id.clone(), None),
-                    _ => anyhow::bail!(
-                        "Gateway endpoint `{}` has a partial session binding",
-                        endpoint.id
-                    ),
-                };
-            let Some(session) = self.secrets.get_gateway_session(session_ref.as_str())? else {
-                if expected_gateway_id.is_some() {
-                    pioneer_client::gateway::registry::clear_endpoint_session_binding(
-                        &mut next_registry,
-                        endpoint.id.as_str(),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                    changed = true;
-                }
-                continue;
-            };
-            if session.installation_id != installation_id {
-                anyhow::bail!(
-                    "durable session `{session_ref}` belongs to a different Desktop installation"
-                );
-            }
-            if expected_gateway_id
-                .as_ref()
-                .is_some_and(|gateway_id| gateway_id != &session.gateway_id)
-            {
-                anyhow::bail!("durable session `{session_ref}` belongs to a different Gateway");
-            }
-            found_durable_session = true;
-            if expected_gateway_id.is_none() {
-                pioneer_client::gateway::registry::commit_registry_v2_binding(
-                    &mut next_registry,
-                    endpoint.id.as_str(),
-                    session_ref.as_str(),
-                    &session.gateway_id,
-                )
-                .map_err(anyhow::Error::new)?;
-                changed = true;
-            }
-        }
-
-        if changed {
-            save_registry(&self.registry_path, &next_registry)?;
-            self.registry = next_registry;
-        }
-        Ok(found_durable_session)
-    }
-
     pub(crate) fn local_gateway(&self) -> Result<&GatewayEndpoint> {
         self.registry
             .local
@@ -577,27 +456,25 @@ fn map_gateway_profile_error(error: client_gateway_runtime::GatewayProfileError)
         client_gateway_runtime::GatewayProfileError::LocalGatewayDeleteUnsupported => {
             anyhow::anyhow!("{}", t!("errors.gateway.local_delete_unsupported"))
         }
-        client_gateway_runtime::GatewayProfileError::DuplicateRemoteAddress { address } => {
+        client_gateway_runtime::GatewayProfileError::DuplicateGatewayBaseUrl {
+            gateway_base_url,
+        } => {
             anyhow::anyhow!(
                 "{}",
                 t!(
                     "errors.gateway.address_already_exists",
-                    address = address.as_str()
+                    gateway_base_url = gateway_base_url.as_str()
                 )
             )
         }
-        client_gateway_runtime::GatewayProfileError::InvalidAddress { address, .. } => {
-            anyhow::anyhow!(
-                "{}",
-                t!(
-                    "errors.gateway.invalid_address",
-                    normalized = address.as_str()
-                )
-            )
+        client_gateway_runtime::GatewayProfileError::InvalidGatewayBaseUrl { .. } => {
+            anyhow::anyhow!("{}", t!("errors.gateway.invalid_address", normalized = "[redacted]"))
         }
-        client_gateway_runtime::GatewayProfileError::SessionBoundAddressChange { endpoint_id } => {
+        client_gateway_runtime::GatewayProfileError::SessionBoundGatewayBaseUrlChange {
+            endpoint_id,
+        } => {
             anyhow::anyhow!(
-                "Gateway `{endpoint_id}` must be reauthenticated before changing its address"
+                "Gateway `{endpoint_id}` must be reauthenticated before changing its gateway_base_url"
             )
         }
     }
@@ -631,7 +508,6 @@ impl GatewayRuntime {
             ws_timings,
             registry_path,
             registry,
-            registry_upgrade_pending: false,
             secrets,
             terminal_sessions: HashMap::new(),
             access_expiries: HashMap::new(),
@@ -678,7 +554,7 @@ mod tests {
             &runtime.registry,
             AddRemoteGatewayInput {
                 name: "Remote Gateway",
-                address: "ws://192.0.2.10:17878",
+                gateway_base_url: "http://192.0.2.10:17878",
                 new_endpoint_id: "remote-test".to_owned(),
                 default_remote_name: "Remote Gateway".to_owned(),
             },
@@ -804,82 +680,4 @@ mod tests {
         assert!(durable_local.server_gateway_id.is_some());
     }
 
-    #[test]
-    fn restart_adopts_the_durable_session_before_finalizing_the_upgrade() {
-        let mut runtime = GatewayRuntime::for_ws_spec_tests();
-        let endpoint_id = runtime
-            .registry
-            .local
-            .as_ref()
-            .expect("local endpoint")
-            .id
-            .clone();
-        let installation_id = runtime
-            .registry
-            .installation_id
-            .clone()
-            .expect("installation id");
-        let gateway_id = GatewayId::new("G00000000000000000001").expect("Gateway identity");
-
-        let runtime_dir = unique_temp_dir();
-        fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-        runtime.registry_path = runtime_dir.join("gateway-registry.toml");
-        save_registry(&runtime.registry_path, &runtime.registry).expect("save unbound registry");
-        fs::write(
-            runtime.registry_path.with_extension("upgrade-v2"),
-            format!("version = 1\ninstallation_id = \"{installation_id}\"\n"),
-        )
-        .expect("write pending upgrade state");
-        runtime.registry_upgrade_pending = true;
-
-        runtime
-            .resume_registry_upgrade_from_durable_session()
-            .expect("inspect missing durable session");
-        assert!(runtime.registry_upgrade_pending);
-        assert!(runtime.registry_path.with_extension("upgrade-v2").exists());
-
-        runtime
-            .secrets
-            .put_gateway_session(
-                endpoint_id.as_str(),
-                &DesktopGatewaySessionSecret {
-                    schema_version: DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION,
-                    gateway_id: gateway_id.clone(),
-                    principal_id: PrincipalId::new("P00000000000000000001").expect("principal id"),
-                    device_id: DeviceId::new("D00000000000000000001").expect("device id"),
-                    session_id: AuthSessionId::new("S00000000000000000001").expect("session id"),
-                    token_family_id: TokenFamilyId::new("F00000000000000000001")
-                        .expect("token family id"),
-                    installation_id,
-                    refresh_generation: 0,
-                    refresh_expires_at_unix: 2_000,
-                    refresh_token: AuthSecretString::new(format!(
-                        "{}{}",
-                        pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
-                        "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
-                    )),
-                },
-                Some("Local Gateway session".to_owned()),
-            )
-            .expect("persist session envelope");
-
-        runtime
-            .resume_registry_upgrade_from_durable_session()
-            .expect("adopt durable session");
-
-        assert!(!runtime.registry_upgrade_pending);
-        assert!(!runtime.registry_path.with_extension("upgrade-v2").exists());
-        let local = runtime.registry.local.as_ref().expect("local endpoint");
-        assert_eq!(local.session_ref.as_deref(), Some(endpoint_id.as_str()));
-        assert_eq!(local.server_gateway_id.as_ref(), Some(&gateway_id));
-        let durable =
-            load_registry(&runtime.registry_path, &runtime.config).expect("load durable registry");
-        let durable_local = durable.local.as_ref().expect("durable local endpoint");
-        assert_eq!(
-            durable_local.session_ref.as_deref(),
-            Some(endpoint_id.as_str())
-        );
-        assert_eq!(durable_local.server_gateway_id.as_ref(), Some(&gateway_id));
-        let _ = fs::remove_dir_all(runtime_dir);
-    }
 }

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactViewGrantCreateResponse",
+  "type": "object",
+  "properties": {
+    "expires_at": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "relative_url": {
+      "type": "string",
+      "maxLength": 58,
+      "minLength": 58
+    }
+  },
+  "required": [
+    "relative_url",
+    "expires_at"
+  ]
+}

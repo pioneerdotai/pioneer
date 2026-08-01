@@ -4,7 +4,10 @@ use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use pioneer_client::{
-    gateway::registry::commit_registry_v2_binding, transport::ws::auth_exchange::AuthExchangeClient,
+    gateway::{
+        endpoint::GatewayBaseUrl, registry::commit_registry_v3_binding,
+    },
+    transport::ws::auth_exchange::AuthExchangeClient,
 };
 use pioneer_protocol::{
     AuthDeviceActivateParams, AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor,
@@ -66,8 +69,8 @@ pub(crate) fn provision_endpoint_session<F, C, S>(
     mut save: S,
 ) -> Result<()>
 where
-    F: FnOnce(&str, &str, AuthDeviceActivateParams) -> Result<AuthSessionGrant>,
-    C: FnMut(&str, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
+    F: FnOnce(&GatewayBaseUrl, &str, AuthDeviceActivateParams) -> Result<AuthSessionGrant>,
+    C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
     S: FnMut(&GatewayRegistry) -> Result<()>,
 {
     let endpoint = registry_endpoint(registry, endpoint_id)?.clone();
@@ -108,7 +111,7 @@ where
             bail!("durable desktop Gateway session belongs to a different Gateway");
         }
         let mut next = registry.clone();
-        commit_registry_v2_binding(
+        commit_registry_v3_binding(
             &mut next,
             endpoint_id,
             session_ref.as_str(),
@@ -129,7 +132,7 @@ where
             client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         },
     };
-    let grant = activate(endpoint.address.as_str(), activation.as_str(), params)
+    let grant = activate(&endpoint.gateway_base_url, activation.as_str(), params)
         .context("desktop Gateway device activation failed")?;
     let cleanup_access = grant.access_token.clone();
     let cleanup_session_id = grant.session.id.clone();
@@ -141,7 +144,7 @@ where
         Ok(result) => result,
         Err(error) => {
             let _ = cleanup_session(
-                endpoint.address.as_str(),
+                &endpoint.gateway_base_url,
                 cleanup_access.expose_secret(),
                 &cleanup_session_id,
             );
@@ -154,14 +157,14 @@ where
         Some(format!("{} session", endpoint.name)),
     ) {
         let _ = cleanup_session(
-            endpoint.address.as_str(),
+            &endpoint.gateway_base_url,
             access.access_token.expose_secret(),
             &session.session_id,
         );
         return Err(DesktopSessionSecureStorageError::new(error).into());
     }
     let mut next = registry.clone();
-    if let Err(error) = commit_registry_v2_binding(
+    if let Err(error) = commit_registry_v3_binding(
         &mut next,
         endpoint_id,
         session_ref.as_str(),
@@ -180,7 +183,7 @@ where
 }
 
 pub(crate) fn activate_device_session(
-    address: &str,
+    gateway_base_url: &GatewayBaseUrl,
     credential: &str,
     params: AuthDeviceActivateParams,
     timeout: Duration,
@@ -190,12 +193,12 @@ pub(crate) fn activate_device_session(
         .build()
         .context("failed to initialize desktop auth exchange runtime")?;
     runtime
-        .block_on(AuthExchangeClient::new(timeout).activate_device(address, credential, params))
+        .block_on(AuthExchangeClient::new(timeout).activate_device(gateway_base_url, credential, params))
         .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn revoke_session_best_effort(
-    address: &str,
+    gateway_base_url: &GatewayBaseUrl,
     access_token: &str,
     session_id: &pioneer_protocol::AuthSessionId,
     timeout: Duration,
@@ -206,7 +209,7 @@ pub(crate) fn revoke_session_best_effort(
         .context("failed to initialize desktop session cleanup runtime")?;
     runtime
         .block_on(AuthExchangeClient::new(timeout).cleanup_session_once(
-            address,
+            gateway_base_url,
             access_token,
             session_id.clone(),
         ))
@@ -297,13 +300,13 @@ mod tests {
 
     fn registry() -> GatewayRegistry {
         GatewayRegistry {
-            version: 2,
+            version: pioneer_client::gateway::registry::CURRENT_GATEWAY_REGISTRY_VERSION,
             installation_id: Some(INSTALLATION_ID.to_owned()),
             active_gateway_id: None,
             local: Some(GatewayEndpoint {
                 id: ENDPOINT_ID.to_owned(),
                 name: "Local Gateway".to_owned(),
-                address: "127.0.0.1:17878".to_owned(),
+                gateway_base_url: pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
                 kind: GatewayEndpointKind::Local,
                 session_ref: None,
                 server_gateway_id: None,
@@ -378,9 +381,9 @@ mod tests {
             ENDPOINT_ID,
             activation_code.as_str(),
             &secrets,
-            |address, credential, params| {
+            |gateway_base_url, credential, params| {
                 exchange_called.set(true);
-                assert_eq!(address, "127.0.0.1:17878");
+                assert_eq!(gateway_base_url.as_str(), "http://127.0.0.1:17878/");
                 assert_eq!(credential, "K7M4P9Q2");
                 assert_eq!(params.installation.installation_id, INSTALLATION_ID);
                 assert_eq!(params.installation.client_kind, ClientKind::Desktop);
@@ -547,8 +550,8 @@ mod tests {
             activation_code.as_str(),
             &secrets,
             |_, _, _| Ok(invalid_grant),
-            |address, access_token, session_id| {
-                assert_eq!(address, "127.0.0.1:17878");
+            |gateway_base_url, access_token, session_id| {
+                assert_eq!(gateway_base_url.as_str(), "http://127.0.0.1:17878/");
                 assert_eq!(access_token, ACCESS_SECRET);
                 assert_eq!(session_id.as_str(), "S00000000000000000001");
                 cleanup_called.set(true);

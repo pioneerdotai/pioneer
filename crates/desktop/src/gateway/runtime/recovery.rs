@@ -1,4 +1,4 @@
-use crate::gateway::connectivity::is_gateway_reachable;
+use crate::gateway::connectivity::{is_gateway_reachable, is_local_gateway_reachable};
 use crate::gateway::control::{
     create_local_pending_device_session, is_configured_service_active, start_gateway_service,
 };
@@ -20,7 +20,7 @@ impl GatewayRuntime {
         };
 
         let reachable =
-            is_gateway_reachable(active.address.as_str(), self.timings.connect_timeout)?;
+            is_gateway_reachable(&active.gateway_base_url, self.timings.connect_timeout)?;
 
         if active.kind == GatewayEndpointKind::Local {
             let service_active =
@@ -53,7 +53,7 @@ impl GatewayRuntime {
                 "managed local gateway auto-update warning"
             );
         }
-        let reachable = is_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
+        let reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
         let service_active = is_configured_service_active(service_name)?;
         let service_active = normalize_local_service_active(reachable, service_active);
 
@@ -81,9 +81,7 @@ impl GatewayRuntime {
                 }
 
                 self.registry.active_gateway_id = Some(local_gateway_id.to_owned());
-                if !self.registry_upgrade_pending() {
-                    save_registry(&self.registry_path, &self.registry)?;
-                }
+                save_registry(&self.registry_path, &self.registry)?;
                 self.ensure_local_gateway_session()?;
                 Ok(LocalGatewayRecovery::Started)
             }
@@ -97,7 +95,7 @@ impl GatewayRuntime {
         let mut warnings =
             ensure_managed_gateway_up_to_date(service_name, listen_addr, &self.timings)?;
 
-        let reachable = is_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
+        let reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
         let service_active = is_configured_service_active(service_name)?;
         let service_active = normalize_local_service_active(reachable, service_active);
 

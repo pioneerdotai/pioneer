@@ -46,7 +46,10 @@ pub use registration::{
     ArtifactRegistrationCandidate, ArtifactRegistrationContext, ArtifactRegistrationSource,
 };
 pub use security::{ArtifactLocalPathPolicy, ValidatedLocalFile};
-pub use service::{ArtifactDownloadSnapshot, ArtifactService};
+pub use service::{
+    ArtifactBoundedReadRequest, ArtifactBoundedReadResult, ArtifactContentKind,
+    ArtifactContentReader, ArtifactContentSnapshot, ArtifactService,
+};
 pub use source::{ArtifactSource, IngestArtifactSourceRequest};
 pub use tools::{
     ARTIFACT_OUTPUT_DIR_ENV, ARTIFACT_PREPARE_TOOL, ARTIFACT_READ_TOOL, ARTIFACT_REGISTER_TOOL,

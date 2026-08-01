@@ -1,12 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Error};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokeReason, DeviceId, GatewayId, InvitationId,
-    InvitationRevokeReason, MemberAvatarGetParams, MemberAvatarGetResponse, MemberListParams,
-    MemberListResponse, MemberManagementErrorReason, MemberMutationResponse, MemberRemoveParams,
+    InvitationRevokeReason, MemberListParams, MemberListResponse, MemberManagementErrorReason,
+    MemberMutationResponse, MemberRemoveParams,
     MemberRestoreParams, MemberSummary, MemberSuspendParams, PROFILE_AVATAR_MAX_DECODED_BYTES,
     PROFILE_AVATAR_MAX_DIMENSION, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus,
     ProfileAvatarMediaType, RoleKey, WorkspaceId, WorkspaceMemberAddParams,
@@ -18,8 +17,8 @@ use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, Tr
 use crate::administrative_audit::AdministrativeAuditWriter;
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::authorization::{
-    AuthorizationDecision, AuthorizationResolver, AuthorizationService, AuthorizedMemberAvatar,
-    AuthorizedMemberDirectory, AuthorizedMemberPrincipal, AuthorizedWorkspace, DenyReason,
+    AuthorizationDecision, AuthorizationResolver, AuthorizationService, AuthorizedMemberDirectory,
+    AuthorizedMemberPrincipal, AuthorizedWorkspace, DenyReason,
     DisclosurePolicy, ProofResolution, ResourceAction, persisted_actor_is_current,
 };
 use crate::epic5_observability::Epic5RateLimits;
@@ -45,6 +44,50 @@ pub(crate) enum MemberServiceError {
     Conflict(MemberManagementErrorReason),
     Authorization(AuthorizationDecision),
     Unavailable(Error),
+}
+
+#[derive(Clone)]
+pub(crate) struct MemberAvatarSnapshot {
+    media_type: ProfileAvatarMediaType,
+    revision: String,
+    content: Vec<u8>,
+}
+
+impl MemberAvatarSnapshot {
+    pub(crate) fn new(
+        media_type: ProfileAvatarMediaType,
+        revision: String,
+        content: Vec<u8>,
+    ) -> Self {
+        Self {
+            media_type,
+            revision,
+            content,
+        }
+    }
+
+    pub(crate) const fn media_type(&self) -> ProfileAvatarMediaType {
+        self.media_type
+    }
+
+    pub(crate) fn revision(&self) -> &str {
+        self.revision.as_str()
+    }
+
+    pub(crate) fn content(&self) -> &[u8] {
+        self.content.as_slice()
+    }
+}
+
+impl std::fmt::Debug for MemberAvatarSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemberAvatarSnapshot")
+            .field("media_type", &self.media_type)
+            .field("revision", &self.revision)
+            .field("content", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -550,23 +593,17 @@ impl MemberService {
         finish_read_transaction(transaction, result).await
     }
 
-    pub(crate) async fn avatar_get(
+    pub(crate) async fn avatar_snapshot(
         &self,
         principal: &AuthenticatedSessionPrincipal,
-        authorization: &AuthorizedMemberAvatar,
-        params: MemberAvatarGetParams,
-    ) -> Result<MemberAvatarGetResponse, MemberServiceError> {
-        if authorization.principal_id() != &principal.principal_id
-            || authorization.action() != ResourceAction::MemberAvatarRead
-            || authorization.target_principal_id() != &params.principal_id
-        {
-            return Err(scope_mismatch());
-        }
+        target_principal_id: &PrincipalId,
+        expected_revision: Option<&str>,
+    ) -> Result<MemberAvatarSnapshot, MemberServiceError> {
         let database = self.store.database_connection();
         let transaction = database
             .begin()
             .await
-            .context("failed to begin Member avatar read transaction")
+            .context("failed to begin Member avatar snapshot transaction")
             .map_err(MemberServiceError::Unavailable)?;
         let result = async {
             ensure_current_actor(&transaction, principal).await?;
@@ -576,7 +613,7 @@ impl MemberService {
                 ResourceAction::MemberAvatarRead,
             );
             match AuthorizationResolver::new(self.store.clone())
-                .authorize_member_avatar(&transaction, principal, &gate, &params.principal_id)
+                .authorize_member_avatar(&transaction, principal, &gate, target_principal_id)
                 .await
                 .map_err(MemberServiceError::Unavailable)?
             {
@@ -585,7 +622,7 @@ impl MemberService {
                     return Err(MemberServiceError::Authorization(decision));
                 }
             }
-            let avatar = pioneer_crud::load_principal_avatar(&transaction, &params.principal_id)
+            let avatar = pioneer_crud::load_principal_avatar(&transaction, target_principal_id)
                 .await?
                 .ok_or_else(|| MemberServiceError::Authorization(missing_resource()))?;
             if avatar.content.is_empty()
@@ -610,12 +647,15 @@ impl MemberService {
                     )));
                 }
             };
-            Ok::<_, MemberServiceError>(MemberAvatarGetResponse {
-                principal_id: params.principal_id,
+            let revision = hex::encode(avatar.content_hash);
+            if expected_revision.is_some_and(|expected| expected != revision) {
+                return Err(MemberServiceError::Authorization(missing_resource()));
+            }
+            Ok::<_, MemberServiceError>(MemberAvatarSnapshot::new(
                 media_type,
-                avatar_revision: hex::encode(avatar.content_hash),
-                content_base64: STANDARD.encode(avatar.content),
-            })
+                revision,
+                avatar.content,
+            ))
         }
         .await;
         finish_read_transaction(transaction, result).await
@@ -1056,7 +1096,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::authorization::{AuthorizationResolver, AuthorizationService, ProofResolution};
-    use crate::authorization_test_support::{IsolatedEpic4Harness, MEMBER_A_ID, MEMBER_B_ID};
+    use crate::tests::authorization::{IsolatedEpic4Harness, MEMBER_A_ID, MEMBER_B_ID};
     use crate::secrets::GatewaySecrets;
 
     use super::*;
@@ -1165,7 +1205,7 @@ mod tests {
         store: &CrudStore,
         principal: &AuthenticatedSessionPrincipal,
         target: &PrincipalId,
-    ) -> ProofResolution<AuthorizedMemberAvatar> {
+    ) -> ProofResolution<crate::authorization::AuthorizedMemberAvatar> {
         let gate = AuthorizationService::new().authorize_action(
             principal.kind,
             principal.role_key.as_ref(),
@@ -1316,25 +1356,21 @@ mod tests {
         .unwrap();
         transaction.commit().await.unwrap();
         let viewer = member_a();
-        let proof = match avatar_proof(&store, &viewer, &target).await {
-            ProofResolution::Authorized(proof) => proof,
-            ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
-        };
-        let response = service
-            .avatar_get(
-                &viewer,
-                &proof,
-                MemberAvatarGetParams {
-                    principal_id: target.clone(),
-                },
-            )
+        let revision = hex::encode(content_hash);
+        let snapshot = service
+            .avatar_snapshot(&viewer, &target, Some(revision.as_str()))
             .await
             .unwrap();
-        assert_eq!(response.principal_id, target);
-        assert_eq!(response.media_type, ProfileAvatarMediaType::Png);
-        assert_eq!(response.avatar_revision, hex::encode(content_hash));
-        assert_eq!(STANDARD.decode(&response.content_base64).unwrap(), content);
-        assert!(format!("{response:?}").contains("[redacted]"));
+        assert_eq!(snapshot.media_type(), ProfileAvatarMediaType::Png);
+        assert_eq!(snapshot.revision(), revision);
+        assert_eq!(snapshot.content(), content);
+        assert!(format!("{snapshot:?}").contains("[redacted]"));
+        assert!(matches!(
+            service
+                .avatar_snapshot(&viewer, &target, Some("0".repeat(64).as_str()))
+                .await,
+            Err(MemberServiceError::Authorization(_))
+        ));
 
         harness
             .database
@@ -1347,13 +1383,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             service
-                .avatar_get(
-                    &viewer,
-                    &proof,
-                    MemberAvatarGetParams {
-                        principal_id: target.clone(),
-                    },
-                )
+                .avatar_snapshot(&viewer, &target, Some(revision.as_str()))
                 .await,
             Err(MemberServiceError::Authorization(_))
         ));
@@ -1363,6 +1393,65 @@ mod tests {
             avatar_proof(&store, &viewer, &hidden).await,
             ProofResolution::Denied(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn avatar_snapshot_preserves_proposal60_directory_visibility() {
+        let harness = IsolatedEpic4Harness::populated().await.unwrap();
+        materialize_superuser_session(&harness).await;
+        let store = CrudStore::new(harness.database.clone());
+        let service = MemberService::new(
+            store,
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+        );
+        let viewer = member_a();
+        let self_id = viewer.principal_id.clone();
+        let shared = PrincipalId::new(MEMBER_B_ID).unwrap();
+        let suspended = PrincipalId::new(
+            crate::tests::authorization::SUSPENDED_MEMBER_ID,
+        )
+        .unwrap();
+        let removed =
+            PrincipalId::new(crate::tests::authorization::REMOVED_MEMBER_ID).unwrap();
+        let missing = PrincipalId::new("P0000000000000000000Z").unwrap();
+
+        let self_revision = seed_avatar(&harness.database, &self_id).await;
+        let shared_revision = seed_avatar(&harness.database, &shared).await;
+        let suspended_revision = seed_avatar(&harness.database, &suspended).await;
+        let removed_revision = seed_avatar(&harness.database, &removed).await;
+        let missing_revision = "0".repeat(64);
+
+        assert!(
+            service
+                .avatar_snapshot(&viewer, &self_id, Some(self_revision.as_str()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            service
+                .avatar_snapshot(&viewer, &shared, Some(shared_revision.as_str()))
+                .await
+                .is_ok()
+        );
+        for (target, revision) in [
+            (&suspended, suspended_revision.as_str()),
+            (&removed, removed_revision.as_str()),
+            (&missing, missing_revision.as_str()),
+        ] {
+            assert!(matches!(
+                service.avatar_snapshot(&viewer, target, Some(revision)).await,
+                Err(MemberServiceError::Authorization(_))
+            ));
+        }
+
+        // Proposal 60 grants the Superuser authoritative directory visibility,
+        // including lifecycle records hidden from ordinary members.
+        assert!(
+            service
+                .avatar_snapshot(&superuser(), &removed, Some(removed_revision.as_str()))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

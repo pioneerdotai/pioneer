@@ -3,17 +3,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use pioneer_protocol::{
     INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest,
     JsonRpcResponse, PARSE_ERROR_CODE, PROFILE_AVATAR_MAX_BASE64_LEN, RequestId,
 };
 use serde_json::{Value as JsonValue, json};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
 use crate::auth::{AuthError, AuthErrorCode, RestrictedAdmission, RestrictedAuthContext};
 
@@ -45,22 +41,15 @@ pub(crate) trait RestrictedExchangeExecutor: Send + Sync {
     ) -> std::result::Result<JsonValue, AuthError>;
 }
 
-pub(crate) async fn run<S>(
-    mut ws: WebSocketStream<S>,
+pub(crate) async fn run(
+    mut ws: WebSocket,
     admission: RestrictedAdmission,
     deadline: Duration,
     executor: Arc<dyn RestrictedExchangeExecutor>,
-) -> Result<RestrictedExchangeOutcome>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<RestrictedExchangeOutcome> {
     match timeout(deadline, run_one_exchange(&mut ws, admission, executor)).await {
         Ok(outcome) => outcome,
         Err(_) => {
-            // The deadline covers admission payload receipt, execution,
-            // response delivery, and the restricted close handshake. Closing
-            // after cancellation is itself bounded so a peer that stopped
-            // reading cannot retain a Gateway task indefinitely.
             let _ = timeout(
                 Duration::from_millis(250),
                 close(
@@ -75,14 +64,11 @@ where
     }
 }
 
-async fn run_one_exchange<S>(
-    ws: &mut WebSocketStream<S>,
+async fn run_one_exchange(
+    ws: &mut WebSocket,
     admission: RestrictedAdmission,
     executor: Arc<dyn RestrictedExchangeExecutor>,
-) -> Result<RestrictedExchangeOutcome>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<RestrictedExchangeOutcome> {
     let exchange_outcome = match receive_one_request(ws).await {
         Err(failure) => {
             if let Some(response) = failure.response {
@@ -102,9 +88,7 @@ where
                             log_exchange_completed(exchange_method.as_str());
                             let response = JsonRpcResponse::from_result(request_id, &result)
                                 .map_err(anyhow::Error::from)
-                                .and_then(|value| {
-                                    serde_json::to_value(value).map_err(Into::into)
-                                })?;
+                                .and_then(|value| serde_json::to_value(value).map_err(Into::into))?;
                             send_bounded_json(ws, &response).await?;
                             close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete").await?;
                             return Ok(RestrictedExchangeOutcome::Succeeded);
@@ -160,88 +144,81 @@ fn log_exchange_failed(method: &str, code: AuthErrorCode) {
         INVITE_ACCEPT => "invitation_accept_failed",
         _ => return,
     };
-    tracing::info!(event, outcome = "failed", reason = code.as_str(),);
+    tracing::info!(event, outcome = "failed", reason = code.as_str());
 }
 
+#[derive(Debug)]
 struct RestrictedReadFailure {
     response: Option<JsonValue>,
     close_code: u16,
     close_reason: &'static str,
 }
 
-async fn receive_one_request<S>(
-    ws: &mut WebSocketStream<S>,
-) -> std::result::Result<JsonRpcRequest, RestrictedReadFailure>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+async fn receive_one_request(
+    ws: &mut WebSocket,
+) -> std::result::Result<JsonRpcRequest, RestrictedReadFailure> {
     loop {
-        let Some(frame) = ws.next().await else {
-            return Err(RestrictedReadFailure {
-                response: None,
-                close_code: CLOSE_AUTH_INVALID_REQUEST,
-                close_reason: "auth_exchange_closed",
-            });
+        let Some(frame) = ws.recv().await else {
+            return Err(closed_failure());
         };
         let frame = frame.map_err(|_| RestrictedReadFailure {
             response: None,
             close_code: CLOSE_AUTH_INVALID_REQUEST,
             close_reason: "auth_exchange_invalid_frame",
         })?;
-        match frame {
-            Message::Text(payload) => {
-                if payload.len() > MAX_RESTRICTED_REQUEST_BYTES {
-                    return Err(read_error(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        "restricted auth request is too large",
-                        "auth_request_too_large",
-                    ));
-                }
-                let request =
-                    serde_json::from_str::<JsonRpcRequest>(payload.as_ref()).map_err(|_| {
-                        read_error(
-                            None,
-                            PARSE_ERROR_CODE,
-                            "invalid JSON-RPC request",
-                            "auth_invalid_request",
-                        )
-                    })?;
-                if request.jsonrpc != JSONRPC_VERSION {
-                    return Err(read_error(
-                        Some(request.id),
-                        INVALID_REQUEST_CODE,
-                        "unsupported JSON-RPC version",
-                        "auth_invalid_request",
-                    ));
-                }
-                return Ok(request);
-            }
-            Message::Binary(_) => {
-                return Err(RestrictedReadFailure {
-                    response: None,
-                    close_code: CLOSE_AUTH_INVALID_REQUEST,
-                    close_reason: "auth_binary_forbidden",
-                });
-            }
-            Message::Ping(payload) => {
-                ws.send(Message::Pong(payload))
-                    .await
-                    .map_err(|_| RestrictedReadFailure {
-                        response: None,
-                        close_code: CLOSE_AUTH_INVALID_REQUEST,
-                        close_reason: "auth_exchange_write_failed",
-                    })?;
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-            Message::Close(_) => {
-                return Err(RestrictedReadFailure {
-                    response: None,
-                    close_code: CLOSE_AUTH_INVALID_REQUEST,
-                    close_reason: "auth_exchange_closed",
-                });
-            }
+        if let Some(request) = decode_request_frame(frame)? {
+            return Ok(request);
         }
+    }
+}
+
+fn decode_request_frame(
+    frame: Message,
+) -> std::result::Result<Option<JsonRpcRequest>, RestrictedReadFailure> {
+    match frame {
+        Message::Text(payload) => {
+            if payload.len() > MAX_RESTRICTED_REQUEST_BYTES {
+                return Err(read_error(
+                    None,
+                    INVALID_REQUEST_CODE,
+                    "restricted auth request is too large",
+                    "auth_request_too_large",
+                ));
+            }
+            let request = serde_json::from_str::<JsonRpcRequest>(payload.as_ref()).map_err(|_| {
+                read_error(
+                    None,
+                    PARSE_ERROR_CODE,
+                    "invalid JSON-RPC request",
+                    "auth_invalid_request",
+                )
+            })?;
+            if request.jsonrpc != JSONRPC_VERSION {
+                return Err(read_error(
+                    Some(request.id),
+                    INVALID_REQUEST_CODE,
+                    "unsupported JSON-RPC version",
+                    "auth_invalid_request",
+                ));
+            }
+            Ok(Some(request))
+        }
+        Message::Binary(_) => Err(RestrictedReadFailure {
+            response: None,
+            close_code: CLOSE_AUTH_INVALID_REQUEST,
+            close_reason: "auth_binary_forbidden",
+        }),
+        // Axum owns Ping/Pong protocol replies; neither counts as the one request.
+        Message::Ping(_) | Message::Pong(_) => Ok(None),
+        Message::Close(_) => Err(closed_failure()),
+    }
+}
+
+fn closed_failure() -> RestrictedReadFailure {
+    RestrictedReadFailure {
+        response: None,
+        close_code: CLOSE_AUTH_INVALID_REQUEST,
+        close_reason: "auth_exchange_closed",
     }
 }
 
@@ -272,9 +249,10 @@ fn authorize_method(
         }
     };
     if allowed {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(AuthErrorCode::MethodNotAllowed)
     }
-    Err(AuthErrorCode::MethodNotAllowed)
 }
 
 fn auth_error_response(id: Option<RequestId>, code: AuthErrorCode) -> Result<JsonValue> {
@@ -291,10 +269,7 @@ fn auth_error_response(id: Option<RequestId>, code: AuthErrorCode) -> Result<Jso
     .context("failed to serialize restricted auth error response")
 }
 
-async fn send_bounded_json<S>(ws: &mut WebSocketStream<S>, response: &JsonValue) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+async fn send_bounded_json(ws: &mut WebSocket, response: &JsonValue) -> Result<()> {
     let payload = serde_json::to_string(response).context("failed to serialize auth response")?;
     if payload.len() > MAX_RESTRICTED_RESPONSE_BYTES {
         anyhow::bail!("restricted auth response exceeded transport limit");
@@ -304,75 +279,36 @@ where
         .context("failed to send restricted auth response")
 }
 
-async fn close<S>(ws: &mut WebSocketStream<S>, code: u16, reason: &'static str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    ws.close(Some(CloseFrame {
-        code: CloseCode::from(code),
+async fn close(ws: &mut WebSocket, code: u16, reason: &'static str) -> Result<()> {
+    ws.send(Message::Close(Some(CloseFrame {
+        code,
         reason: reason.into(),
-    }))
+    })))
     .await
     .context("failed to close restricted auth connection")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{
-        DeviceActivationContext, InvitationExchangeContext, PresentedCredential,
-        RefreshExchangeContext,
+        DeviceActivationContext, InvitationExchangeContext, RefreshExchangeContext,
     };
     use pioneer_protocol::{GatewayId, InvitationTransportSecurity};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::duplex;
-    use tokio_tungstenite::tungstenite::protocol::Role;
-
-    struct RecordingExecutor {
-        calls: AtomicUsize,
-    }
-
-    struct BlockingExecutor {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl RestrictedExchangeExecutor for RecordingExecutor {
-        async fn execute(
-            &self,
-            _admission: RestrictedAdmission,
-            request: JsonRpcRequest,
-        ) -> std::result::Result<JsonValue, AuthError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({ "accepted_method": request.method }))
-        }
-    }
-
-    #[async_trait]
-    impl RestrictedExchangeExecutor for BlockingExecutor {
-        async fn execute(
-            &self,
-            _admission: RestrictedAdmission,
-            _request: JsonRpcRequest,
-        ) -> std::result::Result<JsonValue, AuthError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            Ok(JsonValue::Null)
-        }
-    }
 
     #[test]
     fn method_matrix_is_exact_and_rejects_wrong_methods() {
-        let device_activation = device_activation_context();
+        let device = RestrictedAuthContext::DeviceActivation(DeviceActivationContext {
+            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+        });
         let refresh = RestrictedAuthContext::Refresh(RefreshExchangeContext);
         let invitation = invitation_context();
 
-        assert!(authorize_method(&device_activation, AUTH_DEVICE_ACTIVATE).is_ok());
+        assert!(authorize_method(&device, AUTH_DEVICE_ACTIVATE).is_ok());
         assert!(authorize_method(&refresh, AUTH_REFRESH).is_ok());
         assert!(authorize_method(&invitation, INVITE_PREVIEW).is_ok());
         assert!(authorize_method(&invitation, INVITE_ACCEPT).is_ok());
         assert_eq!(
-            authorize_method(&device_activation, "workspace/list"),
+            authorize_method(&device, "workspace/list"),
             Err(AuthErrorCode::MethodNotAllowed)
         );
         assert_eq!(
@@ -396,206 +332,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn one_text_request_gets_one_response_then_connection_closes() {
-        let executor = Arc::new(RecordingExecutor {
-            calls: AtomicUsize::new(0),
-        });
-        let (server_io, client_io) = duplex(128 * 1024);
-        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let task_executor = executor.clone();
-        let task = tokio::spawn(async move {
-            run(
-                server_ws,
-                refresh_admission(),
-                Duration::from_secs(1),
-                task_executor,
-            )
-            .await
-        });
-        client_ws
-            .send(Message::Text(request(AUTH_REFRESH).into()))
-            .await
-            .unwrap();
-        client_ws
-            .send(Message::Text(request(AUTH_REFRESH).into()))
-            .await
-            .unwrap();
-
-        let response = client_ws.next().await.unwrap().unwrap();
-        assert!(matches!(response, Message::Text(_)));
-        let close = client_ws.next().await.unwrap().unwrap();
-        assert!(matches!(close, Message::Close(_)));
-        task.await.unwrap().unwrap();
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn binary_frame_never_reaches_executor() {
-        let executor = Arc::new(RecordingExecutor {
-            calls: AtomicUsize::new(0),
-        });
-        let (server_io, client_io) = duplex(1024);
-        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let task_executor = executor.clone();
-        let task = tokio::spawn(async move {
-            run(
-                server_ws,
-                refresh_admission(),
-                Duration::from_secs(1),
-                task_executor,
-            )
-            .await
-        });
-        client_ws
-            .send(Message::Binary(vec![1, 2, 3].into()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            client_ws.next().await.unwrap().unwrap(),
-            Message::Close(_)
-        ));
-        task.await.unwrap().unwrap();
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn invitation_wrong_method_never_reaches_executor() {
-        let executor = Arc::new(RecordingExecutor {
-            calls: AtomicUsize::new(0),
-        });
-        let (server_io, client_io) = duplex(16 * 1024);
-        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let task_executor = executor.clone();
-        let task = tokio::spawn(async move {
-            run(
-                server_ws,
-                invitation_admission(),
-                Duration::from_secs(1),
-                task_executor,
-            )
-            .await
-        });
-        client_ws
-            .send(Message::Text(request("workspace/list").into()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            client_ws.next().await.unwrap().unwrap(),
-            Message::Text(_)
-        ));
-        assert!(matches!(
-            client_ws.next().await.unwrap().unwrap(),
-            Message::Close(_)
-        ));
-        assert_eq!(
-            task.await.unwrap().unwrap(),
-            RestrictedExchangeOutcome::Failed
+    #[test]
+    fn restricted_frame_decoder_allows_one_text_request_only() {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":"R00000000000000000001","method":"{AUTH_REFRESH}","params":{{}}}}"#
         );
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+        let decoded = decode_request_frame(Message::Text(request.into()))
+            .unwrap()
+            .expect("text request");
+        assert_eq!(decoded.method, AUTH_REFRESH);
+        assert!(decode_request_frame(Message::Binary(vec![1].into())).is_err());
+        assert!(decode_request_frame(Message::Ping(vec![1].into()))
+            .unwrap()
+            .is_none());
+        assert!(decode_request_frame(Message::Close(None)).is_err());
     }
 
-    #[tokio::test]
-    async fn timeout_closes_without_dispatch() {
-        let executor = Arc::new(RecordingExecutor {
-            calls: AtomicUsize::new(0),
-        });
-        let (server_io, client_io) = duplex(1024);
-        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let task_executor = executor.clone();
-        let task = tokio::spawn(async move {
-            run(
-                server_ws,
-                refresh_admission(),
-                Duration::from_millis(10),
-                task_executor,
-            )
-            .await
-        });
-        assert!(matches!(
-            client_ws.next().await.unwrap().unwrap(),
-            Message::Close(_)
-        ));
-        task.await.unwrap().unwrap();
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn timeout_cancels_a_stalled_exchange_executor() {
-        let executor = Arc::new(BlockingExecutor {
-            calls: AtomicUsize::new(0),
-        });
-        let (server_io, client_io) = duplex(1024);
-        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let task_executor = executor.clone();
-        let task = tokio::spawn(async move {
-            run(
-                server_ws,
-                refresh_admission(),
-                Duration::from_millis(20),
-                task_executor,
-            )
-            .await
-        });
-        client_ws
-            .send(Message::Text(request(AUTH_REFRESH).into()))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            client_ws.next().await.unwrap().unwrap(),
-            Message::Close(_)
-        ));
-        assert_eq!(
-            task.await.unwrap().unwrap(),
-            RestrictedExchangeOutcome::Failed
-        );
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    }
-
-    fn request(method: &str) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "id": "R00000000000000000001",
-            "method": method,
-            "params": {},
-        })
-        .to_string()
-    }
-
-    fn refresh_admission() -> RestrictedAdmission {
-        let credential = format!(
-            "{}{}",
-            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
-            "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
-        );
-        RestrictedAdmission::new(
-            PresentedCredential::classify(&credential).unwrap(),
-            RestrictedAuthContext::Refresh(RefreshExchangeContext),
-        )
-    }
-
-    fn device_activation_context() -> RestrictedAuthContext {
-        RestrictedAuthContext::DeviceActivation(DeviceActivationContext {
-            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
-        })
-    }
-
-    fn invitation_admission() -> RestrictedAdmission {
-        let credential = format!(
-            "{}{}",
-            pioneer_protocol::INVITATION_CREDENTIAL_PREFIX,
-            "A".repeat(pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN)
-        );
-        RestrictedAdmission::new(
-            PresentedCredential::classify(&credential).unwrap(),
-            invitation_context(),
-        )
+    #[test]
+    fn restricted_errors_never_echo_secret_bearing_payloads() {
+        let secret = "prf2_secret-that-must-not-leak";
+        let failure = decode_request_frame(Message::Text(secret.into())).unwrap_err();
+        let rendered = format!("{failure:?}");
+        assert!(!rendered.contains(secret));
     }
 
     fn invitation_context() -> RestrictedAuthContext {

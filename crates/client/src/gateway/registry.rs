@@ -1,7 +1,7 @@
 //! Gateway registry normalization and validation.
 
 use super::{
-    connectivity::normalize_address,
+    endpoint::GatewayBaseUrl,
     types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry},
 };
 use pioneer_protocol::{GatewayId, generate_id};
@@ -9,7 +9,6 @@ use std::{collections::HashSet, error::Error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayRegistryConfig {
-    pub version: u32,
     pub local: Option<GatewayLocalRegistryConfig>,
 }
 
@@ -17,7 +16,7 @@ pub struct GatewayRegistryConfig {
 pub struct GatewayLocalRegistryConfig {
     pub gateway_id: String,
     pub name: String,
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub service_name: Option<String>,
 }
 
@@ -48,7 +47,7 @@ impl GatewayRegistryError {
 
 pub fn default_registry(config: &GatewayRegistryConfig) -> GatewayRegistry {
     GatewayRegistry {
-        version: config.version,
+        version: CURRENT_GATEWAY_REGISTRY_VERSION,
         installation_id: None,
         active_gateway_id: None,
         local: config
@@ -119,7 +118,7 @@ where
         .as_ref()
         .and_then(|endpoint| endpoint.workspace_id.clone())
         .and_then(normalize_workspace_id);
-    registry.version = config.version;
+    registry.version = CURRENT_GATEWAY_REGISTRY_VERSION;
     registry.local = config
         .local
         .as_ref()
@@ -143,24 +142,12 @@ where
         .and_then(|endpoint| endpoint.session_ref.clone())
         .map(|session_ref| HashSet::from([session_ref]))
         .unwrap_or_default();
-    let mut seen_addresses = HashSet::new();
+    let mut seen_gateway_base_urls = HashSet::new();
     let mut remotes = Vec::new();
 
     for mut endpoint in std::mem::take(&mut registry.remotes) {
-        let address = match normalize_address(endpoint.address.as_str()) {
-            Ok(value) => value,
-            Err(_) => {
-                reject_session_bound_endpoint_rewrite(
-                    endpoint.session_ref.as_deref(),
-                    "session-bound endpoint address must be valid",
-                )?;
-                continue;
-            }
-        };
-
         endpoint.kind = GatewayEndpointKind::Remote;
         endpoint.service_name = None;
-        endpoint.address = address.clone();
         endpoint.workspace_id = endpoint.workspace_id.and_then(normalize_workspace_id);
         validate_endpoint_session_binding(&endpoint)?;
         let session_ref = endpoint.session_ref.clone();
@@ -199,10 +186,10 @@ where
             seen_ids.insert(endpoint.id.clone());
         }
 
-        if !seen_addresses.insert(address) {
+        if !seen_gateway_base_urls.insert(endpoint.gateway_base_url.clone()) {
             reject_session_bound_endpoint_rewrite(
                 session_ref.as_deref(),
-                "session-bound endpoint address must be unique",
+                "session-bound endpoint gateway_base_url must be unique",
             )?;
             continue;
         }
@@ -229,16 +216,18 @@ where
     Ok(())
 }
 
-pub fn remote_index_by_address(
+pub fn remote_index_by_gateway_base_url(
     registry: &GatewayRegistry,
-    address: &str,
+    gateway_base_url: &GatewayBaseUrl,
     exclude_id: Option<&str>,
 ) -> Option<usize> {
     registry
         .remotes
         .iter()
         .enumerate()
-        .find(|(_, remote)| remote.address == address && exclude_id != Some(remote.id.as_str()))
+        .find(|(_, remote)| {
+            remote.gateway_base_url == *gateway_base_url && exclude_id != Some(remote.id.as_str())
+        })
         .map(|(index, _)| index)
 }
 
@@ -247,7 +236,7 @@ pub fn normalize_workspace_id(value: String) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed.to_owned())
 }
 
-pub const GATEWAY_REGISTRY_V2: u32 = 2;
+pub const CURRENT_GATEWAY_REGISTRY_VERSION: u32 = 3;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -284,7 +273,7 @@ pub fn bind_endpoint_session(
     Ok(())
 }
 
-pub fn commit_registry_v2_binding(
+pub fn commit_registry_v3_binding(
     registry: &mut GatewayRegistry,
     endpoint_id: &str,
     session_ref: &str,
@@ -297,7 +286,7 @@ pub fn commit_registry_v2_binding(
         }
     })?;
     bind_endpoint_session(endpoint, session_ref, observed_gateway_id)?;
-    registry.version = GATEWAY_REGISTRY_V2;
+    registry.version = CURRENT_GATEWAY_REGISTRY_VERSION;
     Ok(())
 }
 
@@ -381,7 +370,7 @@ fn local_endpoint_from_config(
     GatewayEndpoint {
         id: config.gateway_id.trim().to_owned(),
         name: config.name.trim().to_owned(),
-        address: config.address.trim().to_owned(),
+        gateway_base_url: config.gateway_base_url.clone(),
         kind: GatewayEndpointKind::Local,
         session_ref: None,
         server_gateway_id: None,
@@ -435,11 +424,11 @@ mod tests {
 
     fn config() -> GatewayRegistryConfig {
         GatewayRegistryConfig {
-            version: GATEWAY_REGISTRY_V2,
             local: Some(GatewayLocalRegistryConfig {
                 gateway_id: "local".to_owned(),
                 name: "Local Gateway".to_owned(),
-                address: "ws://localhost:17878".to_owned(),
+                gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878")
+                    .unwrap(),
                 service_name: Some("com.pioneer.gateway".to_owned()),
             }),
         }
@@ -480,7 +469,8 @@ mod tests {
         let endpoint = GatewayEndpoint {
             id: "remote".to_owned(),
             name: "Remote".to_owned(),
-            address: "wss://gateway.example.test".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("https://gateway.example.test")
+                .unwrap(),
             kind: GatewayEndpointKind::Remote,
             session_ref: Some("remote-session".to_owned()),
             server_gateway_id: None,
@@ -499,7 +489,8 @@ mod tests {
         let mut endpoint = GatewayEndpoint {
             id: "remote".to_owned(),
             name: "Remote".to_owned(),
-            address: "wss://gateway.example.test".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("https://gateway.example.test")
+                .unwrap(),
             kind: GatewayEndpointKind::Remote,
             session_ref: None,
             server_gateway_id: None,

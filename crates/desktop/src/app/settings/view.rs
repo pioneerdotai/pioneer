@@ -2185,7 +2185,7 @@ mod tests {
         settings.status.state = GatewayRemoteAccessState::Failed;
         settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::InvalidSettings);
         settings.status.message =
-            Some("remote access relay address must include a port".to_owned());
+            Some("remote access relay gateway_base_url must include a port".to_owned());
 
         assert_eq!(
             super::PioneerDesktop::remote_access_status_label(&settings),

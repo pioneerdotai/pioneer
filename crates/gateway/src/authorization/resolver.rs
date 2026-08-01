@@ -936,13 +936,7 @@ authorized_proof!(
     decision,
 );
 authorized_proof!(AuthorizedMemberDirectory, principal_id, action, decision,);
-authorized_proof!(
-    AuthorizedMemberAvatar,
-    principal_id,
-    action,
-    resource,
-    decision,
-);
+authorized_proof!(AuthorizedMemberAvatar);
 authorized_proof!(
     AuthorizedMemberPrincipal,
     principal_id,
@@ -977,15 +971,6 @@ impl AuthorizedInvitation {
         match self.resource() {
             AuthorizationResource::Invitation(invitation_id) => invitation_id,
             _ => unreachable!("AuthorizedInvitation always contains an invitation resource"),
-        }
-    }
-}
-
-impl AuthorizedMemberAvatar {
-    pub(crate) fn target_principal_id(&self) -> &PrincipalId {
-        match self.resource() {
-            AuthorizationResource::DirectoryPrincipal(principal_id) => principal_id,
-            _ => unreachable!("AuthorizedMemberAvatar always contains a principal resource"),
         }
     }
 }
@@ -1161,7 +1146,7 @@ mod tests {
     use sea_orm::ConnectionTrait;
 
     use super::*;
-    use crate::authorization_test_support::{
+    use crate::tests::authorization::{
         IsolatedEpic4Harness, MEMBER_A_ID, MEMBER_B_ID, THREAD_BLUE_PRIVATE_A_ID,
         THREAD_GREEN_PRIVATE_B_ID, THREAD_RED_INTERNAL_ID, THREAD_RED_PRIVATE_A_ID,
         THREAD_RED_PRIVATE_B_ID, THREAD_RED_WORKSPACE_ID, WORKSPACE_BLUE_ID, WORKSPACE_GREEN_ID,

@@ -82,6 +82,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 uuid = "1.24"
 
 # Async
+axum = { version = "=0.8.9", features = ["ws"] }
 tokio = { version = "1.52", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["full"] }

@@ -169,19 +169,31 @@ output = "Sortie"
 
 [artifacts.action]
 attach_tooltip = "Utiliser cet artefact comme entree dans le compositeur"
+cancel_tooltip = "Annuler le telechargement"
 download_tooltip = "Telecharger cet artefact sur cet ordinateur"
-open_tooltip = "Ouvrir une copie locale verifiee"
+open_tooltip = "Ouvrir une vue securisee en streaming"
 reveal_tooltip = "Afficher la copie locale"
 
 [artifacts.action.error]
 no_gateway = "Aucune passerelle active"
 no_workspace = "L'espace de travail de l'artefact est manquant"
 not_connected = "La passerelle n'est pas connectee"
+authentication = "La session de la passerelle doit etre authentifiee a nouveau"
+cancelled = "Le telechargement de l'artefact a ete annule"
+disk_full = "Espace disque insuffisant pour cet artefact"
+download_failed = "Le telechargement de l'artefact a echoue"
+grant_expired = "La vue securisee a expire; ouvrez-la a nouveau"
+integrity = "La verification du telechargement a echoue"
+invalid_artifact = "Les donnees de version de l'artefact sont incompletes"
+local_copy_invalid = "La copie locale est absente ou invalide"
+reconfigure = "Le point d'acces actif doit etre reconfigure"
+revoked = "Cet artefact n'est plus disponible"
+viewer_failed = "Impossible d'ouvrir le visualiseur systeme"
 
 [artifacts.action.status]
 downloading = "Telechargement sur cet ordinateur..."
 failed = "L'action sur l'artefact a echoue"
-opening = "Ouverture de la copie locale..."
+opening = "Ouverture de la vue securisee..."
 queued = "En attente de destination..."
 revealing = "Affichage de la copie locale..."
 verifying = "Verification de la copie locale..."

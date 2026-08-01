@@ -8,7 +8,7 @@ impl GatewayWsClient {
         let command_sender = GatewayWsCommandSender {
             command_tx,
             next_connection_id: Arc::new(AtomicU64::new(0)),
-            artifact_cache_root: Arc::new(Mutex::new(None)),
+            session_access: Arc::new(Mutex::new(None)),
         };
 
         spawn_worker(command_rx, event_tx);

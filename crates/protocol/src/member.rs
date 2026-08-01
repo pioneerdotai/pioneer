@@ -187,32 +187,6 @@ pub struct MemberListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MemberAvatarGetParams {
-    pub principal_id: PrincipalId,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MemberAvatarGetResponse {
-    pub principal_id: PrincipalId,
-    pub media_type: ProfileAvatarMediaType,
-    pub avatar_revision: String,
-    pub content_base64: String,
-}
-
-impl fmt::Debug for MemberAvatarGetResponse {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemberAvatarGetResponse")
-            .field("principal_id", &self.principal_id)
-            .field("media_type", &self.media_type)
-            .field("avatar_revision", &self.avatar_revision)
-            .field("content_base64", &"[redacted]")
-            .finish()
-    }
-}
-
 macro_rules! member_lifecycle_params {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -488,8 +462,8 @@ mod tests {
     use super::{
         MEMBER_DIRECTORY_CURSOR_MAX_BYTES, MEMBER_DIRECTORY_DEFAULT_LIMIT,
         MEMBER_DIRECTORY_MAX_LIMIT, MEMBER_DISPLAY_NAME_MAX_SCALARS,
-        MEMBER_DISPLAY_NAME_MAX_UTF8_BYTES, MEMBER_NICKNAME_MAX_LEN, MemberAvatarGetParams,
-        MemberDeviceCreateParams, MemberListParams, MemberRemoveParams, MemberRestoreParams,
+        MEMBER_DISPLAY_NAME_MAX_UTF8_BYTES, MEMBER_NICKNAME_MAX_LEN, MemberDeviceCreateParams,
+        MemberListParams, MemberRemoveParams, MemberRestoreParams,
         MemberSuspendParams, NewMemberProfile, PROFILE_AVATAR_MAX_BASE64_LEN,
         PROFILE_AVATAR_MAX_DECODED_BYTES, PROFILE_AVATAR_MAX_DIMENSION, ProfileAvatarInput,
         ProfileAvatarMediaType, WorkspaceMemberAddParams, WorkspaceMemberListParams,
@@ -592,11 +566,6 @@ mod tests {
         let workspace = "W00000000000000000001";
         let values = [
             serde_json::from_value::<MemberListParams>(json!({ "extra": true })).is_err(),
-            serde_json::from_value::<MemberAvatarGetParams>(json!({
-                "principal_id": principal,
-                "extra": true
-            }))
-            .is_err(),
             serde_json::from_value::<MemberSuspendParams>(json!({
                 "principal_id": principal,
                 "force": true

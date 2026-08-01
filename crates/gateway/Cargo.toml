@@ -12,6 +12,7 @@ computer-use = ["pioneer-tools/computer-use"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 base64.workspace = true
 pioneer-agent.workspace = true
 pioneer-artifacts.workspace = true
@@ -37,7 +38,6 @@ pioneer-tasks.workspace = true
 pioneer-tools.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tokio-tungstenite.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true
 libc.workspace = true
@@ -76,3 +76,4 @@ toml.workspace = true
 
 [dev-dependencies]
 pioneer-client.workspace = true
+tower = { version = "0.5", features = ["util"] }

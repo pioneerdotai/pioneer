@@ -1,6 +1,7 @@
 mod activation;
 mod connectivity;
 mod control;
+mod http;
 mod registry;
 mod runtime;
 mod secrets;
@@ -8,6 +9,7 @@ mod timings;
 mod ws;
 
 pub(crate) use control::GatewayInstallWarning;
+pub(crate) use http::DesktopGatewayHttpClient;
 
 pub use pioneer_client::runtime::ClientRuntime;
 pub(crate) use runtime::{DesktopSessionConnectionOutcome, DesktopSessionPreparation};

@@ -21,7 +21,7 @@ use crate::{
         microphone::DesktopMicrophoneGateReport,
     },
     code_highlight::DesktopCodeHighlightCache,
-    gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
+    gateway::{ClientRuntime, DesktopGatewayHttpClient, GatewayRuntime, GatewayWsCommandSender},
 };
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
@@ -33,7 +33,9 @@ pub(super) use pioneer_client::{
     agents_doc::scope::{
         AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
     },
-    artifacts::actions::ArtifactActionStatus as ThreadArtifactActionStatus,
+    artifacts::actions::{
+        ArtifactActionStatus as ThreadArtifactActionStatus, ArtifactVersionKey,
+    },
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
     cli_runtime::approvals::{PendingRequest, PendingRequestState},
@@ -97,7 +99,7 @@ pub(super) enum GatewaySetupFormMode {
     ReauthenticateGateway {
         endpoint_id: String,
         name: String,
-        address: String,
+        gateway_base_url: String,
         close_dialog_on_success: bool,
     },
     EditGateway {
@@ -164,6 +166,7 @@ pub(super) struct GatewayCoordinator {
     pub(super) runtime: Option<GatewayRuntime>,
     pub(super) client_runtime: ClientRuntime,
     pub(super) ws_command_sender: GatewayWsCommandSender,
+    pub(super) http_client: Option<DesktopGatewayHttpClient>,
     pub(super) ws_connection_id: Option<u64>,
     pub(super) deferred_ws_events: VecDeque<pioneer_client::transport::ws::GatewayWsEvent>,
     pub(super) connection_epoch: u64,
@@ -414,6 +417,8 @@ pub struct PioneerDesktop {
         HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     pub(super) task_review_actions: TaskReviewActionState,
     pub(super) thread_artifacts: ThreadArtifactsState,
+    pub(super) artifact_download_cancellations:
+        HashMap<ArtifactVersionKey, tokio_util::sync::CancellationToken>,
     pub(super) show_thread_artifacts_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) ready_turn_resume_threads: VecDeque<String>,

@@ -1,4 +1,4 @@
-//! Deterministic, test-only multi-principal fixture contract for Epic 4.
+//! Deterministic, test-only multi-principal authorization fixtures.
 //!
 //! This module deliberately does not provision a Member through a production
 //! API. Phase-specific tests materialize these records through internal test

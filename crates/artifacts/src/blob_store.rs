@@ -3,8 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use tokio::fs::File;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
 
 use crate::error::{ArtifactError, ArtifactResult};
 
@@ -23,17 +22,23 @@ pub struct StoredArtifactBlob {
     pub deduplicated: bool,
 }
 
-#[derive(Debug)]
+pub trait ArtifactReader: AsyncRead + AsyncSeek + Send + Unpin {}
+
+impl<T> ArtifactReader for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
+
 pub struct ArtifactReadHandle {
-    file: File,
+    reader: Box<dyn ArtifactReader>,
     storage_key: String,
     size_bytes: u64,
 }
 
 impl ArtifactReadHandle {
-    pub fn new(file: File, storage_key: impl Into<String>, size_bytes: u64) -> Self {
+    pub fn new<R>(reader: R, storage_key: impl Into<String>, size_bytes: u64) -> Self
+    where
+        R: ArtifactReader + 'static,
+    {
         Self {
-            file,
+            reader: Box::new(reader),
             storage_key: storage_key.into(),
             size_bytes,
         }
@@ -47,8 +52,17 @@ impl ArtifactReadHandle {
         self.size_bytes
     }
 
-    pub fn into_inner(self) -> File {
-        self.file
+    pub fn into_inner(self) -> Box<dyn ArtifactReader> {
+        self.reader
+    }
+}
+
+impl std::fmt::Debug for ArtifactReadHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactReadHandle")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
     }
 }
 
@@ -58,7 +72,20 @@ impl AsyncRead for ArtifactReadHandle {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_read(cx, buf)
+        Pin::new(&mut *self.reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for ArtifactReadHandle {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut *self.reader).start_seek(position)
+    }
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut *self.reader).poll_complete(cx)
     }
 }
 

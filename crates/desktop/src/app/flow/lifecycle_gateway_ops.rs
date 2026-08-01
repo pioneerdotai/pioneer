@@ -7,7 +7,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
         source: GatewayOperationSource,
         name: String,
-        address: String,
+        gateway_base_url: String,
         activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
@@ -16,7 +16,7 @@ impl PioneerDesktop {
                 window,
                 cx,
                 name,
-                address,
+                gateway_base_url,
                 activation_code,
                 form_state,
             );
@@ -51,7 +51,7 @@ impl PioneerDesktop {
                             let mut runtime = GatewayRuntime::load()?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
-                                address.as_str(),
+                                gateway_base_url.as_str(),
                                 Some(activation_code.as_str()),
                             )?;
                             let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
@@ -256,7 +256,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
         name: String,
-        address: String,
+        gateway_base_url: String,
         activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
@@ -283,7 +283,7 @@ impl PioneerDesktop {
                             let mut runtime = GatewayRuntime::load()?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
-                                address.as_str(),
+                                gateway_base_url.as_str(),
                                 Some(activation_code.as_str()),
                             )?;
                             let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
@@ -479,7 +479,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
         endpoint_id: String,
         name: String,
-        address: String,
+        gateway_base_url: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -520,7 +520,7 @@ impl PioneerDesktop {
                             let endpoint = runtime.update_remote_gateway(
                                 endpoint_id.as_str(),
                                 name.as_str(),
-                                address.as_str(),
+                                gateway_base_url.as_str(),
                             )?;
                             let was_active =
                                 runtime.active_gateway_id() == Some(endpoint.id.as_str());

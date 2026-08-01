@@ -1,17 +1,15 @@
 mod client;
 mod command_sender;
 
-use crate::rpc::RPC_REQUEST_TIMEOUT;
+use crate::transport::http::{GatewayHttpAccess, GatewayHttpAuthorityError};
 use anyhow::{Context, Result, anyhow};
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactCapabilitiesParams,
     ArtifactCapabilitiesResponse, ArtifactDeleteParams, ArtifactDeleteResponse,
-    ArtifactDownloadAbortParams, ArtifactDownloadAbortResponse, ArtifactDownloadChunkParams,
-    ArtifactDownloadChunkResponse, ArtifactDownloadFinishParams, ArtifactDownloadFinishResponse,
-    ArtifactDownloadStartParams, ArtifactDownloadStartResponse, ArtifactGetParams,
-    ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
-    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactReadParams,
-    ArtifactReadResponse, ArtifactRestoreParams, ArtifactRestoreResponse,
+    ArtifactGetParams, ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactRestoreParams,
+    ArtifactRestoreResponse,
+    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
     ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadChunkAckNotification,
     ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadStartParams,
     ArtifactUploadStartResponse, AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse,
@@ -31,8 +29,8 @@ use pioneer_protocol::{
     InvitationRevokeResponse, McpInstallParams, McpInstallResponse, McpListParams, McpListResponse,
     McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse,
     McpServerRestartParams, McpServerRestartResponse, McpUninstallParams, McpUninstallResponse,
-    MemberAvatarGetParams, MemberAvatarGetResponse, MemberDeviceCreateParams,
-    MemberDeviceCreateResponse, MemberListParams, MemberListResponse, MemberMutationResponse,
+    MemberDeviceCreateParams, MemberDeviceCreateResponse, MemberListParams, MemberListResponse,
+    MemberMutationResponse,
     MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, ProviderConfigureParams,
     ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
@@ -68,7 +66,6 @@ use pioneer_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -76,7 +73,6 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use super::client::{GatewayWsCommand, spawn_worker};
-use super::download::ArtifactDownloadChunkPayload;
 use super::{GatewayWsConnectSpec, GatewayWsEvent};
 
 const UPLOAD_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,7 +81,7 @@ const UPLOAD_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct GatewayWsCommandSender {
     command_tx: UnboundedSender<GatewayWsCommand>,
     next_connection_id: Arc<AtomicU64>,
-    artifact_cache_root: Arc<Mutex<Option<PathBuf>>>,
+    session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
 }
 
 #[derive(Clone)]

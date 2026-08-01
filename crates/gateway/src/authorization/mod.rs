@@ -33,11 +33,13 @@ pub(crate) use registry::{
 };
 pub(crate) use resolver::{
     AuthorizationResolver, AuthorizedArtifact, AuthorizedInvitation,
-    AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberAvatar,
-    AuthorizedMemberDirectory, AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask,
+    AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberDirectory,
+    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask,
     AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace, AuthorizedWorkspaceCollection,
     ProofResolution, persisted_actor_is_current,
 };
+#[cfg(test)]
+pub(crate) use resolver::AuthorizedMemberAvatar;
 pub(crate) use service::{
     AuthorizationService, ResolvedResourceAccess, ThreadAccessFacts, WorkspaceAccessFacts,
 };

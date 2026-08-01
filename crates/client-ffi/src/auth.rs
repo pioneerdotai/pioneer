@@ -1,5 +1,8 @@
-use pioneer_client::transport::ws::{
-    GatewayWsSessionIdentity, GatewayWsSessionSpec, auth_exchange::AuthExchangeError,
+use pioneer_client::{
+    gateway::endpoint::GatewayBaseUrl,
+    transport::ws::{
+        GatewayWsSessionIdentity, GatewayWsSessionSpec, auth_exchange::AuthExchangeError,
+    },
 };
 use pioneer_protocol::{
     AuthDeviceActivateParams, AuthDeviceActivationPresentation, AuthDeviceCreateResponse,
@@ -29,7 +32,7 @@ pub struct ClientGatewaySessionLifecycleResult {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientDeviceActivationPresentationRequest {
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub created_device: AuthDeviceCreateResponse,
 }
 
@@ -39,7 +42,7 @@ pub struct ClientDeviceActivationPresentationResult {
     pub device_id: DeviceId,
     pub session_id: AuthSessionId,
     pub gateway_id: GatewayId,
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub expires_at_unix: u64,
     pub manual_code: AuthSecretString,
     pub deep_link: AuthSecretString,
@@ -57,7 +60,7 @@ pub struct ClientDeviceActivationParseRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct ClientDeviceActivationParseResult {
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub gateway_id: GatewayId,
     pub activation_code: AuthSecretString,
 }
@@ -66,9 +69,10 @@ impl ClientDeviceActivationPresentationResult {
     pub fn from_request(
         request: ClientDeviceActivationPresentationRequest,
     ) -> Result<Self, String> {
+        let gateway_base_url = request.gateway_base_url.clone();
         let presentation =
             pioneer_client::gateway::device_activation::DeviceActivationQrPresentation::from_created_device(
-                request.protected_endpoint,
+                &request.gateway_base_url,
                 request.created_device,
             )
             .map_err(|error| error.to_string())?;
@@ -76,7 +80,7 @@ impl ClientDeviceActivationPresentationResult {
             device_id: presentation.device_id.clone(),
             session_id: presentation.session_id.clone(),
             gateway_id: presentation.gateway_id.clone(),
-            protected_endpoint: presentation.protected_endpoint.clone(),
+            gateway_base_url,
             expires_at_unix: presentation.expires_at_unix,
             manual_code: AuthSecretString::new(presentation.manual_code()),
             deep_link: AuthSecretString::new(presentation.deep_link()),
@@ -91,8 +95,11 @@ impl ClientDeviceActivationParseResult {
     pub fn from_request(request: ClientDeviceActivationParseRequest) -> Result<Self, String> {
         let presentation = AuthDeviceActivationPresentation::parse(request.uri.expose_secret())?;
         let activation_code = AuthSecretString::new(presentation.activation_code());
+        let gateway_base_url =
+            GatewayBaseUrl::from_websocket_presentation(&presentation.protected_endpoint)
+                .map_err(|error| error.to_string())?;
         Ok(Self {
-            protected_endpoint: presentation.protected_endpoint,
+            gateway_base_url,
             gateway_id: presentation.gateway_id,
             activation_code,
         })
@@ -124,7 +131,7 @@ pub const AUTH_EXCHANGE_RUNTIME_CODE: &str = "auth_exchange_runtime_failed";
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuthRefreshRequest {
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub credential: AuthSecretString,
     pub params: AuthRefreshParams,
     #[serde(default = "default_exchange_timeout_ms")]
@@ -135,7 +142,7 @@ pub struct ClientAuthRefreshRequest {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuthDeviceActivateRequest {
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub credential: AuthSecretString,
     pub params: AuthDeviceActivateParams,
     #[serde(default = "default_exchange_timeout_ms")]
@@ -146,7 +153,7 @@ pub struct ClientAuthDeviceActivateRequest {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuthSessionCleanupRequest {
-    pub address: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub access_token: AuthSecretString,
     pub session_id: AuthSessionId,
     #[serde(default = "default_exchange_timeout_ms")]
@@ -159,7 +166,7 @@ macro_rules! redacted_exchange_debug {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter
                     .debug_struct(stringify!($type))
-                    .field("address", &self.address)
+                    .field("gateway_base_url", &self.gateway_base_url)
                     .field("credential", &"[redacted]")
                     .field("params", &self.params)
                     .field("timeout_ms", &self.timeout_ms)
@@ -176,7 +183,7 @@ impl std::fmt::Debug for ClientAuthSessionCleanupRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ClientAuthSessionCleanupRequest")
-            .field("address", &self.address)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("access_token", &"[redacted]")
             .field("session_id", &self.session_id)
             .field("timeout_ms", &self.timeout_ms)
@@ -220,7 +227,7 @@ impl ClientGatewaySessionReplaceAccessRequest {
             endpoint_id: self.endpoint.id,
             endpoint_name: self.endpoint.name,
             endpoint_kind: self.endpoint.kind,
-            address: self.endpoint.address,
+            gateway_base_url: self.endpoint.gateway_base_url,
             identity: GatewayWsSessionIdentity {
                 server_gateway_id: self.server_gateway_id,
                 session_id: self.session_id,
@@ -279,7 +286,8 @@ mod tests {
     fn exchange_request_debug_redacts_credential() {
         let raw = "prf_super_secret_refresh_value";
         let request = ClientAuthRefreshRequest {
-            address: "ws://localhost:17878".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878")
+                .unwrap(),
             credential: AuthSecretString::new(raw),
             params: AuthRefreshParams {
                 refresh_request_id: "Q00000000000000000001".to_owned(),
@@ -294,7 +302,8 @@ mod tests {
     fn cleanup_request_debug_redacts_access_token() {
         let raw = "access-super-secret-value";
         let request = ClientAuthSessionCleanupRequest {
-            address: "ws://localhost:17878".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878")
+                .unwrap(),
             access_token: AuthSecretString::new(raw),
             session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
             timeout_ms: 100,
@@ -324,7 +333,10 @@ mod tests {
         let token = "K7M4-P9Q2".to_owned();
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         let request = ClientDeviceActivationPresentationRequest {
-            protected_endpoint: "wss://gateway.example/ws".to_owned(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation(
+                "https://gateway.example/pioneer/",
+            )
+            .unwrap(),
             created_device: AuthDeviceCreateResponse {
                 device_id: DeviceId::new("D00000000000000000001").unwrap(),
                 session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
@@ -349,6 +361,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(parsed.gateway_id, gateway_id);
+        assert_eq!(
+            parsed.gateway_base_url.as_str(),
+            "https://gateway.example/pioneer/"
+        );
         assert_eq!(parsed.activation_code.expose_secret(), token);
         assert!(!format!("{parsed:?}").contains(&token));
     }

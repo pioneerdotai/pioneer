@@ -1,5 +1,5 @@
 use super::*;
-use crate::authorization_test_support::MEMBER_A_ID;
+use crate::tests::authorization::MEMBER_A_ID;
 use pioneer_client::{
     authorization::apply_access_changed_to_client_state,
     gateway::session_lifecycle::{
