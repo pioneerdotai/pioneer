@@ -38,6 +38,8 @@ pub struct Model {
     pub refresh_expires_at: Option<DateTimeWithTimeZone>,
     pub revoked_at: Option<DateTimeWithTimeZone>,
     pub revoke_reason: Option<String>,
+    #[sea_orm(has_many)]
+    pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_one)]
     pub auth_refresh_credential: HasOne<super::auth_refresh_credential::Entity>,
     #[sea_orm(

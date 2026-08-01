@@ -206,6 +206,50 @@ mod tests {
     }
 
     #[test]
+    fn epic5_administration_events_cross_the_bridge_additively_without_secrets() {
+        let events = [
+            GatewayNotification::InvitationChanged(
+                pioneer_protocol::InvitationChangedNotification {
+                    revision: 1,
+                    invitation_id: pioneer_protocol::InvitationId::new("IAAAAAAAAAAAAAAAAAAAA")
+                        .expect("valid invitation id"),
+                },
+            ),
+            GatewayNotification::MemberChanged(pioneer_protocol::MemberChangedNotification {
+                revision: 2,
+                principal_id: pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA")
+                    .expect("valid principal id"),
+            }),
+            GatewayNotification::WorkspaceMembersChanged(
+                pioneer_protocol::WorkspaceMembersChangedNotification {
+                    revision: 3,
+                    workspace_id: pioneer_protocol::WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA")
+                        .expect("valid workspace id"),
+                },
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, notification)| GatewayWsEvent::Notification {
+            connection_id: u64::try_from(index + 1).unwrap(),
+            notification,
+        });
+
+        let reduced = reduce_gateway_ws_events_to_client_events(
+            events,
+            ClientRuntimeWsEventContext::default(),
+        );
+        let encoded = serde_json::to_string(&reduced).expect("bridge event JSON");
+
+        assert_eq!(reduced.len(), 3);
+        assert!(encoded.contains("invitation_changed"));
+        assert!(encoded.contains("member_changed"));
+        assert!(encoded.contains("workspace_members_changed"));
+        assert!(!encoded.contains("pinv1_"));
+        assert!(!encoded.contains("pioneer://invite"));
+    }
+
+    #[test]
     fn mobile_nitro_voice_array_buffer_uses_the_shared_binary_frame_contract() {
         let input = serde_json::json!({
             "session_id": "voice_mobile_binary_1",

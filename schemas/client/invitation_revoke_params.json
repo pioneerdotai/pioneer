@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationRevokeParams",
+  "type": "object",
+  "properties": {
+    "invitation_id": {
+      "$ref": "#/$defs/InvitationId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "invitation_id"
+  ],
+  "$defs": {
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

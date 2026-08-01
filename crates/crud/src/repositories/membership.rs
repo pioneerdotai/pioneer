@@ -61,6 +61,30 @@ pub struct NewWorkspaceMembership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDirectoryCursor {
+    pub nickname_key: String,
+    pub principal_id: PrincipalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDirectoryPage {
+    pub principals: Vec<GatewayPrincipalRecord>,
+    pub next_cursor: Option<MemberDirectoryCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMembershipDeletion {
+    pub changed: bool,
+    pub removed_private_thread_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalMembershipDeletion {
+    pub workspace_ids: Vec<String>,
+    pub private_thread_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewThreadMembership {
     pub gateway_id: GatewayId,
     pub principal_id: PrincipalId,
@@ -254,42 +278,23 @@ fn shared_workspace_principal_ids(viewer_principal_id: &PrincipalId) -> SelectSt
         .from(workspace_membership::Entity)
         .and_where(
             workspace_membership::Column::WorkspaceId
-                .in_subquery(workspace_membership_workspace_ids(viewer_principal_id)),
+                .in_subquery(active_workspace_membership_ids(viewer_principal_id)),
         )
         .to_owned()
 }
 
-/// Lists active and suspended user profiles which share at least one persisted
-/// workspace membership with the exact Member. The ACL predicate precedes
-/// ordering and limiting, so unrelated principals cannot consume the page.
-pub async fn list_shared_workspace_principals_for_principal<C: ConnectionTrait>(
-    db: &C,
-    gateway_id: &GatewayId,
-    viewer_principal_id: &PrincipalId,
-    limit: u64,
-) -> Result<Vec<GatewayPrincipalRecord>> {
-    gateway_principal::Entity::find()
-        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
-        .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
-        .filter(gateway_principal::Column::Status.is_in(["active", "suspended"]))
-        .filter(
-            gateway_principal::Column::Id
-                .in_subquery(shared_workspace_principal_ids(viewer_principal_id)),
-        )
-        .order_by_asc(gateway_principal::Column::NicknameKey)
-        .order_by_asc(gateway_principal::Column::Id)
-        .limit(limit)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to list shared-workspace directory for principal \
-                 `{viewer_principal_id}`"
-            )
-        })?
-        .into_iter()
-        .map(gateway_principal_record_from_model)
-        .collect()
+fn active_workspace_membership_ids(viewer_principal_id: &PrincipalId) -> SelectStatement {
+    let active_workspace_ids = Query::select()
+        .column(workspace::Column::Id)
+        .from(workspace::Entity)
+        .and_where(workspace::Column::IsActive.eq(true))
+        .to_owned();
+    Query::select()
+        .column(workspace_membership::Column::WorkspaceId)
+        .from(workspace_membership::Entity)
+        .and_where(workspace_membership::Column::PrincipalId.eq(viewer_principal_id.to_string()))
+        .and_where(workspace_membership::Column::WorkspaceId.in_subquery(active_workspace_ids))
+        .to_owned()
 }
 
 /// Resolves a directory profile only when it is eligible for the Member's
@@ -303,6 +308,7 @@ pub async fn find_shared_workspace_principal_for_principal<C: ConnectionTrait>(
     gateway_principal::Entity::find_by_id(target_principal_id.to_string())
         .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
         .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
+        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
         .filter(gateway_principal::Column::Status.is_in(["active", "suspended"]))
         .filter(
             gateway_principal::Column::Id
@@ -320,24 +326,158 @@ pub async fn find_shared_workspace_principal_for_principal<C: ConnectionTrait>(
         .transpose()
 }
 
-/// Superuser directory query. Gateway scoping and pagination are both applied
-/// by SQL and include removed historical principals.
-pub async fn list_directory_principals_for_superuser<C: ConnectionTrait>(
+pub async fn list_member_directory_page<C: ConnectionTrait>(
     db: &C,
     gateway_id: &GatewayId,
+    viewer_principal_id: &PrincipalId,
+    viewer_kind: PrincipalKind,
+    cursor: Option<&MemberDirectoryCursor>,
     limit: u64,
-) -> Result<Vec<GatewayPrincipalRecord>> {
-    gateway_principal::Entity::find()
-        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+) -> Result<MemberDirectoryPage> {
+    if limit == 0 {
+        bail!("member directory page limit must be positive");
+    }
+    let mut query = gateway_principal::Entity::find()
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()));
+    if viewer_kind == PrincipalKind::User {
+        query = query.filter(
+            Condition::any()
+                .add(gateway_principal::Column::Id.eq(viewer_principal_id.to_string()))
+                .add(
+                    Condition::all()
+                        .add(
+                            gateway_principal::Column::Kind
+                                .eq(principal_kind_to_db(PrincipalKind::Superuser)),
+                        )
+                        .add(gateway_principal::Column::Status.eq("active")),
+                )
+                .add(
+                    Condition::all()
+                        .add(
+                            gateway_principal::Column::Kind
+                                .eq(principal_kind_to_db(PrincipalKind::User)),
+                        )
+                        .add(
+                            gateway_principal::Column::RoleKey
+                                .eq(pioneer_protocol::MEMBER_ROLE_KEY),
+                        )
+                        .add(gateway_principal::Column::Status.is_in(["active", "suspended"]))
+                        .add(
+                            gateway_principal::Column::Id
+                                .in_subquery(shared_workspace_principal_ids(viewer_principal_id)),
+                        ),
+                ),
+        );
+    }
+    if let Some(cursor) = cursor {
+        query = query.filter(
+            Condition::any()
+                .add(gateway_principal::Column::NicknameKey.gt(cursor.nickname_key.clone()))
+                .add(
+                    Condition::all()
+                        .add(gateway_principal::Column::NicknameKey.eq(cursor.nickname_key.clone()))
+                        .add(gateway_principal::Column::Id.gt(cursor.principal_id.to_string())),
+                ),
+        );
+    }
+    let fetch_limit = limit
+        .checked_add(1)
+        .context("member directory page limit overflow")?;
+    let mut rows = query
         .order_by_asc(gateway_principal::Column::NicknameKey)
         .order_by_asc(gateway_principal::Column::Id)
-        .limit(limit)
+        .limit(fetch_limit)
         .all(db)
         .await
-        .context("failed to list Superuser directory principals")?
-        .into_iter()
-        .map(gateway_principal_record_from_model)
-        .collect()
+        .context("failed to list ACL-scoped member directory page")?;
+    let has_more = rows.len() as u64 > limit;
+    if has_more {
+        rows.pop();
+    }
+    let next_cursor = has_more
+        .then(|| rows.last())
+        .flatten()
+        .map(|row| {
+            Ok::<_, anyhow::Error>(MemberDirectoryCursor {
+                nickname_key: row.nickname_key.clone(),
+                principal_id: PrincipalId::new(row.id.clone())
+                    .context("persisted member directory principal id is invalid")?,
+            })
+        })
+        .transpose()?;
+    Ok(MemberDirectoryPage {
+        principals: rows
+            .into_iter()
+            .map(gateway_principal_record_from_model)
+            .collect::<Result<Vec<_>>>()?,
+        next_cursor,
+    })
+}
+
+pub async fn list_workspace_member_principals_page<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    workspace_id: &str,
+    cursor: Option<&MemberDirectoryCursor>,
+    limit: u64,
+) -> Result<MemberDirectoryPage> {
+    if limit == 0 {
+        bail!("workspace member page limit must be positive");
+    }
+    let member_ids = Query::select()
+        .column(workspace_membership::Column::PrincipalId)
+        .from(workspace_membership::Entity)
+        .and_where(workspace_membership::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .to_owned();
+    let mut query = gateway_principal::Entity::find()
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
+        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
+        .filter(gateway_principal::Column::Status.is_in(["active", "suspended"]))
+        .filter(gateway_principal::Column::Id.in_subquery(member_ids));
+    if let Some(cursor) = cursor {
+        query = query.filter(
+            Condition::any()
+                .add(gateway_principal::Column::NicknameKey.gt(cursor.nickname_key.clone()))
+                .add(
+                    Condition::all()
+                        .add(gateway_principal::Column::NicknameKey.eq(cursor.nickname_key.clone()))
+                        .add(gateway_principal::Column::Id.gt(cursor.principal_id.to_string())),
+                ),
+        );
+    }
+    let fetch_limit = limit
+        .checked_add(1)
+        .context("workspace member page limit overflow")?;
+    let mut rows = query
+        .order_by_asc(gateway_principal::Column::NicknameKey)
+        .order_by_asc(gateway_principal::Column::Id)
+        .limit(fetch_limit)
+        .all(db)
+        .await
+        .context("failed to list explicit workspace member page")?;
+    let has_more = rows.len() as u64 > limit;
+    if has_more {
+        rows.pop();
+    }
+    let next_cursor = has_more
+        .then(|| rows.last())
+        .flatten()
+        .map(|row| {
+            Ok::<_, anyhow::Error>(MemberDirectoryCursor {
+                nickname_key: row.nickname_key.clone(),
+                principal_id: PrincipalId::new(row.id.clone())
+                    .context("persisted workspace member principal id is invalid")?,
+            })
+        })
+        .transpose()?;
+    Ok(MemberDirectoryPage {
+        principals: rows
+            .into_iter()
+            .map(gateway_principal_record_from_model)
+            .collect::<Result<Vec<_>>>()?,
+        next_cursor,
+    })
 }
 
 pub async fn insert_workspace_membership(
@@ -385,9 +525,18 @@ pub async fn delete_workspace_membership(
     gateway_id: &GatewayId,
     principal_id: &PrincipalId,
     workspace_id: &str,
-) -> Result<bool> {
+) -> Result<WorkspaceMembershipDeletion> {
     validate_scope_id("workspace", workspace_id)?;
     validate_principal_gateway(db, gateway_id, principal_id).await?;
+    if find_workspace_membership(db, principal_id, workspace_id)
+        .await?
+        .is_none()
+    {
+        return Ok(WorkspaceMembershipDeletion {
+            changed: false,
+            removed_private_thread_ids: Vec::new(),
+        });
+    }
     let workspace_thread_ids = thread::Entity::find()
         .select_only()
         .column(thread::Column::Id)
@@ -396,14 +545,29 @@ pub async fn delete_workspace_membership(
         .all(db)
         .await
         .context("failed to load workspace threads before membership removal")?;
-    if !workspace_thread_ids.is_empty() {
-        thread_membership::Entity::delete_many()
+    let removed_private_thread_ids = if workspace_thread_ids.is_empty() {
+        Vec::new()
+    } else {
+        let thread_ids = thread_membership::Entity::find()
+            .select_only()
+            .column(thread_membership::Column::ThreadId)
             .filter(thread_membership::Column::PrincipalId.eq(principal_id.to_string()))
             .filter(thread_membership::Column::ThreadId.is_in(workspace_thread_ids))
-            .exec(db)
+            .order_by_asc(thread_membership::Column::ThreadId)
+            .into_tuple::<String>()
+            .all(db)
             .await
-            .context("failed to remove dependent private-thread memberships")?;
-    }
+            .context("failed to capture dependent private-thread memberships")?;
+        if !thread_ids.is_empty() {
+            thread_membership::Entity::delete_many()
+                .filter(thread_membership::Column::PrincipalId.eq(principal_id.to_string()))
+                .filter(thread_membership::Column::ThreadId.is_in(thread_ids.clone()))
+                .exec(db)
+                .await
+                .context("failed to remove dependent private-thread memberships")?;
+        }
+        thread_ids
+    };
     let result = workspace_membership::Entity::delete_by_id((
         principal_id.to_string(),
         workspace_id.to_owned(),
@@ -416,7 +580,59 @@ pub async fn delete_workspace_membership(
              and workspace `{workspace_id}`"
         )
     })?;
-    Ok(result.rows_affected == 1)
+    Ok(WorkspaceMembershipDeletion {
+        changed: result.rows_affected == 1,
+        removed_private_thread_ids,
+    })
+}
+
+pub async fn delete_all_memberships_for_principal(
+    db: &DatabaseTransaction,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+) -> Result<PrincipalMembershipDeletion> {
+    validate_principal_gateway(db, gateway_id, principal_id).await?;
+    let memberships = list_workspace_memberships_for_principal(db, principal_id).await?;
+    let mut workspace_ids = Vec::with_capacity(memberships.len());
+    let mut private_thread_ids = Vec::new();
+    for membership in memberships {
+        let deletion = delete_workspace_membership(
+            db,
+            gateway_id,
+            principal_id,
+            membership.workspace_id.as_str(),
+        )
+        .await?;
+        if deletion.changed {
+            workspace_ids.push(membership.workspace_id);
+            private_thread_ids.extend(deletion.removed_private_thread_ids);
+        }
+    }
+    let dangling_thread_ids = thread_membership::Entity::find()
+        .select_only()
+        .column(thread_membership::Column::ThreadId)
+        .filter(thread_membership::Column::PrincipalId.eq(principal_id.to_string()))
+        .order_by_asc(thread_membership::Column::ThreadId)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to capture remaining principal thread memberships")?;
+    if !dangling_thread_ids.is_empty() {
+        thread_membership::Entity::delete_many()
+            .filter(thread_membership::Column::PrincipalId.eq(principal_id.to_string()))
+            .exec(db)
+            .await
+            .context("failed to remove remaining principal thread memberships")?;
+        private_thread_ids.extend(dangling_thread_ids);
+    }
+    workspace_ids.sort();
+    workspace_ids.dedup();
+    private_thread_ids.sort();
+    private_thread_ids.dedup();
+    Ok(PrincipalMembershipDeletion {
+        workspace_ids,
+        private_thread_ids,
+    })
 }
 
 pub async fn find_thread_membership<C: ConnectionTrait>(
@@ -1913,17 +2129,19 @@ mod tests {
                 .expect("update directory principal status");
         }
 
-        let page = list_shared_workspace_principals_for_principal(
+        let page = list_member_directory_page(
             &fixture.database,
             &fixture.gateway_id,
             &fixture.member_id,
+            PrincipalKind::User,
+            None,
             1,
         )
         .await
         .expect("list one authorized directory row");
-        assert_eq!(page.len(), 1);
+        assert_eq!(page.principals.len(), 1);
         assert_ne!(
-            page[0].id, unrelated_id,
+            page.principals[0].id, unrelated_id,
             "an unrelated row sorted first must not consume the authorized page"
         );
 
@@ -1961,10 +2179,17 @@ mod tests {
             .is_none()
         );
 
-        let superuser_directory =
-            list_directory_principals_for_superuser(&fixture.database, &fixture.gateway_id, 100)
-                .await
-                .expect("list complete Superuser directory");
+        let superuser_directory = list_member_directory_page(
+            &fixture.database,
+            &fixture.gateway_id,
+            &fixture.superuser_id,
+            PrincipalKind::Superuser,
+            None,
+            100,
+        )
+        .await
+        .expect("list complete Superuser directory")
+        .principals;
         let superuser_ids = superuser_directory
             .into_iter()
             .map(|principal| principal.id)
@@ -1976,6 +2201,45 @@ mod tests {
             superuser_ids.contains(&removed_id),
             "removed actor identity remains available to historical Superuser inspection"
         );
+
+        let mut red_workspace: workspace::ActiveModel =
+            workspace::Entity::find_by_id(fixture.red_workspace_id.clone())
+                .one(&fixture.database)
+                .await
+                .expect("query shared workspace")
+                .expect("shared workspace exists")
+                .into();
+        red_workspace.is_active = Set(false);
+        red_workspace
+            .update(&fixture.database)
+            .await
+            .expect("deactivate shared workspace");
+        assert!(
+            find_shared_workspace_principal_for_principal(
+                &fixture.database,
+                &fixture.gateway_id,
+                &fixture.member_id,
+                &shared_id,
+            )
+            .await
+            .expect("inactive workspace must not establish directory scope")
+            .is_none()
+        );
+        let member_ids = list_member_directory_page(
+            &fixture.database,
+            &fixture.gateway_id,
+            &fixture.member_id,
+            PrincipalKind::User,
+            None,
+            100,
+        )
+        .await
+        .expect("list directory after workspace deactivation")
+        .principals
+        .into_iter()
+        .map(|principal| principal.id)
+        .collect::<BTreeSet<_>>();
+        assert!(!member_ids.contains(&shared_id));
     }
 
     #[tokio::test]
@@ -2008,15 +2272,18 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            delete_workspace_membership(
-                &transaction,
-                &fixture.gateway_id,
-                &fixture.member_id,
-                fixture.red_workspace_id.as_str(),
-            )
-            .await
-            .unwrap()
+        let deletion = delete_workspace_membership(
+            &transaction,
+            &fixture.gateway_id,
+            &fixture.member_id,
+            fixture.red_workspace_id.as_str(),
+        )
+        .await
+        .unwrap();
+        assert!(deletion.changed);
+        assert_eq!(
+            deletion.removed_private_thread_ids,
+            vec![fixture.private_thread_id.clone()]
         );
         assert!(
             find_thread_membership(

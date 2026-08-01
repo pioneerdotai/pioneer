@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use pioneer_protocol::{
-    AUTH_DOMAIN_ID_LEN, AuthSessionId, DEVICE_ACTIVATION_ALPHABET, REFRESH_CREDENTIAL_BODY_LEN,
-    REFRESH_CREDENTIAL_PREFIX, TokenFamilyId, device_activation_locator,
-    encode_device_activation_entropy, normalize_device_activation_code,
+    AUTH_DOMAIN_ID_LEN, AuthSessionId, DEVICE_ACTIVATION_ALPHABET, InvitationCredential,
+    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, TokenFamilyId,
+    device_activation_locator, encode_device_activation_entropy, normalize_device_activation_code,
 };
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
@@ -18,6 +18,10 @@ const REFRESH_PAYLOAD_BYTES: usize =
     1 + AUTH_DOMAIN_ID_LEN + AUTH_DOMAIN_ID_LEN + 8 + 8 + REFRESH_NONCE_BYTES;
 const REFRESH_ENVELOPE_BYTES: usize = REFRESH_PAYLOAD_BYTES + REFRESH_MAC_BYTES;
 const REFRESH_MAC_DOMAIN: &[u8] = b"refresh_envelope_v2\0";
+const INVITATION_FINGERPRINT_DOMAIN: &[u8] = b"pioneer.invitation.v1\0";
+const INVITATION_CURSOR_DOMAIN: &[u8] = b"pioneer.invitation.cursor.v1\0";
+const MEMBER_CURSOR_DOMAIN: &[u8] = b"pioneer.member.cursor.v1\0";
+const INVITATION_ENTROPY_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpaqueCredentialKind {
@@ -119,6 +123,36 @@ impl OpaqueCredentialFactory {
             kind: OpaqueCredentialKind::DeviceActivation,
             value: encoded,
         }
+    }
+
+    pub(crate) fn generate_invitation(&self) -> InvitationCredential {
+        let mut entropy = [0_u8; INVITATION_ENTROPY_BYTES];
+        rand::fill(&mut entropy);
+        let credential = self.invitation_from_entropy_inner(&entropy);
+        entropy.zeroize();
+        credential
+    }
+
+    fn invitation_from_entropy_inner(
+        &self,
+        entropy: &[u8; INVITATION_ENTROPY_BYTES],
+    ) -> InvitationCredential {
+        let body = Zeroizing::new(URL_SAFE_NO_PAD.encode(entropy));
+        let raw = Zeroizing::new(format!(
+            "{}{}",
+            pioneer_protocol::INVITATION_CREDENTIAL_PREFIX,
+            body.as_str()
+        ));
+        InvitationCredential::parse(raw.as_str().to_owned())
+            .expect("32-byte entropy always produces a canonical invitation credential")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invitation_from_entropy(
+        &self,
+        entropy: &[u8; INVITATION_ENTROPY_BYTES],
+    ) -> InvitationCredential {
+        self.invitation_from_entropy_inner(entropy)
     }
 
     pub(crate) fn generate_device_activation_for_locator(
@@ -263,6 +297,37 @@ impl OpaqueCredentialFactory {
 
     pub(crate) fn fingerprint_refresh_raw(&self, token: &str) -> [u8; 32] {
         fingerprint(self.hmac_key.as_slice(), b"refresh\0", token.as_bytes())
+    }
+
+    pub(crate) fn fingerprint_invitation(&self, credential: &InvitationCredential) -> [u8; 32] {
+        fingerprint(
+            self.hmac_key.as_slice(),
+            INVITATION_FINGERPRINT_DOMAIN,
+            credential.expose_secret().as_bytes(),
+        )
+    }
+
+    /// Produces the same non-reversible lookup fingerprint without retaining
+    /// or parsing attacker-controlled invitation text. Used only as a bounded
+    /// in-memory abuse-control key.
+    pub(crate) fn fingerprint_invitation_raw(&self, credential: &str) -> [u8; 32] {
+        fingerprint(
+            self.hmac_key.as_slice(),
+            INVITATION_FINGERPRINT_DOMAIN,
+            credential.as_bytes(),
+        )
+    }
+
+    pub(crate) fn fingerprint_invitation_cursor(&self, payload: &[u8]) -> [u8; 32] {
+        fingerprint(self.hmac_key.as_slice(), INVITATION_CURSOR_DOMAIN, payload)
+    }
+
+    pub(crate) fn fingerprint_member_cursor(&self, payload: &[u8]) -> [u8; 32] {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.hmac_key).expect("HMAC accepts arbitrary key lengths");
+        mac.update(MEMBER_CURSOR_DOMAIN);
+        mac.update(payload);
+        mac.finalize().into_bytes().into()
     }
 
     pub(crate) fn fingerprint_device_activation_raw(&self, code: &str) -> [u8; 32] {
@@ -444,5 +509,39 @@ mod tests {
                 .verify_refresh_raw(&format!("prf_{}", "r".repeat(43)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invitation_credential_is_exact_hmac_derived_and_zeroizing() {
+        let mut factory = OpaqueCredentialFactory::new(&[7; 64]).unwrap();
+        let credential = factory.invitation_from_entropy(&[1; INVITATION_ENTROPY_BYTES]);
+        let repeated = factory.invitation_from_entropy(&[1; INVITATION_ENTROPY_BYTES]);
+        let other = factory.invitation_from_entropy(&[2; INVITATION_ENTROPY_BYTES]);
+        assert!(
+            credential
+                .expose_secret()
+                .starts_with(pioneer_protocol::INVITATION_CREDENTIAL_PREFIX)
+        );
+        assert_eq!(
+            credential.expose_secret().len(),
+            pioneer_protocol::INVITATION_CREDENTIAL_PREFIX.len()
+                + pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN
+        );
+        assert_eq!(
+            factory.fingerprint_invitation(&credential),
+            factory.fingerprint_invitation(&repeated)
+        );
+        assert_eq!(
+            factory.fingerprint_invitation(&credential),
+            factory.fingerprint_invitation_raw(credential.expose_secret())
+        );
+        assert_ne!(
+            factory.fingerprint_invitation(&credential),
+            factory.fingerprint_invitation(&other)
+        );
+        assert!(!format!("{credential:?}").contains(credential.expose_secret()));
+        assert!(std::mem::needs_drop::<InvitationCredential>());
+        factory.hmac_key.zeroize();
+        assert!(factory.hmac_key.iter().all(|byte| *byte == 0));
     }
 }

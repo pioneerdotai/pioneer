@@ -2,18 +2,27 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{
-    auth_refresh_credential, auth_session, device, gateway_identity, gateway_principal,
+    audit_event, auth_refresh_credential, auth_session, device, gateway_identity,
+    gateway_principal, invitation, invitation_workspace_grant,
 };
 use pioneer_protocol::{
-    AuthSessionId, AuthSessionRevokeReason, AuthSessionStatus, ClientInstallationDescriptor,
-    ClientKind, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
-    PrincipalId, RefreshCredentialId, RoleKey, TokenFamilyId,
+    AUDIT_METADATA_VERSION_V1, AuthSessionId, AuthSessionRevokeReason, AuthSessionStatus,
+    BoundedServerGeneratedMetadata, ClientInstallationDescriptor, ClientKind,
+    DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
+    INVITATION_MAX_WORKSPACE_GRANTS, INVITATION_MIN_WORKSPACE_GRANTS, INVITATION_TTL_SECONDS,
+    InvitationId, PrincipalId, RefreshCredentialId, RoleKey, TokenFamilyId, WorkspaceId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, Statement, sea_query::Expr,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalCredentialRevocation {
+    pub session_ids: Vec<AuthSessionId>,
+    pub device_ids: Vec<DeviceId>,
+}
 
 #[derive(Clone)]
 pub struct NewPendingDeviceSessionRow {
@@ -38,6 +47,20 @@ pub struct NewRefreshCredentialRow {
     pub token_hash: [u8; 32],
     pub issued_at: DateTimeWithTimeZone,
     pub expires_at: DateTimeWithTimeZone,
+}
+
+#[derive(Clone)]
+pub struct NewActiveDeviceSessionRow {
+    pub device_id: DeviceId,
+    pub session_id: AuthSessionId,
+    pub gateway_id: GatewayId,
+    pub principal_id: PrincipalId,
+    pub token_family_id: TokenFamilyId,
+    pub installation: ClientInstallationDescriptor,
+    pub activation_token_hash: [u8; 32],
+    pub activation_locator_hash: [u8; 32],
+    pub refresh_expires_at: DateTimeWithTimeZone,
+    pub now: DateTimeWithTimeZone,
 }
 
 #[derive(Clone)]
@@ -102,6 +125,24 @@ impl std::fmt::Debug for NewRefreshCredentialRow {
             .field("token_hash", &"[redacted]")
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewActiveDeviceSessionRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewActiveDeviceSessionRow")
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("gateway_id", &self.gateway_id)
+            .field("principal_id", &self.principal_id)
+            .field("token_family_id", &self.token_family_id)
+            .field("installation", &self.installation)
+            .field("activation_token_hash", &"[redacted]")
+            .field("activation_locator_hash", &"[redacted]")
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("now", &self.now)
             .finish()
     }
 }
@@ -203,6 +244,58 @@ pub async fn insert_pending_device_session<C: ConnectionTrait>(
     .insert(db)
     .await
     .context("failed to insert pending auth session")?;
+    Ok((device, session))
+}
+
+pub async fn insert_active_device_session<C: ConnectionTrait>(
+    db: &C,
+    row: NewActiveDeviceSessionRow,
+) -> Result<(device::Model, auth_session::Model)> {
+    let device = device::ActiveModel {
+        id: Set(row.device_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        installation_id: Set(Some(row.installation.installation_id.clone())),
+        display_name: Set(Some(row.installation.display_name.clone())),
+        client_kind: Set(Some(
+            client_kind_to_db(row.installation.client_kind).to_owned(),
+        )),
+        platform: Set(row.installation.platform.clone()),
+        client_version: Set(row.installation.client_version.clone()),
+        status: Set(device_status_to_db(DeviceStatus::Active).to_owned()),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(Some(row.now)),
+        revoked_at: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert active device")?;
+    let session = auth_session::ActiveModel {
+        id: Set(row.session_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        device_id: Set(row.device_id.to_string()),
+        token_family_id: Set(row.token_family_id.to_string()),
+        created_by_session_id: Set(None),
+        activation_token_hash: Set(row.activation_token_hash.to_vec()),
+        activation_locator_hash: Set(row.activation_locator_hash.to_vec()),
+        activation_failed_attempts: Set(0),
+        activation_expires_at: Set(row.now),
+        activated_at: Set(Some(row.now)),
+        status: Set(auth_session_status_to_db(AuthSessionStatus::Active).to_owned()),
+        refresh_generation: Set(0),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(Some(row.now)),
+        last_refreshed_at: Set(Some(row.now)),
+        refresh_expires_at: Set(Some(row.refresh_expires_at)),
+        revoked_at: Set(None),
+        revoke_reason: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert active auth session")?;
     Ok((device, session))
 }
 
@@ -570,6 +663,52 @@ pub async fn list_sessions_for_principal<C: ConnectionTrait>(
         .context("failed to list auth sessions")
 }
 
+pub async fn revoke_principal_credentials<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    reason: AuthSessionRevokeReason,
+    now: DateTimeWithTimeZone,
+) -> Result<PrincipalCredentialRevocation> {
+    let sessions = auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(auth_session::Column::Status.is_in(["pending", "active"]))
+        .order_by_asc(auth_session::Column::Id)
+        .all(db)
+        .await
+        .context("failed to load principal sessions for revocation")?;
+    let mut session_ids = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let session_id = AuthSessionId::new(session.id.clone())
+            .context("persisted principal auth session id is invalid")?;
+        mark_session_revoked(db, session, reason, now).await?;
+        delete_refresh_for_session(db, &session_id).await?;
+        session_ids.push(session_id);
+    }
+
+    let devices = device::Entity::find()
+        .filter(device::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(device::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(device::Column::Status.is_in(["pending", "active"]))
+        .order_by_asc(device::Column::Id)
+        .all(db)
+        .await
+        .context("failed to load principal devices for revocation")?;
+    let mut device_ids = Vec::with_capacity(devices.len());
+    for device in devices {
+        let device_id =
+            DeviceId::new(device.id).context("persisted principal device id is invalid")?;
+        if mark_device_revoked(db, &device_id, now).await? {
+            device_ids.push(device_id);
+        }
+    }
+    Ok(PrincipalCredentialRevocation {
+        session_ids,
+        device_ids,
+    })
+}
+
 pub async fn mark_session_revoked<C: ConnectionTrait>(
     db: &C,
     session: auth_session::Model,
@@ -825,6 +964,12 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
     let devices = device::Entity::find().all(db).await?;
     let sessions = auth_session::Entity::find().all(db).await?;
     let refreshes = auth_refresh_credential::Entity::find().all(db).await?;
+    let invitations = invitation::Entity::find().all(db).await?;
+    let invitation_grants = invitation_workspace_grant::Entity::find().all(db).await?;
+    let recovery_audits = audit_event::Entity::find()
+        .filter(audit_event::Column::Action.eq("member_recovery_device_created"))
+        .all(db)
+        .await?;
 
     let gateway_ids = gateways
         .iter()
@@ -842,6 +987,190 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
         .iter()
         .map(|row| (row.id.as_str(), row))
         .collect::<HashMap<_, _>>();
+    let mut invitation_grant_counts = HashMap::<&str, usize>::new();
+    for grant in &invitation_grants {
+        if InvitationId::new(grant.invitation_id.clone()).is_err()
+            || WorkspaceId::new(grant.workspace_id.clone()).is_err()
+        {
+            violations.push(format!(
+                "invitation grant `{}/{}` has invalid domain IDs",
+                grant.invitation_id, grant.workspace_id
+            ));
+        }
+        *invitation_grant_counts
+            .entry(grant.invitation_id.as_str())
+            .or_default() += 1;
+    }
+
+    let mut accepted_invitation_sessions = HashMap::<String, usize>::new();
+    for row in &invitations {
+        let creator = principal_by_id.get(row.created_by_principal_id.as_str());
+        let creator_session = session_by_id.get(row.created_by_session_id.as_str());
+        let grant_count = invitation_grant_counts
+            .get(row.id.as_str())
+            .copied()
+            .unwrap_or_default();
+        let ttl_seconds = row
+            .expires_at
+            .signed_duration_since(row.created_at)
+            .num_seconds();
+        let valid_token_hash = row
+            .token_hash
+            .as_ref()
+            .is_none_or(|token_hash| token_hash.len() == 32);
+        let valid_state = match row.status.as_str() {
+            "pending" => {
+                row.token_hash.is_some()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            "accepted" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_some()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_some()
+                    && row.accepted_device_id.is_some()
+                    && row.accepted_session_id.is_some()
+                    && row.revoke_reason.is_none()
+            }
+            "revoked" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_some()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.as_deref().is_some_and(|reason| {
+                        matches!(
+                            reason,
+                            "inviter_revoked"
+                                | "inviter_unavailable"
+                                | "grant_authority_lost"
+                                | "workspace_unavailable"
+                        )
+                    })
+            }
+            "expired" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_some()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            _ => false,
+        };
+        if InvitationId::new(row.id.clone()).is_err()
+            || GatewayId::new(row.gateway_id.clone()).is_err()
+            || PrincipalId::new(row.created_by_principal_id.clone()).is_err()
+            || AuthSessionId::new(row.created_by_session_id.clone()).is_err()
+            || row.token_format_version != 1
+            || !valid_token_hash
+            || !valid_state
+            || u64::try_from(ttl_seconds).ok() != Some(INVITATION_TTL_SECONDS)
+            || !(INVITATION_MIN_WORKSPACE_GRANTS..=INVITATION_MAX_WORKSPACE_GRANTS)
+                .contains(&grant_count)
+        {
+            violations.push(format!(
+                "invitation `{}` violates its bounded domain contract",
+                row.id
+            ));
+        }
+        if !gateway_ids.contains(row.gateway_id.as_str())
+            || creator.is_none_or(|principal| principal.gateway_id != row.gateway_id)
+            || creator_session.is_none_or(|session| {
+                session.gateway_id != row.gateway_id
+                    || session.principal_id != row.created_by_principal_id
+            })
+        {
+            violations.push(format!(
+                "invitation `{}` has mismatched creator ownership",
+                row.id
+            ));
+        }
+
+        if row.status == "accepted" {
+            let accepted_principal = row
+                .accepted_principal_id
+                .as_deref()
+                .and_then(|id| principal_by_id.get(id));
+            let accepted_device = row
+                .accepted_device_id
+                .as_deref()
+                .and_then(|id| device_by_id.get(id));
+            let accepted_session = row
+                .accepted_session_id
+                .as_deref()
+                .and_then(|id| session_by_id.get(id));
+            let ownership_matches = accepted_principal.is_some_and(|principal| {
+                principal.gateway_id == row.gateway_id && principal.kind == "user"
+            }) && accepted_device.is_some_and(|device| {
+                Some(device.principal_id.as_str()) == row.accepted_principal_id.as_deref()
+                    && device.gateway_id == row.gateway_id
+            }) && accepted_session.is_some_and(|session| {
+                Some(session.principal_id.as_str()) == row.accepted_principal_id.as_deref()
+                    && Some(session.device_id.as_str()) == row.accepted_device_id.as_deref()
+                    && session.gateway_id == row.gateway_id
+                    && session.created_by_session_id.is_none()
+            });
+            if !ownership_matches {
+                violations.push(format!(
+                    "accepted invitation `{}` has mismatched session provenance",
+                    row.id
+                ));
+            } else if let Some(session_id) = row.accepted_session_id.as_ref() {
+                *accepted_invitation_sessions
+                    .entry(session_id.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let mut recovery_sessions = HashMap::<String, usize>::new();
+    for row in &recovery_audits {
+        let metadata =
+            serde_json::from_str::<BoundedServerGeneratedMetadata>(row.metadata_json.as_str());
+        let binding = metadata
+            .as_ref()
+            .ok()
+            .and_then(BoundedServerGeneratedMetadata::recovery_device_binding);
+        let valid = row.domain == "administration"
+            && row.metadata_version == i64::from(AUDIT_METADATA_VERSION_V1)
+            && row.target_kind == "device_session"
+            && binding.is_some_and(|(principal_id, device_id, session_id)| {
+                row.target_id == device_id.as_str()
+                    && device_by_id.get(device_id.as_str()).is_some_and(|device| {
+                        device.gateway_id == row.gateway_id
+                            && device.principal_id == principal_id.as_str()
+                            && device.id == row.target_id
+                            && session_by_id
+                                .get(session_id.as_str())
+                                .is_some_and(|session| {
+                                    session.gateway_id == row.gateway_id
+                                        && session.device_id == device.id
+                                        && session.principal_id == device.principal_id
+                                        && session.created_by_session_id.is_none()
+                                })
+                    })
+            });
+        if !valid {
+            violations.push(format!(
+                "recovery audit `{}` has invalid session provenance",
+                row.id
+            ));
+        } else if let Some((_, _, session_id)) = binding {
+            *recovery_sessions.entry(session_id.to_string()).or_default() += 1;
+        }
+    }
     let mut active_installations = HashSet::new();
 
     for row in &devices {
@@ -991,6 +1320,30 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
                 "principal `{}` has multiple pending local sessions",
                 row.principal_id
             ));
+        }
+        if row.created_by_session_id.is_none()
+            && owner.is_some_and(|owner| owner.kind == "user")
+            && matches!(row.status.as_str(), "pending" | "active")
+        {
+            let accepted_references = accepted_invitation_sessions
+                .get(row.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let recovery_references = recovery_sessions
+                .get(row.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let valid_provenance = match row.status.as_str() {
+                "pending" => accepted_references == 0 && recovery_references == 1,
+                "active" => accepted_references + recovery_references == 1,
+                _ => true,
+            };
+            if !valid_provenance {
+                violations.push(format!(
+                    "Member session `{}` has no exact invitation or recovery provenance",
+                    row.id
+                ));
+            }
         }
         if row.status == "pending"
             && !pending_activation_locator_hashes.insert((
@@ -1676,5 +2029,152 @@ mod tests {
                 report.violations
             );
         }
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_requires_exact_accepted_invitation_session_provenance_and_ttl() {
+        let db = valid_auth_fixture().await;
+        db.execute_unprepared(
+            "INSERT INTO gateway_principal(
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                created_at,updated_at,removed_at
+             ) VALUES(
+                'P00000000000000000002','G00000000000000000001','user','member','active',
+                'Member','member','member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+             );
+             INSERT INTO workspace(id,name,is_active,is_current)
+             VALUES('W00000000000000000001','Workspace',1,1)",
+        )
+        .await
+        .unwrap();
+        insert_active_session_fixture(
+            &db,
+            "D00000000000000000002",
+            "S00000000000000000002",
+            "F00000000000000000002",
+            "R00000000000000000002",
+            "member-mobile",
+            ClientKind::Mobile,
+            [2; 32],
+            [12; 32],
+        )
+        .await;
+        db.execute_unprepared(
+            "UPDATE device SET principal_id='P00000000000000000002'
+                 WHERE id='D00000000000000000002';
+             UPDATE auth_session SET principal_id='P00000000000000000002'
+                 WHERE id='S00000000000000000002'",
+        )
+        .await
+        .unwrap();
+
+        let missing = scan_auth_persistence_invariants(&db).await.unwrap();
+        assert!(missing.violations.iter().any(|violation| {
+            violation.contains("has no exact invitation or recovery provenance")
+        }));
+
+        db.execute_unprepared(
+            "INSERT INTO invitation(
+                id,gateway_id,created_by_principal_id,created_by_session_id,status,token_hash,
+                token_format_version,expires_at,accepted_at,revoked_at,expired_at,
+                accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,
+                created_at,updated_at
+             ) VALUES(
+                'I00000000000000000001','G00000000000000000001',
+                'P00000000000000000001','S00000000000000000001','accepted',NULL,1,
+                '2026-01-08 00:00:00 +00:00','2026-01-01 00:00:01 +00:00',NULL,NULL,
+                'P00000000000000000002','D00000000000000000002',
+                'S00000000000000000002',NULL,
+                '2026-01-01 00:00:00 +00:00','2026-01-01 00:00:01 +00:00'
+             );
+             INSERT INTO invitation_workspace_grant(invitation_id,workspace_id,created_at)
+             VALUES(
+                'I00000000000000000001','W00000000000000000001',
+                '2026-01-01 00:00:00 +00:00'
+             )",
+        )
+        .await
+        .unwrap();
+        assert!(
+            scan_auth_persistence_invariants(&db)
+                .await
+                .unwrap()
+                .is_valid()
+        );
+
+        db.execute_unprepared(
+            "UPDATE invitation SET expires_at='2026-01-09 00:00:00 +00:00'
+             WHERE id='I00000000000000000001'",
+        )
+        .await
+        .unwrap();
+        let invalid_ttl = scan_auth_persistence_invariants(&db).await.unwrap();
+        assert!(
+            invalid_ttl
+                .violations
+                .iter()
+                .any(|violation| { violation.contains("violates its bounded domain contract") })
+        );
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_requires_exact_recovery_audit_for_local_member_activation() {
+        let db = valid_auth_fixture().await;
+        db.execute_unprepared(
+            "INSERT INTO gateway_principal(
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                created_at,updated_at,removed_at
+             ) VALUES(
+                'P00000000000000000002','G00000000000000000001','user','member','active',
+                'Member','member','member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+             )",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        insert_pending_device_session(
+            &db,
+            NewPendingDeviceSessionRow {
+                device_id: DeviceId::new("D00000000000000000002").unwrap(),
+                session_id: AuthSessionId::new("S00000000000000000002").unwrap(),
+                gateway_id: gateway_id(),
+                principal_id: PrincipalId::new("P00000000000000000002").unwrap(),
+                token_family_id: TokenFamilyId::new("F00000000000000000002").unwrap(),
+                issuer: PendingSessionIssuer::LocalCli,
+                activation_token_hash: [2; 32],
+                activation_locator_hash: [22; 32],
+                activation_expires_at: now + chrono::Duration::minutes(10),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let missing = scan_auth_persistence_invariants(&db).await.unwrap();
+        assert!(missing.violations.iter().any(|violation| {
+            violation.contains("has no exact invitation or recovery provenance")
+        }));
+
+        db.execute_unprepared(
+            "INSERT INTO audit_event(
+                id,gateway_id,actor_principal_id,actor_session_id,action,domain,target_kind,
+                target_id,workspace_id,metadata_version,metadata_json,created_at
+             ) VALUES(
+                'A00000000000000000001','G00000000000000000001',
+                'P00000000000000000001','S00000000000000000001',
+                'member_recovery_device_created','administration','device_session',
+                'D00000000000000000002',NULL,1,
+                '{\"kind\":\"recovery_device\",\"principal_id\":\"P00000000000000000002\",\"device_id\":\"D00000000000000000002\",\"session_id\":\"S00000000000000000002\"}',
+                CURRENT_TIMESTAMP
+             )",
+        )
+        .await
+        .unwrap();
+        assert!(
+            scan_auth_persistence_invariants(&db)
+                .await
+                .unwrap()
+                .is_valid()
+        );
     }
 }

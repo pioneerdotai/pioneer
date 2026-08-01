@@ -7,6 +7,7 @@
 //! loops.
 
 use crate::{
+    administration::AdministrationEvent,
     cli_runtime::approvals::{
         PendingRequestsReduction, reduce_cli_runtime_request_opened_notification,
         reduce_cli_runtime_request_resolved_notification,
@@ -116,6 +117,7 @@ impl Default for ClientRuntimeNotificationContext<'_> {
 #[derive(Clone, Debug)]
 pub enum ClientRuntimeNotification {
     AccessChanged(AccessChangedNotification),
+    AdministrationChanged(AdministrationEvent),
     ThreadStarted(ThreadStartedReduction),
     TurnLifecycle(TurnLifecycleReduction),
     ConversationEvent(ConversationEventReduction),
@@ -353,6 +355,21 @@ pub fn reduce_gateway_notification(
     match notification {
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
+        }
+        GatewayNotification::InvitationChanged(notification) => {
+            Some(ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::InvitationChanged(notification),
+            ))
+        }
+        GatewayNotification::MemberChanged(notification) => {
+            Some(ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::MemberChanged(notification),
+            ))
+        }
+        GatewayNotification::WorkspaceMembersChanged(notification) => {
+            Some(ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::WorkspaceMembersChanged(notification),
+            ))
         }
         GatewayNotification::ThreadStarted(notification) => Some(
             ClientRuntimeNotification::ThreadStarted(reduce_thread_started_notification(
@@ -1025,6 +1042,64 @@ mod tests {
             panic!("expected access changed notification");
         };
         assert_eq!(actual, notification);
+    }
+
+    #[test]
+    fn runtime_routes_epic5_administration_events_to_shared_reducer() {
+        let invitation_id = pioneer_protocol::InvitationId::new("IAAAAAAAAAAAAAAAAAAAA")
+            .expect("valid invitation id");
+        let principal_id = pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA")
+            .expect("valid principal id");
+        let workspace_id = pioneer_protocol::WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA")
+            .expect("valid workspace id");
+        let notifications = vec![
+            GatewayNotification::InvitationChanged(
+                pioneer_protocol::InvitationChangedNotification {
+                    revision: 1,
+                    invitation_id: invitation_id.clone(),
+                },
+            ),
+            GatewayNotification::MemberChanged(pioneer_protocol::MemberChangedNotification {
+                revision: 2,
+                principal_id: principal_id.clone(),
+            }),
+            GatewayNotification::WorkspaceMembersChanged(
+                pioneer_protocol::WorkspaceMembersChangedNotification {
+                    revision: 3,
+                    workspace_id: workspace_id.clone(),
+                },
+            ),
+        ];
+
+        let reduced = notifications
+            .into_iter()
+            .map(|notification| {
+                reduce_gateway_notification(
+                    notification,
+                    ClientRuntimeNotificationContext::default(),
+                )
+                .expect("administration event")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            &reduced[0],
+            ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::InvitationChanged(notification)
+            ) if notification.invitation_id == invitation_id
+        ));
+        assert!(matches!(
+            &reduced[1],
+            ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::MemberChanged(notification)
+            ) if notification.principal_id == principal_id
+        ));
+        assert!(matches!(
+            &reduced[2],
+            ClientRuntimeNotification::AdministrationChanged(
+                AdministrationEvent::WorkspaceMembersChanged(notification)
+            ) if notification.workspace_id == workspace_id
+        ));
     }
 
     #[test]

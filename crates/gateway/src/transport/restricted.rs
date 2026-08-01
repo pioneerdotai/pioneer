@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
     INVALID_REQUEST_CODE, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest,
-    JsonRpcResponse, PARSE_ERROR_CODE, RequestId,
+    JsonRpcResponse, PARSE_ERROR_CODE, PROFILE_AVATAR_MAX_BASE64_LEN, RequestId,
 };
 use serde_json::{Value as JsonValue, json};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,8 +20,10 @@ use crate::auth::{AuthError, AuthErrorCode, RestrictedAdmission, RestrictedAuthC
 pub(crate) const AUTH_DEVICE_ACTIVATE: &str =
     pioneer_protocol::constants::methods::AUTH_DEVICE_ACTIVATE;
 pub(crate) const AUTH_REFRESH: &str = pioneer_protocol::constants::methods::AUTH_REFRESH;
+pub(crate) const INVITE_PREVIEW: &str = pioneer_protocol::constants::methods::INVITE_PREVIEW;
+pub(crate) const INVITE_ACCEPT: &str = pioneer_protocol::constants::methods::INVITE_ACCEPT;
 
-const MAX_RESTRICTED_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_RESTRICTED_REQUEST_BYTES: usize = PROFILE_AVATAR_MAX_BASE64_LEN + 16 * 1024;
 const MAX_RESTRICTED_RESPONSE_BYTES: usize = 256 * 1024;
 const AUTH_ERROR_JSONRPC_CODE: i64 = -32040;
 const CLOSE_AUTH_RESTRICTED_DONE: u16 = 4403;
@@ -132,6 +134,8 @@ fn log_exchange_started(method: &str) {
     let event = match method {
         AUTH_DEVICE_ACTIVATE => "auth_device_activation_started",
         AUTH_REFRESH => "auth_refresh_started",
+        INVITE_PREVIEW => "invitation_preview_started",
+        INVITE_ACCEPT => "invitation_accept_started",
         _ => return,
     };
     tracing::info!(event, outcome = "started");
@@ -141,6 +145,8 @@ fn log_exchange_completed(method: &str) {
     let event = match method {
         AUTH_DEVICE_ACTIVATE => "auth_device_activation_completed",
         AUTH_REFRESH => "auth_refresh_completed",
+        INVITE_PREVIEW => "invitation_preview_completed",
+        INVITE_ACCEPT => "invitation_accept_completed",
         _ => return,
     };
     tracing::info!(event, outcome = "completed");
@@ -150,6 +156,8 @@ fn log_exchange_failed(method: &str, code: AuthErrorCode) {
     let event = match method {
         AUTH_DEVICE_ACTIVATE => "auth_device_activation_failed",
         AUTH_REFRESH => "auth_refresh_failed",
+        INVITE_PREVIEW => "invitation_preview_failed",
+        INVITE_ACCEPT => "invitation_accept_failed",
         _ => return,
     };
     tracing::info!(event, outcome = "failed", reason = code.as_str(),);
@@ -256,11 +264,14 @@ fn authorize_method(
     context: &RestrictedAuthContext,
     method: &str,
 ) -> std::result::Result<(), AuthErrorCode> {
-    let expected = match context {
-        RestrictedAuthContext::DeviceActivation(_) => AUTH_DEVICE_ACTIVATE,
-        RestrictedAuthContext::Refresh(_) => AUTH_REFRESH,
+    let allowed = match context {
+        RestrictedAuthContext::DeviceActivation(_) => method == AUTH_DEVICE_ACTIVATE,
+        RestrictedAuthContext::Refresh(_) => method == AUTH_REFRESH,
+        RestrictedAuthContext::Invitation(_) => {
+            matches!(method, INVITE_PREVIEW | INVITE_ACCEPT)
+        }
     };
-    if method == expected {
+    if allowed {
         return Ok(());
     }
     Err(AuthErrorCode::MethodNotAllowed)
@@ -308,8 +319,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{DeviceActivationContext, PresentedCredential, RefreshExchangeContext};
-    use pioneer_protocol::GatewayId;
+    use crate::auth::{
+        DeviceActivationContext, InvitationExchangeContext, PresentedCredential,
+        RefreshExchangeContext,
+    };
+    use pioneer_protocol::{GatewayId, InvitationTransportSecurity};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::duplex;
     use tokio_tungstenite::tungstenite::protocol::Role;
@@ -351,15 +365,33 @@ mod tests {
     fn method_matrix_is_exact_and_rejects_wrong_methods() {
         let device_activation = device_activation_context();
         let refresh = RestrictedAuthContext::Refresh(RefreshExchangeContext);
+        let invitation = invitation_context();
 
         assert!(authorize_method(&device_activation, AUTH_DEVICE_ACTIVATE).is_ok());
         assert!(authorize_method(&refresh, AUTH_REFRESH).is_ok());
+        assert!(authorize_method(&invitation, INVITE_PREVIEW).is_ok());
+        assert!(authorize_method(&invitation, INVITE_ACCEPT).is_ok());
         assert_eq!(
             authorize_method(&device_activation, "workspace/list"),
             Err(AuthErrorCode::MethodNotAllowed)
         );
         assert_eq!(
             authorize_method(&refresh, AUTH_DEVICE_ACTIVATE),
+            Err(AuthErrorCode::MethodNotAllowed)
+        );
+        for denied in [
+            AUTH_REFRESH,
+            AUTH_DEVICE_ACTIVATE,
+            "workspace/list",
+            "subscription/start",
+        ] {
+            assert_eq!(
+                authorize_method(&invitation, denied),
+                Err(AuthErrorCode::MethodNotAllowed)
+            );
+        }
+        assert_eq!(
+            authorize_method(&refresh, INVITE_PREVIEW),
             Err(AuthErrorCode::MethodNotAllowed)
         );
     }
@@ -426,6 +458,43 @@ mod tests {
             Message::Close(_)
         ));
         task.await.unwrap().unwrap();
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invitation_wrong_method_never_reaches_executor() {
+        let executor = Arc::new(RecordingExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let (server_io, client_io) = duplex(16 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let task_executor = executor.clone();
+        let task = tokio::spawn(async move {
+            run(
+                server_ws,
+                invitation_admission(),
+                Duration::from_secs(1),
+                task_executor,
+            )
+            .await
+        });
+        client_ws
+            .send(Message::Text(request("workspace/list").into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client_ws.next().await.unwrap().unwrap(),
+            Message::Text(_)
+        ));
+        assert!(matches!(
+            client_ws.next().await.unwrap().unwrap(),
+            Message::Close(_)
+        ));
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            RestrictedExchangeOutcome::Failed
+        );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -514,6 +583,25 @@ mod tests {
     fn device_activation_context() -> RestrictedAuthContext {
         RestrictedAuthContext::DeviceActivation(DeviceActivationContext {
             gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+        })
+    }
+
+    fn invitation_admission() -> RestrictedAdmission {
+        let credential = format!(
+            "{}{}",
+            pioneer_protocol::INVITATION_CREDENTIAL_PREFIX,
+            "A".repeat(pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN)
+        );
+        RestrictedAdmission::new(
+            PresentedCredential::classify(&credential).unwrap(),
+            invitation_context(),
+        )
+    }
+
+    fn invitation_context() -> RestrictedAuthContext {
+        RestrictedAuthContext::Invitation(InvitationExchangeContext {
+            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+            transport: InvitationTransportSecurity::InsecureWs,
         })
     }
 }

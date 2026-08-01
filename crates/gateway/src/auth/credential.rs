@@ -3,7 +3,8 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use pioneer_protocol::{
-    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, normalize_device_activation_code,
+    INVITATION_CREDENTIAL_PREFIX, InvitationCredential, REFRESH_CREDENTIAL_BODY_LEN,
+    REFRESH_CREDENTIAL_PREFIX, normalize_device_activation_code,
 };
 
 use super::{AuthError, AuthErrorCode};
@@ -14,8 +15,8 @@ const MAX_PRESENTED_CREDENTIAL_BYTES: usize = 8 * 1024;
 struct RedactedCredential(Zeroizing<String>);
 
 impl RedactedCredential {
-    fn new(value: &str) -> Self {
-        Self(Zeroizing::new(value.to_owned()))
+    fn new(value: Zeroizing<String>) -> Self {
+        Self(value)
     }
 
     fn expose(&self) -> &str {
@@ -34,6 +35,7 @@ pub(crate) enum PresentedCredentialKind {
     AccessV2,
     Refresh,
     DeviceActivation,
+    Invitation,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -47,17 +49,30 @@ impl PresentedCredential {
         if raw.is_empty() || raw.len() > MAX_PRESENTED_CREDENTIAL_BYTES {
             return Err(AuthError::new(AuthErrorCode::MalformedCredential));
         }
-        let (kind, canonical) = if let Some(body) = raw.strip_prefix(REFRESH_CREDENTIAL_PREFIX) {
+        let (kind, canonical) = if raw.starts_with(INVITATION_CREDENTIAL_PREFIX) {
+            let credential = InvitationCredential::parse(raw.to_owned())
+                .map_err(|_| AuthError::new(AuthErrorCode::InvitationUnavailable))?;
+            (
+                PresentedCredentialKind::Invitation,
+                Zeroizing::new(credential.expose_secret().to_owned()),
+            )
+        } else if let Some(body) = raw.strip_prefix(REFRESH_CREDENTIAL_PREFIX) {
             validate_refresh_body(body)?;
-            (PresentedCredentialKind::Refresh, raw.to_owned())
+            (
+                PresentedCredentialKind::Refresh,
+                Zeroizing::new(raw.to_owned()),
+            )
         } else if let Ok(canonical) = normalize_device_activation_code(raw) {
-            (PresentedCredentialKind::DeviceActivation, canonical)
+            (
+                PresentedCredentialKind::DeviceActivation,
+                Zeroizing::new(canonical),
+            )
         } else {
-            (classify_jwt(raw)?, raw.to_owned())
+            (classify_jwt(raw)?, Zeroizing::new(raw.to_owned()))
         };
         Ok(Self {
             kind,
-            secret: RedactedCredential::new(canonical.as_str()),
+            secret: RedactedCredential::new(canonical),
         })
     }
 
@@ -158,6 +173,14 @@ mod tests {
                 PresentedCredentialKind::DeviceActivation,
                 Some("K7M4P9Q2"),
             ),
+            (
+                format!(
+                    "{INVITATION_CREDENTIAL_PREFIX}{}",
+                    "A".repeat(pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN)
+                ),
+                PresentedCredentialKind::Invitation,
+                None,
+            ),
         ];
         for (raw, expected, canonical) in cases {
             let credential = PresentedCredential::classify(&raw).expect("credential class");
@@ -190,6 +213,12 @@ mod tests {
                 AuthErrorCode::MalformedCredential
             );
         }
+        assert_eq!(
+            PresentedCredential::classify("pinv1_invalid")
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::InvitationUnavailable
+        );
         for old_or_invalid_activation in [
             format!(
                 "device_G00000000000000000001_{}",

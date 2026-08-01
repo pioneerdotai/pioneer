@@ -44,6 +44,8 @@ pub struct Model {
         on_delete = "Restrict"
     )]
     pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    #[sea_orm(has_many)]
+    pub invitations: HasMany<super::invitation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

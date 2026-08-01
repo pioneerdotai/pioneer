@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationCreateResponse",
+  "type": "object",
+  "properties": {
+    "invitation": {
+      "$ref": "#/$defs/InvitationSummary"
+    },
+    "presentation": {
+      "$ref": "#/$defs/InvitationPresentation"
+    }
+  },
+  "required": [
+    "invitation",
+    "presentation"
+  ],
+  "$defs": {
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationInviterSummary": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "InvitationPresentation": {
+      "type": "object",
+      "properties": {
+        "deep_link": {
+          "type": "string"
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "protected_endpoint": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protected_endpoint",
+        "gateway_id",
+        "token",
+        "deep_link"
+      ]
+    },
+    "InvitationRevokeReason": {
+      "type": "string",
+      "enum": [
+        "inviter_revoked",
+        "inviter_unavailable",
+        "grant_authority_lost",
+        "workspace_unavailable"
+      ]
+    },
+    "InvitationStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "revoked",
+        "expired"
+      ]
+    },
+    "InvitationSummary": {
+      "type": "object",
+      "properties": {
+        "created_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "inviter": {
+          "$ref": "#/$defs/InvitationInviterSummary"
+        },
+        "revoke_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvitationRevokeReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/InvitationStatus"
+        },
+        "terminal_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InvitationWorkspaceSummary"
+          }
+        }
+      },
+      "required": [
+        "invitation_id",
+        "status",
+        "inviter",
+        "workspaces",
+        "created_at_unix",
+        "expires_at_unix"
+      ]
+    },
+    "InvitationWorkspaceSummary": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "name"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

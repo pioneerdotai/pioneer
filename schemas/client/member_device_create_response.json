@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemberDeviceCreateResponse",
+  "type": "object",
+  "properties": {
+    "activation": {
+      "$ref": "#/$defs/AuthDeviceCreateResponse"
+    },
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    }
+  },
+  "required": [
+    "principal_id",
+    "activation"
+  ],
+  "$defs": {
+    "AuthDeviceCreateResponse": {
+      "type": "object",
+      "properties": {
+        "activation_code": {
+          "type": "string"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        }
+      },
+      "required": [
+        "device_id",
+        "session_id",
+        "activation_code",
+        "expires_at_unix",
+        "gateway_id"
+      ]
+    },
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

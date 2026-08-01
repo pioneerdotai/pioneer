@@ -66,6 +66,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod administration;
 pub mod agents_doc;
 pub mod artifacts;
 pub mod authorization;

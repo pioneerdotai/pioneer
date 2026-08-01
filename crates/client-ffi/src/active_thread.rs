@@ -1163,6 +1163,9 @@ impl ClientFfiActiveThreadState {
                     ..Default::default()
                 });
             }
+            ClientRuntimeNotification::AdministrationChanged(_) => {
+                SemanticTimelineCachePatch::default()
+            }
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 let mut inner = self
                     .inner

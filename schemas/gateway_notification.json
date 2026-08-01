@@ -55,6 +55,54 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "invitation_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/InvitationChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "member_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/MemberChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "workspace_members_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/WorkspaceMembersChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "workspace_changed"
         },
         "params": {
@@ -2837,6 +2885,29 @@
         "settings"
       ]
     },
+    "InvitationChangedNotification": {
+      "type": "object",
+      "properties": {
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "revision",
+        "invitation_id"
+      ]
+    },
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "ItemCompletedNotification": {
       "type": "object",
       "properties": {
@@ -4053,6 +4124,23 @@
       "type": "string",
       "enum": [
         "config"
+      ]
+    },
+    "MemberChangedNotification": {
+      "type": "object",
+      "properties": {
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "revision",
+        "principal_id"
       ]
     },
     "MemoryActor": {
@@ -12673,6 +12761,29 @@
       "required": [
         "kind",
         "workspace"
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "WorkspaceMembersChangedNotification": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "revision",
+        "workspace_id"
       ]
     }
   }

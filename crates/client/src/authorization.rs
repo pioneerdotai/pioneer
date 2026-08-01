@@ -137,6 +137,7 @@ pub fn apply_access_changed_to_client_state(
         return plan;
     }
 
+    state.administration.apply_access_changed(notification);
     state.gateway.authorization_revision = Some(plan.authorization_revision);
     if plan.change == AccessChangeKind::WorkspaceMembership {
         state
@@ -259,6 +260,7 @@ pub fn apply_access_changed_to_client_state(
 
 pub fn clear_authorization_revision_for_endpoint_change(state: &mut ClientState) {
     state.gateway.authorization_revision = None;
+    state.administration.clear_for_session_termination();
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@ use pioneer_crud::{
     resolve_thread_authorization_scope, resolve_turn_authorization_scope,
     resolve_workspace_authorization_scope,
 };
-use pioneer_protocol::{AuthSessionId, PrincipalId, PrincipalKind};
+use pioneer_protocol::{
+    AuthSessionId, InvitationId, PrincipalId, PrincipalKind, PrincipalStatus, WorkspaceId,
+};
+use sea_orm::ConnectionTrait;
 
 use crate::auth::AuthenticatedSessionPrincipal;
 
@@ -47,6 +50,213 @@ impl AuthorizationResolver {
             ResolvedResourceAccess::WorkspaceCollection,
         )
         .map(AuthorizedWorkspaceCollection)
+    }
+
+    pub(crate) async fn authorize_invitation_grants<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<ProofResolution<AuthorizedInvitationGrants>> {
+        let action = ResourceAction::InvitationCreate;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        if !persisted_actor_is_current(db, principal).await? {
+            return Ok(ProofResolution::Denied(inactive_principal()));
+        }
+        let mut canonical_workspace_ids = workspace_ids.to_vec();
+        canonical_workspace_ids.sort();
+        canonical_workspace_ids.dedup();
+        let mut resources = Vec::with_capacity(canonical_workspace_ids.len());
+        for workspace_id in &canonical_workspace_ids {
+            let authorized = match action_gate {
+                ActionGateDecision::AllowSuperuser => {
+                    pioneer_crud::resolve_workspace_authorization_scope(db, workspace_id.as_str())
+                        .await?
+                        .is_some_and(|scope| scope.is_active)
+                }
+                ActionGateDecision::RequireResource { .. } => {
+                    pioneer_crud::find_active_workspace_for_principal(
+                        db,
+                        &principal.principal_id,
+                        workspace_id.as_str(),
+                    )
+                    .await?
+                    .is_some()
+                }
+                ActionGateDecision::Deny { .. } => false,
+            };
+            if !authorized {
+                return Ok(ProofResolution::Denied(missing_resource()));
+            }
+            let Some(resource_id) = resource_id(WorkspaceResourceId::new(workspace_id.to_string()))
+            else {
+                return Ok(ProofResolution::Denied(missing_resource()));
+            };
+            resources.push(resource_id);
+        }
+        if resources.is_empty() {
+            return Ok(ProofResolution::Denied(AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            }));
+        }
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::InvitationGrantSet(resources),
+                ResolvedResourceAccess::InvitationGrantSet {
+                    all_active_and_authorized: true,
+                },
+            )
+            .map(AuthorizedInvitationGrants))
+    }
+
+    pub(crate) fn authorize_invitation_collection(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+    ) -> ProofResolution<AuthorizedInvitationCollection> {
+        self.finish(
+            principal,
+            action_gate,
+            ResourceAction::InvitationList,
+            AuthorizationResource::InvitationCollection(principal.gateway_id.clone()),
+            ResolvedResourceAccess::InvitationCollection,
+        )
+        .map(AuthorizedInvitationCollection)
+    }
+
+    pub(crate) fn authorize_member_directory(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+    ) -> ProofResolution<AuthorizedMemberDirectory> {
+        self.finish(
+            principal,
+            action_gate,
+            ResourceAction::MemberDirectoryList,
+            AuthorizationResource::MemberDirectory(principal.gateway_id.clone()),
+            ResolvedResourceAccess::MemberDirectory,
+        )
+        .map(AuthorizedMemberDirectory)
+    }
+
+    pub(crate) async fn authorize_member_avatar<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        target_principal_id: &PrincipalId,
+    ) -> Result<ProofResolution<AuthorizedMemberAvatar>> {
+        let action = ResourceAction::MemberAvatarRead;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        let Some(target) = pioneer_crud::load_principal_by_id(db, target_principal_id).await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        if target.gateway_id != principal.gateway_id {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let visible = match action_gate {
+            ActionGateDecision::AllowSuperuser => true,
+            ActionGateDecision::RequireResource { .. } => {
+                target.id == principal.principal_id
+                    || (target.kind == PrincipalKind::Superuser
+                        && target.status == pioneer_protocol::PrincipalStatus::Active)
+                    || pioneer_crud::find_shared_workspace_principal_for_principal(
+                        db,
+                        &principal.gateway_id,
+                        &principal.principal_id,
+                        target_principal_id,
+                    )
+                    .await?
+                    .is_some()
+            }
+            ActionGateDecision::Deny { .. } => false,
+        };
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::DirectoryPrincipal(target_principal_id.clone()),
+                ResolvedResourceAccess::DirectoryPrincipal { visible },
+            )
+            .map(AuthorizedMemberAvatar))
+    }
+
+    pub(crate) async fn authorize_member_principal<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        target_principal_id: &PrincipalId,
+    ) -> Result<ProofResolution<AuthorizedMemberPrincipal>> {
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        let Some(target) = pioneer_crud::load_principal_by_id(db, target_principal_id).await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        if target.gateway_id != principal.gateway_id {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        // Resolution proves only that the requested administrative resource
+        // belongs to this Gateway. Transaction-local lifecycle eligibility
+        // (ordinary Member role and current status) is deliberately owned by
+        // MemberService/AuthService so existing but invalid targets receive
+        // the stable `invalid_target` management error instead of being
+        // collapsed into an anti-IDOR miss before the transaction.
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::MemberPrincipal(target_principal_id.clone()),
+                ResolvedResourceAccess::MemberPrincipal,
+            )
+            .map(AuthorizedMemberPrincipal))
+    }
+
+    pub(crate) async fn authorize_invitation<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        invitation_id: &InvitationId,
+    ) -> Result<ProofResolution<AuthorizedInvitation>> {
+        let action = ResourceAction::InvitationRevoke;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        if !persisted_actor_is_current(db, principal).await? {
+            return Ok(ProofResolution::Denied(inactive_principal()));
+        }
+        let Some(invitation) = pioneer_crud::load_invitation(db, invitation_id).await? else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        if invitation.gateway_id != principal.gateway_id.as_str() {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let actor_created = invitation.created_by_principal_id == principal.principal_id.as_str();
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::Invitation(invitation_id.clone()),
+                ResolvedResourceAccess::Invitation { actor_created },
+            )
+            .map(AuthorizedInvitation))
     }
 
     pub(crate) async fn authorize_workspace(
@@ -591,6 +801,38 @@ impl AuthorizationResolver {
     }
 }
 
+pub(crate) async fn persisted_actor_is_current<C: ConnectionTrait>(
+    db: &C,
+    principal: &AuthenticatedSessionPrincipal,
+) -> Result<bool> {
+    let Some(persisted_actor) =
+        pioneer_crud::load_principal_by_id(db, &principal.principal_id).await?
+    else {
+        return Ok(false);
+    };
+    let Some(session) = pioneer_crud::load_session(db, &principal.session_id).await? else {
+        return Ok(false);
+    };
+    let Some(device) = pioneer_crud::load_device(db, &principal.device_id).await? else {
+        return Ok(false);
+    };
+    Ok(persisted_actor.gateway_id == principal.gateway_id
+        && persisted_actor.kind == principal.kind
+        && persisted_actor.status == PrincipalStatus::Active
+        && persisted_actor.role_key.as_deref()
+            == principal
+                .role_key
+                .as_ref()
+                .map(pioneer_protocol::RoleKey::as_str)
+        && session.gateway_id == principal.gateway_id.as_str()
+        && session.principal_id == principal.principal_id.as_str()
+        && session.device_id == principal.device_id.as_str()
+        && session.status == "active"
+        && device.gateway_id == principal.gateway_id.as_str()
+        && device.principal_id == principal.principal_id.as_str()
+        && device.status == "active")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct AuthorizationProofCore {
     principal_id: PrincipalId,
@@ -673,12 +915,86 @@ authorized_proof!(AuthorizedArtifact, action, resource, decision);
 authorized_proof!(AuthorizedTask, action, resource, decision);
 authorized_proof!(AuthorizedSession, principal_id, action, resource, decision,);
 authorized_proof!(AuthorizedCapability);
+authorized_proof!(
+    AuthorizedInvitationGrants,
+    principal_id,
+    action,
+    resource,
+    decision,
+);
+authorized_proof!(
+    AuthorizedInvitationCollection,
+    principal_id,
+    action,
+    decision,
+);
+authorized_proof!(
+    AuthorizedInvitation,
+    principal_id,
+    action,
+    resource,
+    decision,
+);
+authorized_proof!(AuthorizedMemberDirectory, principal_id, action, decision,);
+authorized_proof!(
+    AuthorizedMemberAvatar,
+    principal_id,
+    action,
+    resource,
+    decision,
+);
+authorized_proof!(
+    AuthorizedMemberPrincipal,
+    principal_id,
+    action,
+    resource,
+    decision,
+);
 
 impl AuthorizedWorkspace {
     pub(crate) fn workspace_id(&self) -> &str {
         match self.resource() {
             AuthorizationResource::Workspace(workspace_id) => workspace_id.as_str(),
             _ => unreachable!("AuthorizedWorkspace always contains a workspace resource"),
+        }
+    }
+}
+
+impl AuthorizedInvitationGrants {
+    pub(crate) fn workspace_ids(&self) -> Vec<&str> {
+        match self.resource() {
+            AuthorizationResource::InvitationGrantSet(workspace_ids) => workspace_ids
+                .iter()
+                .map(|workspace_id| workspace_id.as_str())
+                .collect(),
+            _ => unreachable!("AuthorizedInvitationGrants always contains an invitation grant set"),
+        }
+    }
+}
+
+impl AuthorizedInvitation {
+    pub(crate) fn invitation_id(&self) -> &InvitationId {
+        match self.resource() {
+            AuthorizationResource::Invitation(invitation_id) => invitation_id,
+            _ => unreachable!("AuthorizedInvitation always contains an invitation resource"),
+        }
+    }
+}
+
+impl AuthorizedMemberAvatar {
+    pub(crate) fn target_principal_id(&self) -> &PrincipalId {
+        match self.resource() {
+            AuthorizationResource::DirectoryPrincipal(principal_id) => principal_id,
+            _ => unreachable!("AuthorizedMemberAvatar always contains a principal resource"),
+        }
+    }
+}
+
+impl AuthorizedMemberPrincipal {
+    pub(crate) fn target_principal_id(&self) -> &PrincipalId {
+        match self.resource() {
+            AuthorizationResource::MemberPrincipal(principal_id) => principal_id,
+            _ => unreachable!("AuthorizedMemberPrincipal always contains a principal resource"),
         }
     }
 }
@@ -827,6 +1143,13 @@ const fn missing_resource() -> AuthorizationDecision {
     AuthorizationDecision::Deny {
         reason: DenyReason::MissingAuthoritativeResource,
         disclosure: DisclosurePolicy::NotFound,
+    }
+}
+
+const fn inactive_principal() -> AuthorizationDecision {
+    AuthorizationDecision::Deny {
+        reason: DenyReason::InactivePrincipal,
+        disclosure: DisclosurePolicy::AuthenticationTerminal,
     }
 }
 
@@ -1023,6 +1346,45 @@ mod tests {
                 .into_authorized()
                 .is_some(),
             "Superuser must not require membership rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn invitation_grants_reauthorize_the_actor_inside_the_transaction() {
+        let (harness, resolver) = resolver_fixture().await;
+        let service = AuthorizationService::new();
+        let member = principal(MEMBER_A_ID, PrincipalKind::User);
+        let gate = service.authorize_action(
+            member.kind,
+            member.role_key.as_ref(),
+            ResourceAction::InvitationCreate,
+        );
+
+        harness
+            .database
+            .execute_unprepared(
+                "UPDATE gateway_principal SET status='suspended' \
+                 WHERE id='P0000000000000000000A'",
+            )
+            .await
+            .expect("suspend invitation actor");
+
+        assert_eq!(
+            resolver
+                .authorize_invitation_grants(
+                    &harness.database,
+                    &member,
+                    &gate,
+                    &[WorkspaceId::new(WORKSPACE_ID).expect("workspace")],
+                )
+                .await
+                .expect("resolve invitation grants")
+                .denial(),
+            Some(&AuthorizationDecision::Deny {
+                reason: DenyReason::InactivePrincipal,
+                disclosure: DisclosurePolicy::AuthenticationTerminal,
+            }),
+            "the request principal snapshot must not authorize an actor that became inactive"
         );
     }
 

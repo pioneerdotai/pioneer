@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationPreviewResponse",
+  "type": "object",
+  "properties": {
+    "expires_at_unix": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "gateway_display_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gateway_id": {
+      "$ref": "#/$defs/GatewayId"
+    },
+    "inviter": {
+      "$ref": "#/$defs/InvitationInviterSummary"
+    },
+    "transport": {
+      "$ref": "#/$defs/InvitationTransportSecurity"
+    },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/InvitationWorkspaceSummary"
+      }
+    }
+  },
+  "required": [
+    "gateway_id",
+    "inviter",
+    "workspaces",
+    "expires_at_unix",
+    "transport"
+  ],
+  "$defs": {
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationInviterSummary": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "InvitationTransportSecurity": {
+      "type": "string",
+      "enum": [
+        "secure_wss",
+        "insecure_ws"
+      ]
+    },
+    "InvitationWorkspaceSummary": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "name"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

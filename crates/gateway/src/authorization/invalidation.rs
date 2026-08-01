@@ -35,6 +35,18 @@ impl Default for AuthorizationInvalidationHub {
 }
 
 impl AuthorizationInvalidationHub {
+    /// Advances the shared snapshot revision for a committed non-ACL
+    /// administrative projection change. No access signal is emitted because
+    /// invitation/member recipients refetch through their scoped APIs.
+    pub(crate) fn advance_snapshot_revision(&self) -> u64 {
+        self.revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            })
+            .expect("authorization invalidation revision exhausted")
+            + 1
+    }
+
     pub(crate) fn publish(
         &self,
         kind: AccessChangeKind,
@@ -42,14 +54,9 @@ impl AuthorizationInvalidationHub {
         workspace_id: impl Into<String>,
         thread_id: Option<String>,
     ) -> AccessChangeSignal {
-        let previous = self
-            .revision
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
-                revision.checked_add(1)
-            })
-            .expect("authorization invalidation revision exhausted");
+        let revision = self.advance_snapshot_revision();
         AccessChangeSignal {
-            authorization_revision: previous + 1,
+            authorization_revision: revision,
             kind,
             affected_principal_id,
             workspace_id: workspace_id.into(),
@@ -108,5 +115,23 @@ mod tests {
         let hub = AuthorizationInvalidationHub::default();
 
         assert_eq!(hub.current_revision(), 0);
+    }
+
+    #[test]
+    fn committed_snapshot_change_shares_the_monotonic_revision_space() {
+        let hub = AuthorizationInvalidationHub::default();
+
+        assert_eq!(hub.advance_snapshot_revision(), 1);
+        assert_eq!(hub.current_revision(), 1);
+        assert_eq!(
+            hub.publish(
+                AccessChangeKind::WorkspaceMembership,
+                None,
+                "workspace-red",
+                None,
+            )
+            .authorization_revision,
+            2
+        );
     }
 }

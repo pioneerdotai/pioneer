@@ -129,11 +129,23 @@ pub(crate) enum ResourceAction {
     CliRuntimeManage,
     SessionReadOwn,
     SessionRevokeOwn,
+    InvitationCreate,
+    InvitationList,
+    InvitationRevoke,
+    MemberDirectoryList,
+    MemberAvatarRead,
+    WorkspaceMemberList,
+    WorkspaceMemberAdd,
+    WorkspaceMemberRemove,
+    MemberSuspend,
+    MemberRestore,
+    MemberDeviceCreate,
+    MemberRemove,
 }
 
 impl ResourceAction {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 29] = [
+    pub(crate) const ALL: [Self; 41] = [
         Self::GatewayManage,
         Self::WorkspaceList,
         Self::WorkspaceRead,
@@ -163,6 +175,18 @@ impl ResourceAction {
         Self::CliRuntimeManage,
         Self::SessionReadOwn,
         Self::SessionRevokeOwn,
+        Self::InvitationCreate,
+        Self::InvitationList,
+        Self::InvitationRevoke,
+        Self::MemberDirectoryList,
+        Self::MemberAvatarRead,
+        Self::WorkspaceMemberList,
+        Self::WorkspaceMemberAdd,
+        Self::WorkspaceMemberRemove,
+        Self::MemberSuspend,
+        Self::MemberRestore,
+        Self::MemberDeviceCreate,
+        Self::MemberRemove,
     ];
 
     pub(crate) const fn safe_name(self) -> &'static str {
@@ -196,6 +220,18 @@ impl ResourceAction {
             Self::CliRuntimeManage => "cli_runtime_manage",
             Self::SessionReadOwn => "session_read_own",
             Self::SessionRevokeOwn => "session_revoke_own",
+            Self::InvitationCreate => "invitation_create",
+            Self::InvitationList => "invitation_list",
+            Self::InvitationRevoke => "invitation_revoke",
+            Self::MemberDirectoryList => "member_directory_list",
+            Self::MemberAvatarRead => "member_avatar_read",
+            Self::WorkspaceMemberList => "workspace_member_list",
+            Self::WorkspaceMemberAdd => "workspace_member_add",
+            Self::WorkspaceMemberRemove => "workspace_member_remove",
+            Self::MemberSuspend => "member_suspend",
+            Self::MemberRestore => "member_restore",
+            Self::MemberDeviceCreate => "member_device_create",
+            Self::MemberRemove => "member_remove",
         }
     }
 
@@ -245,6 +281,12 @@ pub(crate) enum AuthorizationResource {
         kind: CapabilityKind,
         id: CapabilityResourceId,
     },
+    InvitationGrantSet(Vec<WorkspaceResourceId>),
+    InvitationCollection(GatewayId),
+    Invitation(pioneer_protocol::InvitationId),
+    MemberDirectory(GatewayId),
+    DirectoryPrincipal(PrincipalId),
+    MemberPrincipal(PrincipalId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +298,9 @@ pub(crate) enum AllowReason {
     ThreadCreator,
     OwnSession,
     CapabilityProjected,
+    InvitationGrantSet,
+    InvitationCreator,
+    DirectoryVisible,
 }
 
 impl AllowReason {
@@ -268,6 +313,9 @@ impl AllowReason {
             Self::ThreadCreator => "thread_creator",
             Self::OwnSession => "own_session",
             Self::CapabilityProjected => "capability_projected",
+            Self::InvitationGrantSet => "invitation_grant_set",
+            Self::InvitationCreator => "invitation_creator",
+            Self::DirectoryVisible => "directory_visible",
         }
     }
 }

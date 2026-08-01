@@ -1,5 +1,7 @@
 mod admission;
 mod domain;
+#[cfg(test)]
+mod epic5_contract;
 mod execution;
 mod invalidation;
 mod registry;
@@ -30,8 +32,11 @@ pub(crate) use registry::{
     ResourceResolverKind, binary_ingress_entry, normal_method_entry,
 };
 pub(crate) use resolver::{
-    AuthorizationResolver, AuthorizedArtifact, AuthorizedSession, AuthorizedTask, AuthorizedThread,
-    AuthorizedTurn, AuthorizedWorkspace, AuthorizedWorkspaceCollection, ProofResolution,
+    AuthorizationResolver, AuthorizedArtifact, AuthorizedInvitation,
+    AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberAvatar,
+    AuthorizedMemberDirectory, AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask,
+    AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace, AuthorizedWorkspaceCollection,
+    ProofResolution, persisted_actor_is_current,
 };
 pub(crate) use service::{
     AuthorizationService, ResolvedResourceAccess, ThreadAccessFacts, WorkspaceAccessFacts,

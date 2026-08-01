@@ -13,8 +13,8 @@ pub const DEVICE_ACTIVATION_CODE_SYMBOLS: usize = 8;
 pub const DEVICE_ACTIVATION_LOCATOR_SYMBOLS: usize = 1;
 pub const DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const DEVICE_ACTIVATION_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const MAX_PROTECTED_ACTIVATION_ENDPOINT_BYTES: usize = 2_048;
-const MAX_ACTIVATION_URI_BYTES: usize = 8_192;
+pub const MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES: usize = 2_048;
+pub const MAX_PROTECTED_GATEWAY_URI_BYTES: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +79,7 @@ pub enum AuthCredentialPurpose {
     Access,
     Refresh,
     DeviceActivation,
+    Invitation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -291,11 +292,11 @@ impl AuthDeviceActivationPresentation {
         gateway_id: GatewayId,
         activation_code: impl Into<String>,
     ) -> Result<Self, String> {
-        let protected_endpoint = protected_endpoint.into();
+        let protected_endpoint =
+            normalize_protected_gateway_endpoint(protected_endpoint.into().as_str())?;
         let activation_code = AuthSecretString::new(format_device_activation_code(
             activation_code.into().as_str(),
         )?);
-        validate_protected_activation_endpoint(&protected_endpoint)?;
         Ok(Self {
             protected_endpoint,
             gateway_id,
@@ -321,7 +322,7 @@ impl AuthDeviceActivationPresentation {
     }
 
     pub fn parse(uri: &str) -> Result<Self, String> {
-        if uri.is_empty() || uri.len() > MAX_ACTIVATION_URI_BYTES {
+        if uri.is_empty() || uri.len() > MAX_PROTECTED_GATEWAY_URI_BYTES {
             return Err("invalid device activation URI length".to_owned());
         }
         let parsed =
@@ -458,11 +459,17 @@ pub fn encode_device_activation_entropy(entropy: [u8; 5]) -> String {
     encoded
 }
 
-fn validate_protected_activation_endpoint(endpoint: &str) -> Result<(), String> {
-    if endpoint.is_empty()
-        || endpoint.len() > MAX_PROTECTED_ACTIVATION_ENDPOINT_BYTES
-        || endpoint.trim() != endpoint
-    {
+pub fn normalize_protected_gateway_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() || endpoint.len() > MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES {
+        return Err("invalid Gateway endpoint length".to_owned());
+    }
+    let endpoint = if endpoint.contains("://") {
+        endpoint.to_owned()
+    } else {
+        format!("ws://{endpoint}")
+    };
+    if endpoint.len() > MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES {
         return Err("invalid Gateway endpoint length".to_owned());
     }
     let (_, authority_and_path) = endpoint
@@ -471,7 +478,7 @@ fn validate_protected_activation_endpoint(endpoint: &str) -> Result<(), String> 
     if authority_and_path.is_empty() || authority_and_path.starts_with('/') {
         return Err("Gateway endpoint must contain an explicit authority".to_owned());
     }
-    let parsed = url::Url::parse(endpoint).map_err(|_| "invalid Gateway endpoint".to_owned())?;
+    let parsed = url::Url::parse(&endpoint).map_err(|_| "invalid Gateway endpoint".to_owned())?;
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
         return Err("Gateway endpoint must not contain credentials or a fragment".to_owned());
     }
@@ -479,8 +486,8 @@ fn validate_protected_activation_endpoint(endpoint: &str) -> Result<(), String> 
         .host_str()
         .ok_or_else(|| "Gateway endpoint must contain a host".to_owned())?;
     match parsed.scheme() {
-        "ws" | "wss" => Ok(()),
-        _ => Err("device activation endpoint must use ws or wss".to_owned()),
+        "ws" | "wss" => Ok(endpoint),
+        _ => Err("Gateway endpoint must use ws or wss".to_owned()),
     }
 }
 
@@ -512,6 +519,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuthSessionRevokeReason::ActivationAttemptsExceeded).unwrap(),
             "\"activation_attempts_exceeded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthCredentialPurpose::Invitation).unwrap(),
+            "\"invitation\""
         );
         assert!(serde_json::from_str::<DeviceStatus>("\"unknown\"").is_err());
     }
@@ -674,7 +685,7 @@ mod tests {
         );
         assert!(
             AuthDeviceActivationPresentation::parse(
-                "x".repeat(MAX_ACTIVATION_URI_BYTES + 1).as_str()
+                "x".repeat(MAX_PROTECTED_GATEWAY_URI_BYTES + 1).as_str()
             )
             .is_err()
         );
@@ -696,6 +707,17 @@ mod tests {
                 "{endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn bare_endpoint_cannot_exceed_the_bound_after_ws_normalization() {
+        let prefix = "gateway.example.test/";
+        let endpoint = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES - prefix.len())
+        );
+        assert_eq!(endpoint.len(), MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES);
+        assert!(normalize_protected_gateway_endpoint(&endpoint).is_err());
     }
 
     #[test]

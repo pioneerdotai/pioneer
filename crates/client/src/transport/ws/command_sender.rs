@@ -34,10 +34,14 @@ use pioneer_protocol::{
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, McpInstallParams,
-    McpInstallResponse, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerRestartParams,
-    McpServerRestartResponse, McpUninstallParams, McpUninstallResponse, ProviderConfigureParams,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, InvitationCreateParams,
+    InvitationCreateResponse, InvitationListParams, InvitationListResponse, InvitationRevokeParams,
+    InvitationRevokeResponse, McpInstallParams, McpInstallResponse, McpListParams, McpListResponse,
+    McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse,
+    McpServerRestartParams, McpServerRestartResponse, McpUninstallParams, McpUninstallResponse,
+    MemberAvatarGetParams, MemberAvatarGetResponse, MemberDeviceCreateParams,
+    MemberDeviceCreateResponse, MemberListParams, MemberListResponse, MemberMutationResponse,
+    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, ProviderConfigureParams,
     ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, SkillListParams, SkillListResponse,
@@ -65,9 +69,10 @@ use pioneer_protocol::{
     VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
     VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
     WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
-    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
-    validate_voice_streaming_audio_format,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceMemberAddParams,
+    WorkspaceMemberListParams, WorkspaceMemberListResponse, WorkspaceMemberMutationResponse,
+    WorkspaceMemberRemoveParams, WorkspaceSelectParams, WorkspaceSelectResponse,
+    WorkspaceUpdateParams, WorkspaceUpdateResponse, validate_voice_streaming_audio_format,
 };
 use std::time::Duration;
 
@@ -165,6 +170,186 @@ where
         transport,
         methods::AUTH_DEVICE_CREATE,
         &serde_json::json!({}),
+    )
+}
+
+pub fn invitation_create<TTransport>(
+    transport: &TTransport,
+    params: InvitationCreateParams,
+) -> Result<InvitationCreateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::INVITE_CREATE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn invitation_list<TTransport>(
+    transport: &TTransport,
+    params: InvitationListParams,
+) -> Result<InvitationListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::INVITE_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn invitation_revoke<TTransport>(
+    transport: &TTransport,
+    params: InvitationRevokeParams,
+) -> Result<InvitationRevokeResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::INVITE_REVOKE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_list<TTransport>(
+    transport: &TTransport,
+    params: MemberListParams,
+) -> Result<MemberListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_avatar_get<TTransport>(
+    transport: &TTransport,
+    params: MemberAvatarGetParams,
+) -> Result<MemberAvatarGetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_AVATAR_GET,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_suspend<TTransport>(
+    transport: &TTransport,
+    params: MemberSuspendParams,
+) -> Result<MemberMutationResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_SUSPEND,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_restore<TTransport>(
+    transport: &TTransport,
+    params: MemberRestoreParams,
+) -> Result<MemberMutationResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_RESTORE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_remove<TTransport>(
+    transport: &TTransport,
+    params: MemberRemoveParams,
+) -> Result<MemberMutationResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_REMOVE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn member_device_create<TTransport>(
+    transport: &TTransport,
+    params: MemberDeviceCreateParams,
+) -> Result<MemberDeviceCreateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::MEMBER_DEVICE_CREATE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn workspace_member_list<TTransport>(
+    transport: &TTransport,
+    params: WorkspaceMemberListParams,
+) -> Result<WorkspaceMemberListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::WORKSPACE_MEMBER_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn workspace_member_add<TTransport>(
+    transport: &TTransport,
+    params: WorkspaceMemberAddParams,
+) -> Result<WorkspaceMemberMutationResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::WORKSPACE_MEMBER_ADD,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn workspace_member_remove<TTransport>(
+    transport: &TTransport,
+    params: WorkspaceMemberRemoveParams,
+) -> Result<WorkspaceMemberMutationResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_json_rpc_request_typed(
+        transport,
+        methods::WORKSPACE_MEMBER_REMOVE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
     )
 }
 
@@ -2438,6 +2623,7 @@ mod tests {
         VoiceTurnContext, Workspace,
     };
     use serde_json::json;
+    use std::sync::Mutex;
 
     struct FakeTransport;
 
@@ -2492,6 +2678,85 @@ mod tests {
         ) -> std::result::Result<(), String> {
             panic!("validation should run before transport dispatch");
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingFailureTransport {
+        requests: Mutex<Vec<JsonRpcRequest>>,
+    }
+
+    impl JsonRpcRequestTransport for RecordingFailureTransport {
+        fn send_json_rpc_request(
+            &self,
+            _request_id: String,
+            payload: String,
+            _response_tx: JsonRpcResponseSender,
+        ) -> std::result::Result<(), String> {
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(serde_json::from_str(&payload).expect("request payload"));
+            Err(WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE.to_owned())
+        }
+    }
+
+    fn params<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("valid typed params")
+    }
+
+    #[test]
+    fn epic5_authenticated_wrappers_use_the_complete_normal_method_set() {
+        let transport = RecordingFailureTransport::default();
+        let workspace_id = "WAAAAAAAAAAAAAAAAAAAA";
+        let principal_id = "PAAAAAAAAAAAAAAAAAAAA";
+        let invitation_id = "IAAAAAAAAAAAAAAAAAAAA";
+
+        let _ = invitation_create(&transport, params(json!({"workspace_ids": [workspace_id]})));
+        let _ = invitation_list(&transport, InvitationListParams::default());
+        let _ = invitation_revoke(&transport, params(json!({"invitation_id": invitation_id})));
+        let _ = member_list(&transport, MemberListParams::default());
+        let _ = member_avatar_get(&transport, params(json!({"principal_id": principal_id})));
+        let _ = member_suspend(&transport, params(json!({"principal_id": principal_id})));
+        let _ = member_restore(&transport, params(json!({"principal_id": principal_id})));
+        let _ = member_remove(&transport, params(json!({"principal_id": principal_id})));
+        let _ = member_device_create(&transport, params(json!({"principal_id": principal_id})));
+        let _ = workspace_member_list(&transport, params(json!({"workspace_id": workspace_id})));
+        let _ = workspace_member_add(
+            &transport,
+            params(json!({
+                "workspace_id": workspace_id,
+                "principal_id": principal_id
+            })),
+        );
+        let _ = workspace_member_remove(
+            &transport,
+            params(json!({
+                "workspace_id": workspace_id,
+                "principal_id": principal_id
+            })),
+        );
+
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                methods::INVITE_CREATE,
+                methods::INVITE_LIST,
+                methods::INVITE_REVOKE,
+                methods::MEMBER_LIST,
+                methods::MEMBER_AVATAR_GET,
+                methods::MEMBER_SUSPEND,
+                methods::MEMBER_RESTORE,
+                methods::MEMBER_REMOVE,
+                methods::MEMBER_DEVICE_CREATE,
+                methods::WORKSPACE_MEMBER_LIST,
+                methods::WORKSPACE_MEMBER_ADD,
+                methods::WORKSPACE_MEMBER_REMOVE,
+            ]
+        );
     }
 
     #[test]

@@ -293,6 +293,113 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(super) async fn send_scoped_invitation_changed_notification(
+        &self,
+        invitation_id: &pioneer_protocol::InvitationId,
+        revision: u64,
+    ) {
+        let Some(invitation) =
+            pioneer_crud::load_invitation(&self.crud_store.database_connection(), invitation_id)
+                .await
+                .ok()
+                .flatten()
+        else {
+            tracing::warn!(
+                invitation_id = %invitation_id,
+                "committed invitation notification could not reload authoritative owner"
+            );
+            return;
+        };
+        let Ok(inviter_principal_id) =
+            pioneer_protocol::PrincipalId::new(invitation.created_by_principal_id)
+        else {
+            tracing::warn!(
+                invitation_id = %invitation_id,
+                "committed invitation notification has invalid persisted owner"
+            );
+            return;
+        };
+        let candidates = self.session_manager.connection_ids().await;
+        let initially_authorized = self
+            .authorized_invitation_notification_recipients(&inviter_principal_id, candidates)
+            .await;
+        if initially_authorized.is_empty() {
+            return;
+        }
+        let serialization_authorized = self
+            .authorized_invitation_notification_recipients(
+                &inviter_principal_id,
+                initially_authorized,
+            )
+            .await;
+        if serialization_authorized.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(
+            events::INVITATION_CHANGED,
+            &pioneer_protocol::InvitationChangedNotification {
+                revision,
+                invitation_id: invitation_id.clone(),
+            },
+        ) else {
+            return;
+        };
+        let authorized = self
+            .authorized_invitation_notification_recipients(
+                &inviter_principal_id,
+                serialization_authorized,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(
+            events::INVITATION_CHANGED,
+            &serialized,
+            authorized,
+        )
+        .await;
+    }
+
+    pub(super) async fn authorized_invitation_notification_recipients(
+        &self,
+        inviter_principal_id: &pioneer_protocol::PrincipalId,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{ActionGateDecision, AuthorizationService, ResourceAction};
+
+        let service = AuthorizationService::new();
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            match service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                ResourceAction::InvitationList,
+            ) {
+                ActionGateDecision::AllowSuperuser => recipients.push(connection_id),
+                ActionGateDecision::RequireResource { .. }
+                    if &principal.principal_id == inviter_principal_id =>
+                {
+                    recipients.push(connection_id);
+                }
+                ActionGateDecision::Deny { .. } | ActionGateDecision::RequireResource { .. } => {}
+            }
+        }
+        recipients
+    }
+
     async fn authorized_gateway_management_notification_recipients(
         &self,
         candidate_connection_ids: Vec<ConnectionId>,
@@ -368,6 +475,102 @@ impl MessageProcessor {
             connection_ids,
         )
         .await;
+    }
+
+    pub(super) async fn send_notification_to_authorized_member_connections<T: Serialize>(
+        &self,
+        target_principal_id: &pioneer_protocol::PrincipalId,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidates = self.session_manager.connection_ids().await;
+        let initially_authorized = self
+            .authorized_member_notification_recipients(target_principal_id, candidates)
+            .await;
+        if initially_authorized.is_empty() {
+            return;
+        }
+        let serialization_authorized = self
+            .authorized_member_notification_recipients(target_principal_id, initially_authorized)
+            .await;
+        if serialization_authorized.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let authorized = self
+            .authorized_member_notification_recipients(
+                target_principal_id,
+                serialization_authorized,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, authorized)
+            .await;
+    }
+
+    async fn authorized_member_notification_recipients(
+        &self,
+        target_principal_id: &pioneer_protocol::PrincipalId,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationResolver, AuthorizationService, ProofResolution,
+            ResourceAction, record_authorization_unavailable,
+        };
+
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let database = self.crud_store.database_connection();
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            let action = ResourceAction::MemberAvatarRead;
+            let action_gate =
+                service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
+            if matches!(action_gate, ActionGateDecision::Deny { .. }) {
+                continue;
+            }
+            match resolver
+                .authorize_member_avatar(
+                    &database,
+                    principal.as_ref(),
+                    &action_gate,
+                    target_principal_id,
+                )
+                .await
+            {
+                Ok(ProofResolution::Authorized(_)) => recipients.push(connection_id),
+                Ok(ProofResolution::Denied(_)) => {}
+                Err(error) => {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "directory_principal",
+                        "notification",
+                    );
+                    warn!(
+                        connection_id,
+                        error = %format!("{error:#}"),
+                        "member notification authorization unavailable"
+                    );
+                }
+            }
+        }
+        recipients
     }
 
     pub(super) async fn send_notification_to_reauthorized_workspace_connections<T: Serialize>(
@@ -1014,6 +1217,10 @@ impl MessageProcessor {
         let notification = match JsonRpcNotification::from_params(method, payload) {
             Ok(notification) => notification,
             Err(error) => {
+                crate::epic5_observability::record_outcome(
+                    crate::epic5_observability::Epic5Operation::Notification,
+                    crate::epic5_observability::Epic5Outcome::Unavailable,
+                );
                 error!(method, error = %error, "failed to encode notification");
                 return None;
             }
@@ -1022,6 +1229,10 @@ impl MessageProcessor {
         match serde_json::to_string(&notification) {
             Ok(payload) => Some(payload),
             Err(error) => {
+                crate::epic5_observability::record_outcome(
+                    crate::epic5_observability::Epic5Operation::Notification,
+                    crate::epic5_observability::Epic5Outcome::Unavailable,
+                );
                 error!(method, error = %error, "failed to serialize notification");
                 None
             }
@@ -1040,6 +1251,10 @@ impl MessageProcessor {
                 .send_text(target_connection_id, serialized.to_owned())
                 .await
             {
+                crate::epic5_observability::record_outcome(
+                    crate::epic5_observability::Epic5Operation::Notification,
+                    crate::epic5_observability::Epic5Outcome::Unavailable,
+                );
                 warn!(
                     connection_id = target_connection_id,
                     method,

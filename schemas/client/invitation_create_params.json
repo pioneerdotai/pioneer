@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationCreateParams",
+  "type": "object",
+  "properties": {
+    "workspace_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WorkspaceId"
+      },
+      "maxItems": 64,
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_ids"
+  ],
+  "$defs": {
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

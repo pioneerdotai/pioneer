@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationTransportSecurity",
+  "type": "string",
+  "enum": [
+    "secure_wss",
+    "insecure_ws"
+  ]
+}

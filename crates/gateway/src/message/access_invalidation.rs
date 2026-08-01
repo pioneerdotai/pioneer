@@ -258,6 +258,10 @@ impl MessageProcessor {
         signal: &AccessChangeSignal,
         error: anyhow::Error,
     ) {
+        crate::epic5_observability::record_outcome(
+            crate::epic5_observability::Epic5Operation::Invalidation,
+            crate::epic5_observability::Epic5Outcome::Unavailable,
+        );
         warn!(
             connection_id,
             principal_id = %principal.principal_id,

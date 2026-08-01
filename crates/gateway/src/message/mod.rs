@@ -10,8 +10,11 @@ mod binary;
 mod cli_runtime;
 mod dispatch;
 mod hooks;
+mod invitation_handlers;
+mod invitation_lifecycle;
 mod markdown;
 mod mcp;
+mod member_handlers;
 mod memory_handlers;
 mod notifications;
 mod permission_handlers;
@@ -383,6 +386,7 @@ pub struct MessageProcessor {
     session_manager: Arc<SessionManager>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     auth_service: Option<Arc<GatewayAuthService>>,
+    epic5_rate_limits: Arc<crate::epic5_observability::Epic5RateLimits>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
     thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
@@ -391,6 +395,7 @@ pub struct MessageProcessor {
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
+    invitation_endpoint: Arc<str>,
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
@@ -713,6 +718,7 @@ impl MessageProcessor {
             session_manager,
             authorization_invalidation_hub,
             auth_service: None,
+            epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,
@@ -720,6 +726,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            invitation_endpoint: Arc::from("ws://127.0.0.1:17878"),
             summary_config: Arc::new(summary_config),
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -1049,7 +1056,13 @@ impl MessageProcessor {
 
     pub(crate) fn with_auth_service(mut self, service: Arc<GatewayAuthService>) -> Self {
         self.mcp_service.set_auth_service(service.clone());
+        self.epic5_rate_limits = service.epic5_rate_limits();
         self.auth_service = Some(service);
+        self
+    }
+
+    pub(crate) fn with_invitation_endpoint(mut self, endpoint: impl Into<Arc<str>>) -> Self {
+        self.invitation_endpoint = endpoint.into();
         self
     }
 
@@ -2658,6 +2671,7 @@ impl MessageProcessor {
             session_manager,
             authorization_invalidation_hub,
             auth_service: None,
+            epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
             cli_runtime_manager: None,
             remote_access_supervisor: None,
             thread_episodic_vector_refill_status_tx,
@@ -2665,6 +2679,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            invitation_endpoint: Arc::from("ws://127.0.0.1:17878"),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),

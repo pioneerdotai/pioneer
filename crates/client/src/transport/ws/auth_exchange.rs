@@ -8,8 +8,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
     AuthDeviceActivateParams, AuthLogoutResponse, AuthRefreshGrant, AuthRefreshParams,
-    AuthSessionGrant, AuthSessionId, AuthSessionRevokeResponse, JSONRPC_VERSION,
-    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, REFRESH_CREDENTIAL_BODY_LEN,
+    AuthSessionGrant, AuthSessionId, AuthSessionRevokeResponse, InvitationAcceptParams,
+    InvitationAcceptResponse, InvitationPreviewResponse, JSONRPC_VERSION, JsonRpcErrorResponse,
+    JsonRpcRequest, JsonRpcResponse, PROFILE_AVATAR_MAX_BASE64_LEN, REFRESH_CREDENTIAL_BODY_LEN,
     REFRESH_CREDENTIAL_PREFIX, RequestId, constants::methods,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -25,7 +26,12 @@ use tokio_tungstenite::{
 use url::Url;
 use zeroize::Zeroizing;
 
-const MAX_AUTH_EXCHANGE_REQUEST_BYTES: usize = 64 * 1024;
+use crate::gateway::invitation::{InvitationQrPresentation, InvitationSessionCleanup};
+
+// Invitation accept is the only restricted request that may carry a bounded
+// avatar. Keep enough JSON headroom for the profile and installation envelope
+// while retaining a hard transport limit before the request is written.
+const MAX_AUTH_EXCHANGE_REQUEST_BYTES: usize = PROFILE_AVATAR_MAX_BASE64_LEN + 16 * 1024;
 const MAX_AUTH_EXCHANGE_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +111,77 @@ impl fmt::Display for AuthExchangeError {
 
 impl std::error::Error for AuthExchangeError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationExchangeErrorKind {
+    Unavailable,
+    InvalidProfile,
+    NicknameUnavailable,
+    InvalidInstallation,
+    AvatarInvalid,
+    InvalidEndpoint,
+    Timeout,
+    Transport,
+    Protocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitationExchangeError {
+    pub kind: InvitationExchangeErrorKind,
+}
+
+impl InvitationExchangeError {
+    fn from_auth(error: AuthExchangeError) -> Self {
+        let kind = if error.kind == AuthExchangeErrorKind::Server {
+            match error.code.as_deref() {
+                Some("invalid_profile") => InvitationExchangeErrorKind::InvalidProfile,
+                Some("nickname_unavailable") => InvitationExchangeErrorKind::NicknameUnavailable,
+                Some("invalid_installation") => InvitationExchangeErrorKind::InvalidInstallation,
+                Some("avatar_invalid") => InvitationExchangeErrorKind::AvatarInvalid,
+                _ => InvitationExchangeErrorKind::Unavailable,
+            }
+        } else {
+            match error.kind {
+                AuthExchangeErrorKind::InvalidEndpoint => {
+                    InvitationExchangeErrorKind::InvalidEndpoint
+                }
+                AuthExchangeErrorKind::Timeout => InvitationExchangeErrorKind::Timeout,
+                AuthExchangeErrorKind::TransportBeforeRequest
+                | AuthExchangeErrorKind::Transport => InvitationExchangeErrorKind::Transport,
+                AuthExchangeErrorKind::Protocol
+                | AuthExchangeErrorKind::CredentialMethodMismatch => {
+                    InvitationExchangeErrorKind::Protocol
+                }
+                AuthExchangeErrorKind::Server => InvitationExchangeErrorKind::Unavailable,
+            }
+        };
+        Self { kind }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            kind: InvitationExchangeErrorKind::Unavailable,
+        }
+    }
+}
+
+impl fmt::Display for InvitationExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            InvitationExchangeErrorKind::Unavailable => "invitation is unavailable",
+            InvitationExchangeErrorKind::InvalidProfile => "invitation profile is invalid",
+            InvitationExchangeErrorKind::NicknameUnavailable => "nickname is unavailable",
+            InvitationExchangeErrorKind::InvalidInstallation => "client installation is invalid",
+            InvitationExchangeErrorKind::AvatarInvalid => "profile avatar is invalid",
+            InvitationExchangeErrorKind::InvalidEndpoint => "invitation endpoint is invalid",
+            InvitationExchangeErrorKind::Timeout => "invitation exchange timed out",
+            InvitationExchangeErrorKind::Transport => "invitation transport failed",
+            InvitationExchangeErrorKind::Protocol => "invitation exchange protocol failed",
+        })
+    }
+}
+
+impl std::error::Error for InvitationExchangeError {}
+
 #[derive(Debug, Clone)]
 pub struct AuthExchangeClient {
     timeout: Duration,
@@ -152,6 +229,41 @@ impl AuthExchangeClient {
             &params,
         )
         .await
+    }
+
+    pub async fn preview_invitation(
+        &self,
+        invitation: &InvitationQrPresentation,
+    ) -> Result<InvitationPreviewResponse, InvitationExchangeError> {
+        let (stream, remaining) = self
+            .connect_with_credential(invitation.protected_endpoint(), invitation.credential())
+            .await
+            .map_err(InvitationExchangeError::from_auth)?;
+        preview_invitation_over_stream(stream, invitation, remaining).await
+    }
+
+    pub async fn accept_invitation(
+        &self,
+        invitation: &InvitationQrPresentation,
+        params: InvitationAcceptParams,
+    ) -> Result<InvitationAcceptResponse, InvitationExchangeError> {
+        let (stream, remaining) = self
+            .connect_with_credential(invitation.protected_endpoint(), invitation.credential())
+            .await
+            .map_err(InvitationExchangeError::from_auth)?;
+        accept_invitation_over_stream(stream, invitation, &params, remaining).await
+    }
+
+    /// Uses the existing authenticated logout path. Failure is deliberately
+    /// ignored because the server-side session will still expire/revalidate.
+    pub async fn cleanup_invitation_session_best_effort(&self, cleanup: InvitationSessionCleanup) {
+        let _ = self
+            .cleanup_session_once(
+                cleanup.protected_endpoint(),
+                cleanup.access_token(),
+                cleanup.session_id().clone(),
+            )
+            .await;
     }
 
     pub async fn cleanup_session_once(
@@ -269,6 +381,51 @@ impl AuthExchangeClient {
         }
         Ok((stream, remaining))
     }
+}
+
+async fn preview_invitation_over_stream<S>(
+    stream: WebSocketStream<S>,
+    invitation: &InvitationQrPresentation,
+    remaining: Duration,
+) -> Result<InvitationPreviewResponse, InvitationExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut preview: InvitationPreviewResponse = exchange_over_stream(
+        stream,
+        methods::INVITE_PREVIEW,
+        &serde_json::json!({}),
+        remaining,
+    )
+    .await
+    .map_err(InvitationExchangeError::from_auth)?;
+    if preview.gateway_id != *invitation.gateway_id() {
+        return Err(InvitationExchangeError::unavailable());
+    }
+    // The canonical endpoint used for this connection is authoritative for
+    // transport classification. A server behind TLS termination sees only a
+    // relative WebSocket request target and cannot reliably infer `wss`.
+    preview.transport = invitation.transport_security();
+    Ok(preview)
+}
+
+async fn accept_invitation_over_stream<S>(
+    stream: WebSocketStream<S>,
+    invitation: &InvitationQrPresentation,
+    params: &InvitationAcceptParams,
+    remaining: Duration,
+) -> Result<InvitationAcceptResponse, InvitationExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let accepted: InvitationAcceptResponse =
+        exchange_over_stream(stream, methods::INVITE_ACCEPT, params, remaining)
+            .await
+            .map_err(InvitationExchangeError::from_auth)?;
+    if accepted.grant.gateway.id != *invitation.gateway_id() {
+        return Err(InvitationExchangeError::unavailable());
+    }
+    Ok(accepted)
 }
 
 type GatewayAuthWebSocket =
@@ -573,7 +730,9 @@ mod tests {
     use pioneer_protocol::{
         AuthDeviceSnapshot, AuthGatewaySnapshot, AuthPrincipalSnapshot, AuthSecretString,
         AuthSessionSnapshot, AuthSessionStatus, ClientKind, CredentialStorageOrder, DeviceId,
-        DeviceStatus, GatewayId, PrincipalId, PrincipalKind, TokenFamilyId,
+        DeviceStatus, GatewayId, InvitationCredential, InvitationInviterSummary,
+        InvitationPresentation, InvitationTransportSecurity, InvitationWorkspaceSummary,
+        PrincipalId, PrincipalKind, TokenFamilyId, WorkspaceId,
     };
     use tokio::io::DuplexStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
@@ -636,6 +795,41 @@ mod tests {
         serde_json::from_str::<JsonRpcRequest>(&payload).unwrap().id
     }
 
+    fn invitation() -> InvitationQrPresentation {
+        InvitationQrPresentation::from_presentation(
+            InvitationPresentation::new(
+                "ws://gateway.example.test:17878",
+                GatewayId::new("G00000000000000000001").unwrap(),
+                InvitationCredential::parse(format!(
+                    "{}{}",
+                    pioneer_protocol::INVITATION_CREDENTIAL_PREFIX,
+                    "A".repeat(pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN)
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn preview() -> InvitationPreviewResponse {
+        InvitationPreviewResponse {
+            gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+            gateway_display_name: Some("Gateway".to_owned()),
+            inviter: InvitationInviterSummary {
+                principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+                kind: PrincipalKind::Superuser,
+                display_name: "Owner".to_owned(),
+                nickname: "owner".to_owned(),
+            },
+            workspaces: vec![InvitationWorkspaceSummary {
+                workspace_id: WorkspaceId::new("W00000000000000000001").unwrap(),
+                name: "Workspace".to_owned(),
+            }],
+            expires_at_unix: 100,
+            transport: InvitationTransportSecurity::InsecureWs,
+        }
+    }
+
     #[tokio::test]
     async fn one_response_then_close_returns_secret_directly() {
         let (client, mut server) = streams().await;
@@ -659,6 +853,142 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.refresh_token.expose_secret(), "refresh-secret");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_invitation_preview_uses_only_preview_method_and_pins_gateway() {
+        let invitation = invitation();
+        let (client, mut server) = streams().await;
+        let server_task = tokio::spawn(async move {
+            let Message::Text(payload) = server.next().await.unwrap().unwrap() else {
+                panic!("expected text request")
+            };
+            let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+            assert_eq!(request.method, methods::INVITE_PREVIEW);
+            assert_eq!(request.params, Some(serde_json::json!({})));
+            let response = JsonRpcResponse::from_result(request.id, &preview()).unwrap();
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&response).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            server.send(Message::Close(None)).await.unwrap();
+        });
+
+        let result = preview_invitation_over_stream(client, &invitation, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result.gateway_id, *invitation.gateway_id());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invitation_preview_uses_the_connected_endpoint_transport_classification() {
+        let invitation = InvitationQrPresentation::from_presentation(
+            InvitationPresentation::new(
+                "wss://gateway.example.test/ws",
+                GatewayId::new("G00000000000000000001").unwrap(),
+                InvitationCredential::parse(format!(
+                    "{}{}",
+                    pioneer_protocol::INVITATION_CREDENTIAL_PREFIX,
+                    "A".repeat(pioneer_protocol::INVITATION_CREDENTIAL_BODY_LEN)
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let (client, mut server) = streams().await;
+        let server_task = tokio::spawn(async move {
+            let id = request_id(&mut server).await;
+            let response = JsonRpcResponse::from_result(id, &preview()).unwrap();
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&response).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            server.send(Message::Close(None)).await.unwrap();
+        });
+
+        let result = preview_invitation_over_stream(client, &invitation, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result.transport, InvitationTransportSecurity::SecureWss);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_transport_accepts_the_maximum_bounded_avatar_envelope() {
+        let params = serde_json::json!({
+            "profile": {
+                "display_name": "Member",
+                "nickname": "member",
+                "avatar": {
+                    "media_type": "image/png",
+                    "content_base64": "A".repeat(PROFILE_AVATAR_MAX_BASE64_LEN),
+                }
+            },
+            "installation": {
+                "installation_id": "installation-1",
+                "display_name": "Pioneer App",
+                "client_kind": "mobile"
+            }
+        });
+        let encoded = serde_json::to_vec(&params).unwrap();
+        assert!(encoded.len() > 64 * 1024);
+        assert!(encoded.len() < MAX_AUTH_EXCHANGE_REQUEST_BYTES);
+
+        let (client, mut server) = streams().await;
+        let server_task = tokio::spawn(async move {
+            let id = request_id(&mut server).await;
+            let response = JsonRpcResponse::from_result(id, &()).unwrap();
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&response).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            server.send(Message::Close(None)).await.unwrap();
+        });
+        exchange_over_stream::<_, _, ()>(
+            client,
+            methods::INVITE_ACCEPT,
+            &params,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invitation_server_error_maps_to_bounded_corrective_reason() {
+        let invitation = invitation();
+        let (client, mut server) = streams().await;
+        let server_task = tokio::spawn(async move {
+            let id = request_id(&mut server).await;
+            let mut response = JsonRpcErrorResponse::new(
+                Some(id),
+                -32040,
+                "malicious peer echoed pinv1_raw_secret",
+            );
+            response.error.data = Some(serde_json::json!({"code": "nickname_unavailable"}));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&response).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            server.send(Message::Close(None)).await.unwrap();
+        });
+
+        let error = preview_invitation_over_stream(client, &invitation, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, InvitationExchangeErrorKind::NicknameUnavailable);
+        assert!(!format!("{error:?} {error}").contains("pinv1_raw_secret"));
         server_task.await.unwrap();
     }
 

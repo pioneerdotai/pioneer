@@ -9,23 +9,24 @@ use crate::{
     CLIRuntimeStatusChangedNotification, ContextCompressedNotification,
     ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
-    GatewayVoiceInputStatusChangedNotification, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    GatewayVoiceInputStatusChangedNotification, InvitationChangedNotification,
+    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
     ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
     JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
-    McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
-    MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
-    SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
-    TaskCreatedNotification, TaskDeliveryCancelledNotification, TaskDeliveryDeliveredNotification,
-    TaskDeliveryFailedNotification, TaskDeliveryQueuedNotification,
-    TaskDeliveryStartedNotification, TaskDetachedNotification, TaskFailedNotification,
-    TaskPausedNotification, TaskProgressNotification, TaskQueuedNotification,
-    TaskRecoveredNotification, TaskRescheduledNotification, TaskResumedNotification,
-    TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunFailedNotification,
-    TaskRunStartedNotification, TaskScheduledNotification,
+    McpServerStatusChangedNotification, MemberChangedNotification,
+    MemoryCandidateCreatedNotification, MemoryChangedNotification, MemoryForgottenNotification,
+    SkillsChangedNotification, SkillsUploadChunkAckNotification, TaskCancelledNotification,
+    TaskCompletedNotification, TaskCreatedNotification, TaskDeliveryCancelledNotification,
+    TaskDeliveryDeliveredNotification, TaskDeliveryFailedNotification,
+    TaskDeliveryQueuedNotification, TaskDeliveryStartedNotification, TaskDetachedNotification,
+    TaskFailedNotification, TaskPausedNotification, TaskProgressNotification,
+    TaskQueuedNotification, TaskRecoveredNotification, TaskRescheduledNotification,
+    TaskResumedNotification, TaskRunCompletedNotification, TaskRunCreatedNotification,
+    TaskRunFailedNotification, TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
     ThreadClosedNotification, ThreadParticipantsChangedNotification, ThreadStartedNotification,
@@ -38,6 +39,7 @@ use crate::{
     TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
     TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
     VoiceSessionResultNotification, WorkspaceChangedNotification,
+    WorkspaceMembersChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -64,6 +66,9 @@ pub enum GatewayNotification {
     AccessChanged(AccessChangedNotification),
     AuthSessionRevoked(AuthSessionRevokedNotification),
     AuthAccessExpiring(AuthAccessExpiringNotification),
+    InvitationChanged(InvitationChangedNotification),
+    MemberChanged(MemberChangedNotification),
+    WorkspaceMembersChanged(WorkspaceMembersChangedNotification),
     WorkspaceChanged(WorkspaceChangedNotification),
     ThreadStarted(ThreadStartedNotification),
     ThreadClosed(ThreadClosedNotification),
@@ -187,6 +192,25 @@ impl GatewayNotification {
             events::AUTH_ACCESS_EXPIRING => {
                 match serde_json::from_value::<AuthAccessExpiringNotification>(params.clone()) {
                     Ok(notification) => Some(Self::AuthAccessExpiring(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::INVITATION_CHANGED => {
+                match serde_json::from_value::<InvitationChangedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::InvitationChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::MEMBER_CHANGED => {
+                match serde_json::from_value::<MemberChangedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::MemberChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::WORKSPACE_MEMBERS_CHANGED => {
+                match serde_json::from_value::<WorkspaceMembersChangedNotification>(params.clone())
+                {
+                    Ok(notification) => Some(Self::WorkspaceMembersChanged(notification)),
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
@@ -1915,5 +1939,52 @@ mod tests {
         .expect("notification should decode");
 
         assert!(GatewayNotification::from_jsonrpc(notification).is_none());
+    }
+
+    #[test]
+    fn maps_epic5_refetch_notifications_without_secret_payloads() {
+        let cases = [
+            (
+                events::INVITATION_CHANGED,
+                json!({
+                    "revision": 1,
+                    "invitation_id": "I00000000000000000001"
+                }),
+                "invitation",
+            ),
+            (
+                events::MEMBER_CHANGED,
+                json!({
+                    "revision": 2,
+                    "principal_id": "P00000000000000000001"
+                }),
+                "member",
+            ),
+            (
+                events::WORKSPACE_MEMBERS_CHANGED,
+                json!({
+                    "revision": 3,
+                    "workspace_id": "W00000000000000000001"
+                }),
+                "workspace",
+            ),
+        ];
+
+        for (method, params, expected) in cases {
+            let encoded = serde_json::to_string(&params).unwrap();
+            assert!(!encoded.contains("pinv1_"));
+            assert!(!encoded.contains("token"));
+            let notification = JsonRpcNotification::from_params(method, &params).unwrap();
+            let mapped = GatewayNotification::from_jsonrpc(notification).unwrap();
+            assert!(
+                matches!(
+                    (&mapped, expected),
+                    (GatewayNotification::InvitationChanged(_), "invitation")
+                        | (GatewayNotification::MemberChanged(_), "member")
+                        | (GatewayNotification::WorkspaceMembersChanged(_), "workspace")
+                ),
+                "unexpected Epic 5 notification {mapped:?}"
+            );
+        }
     }
 }

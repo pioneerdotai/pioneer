@@ -232,6 +232,75 @@ impl GatewayWsCommandSender {
         client_ws_commands::auth_device_create(self)
     }
 
+    pub fn invitation_create(
+        &self,
+        params: InvitationCreateParams,
+    ) -> Result<InvitationCreateResponse> {
+        client_ws_commands::invitation_create(self, params)
+    }
+
+    pub fn invitation_list(&self, params: InvitationListParams) -> Result<InvitationListResponse> {
+        client_ws_commands::invitation_list(self, params)
+    }
+
+    pub fn invitation_revoke(
+        &self,
+        params: InvitationRevokeParams,
+    ) -> Result<InvitationRevokeResponse> {
+        client_ws_commands::invitation_revoke(self, params)
+    }
+
+    pub fn member_list(&self, params: MemberListParams) -> Result<MemberListResponse> {
+        client_ws_commands::member_list(self, params)
+    }
+
+    pub fn member_avatar_get(
+        &self,
+        params: MemberAvatarGetParams,
+    ) -> Result<MemberAvatarGetResponse> {
+        client_ws_commands::member_avatar_get(self, params)
+    }
+
+    pub fn member_suspend(&self, params: MemberSuspendParams) -> Result<MemberMutationResponse> {
+        client_ws_commands::member_suspend(self, params)
+    }
+
+    pub fn member_restore(&self, params: MemberRestoreParams) -> Result<MemberMutationResponse> {
+        client_ws_commands::member_restore(self, params)
+    }
+
+    pub fn member_remove(&self, params: MemberRemoveParams) -> Result<MemberMutationResponse> {
+        client_ws_commands::member_remove(self, params)
+    }
+
+    pub fn member_device_create(
+        &self,
+        params: MemberDeviceCreateParams,
+    ) -> Result<MemberDeviceCreateResponse> {
+        client_ws_commands::member_device_create(self, params)
+    }
+
+    pub fn workspace_member_list(
+        &self,
+        params: WorkspaceMemberListParams,
+    ) -> Result<WorkspaceMemberListResponse> {
+        client_ws_commands::workspace_member_list(self, params)
+    }
+
+    pub fn workspace_member_add(
+        &self,
+        params: WorkspaceMemberAddParams,
+    ) -> Result<WorkspaceMemberMutationResponse> {
+        client_ws_commands::workspace_member_add(self, params)
+    }
+
+    pub fn workspace_member_remove(
+        &self,
+        params: WorkspaceMemberRemoveParams,
+    ) -> Result<WorkspaceMemberMutationResponse> {
+        client_ws_commands::workspace_member_remove(self, params)
+    }
+
     pub fn thread_start(&self, params: ThreadStartParams) -> Result<ThreadStartResponse> {
         client_ws_commands::thread_start(self, params)
     }

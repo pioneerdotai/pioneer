@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokedNotification, AuthSessionTerminationReason,
-    JsonRpcNotification, constants::events,
+    JsonRpcNotification, PrincipalId, constants::events,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -165,6 +165,25 @@ impl SessionManager {
             .get(&connection_id)
             .map(|connection| connection.principal.clone())
             .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
+    }
+
+    /// Returns every live auth-session identity currently associated with the
+    /// exact durable principal. Lifecycle callers union this runtime view with
+    /// the session IDs revoked by their committed transaction, closing stale
+    /// sockets without introducing a second connection registry.
+    pub(crate) async fn session_ids_for_principal(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Vec<AuthSessionId> {
+        let connections = self.connections.read().await;
+        let mut session_ids = connections
+            .values()
+            .filter(|connection| &connection.principal.principal_id == principal_id)
+            .map(|connection| connection.principal.session_id.clone())
+            .collect::<Vec<_>>();
+        session_ids.sort();
+        session_ids.dedup();
+        session_ids
     }
 
     pub(crate) async fn connection_context(
@@ -543,6 +562,12 @@ mod tests {
         assert_eq!(
             principal_a.principal_id.as_str(),
             TEST_SUPERUSER_PRINCIPAL_ID
+        );
+        assert_eq!(
+            manager
+                .session_ids_for_principal(&principal_a.principal_id)
+                .await,
+            vec![principal_a.session_id.clone()]
         );
     }
 

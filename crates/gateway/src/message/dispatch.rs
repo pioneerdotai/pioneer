@@ -10,9 +10,12 @@ use pioneer_protocol::{
     CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
     CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
-    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
-    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
-    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    InvitationCreateParams, InvitationListParams, InvitationRevokeParams, McpInstallParams,
+    McpListParams, McpPolicySetParams, MemberAvatarGetParams, MemberDeviceCreateParams,
+    MemberListParams, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
+    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
+    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
+    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPackInstallParams, SkillsPackUninstallParams,
@@ -25,12 +28,15 @@ use pioneer_protocol::{
     ThreadTimelinePageParams, TurnCancelParams, TurnPermissionRequestRespondParams,
     TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
+    WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
 use tracing::Instrument as _;
 
 use crate::authorization::{
     AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
-    AuthorizedArtifact, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
+    AuthorizedArtifact, AuthorizedInvitation, AuthorizedInvitationCollection,
+    AuthorizedInvitationGrants, AuthorizedMemberAvatar, AuthorizedMemberDirectory,
+    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
     AuthorizedWorkspace, AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy,
     MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
     ResourceResolverKind, external_error_for_decision, normal_method_entry,
@@ -39,6 +45,12 @@ use crate::authorization::{
 
 enum RequestAdmission {
     Superuser,
+    InvitationGrants(AuthorizedInvitationGrants),
+    InvitationCollection(AuthorizedInvitationCollection),
+    Invitation(AuthorizedInvitation),
+    MemberDirectory(AuthorizedMemberDirectory),
+    MemberAvatar(AuthorizedMemberAvatar),
+    MemberPrincipal(AuthorizedMemberPrincipal),
     OwnSession(AuthorizedSession),
     WorkspaceCollection(AuthorizedWorkspaceCollection),
     Workspace(AuthorizedWorkspace),
@@ -57,54 +69,21 @@ impl RequestAdmission {
     fn own_session(&self) -> Option<&AuthorizedSession> {
         match self {
             Self::OwnSession(proof) => Some(proof),
-            Self::Superuser
-            | Self::WorkspaceCollection(_)
-            | Self::Workspace(_)
-            | Self::ThreadCreate(_)
-            | Self::ThreadOpen(_)
-            | Self::ThreadManage(_)
-            | Self::ThreadParticipants(_)
-            | Self::Thread(_)
-            | Self::Turn(_)
-            | Self::Artifact(_)
-            | Self::Task(_)
-            | Self::TaskBatch(_) => None,
+            _ => None,
         }
     }
 
     fn workspace_collection(&self) -> Option<&AuthorizedWorkspaceCollection> {
         match self {
             Self::WorkspaceCollection(proof) => Some(proof),
-            Self::Superuser
-            | Self::OwnSession(_)
-            | Self::Workspace(_)
-            | Self::ThreadCreate(_)
-            | Self::ThreadOpen(_)
-            | Self::ThreadManage(_)
-            | Self::ThreadParticipants(_)
-            | Self::Thread(_)
-            | Self::Turn(_)
-            | Self::Artifact(_)
-            | Self::Task(_)
-            | Self::TaskBatch(_) => None,
+            _ => None,
         }
     }
 
     fn workspace(&self) -> Option<&AuthorizedWorkspace> {
         match self {
             Self::Workspace(proof) => Some(proof),
-            Self::Superuser
-            | Self::OwnSession(_)
-            | Self::WorkspaceCollection(_)
-            | Self::ThreadCreate(_)
-            | Self::ThreadOpen(_)
-            | Self::ThreadManage(_)
-            | Self::ThreadParticipants(_)
-            | Self::Thread(_)
-            | Self::Turn(_)
-            | Self::Artifact(_)
-            | Self::Task(_)
-            | Self::TaskBatch(_) => None,
+            _ => None,
         }
     }
 
@@ -167,6 +146,48 @@ impl RequestAdmission {
     fn task_batch(&self) -> Option<&[AuthorizedTask]> {
         match self {
             Self::TaskBatch(proofs) => Some(proofs.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn invitation_grants(&self) -> Option<&AuthorizedInvitationGrants> {
+        match self {
+            Self::InvitationGrants(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn invitation_collection(&self) -> Option<&AuthorizedInvitationCollection> {
+        match self {
+            Self::InvitationCollection(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn invitation(&self) -> Option<&AuthorizedInvitation> {
+        match self {
+            Self::Invitation(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn member_directory(&self) -> Option<&AuthorizedMemberDirectory> {
+        match self {
+            Self::MemberDirectory(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn member_avatar(&self) -> Option<&AuthorizedMemberAvatar> {
+        match self {
+            Self::MemberAvatar(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn member_principal(&self) -> Option<&AuthorizedMemberPrincipal> {
+        match self {
+            Self::MemberPrincipal(proof) => Some(proof),
             _ => None,
         }
     }
@@ -701,6 +722,275 @@ impl MessageProcessor {
         }
 
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        if matches!(
+            request.method.as_str(),
+            methods::WORKSPACE_MEMBER_LIST
+                | methods::WORKSPACE_MEMBER_ADD
+                | methods::WORKSPACE_MEMBER_REMOVE
+        ) {
+            let workspace_id = if request.method == methods::WORKSPACE_MEMBER_LIST {
+                serde_json::from_value::<WorkspaceMemberListParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?
+                .workspace_id
+            } else if request.method == methods::WORKSPACE_MEMBER_ADD {
+                serde_json::from_value::<WorkspaceMemberAddParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?
+                .workspace_id
+            } else {
+                serde_json::from_value::<WorkspaceMemberRemoveParams>(
+                    request.params.clone().unwrap_or_else(empty_object_value),
+                )
+                .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?
+                .workspace_id
+            };
+            let resolution = resolver
+                .authorize_workspace(
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                    workspace_id.as_str(),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Workspace(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if request.method == methods::MEMBER_LIST {
+            serde_json::from_value::<MemberListParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?;
+            let resolution = resolver.authorize_member_directory(context.principal(), &action_gate);
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::MemberDirectory(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if request.method == methods::MEMBER_AVATAR_GET {
+            let params = serde_json::from_value::<MemberAvatarGetParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?;
+            let database = self.crud_store.database_connection();
+            let resolution = resolver
+                .authorize_member_avatar(
+                    &database,
+                    context.principal(),
+                    &action_gate,
+                    &params.principal_id,
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::MemberAvatar(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if matches!(
+            request.method.as_str(),
+            methods::MEMBER_SUSPEND
+                | methods::MEMBER_RESTORE
+                | methods::MEMBER_REMOVE
+                | methods::MEMBER_DEVICE_CREATE
+        ) {
+            let params_value = request.params.clone().unwrap_or_else(empty_object_value);
+            let target_principal_id = if request.method == methods::MEMBER_SUSPEND {
+                serde_json::from_value::<MemberSuspendParams>(params_value)
+                    .map_err(|_| {
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .principal_id
+            } else if request.method == methods::MEMBER_RESTORE {
+                serde_json::from_value::<MemberRestoreParams>(params_value)
+                    .map_err(|_| {
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .principal_id
+            } else if request.method == methods::MEMBER_REMOVE {
+                serde_json::from_value::<MemberRemoveParams>(params_value)
+                    .map_err(|_| {
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .principal_id
+            } else {
+                serde_json::from_value::<MemberDeviceCreateParams>(params_value)
+                    .map_err(|_| {
+                        AuthorizationExternalError::Validation.response(request.id.clone())
+                    })?
+                    .principal_id
+            };
+            let database = self.crud_store.database_connection();
+            let resolution = resolver
+                .authorize_member_principal(
+                    &database,
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                    &target_principal_id,
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::MemberPrincipal(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if request.method == methods::INVITE_CREATE {
+            let params = serde_json::from_value::<InvitationCreateParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::ResourceScopeMismatch,
+                    disclosure: DisclosurePolicy::Validation,
+                };
+                record_method_decision(entry, &decision);
+                AuthorizationExternalError::Validation.response(request.id.clone())
+            })?;
+            let database = self.crud_store.database_connection();
+            let resolution = resolver
+                .authorize_invitation_grants(
+                    &database,
+                    context.principal(),
+                    &action_gate,
+                    params.workspace_ids.as_slice(),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::InvitationGrants(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if request.method == methods::INVITE_LIST {
+            serde_json::from_value::<InvitationListParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?;
+            let resolution =
+                resolver.authorize_invitation_collection(context.principal(), &action_gate);
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::InvitationCollection(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
+        if request.method == methods::INVITE_REVOKE {
+            let params = serde_json::from_value::<InvitationRevokeParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| AuthorizationExternalError::Validation.response(request.id.clone()))?;
+            let database = self.crud_store.database_connection();
+            let resolution = resolver
+                .authorize_invitation(
+                    &database,
+                    context.principal(),
+                    &action_gate,
+                    &params.invitation_id,
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Invitation(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
         if !action_gate.is_final_allow()
             && (entry.resolver == ResourceResolverKind::Task
                 || request.method == methods::TASK_CREATE)
@@ -2229,6 +2519,339 @@ impl MessageProcessor {
         let method = request.method.clone();
         dispatch_request_future! {
             method.as_str();
+                methods::WORKSPACE_MEMBER_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<WorkspaceMemberListParams>(params_value) {
+                        Ok(params) => {
+                            self.workspace_member_list(
+                                &context,
+                                admission.workspace().expect(
+                                    "central admission supplies workspace member-list proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::WORKSPACE_MEMBER_LIST),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::WORKSPACE_MEMBER_ADD => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<WorkspaceMemberAddParams>(params_value) {
+                        Ok(params) => {
+                            self.workspace_member_add(
+                                &context,
+                                admission.workspace().expect(
+                                    "central admission supplies workspace member-add proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::WORKSPACE_MEMBER_ADD),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::WORKSPACE_MEMBER_REMOVE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<WorkspaceMemberRemoveParams>(params_value) {
+                        Ok(params) => {
+                            self.workspace_member_remove(
+                                &context,
+                                admission.workspace().expect(
+                                    "central admission supplies workspace member-remove proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::WORKSPACE_MEMBER_REMOVE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberListParams>(params_value) {
+                        Ok(params) => {
+                            self.member_list(
+                                &context,
+                                admission.member_directory().expect(
+                                    "central admission supplies member directory proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_LIST),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_AVATAR_GET => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberAvatarGetParams>(params_value) {
+                        Ok(params) => {
+                            self.member_avatar_get(
+                                &context,
+                                admission.member_avatar().expect(
+                                    "central admission supplies member avatar proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_AVATAR_GET),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_SUSPEND => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberSuspendParams>(params_value) {
+                        Ok(params) => {
+                            self.member_suspend(
+                                &context,
+                                admission.member_principal().expect(
+                                    "central admission supplies Member principal proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_SUSPEND),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_RESTORE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberRestoreParams>(params_value) {
+                        Ok(params) => {
+                            self.member_restore(
+                                &context,
+                                admission.member_principal().expect(
+                                    "central admission supplies Member principal proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_RESTORE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_REMOVE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberRemoveParams>(params_value) {
+                        Ok(params) => {
+                            self.member_remove(
+                                &context,
+                                admission.member_principal().expect(
+                                    "central admission supplies Member principal proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_REMOVE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::MEMBER_DEVICE_CREATE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<MemberDeviceCreateParams>(params_value) {
+                        Ok(params) => {
+                            self.member_device_create(
+                                &context,
+                                admission.member_principal().expect(
+                                    "central admission supplies Member principal proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::MEMBER_DEVICE_CREATE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::INVITE_CREATE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<InvitationCreateParams>(params_value) {
+                        Ok(params) => {
+                            self.invitation_create(
+                                &context,
+                                admission.invitation_grants().expect(
+                                    "central admission supplies invitation grant proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::INVITE_CREATE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::INVITE_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<InvitationListParams>(params_value) {
+                        Ok(params) => {
+                            self.invitation_list(
+                                &context,
+                                admission.invitation_collection().expect(
+                                    "central admission supplies invitation collection proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::INVITE_LIST
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::INVITE_REVOKE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<InvitationRevokeParams>(params_value) {
+                        Ok(params) => {
+                            self.invitation_revoke(
+                                &context,
+                                admission.invitation().expect(
+                                    "central admission supplies invitation proof",
+                                ),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::INVITE_REVOKE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::AUTH_ME => {
                     if request.params.as_ref().is_some_and(|params| {
                         params.as_object().is_none_or(|value| !value.is_empty())

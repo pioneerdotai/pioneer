@@ -10,6 +10,7 @@ pub const SKILL_PACK_ID_LEN: usize = SKILL_ID_LEN;
 pub const GATEWAY_ID_LEN: usize = 21;
 pub const PRINCIPAL_ID_LEN: usize = 21;
 pub const AUTH_DOMAIN_ID_LEN: usize = 21;
+pub const ADMINISTRATION_DOMAIN_ID_LEN: usize = 21;
 
 const ALPHANUMERIC: [char; 62] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
@@ -579,13 +580,143 @@ auth_domain_id!(AuthSessionId, "auth session id");
 auth_domain_id!(RefreshCredentialId, "refresh credential id");
 auth_domain_id!(TokenFamilyId, "token family id");
 
+macro_rules! administration_domain_id {
+    ($name:ident, $label:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+        #[serde(transparent)]
+        pub struct $name(
+            #[schemars(length(equal = 21), regex(pattern = r"^[A-Za-z0-9]{21}$"))] String,
+        );
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, AdministrationDomainIdError> {
+                validate_checked_id(value.into(), ADMINISTRATION_DOMAIN_ID_LEN)
+                    .map(Self)
+                    .map_err(|error| AdministrationDomainIdError::from_validation($label, error))
+            }
+
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = AdministrationDomainIdError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = AdministrationDomainIdError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = AdministrationDomainIdError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(D::Error::custom)
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdministrationDomainIdError {
+    InvalidLength {
+        domain: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidCharacter {
+        domain: &'static str,
+        index: usize,
+        character: char,
+    },
+}
+
+impl AdministrationDomainIdError {
+    fn from_validation(domain: &'static str, error: CheckedIdValidationError) -> Self {
+        match error {
+            CheckedIdValidationError::InvalidLength { expected, actual } => Self::InvalidLength {
+                domain,
+                expected,
+                actual,
+            },
+            CheckedIdValidationError::InvalidCharacter { index, character } => {
+                Self::InvalidCharacter {
+                    domain,
+                    index,
+                    character,
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for AdministrationDomainIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength {
+                domain,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{domain} must be exactly {expected} characters, got {actual}"
+            ),
+            Self::InvalidCharacter {
+                domain,
+                index,
+                character,
+            } => write!(
+                formatter,
+                "{domain} must contain only ASCII alphanumeric characters; found {character:?} at byte {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdministrationDomainIdError {}
+
+administration_domain_id!(InvitationId, "invitation id");
+administration_domain_id!(AuditEventId, "audit event id");
+administration_domain_id!(WorkspaceId, "workspace id");
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_DOMAIN_ID_LEN, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId, GatewayIdError,
-        PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId, SKILL_ID_LEN,
-        SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError, TokenFamilyId,
-        generate_id,
+        ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, AuditEventId, AuthSessionId, DeviceId,
+        GATEWAY_ID_LEN, GatewayId, GatewayIdError, InvitationId, PRINCIPAL_ID_LEN, PrincipalId,
+        PrincipalIdError, RefreshCredentialId, SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId,
+        SkillIdError, SkillPackId, SkillPackIdError, TokenFamilyId, WorkspaceId, generate_id,
     };
     use serde_json::json;
 
@@ -619,6 +750,25 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PrincipalId>(json!("P00000000000000000001")).unwrap(),
             principal
+        );
+    }
+
+    #[test]
+    fn administration_domain_ids_are_checked_and_round_trip() {
+        let invitation = InvitationId::new("I00000000000000000001").unwrap();
+        let audit = AuditEventId::new("A00000000000000000001").unwrap();
+        let workspace = WorkspaceId::new("W00000000000000000001").unwrap();
+
+        assert_eq!(ADMINISTRATION_DOMAIN_ID_LEN, 21);
+        assert_eq!(invitation.as_str(), "I00000000000000000001");
+        assert_eq!(audit.as_str(), "A00000000000000000001");
+        assert_eq!(workspace.as_str(), "W00000000000000000001");
+        assert!(InvitationId::new("short").is_err());
+        assert!(AuditEventId::new("A0000000000000000000_").is_err());
+        assert!(WorkspaceId::new("W0000000000000000000-").is_err());
+        assert_eq!(
+            serde_json::from_value::<InvitationId>(json!("I00000000000000000001")).unwrap(),
+            invitation
         );
     }
 

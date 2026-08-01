@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemberSuspendParams",
+  "type": "object",
+  "properties": {
+    "expected_status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PrincipalStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "principal_id"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed"
+      ]
+    }
+  }
+}

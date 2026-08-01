@@ -2,6 +2,7 @@
 
 pub mod connectivity;
 pub mod device_activation;
+pub mod invitation;
 pub mod registry;
 pub mod runtime;
 pub mod session_lifecycle;

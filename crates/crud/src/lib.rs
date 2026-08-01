@@ -13,20 +13,26 @@ mod turn_item_terminal;
 mod util;
 
 pub use events::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+pub use repositories::administrative_audit::{
+    NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
+    insert_administrative_audit_event,
+};
 pub use repositories::auth_session::{
-    AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewPendingDeviceSessionRow,
-    NewRefreshCredentialRow, PendingSessionIssuer, activate_pending_auth_session,
-    activate_pending_device, advance_auth_session_refresh, auth_session_status_to_db,
-    client_kind_to_db, delete_refresh_for_session, device_status_to_db,
-    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
-    expire_stale_pending_sessions, insert_pending_device_session, insert_refresh_credential,
+    AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewActiveDeviceSessionRow,
+    NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
+    PrincipalCredentialRevocation, activate_pending_auth_session, activate_pending_device,
+    advance_auth_session_refresh, auth_session_status_to_db, client_kind_to_db,
+    delete_refresh_for_session, device_status_to_db, expire_pending_auth_session,
+    expire_session_refresh_family, expire_stale_auth_sessions, expire_stale_pending_sessions,
+    insert_active_device_session, insert_pending_device_session, insert_refresh_credential,
     list_pending_activation_locator_hashes, list_sessions_for_principal,
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_pending_local_session, load_pending_session_by_activation_locator_hash,
     load_pending_session_for_creator, load_session, load_session_by_activation_hash,
     mark_device_revoked, mark_session_revoked, record_failed_device_activation,
-    replace_current_refresh, revoke_reason_to_db, revoke_session_family_for_refresh_reuse,
-    scan_auth_persistence_invariants, touch_active_auth_session, touch_active_device,
+    replace_current_refresh, revoke_principal_credentials, revoke_reason_to_db,
+    revoke_session_family_for_refresh_reuse, scan_auth_persistence_invariants,
+    touch_active_auth_session, touch_active_device,
 };
 pub use repositories::authorization_persistence::{
     AuthorizationPersistenceInvariantKind, AuthorizationPersistenceInvariantReport,
@@ -45,25 +51,45 @@ pub use repositories::authorization_scope::{
 };
 pub use repositories::identity::{
     ActorReferenceRow, ActorResourceKind, GATEWAY_SINGLETON_KEY, GatewayIdentityRecord,
-    GatewayPrincipalRecord, IdentityInvariantRows, LegacyActorBackfillCounts, actor_ref_from_db,
-    actor_ref_to_db, backfill_legacy_actor_references, create_gateway_singleton, create_superuser,
+    GatewayPrincipalRecord, IdentityInvariantRows, LegacyActorBackfillCounts,
+    NewMemberPrincipalRow, actor_ref_from_db, actor_ref_to_db, backfill_legacy_actor_references,
+    create_gateway_singleton, create_member_principal, create_superuser,
     gateway_identity_record_from_model, gateway_principal_record_from_model,
     list_gateway_identities, list_gateway_principals, load_gateway_singleton,
     load_identity_invariant_rows, load_principal_by_id, load_superusers_for_gateway,
-    mark_gateway_auth_ready, principal_kind_from_db, principal_kind_to_db,
+    mark_gateway_auth_ready, nickname_key_exists, principal_kind_from_db, principal_kind_to_db,
     principal_status_from_db, principal_status_to_db, set_identity_bootstrap_version,
+    transition_member_principal_status,
+};
+pub use repositories::invitation::{
+    InvitationListCursor, InvitationListPage, InvitationProjectionRows,
+    InvitationTransitionOutcome, InvitationWithGrants, InvitationWorkspaceProjectionRow,
+    NewInvitationRow, PendingInvitationLookup, count_live_pending_invitations_for_creator,
+    effective_invitation_status, insert_invitation, insert_invitation_grants,
+    invitation_revoke_reason_from_db, invitation_revoke_reason_to_db, invitation_status_from_db,
+    invitation_status_to_db, list_invitations_for_superuser, list_pending_invitations_for_creator,
+    load_effective_pending_invitation_by_token_hash, load_invitation, load_invitation_grants,
+    load_invitation_projection, load_invitation_with_grants,
+    revoke_pending_invitations_for_creator, transition_pending_to_accepted,
+    transition_pending_to_expired, transition_pending_to_revoked,
 };
 pub use repositories::membership::{
-    NewThreadMembership, NewWorkspaceMembership, PersistedThreadAccessClass,
-    PrivateThreadParticipantMutation, delete_thread_membership, delete_workspace_membership,
-    find_accessible_thread_for_principal, find_active_workspace_for_principal,
-    find_shared_workspace_principal_for_principal, find_thread_membership,
-    find_workspace_membership, insert_thread_membership, insert_workspace_membership,
-    list_accessible_threads_for_principal, list_active_workspaces_for_principal,
-    list_directory_principals_for_superuser, list_shared_workspace_principals_for_principal,
+    MemberDirectoryCursor, MemberDirectoryPage, NewThreadMembership, NewWorkspaceMembership,
+    PersistedThreadAccessClass, PrincipalMembershipDeletion, PrivateThreadParticipantMutation,
+    WorkspaceMembershipDeletion, delete_all_memberships_for_principal, delete_thread_membership,
+    delete_workspace_membership, find_accessible_thread_for_principal,
+    find_active_workspace_for_principal, find_shared_workspace_principal_for_principal,
+    find_thread_membership, find_workspace_membership, insert_thread_membership,
+    insert_workspace_membership, list_accessible_threads_for_principal,
+    list_active_workspaces_for_principal, list_member_directory_page,
     list_thread_memberships_for_principal, list_thread_memberships_for_thread,
-    list_workspace_memberships_for_principal, list_workspace_memberships_for_workspace,
-    persisted_thread_access_class_from_db, persisted_thread_access_class_to_db,
+    list_workspace_member_principals_page, list_workspace_memberships_for_principal,
+    list_workspace_memberships_for_workspace, persisted_thread_access_class_from_db,
+    persisted_thread_access_class_to_db,
+};
+pub use repositories::principal_avatar::{
+    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, insert_principal_avatar,
+    list_principal_avatar_revisions, load_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::turn::find_turn_initiator;

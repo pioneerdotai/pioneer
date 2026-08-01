@@ -8414,6 +8414,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.13.0",
+ "image",
  "jsonwebtoken",
  "keepawake",
  "libc",
@@ -8584,6 +8585,7 @@ dependencies = [
 name = "pioneer-protocol"
 version = "0.36.3"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "nanoid",
  "schemars 1.2.2",

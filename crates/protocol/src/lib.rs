@@ -3,13 +3,16 @@ pub mod constants;
 mod access;
 mod agent_event;
 mod artifact;
+mod audit;
 mod auth;
 mod cli_runtime;
 mod id;
 mod identity;
+mod invitation;
 mod jsonrpc;
 mod markdown;
 mod mcp;
+mod member;
 mod memory;
 mod notification;
 mod provider;
@@ -56,6 +59,10 @@ pub use artifact::{
     ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
     ThreadArtifactsChangedNotification,
 };
+pub use audit::{
+    AUDIT_METADATA_MAX_BYTES, AUDIT_METADATA_VERSION_V1, AuditAction, AuditEvent, AuditEventDomain,
+    AuditMetadataError, AuditTargetKind, BoundedServerGeneratedMetadata,
+};
 pub use auth::{
     AuthAccessExpiringNotification, AuthCredentialPurpose, AuthDeviceActivateParams,
     AuthDeviceActivationPresentation, AuthDeviceCreateResponse, AuthDeviceSnapshot,
@@ -66,10 +73,11 @@ pub use auth::{
     AuthSessionStatus, AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind,
     CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET, DEVICE_ACTIVATION_CODE_SYMBOLS,
     DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS,
-    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, REFRESH_CREDENTIAL_BODY_LEN,
-    REFRESH_CREDENTIAL_PREFIX, device_activation_locator, encode_device_activation_entropy,
-    format_device_activation_code, normalize_device_activation_code,
-    normalize_device_activation_code_input,
+    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES,
+    MAX_PROTECTED_GATEWAY_URI_BYTES, REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX,
+    device_activation_locator, encode_device_activation_entropy, format_device_activation_code,
+    normalize_device_activation_code, normalize_device_activation_code_input,
+    normalize_protected_gateway_endpoint,
 };
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
@@ -94,14 +102,28 @@ pub use cli_runtime::{
     sanitize_runtime_diagnostic_lines,
 };
 pub use id::{
-    AUTH_DOMAIN_ID_LEN, AuthDomainIdError, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId,
-    GatewayIdError, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId,
+    ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, AdministrationDomainIdError, AuditEventId,
+    AuthDomainIdError, AuthSessionId, DeviceId, GATEWAY_ID_LEN, GatewayId, GatewayIdError,
+    InvitationId, PRINCIPAL_ID_LEN, PrincipalId, PrincipalIdError, RefreshCredentialId,
     SKILL_ID_LEN, SKILL_PACK_ID_LEN, SkillId, SkillIdError, SkillPackId, SkillPackIdError,
-    TokenFamilyId, generate_id,
+    TokenFamilyId, WorkspaceId, generate_id,
 };
 pub use identity::{
     MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey,
     RoleKeyError,
+};
+pub use invitation::{
+    INVITATION_CREDENTIAL_BODY_LEN, INVITATION_CREDENTIAL_ENTROPY_BYTES,
+    INVITATION_CREDENTIAL_PREFIX, INVITATION_CURSOR_MAX_BYTES, INVITATION_MAX_WORKSPACE_GRANTS,
+    INVITATION_MIN_WORKSPACE_GRANTS, INVITATION_PAGE_DEFAULT_LIMIT, INVITATION_PAGE_MAX_LIMIT,
+    INVITATION_TTL_SECONDS, InvitationAcceptParams, InvitationAcceptResponse,
+    InvitationChangedNotification, InvitationCreateParams, InvitationCreateResponse,
+    InvitationCredential, InvitationCredentialError, InvitationErrorReason,
+    InvitationInviterSummary, InvitationListParams, InvitationListResponse, InvitationParamsError,
+    InvitationPresentation, InvitationPreviewResponse, InvitationRevokeParams,
+    InvitationRevokeReason, InvitationRevokeResponse, InvitationStatus, InvitationSummary,
+    InvitationTransportSecurity, InvitationUriError, InvitationWorkspaceGrant,
+    InvitationWorkspaceSummary,
 };
 pub use jsonrpc::{
     AUTHENTICATION_TERMINAL_CODE, FORBIDDEN_CODE, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
@@ -125,6 +147,19 @@ pub use mcp::{
     McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
+};
+pub use member::{
+    MEMBER_DIRECTORY_CURSOR_MAX_BYTES, MEMBER_DIRECTORY_DEFAULT_LIMIT, MEMBER_DIRECTORY_MAX_LIMIT,
+    MEMBER_DISPLAY_NAME_MAX_SCALARS, MEMBER_DISPLAY_NAME_MAX_UTF8_BYTES, MEMBER_NICKNAME_MAX_LEN,
+    MEMBER_NICKNAME_MIN_LEN, MemberAvatarGetParams, MemberAvatarGetResponse,
+    MemberChangedNotification, MemberDeviceCreateParams, MemberDeviceCreateResponse,
+    MemberDirectoryParamsError, MemberListParams, MemberListResponse, MemberManagementErrorReason,
+    MemberMutationResponse, MemberProfileValidationError, MemberRemoveParams, MemberRestoreParams,
+    MemberSummary, MemberSuspendParams, NewMemberProfile, PROFILE_AVATAR_MAX_BASE64_LEN,
+    PROFILE_AVATAR_MAX_DECODED_BYTES, PROFILE_AVATAR_MAX_DIMENSION, ProfileAvatarInput,
+    ProfileAvatarMediaType, WorkspaceMemberAddParams, WorkspaceMemberListParams,
+    WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
+    WorkspaceMembersChangedNotification,
 };
 pub use memory::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryAttributeCardinality, MemoryCandidate,

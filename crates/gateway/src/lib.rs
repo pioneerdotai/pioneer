@@ -4,6 +4,7 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
+mod administrative_audit;
 mod artifact_prompt_refs;
 mod attachment;
 mod auth;
@@ -17,13 +18,16 @@ pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
 mod database;
+mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
 mod identity;
+mod invitation;
 mod keep_awake;
 mod mcp_secrets;
 mod mcp_service;
+mod member;
 mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
@@ -628,6 +632,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.skills.max_skill_file_bytes,
     ));
 
+    let invitation_endpoint = config.gateway.listen_addr.clone();
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry.clone(),
@@ -650,7 +655,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     )
-    .with_cli_mcp_limits(cli_mcp_limits);
+    .with_cli_mcp_limits(cli_mcp_limits)
+    .with_invitation_endpoint(invitation_endpoint);
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,
@@ -672,6 +678,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
+    auth_service.set_invitation_accept_post_commit_hook(message_processor.clone());
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
         .context("failed to apply gateway keepawake setting")?;

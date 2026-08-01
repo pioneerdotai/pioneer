@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use pioneer_config::AppConfig;
+use pioneer_protocol::InvitationTransportSecurity;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 
 use crate::helpers::unix_timestamp_secs;
@@ -9,7 +10,8 @@ use crate::secrets::AuthKeyMaterial;
 
 use super::{
     AccessCredential, AccessJwtIssuer, AuthError, AuthErrorCode, DeviceActivationContext,
-    PresentedCredential, PresentedCredentialKind, RefreshExchangeContext, RestrictedAuthContext,
+    InvitationExchangeContext, PresentedCredential, PresentedCredentialKind,
+    RefreshExchangeContext, RestrictedAuthContext,
 };
 
 #[derive(Clone)]
@@ -103,6 +105,19 @@ impl AuthAdmissionService {
                     presented,
                     RestrictedAuthContext::DeviceActivation(DeviceActivationContext {
                         gateway_id: self.gateway_id.clone(),
+                    }),
+                )))
+            }
+            PresentedCredentialKind::Invitation => {
+                Ok(CapturedAdmission::Restricted(RestrictedAdmission::new(
+                    presented,
+                    RestrictedAuthContext::Invitation(InvitationExchangeContext {
+                        gateway_id: self.gateway_id.clone(),
+                        transport: if request.uri().scheme_str() == Some("wss") {
+                            InvitationTransportSecurity::SecureWss
+                        } else {
+                            InvitationTransportSecurity::InsecureWs
+                        },
                     }),
                 )))
             }

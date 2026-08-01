@@ -5,17 +5,31 @@
 //! seams after the corresponding schema and authorization layers exist.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 
-use crate::auth::test_support::{IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID};
+use crate::auth::test_support::{
+    IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID, TestAuthClock,
+};
 use crate::authorization::ThreadAccessClass;
 use crate::identity::{
     GatewayIdentitySnapshot, IdentityBootstrapSnapshot, SuperuserIdentitySnapshot,
 };
-use pioneer_protocol::{GatewayId, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey};
+use pioneer_protocol::{
+    ClientInstallationDescriptor, ClientKind, GatewayId, PrincipalId, PrincipalKind,
+    PrincipalStatus, RoleKey,
+};
+
+pub(crate) const EPIC5_TEST_NOW_UNIX: u64 = 1_800_000_000;
+
+static FIXTURE_SECRET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) const MEMBER_A_ID: &str = "P0000000000000000000A";
 pub(crate) const MEMBER_B_ID: &str = "P0000000000000000000B";
@@ -54,13 +68,35 @@ pub(crate) struct PrincipalFixture {
     pub status: FixturePrincipalStatus,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FixtureSecret(String);
+
+impl FixtureSecret {
+    fn generated(label: &str) -> Self {
+        let sequence = FIXTURE_SECRET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self(format!("epic5-test-{label}-{sequence}"))
+    }
+
+    #[cfg(test)]
+    fn expose_for_assertion(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for FixtureSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FixtureSecret([REDACTED])")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceSessionFixture {
     pub principal_id: &'static str,
     pub device_id: &'static str,
     pub session_id: &'static str,
-    pub access_credential: &'static str,
-    pub refresh_credential: &'static str,
+    pub installation: ClientInstallationDescriptor,
+    pub access_credential: FixtureSecret,
+    pub refresh_credential: FixtureSecret,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,15 +192,29 @@ impl Epic4Fixture {
                 principal_id: MEMBER_A_ID,
                 device_id: "D0000000000000000000A",
                 session_id: "S0000000000000000000A",
-                access_credential: "fixture-access-member-a",
-                refresh_credential: "fixture-refresh-member-a",
+                installation: ClientInstallationDescriptor {
+                    installation_id: "fixture-member-a".to_owned(),
+                    display_name: "Member A Desktop".to_owned(),
+                    client_kind: ClientKind::Desktop,
+                    platform: Some("test".to_owned()),
+                    client_version: Some("1".to_owned()),
+                },
+                access_credential: FixtureSecret::generated("access-member-a"),
+                refresh_credential: FixtureSecret::generated("refresh-member-a"),
             },
             DeviceSessionFixture {
                 principal_id: MEMBER_B_ID,
                 device_id: "D0000000000000000000B",
                 session_id: "S0000000000000000000B",
-                access_credential: "fixture-access-member-b",
-                refresh_credential: "fixture-refresh-member-b",
+                installation: ClientInstallationDescriptor {
+                    installation_id: "fixture-member-b".to_owned(),
+                    display_name: "Member B Desktop".to_owned(),
+                    client_kind: ClientKind::Desktop,
+                    platform: Some("test".to_owned()),
+                    client_version: Some("1".to_owned()),
+                },
+                access_credential: FixtureSecret::generated("access-member-b"),
+                refresh_credential: FixtureSecret::generated("refresh-member-b"),
             },
         ]
         .into_iter()
@@ -217,6 +267,52 @@ impl Epic4Fixture {
             sessions,
             workspace_memberships,
             threads,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RecipientCapture {
+    recipients_by_method: Mutex<BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl RecipientCapture {
+    pub(crate) fn record<I, S>(&self, method: impl Into<String>, recipients: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.recipients_by_method
+            .lock()
+            .expect("Epic 5 recipient capture lock")
+            .entry(method.into())
+            .or_default()
+            .extend(recipients.into_iter().map(Into::into));
+    }
+
+    pub(crate) fn recipients(&self, method: &str) -> BTreeSet<String> {
+        self.recipients_by_method
+            .lock()
+            .expect("Epic 5 recipient capture lock")
+            .get(method)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Epic5Fixture {
+    pub authorization: Epic4Fixture,
+    pub clock: TestAuthClock,
+    pub recipients: RecipientCapture,
+}
+
+impl Epic5Fixture {
+    pub(crate) fn deterministic() -> Self {
+        Self {
+            authorization: Epic4Fixture::deterministic(),
+            clock: TestAuthClock::new(EPIC5_TEST_NOW_UNIX),
+            recipients: RecipientCapture::default(),
         }
     }
 }
@@ -407,11 +503,25 @@ pub(crate) struct IsolatedEpic4Harness {
 
 impl IsolatedEpic4Harness {
     pub(crate) async fn new() -> anyhow::Result<Self> {
+        Self::populated().await
+    }
+
+    pub(crate) async fn empty() -> anyhow::Result<Self> {
+        Self::with_member_foundation(false).await
+    }
+
+    pub(crate) async fn populated() -> anyhow::Result<Self> {
+        Self::with_member_foundation(true).await
+    }
+
+    async fn with_member_foundation(populated: bool) -> anyhow::Result<Self> {
         let runtime = IsolatedAuthRuntime::new()?;
         runtime.validate()?;
         let database = Database::connect("sqlite::memory:").await?;
         Migrator::up(&database, None).await?;
-        materialize_member_auth_foundation(&database).await?;
+        if populated {
+            materialize_member_auth_foundation(&database).await?;
+        }
         let gateway_id = GatewayId::new(TEST_GATEWAY_ID)?;
         let identity = IdentityBootstrapSnapshot {
             gateway: GatewayIdentitySnapshot {
@@ -703,6 +813,60 @@ mod tests {
         assert_ne!(member_a.session_id, member_b.session_id);
         assert_ne!(member_a.access_credential, member_b.access_credential);
         assert_ne!(member_a.refresh_credential, member_b.refresh_credential);
+        assert_ne!(
+            member_a.access_credential.expose_for_assertion(),
+            member_b.access_credential.expose_for_assertion()
+        );
+        assert!(!format!("{fixture:?}").contains("epic5-test-"));
+        assert!(format!("{fixture:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn epic5_fixture_has_deterministic_clock_installations_and_recipient_capture() {
+        let fixture = Epic5Fixture::deterministic();
+        assert_eq!(fixture.clock.now_unix(), EPIC5_TEST_NOW_UNIX);
+        assert_eq!(
+            fixture.authorization.sessions[MEMBER_A_ID]
+                .installation
+                .installation_id,
+            "fixture-member-a"
+        );
+        fixture.recipients.record(
+            "member/changed",
+            [TEST_SUPERUSER_ID, MEMBER_A_ID, MEMBER_A_ID],
+        );
+        assert_eq!(
+            fixture.recipients.recipients("member/changed"),
+            BTreeSet::from([TEST_SUPERUSER_ID.to_owned(), MEMBER_A_ID.to_owned()])
+        );
+        assert!(fixture.recipients.recipients("unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorization_fixture_provides_empty_and_populated_database_states() {
+        let empty = IsolatedEpic4Harness::empty()
+            .await
+            .expect("empty isolated Epic 4 harness");
+        assert_eq!(
+            scalar_i64(
+                &empty.database,
+                "SELECT COUNT(*) AS value FROM gateway_principal"
+            )
+            .await,
+            0
+        );
+
+        let populated = IsolatedEpic4Harness::populated()
+            .await
+            .expect("populated isolated Epic 4 harness");
+        assert_eq!(
+            scalar_i64(
+                &populated.database,
+                "SELECT COUNT(*) AS value FROM gateway_principal"
+            )
+            .await,
+            5
+        );
     }
 
     #[test]
@@ -755,6 +919,32 @@ mod tests {
             .await
             .expect("in-memory database is isolated and live");
         assert_eq!(harness.fixture.gateway_id, TEST_GATEWAY_ID);
+        harness
+            .database
+            .execute_unprepared(
+                "INSERT INTO invitation(\
+                    id,gateway_id,created_by_principal_id,created_by_session_id,status,token_hash,\
+                    token_format_version,expires_at,accepted_at,revoked_at,expired_at,\
+                    accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,\
+                    created_at,updated_at\
+                 ) VALUES\
+                    ('I0000000000000000000A','G00000000000000000001',\
+                     'P0000000000000000000B','S0000000000000000000B','accepted',NULL,1,\
+                     datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
+                     'P0000000000000000000A','D0000000000000000000A',\
+                     'S0000000000000000000A',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                    ('I0000000000000000000B','G00000000000000000001',\
+                     'P0000000000000000000A','S0000000000000000000A','accepted',NULL,1,\
+                     datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
+                     'P0000000000000000000B','D0000000000000000000B',\
+                     'S0000000000000000000B',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
+                 INSERT INTO invitation_workspace_grant(invitation_id,workspace_id,created_at)\
+                 VALUES\
+                    ('I0000000000000000000A','W00000000000000000001',CURRENT_TIMESTAMP),\
+                    ('I0000000000000000000B','W00000000000000000001',CURRENT_TIMESTAMP)",
+            )
+            .await
+            .expect("seed exact invitation provenance for Member fixture sessions");
         crate::auth::ensure_auth_readiness(&harness.database, &harness.identity)
             .await
             .expect("materialized Member fixture passes auth readiness");

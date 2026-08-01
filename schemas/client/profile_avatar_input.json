@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProfileAvatarInput",
+  "type": "object",
+  "properties": {
+    "content_base64": {
+      "type": "string",
+      "maxLength": 349528,
+      "minLength": 1
+    },
+    "media_type": {
+      "$ref": "#/$defs/ProfileAvatarMediaType"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "media_type",
+    "content_base64"
+  ],
+  "$defs": {
+    "ProfileAvatarMediaType": {
+      "type": "string",
+      "enum": [
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ]
+    }
+  }
+}

@@ -23,6 +23,8 @@ pub struct Model {
     pub removed_at: Option<DateTimeWithTimeZone>,
     pub authorization_guard: i64,
     #[sea_orm(has_many)]
+    pub audit_events: HasMany<super::audit_event::Entity>,
+    #[sea_orm(has_many)]
     pub auth_sessions: HasMany<super::auth_session::Entity>,
     #[sea_orm(has_many)]
     pub devices: HasMany<super::device::Entity>,
@@ -34,6 +36,8 @@ pub struct Model {
         on_delete = "Restrict"
     )]
     pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    #[sea_orm(has_one)]
+    pub principal_avatar: HasOne<super::principal_avatar::Entity>,
     #[sea_orm(has_many, via = "thread_membership")]
     pub threads: HasMany<super::thread::Entity>,
     #[sea_orm(has_many, via = "workspace_membership")]

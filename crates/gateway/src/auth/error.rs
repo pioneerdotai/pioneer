@@ -16,6 +16,13 @@ pub(crate) enum AuthErrorCode {
     AuthNotReady,
     MethodNotAllowed,
     ExchangeTimeout,
+    InvitationUnavailable,
+    InvitationInvalidProfile,
+    InvitationNicknameUnavailable,
+    InvitationInvalidInstallation,
+    InvitationAvatarInvalid,
+    RecoveryRateLimited,
+    RecoveryInvalidTarget,
 }
 
 impl AuthErrorCode {
@@ -36,6 +43,13 @@ impl AuthErrorCode {
             Self::AuthNotReady => "auth_not_ready",
             Self::MethodNotAllowed => "auth_method_not_allowed",
             Self::ExchangeTimeout => "auth_exchange_timeout",
+            Self::InvitationUnavailable => "invitation_unavailable",
+            Self::InvitationInvalidProfile => "invalid_profile",
+            Self::InvitationNicknameUnavailable => "nickname_unavailable",
+            Self::InvitationInvalidInstallation => "invalid_installation",
+            Self::InvitationAvatarInvalid => "avatar_invalid",
+            Self::RecoveryRateLimited => "recovery_rate_limited",
+            Self::RecoveryInvalidTarget => "recovery_invalid_target",
         }
     }
 }

@@ -42,6 +42,18 @@ pub(crate) enum ResolvedResourceAccess {
         workspace: WorkspaceAccessFacts,
         enabled: bool,
     },
+    InvitationGrantSet {
+        all_active_and_authorized: bool,
+    },
+    InvitationCollection,
+    Invitation {
+        actor_created: bool,
+    },
+    MemberDirectory,
+    DirectoryPrincipal {
+        visible: bool,
+    },
+    MemberPrincipal,
 }
 
 /// The single role-to-policy boundary for normal Gateway actions.
@@ -142,6 +154,13 @@ const fn member_action_requires_resource(action: ResourceAction) -> bool {
             | ResourceAction::CliRuntimeUse
             | ResourceAction::SessionReadOwn
             | ResourceAction::SessionRevokeOwn
+            | ResourceAction::InvitationCreate
+            | ResourceAction::InvitationList
+            | ResourceAction::InvitationRevoke
+            | ResourceAction::MemberDirectoryList
+            | ResourceAction::MemberAvatarRead
+            | ResourceAction::WorkspaceMemberList
+            | ResourceAction::WorkspaceMemberAdd
     )
 }
 
@@ -225,6 +244,32 @@ fn authorize_member_resource(
                 deny_forbidden(DenyReason::CapabilityDisabled)
             }
         }
+        ResolvedResourceAccess::InvitationGrantSet {
+            all_active_and_authorized,
+        } => {
+            if all_active_and_authorized {
+                allow(role, AllowReason::InvitationGrantSet)
+            } else {
+                deny_not_found(DenyReason::NoWorkspaceMembership)
+            }
+        }
+        ResolvedResourceAccess::InvitationCollection => allow(role, AllowReason::ScopedCollection),
+        ResolvedResourceAccess::Invitation { actor_created } => {
+            if actor_created {
+                allow(role, AllowReason::InvitationCreator)
+            } else {
+                deny_not_found(DenyReason::ManagementDenied)
+            }
+        }
+        ResolvedResourceAccess::MemberDirectory => allow(role, AllowReason::ScopedCollection),
+        ResolvedResourceAccess::DirectoryPrincipal { visible } => {
+            if visible {
+                allow(role, AllowReason::DirectoryVisible)
+            } else {
+                deny_not_found(DenyReason::MissingAuthoritativeResource)
+            }
+        }
+        ResolvedResourceAccess::MemberPrincipal => deny_forbidden(DenyReason::ManagementDenied),
     }
 }
 
@@ -303,6 +348,9 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
                 | ResourceAction::TaskRun
                 | ResourceAction::ProviderUse
                 | ResourceAction::SkillUse
+                | ResourceAction::WorkspaceMemberList
+                | ResourceAction::WorkspaceMemberAdd
+                | ResourceAction::WorkspaceMemberRemove
         ),
         ResolvedResourceAccess::Thread(_) => matches!(
             action,
@@ -346,6 +394,30 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
                 | ResourceAction::CliRuntimeUse
                 | ResourceAction::CliRuntimeManage
         ),
+        ResolvedResourceAccess::InvitationGrantSet { .. } => {
+            matches!(action, ResourceAction::InvitationCreate)
+        }
+        ResolvedResourceAccess::InvitationCollection => {
+            matches!(action, ResourceAction::InvitationList)
+        }
+        ResolvedResourceAccess::Invitation { .. } => {
+            matches!(action, ResourceAction::InvitationRevoke)
+        }
+        ResolvedResourceAccess::MemberDirectory => {
+            matches!(action, ResourceAction::MemberDirectoryList)
+        }
+        ResolvedResourceAccess::DirectoryPrincipal { .. } => {
+            matches!(action, ResourceAction::MemberAvatarRead)
+        }
+        ResolvedResourceAccess::MemberPrincipal => {
+            matches!(
+                action,
+                ResourceAction::MemberSuspend
+                    | ResourceAction::MemberRestore
+                    | ResourceAction::MemberDeviceCreate
+                    | ResourceAction::MemberRemove
+            )
+        }
     }
 }
 
@@ -383,7 +455,7 @@ mod tests {
         WorkspaceAccessFacts,
     };
 
-    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 20] = [
+    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 27] = [
         ResourceAction::WorkspaceList,
         ResourceAction::WorkspaceRead,
         ResourceAction::ThreadCreate,
@@ -404,9 +476,16 @@ mod tests {
         ResourceAction::CliRuntimeUse,
         ResourceAction::SessionReadOwn,
         ResourceAction::SessionRevokeOwn,
+        ResourceAction::InvitationCreate,
+        ResourceAction::InvitationList,
+        ResourceAction::InvitationRevoke,
+        ResourceAction::MemberDirectoryList,
+        ResourceAction::MemberAvatarRead,
+        ResourceAction::WorkspaceMemberList,
+        ResourceAction::WorkspaceMemberAdd,
     ];
 
-    const MEMBER_DENIED_ACTIONS: [ResourceAction; 9] = [
+    const MEMBER_DENIED_ACTIONS: [ResourceAction; 14] = [
         ResourceAction::GatewayManage,
         ResourceAction::WorkspaceCreate,
         ResourceAction::WorkspaceManage,
@@ -416,6 +495,11 @@ mod tests {
         ResourceAction::McpManage,
         ResourceAction::SkillManage,
         ResourceAction::CliRuntimeManage,
+        ResourceAction::WorkspaceMemberRemove,
+        ResourceAction::MemberSuspend,
+        ResourceAction::MemberRestore,
+        ResourceAction::MemberRemove,
+        ResourceAction::MemberDeviceCreate,
     ];
 
     #[test]

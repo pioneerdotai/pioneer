@@ -1,4 +1,7 @@
-use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, RoleKey};
+use pioneer_protocol::{
+    AuthSessionId, DeviceId, GatewayId, InvitationTransportSecurity, PrincipalId, PrincipalKind,
+    RoleKey,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthenticatedSessionPrincipal {
@@ -16,6 +19,7 @@ pub(crate) struct AuthenticatedSessionPrincipal {
 pub(crate) enum RestrictedAuthContext {
     Refresh(RefreshExchangeContext),
     DeviceActivation(DeviceActivationContext),
+    Invitation(InvitationExchangeContext),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,3 +29,9 @@ pub(crate) struct DeviceActivationContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RefreshExchangeContext;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvitationExchangeContext {
+    pub(crate) gateway_id: GatewayId,
+    pub(crate) transport: InvitationTransportSecurity,
+}

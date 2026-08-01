@@ -64,6 +64,54 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::auth::ClientDeviceActivationParseResult
         ),
         schema_doc!(
+            "client_invitation_presentation_request.json",
+            crate::invitation::ClientInvitationPresentationRequest
+        ),
+        schema_doc!(
+            "client_invitation_presentation_result.json",
+            crate::invitation::ClientInvitationPresentationResult
+        ),
+        schema_doc!(
+            "client_invitation_preview_request.json",
+            crate::invitation::ClientInvitationPreviewRequest
+        ),
+        schema_doc!(
+            "client_invitation_accept_request.json",
+            crate::invitation::ClientInvitationAcceptRequest
+        ),
+        schema_doc!(
+            "client_invitation_accept_result.json",
+            crate::invitation::ClientInvitationAcceptResult
+        ),
+        schema_doc!(
+            "client_invitation_commit_state.json",
+            crate::invitation::ClientInvitationCommitState
+        ),
+        schema_doc!(
+            "client_invitation_commit_request.json",
+            crate::invitation::ClientInvitationCommitRequest
+        ),
+        schema_doc!(
+            "client_invitation_commit_cleanup_request.json",
+            crate::invitation::ClientInvitationCommitCleanupRequest
+        ),
+        schema_doc!(
+            "client_invitation_refresh_write.json",
+            crate::invitation::ClientInvitationRefreshWrite
+        ),
+        schema_doc!(
+            "client_invitation_registry_write.json",
+            crate::invitation::ClientInvitationRegistryWrite
+        ),
+        schema_doc!(
+            "client_invitation_access_result.json",
+            crate::invitation::ClientInvitationAccessResult
+        ),
+        schema_doc!(
+            "client_invitation_commit_failure_result.json",
+            crate::invitation::ClientInvitationCommitFailureResult
+        ),
+        schema_doc!(
             "client_active_thread_clear_result.json",
             crate::active_thread::ClientActiveThreadClearResult
         ),

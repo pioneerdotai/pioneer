@@ -107,6 +107,10 @@ impl PioneerDesktop {
             ClientRuntimeNotification::AccessChanged(notification) => {
                 self.apply_access_changed_notification(notification, cx);
             }
+            // Epic 5 does not add production administration screens. The
+            // shared reducer exposes these events for generated/mobile
+            // contracts; Desktop will consume them when that UI is added.
+            ClientRuntimeNotification::AdministrationChanged(_) => {}
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 self.apply_thread_started_reduction(reduction);
             }
@@ -847,6 +851,20 @@ mod access_change_tests {
                 "Desktop capability cleanup is missing `{required}`"
             );
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_ignores_epic5_administration_events_until_the_ui_exists() {
+        let source = include_str!("ws_events_notifications.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]\nmod access_change_tests")
+            .map(|(production_source, _)| production_source)
+            .expect("Desktop notification tests must remain outside production wiring");
+
+        assert!(
+            production_source.contains("ClientRuntimeNotification::AdministrationChanged(_) => {}")
+        );
+        assert!(!production_source.contains("apply_administration"));
     }
 }
 

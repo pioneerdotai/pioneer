@@ -35,6 +35,16 @@ pub struct GatewayPrincipalRecord {
     pub removed_at: Option<DateTimeWithTimeZone>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMemberPrincipalRow {
+    pub id: PrincipalId,
+    pub gateway_id: GatewayId,
+    pub display_name: String,
+    pub nickname: String,
+    pub nickname_key: String,
+    pub now: DateTimeWithTimeZone,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorResourceKind {
     Thread,
@@ -256,6 +266,74 @@ pub async fn load_principal_by_id<C: ConnectionTrait>(
         .context("failed to load Gateway principal by id")?
         .map(gateway_principal_record_from_model)
         .transpose()
+}
+
+pub async fn transition_member_principal_status<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    from: PrincipalStatus,
+    to: PrincipalStatus,
+    removed_at: Option<DateTimeWithTimeZone>,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = gateway_principal::Entity::update_many()
+        .col_expr(
+            gateway_principal::Column::Status,
+            Expr::value(principal_status_to_db(to)),
+        )
+        .col_expr(gateway_principal::Column::UpdatedAt, Expr::value(now))
+        .col_expr(
+            gateway_principal::Column::RemovedAt,
+            Expr::value(removed_at),
+        )
+        .filter(gateway_principal::Column::Id.eq(principal_id.to_string()))
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
+        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
+        .filter(gateway_principal::Column::Status.eq(principal_status_to_db(from)))
+        .exec(db)
+        .await
+        .context("failed to transition Member principal status")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn nickname_key_exists<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    nickname_key: &str,
+) -> Result<bool> {
+    Ok(gateway_principal::Entity::find()
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(gateway_principal::Column::NicknameKey.eq(nickname_key))
+        .one(db)
+        .await
+        .context("failed to check Gateway principal nickname availability")?
+        .is_some())
+}
+
+pub async fn create_member_principal<C: ConnectionTrait>(
+    db: &C,
+    row: NewMemberPrincipalRow,
+) -> Result<GatewayPrincipalRecord> {
+    let model = gateway_principal::ActiveModel {
+        id: Set(row.id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        kind: Set(principal_kind_to_db(PrincipalKind::User).to_owned()),
+        role_key: Set(Some(pioneer_protocol::MEMBER_ROLE_KEY.to_owned())),
+        status: Set(principal_status_to_db(PrincipalStatus::Active).to_owned()),
+        display_name: Set(row.display_name),
+        nickname: Set(row.nickname),
+        nickname_key: Set(row.nickname_key),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        removed_at: Set(None),
+        authorization_guard: Set(1),
+    }
+    .insert(db)
+    .await
+    .context("failed to create Gateway Member principal")?;
+    gateway_principal_record_from_model(model)
 }
 
 #[allow(clippy::too_many_arguments)]

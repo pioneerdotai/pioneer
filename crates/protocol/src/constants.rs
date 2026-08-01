@@ -6,6 +6,20 @@ pub mod methods {
     pub const AUTH_DEVICE_CREATE: &str = "auth/device/create";
     pub const AUTH_REFRESH: &str = "auth/refresh";
     pub const AUTH_DEVICE_ACTIVATE: &str = "auth/device/activate";
+    pub const INVITE_CREATE: &str = "invite/create";
+    pub const INVITE_LIST: &str = "invite/list";
+    pub const INVITE_REVOKE: &str = "invite/revoke";
+    pub const INVITE_PREVIEW: &str = "invite/preview";
+    pub const INVITE_ACCEPT: &str = "invite/accept";
+    pub const MEMBER_LIST: &str = "member/list";
+    pub const MEMBER_AVATAR_GET: &str = "member/avatar/get";
+    pub const MEMBER_SUSPEND: &str = "member/suspend";
+    pub const MEMBER_RESTORE: &str = "member/restore";
+    pub const MEMBER_REMOVE: &str = "member/remove";
+    pub const MEMBER_DEVICE_CREATE: &str = "member/device/create";
+    pub const WORKSPACE_MEMBER_LIST: &str = "workspace/member/list";
+    pub const WORKSPACE_MEMBER_ADD: &str = "workspace/member/add";
+    pub const WORKSPACE_MEMBER_REMOVE: &str = "workspace/member/remove";
     pub const WORKSPACE_LIST: &str = "workspace/list";
     pub const WORKSPACE_CREATE: &str = "workspace/create";
     pub const WORKSPACE_DEFAULT: &str = "workspace/default";
@@ -139,6 +153,18 @@ pub mod methods {
         AUTH_SESSION_REVOKE,
         AUTH_LOGOUT,
         AUTH_DEVICE_CREATE,
+        INVITE_CREATE,
+        INVITE_LIST,
+        INVITE_REVOKE,
+        MEMBER_LIST,
+        MEMBER_AVATAR_GET,
+        MEMBER_SUSPEND,
+        MEMBER_RESTORE,
+        MEMBER_REMOVE,
+        MEMBER_DEVICE_CREATE,
+        WORKSPACE_MEMBER_LIST,
+        WORKSPACE_MEMBER_ADD,
+        WORKSPACE_MEMBER_REMOVE,
         WORKSPACE_LIST,
         WORKSPACE_CREATE,
         WORKSPACE_DEFAULT,
@@ -265,11 +291,19 @@ pub mod methods {
 
     /// Methods accepted only by the pre-authenticated credential exchange
     /// transport. They must never be admitted through normal authorization.
-    pub const RESTRICTED_AUTH_METHODS: &[&str] = &[AUTH_REFRESH, AUTH_DEVICE_ACTIVATE];
+    pub const RESTRICTED_AUTH_METHODS: &[&str] = &[
+        AUTH_REFRESH,
+        AUTH_DEVICE_ACTIVATE,
+        INVITE_PREVIEW,
+        INVITE_ACCEPT,
+    ];
 }
 
 pub mod events {
     pub const ACCESS_CHANGED: &str = "access/changed";
+    pub const INVITATION_CHANGED: &str = "invitation/changed";
+    pub const MEMBER_CHANGED: &str = "member/changed";
+    pub const WORKSPACE_MEMBERS_CHANGED: &str = "workspace/members_changed";
     pub const AUTH_SESSION_REVOKED: &str = "auth/session_revoked";
     pub const AUTH_ACCESS_EXPIRING: &str = "auth/access_expiring";
     pub const WORKSPACE_CHANGED: &str = "workspace/changed";
@@ -386,4 +420,64 @@ pub mod events {
     pub const ARTIFACT_UPLOAD_CHUNK_ACK: &str = "artifact/upload/chunk_ack";
     pub const ARTIFACT_UPLOAD_PROGRESS: &str = "artifact/upload/progress";
     pub const ARTIFACT_DOWNLOAD_PROGRESS: &str = "artifact/download/progress";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{events, methods};
+
+    #[test]
+    fn epic5_normal_and_restricted_method_sets_are_exact_and_disjoint() {
+        let expected_normal = [
+            "invite/create",
+            "invite/list",
+            "invite/revoke",
+            "member/list",
+            "member/avatar/get",
+            "member/suspend",
+            "member/restore",
+            "member/remove",
+            "member/device/create",
+            "workspace/member/list",
+            "workspace/member/add",
+            "workspace/member/remove",
+        ];
+        let expected_restricted = ["invite/preview", "invite/accept"];
+
+        for method in expected_normal {
+            assert!(
+                methods::NORMAL_METHODS.contains(&method),
+                "missing {method}"
+            );
+            assert!(!methods::RESTRICTED_AUTH_METHODS.contains(&method));
+        }
+        for method in expected_restricted {
+            assert!(
+                methods::RESTRICTED_AUTH_METHODS.contains(&method),
+                "missing {method}"
+            );
+            assert!(!methods::NORMAL_METHODS.contains(&method));
+        }
+        let normal = methods::NORMAL_METHODS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let restricted = methods::RESTRICTED_AUTH_METHODS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(normal.len(), methods::NORMAL_METHODS.len());
+        assert_eq!(restricted.len(), methods::RESTRICTED_AUTH_METHODS.len());
+        assert!(normal.is_disjoint(&restricted));
+    }
+
+    #[test]
+    fn epic5_event_set_is_exact() {
+        assert_eq!(events::INVITATION_CHANGED, "invitation/changed");
+        assert_eq!(events::MEMBER_CHANGED, "member/changed");
+        assert_eq!(
+            events::WORKSPACE_MEMBERS_CHANGED,
+            "workspace/members_changed"
+        );
+    }
 }

@@ -9,6 +9,7 @@ mod composer;
 mod contracts;
 mod diagnostics;
 mod gateway;
+mod invitation;
 mod pending_requests;
 #[cfg(feature = "schema")]
 pub mod schema;
@@ -68,11 +69,19 @@ use gateway::{
     provider_list_transcription_models_for_bridge, validate_remote_gateway_request,
     voice_input_plan_for_bridge,
 };
+use invitation::{
+    ClientInvitationAcceptRequest, ClientInvitationAcceptResult, ClientInvitationAccessResult,
+    ClientInvitationCommitCleanupRequest, ClientInvitationCommitFailureResult,
+    ClientInvitationCommitRequest, ClientInvitationPresentationRequest,
+    ClientInvitationPresentationResult, ClientInvitationPreviewRequest,
+    ClientInvitationPreviewResult, ClientInvitationRefreshWrite, ClientInvitationRegistryWrite,
+};
 use pending_requests::{
     ClientPendingRequestPresentationRequest, ClientPendingRequestPresentationResult,
     ClientPendingRequestResponsePlanRequest, ClientPendingRequestResponsePlanResult,
     pending_request_presentation_for_bridge, plan_pending_request_response_for_bridge,
 };
+use pioneer_client::gateway::invitation::InvitationSessionCommitState;
 use pioneer_client::{
     agents_doc::content::{
         AgentsDocSaveErrorKind, agents_doc_get_params, agents_doc_save_error_kind,
@@ -131,7 +140,10 @@ use std::{
     ffi::{CStr, CString, c_char},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
@@ -146,6 +158,7 @@ use workspaces::{
 use zeroize::Zeroizing;
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_OUTSTANDING_INVITATION_COMMITS: usize = 16;
 
 pub struct PioneerClientFfi {
     runtime: ClientFfiRuntime,
@@ -160,12 +173,26 @@ struct ClientFfiRuntime {
     diagnostics: ClientFfiDiagnostics,
     gateway_session_lifecycles:
         Mutex<HashMap<String, pioneer_client::gateway::session_lifecycle::SessionLifecycle>>,
+    invitation_commit_sequence: AtomicU64,
+    invitation_commits:
+        Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
 }
 
 fn contains_gateway_connection_epoch_boundary(events: &[ClientEvent]) -> bool {
     events
         .iter()
         .any(|event| matches!(event, ClientEvent::GatewayConnectionChanged(_)))
+}
+
+fn contains_session_termination(events: &[ClientEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AuthSessionRevoked(_)
+            )
+        )
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -521,10 +548,16 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::AuthLogoutResponse, ClientFfiError> {
         parse_empty_auth_request(input_json)?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
+        let response = self
+            .client_runtime
             .ws_command_sender()
             .auth_logout()
-            .map_err(normal_auth_error)
+            .map_err(normal_auth_error)?;
+        self.invitation_commits
+            .lock()
+            .map_err(|_| invitation_commit_lock_error())?
+            .clear();
+        Ok(response)
     }
 
     fn gateway_auth_device_create(
@@ -537,6 +570,382 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .auth_device_create()
             .map_err(normal_auth_error)
+    }
+
+    fn invitation_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationPresentationResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = serde_json::from_str::<ClientInvitationPresentationRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid invitation presentation request",
+                    invitation::INVALID_INVITATION_REQUEST_CODE,
+                )
+            })?;
+        ClientInvitationPresentationResult::from_request(request).map_err(|message| {
+            ClientFfiError::new(message, invitation::INVALID_INVITATION_REQUEST_CODE)
+        })
+    }
+
+    fn invitation_preview(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationPreviewResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientInvitationPreviewRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid invitation preview request",
+                    invitation::INVALID_INVITATION_REQUEST_CODE,
+                )
+            })?;
+        let presentation = invitation::parse_preview(&request).map_err(|message| {
+            ClientFfiError::new(message, invitation::INVALID_INVITATION_REQUEST_CODE)
+        })?;
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        runtime
+            .block_on(client.preview_invitation(&presentation))
+            .map_err(invitation::exchange_error)
+    }
+
+    fn invitation_accept(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationAcceptResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request =
+            serde_json::from_str::<ClientInvitationAcceptRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid invitation accept request",
+                    invitation::INVALID_INVITATION_REQUEST_CODE,
+                )
+            })?;
+        let presentation = invitation::parse_accept(&request).map_err(|message| {
+            ClientFfiError::new(message, invitation::INVALID_INVITATION_REQUEST_CODE)
+        })?;
+        {
+            let commits = self
+                .invitation_commits
+                .lock()
+                .map_err(|_| invitation_commit_lock_error())?;
+            if !invitation_commit_capacity_available(commits.len()) {
+                return Err(invitation_commit_unavailable());
+            }
+        }
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        let accepted = runtime
+            .block_on(client.accept_invitation(&presentation, request.params))
+            .map_err(invitation::exchange_error)?;
+        let commit = pioneer_client::gateway::invitation::InvitationSessionCommit::new(
+            &presentation,
+            accepted,
+            request.expected_installation_id.as_str(),
+        )
+        .map_err(|_| {
+            ClientFfiError::new(
+                "invalid invitation session grant",
+                invitation::INVALID_INVITATION_REQUEST_CODE,
+            )
+        })?;
+        let state = commit.state().into();
+        let sequence = self
+            .invitation_commit_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let commit_id = format!("invitation_commit_{sequence}");
+        let mut commits = match self.invitation_commits.lock() {
+            Ok(commits) => commits,
+            Err(_) => {
+                cleanup_untracked_invitation_commit(&runtime, &client, commit);
+                return Err(invitation_commit_lock_error());
+            }
+        };
+        if !invitation_commit_capacity_available(commits.len()) {
+            drop(commits);
+            cleanup_untracked_invitation_commit(&runtime, &client, commit);
+            return Err(invitation_commit_unavailable());
+        }
+        commits.insert(commit_id.clone(), commit);
+        Ok(ClientInvitationAcceptResult { commit_id, state })
+    }
+
+    fn invitation_commit_take_refresh(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationRefreshWrite, ClientFfiError> {
+        self.require_initialized()?;
+        let request = parse_invitation_commit_request(input_json)?;
+        let mut commits = self
+            .invitation_commits
+            .lock()
+            .map_err(|_| invitation_commit_lock_error())?;
+        let commit = commits
+            .get_mut(request.commit_id.as_str())
+            .ok_or_else(invitation_commit_unavailable)?;
+        commit
+            .take_refresh_for_secure_storage()
+            .map(ClientInvitationRefreshWrite::from)
+            .map_err(|_| invitation_commit_unavailable())
+    }
+
+    fn invitation_commit_secure_storage_committed(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationRegistryWrite, ClientFfiError> {
+        self.require_initialized()?;
+        let request = parse_invitation_commit_request(input_json)?;
+        let mut commits = self
+            .invitation_commits
+            .lock()
+            .map_err(|_| invitation_commit_lock_error())?;
+        let commit = commits
+            .get_mut(request.commit_id.as_str())
+            .ok_or_else(invitation_commit_unavailable)?;
+        commit
+            .secure_storage_committed()
+            .map(ClientInvitationRegistryWrite::from)
+            .map_err(|_| invitation_commit_unavailable())
+    }
+
+    fn invitation_commit_registry_committed(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationAccessResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = parse_invitation_commit_request(input_json)?;
+        let mut commits = self
+            .invitation_commits
+            .lock()
+            .map_err(|_| invitation_commit_lock_error())?;
+        let access = commits
+            .get_mut(request.commit_id.as_str())
+            .ok_or_else(invitation_commit_unavailable)?
+            .registry_committed()
+            .map_err(|_| invitation_commit_unavailable())?;
+        commits.remove(request.commit_id.as_str());
+        Ok(access.into())
+    }
+
+    fn invitation_commit_registry_failed(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationCommitFailureResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = parse_invitation_commit_request(input_json)?;
+        let mut commits = self
+            .invitation_commits
+            .lock()
+            .map_err(|_| invitation_commit_lock_error())?;
+        let commit = commits
+            .get_mut(request.commit_id.as_str())
+            .ok_or_else(invitation_commit_unavailable)?;
+        commit
+            .registry_failed()
+            .map_err(|_| invitation_commit_unavailable())?;
+        commits.remove(request.commit_id.as_str());
+        Ok(ClientInvitationCommitFailureResult {
+            released: true,
+            cleanup_attempted: false,
+        })
+    }
+
+    fn invitation_commit_secure_storage_failed(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientInvitationCommitFailureResult, ClientFfiError> {
+        self.require_initialized()?;
+        let request = serde_json::from_str::<ClientInvitationCommitCleanupRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid invitation cleanup request",
+                    invitation::INVALID_INVITATION_REQUEST_CODE,
+                )
+            })?;
+        {
+            let commits = self
+                .invitation_commits
+                .lock()
+                .map_err(|_| invitation_commit_lock_error())?;
+            let commit = commits
+                .get(request.commit_id.as_str())
+                .ok_or_else(invitation_commit_unavailable)?;
+            if commit.state() != InvitationSessionCommitState::AwaitingSecureStorage {
+                return Err(invitation_commit_unavailable());
+            }
+        }
+        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
+            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
+        let commit = {
+            let mut commits = self
+                .invitation_commits
+                .lock()
+                .map_err(|_| invitation_commit_lock_error())?;
+            let commit = commits
+                .get(request.commit_id.as_str())
+                .ok_or_else(invitation_commit_unavailable)?;
+            if commit.state() != InvitationSessionCommitState::AwaitingSecureStorage {
+                return Err(invitation_commit_unavailable());
+            }
+            commits
+                .remove(request.commit_id.as_str())
+                .expect("invitation commit verified under the same lock")
+        };
+        let cleanup = commit
+            .secure_storage_failed()
+            .map_err(|_| invitation_commit_unavailable())?;
+        runtime.block_on(client.cleanup_invitation_session_best_effort(cleanup));
+        Ok(ClientInvitationCommitFailureResult {
+            released: true,
+            cleanup_attempted: true,
+        })
+    }
+
+    fn invitation_create(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::InvitationCreateResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "invitation create")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .invitation_create(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn invitation_list(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::InvitationListResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "invitation list")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .invitation_list(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn invitation_revoke(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::InvitationRevokeResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "invitation revoke")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .invitation_revoke(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_list(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberListResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member list")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_list(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_avatar_get(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberAvatarGetResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member avatar get")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_avatar_get(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_suspend(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member suspend")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_suspend(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_restore(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member restore")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_restore(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_remove(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member remove")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_remove(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn member_device_create(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::MemberDeviceCreateResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "member device create")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .member_device_create(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn workspace_member_list(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::WorkspaceMemberListResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "workspace member list")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .workspace_member_list(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn workspace_member_add(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::WorkspaceMemberMutationResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "workspace member add")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .workspace_member_add(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn workspace_member_remove(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::WorkspaceMemberMutationResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "workspace member remove")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .workspace_member_remove(params)
+            .map_err(administration_rpc_error)
     }
 
     fn gateway_session_replace_access(
@@ -599,6 +1008,12 @@ impl ClientFfiRuntime {
             let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
+                if contains_session_termination(events.as_slice()) {
+                    self.invitation_commits
+                        .lock()
+                        .map_err(|_| "invitation commit state is unavailable".to_owned())?
+                        .clear();
+                }
                 if contains_gateway_connection_epoch_boundary(events.as_slice()) {
                     self.active_thread
                         .begin_authorization_epoch()
@@ -621,6 +1036,10 @@ impl ClientFfiRuntime {
             .active_connection_id
             .lock()
             .map_err(|_| "client ffi connection lock is poisoned".to_owned())? = None;
+        self.invitation_commits
+            .lock()
+            .map_err(|_| "invitation commit state is unavailable".to_owned())?
+            .clear();
         Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
     }
 
@@ -1595,6 +2014,82 @@ fn parse_empty_auth_request(input_json: &str) -> Result<(), ClientFfiError> {
     Ok(())
 }
 
+const INVALID_ADMINISTRATION_REQUEST_CODE: &str = "invalid_administration_request";
+
+fn parse_normal_params<T>(input_json: &str, operation: &str) -> Result<T, ClientFfiError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(input_json).map_err(|_| {
+        ClientFfiError::new(
+            format!("invalid {operation} request"),
+            INVALID_ADMINISTRATION_REQUEST_CODE,
+        )
+    })
+}
+
+fn parse_invitation_commit_request(
+    input_json: &str,
+) -> Result<ClientInvitationCommitRequest, ClientFfiError> {
+    let request =
+        serde_json::from_str::<ClientInvitationCommitRequest>(input_json).map_err(|_| {
+            ClientFfiError::new(
+                "invalid invitation commit request",
+                invitation::INVALID_INVITATION_REQUEST_CODE,
+            )
+        })?;
+    if request.commit_id.is_empty() || request.commit_id.len() > 128 {
+        return Err(invitation_commit_unavailable());
+    }
+    Ok(request)
+}
+
+fn invitation_commit_unavailable() -> ClientFfiError {
+    ClientFfiError::new(
+        "invitation commit is unavailable",
+        invitation::INVITATION_COMMIT_UNAVAILABLE_CODE,
+    )
+}
+
+fn invitation_commit_lock_error() -> ClientFfiError {
+    ClientFfiError::new(
+        "invitation commit state is unavailable",
+        ClientFfiError::GENERIC_CODE,
+    )
+}
+
+fn invitation_commit_capacity_available(current: usize) -> bool {
+    current < MAX_OUTSTANDING_INVITATION_COMMITS
+}
+
+fn cleanup_untracked_invitation_commit(
+    runtime: &tokio::runtime::Runtime,
+    client: &pioneer_client::transport::ws::auth_exchange::AuthExchangeClient,
+    mut commit: pioneer_client::gateway::invitation::InvitationSessionCommit,
+) {
+    let Ok(refresh) = commit.take_refresh_for_secure_storage() else {
+        return;
+    };
+    drop(refresh);
+    let Ok(cleanup) = commit.secure_storage_failed() else {
+        return;
+    };
+    runtime.block_on(client.cleanup_invitation_session_best_effort(cleanup));
+}
+
+fn administration_rpc_error(error: anyhow::Error) -> ClientFfiError {
+    let code = pioneer_client::rpc::json_rpc_response_error(&error)
+        .and_then(|response| response.machine_code())
+        .filter(|code| {
+            code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        .unwrap_or(ClientFfiError::GENERIC_CODE);
+    ClientFfiError::new("Gateway administration request failed", code)
+}
+
 fn normal_auth_error(error: anyhow::Error) -> ClientFfiError {
     let message = format!("{error:#}");
     let code = [
@@ -1819,6 +2314,56 @@ ffi_client_json_typed_method!(pioneer_client_ffi_gateway_auth_logout, gateway_au
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_auth_device_create,
     gateway_auth_device_create
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_presentation,
+    invitation_presentation
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_invitation_preview, invitation_preview);
+ffi_client_json_typed_method!(pioneer_client_ffi_invitation_accept, invitation_accept);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_commit_take_refresh,
+    invitation_commit_take_refresh
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_commit_secure_storage_committed,
+    invitation_commit_secure_storage_committed
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_commit_registry_committed,
+    invitation_commit_registry_committed
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_commit_secure_storage_failed,
+    invitation_commit_secure_storage_failed
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_invitation_commit_registry_failed,
+    invitation_commit_registry_failed
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_invitation_create, invitation_create);
+ffi_client_json_typed_method!(pioneer_client_ffi_invitation_list, invitation_list);
+ffi_client_json_typed_method!(pioneer_client_ffi_invitation_revoke, invitation_revoke);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_list, member_list);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_avatar_get, member_avatar_get);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_suspend, member_suspend);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_restore, member_restore);
+ffi_client_json_typed_method!(pioneer_client_ffi_member_remove, member_remove);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_member_device_create,
+    member_device_create
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_workspace_member_list,
+    workspace_member_list
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_workspace_member_add,
+    workspace_member_add
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_workspace_member_remove,
+    workspace_member_remove
 );
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_session_replace_access,
@@ -2335,6 +2880,28 @@ mod tests {
             .expect("initialize");
 
         assert!(result.initialized);
+    }
+
+    #[test]
+    fn outstanding_invitation_commit_ownership_is_bounded() {
+        assert!(invitation_commit_capacity_available(
+            MAX_OUTSTANDING_INVITATION_COMMITS - 1
+        ));
+        assert!(!invitation_commit_capacity_available(
+            MAX_OUTSTANDING_INVITATION_COMMITS
+        ));
+    }
+
+    #[test]
+    fn malformed_normal_administration_request_has_a_domain_neutral_code() {
+        let error = parse_normal_params::<pioneer_protocol::MemberListParams>(
+            r#"{"unknown":true}"#,
+            "member list",
+        )
+        .expect_err("unknown administration fields must be rejected");
+
+        assert_eq!(error.code, INVALID_ADMINISTRATION_REQUEST_CODE);
+        assert_eq!(error.message, "invalid member list request");
     }
 
     #[test]

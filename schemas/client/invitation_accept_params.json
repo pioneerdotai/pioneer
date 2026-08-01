@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationAcceptParams",
+  "type": "object",
+  "properties": {
+    "installation": {
+      "$ref": "#/$defs/ClientInstallationDescriptor"
+    },
+    "profile": {
+      "$ref": "#/$defs/NewMemberProfile"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "installation"
+  ],
+  "$defs": {
+    "ClientInstallationDescriptor": {
+      "type": "object",
+      "properties": {
+        "client_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "client_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "installation_id",
+        "display_name",
+        "client_kind"
+      ]
+    },
+    "ClientKind": {
+      "type": "string",
+      "enum": [
+        "desktop",
+        "mobile",
+        "other"
+      ]
+    },
+    "NewMemberProfile": {
+      "type": "object",
+      "properties": {
+        "avatar": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileAvatarInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "nickname"
+      ]
+    },
+    "ProfileAvatarInput": {
+      "type": "object",
+      "properties": {
+        "content_base64": {
+          "type": "string",
+          "maxLength": 349528,
+          "minLength": 1
+        },
+        "media_type": {
+          "$ref": "#/$defs/ProfileAvatarMediaType"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "media_type",
+        "content_base64"
+      ]
+    },
+    "ProfileAvatarMediaType": {
+      "type": "string",
+      "enum": [
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ]
+    }
+  }
+}

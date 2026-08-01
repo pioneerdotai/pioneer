@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProfileAvatarMediaType",
+  "type": "string",
+  "enum": [
+    "image/png",
+    "image/jpeg",
+    "image/webp"
+  ]
+}

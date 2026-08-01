@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationAcceptResponse",
+  "type": "object",
+  "properties": {
+    "grant": {
+      "$ref": "#/$defs/AuthSessionGrant"
+    },
+    "member": {
+      "$ref": "#/$defs/MemberSummary"
+    },
+    "workspace_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WorkspaceId"
+      }
+    }
+  },
+  "required": [
+    "grant",
+    "member",
+    "workspace_ids"
+  ],
+  "$defs": {
+    "AuthDeviceSnapshot": {
+      "type": "object",
+      "properties": {
+        "client_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/DeviceStatus"
+        }
+      },
+      "required": [
+        "id",
+        "installation_id",
+        "display_name",
+        "client_kind",
+        "status"
+      ]
+    },
+    "AuthGatewaySnapshot": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/GatewayId"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "AuthPrincipalSnapshot": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "AuthSessionGrant": {
+      "type": "object",
+      "properties": {
+        "access_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "access_token": {
+          "type": "string"
+        },
+        "auth_protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "credential_storage_order": {
+          "$ref": "#/$defs/CredentialStorageOrder"
+        },
+        "device": {
+          "$ref": "#/$defs/AuthDeviceSnapshot"
+        },
+        "gateway": {
+          "$ref": "#/$defs/AuthGatewaySnapshot"
+        },
+        "principal": {
+          "$ref": "#/$defs/AuthPrincipalSnapshot"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_token": {
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/AuthSessionSnapshot"
+        }
+      },
+      "required": [
+        "gateway",
+        "principal",
+        "device",
+        "session",
+        "access_token",
+        "access_expires_at_unix",
+        "refresh_token",
+        "refresh_expires_at_unix",
+        "refresh_generation",
+        "auth_protocol_version",
+        "credential_storage_order"
+      ]
+    },
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AuthSessionSnapshot": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "id": {
+          "$ref": "#/$defs/AuthSessionId"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/AuthSessionStatus"
+        },
+        "token_family_id": {
+          "$ref": "#/$defs/TokenFamilyId"
+        }
+      },
+      "required": [
+        "id",
+        "device_id",
+        "token_family_id",
+        "status",
+        "refresh_generation",
+        "refresh_expires_at_unix"
+      ]
+    },
+    "AuthSessionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "active",
+        "revoked",
+        "expired"
+      ]
+    },
+    "ClientKind": {
+      "type": "string",
+      "enum": [
+        "desktop",
+        "mobile",
+        "other"
+      ]
+    },
+    "CredentialStorageOrder": {
+      "type": "string",
+      "enum": [
+        "persist_refresh_before_activating_access"
+      ]
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "DeviceStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "active",
+        "revoked"
+      ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "MemberSummary": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "role_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PrincipalStatus"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname",
+        "status"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "PrincipalStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed"
+      ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "TokenFamilyId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

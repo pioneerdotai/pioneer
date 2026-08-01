@@ -1,6 +1,7 @@
 //! Aggregate client state.
 
 use crate::{
+    administration::AdministrationCache,
     cli_runtime::approvals::PendingRequestState,
     mcp::list::McpListState,
     providers::list::ProviderListState,
@@ -18,6 +19,7 @@ pub use crate::threads::tree::WorkspaceThreadState;
 
 #[derive(Default)]
 pub struct ClientState {
+    pub administration: AdministrationCache,
     pub threads: ThreadsState,
     pub workspaces: WorkspacesState,
     pub gateway: GatewayClientState,

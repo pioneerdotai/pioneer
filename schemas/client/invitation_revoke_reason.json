@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationRevokeReason",
+  "type": "string",
+  "enum": [
+    "inviter_revoked",
+    "inviter_unavailable",
+    "grant_authority_lost",
+    "workspace_unavailable"
+  ]
+}

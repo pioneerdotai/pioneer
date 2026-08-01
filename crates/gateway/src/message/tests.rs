@@ -11950,6 +11950,48 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "an empty Member workspace selection must not become all-connections fanout"
     );
 
+    let allowed_principal_id =
+        pioneer_protocol::PrincipalId::new(MEMBER_ALLOWED_ID).expect("allowed Member principal id");
+    processor
+        .send_notification_to_authorized_member_connections(
+            &allowed_principal_id,
+            "test/member-protected",
+            &json!({ "principal_id": MEMBER_ALLOWED_ID }),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/member-protected")
+            .await
+            .method,
+        "test/member-protected"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/member-protected")
+            .await
+            .method,
+        "test/member-protected"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "Member lifecycle payload must follow the current directory predicate"
+    );
+    assert!(unselected_rx.try_recv().is_err());
+
+    assert_eq!(
+        processor
+            .authorized_invitation_notification_recipients(
+                &allowed_principal_id,
+                vec![
+                    superuser_connection_id,
+                    allowed_connection_id,
+                    denied_connection_id,
+                ],
+            )
+            .await,
+        vec![superuser_connection_id, allowed_connection_id],
+        "invitation changes are visible only to Superuser and the owning inviter"
+    );
+
     let queued_before_revoke = processor
         .authorized_workspace_notification_recipients(
             workspace_id.as_str(),

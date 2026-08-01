@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Utc};
 use pioneer_config::GatewayAuthConfig;
 use pioneer_crud::{
-    DeviceActivationFailureOutcome, NewPendingDeviceSessionRow, NewRefreshCredentialRow,
-    PendingSessionIssuer, activate_pending_auth_session, activate_pending_device,
-    advance_auth_session_refresh, auth_session_status_to_db, delete_refresh_for_session,
-    expire_pending_auth_session, expire_session_refresh_family, expire_stale_auth_sessions,
-    expire_stale_pending_sessions, insert_pending_device_session, insert_refresh_credential,
+    DeviceActivationFailureOutcome, GatewayPrincipalRecord, NewActiveDeviceSessionRow,
+    NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
+    activate_pending_auth_session, activate_pending_device, advance_auth_session_refresh,
+    auth_session_status_to_db, delete_refresh_for_session, expire_pending_auth_session,
+    expire_session_refresh_family, expire_stale_auth_sessions, expire_stale_pending_sessions,
+    insert_active_device_session, insert_pending_device_session, insert_refresh_credential,
     list_pending_activation_locator_hashes, list_sessions_for_principal,
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_gateway_singleton, load_pending_local_session,
@@ -24,9 +25,9 @@ use pioneer_protocol::{
     AuthSessionListItem, AuthSessionListResponse, AuthSessionRevokeReason,
     AuthSessionRevokeResponse, AuthSessionSnapshot, AuthSessionStatus,
     AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind, CredentialStorageOrder,
-    DEVICE_ACTIVATION_ALPHABET, DeviceId, DeviceStatus, PrincipalKind, PrincipalStatus,
-    RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, format_device_activation_code,
-    generate_id,
+    DEVICE_ACTIVATION_ALPHABET, DeviceId, DeviceStatus, InvitationId, PrincipalKind,
+    PrincipalStatus, RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, WorkspaceId,
+    format_device_activation_code, generate_id,
 };
 use sea_orm::{
     DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
@@ -35,18 +36,24 @@ use sea_orm::{
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
+use crate::administrative_audit::AdministrativeAuditWriter;
+use crate::epic5_observability::{
+    Epic5Operation, Epic5Outcome, Epic5RateLimits, record_latency, record_outcome,
+};
 use crate::helpers::unix_timestamp_secs;
 use crate::identity::IdentityBootstrapSnapshot;
+use crate::invitation::{InvitationAcceptServiceError, InvitationService};
 use crate::secrets::AuthKeyMaterial;
-use crate::transport::{AUTH_DEVICE_ACTIVATE, AUTH_REFRESH, RestrictedExchangeExecutor};
+use crate::transport::{
+    AUTH_DEVICE_ACTIVATE, AUTH_REFRESH, INVITE_ACCEPT, INVITE_PREVIEW, RestrictedExchangeExecutor,
+};
 
 use super::{
     AUTH_SCHEMA_VERSION, AccessCredential, AccessJwtIssuer, AccessJwtSubject, AuthError,
     AuthErrorCode, AuthenticatedSessionPrincipal, OpaqueCredentialFactory, RestrictedAdmission,
-    RestrictedAuthContext,
+    RestrictedAuthContext, installation::bounded_optional,
 };
 
-const MAX_INSTALLATION_TEXT: usize = 255;
 const MAX_DIAGNOSTIC_TEXT: usize = 255;
 const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
@@ -57,7 +64,9 @@ pub(crate) struct GatewayAuthService {
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
     opaque_credentials: OpaqueCredentialFactory,
+    epic5_rate_limits: Arc<Epic5RateLimits>,
     disconnect_hook: std::sync::RwLock<Option<Arc<dyn AuthSessionDisconnectHook>>>,
+    invitation_accept_hook: std::sync::RwLock<Option<Arc<dyn InvitationAcceptPostCommitHook>>>,
     #[cfg(test)]
     activation_failpoint: std::sync::atomic::AtomicU8,
     #[cfg(test)]
@@ -71,6 +80,20 @@ pub(crate) trait AuthSessionDisconnectHook: Send + Sync {
         session_id: &AuthSessionId,
         reason: AuthSessionTerminationReason,
     );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvitationAcceptCommitted {
+    pub(crate) invitation_id: InvitationId,
+    pub(crate) inviter_principal_id: pioneer_protocol::PrincipalId,
+    pub(crate) accepted_principal_id: pioneer_protocol::PrincipalId,
+    pub(crate) workspace_ids: Vec<WorkspaceId>,
+}
+
+#[async_trait]
+pub(crate) trait InvitationAcceptPostCommitHook: Send + Sync {
+    async fn invitation_accepted(&self, committed: InvitationAcceptCommitted);
+    async fn invitation_changed(&self, invitation_id: InvitationId);
 }
 
 struct PendingSessionIds {
@@ -100,6 +123,33 @@ impl IssuedCredentialIds {
             refresh_id: typed_id(generate_id(AUTH_DOMAIN_ID_LEN), RefreshCredentialId::new)?,
             access_jti: generate_id(AUTH_DOMAIN_ID_LEN),
         })
+    }
+}
+
+pub(crate) struct FirstMemberSessionIds {
+    pub(crate) device_id: DeviceId,
+    pub(crate) session_id: AuthSessionId,
+    pub(crate) token_family_id: TokenFamilyId,
+    refresh_id: RefreshCredentialId,
+    access_jti: String,
+}
+
+impl FirstMemberSessionIds {
+    pub(crate) fn random() -> Result<Self, AuthError> {
+        Ok(Self {
+            device_id: typed_id(generate_id(AUTH_DOMAIN_ID_LEN), DeviceId::new)?,
+            session_id: typed_id(generate_id(AUTH_DOMAIN_ID_LEN), AuthSessionId::new)?,
+            token_family_id: typed_id(generate_id(AUTH_DOMAIN_ID_LEN), TokenFamilyId::new)?,
+            refresh_id: typed_id(generate_id(AUTH_DOMAIN_ID_LEN), RefreshCredentialId::new)?,
+            access_jti: generate_id(AUTH_DOMAIN_ID_LEN),
+        })
+    }
+
+    fn credential_ids(&self) -> IssuedCredentialIds {
+        IssuedCredentialIds {
+            refresh_id: self.refresh_id.clone(),
+            access_jti: self.access_jti.clone(),
+        }
     }
 }
 
@@ -137,12 +187,18 @@ impl GatewayAuthService {
             database,
             config,
             identity,
+            epic5_rate_limits: Arc::new(Epic5RateLimits::default()),
             disconnect_hook: std::sync::RwLock::new(None),
+            invitation_accept_hook: std::sync::RwLock::new(None),
             #[cfg(test)]
             activation_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             refresh_failpoint: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    pub(crate) fn epic5_rate_limits(&self) -> Arc<Epic5RateLimits> {
+        self.epic5_rate_limits.clone()
     }
 
     pub(crate) async fn exchange_refresh(
@@ -551,6 +607,39 @@ impl GatewayAuthService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *disconnect_hook = Some(hook);
+    }
+
+    pub(crate) fn set_invitation_accept_post_commit_hook(
+        &self,
+        hook: Arc<dyn InvitationAcceptPostCommitHook>,
+    ) {
+        let mut slot = self
+            .invitation_accept_hook
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(hook);
+    }
+
+    pub(crate) async fn invitation_accept_committed(&self, committed: InvitationAcceptCommitted) {
+        let hook = self
+            .invitation_accept_hook
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook.invitation_accepted(committed).await;
+        }
+    }
+
+    pub(crate) async fn invitation_changed_committed(&self, invitation_id: InvitationId) {
+        let hook = self
+            .invitation_accept_hook
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook.invitation_changed(invitation_id).await;
+        }
     }
 
     async fn disconnect_session_after_commit(
@@ -972,6 +1061,7 @@ impl GatewayAuthService {
         self.create_pending_device_session(
             PendingSessionIssuer::AuthenticatedSession(current.session_id.clone()),
             Some(current),
+            None,
             PendingSessionIds::random()?,
         )
         .await
@@ -981,15 +1071,58 @@ impl GatewayAuthService {
         self.create_pending_device_session(
             PendingSessionIssuer::LocalCli,
             None,
+            None,
             PendingSessionIds::random()?,
         )
         .await
+    }
+
+    pub(crate) async fn create_recovery_device(
+        &self,
+        current: &AuthenticatedSessionPrincipal,
+        target_principal_id: &pioneer_protocol::PrincipalId,
+    ) -> Result<AuthDeviceCreateResponse, AuthError> {
+        let started = std::time::Instant::now();
+        if !self
+            .epic5_rate_limits
+            .allow_recovery_create(&current.gateway_id, target_principal_id)
+        {
+            record_outcome(Epic5Operation::RecoveryCreate, Epic5Outcome::RateLimited);
+            record_latency(Epic5Operation::RecoveryCreate, started.elapsed());
+            tracing::warn!(
+                event = "epic5_rate_limited",
+                operation = "member_recovery_device_create",
+                actor_principal_id = %current.principal_id,
+                target_principal_id = %target_principal_id,
+                outcome = "rate_limited",
+            );
+            return Err(AuthError::new(AuthErrorCode::RecoveryRateLimited));
+        }
+        let result = self
+            .create_pending_device_session(
+                PendingSessionIssuer::LocalCli,
+                Some(current),
+                Some(target_principal_id),
+                PendingSessionIds::random()?,
+            )
+            .await;
+        record_outcome(
+            Epic5Operation::RecoveryCreate,
+            match result.as_ref().map_err(AuthError::code) {
+                Ok(_) => Epic5Outcome::Success,
+                Err(AuthErrorCode::RecoveryInvalidTarget) => Epic5Outcome::Invalid,
+                Err(_) => Epic5Outcome::Unavailable,
+            },
+        );
+        record_latency(Epic5Operation::RecoveryCreate, started.elapsed());
+        result
     }
 
     async fn create_pending_device_session(
         &self,
         issuer: PendingSessionIssuer,
         authenticated_actor: Option<&AuthenticatedSessionPrincipal>,
+        administrative_target: Option<&pioneer_protocol::PrincipalId>,
         ids: PendingSessionIds,
     ) -> Result<AuthDeviceCreateResponse, AuthError> {
         let now_unix =
@@ -1018,8 +1151,49 @@ impl GatewayAuthService {
             {
                 return Err(AuthError::new(AuthErrorCode::AuthNotReady));
             }
-            let principal_id = match authenticated_actor {
-                Some(current) => {
+            let principal_id = match (authenticated_actor, administrative_target) {
+                (Some(current), Some(target_principal_id)) => {
+                    self.validate_active_actor_in_transaction(&transaction, current, now)
+                        .await?;
+                    if current.kind != PrincipalKind::Superuser {
+                        return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+                    }
+                    let target = load_principal_by_id(&transaction, target_principal_id)
+                        .await
+                        .map_err(storage_error)?
+                        .ok_or_else(|| AuthError::new(AuthErrorCode::RecoveryInvalidTarget))?;
+                    if target.gateway_id != self.identity.gateway.id
+                        || target.kind != PrincipalKind::User
+                        || target.status != PrincipalStatus::Active
+                        || target.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+                    {
+                        return Err(AuthError::new(AuthErrorCode::RecoveryInvalidTarget));
+                    }
+                    if let Some(previous) = load_pending_local_session(
+                        &transaction,
+                        &self.identity.gateway.id,
+                        target_principal_id,
+                    )
+                    .await
+                    .map_err(storage_error)?
+                    {
+                        let previous_device_id = DeviceId::new(previous.device_id.clone())
+                            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+                        mark_session_revoked(
+                            &transaction,
+                            previous,
+                            AuthSessionRevokeReason::Superseded,
+                            now,
+                        )
+                        .await
+                        .map_err(storage_error)?;
+                        mark_device_revoked(&transaction, &previous_device_id, now)
+                            .await
+                            .map_err(storage_error)?;
+                    }
+                    target_principal_id.clone()
+                }
+                (Some(current), None) => {
                     self.validate_active_actor_in_transaction(&transaction, current, now)
                         .await?;
                     if let Some(previous) =
@@ -1043,7 +1217,7 @@ impl GatewayAuthService {
                     }
                     current.principal_id.clone()
                 }
-                None => {
+                (None, None) => {
                     let principal = load_principal_by_id(&transaction, &self.identity.superuser.id)
                         .await
                         .map_err(storage_error)?
@@ -1078,6 +1252,9 @@ impl GatewayAuthService {
                             .map_err(storage_error)?;
                     }
                     self.identity.superuser.id.clone()
+                }
+                (None, Some(_)) => {
+                    return Err(AuthError::new(AuthErrorCode::InvalidCredential));
                 }
             };
             expire_stale_pending_sessions(
@@ -1146,6 +1323,21 @@ impl GatewayAuthService {
             )
             .await
             .map_err(storage_error)?;
+            if let (Some(actor), Some(_)) = (authenticated_actor, administrative_target) {
+                AdministrativeAuditWriter
+                    .member_recovery_device_created(
+                        &transaction,
+                        &self.identity.gateway.id,
+                        &actor.principal_id,
+                        &actor.session_id,
+                        &principal_id,
+                        &ids.device_id,
+                        &ids.session_id,
+                        now,
+                    )
+                    .await
+                    .map_err(storage_error)?;
+            }
             Ok((activation, principal_id))
         }
         .await;
@@ -1167,7 +1359,13 @@ impl GatewayAuthService {
             device_id = %ids.device_id,
             auth_session_id = %ids.session_id,
             principal_id = %principal_id,
-            issuer = if authenticated_actor.is_some() { "authenticated_session" } else { "local_cli" },
+            issuer = if administrative_target.is_some() {
+                "administrative_recovery"
+            } else if authenticated_actor.is_some() {
+                "authenticated_session"
+            } else {
+                "local_cli"
+            },
             outcome = "created",
         );
         Ok(AuthDeviceCreateResponse {
@@ -1179,6 +1377,186 @@ impl GatewayAuthService {
             ),
             expires_at_unix,
             gateway_id: self.identity.gateway.id.clone(),
+        })
+    }
+
+    pub(crate) async fn provision_first_member_session_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        principal_id: &pioneer_protocol::PrincipalId,
+        mut installation: ClientInstallationDescriptor,
+        ids: &FirstMemberSessionIds,
+        now_unix: u64,
+    ) -> Result<AuthSessionGrant, AuthError> {
+        super::validate_installation_descriptor(&mut installation)?;
+        let now = datetime(now_unix)?;
+        let refresh_expires_at_unix = now_unix
+            .checked_add(self.config.refresh_token_ttl_seconds)
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let access_expires_at_unix = now_unix
+            .checked_add(self.config.access_token_ttl_seconds)
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let refresh_expires_at = datetime(refresh_expires_at_unix)?;
+        let principal = load_principal_by_id(transaction, principal_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        if principal.gateway_id != self.identity.gateway.id
+            || principal.kind != PrincipalKind::User
+            || principal.status != PrincipalStatus::Active
+            || principal.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+        {
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+        if load_active_device_by_installation(
+            transaction,
+            &self.identity.gateway.id,
+            principal_id,
+            installation.installation_id.as_str(),
+        )
+        .await
+        .map_err(storage_error)?
+        .is_some()
+        {
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+
+        // These hashes satisfy the ordinary Epic 3 AuthSession persistence
+        // contract but are never presented as an activation credential.
+        let unused_activation = self.opaque_credentials.generate_device_activation();
+        let activation_token_hash = self.opaque_credentials.fingerprint(&unused_activation);
+        let activation_locator_hash = self
+            .opaque_credentials
+            .fingerprint_device_activation_locator(&unused_activation)?;
+        insert_active_device_session(
+            transaction,
+            NewActiveDeviceSessionRow {
+                device_id: ids.device_id.clone(),
+                session_id: ids.session_id.clone(),
+                gateway_id: self.identity.gateway.id.clone(),
+                principal_id: principal_id.clone(),
+                token_family_id: ids.token_family_id.clone(),
+                installation: installation.clone(),
+                activation_token_hash,
+                activation_locator_hash,
+                refresh_expires_at,
+                now,
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+        self.inject_activation_failure(1)?;
+        self.inject_activation_failure(2)?;
+        self.complete_initial_session_in_transaction(
+            transaction,
+            &self.identity.gateway.id,
+            principal_id,
+            principal,
+            &ids.device_id,
+            &ids.session_id,
+            &ids.token_family_id,
+            &installation,
+            ids.credential_ids(),
+            now_unix,
+            now,
+            refresh_expires_at_unix,
+            refresh_expires_at,
+            access_expires_at_unix,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_initial_session_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        gateway_id: &pioneer_protocol::GatewayId,
+        principal_id: &pioneer_protocol::PrincipalId,
+        principal: GatewayPrincipalRecord,
+        device_id: &DeviceId,
+        session_id: &AuthSessionId,
+        token_family_id: &TokenFamilyId,
+        installation: &ClientInstallationDescriptor,
+        issued_ids: IssuedCredentialIds,
+        now_unix: u64,
+        now: DateTime<FixedOffset>,
+        refresh_expires_at_unix: u64,
+        refresh_expires_at: DateTime<FixedOffset>,
+        access_expires_at_unix: u64,
+    ) -> Result<AuthSessionGrant, AuthError> {
+        if principal.id != *principal_id || principal.gateway_id != *gateway_id {
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+        validate_authenticated_principal(
+            principal.kind,
+            principal.status,
+            principal.role_key.as_deref(),
+        )?;
+        let refresh = self.opaque_credentials.generate_refresh(
+            session_id,
+            token_family_id,
+            0,
+            refresh_expires_at_unix,
+        );
+        let refresh_hash = self.opaque_credentials.fingerprint(&refresh);
+        insert_refresh_credential(
+            transaction,
+            NewRefreshCredentialRow {
+                id: issued_ids.refresh_id,
+                session_id: session_id.clone(),
+                token_family_id: token_family_id.clone(),
+                generation: 0,
+                token_hash: refresh_hash,
+                issued_at: now,
+                expires_at: refresh_expires_at,
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+        self.inject_activation_failure(3)?;
+        let access_token = self.access_issuer.issue(
+            &AccessJwtSubject {
+                gateway_id: gateway_id.clone(),
+                principal_id: principal_id.clone(),
+                device_id: device_id.clone(),
+                session_id: session_id.clone(),
+            },
+            now_unix,
+            Some(issued_ids.access_jti),
+        )?;
+        self.inject_activation_failure(4)?;
+        Ok(AuthSessionGrant {
+            gateway: AuthGatewaySnapshot {
+                id: gateway_id.clone(),
+            },
+            principal: AuthPrincipalSnapshot {
+                id: principal_id.clone(),
+                kind: principal.kind,
+                display_name: principal.display_name,
+                nickname: principal.nickname,
+            },
+            device: AuthDeviceSnapshot {
+                id: device_id.clone(),
+                installation_id: installation.installation_id.clone(),
+                display_name: installation.display_name.clone(),
+                client_kind: installation.client_kind,
+                status: DeviceStatus::Active,
+            },
+            session: AuthSessionSnapshot {
+                id: session_id.clone(),
+                device_id: device_id.clone(),
+                token_family_id: token_family_id.clone(),
+                status: AuthSessionStatus::Active,
+                refresh_generation: 0,
+                refresh_expires_at_unix,
+            },
+            access_token: AuthSecretString::new(access_token),
+            access_expires_at_unix,
+            refresh_token: AuthSecretString::new(refresh.expose_for_exchange().to_owned()),
+            refresh_expires_at_unix,
+            refresh_generation: 0,
+            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
+            credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
         })
     }
 
@@ -1199,7 +1577,7 @@ impl GatewayAuthService {
     ) -> Result<AuthSessionGrant, AuthError> {
         let admission_gateway_id = match admission.context() {
             RestrictedAuthContext::DeviceActivation(context) => context.gateway_id.clone(),
-            RestrictedAuthContext::Refresh(_) => {
+            RestrictedAuthContext::Refresh(_) | RestrictedAuthContext::Invitation(_) => {
                 return Err(AuthError::new(AuthErrorCode::MethodNotAllowed));
             }
         };
@@ -1272,6 +1650,9 @@ impl GatewayAuthService {
             let _ = transaction.rollback().await;
             return Err(AuthError::new(AuthErrorCode::DeviceActivationConsumed));
         }
+        let is_recovery_activation = pending_session.created_by_session_id.is_none()
+            && pending_session.principal_id != self.identity.superuser.id.as_str();
+        let recovery_started = std::time::Instant::now();
         let session_id = AuthSessionId::new(pending_session.id.clone())
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let device_id = DeviceId::new(pending_session.device_id.clone())
@@ -1290,6 +1671,10 @@ impl GatewayAuthService {
                 device_id = %device_id,
                 outcome = "expired",
             );
+            if is_recovery_activation {
+                record_outcome(Epic5Operation::RecoveryActivate, Epic5Outcome::Unavailable);
+                record_latency(Epic5Operation::RecoveryActivate, recovery_started.elapsed());
+            }
             return Err(AuthError::new(if exact_pending_match {
                 AuthErrorCode::DeviceActivationExpired
             } else {
@@ -1325,17 +1710,14 @@ impl GatewayAuthService {
                 request_revoked,
                 outcome = "invalid_credential",
             );
+            if is_recovery_activation {
+                record_outcome(Epic5Operation::RecoveryActivate, Epic5Outcome::Invalid);
+                record_latency(Epic5Operation::RecoveryActivate, recovery_started.elapsed());
+            }
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
         let token_family_id = TokenFamilyId::new(pending_session.token_family_id.clone())
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let refresh = self.opaque_credentials.generate_refresh(
-            &session_id,
-            &token_family_id,
-            0,
-            refresh_expires_at_unix,
-        );
-        let refresh_hash = self.opaque_credentials.fingerprint(&refresh);
         let result = async {
             let gateway_id = pioneer_protocol::GatewayId::new(pending_session.gateway_id.clone())
                 .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -1429,67 +1811,54 @@ impl GatewayAuthService {
             {
                 return Err(AuthError::new(AuthErrorCode::DeviceActivationConsumed));
             }
-            let device =
-                activate_pending_device(&transaction, &device_id, &params.installation, now)
-                    .await
-                    .map_err(storage_error)?
-                    .ok_or_else(|| AuthError::new(AuthErrorCode::DeviceActivationConsumed))?;
+            activate_pending_device(&transaction, &device_id, &params.installation, now)
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| AuthError::new(AuthErrorCode::DeviceActivationConsumed))?;
             self.inject_activation_failure(1)?;
             activate_pending_auth_session(&transaction, &session_id, refresh_expires_at, now)
                 .await
                 .map_err(storage_error)?
                 .ok_or_else(|| AuthError::new(AuthErrorCode::DeviceActivationConsumed))?;
             self.inject_activation_failure(2)?;
-            insert_refresh_credential(
-                &transaction,
-                NewRefreshCredentialRow {
-                    id: issued_ids.refresh_id,
-                    session_id: session_id.clone(),
-                    token_family_id: token_family_id.clone(),
-                    generation: 0,
-                    token_hash: refresh_hash,
-                    issued_at: now,
-                    expires_at: refresh_expires_at,
-                },
-            )
-            .await
-            .map_err(storage_error)?;
-            self.inject_activation_failure(3)?;
-            let access_token = self.access_issuer.issue(
-                &AccessJwtSubject {
-                    gateway_id: gateway_id.clone(),
-                    principal_id: principal_id.clone(),
-                    device_id: device_id.clone(),
-                    session_id: session_id.clone(),
-                },
-                now_unix,
-                Some(issued_ids.access_jti.clone()),
-            )?;
-            self.inject_activation_failure(4)?;
-            Ok((
-                gateway_id,
-                principal_id,
-                principal,
-                device,
-                superseded_session_id,
-                access_token,
-            ))
+            let grant = self
+                .complete_initial_session_in_transaction(
+                    &transaction,
+                    &gateway_id,
+                    &principal_id,
+                    principal,
+                    &device_id,
+                    &session_id,
+                    &token_family_id,
+                    &params.installation,
+                    issued_ids,
+                    now_unix,
+                    now,
+                    refresh_expires_at_unix,
+                    refresh_expires_at,
+                    access_expires_at_unix,
+                )
+                .await?;
+            Ok((grant, superseded_session_id))
         }
         .await;
-        let (gateway_id, principal_id, principal, device, superseded_session_id, access_token) =
-            match result {
-                Ok(value) => {
-                    transaction
-                        .commit()
-                        .await
-                        .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-                    value
+        let (grant, superseded_session_id) = match result {
+            Ok(value) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+                value
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                if is_recovery_activation {
+                    record_outcome(Epic5Operation::RecoveryActivate, Epic5Outcome::Unavailable);
+                    record_latency(Epic5Operation::RecoveryActivate, recovery_started.elapsed());
                 }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
+                return Err(error);
+            }
+        };
         if let Some(session_id) = superseded_session_id.as_ref() {
             self.disconnect_session_after_commit(
                 session_id,
@@ -1499,46 +1868,16 @@ impl GatewayAuthService {
         }
         tracing::info!(
             event = "auth_device_session_activated",
-            principal_id = %principal_id,
-            device_id = %device_id,
-            auth_session_id = %session_id,
+            principal_id = %grant.principal.id,
+            device_id = %grant.device.id,
+            auth_session_id = %grant.session.id,
             outcome = "activated",
         );
-        Ok(AuthSessionGrant {
-            gateway: AuthGatewaySnapshot { id: gateway_id },
-            principal: AuthPrincipalSnapshot {
-                id: principal_id,
-                kind: principal.kind,
-                display_name: principal.display_name,
-                nickname: principal.nickname,
-            },
-            device: AuthDeviceSnapshot {
-                id: device_id.clone(),
-                installation_id: device
-                    .installation_id
-                    .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                display_name: device
-                    .display_name
-                    .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?,
-                client_kind: params.installation.client_kind,
-                status: DeviceStatus::Active,
-            },
-            session: AuthSessionSnapshot {
-                id: session_id,
-                device_id,
-                token_family_id,
-                status: AuthSessionStatus::Active,
-                refresh_generation: 0,
-                refresh_expires_at_unix,
-            },
-            access_token: AuthSecretString::new(access_token),
-            access_expires_at_unix,
-            refresh_token: AuthSecretString::new(refresh.expose_for_exchange().to_owned()),
-            refresh_expires_at_unix,
-            refresh_generation: 0,
-            auth_protocol_version: pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
-            credential_storage_order: CredentialStorageOrder::PersistRefreshBeforeActivatingAccess,
-        })
+        if is_recovery_activation {
+            record_outcome(Epic5Operation::RecoveryActivate, Epic5Outcome::Success);
+            record_latency(Epic5Operation::RecoveryActivate, recovery_started.elapsed());
+        }
+        Ok(grant)
     }
 
     #[cfg(test)]
@@ -1550,6 +1889,7 @@ impl GatewayAuthService {
         let pending = self
             .create_pending_device_session(
                 PendingSessionIssuer::LocalCli,
+                None,
                 None,
                 PendingSessionIds {
                     device_id: ids.device_id,
@@ -1647,7 +1987,7 @@ impl GatewayAuthService {
     }
 
     #[cfg(test)]
-    fn set_activation_failpoint(&self, step: u8) {
+    pub(crate) fn set_activation_failpoint(&self, step: u8) {
         use std::sync::atomic::Ordering;
         self.activation_failpoint.store(step, Ordering::SeqCst);
     }
@@ -1722,6 +2062,182 @@ impl RestrictedExchangeExecutor for GatewayAuthService {
                 to_value(self.activate_device(admission, params).await?)
                     .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))
             }
+            INVITE_PREVIEW => {
+                let started = std::time::Instant::now();
+                let RestrictedAuthContext::Invitation(context) = admission.context() else {
+                    record_outcome(Epic5Operation::InvitationPreview, Epic5Outcome::Invalid);
+                    record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::MethodNotAllowed));
+                };
+                let fingerprint = self
+                    .opaque_credentials
+                    .fingerprint_invitation_raw(admission.credential().expose_for_authentication());
+                if !self
+                    .epic5_rate_limits
+                    .reserve_restricted_invitation_attempt(&fingerprint)
+                {
+                    record_outcome(Epic5Operation::InvitationPreview, Epic5Outcome::RateLimited);
+                    record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                }
+                if context.gateway_id != self.identity.gateway.id {
+                    record_outcome(Epic5Operation::InvitationPreview, Epic5Outcome::Unavailable);
+                    record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                }
+                if params.as_object().is_none_or(|params| !params.is_empty()) {
+                    record_outcome(Epic5Operation::InvitationPreview, Epic5Outcome::Invalid);
+                    record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::MalformedCredential));
+                }
+                let result = InvitationService::preview_restricted_with_lifecycle(
+                    &self.database,
+                    &self.opaque_credentials,
+                    Some(self),
+                    &context.gateway_id,
+                    admission.credential().expose_for_authentication(),
+                    context.transport,
+                )
+                .await;
+                let preview = match result {
+                    Ok(preview) => {
+                        self.epic5_rate_limits
+                            .clear_restricted_invitation_failures(&fingerprint);
+                        preview
+                    }
+                    Err(_) => {
+                        record_outcome(
+                            Epic5Operation::InvitationPreview,
+                            Epic5Outcome::Unavailable,
+                        );
+                        record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                        return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                    }
+                };
+                let result = to_value(preview)
+                    .map_err(|_| AuthError::new(AuthErrorCode::InvitationUnavailable));
+                record_outcome(
+                    Epic5Operation::InvitationPreview,
+                    if result.is_ok() {
+                        Epic5Outcome::Success
+                    } else {
+                        Epic5Outcome::Unavailable
+                    },
+                );
+                record_latency(Epic5Operation::InvitationPreview, started.elapsed());
+                result
+            }
+            INVITE_ACCEPT => {
+                let started = std::time::Instant::now();
+                let RestrictedAuthContext::Invitation(context) = admission.context() else {
+                    record_outcome(Epic5Operation::InvitationAccept, Epic5Outcome::Invalid);
+                    record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::MethodNotAllowed));
+                };
+                let fingerprint = self
+                    .opaque_credentials
+                    .fingerprint_invitation_raw(admission.credential().expose_for_authentication());
+                if !self
+                    .epic5_rate_limits
+                    .reserve_restricted_invitation_attempt(&fingerprint)
+                {
+                    record_outcome(Epic5Operation::InvitationAccept, Epic5Outcome::RateLimited);
+                    record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                }
+                if context.gateway_id != self.identity.gateway.id {
+                    record_outcome(Epic5Operation::InvitationAccept, Epic5Outcome::Unavailable);
+                    record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                    return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                }
+                let params = match serde_json::from_value(params) {
+                    Ok(params) => params,
+                    Err(_) => {
+                        record_outcome(Epic5Operation::InvitationAccept, Epic5Outcome::Invalid);
+                        record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                        return Err(AuthError::new(AuthErrorCode::InvitationUnavailable));
+                    }
+                };
+                let result = InvitationService::accept_restricted(
+                    &self.database,
+                    &self.opaque_credentials,
+                    self,
+                    &context.gateway_id,
+                    admission.credential().expose_for_authentication(),
+                    params,
+                )
+                .await;
+                let response = match result {
+                    Ok(response) => {
+                        self.epic5_rate_limits
+                            .clear_restricted_invitation_failures(&fingerprint);
+                        response
+                    }
+                    Err(error) => {
+                        let outcome = match &error {
+                            InvitationAcceptServiceError::Corrective(
+                                pioneer_protocol::InvitationErrorReason::NicknameUnavailable,
+                            ) => {
+                                record_outcome(
+                                    Epic5Operation::NicknameConflict,
+                                    Epic5Outcome::Conflict,
+                                );
+                                Epic5Outcome::Conflict
+                            }
+                            InvitationAcceptServiceError::Corrective(_) => Epic5Outcome::Invalid,
+                            InvitationAcceptServiceError::Unavailable => Epic5Outcome::Unavailable,
+                            InvitationAcceptServiceError::Contention => Epic5Outcome::Contention,
+                            InvitationAcceptServiceError::Storage(_) => Epic5Outcome::Unavailable,
+                        };
+                        record_outcome(Epic5Operation::InvitationAccept, outcome);
+                        record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                        return Err(match error {
+                            InvitationAcceptServiceError::Unavailable => {
+                                AuthError::new(AuthErrorCode::InvitationUnavailable)
+                            }
+                            InvitationAcceptServiceError::Contention => {
+                                AuthError::new(AuthErrorCode::InvitationUnavailable)
+                            }
+                            InvitationAcceptServiceError::Storage(error) => {
+                                tracing::warn!(
+                                    error = %format!("{error:#}"),
+                                    "restricted invitation accept failed"
+                                );
+                                AuthError::new(AuthErrorCode::InvitationUnavailable)
+                            }
+                            InvitationAcceptServiceError::Corrective(reason) => match reason {
+                                pioneer_protocol::InvitationErrorReason::InvitationUnavailable => {
+                                    AuthError::new(AuthErrorCode::InvitationUnavailable)
+                                }
+                                pioneer_protocol::InvitationErrorReason::InvalidProfile => {
+                                    AuthError::new(AuthErrorCode::InvitationInvalidProfile)
+                                }
+                                pioneer_protocol::InvitationErrorReason::NicknameUnavailable => {
+                                    AuthError::new(AuthErrorCode::InvitationNicknameUnavailable)
+                                }
+                                pioneer_protocol::InvitationErrorReason::InvalidInstallation => {
+                                    AuthError::new(AuthErrorCode::InvitationInvalidInstallation)
+                                }
+                                pioneer_protocol::InvitationErrorReason::AvatarInvalid => {
+                                    AuthError::new(AuthErrorCode::InvitationAvatarInvalid)
+                                }
+                            },
+                        });
+                    }
+                };
+                let result = to_value(response)
+                    .map_err(|_| AuthError::new(AuthErrorCode::InvitationUnavailable));
+                record_outcome(
+                    Epic5Operation::InvitationAccept,
+                    if result.is_ok() {
+                        Epic5Outcome::Success
+                    } else {
+                        Epic5Outcome::Unavailable
+                    },
+                );
+                record_latency(Epic5Operation::InvitationAccept, started.elapsed());
+                result
+            }
             _ => Err(AuthError::new(AuthErrorCode::MethodNotAllowed)),
         }
     }
@@ -1730,33 +2246,7 @@ impl RestrictedExchangeExecutor for GatewayAuthService {
 fn validate_device_activation_params(
     params: &mut AuthDeviceActivateParams,
 ) -> Result<(), AuthError> {
-    validate_installation(&mut params.installation)
-}
-
-fn validate_installation(installation: &mut ClientInstallationDescriptor) -> Result<(), AuthError> {
-    installation.installation_id =
-        bounded_trimmed(installation.installation_id.as_str(), MAX_INSTALLATION_TEXT)?;
-    installation.display_name =
-        bounded_trimmed(installation.display_name.as_str(), MAX_INSTALLATION_TEXT)?;
-    installation.platform = bounded_optional(installation.platform.take(), MAX_DIAGNOSTIC_TEXT)?;
-    installation.client_version =
-        bounded_optional(installation.client_version.take(), MAX_DIAGNOSTIC_TEXT)?;
-    Ok(())
-}
-
-fn bounded_trimmed(value: &str, max_chars: usize) -> Result<String, AuthError> {
-    let trimmed = value.trim();
-    let count = trimmed.chars().count();
-    if count == 0 || count > max_chars || trimmed.chars().any(char::is_control) {
-        return Err(AuthError::new(AuthErrorCode::MalformedCredential));
-    }
-    Ok(trimmed.to_owned())
-}
-
-fn bounded_optional(value: Option<String>, max_chars: usize) -> Result<Option<String>, AuthError> {
-    value
-        .map(|value| bounded_trimmed(value.as_str(), max_chars))
-        .transpose()
+    super::validate_installation_descriptor(&mut params.installation)
 }
 
 fn datetime(unix: u64) -> Result<DateTime<FixedOffset>, AuthError> {
@@ -1836,14 +2326,22 @@ fn timestamp(value: DateTime<FixedOffset>) -> Result<u64, AuthError> {
 #[cfg(test)]
 mod tests {
     use migration::{Migrator, MigratorTrait};
+    use pioneer_crud::CrudStore;
+    use pioneer_keystore::MemorySecretStore;
+    use pioneer_protocol::{MemberRemoveParams, MemberSuspendParams, PrincipalId};
     use sea_orm::{ConnectionTrait, Database, Statement};
     use std::sync::Mutex;
 
     use super::*;
     use crate::auth::PresentedCredential;
+    use crate::auth::installation::bounded_trimmed;
+    use crate::authorization::{
+        AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
+    };
     use crate::bootstrap::bootstrap as bootstrap_workspace;
     use crate::identity::bootstrap_identity;
-    use crate::secrets::AuthKeyMaterial;
+    use crate::member::MemberService;
+    use crate::secrets::{AuthKeyMaterial, GatewaySecrets};
 
     async fn fixture() -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
         let database = Database::connect("sqlite::memory:").await.unwrap();
@@ -2075,6 +2573,227 @@ mod tests {
                  WHERE id='S00000000000000000001'"
             )
             .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_member_refresh_and_suspension_leave_no_usable_rotated_session() {
+        let (service, _identity) = fixture().await;
+        let initial_member = service
+            .create_initial_session_with_ids(
+                params("member-race-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let superuser_grant = service
+            .create_initial_session_with_ids(
+                params("superuser-race-installation", ClientKind::Desktop),
+                ids(2),
+            )
+            .await
+            .unwrap();
+        let (member_id, _) = member_access_credential(&service, &initial_member).await;
+        let actor = authenticate_grant(&service, &superuser_grant).await;
+        let store = CrudStore::new(service.database.clone());
+        let gate = AuthorizationService::new().authorize_action(
+            actor.kind,
+            actor.role_key.as_ref(),
+            ResourceAction::MemberSuspend,
+        );
+        let proof = match AuthorizationResolver::new(store.clone())
+            .authorize_member_principal(
+                &store.database_connection(),
+                actor.as_ref(),
+                &gate,
+                ResourceAction::MemberSuspend,
+                &member_id,
+            )
+            .await
+            .unwrap()
+        {
+            ProofResolution::Authorized(proof) => proof,
+            ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
+        };
+        let member_service = MemberService::new(
+            store,
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+        );
+
+        let refresh = service.exchange_refresh(
+            refresh_admission(initial_member.refresh_token.expose_secret()),
+            refresh_params(1),
+        );
+        let suspend = member_service.suspend(
+            actor.as_ref(),
+            &proof,
+            MemberSuspendParams {
+                principal_id: member_id.clone(),
+                expected_status: Some(PrincipalStatus::Active),
+            },
+        );
+        let (refresh, suspended) = tokio::join!(refresh, suspend);
+        assert!(suspended.unwrap().response.changed);
+        if let Ok(rotated) = refresh {
+            let credential = service
+                .access_issuer
+                .validate(
+                    rotated.access_token.expose_secret(),
+                    unix_timestamp_secs().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                service
+                    .authenticate_access(credential)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+        }
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM gateway_principal \
+                 WHERE id='P0000000000000000000A'"
+            )
+            .await,
+            "suspended"
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session \
+                 WHERE id='S00000000000000000001'"
+            )
+            .await,
+            "revoked"
+        );
+        assert_eq!(
+            count_where(
+                &service.database,
+                "auth_refresh_credential",
+                "session_id='S00000000000000000001'",
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_where(
+                &service.database,
+                "audit_event",
+                "action='member_suspended'",
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_member_refresh_and_removal_leave_no_usable_rotated_session() {
+        let (service, _identity) = fixture().await;
+        let initial_member = service
+            .create_initial_session_with_ids(
+                params("member-remove-race-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let superuser_grant = service
+            .create_initial_session_with_ids(
+                params("superuser-remove-race-installation", ClientKind::Desktop),
+                ids(2),
+            )
+            .await
+            .unwrap();
+        let (member_id, _) = member_access_credential(&service, &initial_member).await;
+        let actor = authenticate_grant(&service, &superuser_grant).await;
+        let store = CrudStore::new(service.database.clone());
+        let gate = AuthorizationService::new().authorize_action(
+            actor.kind,
+            actor.role_key.as_ref(),
+            ResourceAction::MemberRemove,
+        );
+        let proof = match AuthorizationResolver::new(store.clone())
+            .authorize_member_principal(
+                &store.database_connection(),
+                actor.as_ref(),
+                &gate,
+                ResourceAction::MemberRemove,
+                &member_id,
+            )
+            .await
+            .unwrap()
+        {
+            ProofResolution::Authorized(proof) => proof,
+            ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
+        };
+        let member_service = MemberService::new(
+            store,
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+        );
+
+        let refresh = service.exchange_refresh(
+            refresh_admission(initial_member.refresh_token.expose_secret()),
+            refresh_params(1),
+        );
+        let remove = member_service.remove(
+            actor.as_ref(),
+            &proof,
+            MemberRemoveParams {
+                principal_id: member_id.clone(),
+                expected_status: Some(PrincipalStatus::Active),
+            },
+        );
+        let (refresh, removed) = tokio::join!(refresh, remove);
+        assert!(removed.unwrap().response.changed);
+        if let Ok(rotated) = refresh {
+            let credential = service
+                .access_issuer
+                .validate(
+                    rotated.access_token.expose_secret(),
+                    unix_timestamp_secs().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                service
+                    .authenticate_access(credential)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+        }
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM gateway_principal \
+                 WHERE id='P0000000000000000000A'"
+            )
+            .await,
+            "removed"
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                "SELECT status AS value FROM auth_session \
+                 WHERE id='S00000000000000000001'"
+            )
+            .await,
+            "revoked"
+        );
+        assert_eq!(
+            count_where(
+                &service.database,
+                "auth_refresh_credential",
+                "session_id='S00000000000000000001'",
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_where(&service.database, "audit_event", "action='member_removed'").await,
             1
         );
     }
@@ -4125,6 +4844,95 @@ mod tests {
         assert_eq!(count(&service.database, "auth_session").await, 2);
     }
 
+    #[tokio::test]
+    async fn first_member_session_provisioning_is_generation_zero_and_caller_transaction_owned() {
+        let (service, identity) = fixture().await;
+        let member_id = pioneer_protocol::PrincipalId::new("P0000000000000000000A").unwrap();
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                        created_at,updated_at,removed_at\
+                     ) VALUES(\
+                        '{}','{}','user','member','active','Invitee','invitee','invitee',\
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     )",
+                    member_id, identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        let ids = FirstMemberSessionIds {
+            device_id: DeviceId::new("D0000000000000000000A").unwrap(),
+            session_id: AuthSessionId::new("S0000000000000000000A").unwrap(),
+            token_family_id: TokenFamilyId::new("F0000000000000000000A").unwrap(),
+            refresh_id: RefreshCredentialId::new("R0000000000000000000A").unwrap(),
+            access_jti: "J0000000000000000000A".to_owned(),
+        };
+        let transaction = service.database.begin().await.unwrap();
+        let grant = service
+            .provision_first_member_session_in_transaction(
+                &transaction,
+                &member_id,
+                ClientInstallationDescriptor {
+                    installation_id: "  invitee-mobile  ".to_owned(),
+                    display_name: "  Invitee Phone  ".to_owned(),
+                    client_kind: ClientKind::Mobile,
+                    platform: Some("  ios  ".to_owned()),
+                    client_version: Some("  1.0  ".to_owned()),
+                },
+                &ids,
+                unix_timestamp_secs().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(grant.principal.id, member_id);
+        assert_eq!(grant.session.refresh_generation, 0);
+        assert_eq!(grant.refresh_generation, 0);
+        assert_eq!(
+            grant.credential_storage_order,
+            CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
+        );
+        assert_eq!(grant.device.installation_id, "invitee-mobile");
+        let persisted_session = load_session(&transaction, &ids.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_session.status, "active");
+        assert_eq!(persisted_session.refresh_generation, 0);
+        assert!(persisted_session.created_by_session_id.is_none());
+        assert!(
+            load_current_refresh(&transaction, &ids.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        transaction.rollback().await.unwrap();
+        assert!(
+            load_device(&service.database, &ids.device_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_session(&service.database, &ids.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_current_refresh(&service.database, &ids.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn params(installation_id: &str, client_kind: ClientKind) -> AuthDeviceActivateParams {
         AuthDeviceActivateParams {
             installation: ClientInstallationDescriptor {
@@ -4205,6 +5013,176 @@ mod tests {
             .validate(access_token, unix_timestamp_secs().unwrap())
             .unwrap();
         service.authenticate_access(credential).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn administrative_recovery_keeps_one_target_owned_pending_activation_and_audits() {
+        let (service, identity) = fixture().await;
+        let target_id = PrincipalId::new("P0000000000000000000E").unwrap();
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                        created_at,updated_at,removed_at
+                     ) VALUES(
+                        '{}','{}','user','member','active','Recovery Member','recovery-member',
+                        'recovery-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+                     );
+                     INSERT INTO device(
+                        id,gateway_id,principal_id,installation_id,display_name,client_kind,
+                        platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at
+                     ) VALUES(
+                        'D00000000000000000090','{}','{}','recovery-admin-fixture',
+                        'Admin Desktop','desktop','test','1','active',CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+                     );
+                     INSERT INTO auth_session(
+                        id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,
+                        activation_token_hash,activation_locator_hash,activation_failed_attempts,
+                        activation_expires_at,activated_at,status,refresh_generation,created_at,
+                        updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,
+                        revoke_reason
+                     ) VALUES(
+                        'S00000000000000000090','{}','{}','D00000000000000000090',
+                        'F00000000000000000090',NULL,
+                        X'0000000000000000000000000000000000000000000000000000000000000090',
+                        X'1000000000000000000000000000000000000000000000000000000000000090',
+                        0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,
+                        datetime('now','+90 days'),NULL,NULL
+                     )",
+                    target_id,
+                    identity.gateway.id,
+                    identity.gateway.id,
+                    identity.superuser.id,
+                    identity.gateway.id,
+                    identity.superuser.id,
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        let actor = AuthenticatedSessionPrincipal {
+            gateway_id: identity.gateway.id.clone(),
+            principal_id: identity.superuser.id.clone(),
+            kind: PrincipalKind::Superuser,
+            role_key: None,
+            device_id: DeviceId::new("D00000000000000000090").unwrap(),
+            session_id: AuthSessionId::new("S00000000000000000090").unwrap(),
+            access_jti: generate_id(AUTH_DOMAIN_ID_LEN),
+            access_expires_at_unix: u64::MAX,
+        };
+        let first = service
+            .create_recovery_device(&actor, &target_id)
+            .await
+            .unwrap();
+        let second = service
+            .create_recovery_device(&actor, &target_id)
+            .await
+            .unwrap();
+        assert_ne!(first.session_id, second.session_id);
+        assert!(format!("{second:?}").contains("[redacted]"));
+        assert_eq!(
+            count_where(
+                &service.database,
+                "auth_session",
+                format!(
+                    "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
+                    target_id
+                )
+                .as_str(),
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                format!(
+                    "SELECT revoke_reason AS value FROM auth_session WHERE id = '{}'",
+                    first.session_id
+                )
+                .as_str(),
+            )
+            .await,
+            "superseded"
+        );
+        assert_eq!(
+            count_where(
+                &service.database,
+                "audit_event",
+                "action = 'member_recovery_device_created'",
+            )
+            .await,
+            2
+        );
+
+        let recovered = service
+            .activate_device_with_ids(
+                device_activation_admission(&service, second.activation_code.expose_secret()),
+                device_activation_params("recovery-member-installation"),
+                issued_ids(91),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.principal.id, target_id);
+        assert_eq!(recovered.session.id, second.session_id);
+        assert_eq!(recovered.device.id, second.device_id);
+        let authenticated_target = authenticate_grant(&service, &recovered).await;
+        assert_eq!(authenticated_target.principal_id, target_id);
+        assert_eq!(authenticated_target.session_id, recovered.session.id);
+        assert_eq!(authenticated_target.device_id, recovered.device.id);
+        assert_eq!(
+            count_where(
+                &service.database,
+                "auth_session",
+                format!(
+                    "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
+                    target_id
+                )
+                .as_str(),
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_where(
+                &service.database,
+                "audit_event",
+                "action = 'member_recovery_device_created'",
+            )
+            .await,
+            2,
+            "ordinary redemption must not duplicate the administrative creation audit"
+        );
+
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "UPDATE gateway_principal SET status = 'suspended' WHERE id = '{}'",
+                    target_id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        let invalid_target = service
+            .create_recovery_device(&actor, &target_id)
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_target.code(), AuthErrorCode::RecoveryInvalidTarget);
+        assert_eq!(
+            count_where(
+                &service.database,
+                "audit_event",
+                "action = 'member_recovery_device_created'",
+            )
+            .await,
+            2
+        );
     }
 
     fn ids(seed: u8) -> SessionGrantIds {

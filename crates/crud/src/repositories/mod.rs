@@ -1,3 +1,4 @@
+pub mod administrative_audit;
 pub mod agent_memory;
 pub mod agent_memory_candidate;
 pub mod agent_memory_capsule;
@@ -15,11 +16,13 @@ pub(crate) mod canonical_turn_event;
 pub mod cli_runtime_binding;
 pub mod hook_run;
 pub(crate) mod identity;
+pub(crate) mod invitation;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
 pub mod policy;
+pub(crate) mod principal_avatar;
 pub mod recovery_job;
 pub(crate) mod self_improvement_finalization;
 pub(crate) mod self_improvement_run;

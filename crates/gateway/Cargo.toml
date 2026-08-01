@@ -62,6 +62,7 @@ sha2.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true
+image.workspace = true
 fs4.workspace = true
 transcribe-rs.workspace = true
 uuid.workspace = true

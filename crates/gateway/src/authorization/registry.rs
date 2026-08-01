@@ -15,6 +15,12 @@ pub(crate) enum ResourceResolverKind {
     Task,
     Capability,
     OwnSession,
+    InvitationGrantSet,
+    InvitationCollection,
+    Invitation,
+    MemberDirectory,
+    DirectoryPrincipal,
+    MemberPrincipal,
 }
 
 impl ResourceResolverKind {
@@ -29,6 +35,12 @@ impl ResourceResolverKind {
             Self::Task => "task",
             Self::Capability => "capability",
             Self::OwnSession => "own_session",
+            Self::InvitationGrantSet => "invitation_grant_set",
+            Self::InvitationCollection => "invitation_collection",
+            Self::Invitation => "invitation",
+            Self::MemberDirectory => "member_directory",
+            Self::DirectoryPrincipal => "directory_principal",
+            Self::MemberPrincipal => "member_principal",
         }
     }
 }
@@ -83,16 +95,104 @@ use AuthorizationAuditClass::{Authentication, Execution, Management, Mutation, R
 use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
     ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
-    McpManage, MemoryRead, MemoryWrite, ProviderManage, ProviderUse, SessionReadOwn,
-    SessionRevokeOwn, SkillManage, SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate,
-    ThreadManage, ThreadMove, ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate,
-    WorkspaceList, WorkspaceManage, WorkspaceRead,
+    InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberAvatarRead,
+    MemberDeviceCreate, MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend,
+    MemoryRead, MemoryWrite, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn,
+    SkillManage, SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
+    ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate, WorkspaceList,
+    WorkspaceManage, WorkspaceMemberAdd, WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
 };
 use ResourceResolverKind::{
-    Artifact, Capability, Gateway, OwnSession, Task, Thread, Turn, Workspace, WorkspaceCollection,
+    Artifact, Capability, DirectoryPrincipal, Gateway, Invitation, InvitationCollection,
+    InvitationGrantSet, MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn,
+    Workspace, WorkspaceCollection,
 };
 
 pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
+    method_entry(
+        INVITE_CREATE,
+        InvitationCreate,
+        InvitationGrantSet,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        INVITE_LIST,
+        InvitationList,
+        InvitationCollection,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        INVITE_REVOKE,
+        InvitationRevoke,
+        Invitation,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        MEMBER_LIST,
+        MemberDirectoryList,
+        MemberDirectory,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        MEMBER_AVATAR_GET,
+        MemberAvatarRead,
+        DirectoryPrincipal,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        MEMBER_SUSPEND,
+        MemberSuspend,
+        MemberPrincipal,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        MEMBER_RESTORE,
+        MemberRestore,
+        MemberPrincipal,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        MEMBER_DEVICE_CREATE,
+        MemberDeviceCreate,
+        MemberPrincipal,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        MEMBER_REMOVE,
+        MemberRemove,
+        MemberPrincipal,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        WORKSPACE_MEMBER_LIST,
+        WorkspaceMemberList,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        WORKSPACE_MEMBER_ADD,
+        WorkspaceMemberAdd,
+        Workspace,
+        NotFound,
+        Management,
+    ),
+    method_entry(
+        WORKSPACE_MEMBER_REMOVE,
+        WorkspaceMemberRemove,
+        Workspace,
+        NotFound,
+        Management,
+    ),
     method_entry(
         AUTH_ME,
         SessionReadOwn,
@@ -846,7 +946,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 127);
+        assert_eq!(registry.len(), 139);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());
@@ -862,10 +962,15 @@ mod tests {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        assert_eq!(restricted.len(), 2);
+        assert_eq!(restricted.len(), 4);
         assert_eq!(
             methods::RESTRICTED_AUTH_METHODS,
-            &[methods::AUTH_REFRESH, methods::AUTH_DEVICE_ACTIVATE]
+            &[
+                methods::AUTH_REFRESH,
+                methods::AUTH_DEVICE_ACTIVATE,
+                methods::INVITE_PREVIEW,
+                methods::INVITE_ACCEPT,
+            ]
         );
         for method in restricted {
             assert_eq!(
