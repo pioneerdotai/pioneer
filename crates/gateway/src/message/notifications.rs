@@ -789,6 +789,106 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(crate) async fn send_notification_to_removed_runtime_draft_owner<T: Serialize>(
+        &self,
+        access: &crate::thread::RuntimeDraftAccess,
+        method: &str,
+        payload: &T,
+        subscribers: Vec<crate::thread::ThreadSubscriber>,
+    ) {
+        let initially_authorized = self
+            .authorized_removed_runtime_draft_recipients(access, subscribers.clone())
+            .await;
+        let serialization_subscribers =
+            retain_thread_subscribers(subscribers, &initially_authorized);
+        let serialization_authorized = self
+            .authorized_removed_runtime_draft_recipients(access, serialization_subscribers.clone())
+            .await;
+        if serialization_authorized.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let final_subscribers =
+            retain_thread_subscribers(serialization_subscribers, &serialization_authorized);
+        let connection_ids = self
+            .authorized_removed_runtime_draft_recipients(access, final_subscribers)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_removed_runtime_draft_recipients(
+        &self,
+        access: &crate::thread::RuntimeDraftAccess,
+        subscribers: Vec<crate::thread::ThreadSubscriber>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_thread_notification_decision,
+        };
+
+        let owner = access.owner();
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(1);
+        for subscriber in subscribers {
+            if &subscriber != owner {
+                continue;
+            }
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(subscriber.connection_id)
+                .await
+            else {
+                continue;
+            };
+            if principal.principal_id != owner.identity.principal_id
+                || principal.session_id != owner.identity.session_id
+            {
+                continue;
+            }
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+
+            let action = ResourceAction::ThreadRead;
+            let gate =
+                service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
+            match resolver
+                .authorize_runtime_draft(principal.as_ref(), &gate, action, access)
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_thread_notification_decision(action, proof.decision());
+                    recipients.push(subscriber.connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_thread_notification_decision(action, &decision);
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "runtime_draft",
+                        "notification",
+                    );
+                    warn!(
+                        connection_id = subscriber.connection_id,
+                        error = %format!("{error:#}"),
+                        "removed runtime draft notification authorization unavailable"
+                    );
+                }
+            }
+        }
+        recipients
+    }
+
     pub(super) async fn send_notification_to_reauthorized_thread_connections<T: Serialize>(
         &self,
         thread_id: &str,
@@ -961,7 +1061,7 @@ impl MessageProcessor {
             else {
                 continue;
             };
-            if expected_identity.is_some_and(|identity| {
+            if expected_identity.as_ref().is_some_and(|identity| {
                 principal.principal_id != identity.principal_id
                     || principal.session_id != identity.session_id
             }) {
@@ -998,6 +1098,45 @@ impl MessageProcessor {
                     disclosure: *disclosure,
                 };
                 record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
+                continue;
+            }
+
+            let identity = crate::thread::ThreadSubscriptionIdentity::new(
+                principal.principal_id.clone(),
+                principal.session_id.clone(),
+            );
+            if let Some(draft) = self
+                .thread_manager
+                .authorize_runtime_draft(connection_id, &identity, thread_id, None)
+                .await
+            {
+                let action = ResourceAction::ThreadRead;
+                let gate =
+                    service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
+                match resolver
+                    .authorize_runtime_draft(principal.as_ref(), &gate, action, &draft)
+                    .await
+                {
+                    Ok(ProofResolution::Authorized(proof)) => {
+                        record_thread_notification_decision(action, proof.decision());
+                        recipients.push(connection_id);
+                    }
+                    Ok(ProofResolution::Denied(decision)) => {
+                        record_thread_notification_decision(action, &decision);
+                    }
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            action.safe_name(),
+                            "runtime_draft",
+                            "notification",
+                        );
+                        warn!(
+                            connection_id,
+                            error = %format!("{error:#}"),
+                            "runtime draft notification authorization unavailable"
+                        );
+                    }
+                }
                 continue;
             }
 

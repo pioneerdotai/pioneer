@@ -918,11 +918,12 @@ mod tests {
 
     use super::*;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_entity::{gateway_principal, thread, workspace};
+    use pioneer_entity::{gateway_principal, thread, turn_event, workspace};
     use pioneer_protocol::{
         AUTH_DOMAIN_ID_LEN, GATEWAY_ID_LEN, GatewayId, PRINCIPAL_ID_LEN, PersistedActorRef,
-        PrincipalId, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
-        generate_id,
+        PrincipalId, SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+        ThreadStatus, ThreadVisibility, Turn, TurnPermissionAuditEvent,
+        TurnPermissionAuditEventKind, TurnStatus, generate_id,
     };
     use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set, TransactionTrait};
 
@@ -1321,6 +1322,167 @@ mod tests {
                 .expect("query creator membership")
                 .is_some(),
             "private creator membership must commit with the thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_first_turn_creates_thread_membership_and_events_in_one_transaction() {
+        let fixture = fixture().await;
+        let store = crate::CrudStore::new(fixture.database.clone());
+        let timestamp = chrono::Utc::now().timestamp();
+        let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
+        let turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
+        let thread = Thread {
+            id: thread_id.clone(),
+            workspace_id: fixture.red_workspace_id.clone(),
+            name: None,
+            preview: "first message".to_owned(),
+            mode: ThreadMode::Chat,
+            model: "test".to_owned(),
+            model_provider: "test".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: Some(ThreadVisibility::Private),
+            turns: Vec::new(),
+        };
+        let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
+        let turn = Turn {
+            id: turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: permission_profile.clone(),
+        };
+        let audit = TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: permission_profile.mode,
+            profile_source: permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+        let actor = PersistedActorRef::Principal(fixture.member_id.clone());
+
+        store
+            .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                None,
+                actor.clone(),
+                audit.clone(),
+                &fixture.gateway_id,
+                &fixture.member_id,
+            )
+            .await
+            .expect_err("missing workspace membership must roll back the initial turn");
+        assert!(
+            thread::Entity::find_by_id(thread_id.clone())
+                .one(&fixture.database)
+                .await
+                .expect("query rolled-back initial thread")
+                .is_none()
+        );
+        assert!(
+            crate::find_thread_membership(&fixture.database, &thread_id, &fixture.member_id)
+                .await
+                .expect("query rolled-back creator membership")
+                .is_none()
+        );
+        assert!(
+            turn_event::Entity::find()
+                .filter(turn_event::Column::TurnId.eq(turn_id.clone()))
+                .all(&fixture.database)
+                .await
+                .expect("query rolled-back turn events")
+                .is_empty()
+        );
+
+        let transaction = fixture
+            .database
+            .begin()
+            .await
+            .expect("begin workspace membership grant");
+        insert_workspace_membership(
+            &transaction,
+            &NewWorkspaceMembership {
+                gateway_id: fixture.gateway_id.clone(),
+                principal_id: fixture.member_id.clone(),
+                workspace_id: fixture.red_workspace_id.clone(),
+                granted_by: PersistedActorRef::Principal(fixture.superuser_id.clone()),
+                now: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .expect("grant creator workspace membership");
+        transaction
+            .commit()
+            .await
+            .expect("commit workspace membership grant");
+
+        store
+            .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                None,
+                actor,
+                audit,
+                &fixture.gateway_id,
+                &fixture.member_id,
+            )
+            .await
+            .expect("first turn should atomically materialize the private thread");
+
+        let persisted = thread::Entity::find_by_id(thread_id.clone())
+            .one(&fixture.database)
+            .await
+            .expect("query materialized thread")
+            .expect("materialized thread should exist");
+        assert_eq!(persisted.access_class, "private");
+        assert!(
+            crate::find_thread_membership(&fixture.database, &thread_id, &fixture.member_id)
+                .await
+                .expect("query committed creator membership")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_turn(&thread_id, &turn_id)
+                .await
+                .expect("query committed first turn")
+                .is_some()
+        );
+        assert_eq!(
+            turn_event::Entity::find()
+                .filter(turn_event::Column::TurnId.eq(turn_id))
+                .all(&fixture.database)
+                .await
+                .expect("query committed first-turn events")
+                .len(),
+            2
         );
     }
 

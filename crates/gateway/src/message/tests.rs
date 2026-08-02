@@ -27,6 +27,7 @@ use crate::thread_episodic::{
 };
 use crate::workspace::WorkspaceManager;
 use async_trait::async_trait;
+use axum::extract::ws::Message;
 use futures_util::StreamExt;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::{
@@ -75,43 +76,44 @@ use pioneer_memory::hooks::{
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactCapabilitiesResponse,
-    ArtifactUploadChunkHeader, ArtifactUploadSourceKind, ArtifactUploadStartParams,
-    CLIAgentRuntimeKind, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
-    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
-    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondResponse,
-    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
-    ExecutionWindowStatus, INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemStartedNotification, ItemToolRetryScheduledNotification,
-    ItemUpdatedNotification, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
-    METHOD_NOT_FOUND_CODE, McpChangedAction, McpChangedNotification, McpInstallResponse,
-    McpInstallResultStatus, McpInstallStatus, McpListResponse, McpPolicySetResponse,
-    McpRuntimeState, McpScopeKind, McpServerDetailsResponse, McpServerStatus, McpSourceKind,
-    McpTransportSummary, McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
-    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
-    MemorySensitivity, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
-    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
-    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
-    SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
-    SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
-    SkillsUninstallResponse, SkillsUpdateResponse, SkillsUploadAbortResponse,
-    SkillsUploadChunkHeader, SkillsUploadFinishResponse, SkillsUploadStartResponse,
-    TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
-    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
-    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
-    TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
+    ArtifactUploadChunkHeader, ArtifactUploadFinishResponse, ArtifactUploadSourceKind,
+    ArtifactUploadStartParams, ArtifactUploadStartResponse, CLIAgentRuntimeKind,
+    CLIRuntimePendingRequest,
+    CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
+    CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, INVALID_REQUEST_CODE,
+    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcErrorResponse,
+    JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE, McpChangedAction,
+    McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
+    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
+    McpServerStatus, McpSourceKind, McpTransportSummary, McpTurnBindingSummary,
+    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderTransportKind, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, RoleKey,
+    SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
+    SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPackInstallResponse, SkillsPackUninstallResponse, SkillsPackUpdateResponse,
+    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
+    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
+    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
+    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
+    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
     TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
     TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
@@ -163,7 +165,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
-use axum::extract::ws::Message;
 
 mod member_client_harness;
 
@@ -1294,7 +1295,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
 ) {
     let started = harness
         .thread_manager
-        .thread_start(
+        .thread_start_seeded(
             harness.connection_id,
             harness.workspace_id.clone(),
             ThreadStartParams {
@@ -1317,6 +1318,8 @@ async fn seed_cli_runtime_skill_preflight_thread(
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2262,7 +2265,7 @@ async fn seed_cli_runtime_security_thread(
 ) {
     let started = harness
         .thread_manager
-        .thread_start(
+        .thread_start_seeded(
             harness.connection_id,
             harness.workspace_id.clone(),
             ThreadStartParams {
@@ -2279,6 +2282,8 @@ async fn seed_cli_runtime_security_thread(
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("thread/start should seed CLI runtime security regression thread");
@@ -6594,7 +6599,7 @@ async fn setup_progress_delta_harness(
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         thread_manager
-            .thread_start(
+            .thread_start_seeded(
                 connection_id,
                 workspace_id.clone(),
                 ThreadStartParams {
@@ -6611,6 +6616,8 @@ async fn setup_progress_delta_harness(
                     agent_nickname: None,
                     agent_role: None,
                 },
+                None,
+                None,
             )
             .await
             .expect("thread/start should seed subscribed thread");
@@ -7388,7 +7395,7 @@ async fn start_thread_for_artifact_test(
 ) -> ThreadStartResponse {
     let response = processor
         .thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.to_owned(),
             ThreadStartParams {
@@ -7405,6 +7412,8 @@ async fn start_thread_for_artifact_test(
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("thread/start should succeed")
@@ -7418,6 +7427,68 @@ async fn start_thread_for_artifact_test(
         .await
         .expect("artifact test thread authorization root should persist");
     response
+}
+
+async fn materialize_loaded_test_thread_for_durable_operation(
+    processor: &MessageProcessor,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let thread = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .expect("test thread should be loaded before materialization");
+    let turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    processor
+        .crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("test thread should materialize before a durable-only operation");
+    let mut completed_turn = turn;
+    completed_turn.status = TurnStatus::Completed;
+    processor
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: completed_turn,
+            },
+            thread.updated_at.saturating_add(1),
+        )
+        .await
+        .expect("durable-operation seed turn should complete");
+    let persisted = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("materialized test thread should load")
+        .expect("materialized test thread should exist");
+    let sandbox_mode = processor
+        .crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("materialized test sandbox should load");
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(persisted, sandbox_mode)
+        .await
+        .expect("materialized test thread should become durable in memory");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7445,7 +7516,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let parent_thread_id = "thr_collaborative_composer";
     let started = processor
         .thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -7462,6 +7533,8 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("collaborative thread should start");
@@ -7571,7 +7644,7 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 
     let parent_thread_id = "thr_concurrent_frozen_composer";
     let started = thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -7588,6 +7661,8 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("collaborative thread should start");
@@ -7955,7 +8030,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
 
     let parent_thread_id = "thr_collab_child_stop";
     let started = thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -7972,6 +8047,8 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("collaborative parent should start");
@@ -8027,7 +8104,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
 
     thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -8044,6 +8121,8 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("child subscription should start");
@@ -9707,6 +9786,83 @@ async fn submit_test_voice_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_voice_turn_materializes_runtime_draft() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message"));
+    let thread_id = "thr_first_voice_runtime_draft";
+    let turn_id = "turn_first_voice_runtime_draft";
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "firstvoicedraftstart1",
+                "method": "thread/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "firstvoicedraftstart1").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("voice draft lookup should succeed")
+            .is_none(),
+        "voice draft must remain in memory before transcription submits its first turn"
+    );
+
+    let result = submit_test_voice_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(result.turn_id.as_deref(), Some(turn_id));
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("materialized voice thread lookup should succeed")
+            .is_some(),
+        "the first voice turn must materialize its runtime draft"
+    );
+    assert!(
+        crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("materialized voice turn lookup should succeed")
+            .is_some(),
+        "the thread and first voice turn must commit together"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_voice_composer_admits_detached_task() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
@@ -9733,7 +9889,7 @@ async fn collaborative_voice_composer_admits_detached_task() {
     ));
     let parent_thread_id = "thr_voice_collaborative";
     let started = thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -9750,6 +9906,8 @@ async fn collaborative_voice_composer_admits_detached_task() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("collaborative thread should start");
@@ -9830,7 +9988,7 @@ async fn task_run_voice_composer_stays_foreground() {
     .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child"));
     let child_thread_id = "thr_voice_task_run";
     let started = thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -9847,6 +10005,8 @@ async fn task_run_voice_composer_stays_foreground() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("TaskRun child thread should start");
@@ -12260,6 +12420,47 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .await;
     let _ = recv_response_by_id(&mut allowed_rx, create_id.as_str()).await;
     let _ = recv_notification_by_method(&mut allowed_rx, events::THREAD_STARTED).await;
+    assert!(
+        crud_store
+            .get_thread_model(THREAD_ID)
+            .await
+            .expect("Member draft lookup should succeed")
+            .is_none(),
+        "Member thread/start must remain runtime-only before the first turn"
+    );
+
+    let materialize_id = generate_test_request_id("realtimethread", "firstturn");
+    processor
+        .process_request_for_connection(
+            allowed_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": materialize_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": "T00000000000000000002",
+                    "input": [{"type": "text", "text": "materialize private thread"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut allowed_rx, materialize_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut allowed_rx, events::TURN_COMPLETED).await;
+    assert!(
+        pioneer_crud::find_thread_membership(
+            &crud_store.database_connection(),
+            THREAD_ID,
+            &pioneer_protocol::PrincipalId::new(MEMBER_ALLOWED_ID)
+                .expect("allowed Member principal id"),
+        )
+        .await
+        .expect("creator membership lookup should succeed")
+        .is_some(),
+        "first turn must atomically create the Member's private thread membership"
+    );
 
     let superuser_open_id = generate_test_request_id("realtimethread", "superopen");
     processor
@@ -13907,7 +14108,6 @@ async fn artifact_get_rejects_cross_workspace_artifact() {
         .await;
     let get_error = recv_error_by_id(&mut rx, get_id.as_str()).await;
     assert_eq!(get_error.error.message, "not_found");
-
 }
 
 #[test]
@@ -18079,7 +18279,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
 
         let parent_thread_id = format!("thr_dynamic_native_{runtime_id}");
         let started = thread_manager
-            .thread_start(
+            .thread_start_seeded(
                 connection_id,
                 workspace_id.clone(),
                 ThreadStartParams {
@@ -18096,6 +18296,8 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                     agent_nickname: None,
                     agent_role: None,
                 },
+                None,
+                None,
             )
             .await
             .expect("collaborative native parent should start");
@@ -19011,7 +19213,7 @@ async fn assert_detached_native_child_turn_cancellation() {
     assert_eq!(starts.len(), 1);
 
     thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -19028,6 +19230,8 @@ async fn assert_detached_native_child_turn_cancellation() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("child thread subscription should succeed");
@@ -21078,7 +21282,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
     let target_thread_id = "thr_system_delivery";
     processor
         .thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -21095,6 +21299,8 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("delivery target thread should load");
@@ -21687,7 +21893,7 @@ async fn thread_start_returns_response_and_started_notification() {
         test_provider(),
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -21713,6 +21919,14 @@ async fn thread_start_returns_response_and_started_notification() {
     let thread_response: ThreadStartResponse = serde_json::from_value(rpc_response.result)
         .expect("thread/start response payload should decode");
     assert!(!thread_response.thread.workspace_id.is_empty());
+    assert!(
+        crud_store
+            .get_thread_model(thread_response.thread.id.as_str())
+            .await
+            .expect("draft persistence lookup should succeed")
+            .is_none(),
+        "thread/start must keep an empty draft out of durable storage"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21837,7 +22051,7 @@ async fn thread_tree_hides_foreign_empty_draft_threads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connection_closed_removes_empty_thread_started_by_connection() {
+async fn connection_closed_discards_unmaterialized_runtime_draft() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -21849,7 +22063,7 @@ async fn connection_closed_removes_empty_thread_started_by_connection() {
         agent_manager.clone(),
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
     );
 
     let request = json!({
@@ -21877,16 +22091,150 @@ async fn connection_closed_removes_empty_thread_started_by_connection() {
         thread_manager.has_thread(&thread_id).await,
         "thread should be in memory before disconnect"
     );
+    assert!(
+        crud_store
+            .get_thread_model(thread_id.as_str())
+            .await
+            .expect("draft persistence lookup should succeed")
+            .is_none(),
+        "empty draft must not exist in durable storage before disconnect"
+    );
 
     processor.connection_closed(connection_id).await;
 
     assert!(
         !thread_manager.has_thread(&thread_id).await,
-        "empty thread should be removed when owner disconnects"
+        "runtime draft should leave memory when its owner disconnects"
     );
     assert!(
         !agent_manager.has_thread(&thread_id).await,
-        "empty thread should be removed from agent manager when owner disconnects"
+        "an unmaterialized draft must not leave an agent runtime behind"
+    );
+    assert!(
+        crud_store
+            .get_thread_model(thread_id.as_str())
+            .await
+            .expect("post-disconnect persistence lookup should succeed")
+            .is_none(),
+        "disconnect must not need a compensating durable delete"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persistence() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thr_runtime_draft_upload";
+    let attachment = b"runtime draft attachment";
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "draftuploadthread0001",
+                "method": "thread/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "draftuploadthread0001").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "draftuploadstart00001",
+                "method": "artifact/upload/start",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": thread_id,
+                    "planned_turn_id": "turn_runtime_draft_upload",
+                    "client_attachment_id": "attachment-runtime-draft",
+                    "file_name": "draft.txt",
+                    "mime_type": "text/plain",
+                    "size_bytes": attachment.len() as u64,
+                    "sha256": hex::encode(Sha256::digest(attachment)),
+                    "source_kind": "user_composer"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let start_response = recv_response_by_id(&mut rx, "draftuploadstart00001").await;
+    let upload: ArtifactUploadStartResponse = serde_json::from_value(start_response.result)
+        .expect("runtime draft upload/start response should decode");
+
+    let header = ArtifactUploadChunkHeader {
+        workspace_id: workspace_id.clone(),
+        upload_id: upload.upload_id.clone(),
+        offset: 0,
+        len: attachment.len() as u64,
+        chunk_sha256: Some(hex::encode(Sha256::digest(attachment))),
+    };
+    let frame = upload_binary_test_frame(
+        super::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC,
+        &header,
+        attachment,
+    );
+    processor
+        .process_binary_frame_for_connection(connection_id, frame.as_slice())
+        .await
+        .expect("runtime draft artifact chunk should reach binary dispatch");
+    let ack = recv_notification_by_method(&mut rx, events::ARTIFACT_UPLOAD_CHUNK_ACK).await;
+    let ack: pioneer_protocol::ArtifactUploadChunkAckNotification =
+        serde_json::from_value(ack.params.expect("runtime draft artifact ack params"))
+            .expect("runtime draft artifact ack should decode");
+    assert_eq!(ack.upload_id, upload.upload_id);
+    assert_eq!(ack.received_bytes, attachment.len() as u64);
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "draftuploadfinish0001",
+                "method": "artifact/upload/finish",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "upload_id": upload.upload_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let finish_response = recv_response_by_id(&mut rx, "draftuploadfinish0001").await;
+    let finished: ArtifactUploadFinishResponse = serde_json::from_value(finish_response.result)
+        .expect("runtime draft upload/finish response should decode");
+    assert!(!finished.artifact.artifact_id.is_empty());
+
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("runtime draft persistence lookup should succeed")
+            .is_none(),
+        "completed attachment upload must not materialize an empty draft thread"
     );
 }
 
@@ -24803,7 +25151,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
     );
 
     thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -24820,6 +25168,8 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("thread/start should seed native security snapshot thread");
@@ -24919,7 +25269,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
     let turn_id = "turn_security_audit_native";
 
     thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -24936,6 +25286,8 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("thread/start should seed native security audit thread");
@@ -26413,6 +26765,12 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexreviewthread0001").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_review",
+        "turn_codex_review_seed",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -26513,6 +26871,12 @@ async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexreviewthread0002").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_review_custom",
+        "turn_codex_review_custom_seed",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -26606,6 +26970,12 @@ async fn codex_review_start_rejects_before_target_validation() {
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexreviewthread0003").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_review_bad_target",
+        "turn_codex_review_bad_target_seed",
+    )
+    .await;
 
     processor
         .process_request_for_connection(
@@ -26683,6 +27053,12 @@ async fn codex_compaction_start_is_rejected_without_runtime_call() {
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexcompactthread001").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_compact",
+        "turn_codex_compact_seed",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -26773,6 +27149,12 @@ async fn codex_compaction_start_rejects_wrong_backend() {
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexcompactthread002").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_compact_wrong_backend",
+        "turn_codex_compact_wrong_backend_seed",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -27014,6 +27396,12 @@ async fn codex_thread_ops_fork_creates_pioneer_thread_and_native_binding() {
         .await;
     let _thread_response = recv_response_by_id(&mut rx, "codexopsforkstart0001").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        "thread_codex_ops_source",
+        "turn_codex_ops_source_seed",
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -27184,6 +27572,27 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
         .await;
     let _ = recv_response_by_id(&mut rx, SOURCE_REQUEST_ID).await;
     let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    let source_turn_request_id = generate_test_request_id("memberfork", "source-turn");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": source_turn_request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": SOURCE_THREAD_ID,
+                    "turn_id": "T00000000000000000013",
+                    "input": [{"type": "text", "text": "materialize fork source"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, source_turn_request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
 
     let now = chrono::Utc::now().fixed_offset();
     crud_store
@@ -29228,7 +29637,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     let native_thread_id = "native_thread_cli_interrupted_recovery";
     let initial_native_turn_id = "native_turn_cli_interrupted_recovery_1";
     thread_manager
-        .thread_start(
+        .thread_start_seeded(
             connection_id,
             workspace_id.clone(),
             ThreadStartParams {
@@ -29245,6 +29654,8 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 agent_nickname: None,
                 agent_role: None,
             },
+            None,
+            None,
         )
         .await
         .expect("CLI recovery thread should load");
@@ -34335,28 +34746,14 @@ async fn turn_start_materializes_thread_and_turn_state() {
             .expect("thread/start response payload should decode");
     let _thread_started_notification =
         recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-
-    session_manager.unregister_connection(connection_id).await;
-    let (reconnect_tx, mut reconnect_rx) = mpsc::channel(8);
-    let reconnect_id =
-        register_authenticated_test_connection(session_manager.as_ref(), reconnect_tx).await;
-    processor
-        .process_request_for_connection(
-            reconnect_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "reconnectthreadstart1",
-                "method": "thread/start",
-                "params": {
-                    "thread_id": thread_response.thread.id,
-                    "workspace_id": workspace_id
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let _ = recv_response_by_id(&mut reconnect_rx, "reconnectthreadstart1").await;
-    let _ = recv_notification_by_method(&mut reconnect_rx, events::THREAD_STARTED).await;
+    assert!(
+        thread::Entity::find_by_id(thread_response.thread.id.clone())
+            .one(&connection)
+            .await
+            .expect("draft thread lookup should succeed")
+            .is_none(),
+        "thread/start alone must not materialize the draft"
+    );
 
     let turn_start_request = json!({
         "jsonrpc": "2.0",
@@ -34377,12 +34774,12 @@ async fn turn_start_materializes_thread_and_turn_state() {
         }
     });
     processor
-        .process_request_for_connection(reconnect_id, &turn_start_request.to_string())
+        .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_rpc_response = recv_response_by_id(&mut reconnect_rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
     let _turn_started_notification =
-        recv_notification_by_method(&mut reconnect_rx, events::TURN_STARTED).await;
+        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
 
@@ -35117,6 +35514,12 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         .await;
     let _thread_start_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        thread_id,
+        "turn_folder_placement_seed_41",
+    )
+    .await;
 
     let folder_create_request = json!({
         "jsonrpc": "2.0",
@@ -35276,6 +35679,12 @@ async fn folder_delete_promotes_nested_contents_to_parent() {
         .await;
     let _thread_start = recv_response_by_id(&mut rx, "dddddddddddddddddddde").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        thread_id,
+        "turn_folder_placement_seed_42",
+    )
+    .await;
 
     let move_to_child_request = json!({
         "jsonrpc": "2.0",
@@ -35427,6 +35836,12 @@ async fn thread_and_folder_move_support_root_target() {
         .await;
     let _thread_start = recv_response_by_id(&mut rx, "cccccccccccccccccccce").await;
     let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    materialize_loaded_test_thread_for_durable_operation(
+        &processor,
+        thread_id,
+        "turn_folder_placement_seed_43",
+    )
+    .await;
 
     let move_to_child_request = json!({
         "jsonrpc": "2.0",
@@ -35925,6 +36340,12 @@ fn thread_agents_doc_rpc_saves_inherits_archives_and_resolves_for_thread() {
             .await;
         let _thread_start = recv_response_by_id(&mut rx, "agentsdocthread000001").await;
         let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+        materialize_loaded_test_thread_for_durable_operation(
+            &processor,
+            thread_id,
+            "turn_agents_doc_move_seed",
+        )
+        .await;
 
         let move_thread = json!({
             "jsonrpc": "2.0",

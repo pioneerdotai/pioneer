@@ -8,11 +8,13 @@ use pioneer_crud::{
     resolve_workspace_authorization_scope,
 };
 use pioneer_protocol::{
-    AuthSessionId, InvitationId, PrincipalId, PrincipalKind, PrincipalStatus, WorkspaceId,
+    AuthSessionId, InvitationId, PrincipalId, PrincipalKind, PrincipalStatus, ThreadVisibility,
+    WorkspaceId,
 };
 use sea_orm::ConnectionTrait;
 
 use crate::auth::AuthenticatedSessionPrincipal;
+use crate::thread::RuntimeDraftAccess;
 
 use super::{
     ActionGateDecision, ArtifactResourceId, AuthorizationDecision, AuthorizationResource,
@@ -340,6 +342,83 @@ impl AuthorizationResolver {
                 action,
                 resource,
                 ResolvedResourceAccess::Thread(access),
+            )
+            .map(AuthorizedThread))
+    }
+
+    /// Authorizes an exact connection-owned draft without pretending that it
+    /// already exists in persistence. `RuntimeDraftAccess` is the server-owned
+    /// resource proof; persisted workspace state is still resolved here so a
+    /// revoked Member cannot keep using a draft through an old connection.
+    pub(crate) async fn authorize_runtime_draft(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        access: &RuntimeDraftAccess,
+    ) -> Result<ProofResolution<AuthorizedThread>> {
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        if access.owner().identity.principal_id != principal.principal_id
+            || access.owner().identity.session_id != principal.session_id
+        {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        if principal.kind == PrincipalKind::User
+            && access.visibility() == Some(ThreadVisibility::Workspace)
+        {
+            return Ok(ProofResolution::Denied(AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::NotFound,
+            }));
+        }
+
+        let Some(workspace_scope) = resolve_workspace_authorization_scope(
+            &self.store.database_connection(),
+            access.workspace_id(),
+        )
+        .await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let workspace = self
+            .workspace_facts(
+                principal,
+                workspace_scope.workspace_id.as_str(),
+                workspace_scope.is_active,
+            )
+            .await?;
+        let Some(workspace_id) =
+            resource_id(WorkspaceResourceId::new(access.workspace_id().to_owned()))
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(thread_id) = resource_id(ThreadResourceId::new(access.thread_id().to_owned()))
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let access_class = if access.visibility() == Some(ThreadVisibility::Workspace) {
+            ThreadAccessClass::Workspace
+        } else {
+            ThreadAccessClass::Private
+        };
+
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::Thread {
+                    workspace_id,
+                    thread_id,
+                },
+                ResolvedResourceAccess::Thread(ThreadAccessFacts {
+                    workspace,
+                    access_class,
+                    thread_member: principal.kind == PrincipalKind::User,
+                    thread_creator: true,
+                }),
             )
             .map(AuthorizedThread))
     }

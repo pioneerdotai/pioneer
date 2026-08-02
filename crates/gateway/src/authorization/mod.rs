@@ -24,7 +24,8 @@ pub(crate) use domain::{
 };
 pub(crate) use execution::{
     ExecutionAuthorizationAdmission, ExecutionAuthorizationContext,
-    RevalidatedExecutionAuthorization, ensure_contextless_execution_is_trusted,
+    RevalidatedExecutionAuthorization, RuntimeDraftCreator, RuntimeDraftMaterialization,
+    ensure_contextless_execution_is_trusted,
 };
 pub(crate) use invalidation::{AccessChangeKind, AccessChangeSignal, AuthorizationInvalidationHub};
 pub(crate) use registry::{

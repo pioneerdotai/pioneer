@@ -1,21 +1,20 @@
 use super::*;
 use crate::message::artifacts::{ArtifactListAuthorization, ArtifactUploadAuthorization};
+use crate::message::thread_handlers::ThreadAccessAuthorization;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams, ArtifactGetParams,
-    ArtifactListForMessageParams,
-    ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams,
-    ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
-    ArtifactUploadStartParams, ArtifactViewGrantCreateParams, AuthSessionRevokeParams,
-    CLIRuntimeGetParams, CLIRuntimeListParams,
-    CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
-    CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
-    InvitationCreateParams, InvitationListParams, InvitationRevokeParams, McpInstallParams,
-    McpListParams, McpPolicySetParams, MemberDeviceCreateParams, MemberListParams,
-    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
-    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
-    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
-    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    ArtifactListForMessageParams, ArtifactListForThreadParams, ArtifactListForTurnParams,
+    ArtifactListParams, ArtifactRestoreParams, ArtifactUploadAbortParams,
+    ArtifactUploadFinishParams, ArtifactUploadStartParams, ArtifactViewGrantCreateParams,
+    AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
+    CLIRuntimeReviewStartParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
+    GatewaySettingsGetParams, GatewaySettingsUpdateParams, InvitationCreateParams,
+    InvitationListParams, InvitationRevokeParams, McpInstallParams, McpListParams,
+    McpPolicySetParams, MemberDeviceCreateParams, MemberListParams, MemberRemoveParams,
+    MemberRestoreParams, MemberSuspendParams, MemoryCandidatesApproveParams,
+    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
+    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPackInstallParams, SkillsPackUninstallParams,
@@ -36,11 +35,11 @@ use crate::authorization::{
     AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
     AuthorizedArtifact, AuthorizedInvitation, AuthorizedInvitationCollection,
     AuthorizedInvitationGrants, AuthorizedMemberDirectory, AuthorizedMemberPrincipal,
-    AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
-    AuthorizedWorkspace, AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy,
-    MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
-    ResourceResolverKind, external_error_for_decision, normal_method_entry,
-    record_authorization_unavailable, record_method_decision, record_method_decision_for_action,
+    AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace,
+    AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy, MethodAuthorizationEntry,
+    ProofResolution, RegistryLookupError, ResourceAction, ResourceResolverKind,
+    external_error_for_decision, normal_method_entry, record_authorization_unavailable,
+    record_method_decision, record_method_decision_for_action,
 };
 
 enum RequestAdmission {
@@ -58,6 +57,7 @@ enum RequestAdmission {
     ThreadManage(AuthorizedThread),
     ThreadParticipants(AuthorizedThread),
     Thread(AuthorizedThread),
+    RuntimeDraft(crate::thread::RuntimeDraftAccess),
     Turn(AuthorizedTurn),
     Artifact(AuthorizedArtifact),
     Task(AuthorizedTask),
@@ -117,6 +117,13 @@ impl RequestAdmission {
     fn thread(&self) -> Option<&AuthorizedThread> {
         match self {
             Self::Thread(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn runtime_draft(&self) -> Option<&crate::thread::RuntimeDraftAccess> {
+        match self {
+            Self::RuntimeDraft(access) => Some(access),
             _ => None,
         }
     }
@@ -671,6 +678,34 @@ impl MessageProcessor {
         )
         .await
         .map(RequestAdmission::Task)
+    }
+
+    async fn authorize_runtime_draft_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &MethodAuthorizationEntry,
+        action: ResourceAction,
+        thread_id: &str,
+        expected_workspace_id: Option<&str>,
+    ) -> Result<Option<crate::thread::RuntimeDraftAccess>, JsonRpcErrorResponse> {
+        let authorization = self
+            .authorize_runtime_draft_for_request(context, action, thread_id, expected_workspace_id)
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    entry.action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request.id.clone())
+            })?;
+        if let Some((access, decision)) = authorization {
+            record_method_decision(entry, &decision);
+            Ok(Some(access))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn authorize_normal_request(
@@ -1574,6 +1609,37 @@ impl MessageProcessor {
                         record_method_decision(entry, proof.decision());
                         Ok(RequestAdmission::Thread(proof))
                     }
+                    ProofResolution::Denied(decision)
+                        if matches!(
+                            request.method.as_str(),
+                            methods::THREAD_GET | methods::THREAD_UNSUBSCRIBE | methods::TURN_START
+                        ) && matches!(
+                            decision,
+                            AuthorizationDecision::Deny {
+                                reason: DenyReason::MissingAuthoritativeResource,
+                                ..
+                            }
+                        ) =>
+                    {
+                        if let Some(access) = self
+                            .authorize_runtime_draft_request(
+                                context,
+                                request,
+                                entry,
+                                entry.action,
+                                thread_id.trim(),
+                                expected_workspace_id.map(str::trim),
+                            )
+                            .await?
+                        {
+                            Ok(RequestAdmission::RuntimeDraft(access))
+                        } else {
+                            record_method_decision(entry, &decision);
+                            Err(external_error_for_decision(&decision)
+                                .unwrap_or(AuthorizationExternalError::Forbidden)
+                                .response(request.id.clone()))
+                        }
+                    }
                     ProofResolution::Denied(decision) => {
                         record_method_decision(entry, &decision);
                         Err(external_error_for_decision(&decision)
@@ -1956,41 +2022,53 @@ impl MessageProcessor {
                     context.role_key(),
                     turn_action,
                 );
-                return self.finish_turn_transfer_resolution(
-                    resolver
-                        .authorize_turn(
-                            context.principal(),
-                            &turn_gate,
-                            turn_action,
-                            turn_id.trim(),
-                            Some(params.workspace_id.trim()),
-                            Some(thread_id.trim()),
-                        )
-                        .await
-                        .map_err(|_| unavailable())?,
-                    entry,
-                    request.id.clone(),
-                );
+                return self
+                    .finish_turn_transfer_or_runtime_draft(
+                        context,
+                        request,
+                        entry,
+                        turn_action,
+                        resolver
+                            .authorize_turn(
+                                context.principal(),
+                                &turn_gate,
+                                turn_action,
+                                turn_id.trim(),
+                                Some(params.workspace_id.trim()),
+                                Some(thread_id.trim()),
+                            )
+                            .await
+                            .map_err(|_| unavailable())?,
+                        thread_id.trim(),
+                        params.workspace_id.trim(),
+                    )
+                    .await;
             }
             if let Some(thread_id) = params
                 .thread_id
                 .as_deref()
                 .filter(|thread_id| !thread_id.trim().is_empty())
             {
-                return self.finish_thread_transfer_resolution(
-                    resolver
-                        .authorize_thread(
-                            context.principal(),
-                            action_gate,
-                            entry.action,
-                            thread_id.trim(),
-                            Some(params.workspace_id.trim()),
-                        )
-                        .await
-                        .map_err(|_| unavailable())?,
-                    entry,
-                    request.id.clone(),
-                );
+                return self
+                    .finish_thread_transfer_or_runtime_draft(
+                        context,
+                        request,
+                        entry,
+                        entry.action,
+                        resolver
+                            .authorize_thread(
+                                context.principal(),
+                                action_gate,
+                                entry.action,
+                                thread_id.trim(),
+                                Some(params.workspace_id.trim()),
+                            )
+                            .await
+                            .map_err(|_| unavailable())?,
+                        thread_id.trim(),
+                        params.workspace_id.trim(),
+                    )
+                    .await;
             }
             let resolution = resolver
                 .authorize_workspace(
@@ -2055,37 +2133,49 @@ impl MessageProcessor {
                 context.role_key(),
                 turn_action,
             );
-            return self.finish_turn_transfer_resolution(
-                resolver
-                    .authorize_turn(
-                        context.principal(),
-                        &turn_gate,
-                        turn_action,
-                        turn_id,
-                        Some(session.workspace_id.as_str()),
-                        Some(thread_id),
-                    )
-                    .await
-                    .map_err(|_| unavailable())?,
-                entry,
-                request.id.clone(),
-            );
+            return self
+                .finish_turn_transfer_or_runtime_draft(
+                    context,
+                    request,
+                    entry,
+                    turn_action,
+                    resolver
+                        .authorize_turn(
+                            context.principal(),
+                            &turn_gate,
+                            turn_action,
+                            turn_id,
+                            Some(session.workspace_id.as_str()),
+                            Some(thread_id),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    thread_id,
+                    session.workspace_id.as_str(),
+                )
+                .await;
         }
         if let Some(thread_id) = session.thread_id.as_deref() {
-            return self.finish_thread_transfer_resolution(
-                resolver
-                    .authorize_thread(
-                        context.principal(),
-                        action_gate,
-                        entry.action,
-                        thread_id,
-                        Some(session.workspace_id.as_str()),
-                    )
-                    .await
-                    .map_err(|_| unavailable())?,
-                entry,
-                request.id.clone(),
-            );
+            return self
+                .finish_thread_transfer_or_runtime_draft(
+                    context,
+                    request,
+                    entry,
+                    entry.action,
+                    resolver
+                        .authorize_thread(
+                            context.principal(),
+                            action_gate,
+                            entry.action,
+                            thread_id,
+                            Some(session.workspace_id.as_str()),
+                        )
+                        .await
+                        .map_err(|_| unavailable())?,
+                    thread_id,
+                    session.workspace_id.as_str(),
+                )
+                .await;
         }
         let resolution = resolver
             .authorize_workspace(
@@ -2097,26 +2187,6 @@ impl MessageProcessor {
             .await
             .map_err(|_| unavailable())?;
         self.finish_workspace_transfer_resolution(resolution, entry, request.id.clone())
-    }
-
-    fn finish_thread_transfer_resolution(
-        &self,
-        resolution: ProofResolution<AuthorizedThread>,
-        entry: &'static crate::authorization::MethodAuthorizationEntry,
-        request_id: RequestId,
-    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
-        match resolution {
-            ProofResolution::Authorized(proof) => {
-                record_method_decision(entry, proof.decision());
-                Ok(RequestAdmission::Thread(proof))
-            }
-            ProofResolution::Denied(decision) => {
-                record_method_decision(entry, &decision);
-                Err(external_error_for_decision(&decision)
-                    .unwrap_or(AuthorizationExternalError::NotFound)
-                    .response(request_id))
-            }
-        }
     }
 
     fn finish_workspace_transfer_resolution(
@@ -2139,22 +2209,106 @@ impl MessageProcessor {
         }
     }
 
-    fn finish_turn_transfer_resolution(
+    async fn finish_thread_transfer_or_runtime_draft(
         &self,
-        resolution: ProofResolution<AuthorizedTurn>,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
         entry: &'static crate::authorization::MethodAuthorizationEntry,
-        request_id: RequestId,
+        action: ResourceAction,
+        resolution: ProofResolution<AuthorizedThread>,
+        thread_id: &str,
+        workspace_id: &str,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::Thread(proof))
+            }
+            ProofResolution::Denied(decision)
+                if matches!(
+                    decision,
+                    AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    }
+                ) =>
+            {
+                if let Some(access) = self
+                    .authorize_runtime_draft_request(
+                        context,
+                        request,
+                        entry,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await?
+                {
+                    Ok(RequestAdmission::RuntimeDraft(access))
+                } else {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request.id.clone()))
+            }
+        }
+    }
+
+    async fn finish_turn_transfer_or_runtime_draft(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        action: ResourceAction,
+        resolution: ProofResolution<AuthorizedTurn>,
+        thread_id: &str,
+        workspace_id: &str,
     ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
         match resolution {
             ProofResolution::Authorized(proof) => {
                 record_method_decision(entry, proof.decision());
                 Ok(RequestAdmission::Turn(proof))
             }
+            ProofResolution::Denied(decision)
+                if matches!(
+                    decision,
+                    AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    }
+                ) =>
+            {
+                if let Some(access) = self
+                    .authorize_runtime_draft_request(
+                        context,
+                        request,
+                        entry,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await?
+                {
+                    Ok(RequestAdmission::RuntimeDraft(access))
+                } else {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            }
             ProofResolution::Denied(decision) => {
                 record_method_decision(entry, &decision);
                 Err(external_error_for_decision(&decision)
                     .unwrap_or(AuthorizationExternalError::NotFound)
-                    .response(request_id))
+                    .response(request.id.clone()))
             }
         }
     }
@@ -2295,11 +2449,40 @@ impl MessageProcessor {
         let params_value = request.params.unwrap_or_else(empty_object_value);
         match serde_json::from_value::<TurnStartParams>(params_value) {
             Ok(params) => message_future(async move {
-                let proof = admission
-                    .thread()
-                    .expect("central admission supplies thread proof for turn/start");
-                debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
-                self.turn_start(&context, proof, request.id, params).await;
+                let execution_admission = if let Some(proof) = admission.thread() {
+                    debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                    crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
+                        &context,
+                        proof,
+                        self.authorization_invalidation_hub.current_revision(),
+                    )
+                } else if let Some(access) = admission.runtime_draft() {
+                    debug_assert_eq!(access.thread_id(), params.thread_id.trim());
+                    crate::authorization::ExecutionAuthorizationAdmission::from_authorized_runtime_draft(
+                        &context,
+                        access.clone(),
+                        self.authorization_invalidation_hub.current_revision(),
+                    )
+                } else {
+                    unreachable!("central admission supplies a persisted thread or runtime draft")
+                };
+                match execution_admission {
+                    Ok(execution_admission) => {
+                        self.turn_start(&context, execution_admission, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to bind execution authorization: {error:#}"),
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }),
             Err(error) => message_future(async move {
                 self.send_error(
@@ -3587,11 +3770,18 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadGetParams>(params_value) {
                         Ok(params) => {
-                            let proof = admission
-                                .thread()
-                                .expect("central admission supplies thread proof");
-                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
-                            self.thread_get(&context, proof, request.id, params).await;
+                            let authorization = if let Some(proof) = admission.thread() {
+                                ThreadAccessAuthorization::Persisted(proof)
+                            } else if let Some(access) = admission.runtime_draft() {
+                                ThreadAccessAuthorization::RuntimeDraft(access)
+                            } else {
+                                unreachable!(
+                                    "central admission supplies persisted thread or runtime draft"
+                                )
+                            };
+                            debug_assert_eq!(authorization.thread_id(), params.thread_id.trim());
+                            self.thread_get(&context, authorization, request.id, params)
+                                .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -3844,11 +4034,17 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadUnsubscribeParams>(params_value) {
                         Ok(params) => {
-                            let proof = admission
-                                .thread()
-                                .expect("central admission supplies thread proof");
-                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
-                            self.thread_unsubscribe(&context, proof, request.id, params)
+                            let authorization = if let Some(proof) = admission.thread() {
+                                ThreadAccessAuthorization::Persisted(proof)
+                            } else if let Some(access) = admission.runtime_draft() {
+                                ThreadAccessAuthorization::RuntimeDraft(access)
+                            } else {
+                                unreachable!(
+                                    "central admission supplies persisted thread or runtime draft"
+                                )
+                            };
+                            debug_assert_eq!(authorization.thread_id(), params.thread_id.trim());
+                            self.thread_unsubscribe(&context, authorization, request.id, params)
                                 .await;
                         }
                         Err(error) => {
@@ -5113,15 +5309,19 @@ impl MessageProcessor {
                                 admission.workspace(),
                                 admission.thread(),
                                 admission.turn(),
+                                admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None) => {
+                                (Some(proof), None, None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None) => {
+                                (None, Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof)) => {
+                                (None, None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                (None, None, None, Some(access)) => {
+                                    ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(
                                     "central admission supplies one upload target proof"
@@ -5159,15 +5359,19 @@ impl MessageProcessor {
                                 admission.workspace(),
                                 admission.thread(),
                                 admission.turn(),
+                                admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None) => {
+                                (Some(proof), None, None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None) => {
+                                (None, Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof)) => {
+                                (None, None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                (None, None, None, Some(access)) => {
+                                    ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(
                                     "central admission supplies one upload target proof"
@@ -5205,15 +5409,19 @@ impl MessageProcessor {
                                 admission.workspace(),
                                 admission.thread(),
                                 admission.turn(),
+                                admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None) => {
+                                (Some(proof), None, None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None) => {
+                                (None, Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof)) => {
+                                (None, None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Turn(proof)
+                                }
+                                (None, None, None, Some(access)) => {
+                                    ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(
                                     "central admission supplies one upload target proof"
@@ -6371,7 +6579,7 @@ impl MessageProcessor {
         debug!(
             connection_id,
             removed_thread_ids = ?removed_thread_ids,
-            "removed detached idle threads after connection closed"
+            "unloaded idle thread runtime state after connection closed"
         );
     }
 }

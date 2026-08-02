@@ -189,7 +189,16 @@ impl MessageProcessor {
                 .await
             {
                 Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
-                Ok(ProofResolution::Denied(decision)) => decision,
+                Ok(ProofResolution::Denied(decision)) => {
+                    self.authorize_binary_runtime_draft_after_missing(
+                        request_context,
+                        action,
+                        session.workspace_id.as_str(),
+                        thread_id,
+                        decision,
+                    )
+                    .await
+                }
                 Err(_) => missing_binary_resource(),
             }
         } else if let Some(thread_id) = session.thread_id.as_deref() {
@@ -204,7 +213,16 @@ impl MessageProcessor {
                 .await
             {
                 Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
-                Ok(ProofResolution::Denied(decision)) => decision,
+                Ok(ProofResolution::Denied(decision)) => {
+                    self.authorize_binary_runtime_draft_after_missing(
+                        request_context,
+                        action,
+                        session.workspace_id.as_str(),
+                        thread_id,
+                        decision,
+                    )
+                    .await
+                }
                 Err(_) => missing_binary_resource(),
             }
         } else {
@@ -258,8 +276,49 @@ impl MessageProcessor {
             .await
         {
             Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
-            Ok(ProofResolution::Denied(decision)) => decision,
+            Ok(ProofResolution::Denied(decision)) => {
+                self.authorize_binary_runtime_draft_after_missing(
+                    request_context,
+                    action,
+                    session.workspace_id.as_str(),
+                    session.thread_id.as_str(),
+                    decision,
+                )
+                .await
+            }
             Err(_) => missing_binary_resource(),
+        }
+    }
+
+    async fn authorize_binary_runtime_draft_after_missing(
+        &self,
+        request_context: &RequestContext,
+        action: ResourceAction,
+        workspace_id: &str,
+        thread_id: &str,
+        denied: AuthorizationDecision,
+    ) -> AuthorizationDecision {
+        if !matches!(
+            &denied,
+            AuthorizationDecision::Deny {
+                reason: DenyReason::MissingAuthoritativeResource,
+                ..
+            }
+        ) {
+            return denied;
+        }
+
+        match self
+            .authorize_runtime_draft_for_request(
+                request_context,
+                action,
+                thread_id,
+                Some(workspace_id),
+            )
+            .await
+        {
+            Ok(Some((_access, decision))) => decision,
+            Ok(None) | Err(_) => denied,
         }
     }
 

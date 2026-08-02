@@ -1,17 +1,20 @@
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
-    CrudStore, find_turn_initiator, load_device, load_principal_by_id, load_session,
+    CrudStore, PersistedThreadAccessClass, find_turn_initiator, load_device, load_principal_by_id,
+    load_session,
 };
 use pioneer_protocol::{
-    AgentExecutionBackend, AuthSessionId, CLIAgentRuntimeKind, DeviceId, PersistedActorRef,
-    PrincipalId, PrincipalKind, PrincipalStatus, TurnCapability, TurnPermissionMode,
-    TurnPermissionProfileCap, TurnPermissionProfileSnapshot, TurnSkillBinding,
+    AgentExecutionBackend, AuthSessionId, CLIAgentRuntimeKind, DeviceId, GatewayId,
+    PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, ThreadVisibility,
+    TurnCapability, TurnPermissionMode, TurnPermissionProfileCap, TurnPermissionProfileSnapshot,
+    TurnSkillBinding,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::request_context::RequestContext;
+use crate::thread::RuntimeDraftAccess;
 
 use super::{
     AuthorizationResolver, AuthorizationService, AuthorizedThread, ProofResolution, ResourceAction,
@@ -657,8 +660,9 @@ impl RevalidatedExecutionAuthorization {
 }
 
 /// Short-lived admission seed. It can only be created from the authenticated
-/// request and an exact typed thread proof, then finalized from materialized
-/// server-owned execution state.
+/// request and either an exact persisted-thread proof or the exact owner
+/// capability of a runtime draft, then finalized from server-owned execution
+/// state.
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionAuthorizationAdmission {
     initiating_principal_id: PrincipalId,
@@ -667,6 +671,34 @@ pub(crate) struct ExecutionAuthorizationAdmission {
     root_thread_id: String,
     policy_revision: u64,
     member: bool,
+    runtime_draft: Option<RuntimeDraftMaterialization>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeDraftMaterialization {
+    access: RuntimeDraftAccess,
+    creator: RuntimeDraftCreator,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RuntimeDraftCreator {
+    Member {
+        gateway_id: GatewayId,
+        principal_id: PrincipalId,
+    },
+    Superuser {
+        access_class: PersistedThreadAccessClass,
+    },
+}
+
+impl RuntimeDraftMaterialization {
+    pub(crate) fn access(&self) -> &RuntimeDraftAccess {
+        &self.access
+    }
+
+    pub(crate) fn creator(&self) -> &RuntimeDraftCreator {
+        &self.creator
+    }
 }
 
 impl ExecutionAuthorizationAdmission {
@@ -686,7 +718,47 @@ impl ExecutionAuthorizationAdmission {
         )
     }
 
-    pub(crate) fn from_revalidated_thread(
+    pub(crate) fn from_authorized_runtime_draft(
+        request: &RequestContext,
+        access: RuntimeDraftAccess,
+        policy_revision: u64,
+    ) -> Result<Self> {
+        let owner = access.owner();
+        if owner.connection_id != request.connection_id()
+            || owner.identity.principal_id != request.principal().principal_id
+            || owner.identity.session_id != request.principal().session_id
+        {
+            bail!("runtime draft authorization owner does not match request");
+        }
+        let creator = match request.principal().kind {
+            PrincipalKind::User => {
+                if access.visibility() == Some(ThreadVisibility::Workspace) {
+                    bail!("Member runtime draft cannot be workspace-visible");
+                }
+                RuntimeDraftCreator::Member {
+                    gateway_id: request.principal().gateway_id.clone(),
+                    principal_id: request.principal().principal_id.clone(),
+                }
+            }
+            PrincipalKind::Superuser => RuntimeDraftCreator::Superuser {
+                access_class: if access.visibility() == Some(ThreadVisibility::Workspace) {
+                    PersistedThreadAccessClass::Workspace
+                } else {
+                    PersistedThreadAccessClass::Private
+                },
+            },
+        };
+        let mut admission = Self::from_revalidated_thread(
+            request,
+            access.workspace_id(),
+            access.thread_id(),
+            policy_revision,
+        )?;
+        admission.runtime_draft = Some(RuntimeDraftMaterialization { access, creator });
+        Ok(admission)
+    }
+
+    fn from_revalidated_thread(
         request: &RequestContext,
         workspace_id: &str,
         root_thread_id: &str,
@@ -704,6 +776,7 @@ impl ExecutionAuthorizationAdmission {
             root_thread_id: root_thread_id.to_owned(),
             policy_revision,
             member: request.principal().kind == PrincipalKind::User,
+            runtime_draft: None,
         })
     }
 
@@ -717,6 +790,10 @@ impl ExecutionAuthorizationAdmission {
 
     pub(crate) fn root_thread_id(&self) -> &str {
         self.root_thread_id.as_str()
+    }
+
+    pub(crate) fn runtime_draft(&self) -> Option<&RuntimeDraftMaterialization> {
+        self.runtime_draft.as_ref()
     }
 
     /// Member requests may keep or narrow the persisted provider/model, but

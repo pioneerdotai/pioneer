@@ -100,10 +100,49 @@ pub(crate) struct ThreadSubscriber {
     pub(crate) identity: ThreadSubscriptionIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeDraftAccess {
+    workspace_id: String,
+    thread_id: String,
+    visibility: Option<pioneer_protocol::ThreadVisibility>,
+    owner: ThreadSubscriber,
+}
+
+impl RuntimeDraftAccess {
+    pub(crate) fn workspace_id(&self) -> &str {
+        self.workspace_id.as_str()
+    }
+
+    pub(crate) fn thread_id(&self) -> &str {
+        self.thread_id.as_str()
+    }
+
+    pub(crate) const fn visibility(&self) -> Option<pioneer_protocol::ThreadVisibility> {
+        self.visibility
+    }
+
+    pub(crate) fn owner(&self) -> &ThreadSubscriber {
+        &self.owner
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ThreadEntryLifecycle {
+    RuntimeDraft { owner: ThreadSubscriber },
+    Durable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadStartKind {
+    RuntimeDraft,
+    Durable,
+}
+
 struct ThreadEntry {
     thread: Thread,
     sandbox_mode: SandboxMode,
     subscribers: HashMap<ConnectionId, ThreadSubscriptionIdentity>,
+    lifecycle: ThreadEntryLifecycle,
 }
 
 #[derive(Default)]
@@ -137,11 +176,9 @@ impl ThreadManager {
         )
     }
 
-    /// Validates and materializes a new user-addressable thread without
-    /// publishing it into the in-memory subscription graph.
-    ///
-    /// The caller must durably commit the thread (and any creator membership)
-    /// before passing the returned seed to `thread_start_seeded`.
+    /// Validates and prepares a new user-addressable thread without publishing
+    /// it into either the in-memory subscription graph or durable storage.
+    /// The caller selects the runtime-draft or immediately durable lifecycle.
     pub(crate) fn prepare_new_user_thread(
         &self,
         workspace_id: String,
@@ -233,6 +270,26 @@ impl ThreadManager {
         workspace_id: String,
         params: ThreadStartParams,
     ) -> Result<ThreadStartOutcome> {
+        self.thread_start_draft_authenticated(
+            connection_id,
+            identity,
+            workspace_id,
+            params,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn thread_start_draft_authenticated(
+        &self,
+        connection_id: ConnectionId,
+        identity: ThreadSubscriptionIdentity,
+        workspace_id: String,
+        params: ThreadStartParams,
+        seed_thread: Option<Thread>,
+        seed_sandbox_mode: Option<SandboxMode>,
+    ) -> Result<ThreadStartOutcome> {
         self.thread_start_with_seed(
             Some(ThreadSubscriber {
                 connection_id,
@@ -240,8 +297,9 @@ impl ThreadManager {
             }),
             workspace_id,
             params,
-            None,
-            None,
+            seed_thread,
+            seed_sandbox_mode,
+            ThreadStartKind::RuntimeDraft,
         )
         .await
     }
@@ -284,6 +342,7 @@ impl ThreadManager {
             params,
             seed_thread,
             seed_sandbox_mode,
+            ThreadStartKind::Durable,
         )
         .await
     }
@@ -295,8 +354,15 @@ impl ThreadManager {
         seed_thread: Option<Thread>,
         seed_sandbox_mode: Option<SandboxMode>,
     ) -> Result<ThreadStartOutcome> {
-        self.thread_start_with_seed(None, workspace_id, params, seed_thread, seed_sandbox_mode)
-            .await
+        self.thread_start_with_seed(
+            None,
+            workspace_id,
+            params,
+            seed_thread,
+            seed_sandbox_mode,
+            ThreadStartKind::Durable,
+        )
+        .await
     }
 
     /// Restores persisted thread state for background lifecycle processing.
@@ -330,6 +396,7 @@ impl ThreadManager {
                 }
             }
             entry.thread.status = foreground_thread_status(&entry.thread);
+            entry.lifecycle = ThreadEntryLifecycle::Durable;
             return Ok(());
         }
 
@@ -340,6 +407,7 @@ impl ThreadManager {
                 thread,
                 sandbox_mode: sandbox_mode.unwrap_or(DEFAULT_SANDBOX_MODE),
                 subscribers: HashMap::new(),
+                lifecycle: ThreadEntryLifecycle::Durable,
             },
         );
         Ok(())
@@ -352,6 +420,7 @@ impl ThreadManager {
         params: ThreadStartParams,
         seed_thread: Option<Thread>,
         seed_sandbox_mode: Option<SandboxMode>,
+        start_kind: ThreadStartKind,
     ) -> Result<ThreadStartOutcome> {
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
@@ -424,6 +493,33 @@ impl ThreadManager {
                     );
                 }
 
+                let promote_to_durable = match (
+                    &state
+                        .threads
+                        .get(thread_id.as_str())
+                        .expect("thread should still exist")
+                        .lifecycle,
+                    start_kind,
+                    subscriber.as_ref(),
+                ) {
+                    (
+                        ThreadEntryLifecycle::RuntimeDraft { owner },
+                        ThreadStartKind::RuntimeDraft,
+                        Some(candidate),
+                    ) if owner == candidate => false,
+                    (
+                        ThreadEntryLifecycle::RuntimeDraft { .. },
+                        ThreadStartKind::RuntimeDraft,
+                        _,
+                    ) => bail!("thread `{thread_id}` is owned by another connection"),
+                    (ThreadEntryLifecycle::RuntimeDraft { .. }, ThreadStartKind::Durable, _) => {
+                        true
+                    }
+                    (ThreadEntryLifecycle::Durable, ThreadStartKind::RuntimeDraft, _) => {
+                        bail!("thread `{thread_id}` is already durable")
+                    }
+                    (ThreadEntryLifecycle::Durable, ThreadStartKind::Durable, _) => false,
+                };
                 if let Some(subscriber) = subscriber.as_ref() {
                     state
                         .thread_ids_by_connection
@@ -436,6 +532,9 @@ impl ThreadManager {
                     .threads
                     .get_mut(thread_id.as_str())
                     .expect("thread should still exist");
+                if promote_to_durable {
+                    existing_entry.lifecycle = ThreadEntryLifecycle::Durable;
+                }
                 if let Some(subscriber) = subscriber.as_ref() {
                     existing_entry
                         .subscribers
@@ -531,12 +630,21 @@ impl ThreadManager {
                         HashMap::from([(subscriber.connection_id, subscriber.identity.clone())])
                     })
                     .unwrap_or_default();
+                let lifecycle = match start_kind {
+                    ThreadStartKind::RuntimeDraft => ThreadEntryLifecycle::RuntimeDraft {
+                        owner: subscriber.as_ref().cloned().ok_or_else(|| {
+                            anyhow!("runtime draft requires an authenticated owner")
+                        })?,
+                    },
+                    ThreadStartKind::Durable => ThreadEntryLifecycle::Durable,
+                };
                 state.threads.insert(
                     thread_id,
                     ThreadEntry {
                         thread: thread.clone(),
                         sandbox_mode,
                         subscribers,
+                        lifecycle,
                     },
                 );
 
@@ -585,23 +693,64 @@ impl ThreadManager {
             .threads
             .values()
             .filter(|entry| entry.thread.workspace_id == workspace_id)
-            .filter(|entry| thread_visible_to_connection(entry, connection_id))
+            .filter(|entry| match &entry.lifecycle {
+                ThreadEntryLifecycle::Durable => true,
+                ThreadEntryLifecycle::RuntimeDraft { owner } => {
+                    connection_id == Some(owner.connection_id)
+                }
+            })
             .map(|entry| entry.thread.clone())
             .collect()
     }
 
-    /// Returns whether a currently materialized empty draft is visible to the
-    /// requested connection. Non-draft and non-materialized threads return
-    /// `None` so persisted listing policy remains authoritative for them.
-    pub async fn empty_draft_visibility_for_connection(
+    /// Resolves a runtime-only draft only for its exact authenticated owner.
+    /// Persisted threads deliberately never pass through this path.
+    pub(crate) async fn authorize_runtime_draft(
         &self,
-        thread_id: &str,
         connection_id: ConnectionId,
-    ) -> Option<bool> {
+        identity: &ThreadSubscriptionIdentity,
+        thread_id: &str,
+        expected_workspace_id: Option<&str>,
+    ) -> Option<RuntimeDraftAccess> {
         let state = self.state.read().await;
         let entry = state.threads.get(thread_id)?;
-        is_empty_unnamed_draft_thread(&entry.thread)
-            .then(|| thread_visible_to_connection(entry, Some(connection_id)))
+        let ThreadEntryLifecycle::RuntimeDraft { owner } = &entry.lifecycle else {
+            return None;
+        };
+        if owner.connection_id != connection_id
+            || &owner.identity != identity
+            || entry.subscribers.get(&connection_id) != Some(identity)
+            || expected_workspace_id
+                .is_some_and(|workspace_id| workspace_id != entry.thread.workspace_id)
+        {
+            return None;
+        }
+        Some(RuntimeDraftAccess {
+            workspace_id: entry.thread.workspace_id.clone(),
+            thread_id: entry.thread.id.clone(),
+            visibility: entry.thread.visibility,
+            owner: owner.clone(),
+        })
+    }
+
+    /// Completes the in-memory half of the first-turn transaction after the
+    /// durable thread, creator membership, and turn have committed.
+    pub(crate) async fn mark_runtime_draft_durable(&self, access: &RuntimeDraftAccess) -> bool {
+        let mut state = self.state.write().await;
+        let Some(entry) = state.threads.get_mut(access.thread_id()) else {
+            return false;
+        };
+        if entry.thread.workspace_id != access.workspace_id {
+            return false;
+        }
+        match &entry.lifecycle {
+            ThreadEntryLifecycle::RuntimeDraft { owner } if owner == access.owner() => {
+                entry.lifecycle = ThreadEntryLifecycle::Durable;
+                true
+            }
+            ThreadEntryLifecycle::Durable => true,
+            ThreadEntryLifecycle::RuntimeDraft { .. } => false,
+        }
     }
 
     pub async fn turn_start(
@@ -798,6 +947,16 @@ impl ThreadManager {
         entry.thread.model_provider = context.previous_model_provider;
         entry.thread.reasoning_effort = context.previous_reasoning_effort;
         entry.sandbox_mode = context.previous_sandbox_mode;
+
+        let discard_disconnected_runtime_draft = entry.subscribers.is_empty()
+            && matches!(
+                &entry.lifecycle,
+                ThreadEntryLifecycle::RuntimeDraft { .. }
+            )
+            && !has_in_progress_conversation_turn(&entry.thread);
+        if discard_disconnected_runtime_draft {
+            state.threads.remove(&context.thread_id);
+        }
     }
 
     pub async fn turn_finish(
@@ -1154,28 +1313,6 @@ fn foreground_thread_status(thread: &Thread) -> ThreadStatus {
     }
 }
 
-fn thread_visible_to_connection(entry: &ThreadEntry, connection_id: Option<ConnectionId>) -> bool {
-    if !is_empty_unnamed_draft_thread(&entry.thread) {
-        return true;
-    }
-
-    if entry.subscribers.is_empty() {
-        return true;
-    }
-
-    connection_id.is_some_and(|connection_id| entry.subscribers.contains_key(&connection_id))
-}
-
-fn is_empty_unnamed_draft_thread(thread: &Thread) -> bool {
-    thread.status == ThreadStatus::Idle
-        && thread.turns.is_empty()
-        && thread.preview.trim().is_empty()
-        && thread
-            .name
-            .as_deref()
-            .is_none_or(|name| name.trim().is_empty())
-}
-
 fn merge_thread_metadata(existing_thread: &mut Thread, incoming_thread: &Thread) {
     if existing_thread.id != incoming_thread.id
         || existing_thread.workspace_id != incoming_thread.workspace_id
@@ -1243,7 +1380,7 @@ fn test_subscription_identity(connection_id: ConnectionId) -> ThreadSubscription
 
 #[cfg(test)]
 mod tests {
-    use super::ThreadManager;
+    use super::{ThreadManager, ThreadSubscriptionIdentity};
     use pioneer_protocol::{
         PermissionBehavior, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStartParams, ThreadStatus, ThreadUnsubscribeStatus, ToolPermissionPolicySnapshot,
@@ -1525,7 +1662,13 @@ mod tests {
         );
 
         manager
-            .thread_start(10, workspace_id.to_owned(), start_params(thread_id))
+            .thread_start_seeded(
+                10,
+                workspace_id.to_owned(),
+                start_params(thread_id),
+                None,
+                None,
+            )
             .await
             .expect("user should subscribe to restored parent");
         let foreground = manager
@@ -1566,7 +1709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_closed_removes_empty_thread_with_last_subscriber() {
+    async fn connection_closed_discards_runtime_draft_with_its_owner() {
         let manager = ThreadManager::new("o4-mini", "openai");
         let outcome = manager
             .thread_start(
@@ -1577,7 +1720,7 @@ mod tests {
             .await
             .expect("thread start should succeed");
 
-        let thread_id = outcome.response.thread.id;
+        let thread_id = outcome.response.thread.id.clone();
         let removed = manager.connection_closed(10).await;
 
         assert_eq!(removed, vec![thread_id.clone()]);
@@ -1585,7 +1728,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_closed_keeps_thread_when_other_subscriber_exists() {
+    async fn runtime_draft_authorization_requires_exact_connection_and_identity() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let identity = ThreadSubscriptionIdentity::new(
+            pioneer_protocol::PrincipalId::new("P00000000000000000001").expect("principal id"),
+            pioneer_protocol::AuthSessionId::new("S00000000000000000001").expect("session id"),
+        );
+        let thread_id = "thr_runtime_owner_exact";
+        manager
+            .thread_start_authenticated(
+                10,
+                identity.clone(),
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("runtime draft should start");
+
+        assert!(
+            manager
+                .authorize_runtime_draft(10, &identity, thread_id, Some("ws_000000000000000001"),)
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .authorize_runtime_draft(11, &identity, thread_id, Some("ws_000000000000000001"),)
+                .await
+                .is_none()
+        );
+        let other_session = ThreadSubscriptionIdentity::new(
+            identity.principal_id.clone(),
+            pioneer_protocol::AuthSessionId::new("S00000000000000000002")
+                .expect("other session id"),
+        );
+        assert!(
+            manager
+                .authorize_runtime_draft(
+                    10,
+                    &other_session,
+                    thread_id,
+                    Some("ws_000000000000000001"),
+                )
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_closed_keeps_durable_thread_when_other_subscriber_exists() {
         let manager = ThreadManager::new("o4-mini", "openai");
         let outcome = manager
             .thread_start(
@@ -1596,8 +1787,17 @@ mod tests {
             .await
             .expect("thread start should succeed");
 
-        let thread_id = outcome.response.thread.id;
-        assert!(manager.subscribe_connection(&thread_id, 11).await);
+        let thread_id = outcome.response.thread.id.clone();
+        manager
+            .thread_start_seeded(
+                11,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id.as_str()),
+                Some(outcome.response.thread),
+                None,
+            )
+            .await
+            .expect("persisted thread should accept another subscriber");
 
         let removed = manager.connection_closed(10).await;
         assert!(removed.is_empty());
@@ -1694,7 +1894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_unsubscribe_removes_empty_thread_when_last_subscriber_leaves() {
+    async fn thread_unsubscribe_discards_runtime_draft_when_owner_leaves() {
         let manager = ThreadManager::new("o4-mini", "openai");
         let outcome = manager
             .thread_start(
@@ -1722,7 +1922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_unsubscribe_keeps_thread_when_subscribers_remain() {
+    async fn thread_unsubscribe_keeps_durable_thread_when_subscribers_remain() {
         let manager = ThreadManager::new("o4-mini", "openai");
         let outcome = manager
             .thread_start(
@@ -1732,8 +1932,17 @@ mod tests {
             )
             .await
             .expect("thread start should succeed");
-        let thread_id = outcome.response.thread.id;
-        assert!(manager.subscribe_connection(&thread_id, 11).await);
+        let thread_id = outcome.response.thread.id.clone();
+        manager
+            .thread_start_seeded(
+                11,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id.as_str()),
+                Some(outcome.response.thread),
+                None,
+            )
+            .await
+            .expect("persisted thread should accept another subscriber");
 
         let outcome = manager.thread_unsubscribe(10, &thread_id).await;
 

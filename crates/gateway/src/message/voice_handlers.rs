@@ -372,30 +372,33 @@ impl MessageProcessor {
                 transcript,
                 signal_stats,
             }) => {
-                if !self
-                    .revalidate_voice_thread_access(
+                let execution_admission = match self
+                    .resolve_voice_execution_admission(
                         request_context,
                         session.workspace_id.as_str(),
                         session.thread_id.as_str(),
                     )
                     .await
                 {
-                    self.send_voice_session_result_notification(
-                        connection_id,
-                        session.thread_id.as_str(),
-                        VoiceSessionResultNotification {
-                            session_id: session.session_id.clone(),
-                            outcome: VoiceSessionOutcome::Failed,
-                            turn_id: Some(session.turn_id.clone()),
-                            error: Some(VoiceError {
-                                kind: VoiceErrorKind::InvalidSession,
-                                message: "voice session target is unavailable".to_owned(),
-                            }),
-                        },
-                    )
-                    .await;
-                    return;
-                }
+                    Some(admission) => admission,
+                    None => {
+                        self.send_voice_session_result_notification(
+                            connection_id,
+                            session.thread_id.as_str(),
+                            VoiceSessionResultNotification {
+                                session_id: session.session_id.clone(),
+                                outcome: VoiceSessionOutcome::Failed,
+                                turn_id: Some(session.turn_id.clone()),
+                                error: Some(VoiceError {
+                                    kind: VoiceErrorKind::InvalidSession,
+                                    message: "voice session target is unavailable".to_owned(),
+                                }),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let mut turn_params =
                     match voice_turn_start_params_from_transcript(&params.context, transcript) {
                         Ok(turn_params) => turn_params,
@@ -422,34 +425,6 @@ impl MessageProcessor {
                                     outcome: VoiceSessionOutcome::NoSpeech,
                                     turn_id: Some(session.turn_id.clone()),
                                     error: Some(voice_error),
-                                },
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let execution_admission =
-                    match crate::authorization::ExecutionAuthorizationAdmission::from_revalidated_thread(
-                        request_context,
-                        session.workspace_id.as_str(),
-                        session.thread_id.as_str(),
-                        self.authorization_invalidation_hub.current_revision(),
-                    ) {
-                        Ok(admission) => admission,
-                        Err(error) => {
-                            self.send_voice_session_result_notification(
-                                connection_id,
-                                session.thread_id.as_str(),
-                                VoiceSessionResultNotification {
-                                    session_id: session.session_id.clone(),
-                                    outcome: VoiceSessionOutcome::Failed,
-                                    turn_id: Some(session.turn_id.clone()),
-                                    error: Some(VoiceError {
-                                        kind: VoiceErrorKind::InvalidSession,
-                                        message: format!(
-                                            "failed to bind execution authorization: {error:#}"
-                                        ),
-                                    }),
                                 },
                             )
                             .await;
@@ -795,6 +770,17 @@ impl MessageProcessor {
         workspace_id: &str,
         thread_id: &str,
     ) -> bool {
+        self.resolve_voice_execution_admission(request_context, workspace_id, thread_id)
+            .await
+            .is_some()
+    }
+
+    async fn resolve_voice_execution_admission(
+        &self,
+        request_context: &RequestContext,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Option<crate::authorization::ExecutionAuthorizationAdmission> {
         let service = crate::authorization::AuthorizationService::new();
         let action = crate::authorization::ResourceAction::ThreadWrite;
         let gate = service.authorize_action(
@@ -803,18 +789,52 @@ impl MessageProcessor {
             action,
         );
         let resolver = crate::authorization::AuthorizationResolver::new((*self.crud_store).clone());
-        matches!(
-            resolver
-                .authorize_thread(
-                    request_context.principal(),
-                    &gate,
-                    action,
-                    thread_id,
-                    Some(workspace_id),
+        match resolver
+            .authorize_thread(
+                request_context.principal(),
+                &gate,
+                action,
+                thread_id,
+                Some(workspace_id),
+            )
+            .await
+            .ok()?
+        {
+            crate::authorization::ProofResolution::Authorized(proof) => {
+                crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
+                    request_context,
+                    &proof,
+                    self.authorization_invalidation_hub.current_revision(),
                 )
-                .await,
-            Ok(crate::authorization::ProofResolution::Authorized(_))
-        )
+                .ok()
+            }
+            crate::authorization::ProofResolution::Denied(decision)
+                if matches!(
+                    decision,
+                    crate::authorization::AuthorizationDecision::Deny {
+                        reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                        ..
+                    }
+                ) =>
+            {
+                let (access, _) = self
+                    .authorize_runtime_draft_for_request(
+                        request_context,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await
+                    .ok()??;
+                crate::authorization::ExecutionAuthorizationAdmission::from_authorized_runtime_draft(
+                    request_context,
+                    access,
+                    self.authorization_invalidation_hub.current_revision(),
+                )
+                .ok()
+            }
+            crate::authorization::ProofResolution::Denied(_) => None,
+        }
     }
 
     async fn ensure_voice_start_context_owned_by_connection(

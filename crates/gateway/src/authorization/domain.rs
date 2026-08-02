@@ -5,8 +5,8 @@ use pioneer_protocol::{AuthSessionId, GatewayId, PrincipalId, RoleKey, ThreadVis
 
 pub(crate) const RESOURCE_ID_MAX_LEN: usize = 256;
 
-/// A bounded persisted identifier whose marker prevents unrelated child IDs
-/// from being accidentally swapped.
+/// A bounded authoritative resource identifier whose marker prevents
+/// unrelated child IDs from being accidentally swapped.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ResourceId<K> {
     value: String,

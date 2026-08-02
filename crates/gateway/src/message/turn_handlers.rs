@@ -1,7 +1,8 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
 use crate::authorization::{
-    AuthorizationExternalError, AuthorizedThread, AuthorizedTurn, ExecutionAuthorizationAdmission,
+    AuthorizationExternalError, AuthorizedTurn, ExecutionAuthorizationAdmission,
+    RuntimeDraftCreator, RuntimeDraftMaterialization,
 };
 use crate::cli_runtime::config::{
     claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
@@ -26,6 +27,63 @@ pub(super) struct PreparedApiProviderTurnStart {
     effective_reasoning_effort: Option<String>,
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+}
+
+async fn persist_admitted_turn_start(
+    crud_store: &pioneer_crud::CrudStore,
+    materialization: &crate::thread::TurnStartMaterialization,
+    reasoning_effort: Option<&str>,
+    actor: pioneer_protocol::PersistedActorRef,
+    audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    runtime_draft: Option<&RuntimeDraftMaterialization>,
+) -> anyhow::Result<()> {
+    match runtime_draft.map(RuntimeDraftMaterialization::creator) {
+        Some(RuntimeDraftCreator::Member {
+            gateway_id,
+            principal_id,
+        }) => {
+            crud_store
+                .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialization.thread,
+                    materialization.sandbox_mode,
+                    &materialization.turn,
+                    &materialization.input,
+                    reasoning_effort,
+                    actor,
+                    audit_event,
+                    gateway_id,
+                    principal_id,
+                )
+                .await
+        }
+        Some(RuntimeDraftCreator::Superuser { access_class }) => {
+            crud_store
+                .materialize_new_superuser_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialization.thread,
+                    materialization.sandbox_mode,
+                    &materialization.turn,
+                    &materialization.input,
+                    reasoning_effort,
+                    actor,
+                    audit_event,
+                    *access_class,
+                )
+                .await
+        }
+        None => {
+            crud_store
+                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialization.thread,
+                    materialization.sandbox_mode,
+                    &materialization.turn,
+                    &materialization.input,
+                    reasoning_effort,
+                    actor,
+                    audit_event,
+                )
+                .await
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,7 +585,7 @@ impl MessageProcessor {
     pub(super) fn turn_start<'a>(
         &'a self,
         request_context: &'a RequestContext,
-        authorization: &'a AuthorizedThread,
+        execution_admission: ExecutionAuthorizationAdmission,
         request_id: RequestId,
         mut params: TurnStartParams,
     ) -> MessageFuture<'a, ()> {
@@ -537,7 +595,7 @@ impl MessageProcessor {
             == pioneer_protocol::PrincipalKind::User)
             .then(|| request_context.principal().principal_id.clone());
         message_future(async move {
-            if authorization.thread_id() != params.thread_id.trim() {
+            if execution_admission.root_thread_id() != params.thread_id.trim() {
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::NotFound.response(request_id),
@@ -589,25 +647,6 @@ impl MessageProcessor {
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("thread `{}` is not loaded", params.thread_id.trim()),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let execution_admission = match ExecutionAuthorizationAdmission::from_authorized_thread(
-                request_context,
-                authorization,
-                self.authorization_invalidation_hub.current_revision(),
-            ) {
-                Ok(admission) => admission,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to bind execution authorization: {error:#}"),
                         ),
                     )
                     .await;
@@ -732,6 +771,34 @@ impl MessageProcessor {
             self.dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
         })
+    }
+
+    async fn complete_runtime_draft_materialization(
+        &self,
+        execution_admission: Option<&ExecutionAuthorizationAdmission>,
+    ) {
+        let Some(runtime_draft) =
+            execution_admission.and_then(ExecutionAuthorizationAdmission::runtime_draft)
+        else {
+            return;
+        };
+        let access = runtime_draft.access();
+        if !self.thread_manager.mark_runtime_draft_durable(access).await {
+            warn!(
+                workspace_id = access.workspace_id(),
+                thread_id = access.thread_id(),
+                "first turn committed but runtime draft lifecycle could not be promoted"
+            );
+        }
+        if let RuntimeDraftCreator::Member { principal_id, .. } = runtime_draft.creator() {
+            self.publish_committed_authorization_invalidation(
+                AccessChangeKind::ThreadCreated,
+                Some(principal_id.clone()),
+                access.workspace_id().to_owned(),
+                Some(access.thread_id().to_owned()),
+            )
+            .await;
+        }
     }
 
     /// Admit a collaborative Composer submission as a durable user message
@@ -888,18 +955,17 @@ impl MessageProcessor {
                 return;
             }
         };
-        if let Err(error) = self
-            .crud_store
-            .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                &outcome.materialization.thread,
-                outcome.materialization.sandbox_mode,
-                &outcome.materialization.turn,
-                &outcome.materialization.input,
-                requested_reasoning_effort(&launch).as_deref(),
-                request_actor,
-                profile_audit,
-            )
-            .await
+        if let Err(error) = persist_admitted_turn_start(
+            self.crud_store.as_ref(),
+            &outcome.materialization,
+            requested_reasoning_effort(&launch).as_deref(),
+            request_actor,
+            profile_audit,
+            execution_admission
+                .as_ref()
+                .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+        )
+        .await
         {
             self.thread_manager
                 .rollback_turn_start(outcome.rollback_context.clone())
@@ -915,6 +981,8 @@ impl MessageProcessor {
             .await;
             return;
         }
+        self.complete_runtime_draft_materialization(execution_admission.as_ref())
+            .await;
         let security_snapshot = match self
             .persist_turn_execution_security_snapshot(
                 &launch,
@@ -1256,18 +1324,16 @@ impl MessageProcessor {
                 ));
             }
         };
-        if let Err(error) = message_future(
-            self.crud_store
-                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                    &outcome.materialization.thread,
-                    outcome.materialization.sandbox_mode,
-                    &outcome.materialization.turn,
-                    &outcome.materialization.input,
-                    effective_reasoning_effort.as_deref(),
-                    request_actor,
-                    profile_selected_audit,
-                ),
-        )
+        if let Err(error) = message_future(persist_admitted_turn_start(
+            self.crud_store.as_ref(),
+            &outcome.materialization,
+            effective_reasoning_effort.as_deref(),
+            request_actor,
+            profile_selected_audit,
+            execution_admission
+                .as_ref()
+                .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+        ))
         .await
         {
             self.thread_manager
@@ -1278,6 +1344,8 @@ impl MessageProcessor {
                 "failed to persist turn/start state and permission audit: {error:#}"
             ));
         }
+        self.complete_runtime_draft_materialization(execution_admission.as_ref())
+            .await;
         let execution_security_snapshot = match self
             .persist_turn_execution_security_snapshot(
                 &security_params,
@@ -2454,22 +2522,24 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let runtime_draft = execution_admission
+                .as_ref()
+                .and_then(ExecutionAuthorizationAdmission::runtime_draft)
+                .cloned();
             let materialization_result = {
                 let crud_store = self.crud_store.clone();
                 let materialization = outcome.materialization.clone();
                 let effective_reasoning_effort = effective_cli_runtime_effort.clone();
                 let workflow = message_future(async move {
-                    crud_store
-                        .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                            &materialization.thread,
-                            materialization.sandbox_mode,
-                            &materialization.turn,
-                            &materialization.input,
-                            effective_reasoning_effort.as_deref(),
-                            request_actor,
-                            profile_selected_audit,
-                        )
-                        .await
+                    persist_admitted_turn_start(
+                        crud_store.as_ref(),
+                        &materialization,
+                        effective_reasoning_effort.as_deref(),
+                        request_actor,
+                        profile_selected_audit,
+                        runtime_draft.as_ref(),
+                    )
+                    .await
                 });
                 message_fresh_task(workflow).await
             };
@@ -2489,6 +2559,8 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            self.complete_runtime_draft_materialization(execution_admission.as_ref())
+                .await;
             let security_snapshot = match self
                 .persist_turn_execution_security_snapshot(
                     &security_params,

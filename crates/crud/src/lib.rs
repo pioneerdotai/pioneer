@@ -118,8 +118,9 @@ use pioneer_sqlite::{
     is_anyhow_sqlite_lock, retry_with_backoff,
 };
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    TransactionTrait,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
@@ -1630,6 +1631,85 @@ pub struct CrudStore {
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
+}
+
+#[derive(Clone)]
+struct NewUserThreadCreation {
+    creator: PersistedActorRef,
+    access_class: PersistedThreadAccessClass,
+    member: Option<(GatewayId, PrincipalId)>,
+}
+
+async fn insert_new_user_thread_for_initial_turn(
+    transaction: &DatabaseTransaction,
+    events: &[TurnEventPayload],
+    creation: &NewUserThreadCreation,
+) -> Result<()> {
+    let [
+        TurnEventPayload::TurnStarted(started),
+        TurnEventPayload::TurnPermissionAudit(audit),
+    ] = events
+    else {
+        bail!("new user thread materialization requires one turn/started and one permission audit");
+    };
+    if started.actor.as_ref() != Some(&creation.creator) {
+        bail!("new user thread creator differs from first-turn actor");
+    }
+    let PersistedActorRef::Principal(creator_principal_id) = &creation.creator else {
+        bail!("new user thread creator must be an authenticated principal");
+    };
+    if audit.workspace_id != started.thread.workspace_id
+        || audit.thread_id != started.thread.id
+        || audit.turn_id != started.turn.id
+    {
+        bail!("first-turn permission audit scope differs from the new user thread");
+    }
+    if creation.access_class == PersistedThreadAccessClass::Internal {
+        bail!("new user thread cannot use internal access class");
+    }
+    let expected_visibility = match creation.access_class {
+        PersistedThreadAccessClass::Private => ThreadVisibility::Private,
+        PersistedThreadAccessClass::Workspace => ThreadVisibility::Workspace,
+        PersistedThreadAccessClass::Internal => unreachable!("validated above"),
+    };
+    if started.thread.visibility != Some(expected_visibility) {
+        bail!("new user thread visibility differs from authorized access class");
+    }
+    if let Some((_, principal_id)) = creation.member.as_ref() {
+        if creation.access_class != PersistedThreadAccessClass::Private
+            || creator_principal_id != principal_id
+        {
+            bail!("Member first-turn materialization requires its private creator scope");
+        }
+    }
+
+    let thread_created_at = unix_to_datetime(started.thread.created_at);
+    let thread_updated_at = unix_to_datetime(started.thread.updated_at);
+    thread::insert_user_thread_with_creator(
+        transaction,
+        &started.thread,
+        &creation.creator,
+        creation.access_class,
+        thread_created_at,
+        thread_updated_at,
+    )
+    .await?;
+
+    if let Some((gateway_id, principal_id)) = creation.member.as_ref() {
+        insert_thread_membership(
+            transaction,
+            &NewThreadMembership {
+                gateway_id: gateway_id.clone(),
+                principal_id: principal_id.clone(),
+                workspace_id: started.thread.workspace_id.clone(),
+                thread_id: started.thread.id.clone(),
+                added_by: creation.creator.clone(),
+                now: thread_updated_at,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn authorize_private_participant_scope(
@@ -7910,6 +7990,98 @@ impl CrudStore {
         self.materialize_turn_events_atomically(
             vec![started_event, audit_event],
             thread_model.updated_at,
+        )
+        .await
+    }
+
+    /// Atomically creates a Member-owned private thread, its creator
+    /// membership, the first turn, and the permission audit. No empty thread
+    /// row is visible if first-turn materialization fails.
+    pub async fn materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        gateway_id: &GatewayId,
+        principal_id: &PrincipalId,
+    ) -> Result<()> {
+        self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor.clone(),
+            audit_event,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class: PersistedThreadAccessClass::Private,
+                member: Some((gateway_id.clone(), principal_id.clone())),
+            },
+        )
+        .await
+    }
+
+    /// Atomically creates a Superuser-owned thread and its first turn. The
+    /// caller may choose only a user-addressable access class.
+    pub async fn materialize_new_superuser_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        access_class: PersistedThreadAccessClass,
+    ) -> Result<()> {
+        self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor.clone(),
+            audit_event,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class,
+                member: None,
+            },
+        )
+        .await
+    }
+
+    async fn materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        creation: NewUserThreadCreation,
+    ) -> Result<()> {
+        let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: thread_model.clone(),
+            sandbox_mode,
+            turn: turn_model.clone(),
+            input: input.to_vec(),
+            actor: Some(actor),
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+        });
+        self.materialize_turn_events_atomically_with_creation(
+            vec![
+                started_event,
+                TurnEventPayload::TurnPermissionAudit(audit_event),
+            ],
+            thread_model.updated_at,
+            creation,
         )
         .await
     }
@@ -16105,6 +16277,28 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 events.clone(),
                 created_at,
                 claim_expires_at,
+                None,
+            )
+        })
+        .await
+    }
+
+    async fn materialize_turn_events_atomically_with_creation(
+        &self,
+        events: Vec<TurnEventPayload>,
+        event_timestamp_secs: i64,
+        creation: NewUserThreadCreation,
+    ) -> Result<()> {
+        let created_at = unix_to_datetime(event_timestamp_secs);
+        let claim_expires_at =
+            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+
+        self.run_serialized_write(|| {
+            self.materialize_turn_events_atomically_once(
+                events.clone(),
+                created_at,
+                claim_expires_at,
+                Some(creation.clone()),
             )
         })
         .await
@@ -16115,12 +16309,21 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         events: Vec<TurnEventPayload>,
         created_at: DateTimeWithTimeZone,
         claim_expires_at: DateTimeWithTimeZone,
+        creation: Option<NewUserThreadCreation>,
     ) -> Result<()> {
         let transaction = self
             .connection
             .begin()
             .await
             .context("failed to begin turn event batch materialization transaction")?;
+
+        if let Some(creation) = creation
+            && let Err(error) =
+                insert_new_user_thread_for_initial_turn(&transaction, &events, &creation).await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
 
         for event in events {
             if let Err(error) = validate_turn_event_for_permanent_storage(&event).await {

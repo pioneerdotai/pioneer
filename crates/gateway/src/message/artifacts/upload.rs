@@ -25,6 +25,7 @@ pub(in crate::message) enum ArtifactUploadAuthorization<'a> {
     Workspace(&'a crate::authorization::AuthorizedWorkspace),
     Thread(&'a crate::authorization::AuthorizedThread),
     Turn(&'a crate::authorization::AuthorizedTurn),
+    RuntimeDraft(&'a crate::thread::RuntimeDraftAccess),
 }
 
 impl ArtifactUploadAuthorization<'_> {
@@ -38,6 +39,9 @@ impl ArtifactUploadAuthorization<'_> {
                 proof.workspace_id() == workspace_id
                     && proof.thread_id() == thread_id
                     && proof.turn_id() == turn_id
+            }
+            (Self::RuntimeDraft(access), Some(thread_id), _) => {
+                access.workspace_id() == workspace_id && access.thread_id() == thread_id
             }
             _ => false,
         }
@@ -117,7 +121,14 @@ impl ArtifactUploadSessionManager {
                     upload_dir.display()
                 )
             })?;
-        let _ = tokio::fs::remove_file(temp_path.as_path()).await;
+        tokio::fs::File::create(temp_path.as_path())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to initialize artifact upload payload {}",
+                    temp_path.display()
+                )
+            })?;
 
         let session = ArtifactUploadSession {
             upload_id: upload_id.clone(),
@@ -859,8 +870,20 @@ impl MessageProcessor {
                 )
                 .await
                 .map(|resolution| match resolution {
-                    crate::authorization::ProofResolution::Authorized(_) => true,
-                    crate::authorization::ProofResolution::Denied(_) => false,
+                    crate::authorization::ProofResolution::Authorized(_) => Some(true),
+                    crate::authorization::ProofResolution::Denied(decision)
+                        if matches!(
+                            decision,
+                            crate::authorization::AuthorizationDecision::Deny {
+                                reason:
+                                    crate::authorization::DenyReason::MissingAuthoritativeResource,
+                                ..
+                            }
+                        ) =>
+                    {
+                        None
+                    }
+                    crate::authorization::ProofResolution::Denied(_) => Some(false),
                 })
         } else if let Some(thread_id) = session.thread_id.as_deref() {
             resolver
@@ -873,8 +896,20 @@ impl MessageProcessor {
                 )
                 .await
                 .map(|resolution| match resolution {
-                    crate::authorization::ProofResolution::Authorized(_) => true,
-                    crate::authorization::ProofResolution::Denied(_) => false,
+                    crate::authorization::ProofResolution::Authorized(_) => Some(true),
+                    crate::authorization::ProofResolution::Denied(decision)
+                        if matches!(
+                            decision,
+                            crate::authorization::AuthorizationDecision::Deny {
+                                reason:
+                                    crate::authorization::DenyReason::MissingAuthoritativeResource,
+                                ..
+                            }
+                        ) =>
+                    {
+                        None
+                    }
+                    crate::authorization::ProofResolution::Denied(_) => Some(false),
                 })
         } else {
             resolver
@@ -886,11 +921,39 @@ impl MessageProcessor {
                 )
                 .await
                 .map(|resolution| match resolution {
-                    crate::authorization::ProofResolution::Authorized(_) => true,
-                    crate::authorization::ProofResolution::Denied(_) => false,
+                    crate::authorization::ProofResolution::Authorized(_) => Some(true),
+                    crate::authorization::ProofResolution::Denied(_) => Some(false),
                 })
         };
-        resolution.unwrap_or(false)
+        match resolution {
+            Ok(Some(authorized)) => authorized,
+            Ok(None) => {
+                self.revalidate_artifact_runtime_draft(request_context, action, session)
+                    .await
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn revalidate_artifact_runtime_draft(
+        &self,
+        request_context: &RequestContext,
+        action: crate::authorization::ResourceAction,
+        session: &ArtifactUploadSession,
+    ) -> bool {
+        let Some(thread_id) = session.thread_id.as_deref() else {
+            return false;
+        };
+        matches!(
+            self.authorize_runtime_draft_for_request(
+                request_context,
+                action,
+                thread_id,
+                Some(session.workspace_id.as_str()),
+            )
+            .await,
+            Ok(Some(_))
+        )
     }
 
     pub(in crate::message) async fn send_artifact_result<T: serde::Serialize>(
@@ -1186,6 +1249,31 @@ mod tests {
 
         assert_eq!(updated.received_bytes, chunk.len() as u64);
         assert!(updated.temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_zero_byte_session_finishes_without_chunks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = ArtifactUploadSessionManager::new(temp.path().join("uploads"));
+        let session = manager
+            .start(7, start_params("ws_a", sha256_bytes(b""), 0), 10)
+            .await
+            .expect("start empty upload");
+
+        assert_eq!(
+            tokio::fs::metadata(session.temp_path.as_path())
+                .await
+                .expect("empty payload metadata")
+                .len(),
+            0
+        );
+        assert!(matches!(
+            manager
+                .finish(7, "ws_a", session.upload_id.as_str(), 11)
+                .await
+                .expect("finish empty upload"),
+            ArtifactUploadFinishState::Ready(_)
+        ));
     }
 
     #[tokio::test]

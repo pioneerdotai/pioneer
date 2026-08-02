@@ -3,7 +3,7 @@ use crate::authorization::{
     AuthorizationExternalError, AuthorizedThread, AuthorizedWorkspace, ResourceAction,
     record_authorization_unavailable,
 };
-use crate::thread::ThreadSubscriptionIdentity;
+use crate::thread::{RuntimeDraftAccess, ThreadSubscriptionIdentity};
 use pioneer_crud::{PersistedThreadAccessClass, PrivateThreadParticipantMutation};
 use pioneer_protocol::{
     PrincipalId, Thread, ThreadParticipantChangeKind, ThreadParticipantSummary,
@@ -15,6 +15,77 @@ pub(super) enum ThreadParticipantOperation {
     List,
     Add(PrincipalId),
     Remove(PrincipalId),
+}
+
+pub(super) enum ThreadAccessAuthorization<'a> {
+    Persisted(&'a AuthorizedThread),
+    RuntimeDraft(&'a RuntimeDraftAccess),
+}
+
+impl ThreadAccessAuthorization<'_> {
+    pub(super) fn thread_id(&self) -> &str {
+        match self {
+            Self::Persisted(proof) => proof.thread_id(),
+            Self::RuntimeDraft(access) => access.thread_id(),
+        }
+    }
+
+    fn workspace_id(&self) -> &str {
+        match self {
+            Self::Persisted(proof) => proof.workspace_id(),
+            Self::RuntimeDraft(access) => access.workspace_id(),
+        }
+    }
+}
+
+impl MessageProcessor {
+    /// Revalidates a connection-owned draft against its in-memory owner
+    /// capability and the same role/resource policy used for durable threads.
+    pub(super) async fn authorize_runtime_draft_for_request(
+        &self,
+        request_context: &RequestContext,
+        action: ResourceAction,
+        thread_id: &str,
+        expected_workspace_id: Option<&str>,
+    ) -> anyhow::Result<
+        Option<(
+            RuntimeDraftAccess,
+            crate::authorization::AuthorizationDecision,
+        )>,
+    > {
+        let identity = ThreadSubscriptionIdentity::new(
+            request_context.principal().principal_id.clone(),
+            request_context.principal().session_id.clone(),
+        );
+        let Some(access) = self
+            .thread_manager
+            .authorize_runtime_draft(
+                request_context.connection_id(),
+                &identity,
+                thread_id,
+                expected_workspace_id,
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+
+        let gate = crate::authorization::AuthorizationService::new().authorize_action(
+            request_context.principal().kind,
+            request_context.role_key(),
+            action,
+        );
+        let resolver = crate::authorization::AuthorizationResolver::new((*self.crud_store).clone());
+        match resolver
+            .authorize_runtime_draft(request_context.principal(), &gate, action, &access)
+            .await?
+        {
+            crate::authorization::ProofResolution::Authorized(proof) => {
+                Ok(Some((access, proof.decision().clone())))
+            }
+            crate::authorization::ProofResolution::Denied(_) => Ok(None),
+        }
+    }
 }
 
 fn open_only_thread_start_params(thread: &Thread) -> ThreadStartParams {
@@ -153,47 +224,9 @@ impl MessageProcessor {
             }
         });
 
-        let creator = request_context.persisted_actor();
-        let persist_result = if is_superuser {
-            self.crud_store
-                .create_superuser_thread(&thread, creator, access_class)
-                .await
-        } else {
-            self.crud_store
-                .create_member_private_thread(
-                    &thread,
-                    &request_context.principal().gateway_id,
-                    authorization.principal_id(),
-                    creator,
-                )
-                .await
-        };
-        if let Err(error) = persist_result {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to commit thread creation: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        if !is_superuser {
-            self.publish_committed_authorization_invalidation(
-                AccessChangeKind::ThreadCreated,
-                Some(authorization.principal_id().clone()),
-                workspace_id.clone(),
-                Some(thread.id.clone()),
-            )
-            .await;
-        }
-
         let outcome = self
             .thread_manager
-            .thread_start_seeded_authenticated(
+            .thread_start_draft_authenticated(
                 connection_id,
                 ThreadSubscriptionIdentity::new(
                     request_context.principal().principal_id.clone(),
@@ -205,7 +238,7 @@ impl MessageProcessor {
                 Some(sandbox_mode),
             )
             .await
-            .map_err(|error| format!("failed to publish committed thread: {error:#}"));
+            .map_err(|error| format!("failed to publish runtime thread draft: {error:#}"));
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -419,7 +452,15 @@ impl MessageProcessor {
             .await;
 
         let threads = match self
-            .list_threads_snapshot_for_authorization(authorization, 500, connection_id)
+            .list_threads_snapshot_for_authorization(
+                authorization,
+                500,
+                connection_id,
+                &ThreadSubscriptionIdentity::new(
+                    request_context.principal().principal_id.clone(),
+                    request_context.principal().session_id.clone(),
+                ),
+            )
             .await
         {
             Ok(threads) => threads,
@@ -549,7 +590,7 @@ impl MessageProcessor {
     pub(super) async fn thread_get(
         &self,
         request_context: &RequestContext,
-        authorization: &AuthorizedThread,
+        authorization: ThreadAccessAuthorization<'_>,
         request_id: RequestId,
         params: ThreadGetParams,
     ) {
@@ -670,6 +711,7 @@ impl MessageProcessor {
         authorization: &AuthorizedWorkspace,
         limit: u64,
         connection_id: ConnectionId,
+        identity: &ThreadSubscriptionIdentity,
     ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
         let persisted_threads = if authorization.decision().is_absolute_superuser() {
             self.crud_store
@@ -690,14 +732,6 @@ impl MessageProcessor {
             .collect::<HashSet<_>>();
         let mut threads_by_id = HashMap::new();
         for thread in persisted_threads {
-            if self
-                .thread_manager
-                .empty_draft_visibility_for_connection(thread.id.as_str(), connection_id)
-                .await
-                == Some(false)
-            {
-                continue;
-            }
             threads_by_id.insert(thread.id.clone(), thread);
         }
         for thread in self
@@ -708,8 +742,17 @@ impl MessageProcessor {
             )
             .await
         {
-            if !authorization.decision().is_absolute_superuser()
-                && !allowed_ids.contains(thread.id.as_str())
+            if !allowed_ids.contains(thread.id.as_str())
+                && self
+                    .thread_manager
+                    .authorize_runtime_draft(
+                        connection_id,
+                        identity,
+                        thread.id.as_str(),
+                        Some(authorization.workspace_id()),
+                    )
+                    .await
+                    .is_none()
             {
                 continue;
             }
@@ -1813,7 +1856,7 @@ impl MessageProcessor {
     pub(super) async fn thread_unsubscribe(
         &self,
         request_context: &RequestContext,
-        authorization: &AuthorizedThread,
+        authorization: ThreadAccessAuthorization<'_>,
         request_id: RequestId,
         params: ThreadUnsubscribeParams,
     ) {
@@ -1826,6 +1869,10 @@ impl MessageProcessor {
             .await;
             return;
         }
+        let runtime_draft_access = match &authorization {
+            ThreadAccessAuthorization::RuntimeDraft(access) => Some((*access).clone()),
+            ThreadAccessAuthorization::Persisted(_) => None,
+        };
         let outcome = self
             .thread_manager
             .thread_unsubscribe(connection_id, &params.thread_id)
@@ -1861,13 +1908,23 @@ impl MessageProcessor {
         };
         let closed_thread_id = closed_notification.thread_id.clone();
 
-        self.send_notification_to_removed_thread_subscribers(
-            closed_thread_id.as_str(),
-            events::THREAD_CLOSED,
-            &closed_notification,
-            outcome.closed_notification_subscribers,
-        )
-        .await;
+        if let Some(access) = runtime_draft_access.as_ref() {
+            self.send_notification_to_removed_runtime_draft_owner(
+                access,
+                events::THREAD_CLOSED,
+                &closed_notification,
+                outcome.closed_notification_subscribers,
+            )
+            .await;
+        } else {
+            self.send_notification_to_removed_thread_subscribers(
+                closed_thread_id.as_str(),
+                events::THREAD_CLOSED,
+                &closed_notification,
+                outcome.closed_notification_subscribers,
+            )
+            .await;
+        }
 
         self.teardown_agent_thread(closed_thread_id.as_str()).await;
     }
