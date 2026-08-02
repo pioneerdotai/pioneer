@@ -144,7 +144,7 @@ fn log_exchange_failed(method: &str, code: AuthErrorCode) {
         INVITE_ACCEPT => "invitation_accept_failed",
         _ => return,
     };
-    tracing::info!(event, outcome = "failed", reason = code.as_str());
+    tracing::info!(event, outcome = "failed", reason_code = code.as_str());
 }
 
 #[derive(Debug)]

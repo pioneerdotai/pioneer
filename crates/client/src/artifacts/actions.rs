@@ -1,16 +1,25 @@
 //! Artifact file action state and helpers.
 
 use crate::artifacts::http_download::{ArtifactHttpDownloadRequest, ArtifactHttpDownloadResult};
+use crate::local_file::{configure_std_no_follow, metadata_is_plain_file};
 use crate::platform::{ArtifactFileOpener, ClientPath};
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use pioneer_protocol::{ArtifactRef, ArtifactStatus, ArtifactSummary};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+const MAX_DESTINATION_FILE_NAME_BYTES: usize = 180;
+const DESTINATION_FILE_NAME_HASH_CHARS: usize = 16;
+const MAX_DESTINATION_EXTENSION_BYTES: usize = 16;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
@@ -214,44 +223,63 @@ pub fn copy_cached_download_to_destination(
             destination_dir.display()
         );
     }
-    verify_cached_download(download)?;
-
-    let final_path = unique_destination_path(destination_dir, display_name)?;
-    let part_path = unique_part_path(&final_path)?;
-    let copy_result = (|| -> Result<()> {
-        if part_path.exists() {
-            fs::remove_file(part_path.as_path()).with_context(|| {
-                format!(
-                    "failed to remove stale artifact download part `{}`",
-                    part_path.display()
-                )
-            })?;
-        }
-        fs::copy(download.local_path.as_path(), part_path.as_path()).with_context(|| {
+    let destination_identity = fs::canonicalize(destination_dir).with_context(|| {
+        format!(
+            "failed to resolve artifact destination `{}`",
+            destination_dir.display()
+        )
+    })?;
+    let destination_gate = destination_gate_for(destination_identity.as_path());
+    let _destination_operation = destination_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (part_path, mut part_file) = create_owned_part_file(destination_dir)?;
+    let copy_result = (|| -> Result<PathBuf> {
+        // Verify and copy through the same no-follow file handle. Reopening the
+        // cache path after verification would leave a swap/symlink TOCTOU gap.
+        let mut source = open_verified_file(
+            download.local_path.as_path(),
+            download.sha256.as_str(),
+            Some(download.size_bytes),
+        )?;
+        std::io::copy(&mut source, &mut part_file).with_context(|| {
             format!(
-                "failed to copy artifact download `{}` to `{}`",
-                download.local_path.display(),
-                part_path.display()
+                "failed to copy verified artifact download into `{}`",
+                destination_dir.display()
             )
         })?;
+        part_file.flush().with_context(|| {
+            format!(
+                "failed to flush artifact download in `{}`",
+                destination_dir.display()
+            )
+        })?;
+        part_file.sync_all().with_context(|| {
+            format!(
+                "failed to synchronize artifact download in `{}`",
+                destination_dir.display()
+            )
+        })?;
+        drop(part_file);
         verify_file(
             part_path.as_path(),
             download.sha256.as_str(),
             Some(download.size_bytes),
         )?;
-        fs::rename(part_path.as_path(), final_path.as_path()).with_context(|| {
-            format!(
-                "failed to finalize artifact download `{}`",
-                final_path.display()
-            )
-        })?;
-        Ok(())
+        let final_path = publish_without_overwrite(
+            part_path.as_path(),
+            destination_dir,
+            display_name,
+        )?;
+        let _ = fs::remove_file(part_path.as_path());
+        sync_directory(destination_dir)?;
+        Ok(final_path)
     })();
 
     if copy_result.is_err() {
         let _ = fs::remove_file(part_path.as_path());
     }
-    copy_result?;
+    let final_path = copy_result?;
 
     Ok(ArtifactLocalFile {
         path: final_path,
@@ -261,7 +289,7 @@ pub fn copy_cached_download_to_destination(
 }
 
 pub fn open_artifact_local_file<O: ArtifactFileOpener>(opener: &O, path: &Path) -> Result<()> {
-    if !path.is_file() {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata_is_plain_file(&metadata)) {
         bail!("artifact local file `{}` does not exist", path.display());
     }
     opener.open_file(&ClientPath::new(path.to_owned()))?;
@@ -269,7 +297,7 @@ pub fn open_artifact_local_file<O: ArtifactFileOpener>(opener: &O, path: &Path) 
 }
 
 pub fn reveal_artifact_local_file<O: ArtifactFileOpener>(opener: &O, path: &Path) -> Result<()> {
-    if !path.is_file() {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata_is_plain_file(&metadata)) {
         bail!("artifact local file `{}` does not exist", path.display());
     }
     opener.reveal_file(&ClientPath::new(path.to_owned()))?;
@@ -280,9 +308,19 @@ pub fn existing_local_file_is_verified(
     local_file: &ArtifactLocalFile,
     artifact: &ArtifactRef,
 ) -> Result<bool> {
-    if !local_file.path.is_file() {
-        return Ok(false);
-    }
+    let metadata = match fs::symlink_metadata(local_file.path.as_path()) {
+        Ok(metadata) if metadata_is_plain_file(&metadata) => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect artifact local file `{}`",
+                    local_file.path.display()
+                )
+            });
+        }
+    };
     let expected_sha = artifact
         .sha256
         .as_deref()
@@ -291,19 +329,12 @@ pub fn existing_local_file_is_verified(
         return Ok(false);
     }
     if let Some(expected_size) = artifact.size_bytes.or(local_file.size_bytes) {
-        let actual_size = fs::metadata(local_file.path.as_path())
-            .with_context(|| {
-                format!(
-                    "failed to stat artifact local file `{}`",
-                    local_file.path.display()
-                )
-            })?
-            .len();
-        if actual_size != expected_size {
+        if metadata.len() != expected_size {
             return Ok(false);
         }
     }
-    Ok(sha256_file(local_file.path.as_path())? == expected_sha)
+    let mut file = open_readonly_no_follow(local_file.path.as_path())?;
+    Ok(sha256_open_file(&mut file, local_file.path.as_path())? == expected_sha)
 }
 
 pub fn sanitized_artifact_file_name(display_name: &str) -> String {
@@ -323,10 +354,15 @@ pub fn sanitized_artifact_file_name(display_name: &str) -> String {
     let trimmed = sanitized
         .trim_matches([' ', '\t', '\r', '\n'])
         .trim_matches('.');
-    if trimmed.is_empty() {
-        fallback.to_owned()
+    let safe_name = if trimmed.is_empty() {
+        fallback
     } else {
-        trimmed.to_owned()
+        trimmed
+    };
+    if safe_name.len() <= MAX_DESTINATION_FILE_NAME_BYTES {
+        safe_name.to_owned()
+    } else {
+        bounded_artifact_file_name(safe_name)
     }
 }
 
@@ -334,7 +370,7 @@ pub fn unique_destination_path(destination_dir: &Path, display_name: &str) -> Re
     reject_path_traversal(destination_dir)?;
     let safe_name = sanitized_artifact_file_name(display_name);
     let initial = destination_dir.join(safe_name.as_str());
-    if !initial.exists() {
+    if !path_is_occupied(initial.as_path())? {
         return Ok(initial);
     }
 
@@ -352,7 +388,7 @@ pub fn unique_destination_path(destination_dir: &Path, display_name: &str) -> Re
             format!("{stem} ({index})")
         };
         let candidate = destination_dir.join(candidate_name);
-        if !candidate.exists() {
+        if !path_is_occupied(candidate.as_path())? {
             return Ok(candidate);
         }
     }
@@ -369,11 +405,24 @@ pub fn verify_cached_download(download: &ArtifactCachedDownload) -> Result<()> {
 }
 
 pub fn verify_file(path: &Path, expected_sha256: &str, expected_size: Option<u64>) -> Result<()> {
-    if !path.is_file() {
-        bail!("artifact file `{}` does not exist", path.display());
-    }
+    drop(open_verified_file(path, expected_sha256, expected_size)?);
+    Ok(())
+}
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = open_readonly_no_follow(path)?;
+    sha256_open_file(&mut file, path)
+}
+
+fn open_verified_file(
+    path: &Path,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+) -> Result<fs::File> {
+    let mut file = open_readonly_no_follow(path)?;
     if let Some(expected_size) = expected_size {
-        let actual_size = fs::metadata(path)
+        let actual_size = file
+            .metadata()
             .with_context(|| format!("failed to stat artifact file `{}`", path.display()))?
             .len();
         if actual_size != expected_size {
@@ -385,16 +434,39 @@ pub fn verify_file(path: &Path, expected_sha256: &str, expected_size: Option<u64
             );
         }
     }
-    let actual_sha256 = sha256_file(path)?;
+    let actual_sha256 = sha256_open_file(&mut file, path)?;
     if actual_sha256 != expected_sha256 {
         bail!("artifact file sha256 mismatch for `{}`", path.display());
     }
-    Ok(())
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind artifact file `{}`", path.display()))?;
+    Ok(file)
 }
 
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open `{}`", path.display()))?;
+fn open_readonly_no_follow(path: &Path) -> Result<fs::File> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect artifact file `{}`", path.display()))?;
+    if !metadata_is_plain_file(&metadata) {
+        bail!("artifact file `{}` is not a regular file", path.display());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    configure_std_no_follow(&mut options);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open artifact file `{}`", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat artifact file `{}`", path.display()))?;
+    if !metadata_is_plain_file(&opened_metadata) {
+        bail!("artifact file `{}` is not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+fn sha256_open_file(file: &mut fs::File, path: &Path) -> Result<String> {
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind artifact file `{}`", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -409,12 +481,117 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn unique_part_path(final_path: &Path) -> Result<PathBuf> {
-    let file_name = final_path
-        .file_name()
+fn destination_gate_for(destination: &Path) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(destination).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(destination.to_owned(), Arc::downgrade(&gate));
+    gate
+}
+
+fn create_owned_part_file(destination_dir: &Path) -> Result<(PathBuf, fs::File)> {
+    static NEXT_PART_ID: AtomicU64 = AtomicU64::new(1);
+    for _ in 0..10_000 {
+        let part_id = NEXT_PART_ID.fetch_add(1, Ordering::Relaxed);
+        let part_path = destination_dir.join(format!(
+            ".pioneer-artifact-{}-{part_id}.part",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_std_no_follow(&mut options);
+        match options.open(part_path.as_path()) {
+            Ok(file) => return Ok((part_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create artifact download staging file in `{}`",
+                        destination_dir.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed to allocate an artifact download staging file")
+}
+
+fn publish_without_overwrite(
+    part_path: &Path,
+    destination_dir: &Path,
+    display_name: &str,
+) -> Result<PathBuf> {
+    for _ in 0..10_000 {
+        let final_path = unique_destination_path(destination_dir, display_name)?;
+        match fs::hard_link(part_path, final_path.as_path()) {
+            Ok(()) => return Ok(final_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to publish artifact download in `{}`",
+                        destination_dir.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed to publish a uniquely named artifact download")
+}
+
+fn path_is_occupied(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to inspect artifact destination `{}`", path.display())
+        }),
+    }
+}
+
+fn bounded_artifact_file_name(file_name: &str) -> String {
+    let digest = Sha256::digest(file_name.as_bytes());
+    let digest = &hex::encode(digest)[..DESTINATION_FILE_NAME_HASH_CHARS];
+    let path = Path::new(file_name);
+    let extension = path
+        .extension()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("artifact destination has no file name"))?;
-    Ok(final_path.with_file_name(format!("{file_name}.part")))
+        .filter(|value| !value.is_empty() && value.len() <= MAX_DESTINATION_EXTENSION_BYTES);
+    let suffix_len = 1
+        + DESTINATION_FILE_NAME_HASH_CHARS
+        + extension.map_or(0, |value| value.len() + 1);
+    let stem_budget = MAX_DESTINATION_FILE_NAME_BYTES.saturating_sub(suffix_len);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("artifact");
+    let stem = &stem[..stem.len().min(stem_budget)];
+
+    match extension {
+        Some(extension) => format!("{stem}-{digest}.{extension}"),
+        None => format!("{stem}-{digest}"),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("failed to open artifact destination `{}`", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to synchronize artifact destination `{}`", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn reject_path_traversal(path: &Path) -> Result<()> {
@@ -470,6 +647,39 @@ mod tests {
     }
 
     #[test]
+    fn destination_copy_never_removes_a_preexisting_part_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bytes = b"artifact bytes";
+        let cache_path = temp.path().join("cache.bin");
+        let existing_part = temp.path().join("report.txt.part");
+        fs::write(cache_path.as_path(), bytes).expect("write cache");
+        fs::write(existing_part.as_path(), b"owned by another operation")
+            .expect("write existing part");
+
+        let local_file = copy_cached_download_to_destination(
+            &cached_download(cache_path, bytes),
+            "report.txt",
+            temp.path(),
+        )
+        .expect("copy download");
+
+        assert_eq!(fs::read(local_file.path).expect("read final"), bytes);
+        assert_eq!(
+            fs::read(existing_part).expect("read existing part"),
+            b"owned by another operation"
+        );
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("read destination")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pioneer-artifact-"))
+        );
+    }
+
+    #[test]
     fn artifact_file_names_are_sanitized_and_uniqued() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("report_.txt"), b"existing").expect("write existing");
@@ -481,6 +691,21 @@ mod tests {
             Some("report_ (1).txt")
         );
         assert!(path.starts_with(temp.path()));
+    }
+
+    #[test]
+    fn artifact_file_names_are_bounded_without_losing_extension_or_identity() {
+        let first = format!("{}.txt", "a".repeat(400));
+        let second = format!("{}b.txt", "a".repeat(399));
+
+        let first_safe = sanitized_artifact_file_name(first.as_str());
+        let second_safe = sanitized_artifact_file_name(second.as_str());
+
+        assert!(first_safe.len() <= MAX_DESTINATION_FILE_NAME_BYTES);
+        assert!(second_safe.len() <= MAX_DESTINATION_FILE_NAME_BYTES);
+        assert!(first_safe.ends_with(".txt"));
+        assert!(second_safe.ends_with(".txt"));
+        assert_ne!(first_safe, second_safe);
     }
 
     #[test]

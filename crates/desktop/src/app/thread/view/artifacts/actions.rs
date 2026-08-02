@@ -686,6 +686,7 @@ fn map_gateway_http_error(error: GatewayHttpError) -> DesktopArtifactActionError
         GatewayHttpError::InvalidStoragePath
         | GatewayHttpError::InvalidHeader
         | GatewayHttpError::InvalidResponse
+        | GatewayHttpError::Conflict
         | GatewayHttpError::RangeNotSatisfiable => DesktopArtifactActionError::InvalidArtifact,
         GatewayHttpError::Transport
         | GatewayHttpError::TooManyRequests
@@ -768,10 +769,7 @@ fn spawn_open_url(url: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn spawn_open_url(url: &str) -> Result<()> {
-    spawn_command(
-        Command::new("cmd").arg("/C").arg("start").arg("").arg(url),
-        "open artifact view",
-    )
+    shell_open(std::ffi::OsStr::new(url), "open artifact view")
 }
 
 #[cfg(target_os = "macos")]
@@ -800,10 +798,7 @@ fn spawn_reveal_file(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn spawn_open_file(path: &Path) -> Result<()> {
-    spawn_command(
-        Command::new("cmd").arg("/C").arg("start").arg("").arg(path),
-        "open artifact file",
-    )
+    shell_open(path.as_os_str(), "open artifact file")
 }
 
 #[cfg(windows)]
@@ -812,6 +807,34 @@ fn spawn_reveal_file(path: &Path) -> Result<()> {
         Command::new("explorer").arg("/select,").arg(path),
         "reveal artifact file",
     )
+}
+
+#[cfg(windows)]
+fn shell_open(target: &std::ffi::OsStr, action: &str) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let mut target = target.encode_wide().collect::<Vec<_>>();
+    if target.contains(&0) {
+        anyhow::bail!("failed to {action}: target contains a NUL character");
+    }
+    target.push(0);
+    let operation = "open\0".encode_utf16().collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        anyhow::bail!("failed to {action}: ShellExecuteW returned {result:?}");
+    }
+    Ok(())
 }
 
 fn spawn_command(command: &mut Command, action: &str) -> Result<()> {
@@ -918,6 +941,10 @@ mod tests {
         assert!(!source.contains(&["ensure_artifact_local_copy", "_for_open("].concat()));
         assert!(!source.contains(&["download_artifact", "_to_cache("].concat()));
         assert!(!source.contains(&["ArtifactDownload", "Request"].concat()));
+        assert!(
+            !source.contains("Command::new(\"cmd\")"),
+            "artifact URLs and paths must never pass through cmd.exe"
+        );
         assert!(source.contains("artifact_view_grant_create(params)"));
         assert!(source.contains("DesktopGatewayHttpClient"));
     }

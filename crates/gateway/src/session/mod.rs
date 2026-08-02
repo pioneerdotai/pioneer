@@ -233,6 +233,9 @@ impl SessionManager {
                 .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
         };
 
+        if sender.capacity() == 0 {
+            record_outbound_queue_saturation("session_send_waited");
+        }
         if sender.send(Message::Text(payload.into())).await.is_err() {
             self.unregister_connection(connection_id).await;
             return Err(anyhow!("connection `{connection_id}` channel is closed"));
@@ -305,6 +308,9 @@ impl SessionManager {
                 .get(&connection_id)
                 .map(|connection| (connection.sender.clone(), connection.termination_tx.clone()));
             if let Some((sender, termination_tx)) = connection {
+                if sender.capacity() == 0 {
+                    record_outbound_queue_saturation("session_disconnect");
+                }
                 if let Ok(notification) = notification {
                     let _ = sender.try_send(Message::Text(notification.into()));
                 }
@@ -317,6 +323,14 @@ impl SessionManager {
             self.unregister_connection(connection_id).await;
         }
     }
+}
+
+fn record_outbound_queue_saturation(reason_code: &'static str) {
+    tracing::debug!(
+        event = "websocket_outbound_queue",
+        outcome = "saturated",
+        reason_code,
+    );
 }
 
 fn prune_terminated_session_tombstones(

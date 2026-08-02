@@ -85,9 +85,9 @@ mod tests {
 
     #[test]
     fn untrusted_peer_cannot_spoof_forwarded_address() {
-        let direct = peer([203, 0, 113, 61]);
+        let direct = peer([203, 0, 113, 42]);
         let mut headers = HeaderMap::new();
-        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.61"));
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.42"));
         headers.insert(FORWARDED, HeaderValue::from_static("for=192.0.2.62"));
 
         let network = resolve_request_network(direct, &headers, &[IpAddr::from([127, 0, 0, 1])]);
@@ -101,18 +101,18 @@ mod tests {
         let trusted = [proxy.ip()];
 
         let mut xff = HeaderMap::new();
-        xff.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.61"));
+        xff.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.42"));
         let network = resolve_request_network(proxy, &xff, &trusted);
-        assert_eq!(network.client_ip(), Some(IpAddr::from([192, 0, 2, 61])));
+        assert_eq!(network.client_ip(), Some(IpAddr::from([192, 0, 2, 42])));
         assert_eq!(network.safe_source(), "trusted_proxy");
 
         let mut forwarded = HeaderMap::new();
         forwarded.insert(
             FORWARDED,
-            HeaderValue::from_static("for=2001:db8::61;proto=https"),
+            HeaderValue::from_static("for=2001:db8::42;proto=https"),
         );
         let network = resolve_request_network(proxy, &forwarded, &trusted);
-        assert_eq!(network.client_ip(), Some("2001:db8::61".parse().unwrap()));
+        assert_eq!(network.client_ip(), Some("2001:db8::42".parse().unwrap()));
     }
 
     #[test]
@@ -129,8 +129,8 @@ mod tests {
         }
 
         let mut both = HeaderMap::new();
-        both.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.61"));
-        both.insert(FORWARDED, HeaderValue::from_static("for=192.0.2.61"));
+        both.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.42"));
+        both.insert(FORWARDED, HeaderValue::from_static("for=192.0.2.42"));
         assert_eq!(
             resolve_request_network(proxy, &both, &trusted).client_ip(),
             Some(proxy.ip())

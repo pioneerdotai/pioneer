@@ -20,6 +20,9 @@ pub(crate) async fn authenticate_native_storage_request(
     let request_id = new_request_id();
     crate::transport::protocol::validate_protocol_version(headers)
         .map_err(|_| HttpError::bad_request(request_id.clone()))?;
+    if !state.is_ready() {
+        return Err(HttpError::service_unavailable(request_id));
+    }
 
     let credential = state.auth.capture_access_headers(headers).map_err(|error| {
         tracing::debug!(

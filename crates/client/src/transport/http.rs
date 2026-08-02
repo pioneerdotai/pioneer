@@ -12,21 +12,27 @@ use reqwest::header::{
     AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
     IF_NONE_MATCH, IF_RANGE, RANGE,
 };
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use zeroize::Zeroize;
+
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 use crate::gateway::endpoint::{
     GatewayBaseUrl, GatewayBaseUrlError, PIONEER_PROTOCOL_VERSION,
     PIONEER_PROTOCOL_VERSION_HEADER,
+    canonical_storage_path,
 };
 use crate::gateway::session_lifecycle::SessionTerminalReason;
 use crate::gateway::types::GatewayEndpoint;
 
 const MAX_STORAGE_PATH_BYTES: usize = 2_048;
 const MAX_RESPONSE_HEADER_BYTES: usize = 2_048;
+const MAX_HTTP2_RESPONSE_HEADER_LIST_BYTES: u32 = 16 * 1024;
 const REQUEST_ID_HEADER: &str = "Pioneer-Request-Id";
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct GatewayHttpAccess {
@@ -98,18 +104,18 @@ impl GatewayHttpRequest {
     }
 
     fn new(method: GatewayHttpMethod, storage_path: String) -> Result<Self, GatewayHttpError> {
-        let canonical = storage_path.trim_start_matches('/');
         if storage_path.is_empty()
             || storage_path.len() > MAX_STORAGE_PATH_BYTES
-            || !canonical.starts_with("storage/")
-            || canonical.starts_with("storage/views/")
-            || storage_path.contains(|character| matches!(character, '?' | '#' | '\\'))
         {
+            return Err(GatewayHttpError::InvalidStoragePath);
+        }
+        let canonical = canonical_storage_path(storage_path.as_str()).map_err(map_base_url_error)?;
+        if canonical.starts_with("storage/views/") {
             return Err(GatewayHttpError::InvalidStoragePath);
         }
         Ok(Self {
             method,
-            storage_path,
+            storage_path: canonical,
             range: None,
             if_none_match: None,
             if_range: None,
@@ -174,6 +180,7 @@ pub struct GatewayHttpResponseHead {
 pub struct GatewayHttpBody {
     stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, GatewayHttpError>> + Send>>,
     cancellation: CancellationToken,
+    idle_timeout: Duration,
 }
 
 impl fmt::Debug for GatewayHttpBody {
@@ -190,7 +197,12 @@ impl GatewayHttpBody {
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, GatewayHttpError>> {
         tokio::select! {
             _ = self.cancellation.cancelled() => Some(Err(GatewayHttpError::Cancelled)),
-            chunk = self.stream.next() => chunk,
+            chunk = tokio::time::timeout(self.idle_timeout, self.stream.next()) => {
+                match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => Some(Err(GatewayHttpError::Transport)),
+                }
+            },
         }
     }
 
@@ -202,6 +214,7 @@ impl GatewayHttpBody {
         Self {
             stream: Box::pin(futures_util::stream::iter(chunks)),
             cancellation,
+            idle_timeout: RESPONSE_BODY_IDLE_TIMEOUT,
         }
     }
 }
@@ -212,7 +225,6 @@ pub struct GatewayHttpResponse {
     pub body: GatewayHttpBody,
 }
 
-#[derive(Clone)]
 pub struct BrowserViewUrl(String);
 
 impl BrowserViewUrl {
@@ -246,6 +258,12 @@ impl fmt::Debug for BrowserViewUrl {
     }
 }
 
+impl Drop for BrowserViewUrl {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayHttpError {
     InvalidEndpoint,
@@ -261,6 +279,7 @@ pub enum GatewayHttpError {
     Unauthorized,
     Forbidden,
     NotFound,
+    Conflict,
     RangeNotSatisfiable,
     TooManyRequests,
     ServiceUnavailable,
@@ -283,6 +302,7 @@ impl GatewayHttpError {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
             Self::RangeNotSatisfiable => "range_not_satisfiable",
             Self::TooManyRequests => "too_many_requests",
             Self::ServiceUnavailable => "service_unavailable",
@@ -306,7 +326,6 @@ pub struct GatewayHttpSession {
     session_id: AuthSessionId,
     authority: Arc<dyn GatewayHttpSessionAuthority>,
     executor: Arc<dyn GatewayHttpExecutor>,
-    refresh_gate: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for GatewayHttpSession {
@@ -333,17 +352,43 @@ impl GatewayHttpSession {
         if endpoint.session_ref.is_none() {
             return Err(GatewayHttpError::InvalidEndpoint);
         }
+        Self::new(
+            endpoint.gateway_base_url.clone(),
+            pinned_gateway_id,
+            session_id,
+            authority,
+        )
+    }
+
+    pub fn from_access(
+        access: &GatewayHttpAccess,
+        authority: Arc<dyn GatewayHttpSessionAuthority>,
+    ) -> Result<Self, GatewayHttpError> {
+        Self::new(
+            access.gateway_base_url.clone(),
+            access.gateway_id.clone(),
+            access.session_id.clone(),
+            authority,
+        )
+    }
+
+    fn new(
+        gateway_base_url: GatewayBaseUrl,
+        pinned_gateway_id: GatewayId,
+        session_id: AuthSessionId,
+        authority: Arc<dyn GatewayHttpSessionAuthority>,
+    ) -> Result<Self, GatewayHttpError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .http2_max_header_list_size(MAX_HTTP2_RESPONSE_HEADER_LIST_BYTES)
             .build()
             .map_err(|_| GatewayHttpError::InvalidEndpoint)?;
         Ok(Self {
-            gateway_base_url: endpoint.gateway_base_url.clone(),
+            gateway_base_url,
             pinned_gateway_id,
             session_id,
             authority,
             executor: Arc::new(ReqwestGatewayHttpExecutor { client }),
-            refresh_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -371,6 +416,7 @@ impl GatewayHttpSession {
         if first.head.status != 401 {
             return classify_response(first);
         }
+        drop(first);
 
         let refreshed = self.refresh_access(access.generation).await?;
         let retry = self
@@ -383,7 +429,6 @@ impl GatewayHttpSession {
         &self,
         rejected_generation: u64,
     ) -> Result<GatewayHttpAccess, GatewayHttpError> {
-        let _guard = self.refresh_gate.lock().await;
         let current = self.authority.current_access().await.map_err(map_authority_error)?;
         self.validate_access(&current)?;
         if current.generation != rejected_generation && current.access_expires_at_unix > now_unix()? {
@@ -395,6 +440,9 @@ impl GatewayHttpSession {
             .await
             .map_err(map_authority_error)?;
         self.validate_access(&refreshed)?;
+        if refreshed.access_expires_at_unix <= now_unix()? {
+            return Err(GatewayHttpError::AuthenticationUnavailable);
+        }
         Ok(refreshed)
     }
 
@@ -451,7 +499,6 @@ impl GatewayHttpSession {
             session_id,
             authority,
             executor,
-            refresh_gate: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -540,6 +587,7 @@ impl GatewayHttpExecutor for ReqwestGatewayHttpExecutor {
             body: GatewayHttpBody {
                 stream: Box::pin(body_stream),
                 cancellation,
+                idle_timeout: RESPONSE_BODY_IDLE_TIMEOUT,
             },
         })
     }
@@ -550,7 +598,7 @@ fn response_head(response: &reqwest::Response) -> Result<GatewayHttpResponseHead
         status: response.status().as_u16(),
         request_id: bounded_response_header(response, REQUEST_ID_HEADER)?,
         etag: bounded_response_header(response, ETAG.as_str())?,
-        content_length: match response.headers().get(CONTENT_LENGTH) {
+        content_length: match single_response_header(response, CONTENT_LENGTH.as_str())? {
             Some(value) => Some(
                 value
                     .to_str()
@@ -570,7 +618,7 @@ fn bounded_response_header(
     response: &reqwest::Response,
     name: &str,
 ) -> Result<Option<String>, GatewayHttpError> {
-    let Some(value) = response.headers().get(name) else {
+    let Some(value) = single_response_header(response, name)? else {
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| GatewayHttpError::InvalidResponse)?;
@@ -580,12 +628,27 @@ fn bounded_response_header(
     Ok(Some(value.to_owned()))
 }
 
+fn single_response_header<'a>(
+    response: &'a reqwest::Response,
+    name: &str,
+) -> Result<Option<&'a reqwest::header::HeaderValue>, GatewayHttpError> {
+    let mut values = response.headers().get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(GatewayHttpError::InvalidResponse);
+    }
+    Ok(Some(value))
+}
+
 fn classify_response(response: GatewayHttpResponse) -> Result<GatewayHttpResponse, GatewayHttpError> {
     match response.head.status {
         200 | 206 | 304 => Ok(response),
         401 => Err(GatewayHttpError::Unauthorized),
         403 => Err(GatewayHttpError::Forbidden),
         404 => Err(GatewayHttpError::NotFound),
+        409 => Err(GatewayHttpError::Conflict),
         416 => Err(GatewayHttpError::RangeNotSatisfiable),
         429 => Err(GatewayHttpError::TooManyRequests),
         503 => Err(GatewayHttpError::ServiceUnavailable),
@@ -668,9 +731,9 @@ mod tests {
             &self,
             rejected_generation: u64,
         ) -> Result<GatewayHttpAccess, GatewayHttpAuthorityError> {
-            self.refreshes.fetch_add(1, Ordering::SeqCst);
             let mut access = self.access.lock().await;
             if access.generation == rejected_generation {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
                 access.generation += 1;
                 access.access_token = AuthSecretString::new("fresh-access-secret");
                 access.access_expires_at_unix = u64::MAX;
@@ -759,6 +822,7 @@ mod tests {
             body: GatewayHttpBody {
                 stream: Box::pin(futures_util::stream::empty()),
                 cancellation,
+                idle_timeout: RESPONSE_BODY_IDLE_TIMEOUT,
             },
         }
     }
@@ -928,6 +992,20 @@ mod tests {
         assert!(!format!("{error:?} {error}").contains("secret"));
     }
 
+    #[tokio::test]
+    async fn stalled_response_body_fails_with_a_bounded_transport_error() {
+        let mut body = GatewayHttpBody {
+            stream: Box::pin(futures_util::stream::pending()),
+            cancellation: CancellationToken::new(),
+            idle_timeout: Duration::from_millis(20),
+        };
+
+        assert_eq!(
+            body.next_chunk().await,
+            Some(Err(GatewayHttpError::Transport))
+        );
+    }
+
     #[test]
     fn view_urls_are_same_origin_prefix_preserving_and_debug_redacted() {
         let authority = Arc::new(FakeAuthority {
@@ -956,5 +1034,14 @@ mod tests {
         ] {
             assert!(session.resolve_view_url(invalid.as_str()).is_err());
         }
+    }
+
+    #[test]
+    fn conflict_status_has_a_stable_typed_client_error() {
+        let response = empty_response(409, CancellationToken::new());
+        assert_eq!(
+            classify_response(response).unwrap_err(),
+            GatewayHttpError::Conflict
+        );
     }
 }

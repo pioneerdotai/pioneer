@@ -8288,6 +8288,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "mime_guess",
  "pioneer-protocol",
  "pioneer-skills",
@@ -8303,7 +8304,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "tracing",
  "url",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -95,11 +95,8 @@ impl ClientDeviceActivationParseResult {
     pub fn from_request(request: ClientDeviceActivationParseRequest) -> Result<Self, String> {
         let presentation = AuthDeviceActivationPresentation::parse(request.uri.expose_secret())?;
         let activation_code = AuthSecretString::new(presentation.activation_code());
-        let gateway_base_url =
-            GatewayBaseUrl::from_websocket_presentation(&presentation.protected_endpoint)
-                .map_err(|error| error.to_string())?;
         Ok(Self {
-            gateway_base_url,
+            gateway_base_url: presentation.gateway_base_url,
             gateway_id: presentation.gateway_id,
             activation_code,
         })

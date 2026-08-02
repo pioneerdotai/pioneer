@@ -25,8 +25,9 @@ pub fn build_ws_request(
 
     if let Some(token) = token.and_then(non_empty) {
         let authorization_value = Zeroizing::new(format!("Bearer {token}"));
-        let header = HeaderValue::from_str(authorization_value.as_str())
+        let mut header = HeaderValue::from_str(authorization_value.as_str())
             .map_err(|error| anyhow!("invalid authorization header value: {error}"))?;
+        header.set_sensitive(true);
         request.headers_mut().insert("authorization", header);
     }
 
@@ -69,6 +70,12 @@ mod tests {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer token")
+        );
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .is_some_and(HeaderValue::is_sensitive)
         );
     }
 

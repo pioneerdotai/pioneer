@@ -21,6 +21,7 @@ async-trait.workspace = true
 base64.workspace = true
 flate2.workspace = true
 hex.workspace = true
+libc.workspace = true
 mime_guess.workspace = true
 pioneer-protocol.workspace = true
 pioneer-skills.workspace = true
@@ -35,9 +36,13 @@ tar.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 url.workspace = true
 futures-util.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 schemars.workspace = true

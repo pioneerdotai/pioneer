@@ -477,7 +477,7 @@ impl MessageProcessor {
             .await
         {
             Ok(status) => {
-                self.cancel_http_artifact_streams(&workspace_id, &params.artifact_id);
+                self.cancel_artifact_streams(&workspace_id, &params.artifact_id);
                 self.send_artifact_result(
                     connection_id,
                     request_id,

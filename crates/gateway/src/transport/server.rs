@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,7 +7,10 @@ use anyhow::{Context, Result};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use pioneer_config::AppConfig;
-use pioneer_protocol::{AuthAccessExpiringNotification, JsonRpcNotification, constants::events};
+use pioneer_protocol::{
+    AuthAccessExpiringNotification, AuthSessionTerminationReason, JsonRpcNotification,
+    constants::events,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -19,6 +23,17 @@ use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 
 const ACCESS_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+type WriterCompletion = std::result::Result<Result<()>, tokio::task::JoinError>;
+
+enum MessageProcessingOutcome {
+    Completed,
+    SessionTerminated(Option<AuthSessionTerminationReason>),
+    ServerShutdown,
+    AccessExpired,
+    AccessLeaseStopped,
+    WriterFinished(WriterCompletion),
+}
 
 #[derive(Debug)]
 pub struct GatewayServerHandle {
@@ -63,7 +78,7 @@ pub async fn spawn_server(
         message_processor,
         session_manager,
     )
-    .map_err(|error| anyhow::anyhow!("invalid view-grant configuration: {error:?}"))?;
+    .map_err(|error| anyhow::anyhow!("invalid Gateway HTTP configuration: {error:?}"))?;
     let app = gateway_router(state.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     state.set_ready(true);
@@ -94,6 +109,8 @@ async fn shutdown_signal(
         }
     }
     state.set_ready(false);
+    state.view_grants.begin_shutdown();
+    state.http_streams.begin_shutdown();
     state.active_connections.cancel_all().await;
 }
 
@@ -127,9 +144,24 @@ pub(super) async fn run_admitted_connection(
                 _ = wait_for_cancellation(&mut server_cancellation) => Ok(None),
             };
             match &result {
-                Ok(Some(RestrictedExchangeOutcome::Succeeded)) => permit.record_success(),
-                Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => permit.record_failure(),
-                Ok(None) => {}
+                Ok(Some(RestrictedExchangeOutcome::Succeeded)) => {
+                    permit.record_success();
+                    tracing::debug!(
+                        event = "websocket_auth",
+                        outcome = "restricted_succeeded",
+                    );
+                }
+                Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => {
+                    permit.record_failure();
+                    tracing::debug!(
+                        event = "websocket_auth",
+                        outcome = "restricted_failed",
+                    );
+                }
+                Ok(None) => tracing::debug!(
+                    event = "websocket_auth",
+                    outcome = "restricted_cancelled",
+                ),
             }
             result.map(|_| ())
         }
@@ -202,7 +234,6 @@ async fn run_normal_connection(
         enforce_access_lease(
             access_lease_outbound,
             access_lease_principal,
-            connection_id,
             access_lifetime,
             access_warning_delay,
             lease_cancel_rx,
@@ -225,24 +256,30 @@ async fn run_normal_connection(
         ws_writer.close().await.context("websocket close failed")?;
         Ok::<(), anyhow::Error>(())
     });
-
+    let mut writer_completion = None;
     let read_result = async {
         loop {
             let payload = tokio::select! {
                 termination = termination_rx.changed() => {
-                    let _ = termination;
+                    let reason = termination
+                        .is_ok()
+                        .then(|| *termination_rx.borrow())
+                        .flatten();
+                    if let Some(reason) = reason {
+                        send_close_bounded(&outbound_tx, 4403, reason.as_str()).await;
+                    }
                     break;
                 }
                 _ = wait_for_cancellation(&mut server_cancellation) => {
-                    let _ = outbound_tx.try_send(Message::Close(Some(CloseFrame {
-                        code: 1012,
-                        reason: "server_shutdown".into(),
-                    })));
+                    send_close_bounded(&outbound_tx, 1012, "server_shutdown").await;
                     break;
                 }
                 changed = access_expired_rx.changed() => {
                     match changed {
-                        Ok(()) if *access_expired_rx.borrow() => break,
+                        Ok(()) if *access_expired_rx.borrow() => {
+                            send_close_bounded(&outbound_tx, 4401, "access_expired").await;
+                            break;
+                        }
                         Ok(()) => continue,
                         Err(_) => {
                             return Err(anyhow::anyhow!(
@@ -250,6 +287,10 @@ async fn run_normal_connection(
                             ));
                         }
                     }
+                }
+                result = &mut writer_task => {
+                    writer_completion = Some(result);
+                    break;
                 }
                 payload = ws_reader.next() => payload,
             };
@@ -263,37 +304,52 @@ async fn run_normal_connection(
                     if let Some(reason) =
                         normal_ingress_lease_failure(&auth_service, &connection_context).await
                     {
-                        send_outbound(
-                            &outbound_tx,
-                            Message::Close(Some(CloseFrame {
-                                code: 4401,
-                                reason: reason.into(),
-                            })),
-                        )
-                        .await?;
+                        send_close_bounded(&outbound_tx, 4401, reason).await;
                         break;
                     }
-                    message_processor
-                        .process_request(&connection_context, payload.as_ref())
-                        .await;
+                    let outcome = await_message_processing(
+                        message_processor.process_request(&connection_context, payload.as_ref()),
+                        &mut termination_rx,
+                        &mut server_cancellation,
+                        &mut access_expired_rx,
+                        &mut writer_task,
+                    )
+                    .await;
+                    if !continue_after_message_processing(
+                        outcome,
+                        &outbound_tx,
+                        &mut writer_completion,
+                    )
+                    .await?
+                    {
+                        break;
+                    }
                 }
                 Message::Binary(payload) => {
                     if let Some(reason) =
                         normal_ingress_lease_failure(&auth_service, &connection_context).await
                     {
-                        send_outbound(
-                            &outbound_tx,
-                            Message::Close(Some(CloseFrame {
-                                code: 4401,
-                                reason: reason.into(),
-                            })),
-                        )
-                        .await?;
+                        send_close_bounded(&outbound_tx, 4401, reason).await;
                         break;
                     }
-                    message_processor
-                        .process_binary_frame(&connection_context, payload.as_ref())
-                        .await;
+                    let outcome = await_message_processing(
+                        message_processor
+                            .process_binary_frame(&connection_context, payload.as_ref()),
+                        &mut termination_rx,
+                        &mut server_cancellation,
+                        &mut access_expired_rx,
+                        &mut writer_task,
+                    )
+                    .await;
+                    if !continue_after_message_processing(
+                        outcome,
+                        &outbound_tx,
+                        &mut writer_completion,
+                    )
+                    .await?
+                    {
+                        break;
+                    }
                 }
                 // Axum automatically emits Pong for Ping and the close reply for peer Close.
                 Message::Ping(_) | Message::Pong(_) => {}
@@ -308,11 +364,14 @@ async fn run_normal_connection(
     session_manager.unregister_connection(connection_id).await;
     message_processor.connection_closed(connection_id).await;
     drop(outbound_tx);
-    match tokio::time::timeout(ACCESS_CLOSE_GRACE, &mut writer_task).await {
-        Ok(result) => result.context("writer task join failed")??,
-        Err(_) => {
-            writer_task.abort();
-            let _ = writer_task.await;
+    match writer_completion {
+        Some(result) => result.context("writer task join failed")??,
+        None => match tokio::time::timeout(ACCESS_CLOSE_GRACE, &mut writer_task).await {
+            Ok(result) => result.context("writer task join failed")??,
+            Err(_) => {
+                writer_task.abort();
+                let _ = writer_task.await;
+            }
         }
     }
     access_lease_task
@@ -322,10 +381,80 @@ async fn run_normal_connection(
     read_result
 }
 
+async fn await_message_processing<F>(
+    processing: F,
+    termination_rx: &mut watch::Receiver<Option<AuthSessionTerminationReason>>,
+    server_cancellation: &mut watch::Receiver<bool>,
+    access_expired_rx: &mut watch::Receiver<bool>,
+    writer_task: &mut JoinHandle<Result<()>>,
+) -> MessageProcessingOutcome
+where
+    F: Future<Output = ()>,
+{
+    tokio::pin!(processing);
+    loop {
+        tokio::select! {
+            () = &mut processing => return MessageProcessingOutcome::Completed,
+            changed = termination_rx.changed() => {
+                let reason = changed
+                    .is_ok()
+                    .then(|| *termination_rx.borrow())
+                    .flatten();
+                return MessageProcessingOutcome::SessionTerminated(reason);
+            }
+            _ = wait_for_cancellation(server_cancellation) => {
+                return MessageProcessingOutcome::ServerShutdown;
+            }
+            changed = access_expired_rx.changed() => {
+                match changed {
+                    Ok(()) if *access_expired_rx.borrow() => {
+                        return MessageProcessingOutcome::AccessExpired;
+                    }
+                    Ok(()) => continue,
+                    Err(_) => return MessageProcessingOutcome::AccessLeaseStopped,
+                }
+            }
+            result = &mut *writer_task => {
+                return MessageProcessingOutcome::WriterFinished(result);
+            }
+        }
+    }
+}
+
+async fn continue_after_message_processing(
+    outcome: MessageProcessingOutcome,
+    outbound_tx: &mpsc::Sender<Message>,
+    writer_completion: &mut Option<WriterCompletion>,
+) -> Result<bool> {
+    match outcome {
+        MessageProcessingOutcome::Completed => Ok(true),
+        MessageProcessingOutcome::SessionTerminated(reason) => {
+            if let Some(reason) = reason {
+                send_close_bounded(outbound_tx, 4403, reason.as_str()).await;
+            }
+            Ok(false)
+        }
+        MessageProcessingOutcome::ServerShutdown => {
+            send_close_bounded(outbound_tx, 1012, "server_shutdown").await;
+            Ok(false)
+        }
+        MessageProcessingOutcome::AccessExpired => {
+            send_close_bounded(outbound_tx, 4401, "access_expired").await;
+            Ok(false)
+        }
+        MessageProcessingOutcome::AccessLeaseStopped => Err(anyhow::anyhow!(
+            "access lease task stopped before connection expiry"
+        )),
+        MessageProcessingOutcome::WriterFinished(result) => {
+            *writer_completion = Some(result);
+            Ok(false)
+        }
+    }
+}
+
 async fn enforce_access_lease(
     outbound_tx: mpsc::Sender<Message>,
     principal: AuthenticatedSessionPrincipal,
-    connection_id: u64,
     access_lifetime: Duration,
     access_warning_delay: Duration,
     mut cancellation_rx: watch::Receiver<bool>,
@@ -347,7 +476,12 @@ async fn enforce_access_lease(
                 )
                 .and_then(|notification| serde_json::to_string(&notification))
                 {
-                    let _ = outbound_tx.try_send(Message::Text(notification.into()));
+                    if matches!(
+                        outbound_tx.try_send(Message::Text(notification.into())),
+                        Err(mpsc::error::TrySendError::Full(_)),
+                    ) {
+                        record_outbound_queue_saturation("access_expiry_warning");
+                    }
                 }
             }
             _ = wait_for_cancellation(&mut cancellation_rx) => return,
@@ -364,16 +498,10 @@ async fn enforce_access_lease(
         event = "auth_access_expired",
         gateway_id = %principal.gateway_id,
         principal_id = %principal.principal_id,
-        device_id = %principal.device_id,
         auth_session_id = %principal.session_id,
-        connection_id,
         outcome = "connection_closed",
-        reason = "access_expired",
+        reason_code = "access_expired",
     );
-    let _ = outbound_tx.try_send(Message::Close(Some(CloseFrame {
-        code: 4401,
-        reason: "access_expired".into(),
-    })));
 }
 
 async fn wait_for_cancellation(cancellation_rx: &mut watch::Receiver<bool>) {
@@ -409,11 +537,26 @@ async fn normal_ingress_lease_failure(
         })
 }
 
-async fn send_outbound(sender: &mpsc::Sender<Message>, message: Message) -> Result<()> {
-    sender
-        .send(message)
-        .await
-        .map_err(|_| anyhow::anyhow!("outbound channel closed"))
+async fn send_close_bounded(sender: &mpsc::Sender<Message>, code: u16, reason: &'static str) {
+    if sender.capacity() == 0 {
+        record_outbound_queue_saturation("close_waited");
+    }
+    let _ = tokio::time::timeout(
+        ACCESS_CLOSE_GRACE,
+        sender.send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }))),
+    )
+    .await;
+}
+
+fn record_outbound_queue_saturation(reason_code: &'static str) {
+    tracing::debug!(
+        event = "websocket_outbound_queue",
+        outcome = "saturated",
+        reason_code,
+    );
 }
 
 #[cfg(test)]
@@ -452,14 +595,14 @@ mod tests {
             .await
             .expect("prime bounded queue");
 
-        let pending = send_outbound(&sender, Message::Text("second".into()));
+        let pending = sender.send(Message::Text("second".into()));
         tokio::pin!(pending);
         assert!(pending.as_mut().now_or_never().is_none());
         assert!(matches!(receiver.recv().await, Some(Message::Text(_))));
         pending.await.expect("writer progress releases backpressure");
 
         drop(receiver);
-        assert!(send_outbound(&sender, Message::Close(None)).await.is_err());
+        assert!(sender.send(Message::Close(None)).await.is_err());
     }
 
     #[tokio::test]
@@ -476,13 +619,13 @@ mod tests {
     #[tokio::test]
     async fn access_lease_cancellation_releases_task_without_wall_clock_wait() {
         let principal = AuthenticatedSessionPrincipal {
-            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000061").unwrap(),
-            principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000061").unwrap(),
+            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+            principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
             kind: pioneer_protocol::PrincipalKind::Superuser,
             role_key: None,
-            device_id: pioneer_protocol::DeviceId::new("D00000000000000000061").unwrap(),
-            session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000061").unwrap(),
-            access_jti: "J00000000000000000061".to_owned(),
+            device_id: pioneer_protocol::DeviceId::new("D00000000000000000001").unwrap(),
+            session_id: pioneer_protocol::AuthSessionId::new("S00000000000000000001").unwrap(),
+            access_jti: "J00000000000000000001".to_owned(),
             access_expires_at_unix: 10_000,
         };
         let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
@@ -491,7 +634,6 @@ mod tests {
         let task = tokio::spawn(enforce_access_lease(
             outbound_tx,
             principal,
-            61,
             Duration::from_secs(60),
             Duration::from_secs(30),
             cancel_rx,
@@ -502,5 +644,27 @@ mod tests {
         task.await.unwrap();
         assert!(!*expired_rx.borrow());
         assert!(outbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_interrupts_in_flight_message_processing() {
+        let (_termination_tx, mut termination_rx) = watch::channel(None);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_expired_tx, mut expired_rx) = watch::channel(false);
+        let mut writer_task = tokio::spawn(std::future::pending::<Result<()>>());
+
+        shutdown_tx.send(true).unwrap();
+        let outcome = await_message_processing(
+            std::future::pending(),
+            &mut termination_rx,
+            &mut shutdown_rx,
+            &mut expired_rx,
+            &mut writer_task,
+        )
+        .await;
+
+        assert!(matches!(outcome, MessageProcessingOutcome::ServerShutdown));
+        writer_task.abort();
+        let _ = writer_task.await;
     }
 }

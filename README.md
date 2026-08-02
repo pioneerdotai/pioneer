@@ -304,6 +304,9 @@ cargo run -p pioneer-cli --features dev --bin pioneer-dev -- status
 
 ## Release Signing
 
+The coordinated Gateway/Desktop/Pioneer App edge release and registry-v3 recovery checklist is
+documented in [Gateway Edge Breaking Release](docs/gateway-edge-release.md).
+
 Tagged desktop release builds enforce signing/notarization where configured.
 
 macOS secrets:

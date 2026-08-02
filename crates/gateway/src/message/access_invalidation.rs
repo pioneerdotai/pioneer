@@ -22,7 +22,7 @@ impl MessageProcessor {
     ) {
         // The signal exists only after the ACL mutation commits. Cancel the
         // exact principal/workspace HTTP scope before any further delivery.
-        self.cancel_http_streams_for_access_change(signal);
+        self.cancel_artifact_streams_for_access_change(signal);
         self.expire_native_permission_requests_without_current_authority(
             signal.workspace_id.as_str(),
             signal.affected_principal_id.as_ref(),

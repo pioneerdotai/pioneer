@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pioneer_client::{
-    avatars::{AvatarCacheError, AvatarCacheRequest, AvatarCacheService, AvatarCacheSource},
-    gateway::types::{GatewayEndpoint, GatewayEndpointKind},
+    avatars::{
+        AvatarCacheError, AvatarCacheRequest, AvatarCacheService, AvatarCacheSource,
+        invalidate_avatar_cache,
+    },
     transport::{
         http::{
             GatewayHttpAccess, GatewayHttpAuthorityError, GatewayHttpSession,
@@ -60,27 +62,22 @@ impl ClientFfiAvatarCache {
         let access = sender
             .current_gateway_http_access()
             .map_err(map_authority_error)?;
-        let endpoint = GatewayEndpoint {
-            id: access.gateway_id.as_str().to_owned(),
-            name: "active Gateway".to_owned(),
-            gateway_base_url: access.gateway_base_url.clone(),
-            kind: GatewayEndpointKind::Remote,
-            session_ref: Some(access.session_id.as_str().to_owned()),
-            server_gateway_id: Some(access.gateway_id.clone()),
-            workspace_id: None,
-            service_name: None,
-        };
         let authority = Arc::new(FfiAvatarHttpAuthority {
             sender: sender.clone(),
         });
-        let session = GatewayHttpSession::from_endpoint(&endpoint, access.session_id, authority)
+        let session = GatewayHttpSession::from_access(&access, authority)
             .map_err(|_| {
                 ClientFfiError::new(
                     "Gateway endpoint is unavailable for avatar access",
                     AVATAR_RECONFIGURATION_CODE,
                 )
             })?;
-        let service = AvatarCacheService::new(session, runtime_home, access.gateway_id);
+        let service = AvatarCacheService::new(
+            session,
+            runtime_home,
+            access.gateway_id,
+            access.session_id,
+        );
         let runtime = Runtime::new().map_err(|_| {
             ClientFfiError::new("avatar cache runtime is unavailable", "avatar_cache_unavailable")
         })?;
@@ -118,8 +115,7 @@ impl ClientFfiAvatarCache {
         let Ok(_operation) = self.operation_gate.lock() else {
             return;
         };
-        let root = runtime_home.join("cache").join("avatars");
-        let _ = std::fs::remove_dir_all(root);
+        let _ = invalidate_avatar_cache(runtime_home);
     }
 }
 
@@ -153,8 +149,8 @@ fn map_authority_error(error: GatewayHttpAuthorityError) -> ClientFfiError {
             "avatar_authentication_required",
         ),
         GatewayHttpAuthorityError::TemporarilyUnavailable => ClientFfiError::new(
-            "Gateway session is temporarily unavailable for avatar access",
-            "avatar_offline",
+            "Gateway session must be refreshed before avatar access",
+            "avatar_authentication_required",
         ),
     }
 }
@@ -181,5 +177,11 @@ mod tests {
         for forbidden in ["content", "content_base64", "access_token", "authorization"] {
             assert!(value.get(forbidden).is_none(), "forbidden FFI field {forbidden}");
         }
+    }
+
+    #[test]
+    fn refresh_owned_by_shell_is_reported_as_authentication_required() {
+        let error = map_authority_error(GatewayHttpAuthorityError::TemporarilyUnavailable);
+        assert_eq!(error.code, "avatar_authentication_required");
     }
 }

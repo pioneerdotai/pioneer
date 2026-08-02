@@ -7,9 +7,7 @@ use pioneer_protocol::{
 
 use super::super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedArtifact};
-use crate::transport::{
-    ViewGrantDisposition, ViewGrantError, ViewGrantScope,
-};
+use crate::view_grants::{ViewGrantDisposition, ViewGrantError, ViewGrantScope};
 
 const MAX_VIEW_GRANT_SCOPE_ID_BYTES: usize = 128;
 
@@ -29,6 +27,7 @@ impl MessageProcessor {
             || !valid_scope_id(artifact_id)
             || !valid_scope_id(version_id)
         {
+            record_view_grant_creation_rejection("invalid_scope");
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
@@ -43,6 +42,7 @@ impl MessageProcessor {
         if authorization.workspace_id() != workspace_id
             || authorization.artifact_id() != artifact_id
         {
+            record_view_grant_creation_rejection("authorization_scope_mismatch");
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
@@ -71,6 +71,7 @@ impl MessageProcessor {
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(ArtifactError::NotFound { .. } | ArtifactError::InvalidRequest { .. }) => {
+                record_view_grant_creation_rejection("content_not_found");
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::NotFound.response(request_id),
@@ -79,6 +80,7 @@ impl MessageProcessor {
                 return;
             }
             Err(_) => {
+                record_view_grant_creation_rejection("content_unavailable");
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -91,6 +93,7 @@ impl MessageProcessor {
             || snapshot.artifact_id() != artifact_id
             || snapshot.artifact_version_id() != version_id
         {
+            record_view_grant_creation_rejection("content_scope_mismatch");
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
@@ -100,6 +103,7 @@ impl MessageProcessor {
         }
         let mut artifact_sha256 = [0_u8; 32];
         if hex::decode_to_slice(snapshot.sha256(), &mut artifact_sha256).is_err() {
+            record_view_grant_creation_rejection("invalid_content_hash");
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::Unavailable.response(request_id),
@@ -108,6 +112,7 @@ impl MessageProcessor {
             return;
         }
         let Some(service) = self.view_grant_service() else {
+            record_view_grant_creation_rejection("service_unavailable");
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::Unavailable.response(request_id),
@@ -166,8 +171,19 @@ impl MessageProcessor {
     }
 }
 
+fn record_view_grant_creation_rejection(reason_code: &'static str) {
+    tracing::debug!(
+        event = "view_grant_lifecycle",
+        outcome = "rejected",
+        reason_code,
+    );
+}
+
 fn valid_scope_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_VIEW_GRANT_SCOPE_ID_BYTES
+    !value.is_empty()
+        && value.len() <= MAX_VIEW_GRANT_SCOPE_ID_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]

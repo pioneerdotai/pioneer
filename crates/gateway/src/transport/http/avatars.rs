@@ -43,9 +43,12 @@ pub(super) async fn member_avatar_route(
         .request_id()
         .cloned()
         .expect("native HTTP authentication always assigns a request ID");
-    let principal_id = PrincipalId::new(path.principal_id)
-        .map_err(|_| HttpError::not_found(request_id.clone()))?;
+    let principal_id = PrincipalId::new(path.principal_id).map_err(|_| {
+        record_avatar_hidden(&request_id, "invalid_principal_id");
+        HttpError::not_found(request_id.clone())
+    })?;
     if !valid_revision(path.avatar_revision.as_str()) {
+        record_avatar_hidden(&request_id, "invalid_revision");
         return Err(HttpError::not_found(request_id));
     }
 
@@ -110,6 +113,11 @@ fn avatar_response(
             request_id,
         )?;
     }
+    tracing::debug!(
+        event = "avatar_http_response",
+        outcome = if not_modified { "304" } else { "200" },
+        request_id = request_id.as_str(),
+    );
     Ok(response)
 }
 
@@ -168,7 +176,27 @@ fn map_avatar_error(error: MemberServiceError, request_id: RequestId) -> HttpErr
         | MemberServiceError::InvalidTarget
         | MemberServiceError::Conflict(_) => HttpErrorKind::NotFound,
     };
+    match &kind {
+        HttpErrorKind::Forbidden | HttpErrorKind::NotFound => {
+            record_avatar_hidden(&request_id, "not_disclosed")
+        }
+        _ => tracing::debug!(
+            event = "avatar_http_response",
+            outcome = "failed",
+            request_id = request_id.as_str(),
+            reason_code = "unavailable",
+        ),
+    }
     HttpError::new(kind, request_id)
+}
+
+fn record_avatar_hidden(request_id: &RequestId, reason_code: &'static str) {
+    tracing::debug!(
+        event = "avatar_http_response",
+        outcome = "hidden",
+        request_id = request_id.as_str(),
+        reason_code,
+    );
 }
 
 #[cfg(test)]
@@ -179,7 +207,7 @@ mod tests {
     use super::*;
 
     fn request_id() -> RequestId {
-        RequestId::new("R00000000000000000061").unwrap()
+        RequestId::new("R00000000000000000001").unwrap()
     }
 
     fn snapshot() -> MemberAvatarSnapshot {

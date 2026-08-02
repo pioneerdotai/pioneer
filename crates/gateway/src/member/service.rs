@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Error};
 use pioneer_crud::CrudStore;
+use pioneer_artifacts::mime::detect_mime_from_bytes;
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokeReason, DeviceId, GatewayId, InvitationId,
     InvitationRevokeReason, MemberListParams, MemberListResponse, MemberManagementErrorReason,
@@ -13,6 +14,7 @@ use pioneer_protocol::{
     WorkspaceMemberRemoveParams,
 };
 use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sha2::Digest as _;
 
 use crate::administrative_audit::AdministrativeAuditWriter;
 use crate::auth::AuthenticatedSessionPrincipal;
@@ -647,6 +649,17 @@ impl MemberService {
                     )));
                 }
             };
+            let actual_content_hash: [u8; 32] = sha2::Sha256::digest(&avatar.content).into();
+            if avatar.content_hash.as_slice() != actual_content_hash {
+                return Err(MemberServiceError::Unavailable(Error::msg(
+                    "persisted principal avatar content hash is invalid",
+                )));
+            }
+            if detect_mime_from_bytes(avatar.content.as_slice(), None) != media_type.as_str() {
+                return Err(MemberServiceError::Unavailable(Error::msg(
+                    "persisted principal avatar media type does not match its content",
+                )));
+            }
             let revision = hex::encode(avatar.content_hash);
             if expected_revision.is_some_and(|expected| expected != revision) {
                 return Err(MemberServiceError::Authorization(missing_resource()));
@@ -1131,7 +1144,7 @@ mod tests {
         database: &sea_orm::DatabaseConnection,
         principal_id: &PrincipalId,
     ) -> String {
-        let content = vec![1, 2, 3, 4];
+        let content = b"\x89PNG\r\n\x1a\nfixture-avatar".to_vec();
         let content_hash: [u8; 32] = Sha256::digest(content.as_slice()).into();
         let transaction = database.begin().await.unwrap();
         pioneer_crud::insert_principal_avatar(
@@ -1337,7 +1350,7 @@ mod tests {
             Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
         );
         let target = PrincipalId::new(MEMBER_B_ID).unwrap();
-        let content = vec![1, 2, 3, 4];
+        let content = b"\x89PNG\r\n\x1a\nfixture-avatar".to_vec();
         let content_hash: [u8; 32] = Sha256::digest(content.as_slice()).into();
         let transaction = harness.database.begin().await.unwrap();
         pioneer_crud::insert_principal_avatar(
@@ -1370,6 +1383,36 @@ mod tests {
                 .avatar_snapshot(&viewer, &target, Some("0".repeat(64).as_str()))
                 .await,
             Err(MemberServiceError::Authorization(_))
+        ));
+
+        harness
+            .database
+            .execute_unprepared(
+                "UPDATE principal_avatar SET media_type='image/jpeg' \
+                 WHERE principal_id='P0000000000000000000B'",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .avatar_snapshot(&viewer, &target, Some(revision.as_str()))
+                .await,
+            Err(MemberServiceError::Unavailable(_))
+        ));
+
+        harness
+            .database
+            .execute_unprepared(
+                "UPDATE principal_avatar SET media_type='image/png', content_hash=zeroblob(32) \
+                 WHERE principal_id='P0000000000000000000B'",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .avatar_snapshot(&viewer, &target, Some("0".repeat(64).as_str()))
+                .await,
+            Err(MemberServiceError::Unavailable(_))
         ));
 
         harness

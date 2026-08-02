@@ -1,7 +1,7 @@
 //! Artifact preview state, authenticated HTTP projection reads, and cache helpers.
 
 use crate::artifacts::actions::{ArtifactVersionKey, artifact_version_key};
-use crate::artifacts::http_download::encode_path_segment;
+use crate::artifacts::http_download::valid_storage_path_segment;
 use crate::transport::http::{
     GatewayHttpError, GatewayHttpRequest, GatewayHttpResponse, GatewayHttpSession,
 };
@@ -88,7 +88,7 @@ impl ArtifactHttpPreviewService {
             ("artifact_id", artifact.artifact_id.as_str()),
             ("version_id", version_id),
         ] {
-            if value.trim().is_empty() || value.len() > 512 || value.contains('\0') {
+            if !valid_storage_path_segment(value) {
                 bail!("invalid {field} for artifact thumbnail");
             }
         }
@@ -106,9 +106,9 @@ impl ArtifactHttpPreviewService {
             .ok_or_else(|| anyhow::anyhow!("artifact thumbnail sha256 is invalid"))?;
         let path = format!(
             "storage/workspaces/{}/artifacts/{}/versions/{}/projections/thumbnail",
-            encode_path_segment(workspace_id),
-            encode_path_segment(artifact.artifact_id.as_str()),
-            encode_path_segment(version_id),
+            workspace_id,
+            artifact.artifact_id,
+            version_id,
         );
         let mut response = self
             .http
@@ -595,7 +595,7 @@ mod tests {
     async fn artifact_preview_fetches_exact_authenticated_http_projection() {
         let bytes = b"preview bytes".to_vec();
         let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
-        let mut artifact = preview_artifact("art/preview");
+        let mut artifact = preview_artifact("art-preview");
         let preview = artifact.preview.as_mut().expect("preview");
         preview.size_bytes = Some(bytes.len() as u64);
         preview.sha256 = Some(sha256.clone());
@@ -617,7 +617,7 @@ mod tests {
         let service = ArtifactHttpPreviewService::with_http(http.clone());
 
         let result = service
-            .fetch_thumbnail("ws preview", &artifact, CancellationToken::new())
+            .fetch_thumbnail("ws-preview", &artifact, CancellationToken::new())
             .await
             .expect("HTTP preview");
 
@@ -627,7 +627,7 @@ mod tests {
             http.requests(),
             vec![(
                 GatewayHttpMethod::Get,
-                "storage/workspaces/ws%20preview/artifacts/art%2Fpreview/versions/v1/projections/thumbnail"
+                "storage/workspaces/ws-preview/artifacts/art-preview/versions/v1/projections/thumbnail"
                     .to_owned(),
             )]
         );

@@ -11,7 +11,6 @@ use pioneer_client::{
     artifacts::preview::{
         ArtifactHttpPreviewService, ArtifactPreviewReadData,
     },
-    avatars::{AvatarCacheError, AvatarCacheRequest, AvatarCacheResult, AvatarCacheService},
     gateway::endpoint::GatewayBaseUrl,
     transport::{
         http::{
@@ -35,8 +34,6 @@ pub(crate) struct DesktopGatewayHttpClient {
     session: GatewayHttpSession,
     downloads: ArtifactHttpDownloadService,
     previews: ArtifactHttpPreviewService,
-    #[allow(dead_code)]
-    avatars: AvatarCacheService,
     runtime: Arc<Runtime>,
 }
 
@@ -77,11 +74,6 @@ impl DesktopGatewayHttpClient {
         )?;
         let downloads = ArtifactHttpDownloadService::new(session.clone(), runtime_home.clone());
         let previews = ArtifactHttpPreviewService::new(session.clone());
-        let avatars = AvatarCacheService::new(
-            session.clone(),
-            runtime_home,
-            access.gateway_id.clone(),
-        );
         let runtime = Runtime::new().map_err(|_| GatewayHttpError::ServiceUnavailable)?;
         Ok(Self {
             endpoint_id: endpoint.id.clone(),
@@ -90,7 +82,6 @@ impl DesktopGatewayHttpClient {
             session,
             downloads,
             previews,
-            avatars,
             runtime: Arc::new(runtime),
         })
     }
@@ -136,15 +127,6 @@ impl DesktopGatewayHttpClient {
             cancellation,
         ))
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn resolve_member_avatar(
-        &self,
-        request: AvatarCacheRequest,
-        cancellation: CancellationToken,
-    ) -> Result<AvatarCacheResult, AvatarCacheError> {
-        self.runtime.block_on(self.avatars.resolve(request, cancellation))
-    }
 }
 
 struct DesktopGatewayHttpAuthority {
@@ -178,13 +160,17 @@ impl GatewayHttpSessionAuthority for DesktopGatewayHttpAuthority {
             let mut runtime = GatewayRuntime::load()
                 .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?;
             match runtime
-                .replace_gateway_session_access(endpoint_id.as_str(), &sender)
+                .replace_gateway_session_access_after_rejection(
+                    endpoint_id.as_str(),
+                    &sender,
+                    rejected_generation,
+                )
                 .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?
             {
-                DesktopSessionConnectionOutcome::Connected { .. } => {
+                None | Some(DesktopSessionConnectionOutcome::Connected { .. }) => {
                     sender.current_gateway_http_access()
                 }
-                DesktopSessionConnectionOutcome::Terminal(terminal) => {
+                Some(DesktopSessionConnectionOutcome::Terminal(terminal)) => {
                     Err(GatewayHttpAuthorityError::Terminal(terminal.reason))
                 }
             }

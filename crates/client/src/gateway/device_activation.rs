@@ -18,7 +18,7 @@ pub struct DeviceActivationQrPresentation {
     pub device_id: DeviceId,
     pub session_id: AuthSessionId,
     pub gateway_id: GatewayId,
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub expires_at_unix: u64,
     manual_code: AuthSecretString,
     deep_link: AuthSecretString,
@@ -31,9 +31,8 @@ impl DeviceActivationQrPresentation {
         gateway_base_url: &GatewayBaseUrl,
         created: AuthDeviceCreateResponse,
     ) -> Result<Self> {
-        let protected_endpoint = gateway_base_url.websocket_url().to_string();
         let presentation = AuthDeviceActivationPresentation::new(
-            protected_endpoint.clone(),
+            gateway_base_url.clone(),
             created.gateway_id.clone(),
             created.activation_code.expose_secret(),
         )
@@ -52,7 +51,7 @@ impl DeviceActivationQrPresentation {
             device_id: created.device_id,
             session_id: created.session_id,
             gateway_id: created.gateway_id,
-            protected_endpoint,
+            gateway_base_url: gateway_base_url.clone(),
             expires_at_unix: created.expires_at_unix,
             manual_code: created.activation_code,
             deep_link: AuthSecretString::new(deep_link),
@@ -85,7 +84,7 @@ impl std::fmt::Debug for DeviceActivationQrPresentation {
             .field("device_id", &self.device_id)
             .field("session_id", &self.session_id)
             .field("gateway_id", &self.gateway_id)
-            .field("protected_endpoint", &self.protected_endpoint)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("expires_at_unix", &self.expires_at_unix)
             .field("manual_code", &"[redacted]")
             .field("deep_link", &"[redacted]")
@@ -117,8 +116,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            presentation.protected_endpoint,
-            "ws://91.224.86.172:17878/"
+            presentation.gateway_base_url.as_str(),
+            "http://91.224.86.172:17878/"
         );
         let parsed = AuthDeviceActivationPresentation::parse(presentation.deep_link()).unwrap();
         assert_eq!(parsed.gateway_id, presentation.gateway_id);

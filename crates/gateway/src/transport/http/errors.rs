@@ -17,6 +17,7 @@ pub(crate) enum HttpErrorKind {
     Forbidden,
     NotFound,
     BadRequest,
+    Conflict,
     RangeNotSatisfiable { complete_length: u64 },
     TooManyRequests { retry_after_seconds: u64 },
     ServiceUnavailable { retry_after_seconds: Option<u64> },
@@ -30,6 +31,7 @@ impl HttpErrorKind {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::Conflict => StatusCode::CONFLICT,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -43,6 +45,7 @@ impl HttpErrorKind {
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::BadRequest => "bad_request",
+            Self::Conflict => "conflict",
             Self::RangeNotSatisfiable { .. } => "range_not_satisfiable",
             Self::TooManyRequests { .. } => "too_many_requests",
             Self::ServiceUnavailable { .. } => "service_unavailable",
@@ -96,7 +99,6 @@ impl HttpError {
     pub(crate) const fn kind(&self) -> HttpErrorKind {
         self.kind
     }
-
 }
 
 #[derive(Serialize)]
@@ -176,6 +178,7 @@ mod tests {
             (HttpErrorKind::Forbidden, StatusCode::FORBIDDEN, "forbidden"),
             (HttpErrorKind::NotFound, StatusCode::NOT_FOUND, "not_found"),
             (HttpErrorKind::BadRequest, StatusCode::BAD_REQUEST, "bad_request"),
+            (HttpErrorKind::Conflict, StatusCode::CONFLICT, "conflict"),
             (
                 HttpErrorKind::RangeNotSatisfiable {
                     complete_length: 41,

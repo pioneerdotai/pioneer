@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
@@ -10,21 +10,24 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
-use pioneer_artifacts::ArtifactError;
+use pioneer_artifacts::{ArtifactContentKind, ArtifactContentSnapshot, ArtifactError};
 use pioneer_protocol::{ArtifactProjectionKind, RequestId};
 use serde::Deserialize;
-use tokio::io::{AsyncRead, ReadBuf};
-use tokio_util::io::ReaderStream;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::authorization::{AuthorizationExternalError, external_error_for_decision};
 
-use super::artifacts::{ArtifactHttpService, ArtifactHttpServiceError, AuthorizedArtifactContent};
+use crate::artifact_delivery::{
+    ArtifactDeliveryError, ArtifactDeliveryService, AuthorizedArtifactContent,
+};
 use super::auth::authenticate_native_storage_request;
 use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 use super::streams::{ManagedArtifactReader, StreamAdmissionError};
-use super::view_grants::{ViewGrantDisposition, ViewGrantLease};
+use crate::view_grants::{ViewGrantDisposition, ViewGrantLease};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
@@ -189,7 +192,7 @@ async fn artifact_route(
         .request_id()
         .cloned()
         .expect("native HTTP authentication always assigns a request ID");
-    let service = ArtifactHttpService::new(state.message_processor.clone());
+    let service = ArtifactDeliveryService::new(state.message_processor.clone());
     let request_span = context.request_span();
     let projection_kind = match &target {
         ContentRouteTarget::Original => None,
@@ -241,7 +244,7 @@ async fn artifact_route(
 
 pub(super) async fn serve_authorized_content(
     state: &GatewayHttpState,
-    service: &ArtifactHttpService,
+    service: &ArtifactDeliveryService,
     context: &crate::request_context::AuthenticatedRequestContext,
     content: AuthorizedArtifactContent,
     method: Method,
@@ -254,20 +257,37 @@ pub(super) async fn serve_authorized_content(
         .cloned()
         .expect("authenticated content context always assigns a request ID");
     let etag = strong_content_etag(content.snapshot().sha256());
-    let selection = select_response(&headers, content.snapshot().size_bytes(), etag.as_str())
-        .map_err(|rejection| map_range_rejection(rejection, content.snapshot().size_bytes(), request_id.clone()))?;
+    let selection = match select_response(
+        &headers,
+        content.snapshot().size_bytes(),
+        etag.as_str(),
+    ) {
+        Ok(selection) => selection,
+        Err(rejection) => {
+            record_artifact_http_rejection(context, content.snapshot(), rejection);
+            return Err(map_range_rejection(
+                rejection,
+                content.snapshot().size_bytes(),
+                request_id,
+            ));
+        }
+    };
     let send_body = method == Method::GET;
 
-    match selection {
+    let (response, cache_outcome, range_kind) = match selection {
         ResponseSelection::NotModified => {
-            representation_response(
-                &content,
-                &request_id,
-                &etag,
-                StatusCode::NOT_MODIFIED,
-                None,
-                Body::empty(),
-                policy,
+            (
+                representation_response(
+                    &content,
+                    &request_id,
+                    &etag,
+                    StatusCode::NOT_MODIFIED,
+                    None,
+                    Body::empty(),
+                    policy,
+                ),
+                "304",
+                "none",
             )
         }
         ResponseSelection::Full => {
@@ -287,14 +307,18 @@ pub(super) async fn serve_authorized_content(
             } else {
                 Body::empty()
             };
-            representation_response(
-                &content,
-                &request_id,
-                &etag,
-                StatusCode::OK,
-                Some((size, None)),
-                body,
-                policy,
+            (
+                representation_response(
+                    &content,
+                    &request_id,
+                    &etag,
+                    StatusCode::OK,
+                    Some((size, None)),
+                    body,
+                    policy,
+                ),
+                "200",
+                "full",
             )
         }
         ResponseSelection::Partial(range) => {
@@ -318,16 +342,99 @@ pub(super) async fn serve_authorized_content(
             } else {
                 Body::empty()
             };
-            representation_response(
-                &content,
-                &request_id,
-                &etag,
-                StatusCode::PARTIAL_CONTENT,
-                Some((length, Some(range))),
-                body,
-                policy,
+            (
+                representation_response(
+                    &content,
+                    &request_id,
+                    &etag,
+                    StatusCode::PARTIAL_CONTENT,
+                    Some((length, Some(range))),
+                    body,
+                    policy,
+                ),
+                "206",
+                "single",
             )
         }
+    };
+    let response = response?;
+    record_artifact_http_response(
+        context,
+        content.snapshot(),
+        cache_outcome,
+        range_kind,
+    );
+    Ok(response)
+}
+
+fn record_artifact_http_response(
+    context: &crate::request_context::AuthenticatedRequestContext,
+    snapshot: &ArtifactContentSnapshot,
+    cache_outcome: &'static str,
+    range_kind: &'static str,
+) {
+    tracing::debug!(
+        event = "artifact_http_response",
+        outcome = "served",
+        request_id = context.request_id().map(RequestId::as_str).unwrap_or("unavailable"),
+        gateway_id = %context.principal().gateway_id,
+        principal_id = %context.principal().principal_id,
+        auth_session_id = %context.principal().session_id,
+        workspace_id = snapshot.workspace_id(),
+        artifact_id = snapshot.artifact_id(),
+        version_id = snapshot.artifact_version_id(),
+        projection_kind = projection_kind(snapshot),
+        range_kind,
+        cache_outcome,
+    );
+}
+
+fn record_artifact_http_rejection(
+    context: &crate::request_context::AuthenticatedRequestContext,
+    snapshot: &ArtifactContentSnapshot,
+    rejection: RangeRejection,
+) {
+    let (cache_outcome, reason_code) = match rejection {
+        RangeRejection::Unsatisfiable => ("416", "range_unsatisfiable"),
+        RangeRejection::Malformed => ("400", "range_malformed"),
+        RangeRejection::Multiple => ("400", "multiple_ranges_unsupported"),
+    };
+    tracing::debug!(
+        event = "artifact_http_response",
+        outcome = "rejected",
+        request_id = context.request_id().map(RequestId::as_str).unwrap_or("unavailable"),
+        gateway_id = %context.principal().gateway_id,
+        principal_id = %context.principal().principal_id,
+        auth_session_id = %context.principal().session_id,
+        workspace_id = snapshot.workspace_id(),
+        artifact_id = snapshot.artifact_id(),
+        version_id = snapshot.artifact_version_id(),
+        projection_kind = projection_kind(snapshot),
+        range_kind = "rejected",
+        cache_outcome,
+        reason_code,
+    );
+}
+
+fn projection_kind(snapshot: &ArtifactContentSnapshot) -> &'static str {
+    match snapshot.content_kind() {
+        ArtifactContentKind::Original { .. } => "original",
+        ArtifactContentKind::Projection {
+            projection_kind: ArtifactProjectionKind::PlainText,
+            ..
+        } => "plain_text",
+        ArtifactContentKind::Projection {
+            projection_kind: ArtifactProjectionKind::Thumbnail,
+            ..
+        } => "thumbnail",
+        ArtifactContentKind::Projection {
+            projection_kind: ArtifactProjectionKind::JsonSummary,
+            ..
+        } => "json_summary",
+        ArtifactContentKind::Projection {
+            projection_kind: ArtifactProjectionKind::PdfText,
+            ..
+        } => "pdf_text",
     }
 }
 
@@ -346,7 +453,7 @@ fn parse_projection_kind(
 
 async fn open_stream_body(
     state: &GatewayHttpState,
-    service: &ArtifactHttpService,
+    service: &ArtifactDeliveryService,
     context: &crate::request_context::AuthenticatedRequestContext,
     content: &AuthorizedArtifactContent,
     offset: u64,
@@ -365,30 +472,57 @@ async fn open_stream_body(
         .map_err(|error| map_stream_admission(error, request_id.clone()))?;
     let reader = tokio::time::timeout(
         state.http_streams.limits().open_timeout(),
-        service
-            .open_range(content, offset, length)
-            .instrument(context.request_span()),
+        async {
+            service
+                .reauthorize_registered_stream(context, content)
+                .await?;
+            service.open_range(content, offset, length).await
+        }
+        .instrument(context.request_span()),
     )
     .await
     .map_err(|_| HttpError::service_unavailable(request_id.clone()))?
     .map_err(|error| map_content_error(error, request_id))?;
-    Ok(stream_body(ViewGrantBoundReader {
-        reader: ManagedArtifactReader::new(
-            reader,
-            length,
-            lease,
-            state.http_streams.limits().body_idle_timeout(),
-        ),
-        view_grant_lease,
-    }))
+    let body_idle_timeout = state.http_streams.limits().body_idle_timeout();
+    Ok(stream_body(
+        ViewGrantBoundReader {
+            reader: ManagedArtifactReader::new(reader, length, lease, body_idle_timeout),
+            view_grant_lease,
+        },
+        body_idle_timeout,
+    ))
 }
 
-struct ViewGrantBoundReader {
-    reader: ManagedArtifactReader<pioneer_artifacts::ArtifactContentReader>,
+struct ViewGrantBoundReader<R> {
+    reader: ManagedArtifactReader<R>,
     view_grant_lease: Option<ViewGrantLease>,
 }
 
-impl AsyncRead for ViewGrantBoundReader {
+impl<R> ViewGrantBoundReader<R> {
+    fn stream_cancellation_token(&self) -> CancellationToken {
+        self.reader.cancellation_token()
+    }
+
+    fn view_grant_cancellation_token(&self) -> CancellationToken {
+        self.view_grant_lease
+            .as_ref()
+            .map(ViewGrantLease::cancellation_token)
+            .unwrap_or_else(CancellationToken::new)
+    }
+
+    fn mark_cancelled(&mut self) {
+        self.reader.mark_cancelled();
+    }
+
+    fn mark_idle_timeout(&mut self) {
+        self.reader.mark_idle_timeout();
+    }
+}
+
+impl<R> AsyncRead for ViewGrantBoundReader<R>
+where
+    R: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -398,6 +532,7 @@ impl AsyncRead for ViewGrantBoundReader {
         if let Some(lease) = this.view_grant_lease.as_mut()
             && lease.poll_invalidated(context).is_ready()
         {
+            this.reader.mark_cancelled();
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "view grant invalidated",
@@ -407,13 +542,106 @@ impl AsyncRead for ViewGrantBoundReader {
     }
 }
 
-fn stream_body(reader: ViewGrantBoundReader) -> Body {
-    // ReaderStream owns the exact-length reader. Dropping the response body on
-    // disconnect drops the stream and its storage handle immediately.
-    Body::from_stream(ReaderStream::with_capacity(reader, STREAM_CHUNK_BYTES))
+fn stream_body<R>(
+    mut reader: ViewGrantBoundReader<R>,
+    body_idle_timeout: std::time::Duration,
+) -> Body
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    // Hyper can stop polling a body when downstream flow-control is exhausted.
+    // A one-slot producer keeps memory bounded and makes that lack of progress
+    // observable, so slow consumers cannot retain storage handles indefinitely.
+    let stream_cancellation = reader.stream_cancellation_token();
+    let view_grant_cancellation = reader.view_grant_cancellation_token();
+    let producer_stream_cancellation = stream_cancellation.clone();
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let producer = tokio::spawn(async move {
+        loop {
+            let mut chunk = vec![0_u8; STREAM_CHUNK_BYTES];
+            let read = reader.read(&mut chunk).await;
+            let bytes_read = match read {
+                Ok(0) => break,
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    let _ = tokio::time::timeout(body_idle_timeout, sender.send(Err(error))).await;
+                    break;
+                }
+            };
+            chunk.truncate(bytes_read);
+            let send = sender.send(Ok(Bytes::from(chunk)));
+            let send_result = tokio::select! {
+                _ = producer_stream_cancellation.cancelled() => {
+                    reader.mark_cancelled();
+                    break;
+                }
+                _ = view_grant_cancellation.cancelled() => {
+                    reader.mark_cancelled();
+                    break;
+                }
+                result = tokio::time::timeout(body_idle_timeout, send) => result,
+            };
+            match send_result {
+                Ok(Ok(())) => {}
+                Ok(Err(_receiver_closed)) => {
+                    reader.mark_cancelled();
+                    break;
+                }
+                Err(_elapsed) => {
+                    reader.mark_idle_timeout();
+                    break;
+                }
+            }
+        }
+    });
+    let stream = futures_util::stream::unfold(
+        StreamBodyState {
+            receiver,
+            producer,
+            cancellation: stream_cancellation,
+        },
+        |mut state| async move {
+            state
+                .receiver
+                .recv()
+                .await
+                .map(|item| (item, state))
+        },
+    );
+    Body::from_stream(stream)
+}
+
+struct StreamBodyState {
+    receiver: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    producer: tokio::task::JoinHandle<()>,
+    cancellation: CancellationToken,
+}
+
+impl Drop for StreamBodyState {
+    fn drop(&mut self) {
+        // The response body owns the producer. A disconnected downstream must
+        // release its reader, stream permits and optional view-grant lease
+        // immediately rather than leave an unowned task behind.
+        self.cancellation.cancel();
+        self.producer.abort();
+    }
 }
 
 fn map_stream_admission(error: StreamAdmissionError, request_id: RequestId) -> HttpError {
+    let reason_code = match error {
+        StreamAdmissionError::GlobalCapacity => "global_capacity",
+        StreamAdmissionError::PrincipalCapacity => "principal_capacity",
+        StreamAdmissionError::SessionCapacity => "session_capacity",
+        StreamAdmissionError::RangeTooLarge => "range_too_large",
+        StreamAdmissionError::TinyRangeRate => "tiny_range_rate",
+        StreamAdmissionError::ShuttingDown => "shutting_down",
+    };
+    tracing::debug!(
+        event = "artifact_stream_admission",
+        outcome = "rejected",
+        request_id = request_id.as_str(),
+        reason_code,
+    );
     match error {
         StreamAdmissionError::GlobalCapacity => HttpError::new(
             HttpErrorKind::ServiceUnavailable {
@@ -421,7 +649,9 @@ fn map_stream_admission(error: StreamAdmissionError, request_id: RequestId) -> H
             },
             request_id,
         ),
-        StreamAdmissionError::SessionCapacity
+        StreamAdmissionError::ShuttingDown => HttpError::service_unavailable(request_id),
+        StreamAdmissionError::PrincipalCapacity
+        | StreamAdmissionError::SessionCapacity
         | StreamAdmissionError::RangeTooLarge
         | StreamAdmissionError::TinyRangeRate => HttpError::new(
             HttpErrorKind::TooManyRequests {
@@ -721,15 +951,16 @@ fn map_range_rejection(
     }
 }
 
-fn map_content_error(error: ArtifactHttpServiceError, request_id: RequestId) -> HttpError {
+fn map_content_error(error: ArtifactDeliveryError, request_id: RequestId) -> HttpError {
     let kind = match error {
-        ArtifactHttpServiceError::Denied(decision) => external_error_for_decision(&decision)
+        ArtifactDeliveryError::Denied(decision) => external_error_for_decision(&decision)
             .map(http_kind_for_authorization_error)
             .unwrap_or(HttpErrorKind::Internal),
-        ArtifactHttpServiceError::AuthorizationUnavailable => HttpErrorKind::ServiceUnavailable {
+        ArtifactDeliveryError::AuthorizationUnavailable => HttpErrorKind::ServiceUnavailable {
             retry_after_seconds: None,
         },
-        ArtifactHttpServiceError::Content(error) => http_kind_for_artifact_error(&error),
+        ArtifactDeliveryError::RepresentationChanged => HttpErrorKind::Conflict,
+        ArtifactDeliveryError::Content(error) => http_kind_for_artifact_error(&error),
     };
     HttpError::new(kind, request_id)
 }
@@ -773,8 +1004,12 @@ fn http_kind_for_artifact_error(error: &ArtifactError) -> HttpErrorKind {
 #[cfg(test)]
 mod tests {
     use axum::http::header::{IF_NONE_MATCH, IF_RANGE, RANGE};
+    use pioneer_config::GatewayArtifactsConfig;
+    use pioneer_protocol::AuthSessionId;
+    use tokio::io::AsyncReadExt;
 
     use super::*;
+    use crate::transport::http::streams::HttpStreamRegistry;
 
     const ETAG: &str = "\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
 
@@ -860,6 +1095,15 @@ mod tests {
     }
 
     #[test]
+    fn representation_change_is_a_typed_version_conflict() {
+        let error = map_content_error(
+            ArtifactDeliveryError::RepresentationChanged,
+            RequestId::new("R00000000000000000001").unwrap(),
+        );
+        assert_eq!(error.kind(), HttpErrorKind::Conflict);
+    }
+
+    #[test]
     fn etag_is_strong_and_derived_only_from_the_immutable_digest() {
         let sha = "a".repeat(64);
         assert_eq!(strong_content_etag(&sha), format!("\"sha256-{sha}\""));
@@ -868,7 +1112,7 @@ mod tests {
 
     #[test]
     fn projection_kinds_are_exact_and_typed() {
-        let request_id = RequestId::new("R00000000000000000061").unwrap();
+        let request_id = RequestId::new("R00000000000000000001").unwrap();
         assert_eq!(
             parse_projection_kind("plain_text", request_id.clone()).unwrap(),
             ArtifactProjectionKind::PlainText
@@ -949,5 +1193,75 @@ mod tests {
 
         let attachment = ContentResponsePolicy::view(ViewGrantDisposition::Attachment);
         assert_eq!(attachment.disposition, Some(Disposition::Attachment));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_backpressure_releases_stream_after_idle_timeout() {
+        let mut config = GatewayArtifactsConfig::default();
+        config.http_streams_global = 2;
+        config.http_streams_per_principal = 2;
+        config.http_streams_per_session = 1;
+        config.http_open_handles = 2;
+        config.http_max_single_range_bytes = (STREAM_CHUNK_BYTES * 4) as u64;
+        config.http_tiny_range_bytes = 1;
+        config.http_tiny_range_window_secs = 1;
+        config.http_tiny_range_max_requests = 2;
+        config.http_open_timeout_secs = 1;
+        config.http_body_idle_timeout_secs = 1;
+        let registry = HttpStreamRegistry::new(&config).unwrap();
+        let session = AuthSessionId::new("S00000000000000000001").unwrap();
+        let lease = registry
+            .acquire(&session, "principal-a", "workspace-a", "artifact-a")
+            .unwrap();
+        let length = (STREAM_CHUNK_BYTES * 3) as u64;
+        let reader = tokio::io::repeat(0x61).take(length);
+        let body = stream_body(
+            ViewGrantBoundReader {
+                reader: ManagedArtifactReader::new(
+                    reader,
+                    length,
+                    lease,
+                    std::time::Duration::from_secs(1),
+                ),
+                view_grant_lease: None,
+            },
+            std::time::Duration::from_millis(20),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.metrics_observation().2, 1);
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn dropped_body_aborts_its_producer_and_releases_stream() {
+        let registry = HttpStreamRegistry::new(&GatewayArtifactsConfig::default()).unwrap();
+        let session = AuthSessionId::new("S00000000000000000001").unwrap();
+        let lease = registry
+            .acquire(&session, "principal-a", "workspace-a", "artifact-a")
+            .unwrap();
+        let body = stream_body(
+            ViewGrantBoundReader {
+                reader: ManagedArtifactReader::new(
+                    tokio::io::repeat(0x61),
+                    u64::MAX,
+                    lease,
+                    std::time::Duration::from_secs(30),
+                ),
+                view_grant_lease: None,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(registry.active_count(), 1);
+
+        drop(body);
+        tokio::task::yield_now().await;
+
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.metrics_observation().1, 1);
     }
 }

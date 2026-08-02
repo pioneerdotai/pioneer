@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::{
-    AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, RoleKey, TokenFamilyId,
+    AuthSessionId, DeviceId, GatewayBaseUrl, GatewayId, PrincipalId, PrincipalKind, RoleKey,
+    TokenFamilyId,
 };
 
 pub const REFRESH_CREDENTIAL_PREFIX: &str = "prf2_";
@@ -13,7 +14,6 @@ pub const DEVICE_ACTIVATION_CODE_SYMBOLS: usize = 8;
 pub const DEVICE_ACTIVATION_LOCATOR_SYMBOLS: usize = 1;
 pub const DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const DEVICE_ACTIVATION_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-pub const MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES: usize = 2_048;
 pub const MAX_PROTECTED_GATEWAY_URI_BYTES: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -281,24 +281,22 @@ pub struct AuthDeviceActivateParams {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthDeviceActivationPresentation {
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub gateway_id: GatewayId,
     activation_code: AuthSecretString,
 }
 
 impl AuthDeviceActivationPresentation {
     pub fn new(
-        protected_endpoint: impl Into<String>,
+        gateway_base_url: GatewayBaseUrl,
         gateway_id: GatewayId,
         activation_code: impl Into<String>,
     ) -> Result<Self, String> {
-        let protected_endpoint =
-            normalize_protected_gateway_endpoint(protected_endpoint.into().as_str())?;
         let activation_code = AuthSecretString::new(format_device_activation_code(
             activation_code.into().as_str(),
         )?);
         Ok(Self {
-            protected_endpoint,
+            gateway_base_url,
             gateway_id,
             activation_code,
         })
@@ -312,7 +310,7 @@ impl AuthDeviceActivationPresentation {
         let mut uri =
             url::Url::parse("pioneer://activate").expect("static activation URI is valid");
         uri.query_pairs_mut()
-            .append_pair("gateway", self.protected_endpoint.as_str())
+            .append_pair("gateway_base_url", self.gateway_base_url.as_str())
             .append_pair("gateway_id", self.gateway_id.as_str());
         let fragment = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", self.activation_code.expose_secret())
@@ -336,12 +334,18 @@ impl AuthDeviceActivationPresentation {
         {
             return Err("invalid device activation URI target".to_owned());
         }
-        let mut endpoint = None;
+        let mut gateway_base_url = None;
         let mut gateway_id = None;
         for (key, value) in parsed.query_pairs() {
             match key.as_ref() {
-                "gateway" if endpoint.is_none() => endpoint = Some(value.into_owned()),
-                "gateway" => {
+                "gateway_base_url" if gateway_base_url.is_none() => {
+                    gateway_base_url = Some(
+                        GatewayBaseUrl::parse_presentation(value.as_ref()).map_err(|_| {
+                            "device activation URI has an invalid Gateway base URL"
+                        })?,
+                    );
+                }
+                "gateway_base_url" => {
                     return Err("device activation URI contains duplicate fields".to_owned());
                 }
                 "gateway_id" if gateway_id.is_none() => {
@@ -380,7 +384,8 @@ impl AuthDeviceActivationPresentation {
             }
         }
         Self::new(
-            endpoint.ok_or_else(|| "device activation URI has no Gateway endpoint".to_owned())?,
+            gateway_base_url
+                .ok_or_else(|| "device activation URI has no Gateway base URL".to_owned())?,
             gateway_id.ok_or_else(|| "device activation URI has no Gateway id".to_owned())?,
             code.ok_or_else(|| "device activation URI has no code fragment".to_owned())?,
         )
@@ -459,43 +464,11 @@ pub fn encode_device_activation_entropy(entropy: [u8; 5]) -> String {
     encoded
 }
 
-pub fn normalize_protected_gateway_endpoint(endpoint: &str) -> Result<String, String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() || endpoint.len() > MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES {
-        return Err("invalid Gateway endpoint length".to_owned());
-    }
-    let endpoint = if endpoint.contains("://") {
-        endpoint.to_owned()
-    } else {
-        format!("ws://{endpoint}")
-    };
-    if endpoint.len() > MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES {
-        return Err("invalid Gateway endpoint length".to_owned());
-    }
-    let (_, authority_and_path) = endpoint
-        .split_once("://")
-        .ok_or_else(|| "invalid Gateway endpoint".to_owned())?;
-    if authority_and_path.is_empty() || authority_and_path.starts_with('/') {
-        return Err("Gateway endpoint must contain an explicit authority".to_owned());
-    }
-    let parsed = url::Url::parse(&endpoint).map_err(|_| "invalid Gateway endpoint".to_owned())?;
-    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
-        return Err("Gateway endpoint must not contain credentials or a fragment".to_owned());
-    }
-    parsed
-        .host_str()
-        .ok_or_else(|| "Gateway endpoint must contain a host".to_owned())?;
-    match parsed.scheme() {
-        "ws" | "wss" => Ok(endpoint),
-        _ => Err("Gateway endpoint must use ws or wss".to_owned()),
-    }
-}
-
 impl std::fmt::Debug for AuthDeviceActivationPresentation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AuthDeviceActivationPresentation")
-            .field("protected_endpoint", &self.protected_endpoint)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("gateway_id", &self.gateway_id)
             .field("activation_code", &"[redacted]")
             .finish()
@@ -596,7 +569,7 @@ mod tests {
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         let code = "K7M4-P9Q2";
         let presentation = AuthDeviceActivationPresentation::new(
-            "wss://gateway.example.test/ws?tenant=a",
+            GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer").unwrap(),
             gateway_id.clone(),
             code,
         )
@@ -622,25 +595,28 @@ mod tests {
         let code = "K7M4-P9Q2";
         for uri in [
             format!(
-                "pioneer://activate?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}&code={code}#code={code}"
+                "pioneer://activate?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}&code={code}#code={code}"
             ),
             format!(
-                "pioneer://activate?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway=wss%3A%2F%2Fother.example%2Fws&gateway_id={gateway_id}#code={code}"
+                "pioneer://activate?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_base_url=https%3A%2F%2Fother.example%2F&gateway_id={gateway_id}#code={code}"
             ),
             format!(
-                "pioneer://activate?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}#code={code}&code={code}"
+                "pioneer://activate?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}&code={code}"
             ),
             format!(
-                "pioneer://activate?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}#code={code}&extra=1"
+                "pioneer://activate?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}&extra=1"
             ),
             format!(
-                "pioneer://activate/unexpected?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}#code={code}"
+                "pioneer://activate/unexpected?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}"
             ),
             format!(
-                "pioneer://user@activate?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}#code={code}"
+                "pioneer://user@activate?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}"
             ),
             format!(
-                "pioneer://activate:1234?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id={gateway_id}#code={code}"
+                "pioneer://activate:1234?gateway_base_url=https%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}"
+            ),
+            format!(
+                "pioneer://activate?gateway=wss%3A%2F%2Fgateway.example%2F&gateway_id={gateway_id}#code={code}"
             ),
         ] {
             assert!(
@@ -650,34 +626,15 @@ mod tests {
         }
         assert!(
             AuthDeviceActivationPresentation::new(
-                "wss://user:password@gateway.example/ws",
-                gateway_id.clone(),
-                code,
-            )
-            .is_err()
-        );
-        assert!(
-            AuthDeviceActivationPresentation::new(
-                "wss://gateway.example/ws#secret",
-                gateway_id.clone(),
-                code,
-            )
-            .is_err()
-        );
-        assert!(
-            AuthDeviceActivationPresentation::new(
-                "wss://gateway.example/ws",
+                GatewayBaseUrl::parse_presentation("https://gateway.example").unwrap(),
                 gateway_id.clone(),
                 "K7M4-P9Q!",
             )
             .is_err()
         );
         assert!(
-            AuthDeviceActivationPresentation::new("wss:///ws", gateway_id.clone(), code,).is_err()
-        );
-        assert!(
             AuthDeviceActivationPresentation::new(
-                "wss://gateway.example/ws",
+                GatewayBaseUrl::parse_presentation("https://gateway.example").unwrap(),
                 gateway_id,
                 "K7M4-P9Q22",
             )
@@ -692,32 +649,25 @@ mod tests {
     }
 
     #[test]
-    fn activation_presentation_accepts_local_and_remote_plaintext() {
+    fn activation_presentation_accepts_canonical_local_remote_and_tls_bases() {
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         for endpoint in [
-            "ws://localhost:17878",
-            "ws://127.0.0.1:17878",
-            "ws://[::1]:17878",
-            "ws://91.224.86.172:17878",
-            "ws://gateway.example.test:17878",
+            "http://localhost:17878",
+            "http://127.0.0.1:17878",
+            "http://[::1]:17878",
+            "http://91.224.86.172:17878",
+            "https://gateway.example.test/pioneer",
         ] {
             assert!(
-                AuthDeviceActivationPresentation::new(endpoint, gateway_id.clone(), "K7M4-P9Q2",)
-                    .is_ok(),
+                AuthDeviceActivationPresentation::new(
+                    GatewayBaseUrl::parse_presentation(endpoint).unwrap(),
+                    gateway_id.clone(),
+                    "K7M4-P9Q2",
+                )
+                .is_ok(),
                 "{endpoint}"
             );
         }
-    }
-
-    #[test]
-    fn bare_endpoint_cannot_exceed_the_bound_after_ws_normalization() {
-        let prefix = "gateway.example.test/";
-        let endpoint = format!(
-            "{prefix}{}",
-            "a".repeat(MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES - prefix.len())
-        );
-        assert_eq!(endpoint.len(), MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES);
-        assert!(normalize_protected_gateway_endpoint(&endpoint).is_err());
     }
 
     #[test]

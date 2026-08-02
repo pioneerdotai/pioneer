@@ -1,10 +1,8 @@
 //! Deterministic, process-free Gateway contract fixtures.
 //!
-//! This module intentionally contains no production implementation. Later
-//! phases reuse these matrices and fixtures from unit tests while the real
-//! Router, transports and storage services remain owned by their phase.
-
-#![allow(dead_code)]
+//! This module intentionally contains no production implementation. The
+//! matrices and fixtures exercise the real Router, transports and storage
+//! services from deterministic unit tests.
 
 use std::{
     io::{Error, ErrorKind, SeekFrom},
@@ -27,8 +25,9 @@ use tower::ServiceExt;
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "Pioneer-Protocol-Version";
 pub(crate) const PROTOCOL_VERSION_V1: &str = "1";
-pub(crate) const TEST_VIEW_GRANT: &str =
-    "pvg1_test-only-opaque-grant-that-must-never-appear-in-snapshots";
+// A 256-bit URL-safe secret has 43 unpadded base64url characters. Keep the
+// redaction fixture shape-identical to a real grant without using a real one.
+pub(crate) const TEST_VIEW_GRANT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 pub(crate) const TEST_AUTHORIZATION: &str =
     "Bearer test_access_header.test_access_payload.test_access_signature";
 
@@ -432,15 +431,14 @@ impl DeterministicClock {
     }
 }
 
-pub(crate) const TEST_GATEWAY_ID: &str = "G00000000000000000061";
-pub(crate) const TEST_PRINCIPAL_ID: &str = "P00000000000000000061";
-pub(crate) const TEST_HIDDEN_PRINCIPAL_ID: &str = "P00000000000000000062";
-pub(crate) const TEST_SESSION_ID: &str = "S00000000000000000061";
-pub(crate) const TEST_REVOKED_SESSION_ID: &str = "S00000000000000000062";
-pub(crate) const TEST_WORKSPACE_ID: &str = "W00000000000000000061";
-pub(crate) const TEST_ARTIFACT_ID: &str = "A00000000000000000061";
-pub(crate) const TEST_HIDDEN_ARTIFACT_ID: &str = "A00000000000000000062";
-pub(crate) const TEST_VERSION_ID: &str = "V00000000000000000061";
+pub(crate) const TEST_GATEWAY_ID: &str = "G00000000000000000001";
+pub(crate) const TEST_PRINCIPAL_ID: &str = "P00000000000000000001";
+pub(crate) const TEST_SESSION_ID: &str = "S00000000000000000001";
+pub(crate) const TEST_REVOKED_SESSION_ID: &str = "S00000000000000000002";
+pub(crate) const TEST_WORKSPACE_ID: &str = "W00000000000000000001";
+pub(crate) const TEST_ARTIFACT_ID: &str = "A00000000000000000001";
+pub(crate) const TEST_HIDDEN_ARTIFACT_ID: &str = "A00000000000000000002";
+pub(crate) const TEST_VERSION_ID: &str = "V00000000000000000001";
 pub(crate) const TEST_ARTIFACT_SHA256: &str =
     "6161616161616161616161616161616161616161616161616161616161616161";
 
@@ -750,7 +748,12 @@ mod tests {
 
     #[test]
     fn matrices_cover_canonical_and_reserved_namespaces() {
+        assert_eq!(PROTOCOL_VERSION_HEADER, pioneer_protocol::PIONEER_PROTOCOL_VERSION_HEADER);
+        assert_eq!(PROTOCOL_VERSION_V1, pioneer_protocol::PIONEER_PROTOCOL_VERSION);
         assert_eq!(ROUTE_CONTRACTS.len(), 8);
+        assert!(ROUTE_CONTRACTS.iter().all(|route| {
+            !route.methods.is_empty() && route.path.starts_with('/')
+        }));
         assert!(ROUTE_CONTRACTS.iter().any(|route| {
             route.owner == RouteOwner::ViewGrant
                 && route.version == RouteVersion::ServerBoundV1
@@ -760,28 +763,104 @@ mod tests {
             route.owner == RouteOwner::ReservedWebhooks && !route.registered
         }));
         assert!(REJECTED_WS_PATHS.contains(&"/api/v1/ws"));
+
+        assert_eq!(WS_ADMISSION_CASES.len(), 14);
+        for protocol in [
+            ProtocolHeaderCase::ExactV1,
+            ProtocolHeaderCase::Missing,
+            ProtocolHeaderCase::Duplicate,
+            ProtocolHeaderCase::Malformed,
+            ProtocolHeaderCase::Unsupported,
+        ] {
+            assert!(WS_ADMISSION_CASES.iter().any(|case| case.protocol == protocol));
+        }
+        for credential in [
+            CredentialCase::Access,
+            CredentialCase::Refresh,
+            CredentialCase::DeviceActivation,
+            CredentialCase::Invitation,
+            CredentialCase::Missing,
+            CredentialCase::Duplicate,
+            CredentialCase::Malformed,
+            CredentialCase::InvalidOrExpired,
+        ] {
+            assert!(
+                WS_ADMISSION_CASES
+                    .iter()
+                    .any(|case| case.credential == credential)
+            );
+        }
+        assert!(WS_ADMISSION_CASES.iter().all(|case| {
+            !case.name.is_empty() && case.path.starts_with('/')
+        }));
+        assert!(WS_ADMISSION_CASES.iter().any(|case| {
+            case.standard_upgrade_headers_valid
+                && case.outcome == WsAdmissionOutcome::NormalUpgrade
+        }));
+        assert!(WS_ADMISSION_CASES.iter().any(|case| {
+            case.standard_upgrade_headers_valid
+                && case.outcome == WsAdmissionOutcome::RestrictedUpgrade
+        }));
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(WS_ADMISSION_CASES.iter().any(|case| {
+                case.outcome == WsAdmissionOutcome::Reject(status)
+            }));
+        }
+        assert_eq!(
+            (
+                CLOSE_ACCESS_EXPIRED,
+                CLOSE_RESTRICTED_DONE,
+                CLOSE_RESTRICTED_INVALID,
+                CLOSE_RESTRICTED_TIMEOUT,
+            ),
+            (4401, 4403, 4400, 4408),
+        );
     }
 
     #[test]
     fn failure_content_and_cache_matrices_are_closed() {
-        assert_eq!(
-            status_for_failure(HttpFailure::HiddenOrMissingResource),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            status_for_failure(HttpFailure::PerScopeCapacity),
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        for (failure, expected) in [
+            (HttpFailure::UnknownPath, StatusCode::NOT_FOUND),
+            (HttpFailure::OrdinaryRoot, StatusCode::BAD_REQUEST),
+            (HttpFailure::InvalidProtocolHeader, StatusCode::BAD_REQUEST),
+            (HttpFailure::InvalidWebSocketHeaders, StatusCode::BAD_REQUEST),
+            (HttpFailure::InvalidAccess, StatusCode::UNAUTHORIZED),
+            (HttpFailure::HiddenOrMissingResource, StatusCode::NOT_FOUND),
+            (HttpFailure::DisclosedForbidden, StatusCode::FORBIDDEN),
+            (HttpFailure::ExpiredOrRevokedGrant, StatusCode::NOT_FOUND),
+            (HttpFailure::MalformedRange, StatusCode::BAD_REQUEST),
+            (HttpFailure::UnsatisfiableRange, StatusCode::RANGE_NOT_SATISFIABLE),
+            (HttpFailure::MultipleRanges, StatusCode::BAD_REQUEST),
+            (HttpFailure::StorageInvariant, StatusCode::INTERNAL_SERVER_ERROR),
+            (HttpFailure::PerScopeCapacity, StatusCode::TOO_MANY_REQUESTS),
+            (HttpFailure::GlobalCapacity, StatusCode::SERVICE_UNAVAILABLE),
+            (HttpFailure::TemporaryBackend, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            assert_eq!(status_for_failure(failure), expected);
+        }
         assert_eq!(
             disposition_for_mime("text/html"),
             ContentDispositionPolicy::Attachment
         );
-        assert_eq!(
-            cache_control(CachePolicy::ViewGrant),
-            "private, no-store"
-        );
+        for (policy, expected) in [
+            (CachePolicy::BearerExactVersion, "private, no-cache"),
+            (CachePolicy::Projection, "private, no-cache"),
+            (CachePolicy::ViewGrant, "private, no-store"),
+            (
+                CachePolicy::AvatarRevision,
+                "private, max-age=31536000, immutable",
+            ),
+        ] {
+            assert_eq!(cache_control(policy), expected);
+        }
         assert!(ENTITY_TAG_CONTRACTS.iter().all(|contract| contract.strong));
         assert_eq!(strong_etag("revision-test"), "\"revision-test\"");
+        assert_eq!(CONTENT_SECURITY_HEADERS[0], ("x-content-type-options", "nosniff"));
+        assert!(VIEW_SECURITY_HEADERS.contains(&("referrer-policy", "no-referrer")));
     }
 
     #[test]
@@ -793,6 +872,16 @@ mod tests {
         assert_eq!(clock.advance(5), 1_800_000_005);
         let grant = view_grant_fixture(clock.now_unix());
         assert_eq!(grant.expires_at_unix - grant.issued_at_unix, 180);
+        assert_eq!(TEST_GATEWAY_ID, "G00000000000000000001");
+        assert_eq!(active_session_fixture().state, FixtureSessionState::Active);
+        assert_eq!(revoked_session_fixture().state, FixtureSessionState::Revoked);
+        assert_eq!(active_session_fixture().principal_id, TEST_PRINCIPAL_ID);
+        assert_eq!(revoked_session_fixture().session_id, TEST_REVOKED_SESSION_ID);
+        assert!(!hidden_artifact_fixture().visible);
+        assert_eq!(hidden_artifact_fixture().artifact_id, TEST_HIDDEN_ARTIFACT_ID);
+        assert_eq!(projection_fixture().kind, "thumbnail");
+        assert_eq!(avatar_fixture().principal_id, TEST_PRINCIPAL_ID);
+        assert_eq!(avatar_fixture().revision, "avatar-revision-test");
         let redacted = redact_sensitive_snapshot(&format!(
             "Authorization: {TEST_AUTHORIZATION}; /storage/views/{TEST_VIEW_GRANT}"
         ));

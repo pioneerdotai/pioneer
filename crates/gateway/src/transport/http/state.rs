@@ -10,52 +10,97 @@ use crate::message::MessageProcessor;
 use crate::session::SessionManager;
 use crate::transport::ws::admission::AuthAbuseLimiter;
 
-use super::streams::HttpStreamRegistry;
-use super::view_grants::{ViewGrantError, ViewGrantService};
+use super::streams::{HttpStreamConfigError, HttpStreamRegistry};
+use crate::view_grants::{ViewGrantError, ViewGrantService};
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayHttpStateError {
+    InvalidHttpStreamConfig,
+    InvalidViewGrantConfig(ViewGrantError),
+}
+
+impl From<HttpStreamConfigError> for GatewayHttpStateError {
+    fn from(_: HttpStreamConfigError) -> Self {
+        Self::InvalidHttpStreamConfig
+    }
+}
+
+impl From<ViewGrantError> for GatewayHttpStateError {
+    fn from(error: ViewGrantError) -> Self {
+        Self::InvalidViewGrantConfig(error)
+    }
+}
+
+#[derive(Default)]
+struct ActiveConnectionState {
+    accepting: bool,
+    connections: HashMap<u64, watch::Sender<bool>>,
+}
+
+impl ActiveConnectionState {
+    fn accepting() -> Self {
+        Self {
+            accepting: true,
+            connections: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ActiveConnectionRegistry {
     next_id: Arc<AtomicU64>,
-    connections: Arc<Mutex<HashMap<u64, watch::Sender<bool>>>>,
+    state: Arc<Mutex<ActiveConnectionState>>,
+}
+
+impl Default for ActiveConnectionRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(Mutex::new(ActiveConnectionState::accepting())),
+        }
+    }
 }
 
 impl ActiveConnectionRegistry {
     pub(crate) async fn register(&self) -> ActiveConnectionGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (cancellation_tx, cancellation_rx) = watch::channel(false);
-        self.connections.lock().await.insert(id, cancellation_tx);
+        let mut state = self.state.lock().await;
+        let registered = state.accepting;
+        if registered {
+            state.connections.insert(id, cancellation_tx);
+        } else {
+            let _ = cancellation_tx.send(true);
+        }
         ActiveConnectionGuard {
             id,
+            registered,
             cancellation_rx,
             registry: self.clone(),
         }
     }
 
     pub(crate) async fn cancel_all(&self) {
-        let senders = self
-            .connections
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for sender in senders {
+        let mut state = self.state.lock().await;
+        state.accepting = false;
+        for sender in state.connections.values() {
             let _ = sender.send(true);
         }
     }
 
     async fn unregister(&self, id: u64) {
-        self.connections.lock().await.remove(&id);
+        self.state.lock().await.connections.remove(&id);
     }
 
     #[cfg(test)]
     pub(crate) async fn len(&self) -> usize {
-        self.connections.lock().await.len()
+        self.state.lock().await.connections.len()
     }
 }
 
 pub(crate) struct ActiveConnectionGuard {
     id: u64,
+    registered: bool,
     cancellation_rx: watch::Receiver<bool>,
     registry: ActiveConnectionRegistry,
 }
@@ -66,7 +111,9 @@ impl ActiveConnectionGuard {
     }
 
     pub(crate) async fn unregister(self) {
-        self.registry.unregister(self.id).await;
+        if self.registered {
+            self.registry.unregister(self.id).await;
+        }
     }
 }
 
@@ -106,12 +153,12 @@ impl GatewayHttpState {
         auth_service: Arc<GatewayAuthService>,
         message_processor: Arc<MessageProcessor>,
         session_manager: Arc<SessionManager>,
-    ) -> Result<Self, ViewGrantError> {
-        let http_streams = HttpStreamRegistry::new(&config.gateway.artifacts);
+    ) -> Result<Self, GatewayHttpStateError> {
+        let http_streams = HttpStreamRegistry::new(&config.gateway.artifacts)?;
         let view_grants = ViewGrantService::new(&config.gateway.artifacts)?;
         auth_service.add_disconnect_hook(http_streams.clone());
         auth_service.add_disconnect_hook(view_grants.clone());
-        message_processor.set_http_stream_registry(http_streams.clone());
+        message_processor.set_artifact_stream_invalidation(http_streams.clone());
         message_processor.set_view_grant_service(view_grants.clone());
         Ok(Self {
             config,
@@ -131,6 +178,10 @@ impl GatewayHttpState {
         self.readiness.set_ready(ready);
     }
 
+    pub(crate) fn is_ready(&self) -> bool {
+        self.readiness.is_ready()
+    }
+
     pub(crate) fn readiness(&self) -> ReadinessState {
         self.readiness.clone()
     }
@@ -139,6 +190,18 @@ impl GatewayHttpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_is_fail_closed_until_explicitly_enabled() {
+        let readiness = ReadinessState::default();
+        assert!(!readiness.is_ready());
+
+        readiness.set_ready(true);
+        assert!(readiness.is_ready());
+
+        readiness.set_ready(false);
+        assert!(!readiness.is_ready());
+    }
 
     #[tokio::test]
     async fn active_connection_shutdown_is_targeted_bounded_and_idempotent() {
@@ -161,5 +224,10 @@ mod tests {
         assert_eq!(registry.len().await, 1);
         second.unregister().await;
         assert_eq!(registry.len().await, 0);
+
+        let late = registry.register().await;
+        assert!(*late.cancellation_receiver().borrow());
+        assert_eq!(registry.len().await, 0);
+        late.unregister().await;
     }
 }

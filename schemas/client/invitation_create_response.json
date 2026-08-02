@@ -59,7 +59,7 @@
         "gateway_id": {
           "$ref": "#/$defs/GatewayId"
         },
-        "protected_endpoint": {
+        "gateway_base_url": {
           "type": "string"
         },
         "token": {
@@ -68,7 +68,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "protected_endpoint",
+        "gateway_base_url",
         "gateway_id",
         "token",
         "deep_link"

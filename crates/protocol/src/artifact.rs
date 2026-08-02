@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroize::Zeroize;
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -331,11 +332,27 @@ pub struct ArtifactViewGrantCreateParams {
     pub disposition: ArtifactViewGrantDisposition,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ArtifactViewGrantCreateResponse {
     #[schemars(length(min = 58, max = 58))]
     pub relative_url: String,
     pub expires_at: u64,
+}
+
+impl std::fmt::Debug for ArtifactViewGrantCreateResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactViewGrantCreateResponse")
+            .field("relative_url", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for ArtifactViewGrantCreateResponse {
+    fn drop(&mut self) {
+        self.relative_url.zeroize();
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -625,6 +642,9 @@ mod tests {
             relative_url: format!("/storage/views/{}", "a".repeat(43)),
             expires_at: 1_180,
         };
+        let rendered = format!("{response:?}");
+        assert!(!rendered.contains(response.relative_url.as_str()));
+        assert!(rendered.contains("[redacted]"));
         let response_json = serde_json::to_value(&response).unwrap();
         assert!(response_json["relative_url"]
             .as_str()

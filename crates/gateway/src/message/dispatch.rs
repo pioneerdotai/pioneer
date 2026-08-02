@@ -2013,94 +2013,90 @@ impl MessageProcessor {
         ) {
             return Err(validation());
         }
-            let params = request.params.as_ref().and_then(JsonValue::as_object);
-            let workspace_id = params
-                .and_then(|value| {
-                    value
-                        .get("workspace_id")
-                        .or_else(|| value.get("workspaceId"))
-                })
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(validation)?;
-            let upload_id = params
-                .and_then(|value| value.get("upload_id").or_else(|| value.get("uploadId")))
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(validation)?;
-            let session = self
-                .artifact_uploads
-                .lookup_for_owner(
-                    &owner,
-                    workspace_id.trim(),
-                    upload_id.trim(),
-                    now_timestamp_secs(),
-                )
-                .await
-                .map_err(|_| {
-                    let decision = AuthorizationDecision::Deny {
-                        reason: DenyReason::MissingAuthoritativeResource,
-                        disclosure: entry.disclosure,
-                    };
-                    record_method_decision(entry, &decision);
-                    AuthorizationExternalError::NotFound.response(request.id.clone())
-                })?;
-            if let (Some(thread_id), Some(turn_id)) = (
-                session.thread_id.as_deref(),
-                session.planned_turn_id.as_deref(),
-            ) {
-                let turn_action = ResourceAction::ThreadWrite;
-                let turn_gate = AuthorizationService::new().authorize_action(
-                    context.principal().kind,
-                    context.role_key(),
-                    turn_action,
-                );
-                return self.finish_turn_transfer_resolution(
-                    resolver
-                        .authorize_turn(
-                            context.principal(),
-                            &turn_gate,
-                            turn_action,
-                            turn_id,
-                            Some(session.workspace_id.as_str()),
-                            Some(thread_id),
-                        )
-                        .await
-                        .map_err(|_| unavailable())?,
-                    entry,
-                    request.id.clone(),
-                );
-            }
-            if let Some(thread_id) = session.thread_id.as_deref() {
-                return self.finish_thread_transfer_resolution(
-                    resolver
-                        .authorize_thread(
-                            context.principal(),
-                            action_gate,
-                            entry.action,
-                            thread_id,
-                            Some(session.workspace_id.as_str()),
-                        )
-                        .await
-                        .map_err(|_| unavailable())?,
-                    entry,
-                    request.id.clone(),
-                );
-            }
-            let resolution = resolver
-                .authorize_workspace(
-                    context.principal(),
-                    action_gate,
-                    entry.action,
-                    session.workspace_id.as_str(),
-                )
-                .await
-                .map_err(|_| unavailable())?;
-            self.finish_workspace_transfer_resolution(
-                resolution,
+        let params = request.params.as_ref().and_then(JsonValue::as_object);
+        let workspace_id = params
+            .and_then(|value| {
+                value
+                    .get("workspace_id")
+                    .or_else(|| value.get("workspaceId"))
+            })
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(validation)?;
+        let upload_id = params
+            .and_then(|value| value.get("upload_id").or_else(|| value.get("uploadId")))
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(validation)?;
+        let session = self
+            .artifact_uploads
+            .lookup_for_owner(
+                &owner,
+                workspace_id.trim(),
+                upload_id.trim(),
+                now_timestamp_secs(),
+            )
+            .await
+            .map_err(|_| {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    disclosure: entry.disclosure,
+                };
+                record_method_decision(entry, &decision);
+                AuthorizationExternalError::NotFound.response(request.id.clone())
+            })?;
+        if let (Some(thread_id), Some(turn_id)) = (
+            session.thread_id.as_deref(),
+            session.planned_turn_id.as_deref(),
+        ) {
+            let turn_action = ResourceAction::ThreadWrite;
+            let turn_gate = AuthorizationService::new().authorize_action(
+                context.principal().kind,
+                context.role_key(),
+                turn_action,
+            );
+            return self.finish_turn_transfer_resolution(
+                resolver
+                    .authorize_turn(
+                        context.principal(),
+                        &turn_gate,
+                        turn_action,
+                        turn_id,
+                        Some(session.workspace_id.as_str()),
+                        Some(thread_id),
+                    )
+                    .await
+                    .map_err(|_| unavailable())?,
                 entry,
                 request.id.clone(),
+            );
+        }
+        if let Some(thread_id) = session.thread_id.as_deref() {
+            return self.finish_thread_transfer_resolution(
+                resolver
+                    .authorize_thread(
+                        context.principal(),
+                        action_gate,
+                        entry.action,
+                        thread_id,
+                        Some(session.workspace_id.as_str()),
+                    )
+                    .await
+                    .map_err(|_| unavailable())?,
+                entry,
+                request.id.clone(),
+            );
+        }
+        let resolution = resolver
+            .authorize_workspace(
+                context.principal(),
+                action_gate,
+                entry.action,
+                session.workspace_id.as_str(),
             )
+            .await
+            .map_err(|_| unavailable())?;
+        self.finish_workspace_transfer_resolution(resolution, entry, request.id.clone())
     }
 
     fn finish_thread_transfer_resolution(

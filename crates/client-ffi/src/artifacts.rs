@@ -15,7 +15,6 @@ use pioneer_client::{
         ArtifactHttpDownloadError, ArtifactHttpDownloadProgress,
         ArtifactHttpDownloadRequest, ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
     },
-    gateway::types::{GatewayEndpoint, GatewayEndpointKind},
     transport::{
         http::{
             BrowserViewUrl, GatewayHttpAccess, GatewayHttpAuthorityError, GatewayHttpError,
@@ -31,6 +30,7 @@ use pioneer_protocol::{
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
 use crate::ClientFfiError;
 
@@ -43,6 +43,8 @@ const OPERATION_DOWNLOADING: u8 = 1;
 const OPERATION_COMPLETED: u8 = 2;
 const OPERATION_FAILED: u8 = 3;
 const OPERATION_CANCELLED: u8 = 4;
+const MAX_ACTIVE_DOWNLOAD_OPERATIONS: usize = 8;
+const MAX_TRACKED_DOWNLOAD_OPERATIONS: usize = 128;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -55,10 +57,26 @@ pub struct ClientArtifactTargetRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Serialize, PartialEq, Eq)]
 pub struct ClientArtifactViewOpenResult {
     pub view_url: String,
     pub expires_at: u64,
+}
+
+impl std::fmt::Debug for ClientArtifactViewOpenResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientArtifactViewOpenResult")
+            .field("view_url", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for ClientArtifactViewOpenResult {
+    fn drop(&mut self) {
+        self.view_url.zeroize();
+    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -148,6 +166,12 @@ impl ArtifactDownloadOperation {
     }
 
     fn update_progress(&self, progress: ArtifactHttpDownloadProgress) {
+        let Ok(_transition) = self.error_code.lock() else {
+            return;
+        };
+        if !operation_is_active(self.state.load(Ordering::Acquire)) {
+            return;
+        }
         self.downloaded_bytes
             .store(progress.downloaded_bytes, Ordering::Relaxed);
         self.total_bytes
@@ -157,14 +181,20 @@ impl ArtifactDownloadOperation {
         self.state.store(OPERATION_DOWNLOADING, Ordering::Release);
     }
 
-    fn finish(&self, state: u8, error_code: Option<String>) {
-        if let Ok(mut stored) = self.error_code.lock() {
-            *stored = error_code;
+    fn finish(&self, state: u8, error_code: Option<String>) -> bool {
+        let Ok(mut stored) = self.error_code.lock() else {
+            return false;
+        };
+        if !operation_is_active(self.state.load(Ordering::Acquire)) {
+            return false;
         }
+        *stored = error_code;
         self.state.store(state, Ordering::Release);
+        true
     }
 
     fn snapshot(&self, operation_id: String) -> ClientArtifactDownloadProgressResult {
+        let stored_error = self.error_code.lock().ok();
         let state = match self.state.load(Ordering::Acquire) {
             OPERATION_QUEUED => ClientArtifactDownloadState::Queued,
             OPERATION_DOWNLOADING => ClientArtifactDownloadState::Downloading,
@@ -178,7 +208,7 @@ impl ArtifactDownloadOperation {
             downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             resumed_from_bytes: self.resumed_from_bytes.load(Ordering::Relaxed),
-            error_code: self.error_code.lock().ok().and_then(|value| value.clone()),
+            error_code: stored_error.and_then(|value| value.clone()),
         }
     }
 }
@@ -196,19 +226,43 @@ impl ClientFfiArtifactDownloads {
                 ClientFfiError::GENERIC_CODE,
             )
         })?;
-        if operations
-            .get(operation_id)
-            .is_some_and(|existing| {
-                matches!(
-                    existing.state.load(Ordering::Acquire),
-                    OPERATION_QUEUED | OPERATION_DOWNLOADING
-                )
-            })
+        if operations.get(operation_id).is_some_and(|existing| {
+            operation_is_active(existing.state.load(Ordering::Acquire))
+        })
         {
             return Err(ClientFfiError::new(
                 "artifact download operation is already active",
                 INVALID_ARTIFACT_ACTION_CODE,
             ));
+        }
+        if operations
+            .values()
+            .filter(|existing| {
+                operation_is_active(existing.state.load(Ordering::Acquire))
+            })
+            .count()
+            >= MAX_ACTIVE_DOWNLOAD_OPERATIONS
+        {
+            return Err(ClientFfiError::new(
+                "artifact download operation capacity is exhausted",
+                "artifact_download_capacity",
+            ));
+        }
+        if !operations.contains_key(operation_id)
+            && operations.len() >= MAX_TRACKED_DOWNLOAD_OPERATIONS
+        {
+            let remove_count = operations.len() + 1 - MAX_TRACKED_DOWNLOAD_OPERATIONS;
+            let terminal = operations
+                .iter()
+                .filter(|(_, existing)| {
+                    !operation_is_active(existing.state.load(Ordering::Acquire))
+                })
+                .map(|(operation_id, _)| operation_id.clone())
+                .take(remove_count)
+                .collect::<Vec<_>>();
+            for operation_id in terminal {
+                operations.remove(operation_id.as_str());
+            }
         }
         operations.insert(operation_id.to_owned(), operation.clone());
         Ok(operation)
@@ -251,33 +305,35 @@ impl ClientFfiArtifactDownloads {
                 INVALID_ARTIFACT_ACTION_CODE,
             )
         })?;
-        let active = matches!(
-            operation.state.load(Ordering::Acquire),
-            OPERATION_QUEUED | OPERATION_DOWNLOADING
-        );
+        let active = operation_is_active(operation.state.load(Ordering::Acquire));
         if active {
             operation.cancellation.cancel();
-            operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
         }
+        let cancelled = active
+            && operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
         Ok(ClientArtifactDownloadCancelResult {
             operation_id: request.operation_id,
-            cancelled: active,
+            cancelled,
         })
     }
 
     pub(crate) fn cancel_all(&self) {
         if let Ok(operations) = self.operations.lock() {
             for operation in operations.values() {
-                if matches!(
-                    operation.state.load(Ordering::Acquire),
-                    OPERATION_QUEUED | OPERATION_DOWNLOADING
-                ) {
+                if operation_is_active(operation.state.load(Ordering::Acquire)) {
                     operation.cancellation.cancel();
-                    operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
+                    let _ = operation.finish(
+                        OPERATION_CANCELLED,
+                        Some("cancelled".to_owned()),
+                    );
                 }
             }
         }
     }
+}
+
+fn operation_is_active(state: u8) -> bool {
+    matches!(state, OPERATION_QUEUED | OPERATION_DOWNLOADING)
 }
 
 pub(crate) fn open_artifact_view(
@@ -316,17 +372,23 @@ pub(crate) fn download_artifact(
     let result = download_artifact_inner(sender, runtime_home, &request, operation.as_ref());
     match result {
         Ok(result) => {
-            operation.finish(OPERATION_COMPLETED, None);
-            Ok(result)
+            if operation.finish(OPERATION_COMPLETED, None) {
+                Ok(result)
+            } else {
+                Err(map_download_error(ArtifactHttpDownloadError::Cancelled))
+            }
         }
         Err(error) => {
-            let state = if operation.cancellation.is_cancelled() {
-                OPERATION_CANCELLED
+            if operation.cancellation.is_cancelled() {
+                let _ = operation.finish(
+                    OPERATION_CANCELLED,
+                    Some("cancelled".to_owned()),
+                );
+                Err(map_download_error(ArtifactHttpDownloadError::Cancelled))
             } else {
-                OPERATION_FAILED
-            };
-            operation.finish(state, Some(error.code.clone()));
-            Err(error)
+                let _ = operation.finish(OPERATION_FAILED, Some(error.code.clone()));
+                Err(error)
+            }
         }
     }
 }
@@ -356,24 +418,14 @@ fn download_artifact_inner(
     let access = sender
         .current_gateway_http_access()
         .map_err(map_authority_error)?;
-    let endpoint = GatewayEndpoint {
-        id: access.gateway_id.as_str().to_owned(),
-        name: "active Gateway".to_owned(),
-        gateway_base_url: access.gateway_base_url.clone(),
-        kind: GatewayEndpointKind::Remote,
-        session_ref: Some(access.session_id.as_str().to_owned()),
-        server_gateway_id: Some(access.gateway_id.clone()),
-        workspace_id: Some(artifact.workspace_id.clone()),
-        service_name: None,
-    };
     let authority = Arc::new(FfiGatewayHttpAuthority {
         sender: sender.clone(),
     });
-    let session = GatewayHttpSession::from_endpoint(&endpoint, access.session_id, authority)
+    let session = GatewayHttpSession::from_access(&access, authority)
         .map_err(map_http_error)?;
     let service = ArtifactHttpDownloadService::new(session, runtime_home);
     let native_request = ArtifactHttpDownloadRequest {
-        gateway_profile_id: endpoint.id,
+        gateway_profile_id: access.gateway_id.as_str().to_owned(),
         workspace_id: artifact.workspace_id,
         artifact_id: artifact.artifact.artifact_id.clone(),
         version_id: version_id.clone(),
@@ -411,14 +463,23 @@ fn resolve_artifact(
         let value = value.trim().to_owned();
         (!value.is_empty()).then_some(value)
     });
-    sender
+    let artifact = sender
         .artifact_get(ArtifactGetParams {
-            workspace_id,
-            artifact_id,
-            version_id,
+            workspace_id: workspace_id.clone(),
+            artifact_id: artifact_id.clone(),
+            version_id: version_id.clone(),
         })
         .map(|response| response.artifact)
-        .map_err(map_rpc_error)
+        .map_err(map_rpc_error)?;
+    if artifact.workspace_id != workspace_id
+        || artifact.artifact.artifact_id != artifact_id
+        || version_id
+            .as_deref()
+            .is_some_and(|expected| artifact.artifact.version_id.as_deref() != Some(expected))
+    {
+        return Err(invalid_artifact());
+    }
+    Ok(artifact)
 }
 
 fn exact_version(artifact: &ArtifactSummary) -> Result<String, ClientFfiError> {
@@ -605,10 +666,75 @@ mod tests {
     }
 
     #[test]
+    fn operation_registry_bounds_active_and_terminal_entries() {
+        let downloads = ClientFfiArtifactDownloads::default();
+        let active = (0..MAX_ACTIVE_DOWNLOAD_OPERATIONS)
+            .map(|index| downloads.begin(format!("active-{index}").as_str()).unwrap())
+            .collect::<Vec<_>>();
+        let error = match downloads.begin("active-overflow") {
+            Ok(_) => panic!("active download capacity must be bounded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "artifact_download_capacity");
+
+        for operation in active {
+            assert!(operation.finish(OPERATION_COMPLETED, None));
+        }
+        for index in 0..(MAX_TRACKED_DOWNLOAD_OPERATIONS + 10) {
+            let operation = downloads
+                .begin(format!("terminal-{index}").as_str())
+                .unwrap();
+            assert!(operation.finish(OPERATION_COMPLETED, None));
+        }
+        assert!(
+            downloads
+                .operations
+                .lock()
+                .unwrap()
+                .len()
+                <= MAX_TRACKED_DOWNLOAD_OPERATIONS
+        );
+    }
+
+    #[test]
+    fn cancellation_is_terminal_against_late_progress_and_completion() {
+        let operation = ArtifactDownloadOperation::new();
+        operation.cancellation.cancel();
+        assert!(operation.finish(
+            OPERATION_CANCELLED,
+            Some("cancelled".to_owned())
+        ));
+
+        operation.update_progress(ArtifactHttpDownloadProgress {
+            downloaded_bytes: 9,
+            total_bytes: 10,
+            resumed_from_bytes: 0,
+        });
+
+        assert!(!operation.finish(OPERATION_COMPLETED, None));
+        assert_eq!(
+            operation.snapshot("cancelled-operation".to_owned()).state,
+            ClientArtifactDownloadState::Cancelled
+        );
+    }
+
+    #[test]
     fn bridge_dtos_contain_no_access_or_authorization_fields() {
         let source = include_str!("artifacts.rs");
         assert!(!source.contains(&["pub access", "_token"].concat()));
         assert!(!source.contains(&["pub authorization", "_header"].concat()));
         assert!(!source.contains(&["refresh", "_token"].concat()));
+    }
+
+    #[test]
+    fn browser_view_result_redacts_the_opaque_grant_from_debug() {
+        let secret = "a".repeat(43);
+        let result = ClientArtifactViewOpenResult {
+            view_url: format!("https://gateway.example/storage/views/{secret}"),
+            expires_at: 1_800_000_000,
+        };
+        let rendered = format!("{result:?}");
+        assert!(!rendered.contains(secret.as_str()));
+        assert!(rendered.contains("[redacted]"));
     }
 }

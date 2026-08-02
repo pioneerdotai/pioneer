@@ -7,8 +7,9 @@
 
 use pioneer_protocol::{
     AuthSecretString, AuthSessionId, ClientKind, CredentialStorageOrder, DeviceId, DeviceStatus,
-    GatewayId, InvitationAcceptResponse, InvitationPresentation, InvitationTransportSecurity,
-    MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, TokenFamilyId, WorkspaceId,
+    GatewayBaseUrl, GatewayId, InvitationAcceptResponse, InvitationPresentation,
+    InvitationTransportSecurity, MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus,
+    TokenFamilyId, WorkspaceId,
 };
 
 use crate::{ClientError, ClientResult};
@@ -39,8 +40,8 @@ impl InvitationQrPresentation {
         &self.presentation.gateway_id
     }
 
-    pub fn protected_endpoint(&self) -> &str {
-        self.presentation.protected_endpoint.as_str()
+    pub fn gateway_base_url(&self) -> &GatewayBaseUrl {
+        &self.presentation.gateway_base_url
     }
 
     pub fn transport_security(&self) -> InvitationTransportSecurity {
@@ -66,7 +67,7 @@ impl std::fmt::Debug for InvitationQrPresentation {
         formatter
             .debug_struct("InvitationQrPresentation")
             .field("gateway_id", self.gateway_id())
-            .field("protected_endpoint", &self.protected_endpoint())
+            .field("gateway_base_url", &self.gateway_base_url())
             .field("transport_security", &self.transport_security())
             .field("credential", &"[redacted]")
             .field("deep_link", &"[redacted]")
@@ -161,14 +162,14 @@ impl std::fmt::Debug for InvitationAccessGrant {
 }
 
 pub struct InvitationSessionCleanup {
-    protected_endpoint: String,
+    gateway_base_url: GatewayBaseUrl,
     session_id: AuthSessionId,
     access_token: AuthSecretString,
 }
 
 impl InvitationSessionCleanup {
-    pub fn protected_endpoint(&self) -> &str {
-        self.protected_endpoint.as_str()
+    pub fn gateway_base_url(&self) -> &GatewayBaseUrl {
+        &self.gateway_base_url
     }
 
     pub fn session_id(&self) -> &AuthSessionId {
@@ -184,7 +185,7 @@ impl std::fmt::Debug for InvitationSessionCleanup {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("InvitationSessionCleanup")
-            .field("protected_endpoint", &self.protected_endpoint)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("session_id", &self.session_id)
             .field("access_token", &"[redacted]")
             .finish()
@@ -198,7 +199,7 @@ impl std::fmt::Debug for InvitationSessionCleanup {
 /// only a best-effort cleanup capability, never a connected-state grant.
 pub struct InvitationSessionCommit {
     state: InvitationSessionCommitState,
-    protected_endpoint: String,
+    gateway_base_url: GatewayBaseUrl,
     gateway_id: GatewayId,
     principal_id: PrincipalId,
     device_id: DeviceId,
@@ -260,7 +261,7 @@ impl InvitationSessionCommit {
         }
         Ok(Self {
             state: InvitationSessionCommitState::RefreshReady,
-            protected_endpoint: invitation.protected_endpoint().to_owned(),
+            gateway_base_url: invitation.gateway_base_url().clone(),
             gateway_id: grant.gateway.id,
             principal_id: grant.principal.id,
             device_id: grant.device.id,
@@ -360,7 +361,7 @@ impl InvitationSessionCommit {
             .take()
             .ok_or_else(|| ClientError::invalid_state("missing invitation access credential"))?;
         Ok(InvitationSessionCleanup {
-            protected_endpoint: self.protected_endpoint,
+            gateway_base_url: self.gateway_base_url,
             session_id: self.session_id,
             access_token,
         })
@@ -383,7 +384,7 @@ impl std::fmt::Debug for InvitationSessionCommit {
         formatter
             .debug_struct("InvitationSessionCommit")
             .field("state", &self.state)
-            .field("protected_endpoint", &self.protected_endpoint)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("gateway_id", &self.gateway_id)
             .field("principal_id", &self.principal_id)
             .field("device_id", &self.device_id)
@@ -406,7 +407,7 @@ mod tests {
 
     fn presentation() -> InvitationPresentation {
         InvitationPresentation::new(
-            "91.224.86.172:17878",
+            GatewayBaseUrl::parse_presentation("91.224.86.172:17878").unwrap(),
             GatewayId::new("G00000000000000000001").unwrap(),
             InvitationCredential::parse(format!(
                 "{}{}",
@@ -483,7 +484,10 @@ mod tests {
 
         assert_eq!(presented.deep_link(), deep_link);
         assert_eq!(presented.qr_payload(), deep_link.as_bytes());
-        assert_eq!(presented.protected_endpoint(), "ws://91.224.86.172:17878");
+        assert_eq!(
+            presented.gateway_base_url().as_str(),
+            "http://91.224.86.172:17878/"
+        );
         assert_eq!(
             presented.transport_security(),
             InvitationTransportSecurity::InsecureWs
@@ -508,13 +512,13 @@ mod tests {
         let gateway_id = canonical.gateway_id;
         for invalid in [
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}&token={credential}#token={credential}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}&token={credential}#token={credential}"
             ),
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway=ws%3A%2F%2Fother%3A17878&gateway_id={gateway_id}#token={credential}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_base_url=http%3A%2F%2Fother%3A17878%2F&gateway_id={gateway_id}#token={credential}"
             ),
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}&unknown=1#token={credential}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}&unknown=1#token={credential}"
             ),
         ] {
             assert!(InvitationQrPresentation::parse(&invalid).is_err());

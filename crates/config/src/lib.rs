@@ -259,8 +259,6 @@ pub struct GatewayArtifactsConfig {
     pub max_files_per_workspace: u64,
     #[serde(default = "default_gateway_artifacts_upload_session_ttl_secs")]
     pub upload_session_ttl_secs: u64,
-    #[serde(default = "default_gateway_artifacts_download_session_ttl_secs")]
-    pub download_session_ttl_secs: u64,
     #[serde(default = "default_gateway_artifacts_gc_grace_secs")]
     pub gc_grace_secs: u64,
     #[serde(default = "default_gateway_artifacts_output_dir_ttl_secs")]
@@ -271,6 +269,8 @@ pub struct GatewayArtifactsConfig {
     pub quota_warn_at_percent: u8,
     #[serde(default = "default_gateway_artifacts_http_streams_global")]
     pub http_streams_global: usize,
+    #[serde(default = "default_gateway_artifacts_http_streams_per_principal")]
+    pub http_streams_per_principal: usize,
     #[serde(default = "default_gateway_artifacts_http_streams_per_session")]
     pub http_streams_per_session: usize,
     #[serde(default = "default_gateway_artifacts_http_open_handles")]
@@ -304,12 +304,13 @@ impl Default for GatewayArtifactsConfig {
             max_workspace_bytes: default_gateway_artifacts_max_workspace_bytes(),
             max_files_per_workspace: default_gateway_artifacts_max_files_per_workspace(),
             upload_session_ttl_secs: default_gateway_artifacts_upload_session_ttl_secs(),
-            download_session_ttl_secs: default_gateway_artifacts_download_session_ttl_secs(),
             gc_grace_secs: default_gateway_artifacts_gc_grace_secs(),
             output_dir_ttl_secs: default_gateway_artifacts_output_dir_ttl_secs(),
             readable_copy_ttl_secs: default_gateway_artifacts_readable_copy_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
             http_streams_global: default_gateway_artifacts_http_streams_global(),
+            http_streams_per_principal:
+                default_gateway_artifacts_http_streams_per_principal(),
             http_streams_per_session: default_gateway_artifacts_http_streams_per_session(),
             http_open_handles: default_gateway_artifacts_http_open_handles(),
             http_max_single_range_bytes:
@@ -2560,10 +2561,6 @@ const fn default_gateway_artifacts_upload_session_ttl_secs() -> u64 {
     60 * 60
 }
 
-const fn default_gateway_artifacts_download_session_ttl_secs() -> u64 {
-    15 * 60
-}
-
 const fn default_gateway_artifacts_gc_grace_secs() -> u64 {
     24 * 60 * 60
 }
@@ -2582,6 +2579,10 @@ const fn default_gateway_artifacts_quota_warn_at_percent() -> u8 {
 
 const fn default_gateway_artifacts_http_streams_global() -> usize {
     32
+}
+
+const fn default_gateway_artifacts_http_streams_per_principal() -> usize {
+    8
 }
 
 const fn default_gateway_artifacts_http_streams_per_session() -> usize {

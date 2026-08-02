@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
-use base64::Engine as _;
 use async_trait::async_trait;
+use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use pioneer_config::GatewayArtifactsConfig;
 use pioneer_protocol::{
@@ -18,8 +18,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
-use crate::helpers::unix_timestamp_secs;
 use crate::auth::AuthSessionDisconnectHook;
+use crate::helpers::unix_timestamp_secs;
 
 const VIEW_GRANT_HASH_DOMAIN: &[u8] = b"pioneer:view-grant:v1\0";
 const VIEW_GRANT_SECRET_BYTES: usize = 32;
@@ -69,7 +69,11 @@ impl ViewGrantScope {
             self.artifact_id.as_str(),
             self.version_id.as_str(),
         ] {
-            if value.is_empty() || value.len() > MAX_SCOPE_ID_BYTES {
+            if value.is_empty()
+                || value.len() > MAX_SCOPE_ID_BYTES
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
                 return Err(ViewGrantError::InvalidScope);
             }
         }
@@ -83,11 +87,13 @@ pub(crate) struct OpaqueViewGrantSecret {
 
 impl OpaqueViewGrantSecret {
     pub(crate) fn into_relative_url(mut self) -> String {
-        let secret = self
+        let mut secret = self
             .value
             .take()
             .expect("view-grant secret may be returned only once");
-        format!("/storage/views/{secret}")
+        let relative_url = format!("/storage/views/{secret}");
+        secret.zeroize();
+        relative_url
     }
 }
 
@@ -154,6 +160,10 @@ impl ViewGrantLease {
     pub(crate) fn poll_invalidated(&mut self, context: &mut Context<'_>) -> Poll<()> {
         self.cancellation_wait.as_mut().poll(context)
     }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 }
 
 struct StoredViewGrant {
@@ -178,10 +188,20 @@ impl fmt::Debug for StoredViewGrant {
     }
 }
 
-#[derive(Default)]
 struct ViewGrantState {
+    accepting: bool,
     grants: HashMap<ViewGrantHash, StoredViewGrant>,
     by_session: HashMap<AuthSessionId, HashSet<ViewGrantHash>>,
+}
+
+impl Default for ViewGrantState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            grants: HashMap::new(),
+            by_session: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +220,7 @@ impl ViewGrantLimits {
             || config.view_grants_per_session == 0
             || config.view_grants_per_session > config.view_grants_global
             || config.view_grant_streams == 0
+            || config.view_grant_streams > Semaphore::MAX_PERMITS
         {
             return Err(ViewGrantError::InvalidConfig);
         }
@@ -220,6 +241,7 @@ pub(crate) enum ViewGrantError {
     Capacity,
     UnknownOrExpired,
     Concurrency,
+    ShuttingDown,
 }
 
 pub(crate) struct ViewGrantService {
@@ -255,11 +277,18 @@ impl ViewGrantService {
     fn with_clock_and_key(
         config: &GatewayArtifactsConfig,
         clock: Arc<dyn ViewGrantClock>,
-        hash_key: [u8; 32],
+        mut hash_key: [u8; 32],
     ) -> Result<Arc<Self>, ViewGrantError> {
+        let limits = match ViewGrantLimits::from_config(config) {
+            Ok(limits) => limits,
+            Err(error) => {
+                hash_key.zeroize();
+                return Err(error);
+            }
+        };
         Ok(Arc::new(Self {
             hash_key,
-            limits: ViewGrantLimits::from_config(config)?,
+            limits,
             clock,
             state: Mutex::new(ViewGrantState::default()),
         }))
@@ -269,12 +298,23 @@ impl ViewGrantService {
         &self,
         scope: ViewGrantScope,
     ) -> Result<IssuedViewGrant, ViewGrantError> {
-        scope.validate()?;
-        let issued_at_unix = self.clock.now_unix()?;
-        let expires_at_unix = issued_at_unix
-            .checked_add(self.limits.ttl_secs)
-            .ok_or(ViewGrantError::Clock)?;
+        if let Err(error) = scope.validate() {
+            record_view_grant_event("rejected", "invalid_scope");
+            return Err(error);
+        }
+        let issued_at_unix = self.clock.now_unix().map_err(|error| {
+            record_view_grant_event("rejected", "clock");
+            error
+        })?;
+        let expires_at_unix = issued_at_unix.checked_add(self.limits.ttl_secs).ok_or_else(|| {
+            record_view_grant_event("rejected", "clock");
+            ViewGrantError::Clock
+        })?;
         let mut state = self.lock_state();
+        if !state.accepting {
+            record_view_grant_event("rejected", "shutting_down");
+            return Err(ViewGrantError::ShuttingDown);
+        }
         self.prune_expired_locked(&mut state, issued_at_unix);
 
         let session_count = state
@@ -282,15 +322,17 @@ impl ViewGrantService {
             .get(&scope.auth_session_id)
             .map_or(0, HashSet::len);
         if state.grants.len() >= self.limits.global || session_count >= self.limits.per_session {
+            record_view_grant_event("rejected", "capacity");
             return Err(ViewGrantError::Capacity);
         }
 
         let (secret, hash) = loop {
-            let secret = generate_secret();
+            let mut secret = generate_secret();
             let hash = self.hash_secret(secret.as_str());
             if !state.grants.contains_key(&hash) {
                 break (secret, hash);
             }
+            secret.zeroize();
         };
         state
             .by_session
@@ -301,13 +343,14 @@ impl ViewGrantService {
             hash,
             StoredViewGrant {
                 scope,
-                protocol_version: crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER,
+                protocol_version: pioneer_protocol::PIONEER_PROTOCOL_VERSION_NUMBER,
                 issued_at_unix,
                 expires_at_unix,
                 concurrency: Arc::new(Semaphore::new(self.limits.streams_per_grant)),
                 cancellation: CancellationToken::new(),
             },
         );
+        record_view_grant_event("minted", "created");
 
         Ok(IssuedViewGrant {
             secret: OpaqueViewGrantSecret {
@@ -319,21 +362,32 @@ impl ViewGrantService {
 
     pub(crate) fn resolve(&self, presented: &str) -> Result<ViewGrantLease, ViewGrantError> {
         if !valid_presented_secret(presented) {
+            record_view_grant_event("rejected", "invalid_secret_format");
             return Err(ViewGrantError::UnknownOrExpired);
         }
-        let now_unix = self.clock.now_unix()?;
+        let now_unix = self.clock.now_unix().map_err(|error| {
+            record_view_grant_event("rejected", "clock");
+            error
+        })?;
         let hash = self.hash_secret(presented);
         let mut state = self.lock_state();
+        if !state.accepting {
+            record_view_grant_event("rejected", "shutting_down");
+            return Err(ViewGrantError::ShuttingDown);
+        }
         self.prune_expired_locked(&mut state, now_unix);
-        let stored = state
-            .grants
-            .get(&hash)
-            .ok_or(ViewGrantError::UnknownOrExpired)?;
+        let Some(stored) = state.grants.get(&hash) else {
+            record_view_grant_event("rejected", "unknown_or_expired");
+            return Err(ViewGrantError::UnknownOrExpired);
+        };
         let permit = stored
             .concurrency
             .clone()
             .try_acquire_owned()
-            .map_err(|_| ViewGrantError::Concurrency)?;
+            .map_err(|_| {
+                record_view_grant_event("rejected", "concurrency");
+                ViewGrantError::Concurrency
+            })?;
         let grant = ResolvedViewGrant {
             scope: stored.scope.clone(),
             protocol_version: stored.protocol_version,
@@ -364,6 +418,18 @@ impl ViewGrantService {
         count
     }
 
+    pub(crate) fn begin_shutdown(&self) -> usize {
+        let mut state = self.lock_state();
+        state.accepting = false;
+        let grants = std::mem::take(&mut state.grants);
+        state.by_session.clear();
+        let count = grants.len();
+        for grant in grants.into_values() {
+            grant.cancellation.cancel();
+        }
+        count
+    }
+
     fn prune_expired_locked(&self, state: &mut ViewGrantState, now_unix: u64) {
         let expired = state
             .grants
@@ -372,6 +438,7 @@ impl ViewGrantService {
             .collect::<Vec<_>>();
         for hash in expired {
             if let Some(grant) = state.grants.remove(&hash) {
+                record_view_grant_event("expired", "ttl_elapsed");
                 grant.cancellation.cancel();
                 if let Some(session_grants) =
                     state.by_session.get_mut(&grant.scope.auth_session_id)
@@ -396,6 +463,14 @@ impl ViewGrantService {
     fn lock_state(&self) -> MutexGuard<'_, ViewGrantState> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn record_view_grant_event(outcome: &'static str, reason_code: &'static str) {
+    tracing::debug!(
+        event = "view_grant_lifecycle",
+        outcome,
+        reason_code,
+    );
 }
 
 #[async_trait]
@@ -634,11 +709,30 @@ mod tests {
         assert_eq!(resolved.grant.scope, expected);
         assert_eq!(
             resolved.grant.protocol_version,
-            crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER
+            pioneer_protocol::PIONEER_PROTOCOL_VERSION_NUMBER
         );
 
         let mut invalid = scope("2");
         invalid.version_id = "x".repeat(MAX_SCOPE_ID_BYTES + 1);
         assert!(matches!(service.mint(invalid), Err(ViewGrantError::InvalidScope)));
+    }
+
+    #[test]
+    fn shutdown_invalidates_existing_grants_and_rejects_new_work() {
+        let clock = Arc::new(TestClock::new(1_000));
+        let service = service(&config(), clock, 9);
+        let secret = extract_secret(service.mint(scope("1")).unwrap());
+        let lease = service.resolve(secret.as_str()).unwrap();
+
+        assert_eq!(service.begin_shutdown(), 1);
+        assert!(lease.invalidated());
+        assert!(matches!(
+            service.resolve(secret.as_str()),
+            Err(ViewGrantError::ShuttingDown)
+        ));
+        assert!(matches!(
+            service.mint(scope("2")),
+            Err(ViewGrantError::ShuttingDown)
+        ));
     }
 }

@@ -128,6 +128,11 @@ fn migrate_v2(
     if !reconfiguration_ids.is_empty() {
         reconfiguration_ids.sort();
         reconfiguration_ids.dedup();
+        tracing::warn!(
+            event = "gateway_registry_migration",
+            outcome = "reconfiguration_required",
+            reason_code = "ambiguous_custom_path",
+        );
         return Ok(GatewayRegistryLoad::ReconfigurationRequired {
             endpoint_ids: reconfiguration_ids,
         });
@@ -184,14 +189,21 @@ fn migrate_address(input: &str, local: bool) -> Result<GatewayBaseUrl, AddressMi
     {
         return GatewayBaseUrl::from_local_listen_addr(trimmed).map_err(map_base_error);
     }
-    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+    if trimmed.contains("://") {
         let mut url = Url::parse(trimmed).map_err(|_| AddressMigrationError::Invalid)?;
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(AddressMigrationError::Ambiguous);
         }
-        let scheme = if url.scheme() == "ws" { "http" } else { "https" };
-        url.set_scheme(scheme)
-            .map_err(|_| AddressMigrationError::Invalid)?;
+        match url.scheme() {
+            "ws" => url
+                .set_scheme("http")
+                .map_err(|_| AddressMigrationError::Invalid)?,
+            "wss" => url
+                .set_scheme("https")
+                .map_err(|_| AddressMigrationError::Invalid)?,
+            "http" | "https" => {}
+            _ => return Err(AddressMigrationError::Invalid),
+        }
         if local && matches!(url.host_str(), Some("0.0.0.0" | "::")) {
             let port = url
                 .port_or_known_default()
@@ -205,6 +217,13 @@ fn migrate_address(input: &str, local: bool) -> Result<GatewayBaseUrl, AddressMi
                 .map_err(map_base_error);
         }
         return GatewayBaseUrl::parse_presentation(url.as_str()).map_err(map_base_error);
+    }
+    // A v2 address did not distinguish a WebSocket route from an HTTP base
+    // prefix. Only a path-free authority can therefore be converted without
+    // guessing user intent. Custom base prefixes remain valid when entered
+    // explicitly into the v3 model.
+    if trimmed.contains(['/', '?', '#']) {
+        return Err(AddressMigrationError::Ambiguous);
     }
     GatewayBaseUrl::parse_presentation(trimmed).map_err(map_base_error)
 }
@@ -249,17 +268,25 @@ mod tests {
 
     #[test]
     fn v2_custom_websocket_path_requires_reconfiguration() {
-        let input = r#"{
-            "version":2,
-            "active_gateway_id":"custom",
-            "remotes":[{"id":"custom","name":"Custom","address":"wss://relay.example/socket","kind":"remote"}]
-        }"#;
-        assert_eq!(
-            load_registry_json(input).unwrap(),
-            GatewayRegistryLoad::ReconfigurationRequired {
-                endpoint_ids: vec!["custom".to_owned()]
-            }
-        );
+        for address in [
+            "wss://relay.example/socket",
+            "https://relay.example/socket",
+            "relay.example/socket",
+        ] {
+            let input = format!(
+                r#"{{
+                    "version":2,
+                    "active_gateway_id":"custom",
+                    "remotes":[{{"id":"custom","name":"Custom","address":"{address}","kind":"remote"}}]
+                }}"#
+            );
+            assert_eq!(
+                load_registry_json(input.as_str()).unwrap(),
+                GatewayRegistryLoad::ReconfigurationRequired {
+                    endpoint_ids: vec!["custom".to_owned()]
+                }
+            );
+        }
     }
 
     #[test]

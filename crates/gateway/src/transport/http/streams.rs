@@ -23,14 +23,20 @@ const MAX_TINY_RANGE_TRACKED_SESSIONS: usize = 1_024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamAdmissionError {
     GlobalCapacity,
+    PrincipalCapacity,
     SessionCapacity,
     RangeTooLarge,
     TinyRangeRate,
+    ShuttingDown,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HttpStreamConfigError;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HttpStreamLimits {
     global_streams: usize,
+    per_principal_streams: usize,
     per_session_streams: usize,
     open_handles: usize,
     max_single_range_bytes: u64,
@@ -42,25 +48,37 @@ pub(super) struct HttpStreamLimits {
 }
 
 impl HttpStreamLimits {
-    fn from_config(config: &GatewayArtifactsConfig) -> Self {
-        Self {
-            global_streams: config.http_streams_global.max(1),
-            per_session_streams: config
-                .http_streams_per_session
-                .max(1)
-                .min(config.http_streams_global.max(1)),
-            open_handles: config.http_open_handles.max(1),
-            max_single_range_bytes: config.http_max_single_range_bytes.max(1),
-            tiny_range_bytes: config.http_tiny_range_bytes.max(1),
-            tiny_range_window: Duration::from_secs(
-                config.http_tiny_range_window_secs.max(1),
-            ),
-            tiny_range_max_requests: config.http_tiny_range_max_requests.max(1),
-            open_timeout: Duration::from_secs(config.http_open_timeout_secs.max(1)),
-            body_idle_timeout: Duration::from_secs(
-                config.http_body_idle_timeout_secs.max(1),
-            ),
+    fn from_config(config: &GatewayArtifactsConfig) -> Result<Self, HttpStreamConfigError> {
+        if config.http_streams_global == 0
+            || config.http_streams_global > Semaphore::MAX_PERMITS
+            || config.http_streams_per_principal == 0
+            || config.http_streams_per_principal > config.http_streams_global
+            || config.http_streams_per_session == 0
+            || config.http_streams_per_session > config.http_streams_per_principal
+            || config.http_open_handles == 0
+            || config.http_open_handles > Semaphore::MAX_PERMITS
+            || config.http_max_single_range_bytes == 0
+            || config.http_tiny_range_bytes == 0
+            || config.http_tiny_range_bytes > config.http_max_single_range_bytes
+            || config.http_tiny_range_window_secs == 0
+            || config.http_tiny_range_max_requests == 0
+            || config.http_open_timeout_secs == 0
+            || config.http_body_idle_timeout_secs == 0
+        {
+            return Err(HttpStreamConfigError);
         }
+        Ok(Self {
+            global_streams: config.http_streams_global,
+            per_principal_streams: config.http_streams_per_principal,
+            per_session_streams: config.http_streams_per_session,
+            open_handles: config.http_open_handles,
+            max_single_range_bytes: config.http_max_single_range_bytes,
+            tiny_range_bytes: config.http_tiny_range_bytes,
+            tiny_range_window: Duration::from_secs(config.http_tiny_range_window_secs),
+            tiny_range_max_requests: config.http_tiny_range_max_requests,
+            open_timeout: Duration::from_secs(config.http_open_timeout_secs),
+            body_idle_timeout: Duration::from_secs(config.http_body_idle_timeout_secs),
+        })
     }
 
     pub(super) const fn open_timeout(self) -> Duration {
@@ -87,12 +105,26 @@ struct TinyRangeWindow {
     requests: usize,
 }
 
-#[derive(Debug, Default)]
 struct RegistryState {
+    accepting: bool,
     next_id: u64,
     active: HashMap<u64, ActiveStream>,
+    per_principal: HashMap<String, usize>,
     per_session: HashMap<String, usize>,
     tiny_ranges: HashMap<String, TinyRangeWindow>,
+}
+
+impl Default for RegistryState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            next_id: 0,
+            active: HashMap::new(),
+            per_principal: HashMap::new(),
+            per_session: HashMap::new(),
+            tiny_ranges: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -104,7 +136,6 @@ struct StreamMetrics {
     abandoned: AtomicU64,
 }
 
-#[derive(Debug)]
 pub(crate) struct HttpStreamRegistry {
     limits: HttpStreamLimits,
     global: Arc<Semaphore>,
@@ -113,16 +144,27 @@ pub(crate) struct HttpStreamRegistry {
     metrics: StreamMetrics,
 }
 
+impl std::fmt::Debug for HttpStreamRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpStreamRegistry")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpStreamRegistry {
-    pub(crate) fn new(config: &GatewayArtifactsConfig) -> Arc<Self> {
-        let limits = HttpStreamLimits::from_config(config);
-        Arc::new(Self {
+    pub(super) fn new(
+        config: &GatewayArtifactsConfig,
+    ) -> Result<Arc<Self>, HttpStreamConfigError> {
+        let limits = HttpStreamLimits::from_config(config)?;
+        Ok(Arc::new(Self {
             limits,
             global: Arc::new(Semaphore::new(limits.global_streams)),
             open_handles: Arc::new(Semaphore::new(limits.open_handles)),
             state: Mutex::new(RegistryState::default()),
             metrics: StreamMetrics::default(),
-        })
+        }))
     }
 
     pub(super) const fn limits(&self) -> HttpStreamLimits {
@@ -137,12 +179,15 @@ impl HttpStreamRegistry {
         if length > self.limits.max_single_range_bytes {
             return Err(StreamAdmissionError::RangeTooLarge);
         }
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(StreamAdmissionError::ShuttingDown);
+        }
         if length >= self.limits.tiny_range_bytes {
             return Ok(());
         }
 
         let now = Instant::now();
-        let mut state = self.lock_state();
         state
             .tiny_ranges
             .retain(|_, window| now.duration_since(window.started_at) < self.limits.tiny_range_window);
@@ -191,6 +236,19 @@ impl HttpStreamRegistry {
             .map_err(|_| StreamAdmissionError::GlobalCapacity)?;
 
         let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(StreamAdmissionError::ShuttingDown);
+        }
+        let principal_key = principal_id.to_owned();
+        if state
+            .per_principal
+            .get(&principal_key)
+            .copied()
+            .unwrap_or(0)
+            >= self.limits.per_principal_streams
+        {
+            return Err(StreamAdmissionError::PrincipalCapacity);
+        }
         let session_key = session_id.as_str().to_owned();
         if state.per_session.get(&session_key).copied().unwrap_or(0)
             >= self.limits.per_session_streams
@@ -200,19 +258,20 @@ impl HttpStreamRegistry {
         state.next_id = state
             .next_id
             .checked_add(1)
-            .expect("HTTP stream identifier exhausted");
+            .ok_or(StreamAdmissionError::GlobalCapacity)?;
         let stream_id = state.next_id;
         let cancellation = CancellationToken::new();
         state.active.insert(
             stream_id,
             ActiveStream {
                 session_id: session_key.clone(),
-                principal_id: principal_id.to_owned(),
+                principal_id: principal_key.clone(),
                 workspace_id: workspace_id.to_owned(),
                 artifact_id: artifact_id.to_owned(),
                 cancellation: cancellation.clone(),
             },
         );
+        *state.per_principal.entry(principal_key).or_insert(0) += 1;
         *state.per_session.entry(session_key).or_insert(0) += 1;
         drop(state);
 
@@ -257,6 +316,22 @@ impl HttpStreamRegistry {
         })
     }
 
+    pub(crate) fn begin_shutdown(&self) -> usize {
+        let cancellations = {
+            let mut state = self.lock_state();
+            state.accepting = false;
+            state
+                .active
+                .values()
+                .map(|stream| stream.cancellation.clone())
+                .collect::<Vec<_>>()
+        };
+        for cancellation in &cancellations {
+            cancellation.cancel();
+        }
+        cancellations.len()
+    }
+
     fn cancel_matching(&self, predicate: impl Fn(&ActiveStream) -> bool) -> usize {
         let cancellations = self
             .lock_state()
@@ -276,6 +351,12 @@ impl HttpStreamRegistry {
         let Some(stream) = state.active.remove(&stream_id) else {
             return;
         };
+        if let Some(active) = state.per_principal.get_mut(&stream.principal_id) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                state.per_principal.remove(&stream.principal_id);
+            }
+        }
         if let Some(active) = state.per_session.get_mut(&stream.session_id) {
             *active = active.saturating_sub(1);
             if *active == 0 {
@@ -295,8 +376,8 @@ impl HttpStreamRegistry {
         tracing::debug!(
             event = "http_storage_stream_finished",
             outcome = outcome.safe_name(),
-            bytes_bucket = bytes_bucket(bytes),
-            duration_bucket = duration_bucket(duration),
+            bytes_sent = bytes,
+            reason_code = duration_bucket(duration),
         );
     }
 
@@ -307,12 +388,12 @@ impl HttpStreamRegistry {
     }
 
     #[cfg(test)]
-    fn active_count(&self) -> usize {
+    pub(super) fn active_count(&self) -> usize {
         self.lock_state().active.len()
     }
 
     #[cfg(test)]
-    fn metrics_observation(&self) -> (u64, u64, u64, u64, u64) {
+    pub(super) fn metrics_observation(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.metrics.completed.load(Ordering::Relaxed),
             self.metrics.cancelled.load(Ordering::Relaxed),
@@ -331,6 +412,16 @@ impl AuthSessionDisconnectHook for HttpStreamRegistry {
         _reason: AuthSessionTerminationReason,
     ) {
         self.cancel_session(session_id);
+    }
+}
+
+impl crate::message::ArtifactStreamInvalidation for HttpStreamRegistry {
+    fn cancel_artifact(&self, workspace_id: &str, artifact_id: &str) -> usize {
+        HttpStreamRegistry::cancel_artifact(self, workspace_id, artifact_id)
+    }
+
+    fn cancel_authorization_signal(&self, signal: &AccessChangeSignal) -> usize {
+        HttpStreamRegistry::cancel_authorization_signal(self, signal)
     }
 }
 
@@ -394,11 +485,18 @@ impl HttpStreamLease {
 impl Drop for HttpStreamLease {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
+            let outcome = if self.outcome == StreamOutcome::Abandoned
+                && self.cancellation.is_cancelled()
+            {
+                StreamOutcome::Cancelled
+            } else {
+                self.outcome
+            };
             registry.release(
                 self.stream_id,
                 self.bytes,
                 self.started_at.elapsed(),
-                self.outcome,
+                outcome,
             );
         }
         self.open_handle_permit.take();
@@ -430,6 +528,18 @@ impl<R> ManagedArtifactReader<R> {
             idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
         }
     }
+
+    pub(super) fn cancellation_token(&self) -> CancellationToken {
+        self.lease.cancellation.clone()
+    }
+
+    pub(super) fn mark_cancelled(&mut self) {
+        self.lease.set_outcome(StreamOutcome::Cancelled);
+    }
+
+    pub(super) fn mark_idle_timeout(&mut self) {
+        self.lease.set_outcome(StreamOutcome::IdleTimeout);
+    }
 }
 
 impl<R> AsyncRead for ManagedArtifactReader<R>
@@ -442,6 +552,10 @@ where
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if this.remaining == 0 {
+            this.lease.set_outcome(StreamOutcome::Completed);
+            return Poll::Ready(Ok(()));
+        }
         if this.lease.cancelled() || this.lease.cancellation_wait.as_mut().poll(cx).is_ready() {
             this.lease.set_outcome(StreamOutcome::Cancelled);
             return Poll::Ready(Err(io::Error::new(
@@ -456,26 +570,33 @@ where
                 "artifact stream made no progress before idle timeout",
             )));
         }
-
-        let filled_before = buffer.filled().len();
-        let requested_before = buffer.remaining();
-        match Pin::new(&mut this.reader).poll_read(cx, buffer) {
+        let maximum_read = usize::try_from(this.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.remaining());
+        if maximum_read == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let (result, bytes) = {
+            let initialized = buffer.initialize_unfilled_to(maximum_read);
+            let mut limited = ReadBuf::new(&mut initialized[..maximum_read]);
+            let result = Pin::new(&mut this.reader).poll_read(cx, &mut limited);
+            (result, limited.filled().len())
+        };
+        match result {
             Poll::Ready(Ok(())) => {
-                let bytes = buffer.filled().len().saturating_sub(filled_before);
-                if bytes == 0 && requested_before > 0 && this.remaining > 0 {
+                if bytes == 0 {
                     this.lease.set_outcome(StreamOutcome::Failed);
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "artifact stream ended before the declared content length",
                     )));
                 }
-                if bytes > 0 {
-                    this.lease.record_bytes(bytes);
-                    this.remaining = this.remaining.saturating_sub(bytes as u64);
-                    this.idle_sleep
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + this.idle_timeout);
-                }
+                buffer.advance(bytes);
+                this.lease.record_bytes(bytes);
+                this.remaining -= bytes as u64;
+                this.idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle_timeout);
                 if this.remaining == 0 {
                     this.lease.set_outcome(StreamOutcome::Completed);
                 }
@@ -487,16 +608,6 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-const fn bytes_bucket(bytes: u64) -> &'static str {
-    match bytes {
-        0 => "zero",
-        1..=65_535 => "lt_64k",
-        65_536..=1_048_575 => "lt_1m",
-        1_048_576..=16_777_215 => "lt_16m",
-        _ => "gte_16m",
     }
 }
 
@@ -580,6 +691,7 @@ mod tests {
     fn config() -> GatewayArtifactsConfig {
         GatewayArtifactsConfig {
             http_streams_global: 2,
+            http_streams_per_principal: 2,
             http_streams_per_session: 1,
             http_open_handles: 2,
             http_max_single_range_bytes: 64,
@@ -597,8 +709,61 @@ mod tests {
     }
 
     #[test]
+    fn invalid_stream_limits_are_rejected_instead_of_silently_clamped() {
+        let mut invalid = config();
+        invalid.http_streams_global = 0;
+        assert_eq!(
+            HttpStreamRegistry::new(&invalid).unwrap_err(),
+            HttpStreamConfigError
+        );
+
+        let mut invalid = config();
+        invalid.http_streams_per_principal = invalid.http_streams_global + 1;
+        assert_eq!(
+            HttpStreamRegistry::new(&invalid).unwrap_err(),
+            HttpStreamConfigError
+        );
+
+        let mut invalid = config();
+        invalid.http_streams_per_session = invalid.http_streams_global + 1;
+        assert_eq!(
+            HttpStreamRegistry::new(&invalid).unwrap_err(),
+            HttpStreamConfigError
+        );
+
+        let mut invalid = config();
+        invalid.http_tiny_range_bytes = invalid.http_max_single_range_bytes + 1;
+        assert_eq!(
+            HttpStreamRegistry::new(&invalid).unwrap_err(),
+            HttpStreamConfigError
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_existing_streams_and_rejects_late_admission() {
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
+        let session = session("S00000000000000000001");
+        let existing = registry
+            .acquire(&session, "principal-a", "workspace-a", "artifact-a")
+            .unwrap();
+
+        assert_eq!(registry.begin_shutdown(), 1);
+        assert!(existing.cancelled());
+        assert!(matches!(
+            registry.acquire(&session, "principal-a", "workspace-a", "artifact-b"),
+            Err(StreamAdmissionError::ShuttingDown)
+        ));
+        assert_eq!(
+            registry.admit_range(&session, 8),
+            Err(StreamAdmissionError::ShuttingDown)
+        );
+        drop(existing);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
     fn permits_are_bounded_targeted_and_released_exactly_once() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let first_session = session("S00000000000000000001");
         let second_session = session("S00000000000000000002");
         let first = registry
@@ -626,8 +791,54 @@ mod tests {
     }
 
     #[test]
+    fn principal_capacity_spans_independent_auth_sessions() {
+        let mut config = config();
+        config.http_streams_global = 3;
+        config.http_streams_per_principal = 2;
+        config.http_streams_per_session = 1;
+        config.http_open_handles = 3;
+        let registry = HttpStreamRegistry::new(&config).unwrap();
+        let first = registry
+            .acquire(
+                &session("S00000000000000000001"),
+                "principal-a",
+                "workspace-a",
+                "artifact-a",
+            )
+            .unwrap();
+        let second = registry
+            .acquire(
+                &session("S00000000000000000002"),
+                "principal-a",
+                "workspace-a",
+                "artifact-b",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.acquire(
+                &session("S00000000000000000003"),
+                "principal-a",
+                "workspace-a",
+                "artifact-c",
+            ),
+            Err(StreamAdmissionError::PrincipalCapacity)
+        ));
+        drop(first);
+        assert!(registry
+            .acquire(
+                &session("S00000000000000000003"),
+                "principal-a",
+                "workspace-a",
+                "artifact-c",
+            )
+            .is_ok());
+        drop(second);
+    }
+
+    #[test]
     fn committed_access_change_cancels_only_matching_principal_and_workspace() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let first_session = session("S00000000000000000001");
         let second_session = session("S00000000000000000002");
         let first = registry
@@ -655,7 +866,7 @@ mod tests {
 
     #[test]
     fn range_size_and_tiny_range_policy_are_bounded() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let session = session("S00000000000000000001");
         assert_eq!(
             registry.admit_range(&session, 65),
@@ -672,7 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_and_repeated_drop_release_only_the_target_stream() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let first_session = session("S00000000000000000001");
         let second_session = session("S00000000000000000002");
         let first_lease = registry
@@ -696,7 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_timeout_has_no_download_wall_clock_and_large_reader_is_constant_memory() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let session = session("S00000000000000000001");
         let idle_lease = registry
             .acquire(&session, "principal-a", "workspace-a", "artifact-a")
@@ -729,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_fault_and_truncation_release_handles_with_stable_failure_outcomes() {
-        let registry = HttpStreamRegistry::new(&config());
+        let registry = HttpStreamRegistry::new(&config()).unwrap();
         let session = session("S00000000000000000001");
 
         let failed_lease = registry
@@ -771,6 +982,25 @@ mod tests {
         drop(truncated);
         assert_eq!(registry.active_count(), 0);
         assert_eq!(registry.metrics_observation().3, 2);
+
+        let bounded_lease = registry
+            .acquire(&session, "principal-a", "workspace-a", "artifact-bounded")
+            .unwrap();
+        let mut bounded = ManagedArtifactReader::new(
+            RepeatedReader {
+                remaining: 8,
+                byte: 0x63,
+                max_read: 8,
+            },
+            4,
+            bounded_lease,
+            Duration::from_secs(60),
+        );
+        let mut exact = Vec::new();
+        bounded.read_to_end(&mut exact).await.unwrap();
+        assert_eq!(exact, b"cccc");
+        drop(bounded);
+        assert_eq!(registry.metrics_observation().0, 1);
 
         let replacement = registry
             .acquire(&session, "principal-a", "workspace-a", "artifact-replacement")

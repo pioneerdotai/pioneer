@@ -24,7 +24,7 @@ impl MessageProcessor {
         let service = match InvitationService::with_rate_limits(
             (*self.crud_store).clone(),
             self.gateway_secrets.clone(),
-            self.invitation_endpoint.as_ref(),
+            self.invitation_gateway_base_url.as_ref().clone(),
             self.epic5_rate_limits.clone(),
         ) {
             Ok(service) => service,
@@ -166,7 +166,7 @@ impl MessageProcessor {
         InvitationService::with_rate_limits(
             (*self.crud_store).clone(),
             self.gateway_secrets.clone(),
-            self.invitation_endpoint.as_ref(),
+            self.invitation_gateway_base_url.as_ref().clone(),
             self.epic5_rate_limits.clone(),
         )
     }

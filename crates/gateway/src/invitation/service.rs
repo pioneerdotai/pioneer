@@ -8,13 +8,14 @@ use pioneer_crud::{
 };
 use pioneer_protocol::{
     ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, INVITATION_MAX_WORKSPACE_GRANTS,
+    GatewayBaseUrl,
     InvitationAcceptParams, InvitationAcceptResponse, InvitationCreateParams,
     InvitationCreateResponse, InvitationCredential, InvitationErrorReason, InvitationId,
     InvitationInviterSummary, InvitationListParams, InvitationListResponse, InvitationPresentation,
     InvitationPreviewResponse, InvitationRevokeParams, InvitationRevokeReason,
     InvitationRevokeResponse, InvitationStatus, InvitationSummary, InvitationTransportSecurity,
     InvitationWorkspaceSummary, MemberSummary, PersistedActorRef, PrincipalId, PrincipalKind,
-    PrincipalStatus, RoleKey, WorkspaceId, generate_id, normalize_protected_gateway_endpoint,
+    PrincipalStatus, RoleKey, WorkspaceId, generate_id,
 };
 use sea_orm::{
     DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait,
@@ -48,7 +49,7 @@ const INVITATION_CREDENTIAL_KEY_MIN_BYTES: usize = 32;
 pub(crate) struct InvitationService {
     store: CrudStore,
     secrets: Arc<GatewaySecrets>,
-    protected_endpoint: String,
+    gateway_base_url: GatewayBaseUrl,
     audit: AdministrativeAuditWriter,
     rate_limits: Arc<Epic5RateLimits>,
 }
@@ -272,12 +273,14 @@ impl InvitationService {
     pub(crate) fn new(
         store: CrudStore,
         secrets: Arc<GatewaySecrets>,
-        protected_endpoint: impl Into<String>,
+        gateway_base_url: impl AsRef<str>,
     ) -> Result<Self, InvitationServiceError> {
+        let gateway_base_url = GatewayBaseUrl::parse_presentation(gateway_base_url.as_ref())
+            .map_err(|error| InvitationServiceError::Unavailable(Error::msg(error)))?;
         Self::with_rate_limits(
             store,
             secrets,
-            protected_endpoint,
+            gateway_base_url,
             Arc::new(Epic5RateLimits::default()),
         )
     }
@@ -285,16 +288,13 @@ impl InvitationService {
     pub(crate) fn with_rate_limits(
         store: CrudStore,
         secrets: Arc<GatewaySecrets>,
-        protected_endpoint: impl Into<String>,
+        gateway_base_url: GatewayBaseUrl,
         rate_limits: Arc<Epic5RateLimits>,
     ) -> Result<Self, InvitationServiceError> {
-        let protected_endpoint =
-            normalize_protected_gateway_endpoint(protected_endpoint.into().as_str())
-                .map_err(|error| InvitationServiceError::Unavailable(Error::msg(error)))?;
         Ok(Self {
             store,
             secrets,
-            protected_endpoint,
+            gateway_base_url,
             audit: AdministrativeAuditWriter,
             rate_limits,
         })
@@ -483,7 +483,7 @@ impl InvitationService {
         let summary =
             invitation_summary(projection, now).map_err(InvitationServiceError::Unavailable)?;
         let presentation = InvitationPresentation::new(
-            self.protected_endpoint.clone(),
+            self.gateway_base_url.clone(),
             principal.gateway_id.clone(),
             issued.into_credential(),
         )
@@ -1750,8 +1750,8 @@ mod tests {
             pioneer_protocol::INVITATION_TTL_SECONDS
         );
         assert_eq!(
-            response.presentation.protected_endpoint,
-            "ws://127.0.0.1:17878"
+            response.presentation.gateway_base_url.as_str(),
+            "http://127.0.0.1:17878/"
         );
         let rows = invitation::Entity::find()
             .all(&harness.database)
@@ -1951,7 +1951,7 @@ mod tests {
         let service = InvitationService::new(
             store,
             Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "ws://127.0.0.1:17878",
+            "http://127.0.0.1:17878",
         )
         .unwrap();
 
@@ -2421,7 +2421,8 @@ mod tests {
         let store = CrudStore::new(harness.database.clone());
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
-            InvitationService::new(store.clone(), secrets.clone(), "ws://127.0.0.1:17878").unwrap();
+            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
+                .unwrap();
         let principal = member_a();
         let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
         let created = service
@@ -2489,7 +2490,8 @@ mod tests {
         let store = CrudStore::new(harness.database.clone());
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
-            InvitationService::new(store.clone(), secrets.clone(), "ws://127.0.0.1:17878").unwrap();
+            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
+                .unwrap();
         let principal = member_a();
         let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
         let created = service
@@ -2559,7 +2561,8 @@ mod tests {
         let store = CrudStore::new(harness.database.clone());
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
-            InvitationService::new(store.clone(), secrets.clone(), "ws://127.0.0.1:17878").unwrap();
+            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
+                .unwrap();
         let inviter = member_a();
         let workspace_ids = vec![
             WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),

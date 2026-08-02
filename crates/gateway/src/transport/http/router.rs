@@ -1,4 +1,5 @@
 use axum::Router;
+use axum::middleware;
 use axum::routing::get;
 
 use super::GatewayHttpState;
@@ -26,6 +27,7 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
             "/storage/members/{principal_id}/avatar/{avatar_revision}",
             get(member_avatar_route).head(member_avatar_route),
         )
+        .layer(middleware::from_fn(super::header_policy::enforce))
         .with_state(state)
 }
 

@@ -1,8 +1,9 @@
 use axum::http::HeaderMap;
 
-pub(crate) const PIONEER_PROTOCOL_VERSION_HEADER: &str = "Pioneer-Protocol-Version";
-pub(crate) const PIONEER_PROTOCOL_VERSION: &str = "1";
-pub(crate) const PIONEER_PROTOCOL_VERSION_NUMBER: u16 = 1;
+pub(crate) use pioneer_protocol::{
+    PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
+    PIONEER_PROTOCOL_VERSION_NUMBER,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidProtocolVersion;

@@ -1,13 +1,12 @@
 mod auth;
 mod avatars;
-mod artifacts;
 mod content;
 mod errors;
+pub(crate) mod header_policy;
 mod health;
 mod router;
 mod state;
 pub(crate) mod streams;
-pub(crate) mod view_grants;
 mod views;
 
 pub(crate) use router::gateway_router;

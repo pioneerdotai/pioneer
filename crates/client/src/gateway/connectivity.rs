@@ -8,8 +8,7 @@ use std::{
 };
 
 use super::endpoint::GatewayBaseUrl;
-
-pub const DEFAULT_GATEWAY_PORT: u16 = 17878;
+pub use pioneer_protocol::DEFAULT_GATEWAY_PORT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayAddressError {

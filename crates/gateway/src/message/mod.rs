@@ -39,6 +39,11 @@ mod workspace_handlers;
 
 pub use summary::SummaryConfig;
 
+pub(crate) trait ArtifactStreamInvalidation: Send + Sync {
+    fn cancel_artifact(&self, workspace_id: &str, artifact_id: &str) -> usize;
+    fn cancel_authorization_signal(&self, signal: &AccessChangeSignal) -> usize;
+}
+
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
@@ -385,8 +390,9 @@ pub struct MessageProcessor {
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
-    http_stream_registry: Arc<StdRwLock<Option<Weak<crate::transport::HttpStreamRegistry>>>>,
-    view_grant_service: Arc<StdRwLock<Option<Weak<crate::transport::ViewGrantService>>>>,
+    artifact_stream_invalidation:
+        Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
+    view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
     auth_service: Option<Arc<GatewayAuthService>>,
     epic5_rate_limits: Arc<crate::epic5_observability::Epic5RateLimits>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
@@ -397,7 +403,7 @@ pub struct MessageProcessor {
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
-    invitation_endpoint: Arc<str>,
+    invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
@@ -716,7 +722,7 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
-            http_stream_registry: Arc::new(StdRwLock::new(None)),
+            artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
             epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
@@ -727,7 +733,12 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
-            invitation_endpoint: Arc::from("ws://127.0.0.1:17878"),
+            invitation_gateway_base_url: Arc::new(
+                pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                    "http://127.0.0.1:17878",
+                )
+                .expect("static Gateway base URL is valid"),
+            ),
             summary_config: Arc::new(summary_config),
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -1069,19 +1080,20 @@ impl MessageProcessor {
         )
     }
 
-    pub(crate) fn set_http_stream_registry(
+    pub(crate) fn set_artifact_stream_invalidation(
         &self,
-        registry: Arc<crate::transport::HttpStreamRegistry>,
+        invalidation: Arc<dyn ArtifactStreamInvalidation>,
     ) {
         *self
-            .http_stream_registry
+            .artifact_stream_invalidation
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&registry));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::downgrade(&invalidation));
     }
 
     pub(crate) fn set_view_grant_service(
         &self,
-        service: Arc<crate::transport::ViewGrantService>,
+        service: Arc<crate::view_grants::ViewGrantService>,
     ) {
         *self
             .view_grant_service
@@ -1091,7 +1103,7 @@ impl MessageProcessor {
 
     pub(in crate::message) fn view_grant_service(
         &self,
-    ) -> Option<Arc<crate::transport::ViewGrantService>> {
+    ) -> Option<Arc<crate::view_grants::ViewGrantService>> {
         self.view_grant_service
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1099,37 +1111,40 @@ impl MessageProcessor {
             .and_then(Weak::upgrade)
     }
 
-    pub(crate) fn cancel_http_artifact_streams(
+    pub(crate) fn cancel_artifact_streams(
         &self,
         workspace_id: &str,
         artifact_id: &str,
     ) -> usize {
-        self.http_stream_registry()
-            .map(|registry| registry.cancel_artifact(workspace_id, artifact_id))
+        self.artifact_stream_invalidation()
+            .map(|invalidation| invalidation.cancel_artifact(workspace_id, artifact_id))
             .unwrap_or(0)
     }
 
-    pub(crate) fn cancel_http_streams_for_access_change(
+    pub(crate) fn cancel_artifact_streams_for_access_change(
         &self,
         signal: &AccessChangeSignal,
     ) -> usize {
-        self.http_stream_registry()
-            .map(|registry| registry.cancel_authorization_signal(signal))
+        self.artifact_stream_invalidation()
+            .map(|invalidation| invalidation.cancel_authorization_signal(signal))
             .unwrap_or(0)
     }
 
-    fn http_stream_registry(
+    fn artifact_stream_invalidation(
         &self,
-    ) -> Option<Arc<crate::transport::HttpStreamRegistry>> {
-        self.http_stream_registry
+    ) -> Option<Arc<dyn ArtifactStreamInvalidation>> {
+        self.artifact_stream_invalidation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(Weak::upgrade)
     }
 
-    pub(crate) fn with_invitation_endpoint(mut self, endpoint: impl Into<Arc<str>>) -> Self {
-        self.invitation_endpoint = endpoint.into();
+    pub(crate) fn with_invitation_gateway_base_url(
+        mut self,
+        gateway_base_url: pioneer_protocol::GatewayBaseUrl,
+    ) -> Self {
+        self.invitation_gateway_base_url = Arc::new(gateway_base_url);
         self
     }
 
@@ -2735,7 +2750,7 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
-            http_stream_registry: Arc::new(StdRwLock::new(None)),
+            artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
             epic5_rate_limits: Arc::new(crate::epic5_observability::Epic5RateLimits::default()),
@@ -2746,7 +2761,12 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
-            invitation_endpoint: Arc::from("ws://127.0.0.1:17878"),
+            invitation_gateway_base_url: Arc::new(
+                pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                    "http://127.0.0.1:17878",
+                )
+                .expect("static Gateway base URL is valid"),
+            ),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),

@@ -6,6 +6,7 @@ mod artifact;
 mod audit;
 mod auth;
 mod cli_runtime;
+mod gateway_endpoint;
 mod id;
 mod identity;
 mod invitation;
@@ -70,11 +71,10 @@ pub use auth::{
     AuthSessionStatus, AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind,
     CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET, DEVICE_ACTIVATION_CODE_SYMBOLS,
     DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS,
-    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, MAX_PROTECTED_GATEWAY_ENDPOINT_BYTES,
-    MAX_PROTECTED_GATEWAY_URI_BYTES, REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX,
+    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, MAX_PROTECTED_GATEWAY_URI_BYTES,
+    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX,
     device_activation_locator, encode_device_activation_entropy, format_device_activation_code,
     normalize_device_activation_code, normalize_device_activation_code_input,
-    normalize_protected_gateway_endpoint,
 };
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
@@ -97,6 +97,11 @@ pub use cli_runtime::{
     RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
     sanitize_runtime_diagnostic_lines,
+};
+pub use gateway_endpoint::{
+    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,
+    PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
+    PIONEER_PROTOCOL_VERSION_NUMBER, canonical_storage_path,
 };
 pub use id::{
     ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, AdministrationDomainIdError, AuditEventId,

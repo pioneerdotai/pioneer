@@ -16,11 +16,11 @@
 //!   atomically renamed to the final path.
 
 use std::{
+    collections::HashMap,
     fmt,
-    fs::File as StdFile,
     io::Read as _,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncWriteExt as _, BufWriter},
+    io::{AsyncReadExt as _, AsyncWriteExt as _, BufWriter},
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     artifacts::download::{
         ArtifactHttpDownloadCachePaths, build_artifact_http_download_cache_path,
+    },
+    local_file::{
+        configure_std_no_follow, configure_tokio_no_follow, ensure_owned_directory,
+        metadata_is_plain_file,
     },
     platform::ClientPath,
     transport::http::{
@@ -46,6 +50,7 @@ use crate::{
 const PARTIAL_METADATA_VERSION: u8 = 1;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_NAME_BYTES: usize = 1_024;
+const MAX_PARTIAL_METADATA_BYTES: u64 = 16 * 1024;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,7 +158,6 @@ impl ArtifactDownloadHttp for GatewayHttpSession {
 pub struct ArtifactHttpDownloadService {
     http: Arc<dyn ArtifactDownloadHttp>,
     runtime_home: PathBuf,
-    operation_gate: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for ArtifactHttpDownloadService {
@@ -170,7 +174,6 @@ impl ArtifactHttpDownloadService {
         Self {
             http: Arc::new(http),
             runtime_home: runtime_home.into(),
-            operation_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -180,11 +183,12 @@ impl ArtifactHttpDownloadService {
         cancellation: CancellationToken,
         progress: Option<&dyn ArtifactHttpDownloadProgressSink>,
     ) -> Result<ArtifactHttpDownloadResult, ArtifactHttpDownloadError> {
-        let _operation = self.operation_gate.lock().await;
         let request = ValidatedRequest::new(request)?;
         let paths = OwnedDownloadPaths::new(self.runtime_home.as_path(), &request)?;
+        let operation_gate = download_gate_for(paths.cache.final_path.as_path());
+        let _operation = operation_gate.lock().await;
         ensure_not_cancelled(&cancellation)?;
-        fs::create_dir_all(paths.parent())
+        ensure_owned_directory(self.runtime_home.as_path(), paths.parent())
             .await
             .map_err(map_disk_error)?;
 
@@ -319,7 +323,7 @@ impl ArtifactHttpDownloadService {
             || response.head.content_length != Some(request.expected_size_bytes)
             || response.head.etag.as_deref() != Some(request.expected_etag.as_str())
         {
-            return Err(ArtifactHttpDownloadError::Integrity);
+            return Err(integrity_failure("head_metadata_mismatch"));
         }
         Ok(CurrentRepresentation {
             etag: request.expected_etag.clone(),
@@ -351,9 +355,23 @@ impl ArtifactHttpDownloadService {
         Self {
             http,
             runtime_home: runtime_home.into(),
-            operation_gate: Arc::new(Mutex::new(())),
         }
     }
+}
+
+fn download_gate_for(target: &Path) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let gates = GATES.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(target).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(target.to_owned(), Arc::downgrade(&gate));
+    gate
 }
 
 #[derive(Clone)]
@@ -372,11 +390,17 @@ impl ValidatedRequest {
     fn new(request: ArtifactHttpDownloadRequest) -> Result<Self, ArtifactHttpDownloadError> {
         for value in [
             request.gateway_profile_id.as_str(),
+        ] {
+            if value.trim().is_empty() || value.len() > MAX_ID_BYTES || value.contains('\0') {
+                return Err(ArtifactHttpDownloadError::InvalidRequest);
+            }
+        }
+        for value in [
             request.workspace_id.as_str(),
             request.artifact_id.as_str(),
             request.version_id.as_str(),
         ] {
-            if value.trim().is_empty() || value.len() > MAX_ID_BYTES || value.contains('\0') {
+            if !valid_storage_path_segment(value) {
                 return Err(ArtifactHttpDownloadError::InvalidRequest);
             }
         }
@@ -407,9 +431,9 @@ impl ValidatedRequest {
     fn storage_path(&self) -> String {
         format!(
             "storage/workspaces/{}/artifacts/{}/versions/{}/content",
-            encode_path_segment(self.workspace_id.as_str()),
-            encode_path_segment(self.artifact_id.as_str()),
-            encode_path_segment(self.version_id.as_str()),
+            self.workspace_id,
+            self.artifact_id,
+            self.version_id,
         )
     }
 
@@ -524,7 +548,7 @@ fn validate_get_response(
     resume_from: u64,
 ) -> Result<DownloadResponseMode, ArtifactHttpDownloadError> {
     if response.head.etag.as_deref() != Some(representation.etag.as_str()) {
-        return Err(ArtifactHttpDownloadError::Integrity);
+        return Err(integrity_failure("get_etag_mismatch"));
     }
     if resume_from == 0 {
         return if response.head.status == 200
@@ -564,14 +588,18 @@ async fn load_resume_offset(
     request: &ValidatedRequest,
     representation: &CurrentRepresentation,
 ) -> Result<u64, ArtifactHttpDownloadError> {
-    let part_length = match fs::metadata(paths.cache.part_path.as_path()).await {
-        Ok(metadata) if metadata.is_file() => Some(metadata.len()),
-        Ok(_) => None,
+    let part_length = match fs::symlink_metadata(paths.cache.part_path.as_path()).await {
+        Ok(metadata) if metadata_is_plain_file(&metadata) => Some(metadata.len()),
+        Ok(_) => {
+            cleanup_partial(paths).await;
+            return Ok(0);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(map_disk_error(error)),
     };
-    let metadata = match fs::read(paths.metadata.as_path()).await {
-        Ok(bytes) => serde_json::from_slice::<PartialDownloadMetadata>(bytes.as_slice()).ok(),
+    let metadata = match read_owned_metadata(paths.metadata.as_path()).await {
+        Ok(Some(bytes)) => serde_json::from_slice::<PartialDownloadMetadata>(bytes.as_slice()).ok(),
+        Ok(None) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(map_disk_error(error)),
     };
@@ -594,16 +622,30 @@ async fn open_partial_file(
     resume_from: u64,
 ) -> Result<File, ArtifactHttpDownloadError> {
     let mut options = OpenOptions::new();
-    options.create(true).write(true);
+    options.write(true);
     if resume_from == 0 {
-        options.truncate(true);
+        options.create_new(true);
     } else {
+        let metadata = fs::symlink_metadata(paths.cache.part_path.as_path())
+            .await
+            .map_err(map_disk_error)?;
+        if !metadata_is_plain_file(&metadata) {
+            return Err(ArtifactHttpDownloadError::DiskWrite);
+        }
         options.append(true);
     }
-    options
+    configure_tokio_no_follow(&mut options);
+    let file = options
         .open(paths.cache.part_path.as_path())
         .await
-        .map_err(map_disk_error)
+        .map_err(map_disk_error)?;
+    let opened_metadata = file.metadata().await.map_err(map_disk_error)?;
+    if !metadata_is_plain_file(&opened_metadata)
+        || (resume_from > 0 && opened_metadata.len() != resume_from)
+    {
+        return Err(ArtifactHttpDownloadError::DiskWrite);
+    }
+    Ok(file)
 }
 
 async fn persist_partial_metadata(
@@ -611,9 +653,26 @@ async fn persist_partial_metadata(
     metadata: &PartialDownloadMetadata,
 ) -> Result<(), ArtifactHttpDownloadError> {
     let bytes = serde_json::to_vec(metadata).map_err(|_| ArtifactHttpDownloadError::DiskWrite)?;
-    let mut file = File::create(paths.metadata_temp.as_path())
+    match fs::symlink_metadata(paths.metadata_temp.as_path()).await {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(paths.metadata_temp.as_path())
+                .await
+                .map_err(map_disk_error)?;
+        }
+        Ok(_) => return Err(ArtifactHttpDownloadError::DiskWrite),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_disk_error(error)),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_tokio_no_follow(&mut options);
+    let mut file = options
+        .open(paths.metadata_temp.as_path())
         .await
         .map_err(map_disk_error)?;
+    if !metadata_is_plain_file(&file.metadata().await.map_err(map_disk_error)?) {
+        return Err(ArtifactHttpDownloadError::DiskWrite);
+    }
     file.write_all(bytes.as_slice()).await.map_err(map_disk_error)?;
     file.sync_all().await.map_err(map_disk_error)?;
     drop(file);
@@ -626,17 +685,29 @@ async fn persist_partial_metadata(
             .await
             .map_err(map_disk_error)?;
     }
+    sync_parent_directory(paths.parent()).await?;
     Ok(())
 }
 
 async fn restore_partial_length(paths: &OwnedDownloadPaths, length: u64) {
-    if let Ok(file) = OpenOptions::new()
-        .write(true)
-        .open(paths.cache.part_path.as_path())
-        .await
-    {
-        let _ = file.set_len(length).await;
-        let _ = file.sync_all().await;
+    let Ok(metadata) = fs::symlink_metadata(paths.cache.part_path.as_path()).await else {
+        return;
+    };
+    if !metadata_is_plain_file(&metadata) {
+        return;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true);
+    configure_tokio_no_follow(&mut options);
+    if let Ok(file) = options.open(paths.cache.part_path.as_path()).await {
+        if file
+            .metadata()
+            .await
+            .is_ok_and(|metadata| metadata_is_plain_file(&metadata))
+        {
+            let _ = file.set_len(length).await;
+            let _ = file.sync_all().await;
+        }
     }
 }
 
@@ -654,52 +725,103 @@ async fn quarantine_invalid_final(
     paths: &OwnedDownloadPaths,
     request: &ValidatedRequest,
 ) -> Result<(), ArtifactHttpDownloadError> {
-    if !path_is_file(paths.cache.final_path.as_path()).await? {
-        return Ok(());
+    match fs::symlink_metadata(paths.cache.final_path.as_path()).await {
+        Ok(metadata) if metadata_is_plain_file(&metadata) => {
+            if verified_file(paths.cache.final_path.as_path(), request).await? {
+                return Ok(());
+            }
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(ArtifactHttpDownloadError::DiskWrite),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(map_disk_error(error)),
     }
-    if verified_file(paths.cache.final_path.as_path(), request).await? {
-        return Ok(());
-    }
-    let quarantine = append_file_suffix(paths.cache.final_path.as_path(), ".invalid")?;
-    let _ = fs::remove_file(quarantine.as_path()).await;
-    fs::rename(paths.cache.final_path.as_path(), quarantine.as_path())
+    fs::remove_file(paths.cache.final_path.as_path())
         .await
         .map_err(map_disk_error)?;
-    let _ = fs::remove_file(quarantine.as_path()).await;
-    Ok(())
+    sync_parent_directory(paths.parent()).await
 }
 
 async fn finalize_complete_partial(
     paths: OwnedDownloadPaths,
     request: ValidatedRequest,
 ) -> Result<ArtifactHttpDownloadResult, ArtifactHttpDownloadError> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    configure_tokio_no_follow(&mut options);
+    let file = options
+        .open(paths.cache.part_path.as_path())
+        .await
+        .map_err(map_disk_error)?;
+    if !metadata_is_plain_file(&file.metadata().await.map_err(map_disk_error)?) {
+        return Err(ArtifactHttpDownloadError::DiskWrite);
+    }
+    file.sync_all().await.map_err(map_disk_error)?;
     if !verified_file(paths.cache.part_path.as_path(), &request).await? {
         cleanup_partial(&paths).await;
-        return Err(ArtifactHttpDownloadError::Integrity);
+        return Err(integrity_failure("downloaded_content_mismatch"));
     }
-    if path_is_file(paths.cache.final_path.as_path()).await? {
+    if path_is_regular_file(paths.cache.final_path.as_path()).await? {
         if verified_file(paths.cache.final_path.as_path(), &request).await? {
             cleanup_partial(&paths).await;
             return Ok(request.result(paths.cache.final_path));
         }
         quarantine_invalid_final(&paths, &request).await?;
     }
-    fs::rename(
+    match fs::hard_link(
         paths.cache.part_path.as_path(),
         paths.cache.final_path.as_path(),
     )
     .await
-    .map_err(map_disk_error)?;
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if verified_file(paths.cache.final_path.as_path(), &request).await? {
+                cleanup_partial(&paths).await;
+                return Ok(request.result(paths.cache.final_path));
+            }
+            return Err(ArtifactHttpDownloadError::DiskWrite);
+        }
+        Err(error) => return Err(map_disk_error(error)),
+    }
+    // Verification and publication are separate pathname operations. Recheck
+    // the published inode before returning it so a local pathname swap cannot
+    // turn a verified partial into an unverified cache hit.
+    if !verified_file(paths.cache.final_path.as_path(), &request).await? {
+        let _ = fs::remove_file(paths.cache.final_path.as_path()).await;
+        cleanup_partial(&paths).await;
+        sync_parent_directory(paths.parent()).await?;
+        return Err(integrity_failure("published_content_mismatch"));
+    }
+    fs::remove_file(paths.cache.part_path.as_path())
+        .await
+        .map_err(map_disk_error)?;
     let _ = fs::remove_file(paths.metadata.as_path()).await;
     let _ = fs::remove_file(paths.metadata_temp.as_path()).await;
+    sync_parent_directory(paths.parent()).await?;
     Ok(request.result(paths.cache.final_path))
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(parent: &Path) -> Result<(), ArtifactHttpDownloadError> {
+    File::open(parent)
+        .await
+        .map_err(map_disk_error)?
+        .sync_all()
+        .await
+        .map_err(map_disk_error)
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_parent: &Path) -> Result<(), ArtifactHttpDownloadError> {
+    Ok(())
 }
 
 async fn verified_file(
     path: &Path,
     request: &ValidatedRequest,
 ) -> Result<bool, ArtifactHttpDownloadError> {
-    if !path_is_file(path).await? {
+    if !path_is_regular_file(path).await? {
         return Ok(false);
     }
     let path = path.to_owned();
@@ -714,8 +836,12 @@ async fn verified_file(
 }
 
 fn verify_file_sync(path: &Path, expected_size: u64, expected_sha: &str) -> std::io::Result<bool> {
-    let mut file = StdFile::open(path)?;
-    if file.metadata()?.len() != expected_size {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_std_no_follow(&mut options);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_plain_file(&metadata) || metadata.len() != expected_size {
         return Ok(false);
     }
     let mut hasher = Sha256::new();
@@ -730,12 +856,41 @@ fn verify_file_sync(path: &Path, expected_size: u64, expected_sha: &str) -> std:
     Ok(hex::encode(hasher.finalize()) == expected_sha)
 }
 
-async fn path_is_file(path: &Path) -> Result<bool, ArtifactHttpDownloadError> {
-    match fs::metadata(path).await {
-        Ok(metadata) => Ok(metadata.is_file()),
+async fn path_is_regular_file(path: &Path) -> Result<bool, ArtifactHttpDownloadError> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(metadata_is_plain_file(&metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(map_disk_error(error)),
     }
+}
+
+async fn read_owned_metadata(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata)
+            if metadata_is_plain_file(&metadata)
+                && metadata.len() <= MAX_PARTIAL_METADATA_BYTES => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_tokio_no_follow(&mut options);
+    let file = options.open(path).await?;
+    let opened_metadata = file.metadata().await?;
+    if !metadata_is_plain_file(&opened_metadata)
+        || opened_metadata.len() > MAX_PARTIAL_METADATA_BYTES
+    {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    file.take(MAX_PARTIAL_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_PARTIAL_METADATA_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 fn notify_progress(
@@ -772,6 +927,15 @@ fn invalidates_partial(error: ArtifactHttpDownloadError) -> bool {
     )
 }
 
+fn integrity_failure(reason_code: &'static str) -> ArtifactHttpDownloadError {
+    tracing::warn!(
+        event = "artifact_download_integrity_failure",
+        outcome = "rejected",
+        reason_code,
+    );
+    ArtifactHttpDownloadError::Integrity
+}
+
 fn map_http_error(error: GatewayHttpError) -> ArtifactHttpDownloadError {
     match error {
         GatewayHttpError::AuthenticationTerminal(_)
@@ -781,7 +945,10 @@ fn map_http_error(error: GatewayHttpError) -> ArtifactHttpDownloadError {
             ArtifactHttpDownloadError::RevokedOrUnavailable
         }
         GatewayHttpError::Cancelled => ArtifactHttpDownloadError::Cancelled,
-        GatewayHttpError::Transport | GatewayHttpError::ServiceUnavailable => {
+        GatewayHttpError::Transport
+        | GatewayHttpError::ServiceUnavailable
+        | GatewayHttpError::TooManyRequests
+        | GatewayHttpError::Server => {
             ArtifactHttpDownloadError::Transport
         }
         GatewayHttpError::InvalidEndpoint
@@ -790,9 +957,10 @@ fn map_http_error(error: GatewayHttpError) -> ArtifactHttpDownloadError {
         | GatewayHttpError::GatewayPinMismatch
         | GatewayHttpError::SessionMismatch => ArtifactHttpDownloadError::InvalidRequest,
         GatewayHttpError::InvalidResponse
-        | GatewayHttpError::RangeNotSatisfiable
-        | GatewayHttpError::TooManyRequests
-        | GatewayHttpError::Server => ArtifactHttpDownloadError::InvalidResponse,
+        | GatewayHttpError::Conflict
+        | GatewayHttpError::RangeNotSatisfiable => {
+            ArtifactHttpDownloadError::InvalidResponse
+        }
     }
 }
 
@@ -804,19 +972,13 @@ fn map_disk_error(error: std::io::Error) -> ArtifactHttpDownloadError {
     }
 }
 
-pub(crate) fn encode_path_segment(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[(byte >> 4) as usize]));
-            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-    }
-    encoded
+pub(crate) fn valid_storage_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID_BYTES
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn append_file_suffix(path: &Path, suffix: &str) -> Result<PathBuf, ArtifactHttpDownloadError> {
@@ -935,7 +1097,7 @@ mod tests {
         assert_eq!(http.requests()[1].method, GatewayHttpMethod::Get);
         assert_eq!(
             http.requests()[1].path,
-            "storage/workspaces/workspace%20one/artifacts/artifact%2Fone/versions/version%20one/content"
+            "storage/workspaces/workspace-one/artifacts/artifact-one/versions/version-one/content"
         );
         let updates = progress.lock().expect("progress lock");
         assert_eq!(
@@ -1125,6 +1287,40 @@ mod tests {
         assert!(http.requests().is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_cache_symlink_is_replaced_without_following_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let bytes = b"downloaded bytes";
+        let request = request(bytes);
+        let paths = owned_paths(temp.path(), &request);
+        fs::create_dir_all(paths.parent()).await.expect("parent");
+        let outside = temp.path().join("outside.txt");
+        fs::write(outside.as_path(), b"do not overwrite")
+            .await
+            .expect("outside file");
+        symlink(outside.as_path(), paths.cache.final_path.as_path()).expect("cache symlink");
+        let service = ArtifactHttpDownloadService::with_http(
+            Arc::new(FakeHttp::new(vec![head(bytes), full(bytes, vec![bytes])])),
+            temp.path(),
+        );
+
+        let result = service
+            .download(request, CancellationToken::new(), None)
+            .await
+            .expect("download");
+
+        assert_eq!(fs::read(result.local_path.as_path()).await.unwrap(), bytes);
+        assert_eq!(fs::read(outside.as_path()).await.unwrap(), b"do not overwrite");
+        assert!(!fs::symlink_metadata(result.local_path.as_path())
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     #[test]
     fn error_mapping_preserves_auth_revoke_disk_full_and_secret_free_codes() {
         assert_eq!(
@@ -1134,6 +1330,18 @@ mod tests {
         assert_eq!(
             map_http_error(GatewayHttpError::Forbidden),
             ArtifactHttpDownloadError::RevokedOrUnavailable
+        );
+        assert_eq!(
+            map_http_error(GatewayHttpError::TooManyRequests),
+            ArtifactHttpDownloadError::Transport
+        );
+        assert_eq!(
+            map_http_error(GatewayHttpError::Server),
+            ArtifactHttpDownloadError::Transport
+        );
+        assert_eq!(
+            map_http_error(GatewayHttpError::Conflict),
+            ArtifactHttpDownloadError::InvalidResponse
         );
         assert_eq!(
             map_disk_error(std::io::Error::from_raw_os_error(28)),
@@ -1148,6 +1356,17 @@ mod tests {
             assert!(!diagnostic.contains("Bearer"));
             assert!(!diagnostic.contains("Authorization"));
         }
+    }
+
+    #[test]
+    fn operation_gates_are_shared_only_by_the_exact_owned_target() {
+        let root = Path::new("/owned/runtime/downloads");
+        let first = download_gate_for(&root.join("artifact-a"));
+        let same = download_gate_for(&root.join("artifact-a"));
+        let other = download_gate_for(&root.join("artifact-b"));
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[tokio::test]
@@ -1169,9 +1388,9 @@ mod tests {
     fn request(bytes: &[u8]) -> ArtifactHttpDownloadRequest {
         ArtifactHttpDownloadRequest {
             gateway_profile_id: "gateway/one".to_owned(),
-            workspace_id: "workspace one".to_owned(),
-            artifact_id: "artifact/one".to_owned(),
-            version_id: "version one".to_owned(),
+            workspace_id: "workspace-one".to_owned(),
+            artifact_id: "artifact-one".to_owned(),
+            version_id: "version-one".to_owned(),
             display_name: "../report?.txt".to_owned(),
             expected_size_bytes: bytes.len() as u64,
             expected_sha256: sha256(bytes),

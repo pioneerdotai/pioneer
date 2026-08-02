@@ -6,9 +6,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayId, InvitationId,
-    MemberSummary, NewMemberProfile, PrincipalId, PrincipalKind, WorkspaceId,
-    normalize_protected_gateway_endpoint,
+    AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayBaseUrl,
+    GatewayTransportSecurity, GatewayId, InvitationId, MemberSummary, NewMemberProfile,
+    PrincipalId, PrincipalKind, WorkspaceId,
 };
 
 pub const INVITATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -113,7 +113,7 @@ pub enum InvitationTransportSecurity {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "InvitationPresentationWire")]
 pub struct InvitationPresentation {
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub gateway_id: GatewayId,
     token: InvitationCredential,
     deep_link: AuthSecretString,
@@ -121,16 +121,13 @@ pub struct InvitationPresentation {
 
 impl InvitationPresentation {
     pub fn new(
-        protected_endpoint: impl Into<String>,
+        gateway_base_url: GatewayBaseUrl,
         gateway_id: GatewayId,
         token: InvitationCredential,
     ) -> Result<Self, InvitationUriError> {
-        let protected_endpoint =
-            normalize_protected_gateway_endpoint(protected_endpoint.into().as_str())
-                .map_err(|_| InvitationUriError)?;
         let mut uri = url::Url::parse("pioneer://invite").expect("static invite URI is valid");
         uri.query_pairs_mut()
-            .append_pair("gateway", protected_endpoint.as_str())
+            .append_pair("gateway_base_url", gateway_base_url.as_str())
             .append_pair("gateway_id", gateway_id.as_str());
         let mut deep_link = Zeroizing::new(uri.to_string());
         deep_link.push_str("#token=");
@@ -140,7 +137,7 @@ impl InvitationPresentation {
         }
         let deep_link = std::mem::take(&mut *deep_link);
         Ok(Self {
-            protected_endpoint,
+            gateway_base_url,
             gateway_id,
             token,
             deep_link: AuthSecretString::new(deep_link),
@@ -163,16 +160,23 @@ impl InvitationPresentation {
             return Err(InvitationUriError);
         }
 
-        let mut endpoint = None;
+        let mut gateway_base_url = None;
         let mut gateway_id = None;
         for (key, value) in parsed.query_pairs() {
             match key.as_ref() {
-                "gateway" if endpoint.is_none() => endpoint = Some(value.into_owned()),
+                "gateway_base_url" if gateway_base_url.is_none() => {
+                    gateway_base_url = Some(
+                        GatewayBaseUrl::parse_presentation(value.as_ref())
+                            .map_err(|_| InvitationUriError)?,
+                    );
+                }
                 "gateway_id" if gateway_id.is_none() => {
                     gateway_id =
                         Some(GatewayId::new(value.into_owned()).map_err(|_| InvitationUriError)?);
                 }
-                "token" | "gateway" | "gateway_id" => return Err(InvitationUriError),
+                "token" | "gateway_base_url" | "gateway_id" => {
+                    return Err(InvitationUriError);
+                }
                 _ => return Err(InvitationUriError),
             }
         }
@@ -180,7 +184,7 @@ impl InvitationPresentation {
         let token =
             InvitationCredential::parse(token.to_owned()).map_err(|_| InvitationUriError)?;
         Self::new(
-            endpoint.ok_or(InvitationUriError)?,
+            gateway_base_url.ok_or(InvitationUriError)?,
             gateway_id.ok_or(InvitationUriError)?,
             token,
         )
@@ -195,10 +199,10 @@ impl InvitationPresentation {
     }
 
     pub fn transport_security(&self) -> InvitationTransportSecurity {
-        if self.protected_endpoint.starts_with("wss://") {
-            InvitationTransportSecurity::SecureWss
-        } else {
-            InvitationTransportSecurity::InsecureWs
+        match self.gateway_base_url.transport_security() {
+            GatewayTransportSecurity::Tls => InvitationTransportSecurity::SecureWss,
+            GatewayTransportSecurity::LoopbackPlaintext
+            | GatewayTransportSecurity::RemotePlaintext => InvitationTransportSecurity::InsecureWs,
         }
     }
 
@@ -215,7 +219,7 @@ impl fmt::Debug for InvitationPresentation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InvitationPresentation")
-            .field("protected_endpoint", &self.protected_endpoint)
+            .field("gateway_base_url", &self.gateway_base_url)
             .field("gateway_id", &self.gateway_id)
             .field("token", &"[redacted]")
             .field("deep_link", &"[redacted]")
@@ -226,7 +230,7 @@ impl fmt::Debug for InvitationPresentation {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InvitationPresentationWire {
-    protected_endpoint: String,
+    gateway_base_url: GatewayBaseUrl,
     gateway_id: GatewayId,
     token: InvitationCredential,
     deep_link: AuthSecretString,
@@ -236,7 +240,7 @@ impl TryFrom<InvitationPresentationWire> for InvitationPresentation {
     type Error = InvitationUriError;
 
     fn try_from(value: InvitationPresentationWire) -> Result<Self, Self::Error> {
-        let presentation = Self::new(value.protected_endpoint, value.gateway_id, value.token)?;
+        let presentation = Self::new(value.gateway_base_url, value.gateway_id, value.token)?;
         if presentation.deep_link() != value.deep_link.expose_secret() {
             return Err(InvitationUriError);
         }
@@ -479,7 +483,7 @@ mod tests {
         InvitationPresentation, InvitationRevokeParams, InvitationRevokeReason, InvitationStatus,
         InvitationTransportSecurity, InvitationWorkspaceGrant,
     };
-    use crate::{GatewayId, InvitationId, WorkspaceId};
+    use crate::{GatewayBaseUrl, GatewayId, InvitationId, WorkspaceId};
     use serde_json::json;
 
     #[test]
@@ -552,12 +556,15 @@ mod tests {
         let raw = credential();
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         let presentation = InvitationPresentation::new(
-            "91.224.86.172:17878",
+            GatewayBaseUrl::parse_presentation("91.224.86.172:17878").unwrap(),
             gateway_id.clone(),
             InvitationCredential::parse(raw.clone()).unwrap(),
         )
         .unwrap();
-        assert_eq!(presentation.protected_endpoint, "ws://91.224.86.172:17878");
+        assert_eq!(
+            presentation.gateway_base_url.as_str(),
+            "http://91.224.86.172:17878/"
+        );
         assert_eq!(
             presentation.transport_security(),
             InvitationTransportSecurity::InsecureWs
@@ -581,11 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn invitation_uri_accepts_ws_and_wss_but_rejects_ambiguous_or_leaky_fields() {
+    fn invitation_uri_accepts_canonical_bases_and_rejects_legacy_or_leaky_fields() {
         let raw = credential();
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
         let secure = InvitationPresentation::new(
-            "wss://gateway.example.test/ws",
+            GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer").unwrap(),
             gateway_id.clone(),
             InvitationCredential::parse(raw.clone()).unwrap(),
         )
@@ -595,14 +602,14 @@ mod tests {
             InvitationTransportSecurity::SecureWss
         );
         for endpoint in [
-            "ws://localhost:17878",
-            "ws://192.168.1.10:17878",
-            "ws://gateway.example.test:17878",
-            "wss://gateway.example.test/ws",
+            "http://localhost:17878",
+            "http://192.168.1.10:17878",
+            "http://gateway.example.test:17878",
+            "https://gateway.example.test/pioneer",
         ] {
             assert!(
                 InvitationPresentation::new(
-                    endpoint,
+                    GatewayBaseUrl::parse_presentation(endpoint).unwrap(),
                     gateway_id.clone(),
                     InvitationCredential::parse(raw.clone()).unwrap(),
                 )
@@ -612,22 +619,25 @@ mod tests {
         }
         for uri in [
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}&token={raw}#token={raw}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}&token={raw}#token={raw}"
             ),
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway=ws%3A%2F%2Fother%3A17878&gateway_id={gateway_id}#token={raw}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_base_url=http%3A%2F%2Fother%3A17878%2F&gateway_id={gateway_id}#token={raw}"
             ),
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}#token={raw}&token={raw}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}#token={raw}&token={raw}"
             ),
             format!(
-                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}&extra=1#token={raw}"
+                "pioneer://invite?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}&extra=1#token={raw}"
             ),
             format!(
-                "pioneer://invite/other?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}#token={raw}"
+                "pioneer://invite/other?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}#token={raw}"
             ),
             format!(
-                "pioneer://invite/?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}#token={raw}"
+                "pioneer://invite/?gateway_base_url=http%3A%2F%2Flocalhost%3A17878%2F&gateway_id={gateway_id}#token={raw}"
+            ),
+            format!(
+                "pioneer://invite?gateway=ws%3A%2F%2Flocalhost%3A17878&gateway_id={gateway_id}#token={raw}"
             ),
         ] {
             assert!(InvitationPresentation::parse(&uri).is_err(), "{uri}");

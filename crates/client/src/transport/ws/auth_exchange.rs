@@ -237,10 +237,8 @@ impl AuthExchangeClient {
         &self,
         invitation: &InvitationQrPresentation,
     ) -> Result<InvitationPreviewResponse, InvitationExchangeError> {
-        let gateway_base_url = invitation_gateway_base_url(invitation.protected_endpoint())
-            .map_err(InvitationExchangeError::from_auth)?;
         let (stream, remaining) = self
-            .connect_with_credential(&gateway_base_url, invitation.credential())
+            .connect_with_credential(invitation.gateway_base_url(), invitation.credential())
             .await
             .map_err(InvitationExchangeError::from_auth)?;
         preview_invitation_over_stream(stream, invitation, remaining).await
@@ -251,10 +249,8 @@ impl AuthExchangeClient {
         invitation: &InvitationQrPresentation,
         params: InvitationAcceptParams,
     ) -> Result<InvitationAcceptResponse, InvitationExchangeError> {
-        let gateway_base_url = invitation_gateway_base_url(invitation.protected_endpoint())
-            .map_err(InvitationExchangeError::from_auth)?;
         let (stream, remaining) = self
-            .connect_with_credential(&gateway_base_url, invitation.credential())
+            .connect_with_credential(invitation.gateway_base_url(), invitation.credential())
             .await
             .map_err(InvitationExchangeError::from_auth)?;
         accept_invitation_over_stream(stream, invitation, &params, remaining).await
@@ -263,12 +259,9 @@ impl AuthExchangeClient {
     /// Uses the existing authenticated logout path. Failure is deliberately
     /// ignored because the server-side session will still expire/revalidate.
     pub async fn cleanup_invitation_session_best_effort(&self, cleanup: InvitationSessionCleanup) {
-        let Ok(gateway_base_url) = invitation_gateway_base_url(cleanup.protected_endpoint()) else {
-            return;
-        };
         let _ = self
             .cleanup_session_once(
-                &gateway_base_url,
+                cleanup.gateway_base_url(),
                 cleanup.access_token(),
                 cleanup.session_id().clone(),
             )
@@ -356,13 +349,7 @@ impl AuthExchangeClient {
             PIONEER_PROTOCOL_VERSION_HEADER,
             HeaderValue::from_static(PIONEER_PROTOCOL_VERSION),
         );
-        let authorization_value = Zeroizing::new(format!("Bearer {credential}"));
-        let authorization = HeaderValue::from_str(authorization_value.as_str()).map_err(|_| {
-            AuthExchangeError::new(
-                AuthExchangeErrorKind::CredentialMethodMismatch,
-                "credential cannot be represented in an Authorization header",
-            )
-        })?;
+        let authorization = sensitive_bearer_header(credential)?;
         request.headers_mut().insert("authorization", authorization);
         let deadline = Instant::now() + self.timeout;
         let websocket_config = WebSocketConfig::default()
@@ -396,15 +383,16 @@ impl AuthExchangeClient {
     }
 }
 
-fn invitation_gateway_base_url(
-    protected_endpoint: &str,
-) -> Result<GatewayBaseUrl, AuthExchangeError> {
-    GatewayBaseUrl::from_websocket_presentation(protected_endpoint).map_err(|_| {
+fn sensitive_bearer_header(credential: &str) -> Result<HeaderValue, AuthExchangeError> {
+    let authorization_value = Zeroizing::new(format!("Bearer {credential}"));
+    let mut authorization = HeaderValue::from_str(authorization_value.as_str()).map_err(|_| {
         AuthExchangeError::new(
-            AuthExchangeErrorKind::InvalidEndpoint,
-            "invitation endpoint is not a canonical Gateway WebSocket authority",
+            AuthExchangeErrorKind::CredentialMethodMismatch,
+            "credential cannot be represented in an Authorization header",
         )
-    })
+    })?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
 }
 
 async fn preview_invitation_over_stream<S>(
@@ -719,6 +707,13 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
+    #[test]
+    fn restricted_bearer_header_is_locally_redacted() {
+        let header = sensitive_bearer_header("restricted-secret").unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer restricted-secret");
+        assert!(header.is_sensitive());
+    }
+
     fn classified_jwt(payload: serde_json::Value) -> String {
         format!(
             "{}.{}.signature",
@@ -780,7 +775,7 @@ mod tests {
     fn invitation() -> InvitationQrPresentation {
         InvitationQrPresentation::from_presentation(
             InvitationPresentation::new(
-                "ws://gateway.example.test:17878",
+                GatewayBaseUrl::parse_presentation("http://gateway.example.test:17878").unwrap(),
                 GatewayId::new("G00000000000000000001").unwrap(),
                 InvitationCredential::parse(format!(
                     "{}{}",
@@ -870,7 +865,8 @@ mod tests {
     async fn invitation_preview_uses_the_connected_endpoint_transport_classification() {
         let invitation = InvitationQrPresentation::from_presentation(
             InvitationPresentation::new(
-                "wss://gateway.example.test/ws",
+                GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer")
+                    .unwrap(),
                 GatewayId::new("G00000000000000000001").unwrap(),
                 InvitationCredential::parse(format!(
                     "{}{}",

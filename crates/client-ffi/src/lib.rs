@@ -209,6 +209,19 @@ fn contains_session_termination(events: &[ClientEvent]) -> bool {
     })
 }
 
+fn contains_avatar_authorization_boundary(events: &[ClientEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AccessChanged(_)
+                    | pioneer_protocol::GatewayNotification::MemberChanged(_)
+                    | pioneer_protocol::GatewayNotification::WorkspaceMembersChanged(_)
+            )
+        )
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientFfiConfig {
@@ -576,6 +589,9 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .auth_logout()
             .map_err(normal_auth_error)?;
+        if let Ok(runtime_home) = self.native_cache_runtime_home() {
+            self.avatar_cache.invalidate_all(runtime_home.as_path());
+        }
         self.invitation_commits
             .lock()
             .map_err(|_| invitation_commit_lock_error())?
@@ -999,6 +1015,9 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .replace_access_and_wait(spec.into_connect_spec())
             .map_err(normal_auth_error)?;
+        if let Ok(runtime_home) = self.native_cache_runtime_home() {
+            self.avatar_cache.invalidate_all(runtime_home.as_path());
+        }
         self.active_thread
             .begin_authorization_epoch()
             .map_err(|error| {
@@ -1039,10 +1058,14 @@ impl ClientFfiRuntime {
             let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
-                if contains_session_termination(events.as_slice()) {
+                if contains_session_termination(events.as_slice())
+                    || contains_avatar_authorization_boundary(events.as_slice())
+                {
                     if let Ok(runtime_home) = self.native_cache_runtime_home() {
                         self.avatar_cache.invalidate_all(runtime_home.as_path());
                     }
+                }
+                if contains_session_termination(events.as_slice()) {
                     self.invitation_commits
                         .lock()
                         .map_err(|_| "invitation commit state is unavailable".to_owned())?
@@ -1171,7 +1194,18 @@ impl ClientFfiRuntime {
                     artifacts::ARTIFACT_RECONFIGURATION_CODE,
                 )
             })?;
-        Ok(std::path::PathBuf::from(app_data_dir))
+        let runtime_home = std::path::PathBuf::from(app_data_dir);
+        if !runtime_home.is_absolute()
+            || runtime_home
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(ClientFfiError::new(
+                "native app data directory must be an absolute normalized path",
+                artifacts::ARTIFACT_RECONFIGURATION_CODE,
+            ));
+        }
+        Ok(runtime_home)
     }
 
     fn gateway_settings_get(
@@ -3824,6 +3858,42 @@ mod tests {
             }),
         ]));
         assert!(!contains_gateway_connection_epoch_boundary(&[
+            ClientEvent::Error(contracts::ClientErrorEvent {
+                message: "unrelated".to_owned(),
+                code: None,
+            }),
+        ]));
+    }
+
+    #[test]
+    fn authorization_and_directory_events_invalidate_private_avatar_cache() {
+        let access_changed = ClientEvent::GatewayNotification(
+            pioneer_protocol::GatewayNotification::AccessChanged(
+                pioneer_protocol::AccessChangedNotification {
+                    authorization_revision: 7,
+                    workspace_id: "workspace-one".to_owned(),
+                    thread_id: None,
+                    change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
+                },
+            ),
+        );
+        let member_changed = ClientEvent::GatewayNotification(
+            pioneer_protocol::GatewayNotification::MemberChanged(
+                pioneer_protocol::MemberChangedNotification {
+                    revision: 8,
+                    principal_id: pioneer_protocol::PrincipalId::new(
+                        "P00000000000000000001",
+                    )
+                    .unwrap(),
+                },
+            ),
+        );
+
+        assert!(contains_avatar_authorization_boundary(&[
+            access_changed,
+            member_changed,
+        ]));
+        assert!(!contains_avatar_authorization_boundary(&[
             ClientEvent::Error(contracts::ClientErrorEvent {
                 message: "unrelated".to_owned(),
                 code: None,

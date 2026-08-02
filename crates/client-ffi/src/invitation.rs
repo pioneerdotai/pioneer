@@ -6,8 +6,9 @@ use pioneer_client::transport::ws::auth_exchange::{
     InvitationExchangeError, InvitationExchangeErrorKind,
 };
 use pioneer_protocol::{
-    AuthSecretString, ClientKind, GatewayId, InvitationAcceptParams, InvitationPreviewResponse,
-    InvitationTransportSecurity, MemberSummary, PrincipalId, WorkspaceId,
+    AuthSecretString, ClientKind, GatewayBaseUrl, GatewayId, InvitationAcceptParams,
+    InvitationPreviewResponse, InvitationTransportSecurity, MemberSummary, PrincipalId,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +25,7 @@ pub struct ClientInvitationPresentationRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct ClientInvitationPresentationResult {
-    pub protected_endpoint: String,
+    pub gateway_base_url: GatewayBaseUrl,
     pub gateway_id: GatewayId,
     pub transport_security: InvitationTransportSecurity,
     pub canonical_uri: AuthSecretString,
@@ -40,7 +41,7 @@ impl ClientInvitationPresentationResult {
             .map(|payload| AuthSecretString::new(payload.to_owned()))
             .map_err(|_| "invalid invitation QR payload".to_owned())?;
         Ok(Self {
-            protected_endpoint: presentation.protected_endpoint().to_owned(),
+            gateway_base_url: presentation.gateway_base_url().clone(),
             gateway_id: presentation.gateway_id().clone(),
             transport_security: presentation.transport_security(),
             canonical_uri,
@@ -282,7 +283,7 @@ mod tests {
     fn presentation_and_secret_results_have_redacted_debug() {
         let secret = format!("pinv1_{}", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let uri = format!(
-            "pioneer://invite?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id=G00000000000000000001#token={secret}"
+            "pioneer://invite?gateway_base_url=https%3A%2F%2Fgateway.example%2Fpioneer%2F&gateway_id=G00000000000000000001#token={secret}"
         );
         let request = ClientInvitationPresentationRequest {
             uri: AuthSecretString::new(uri.clone()),
@@ -299,7 +300,7 @@ mod tests {
     fn accept_rejects_local_installation_mismatch_before_exchange() {
         let secret = format!("pinv1_{}", "A".repeat(43));
         let uri = format!(
-            "pioneer://invite?gateway=wss%3A%2F%2Fgateway.example%2Fws&gateway_id=G00000000000000000001#token={secret}"
+            "pioneer://invite?gateway_base_url=https%3A%2F%2Fgateway.example%2Fpioneer%2F&gateway_id=G00000000000000000001#token={secret}"
         );
         let request: ClientInvitationAcceptRequest = serde_json::from_value(serde_json::json!({
             "uri": uri,

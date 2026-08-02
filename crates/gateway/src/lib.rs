@@ -5,6 +5,7 @@
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
 mod administrative_audit;
+mod artifact_delivery;
 mod artifact_prompt_refs;
 mod attachment;
 mod auth;
@@ -53,6 +54,7 @@ mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
 mod voice;
+mod view_grants;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -632,7 +634,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.skills.max_skill_file_bytes,
     ));
 
-    let invitation_endpoint = config.gateway.listen_addr.clone();
+    let invitation_gateway_base_url = pioneer_protocol::GatewayBaseUrl::from_local_listen_addr(
+        config.gateway.listen_addr.as_str(),
+    )
+    .context("invalid Gateway listener address for invitation presentation")?;
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry.clone(),
@@ -656,7 +661,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         },
     )
     .with_cli_mcp_limits(cli_mcp_limits)
-    .with_invitation_endpoint(invitation_endpoint);
+    .with_invitation_gateway_base_url(invitation_gateway_base_url);
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,

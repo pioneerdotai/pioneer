@@ -193,8 +193,9 @@ pub(crate) async fn admit(
     let admission = state.auth.capture_headers(headers).map_err(|error| {
         permit.record_failure();
         tracing::debug!(
-            code = error.code().as_str(),
-            "websocket auth rejected request"
+            event = "websocket_auth",
+            outcome = "rejected",
+            reason_code = error.code().as_str(),
         );
         bounded_error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
     })?;
@@ -217,8 +218,9 @@ pub(crate) async fn admit(
                 Ok(Err(error)) => {
                     permit.record_failure();
                     tracing::debug!(
-                        code = error.code().as_str(),
-                        "websocket persisted auth rejected request"
+                        event = "websocket_auth",
+                        outcome = "rejected",
+                        reason_code = error.code().as_str(),
                     );
                     Err(bounded_error(
                         StatusCode::UNAUTHORIZED,
@@ -344,7 +346,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(limiter.test_observation(first_address).0, MAX_AUTH_IN_FLIGHT_GLOBAL);
         assert!(limiter
-            .try_acquire("192.0.2.61".parse().unwrap())
+            .try_acquire("192.0.2.42".parse().unwrap())
             .is_none());
         drop(permits);
         assert_eq!(limiter.test_observation(first_address).0, 0);

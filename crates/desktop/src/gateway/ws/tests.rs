@@ -1095,11 +1095,6 @@ impl TestWsServer {
                                                                     "max_chunk_size_bytes": 1024,
                                                                     "max_file_size_bytes": 1048576,
                                                                     "max_files_per_turn": 32
-                                                                },
-                                                                "download": {
-                                                                    "recommended_chunk_size_bytes": 3,
-                                                                    "max_chunk_size_bytes": 1024,
-                                                                    "max_concurrent_downloads": 2
                                                                 }
                                                             }
                                                         });

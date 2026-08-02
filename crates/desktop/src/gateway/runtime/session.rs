@@ -129,6 +129,28 @@ impl GatewayRuntime {
         &mut self,
         endpoint_id: &str,
     ) -> Result<DesktopSessionPreparation> {
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
+            runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)
+        })
+    }
+
+    fn with_gateway_session_refresh_slot<T>(
+        &mut self,
+        endpoint_id: &str,
+        operation: impl FnOnce(&mut Self, &mut RefreshSlot) -> Result<T>,
+    ) -> Result<T> {
+        let refresh_slot = refresh_slot(self.registry_path.as_path(), endpoint_id)?;
+        let mut refresh_slot = refresh_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop Gateway refresh lock is poisoned"))?;
+        operation(self, &mut refresh_slot)
+    }
+
+    fn prepare_gateway_session_locked(
+        &mut self,
+        endpoint_id: &str,
+        refresh_slot: &mut RefreshSlot,
+    ) -> Result<DesktopSessionPreparation> {
         if let Some(reason) = self.terminal_sessions.get(endpoint_id).copied() {
             return Ok(DesktopSessionPreparation::Terminal(
                 DesktopSessionTerminal {
@@ -137,17 +159,13 @@ impl GatewayRuntime {
                 },
             ));
         }
-        let refresh_slot = refresh_slot(self.registry_path.as_path(), endpoint_id)?;
-        let mut refresh_slot = refresh_slot
-            .lock()
-            .map_err(|_| anyhow::anyhow!("desktop Gateway refresh lock is poisoned"))?;
         if refresh_slot.mutation_in_progress {
             bail!("desktop Gateway session mutation is in progress");
         }
         let cleanup_timeout = self.timings.startup_timeout;
         self.prepare_gateway_session_serialized(
             endpoint_id,
-            &mut refresh_slot,
+            refresh_slot,
             exchange_refresh,
             |gateway_base_url, access_token, session_id| {
                 revoke_session_best_effort(gateway_base_url, access_token, session_id, cleanup_timeout)
@@ -191,21 +209,60 @@ impl GatewayRuntime {
         endpoint_id: &str,
         sender: &GatewayWsCommandSender,
     ) -> Result<DesktopSessionConnectionOutcome> {
-        match self.prepare_gateway_session(endpoint_id)? {
-            DesktopSessionPreparation::Terminal(terminal) => {
-                Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
+            match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
+                DesktopSessionPreparation::Terminal(terminal) => {
+                    Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
+                }
+                DesktopSessionPreparation::Ready(ready) => {
+                    let expires_at = ready.spec.identity.access_expires_at_unix;
+                    let connection_id =
+                        sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
+                    Ok(DesktopSessionConnectionOutcome::Connected {
+                        connection_id,
+                        metadata: ready.metadata,
+                        access_expires_at_unix: expires_at,
+                    })
+                }
             }
-            DesktopSessionPreparation::Ready(ready) => {
-                let expires_at = ready.spec.identity.access_expires_at_unix;
-                let connection_id =
-                    sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
-                Ok(DesktopSessionConnectionOutcome::Connected {
-                    connection_id,
-                    metadata: ready.metadata,
-                    access_expires_at_unix: expires_at,
-                })
+        })
+    }
+
+    /// Refreshes and replaces an access credential only while the rejected
+    /// generation is still current. The existing per-session refresh slot is
+    /// held through the WS replacement so concurrent WS and HTTP recovery
+    /// paths cannot rotate the refresh credential twice.
+    pub(crate) fn replace_gateway_session_access_after_rejection(
+        &mut self,
+        endpoint_id: &str,
+        sender: &GatewayWsCommandSender,
+        rejected_generation: u64,
+    ) -> Result<Option<DesktopSessionConnectionOutcome>> {
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
+            if let Ok(current) = sender.current_gateway_http_access()
+                && current.generation != rejected_generation
+            {
+                return Ok(None);
             }
-        }
+
+            let outcome =
+                match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
+                    DesktopSessionPreparation::Terminal(terminal) => {
+                        DesktopSessionConnectionOutcome::Terminal(terminal)
+                    }
+                    DesktopSessionPreparation::Ready(ready) => {
+                        let expires_at = ready.spec.identity.access_expires_at_unix;
+                        let connection_id =
+                            sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
+                        DesktopSessionConnectionOutcome::Connected {
+                            connection_id,
+                            metadata: ready.metadata,
+                            access_expires_at_unix: expires_at,
+                        }
+                    }
+                };
+            Ok(Some(outcome))
+        })
     }
 
     pub(crate) fn recover_gateway_session_access(
@@ -213,20 +270,22 @@ impl GatewayRuntime {
         endpoint_id: &str,
         sender: &GatewayWsCommandSender,
     ) -> Result<DesktopSessionConnectionOutcome> {
-        match self.prepare_gateway_session(endpoint_id)? {
-            DesktopSessionPreparation::Terminal(terminal) => {
-                Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
+            match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
+                DesktopSessionPreparation::Terminal(terminal) => {
+                    Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
+                }
+                DesktopSessionPreparation::Ready(ready) => {
+                    let expires_at = ready.spec.identity.access_expires_at_unix;
+                    let connection_id = sender.connect_with_retry(ready.spec.into_connect_spec())?;
+                    Ok(DesktopSessionConnectionOutcome::Connected {
+                        connection_id,
+                        metadata: ready.metadata,
+                        access_expires_at_unix: expires_at,
+                    })
+                }
             }
-            DesktopSessionPreparation::Ready(ready) => {
-                let expires_at = ready.spec.identity.access_expires_at_unix;
-                let connection_id = sender.connect_with_retry(ready.spec.into_connect_spec())?;
-                Ok(DesktopSessionConnectionOutcome::Connected {
-                    connection_id,
-                    metadata: ready.metadata,
-                    access_expires_at_unix: expires_at,
-                })
-            }
-        }
+        })
     }
 
     pub(crate) fn session_terminal_reason(
@@ -1091,6 +1150,25 @@ mod tests {
                 Ok(refresh_grant(1))
             })
             .expect("refresh after mutation");
+    }
+
+    #[test]
+    fn serialized_refresh_operation_holds_the_shared_slot_until_handoff_finishes() {
+        let (mut runtime, _, endpoint_id) = fixture();
+        let slot = refresh_slot(runtime.registry_path.as_path(), endpoint_id.as_str())
+            .expect("shared refresh slot");
+
+        runtime
+            .with_gateway_session_refresh_slot(endpoint_id.as_str(), |_, _| {
+                assert!(
+                    slot.try_lock().is_err(),
+                    "the slot must remain held through credential handoff"
+                );
+                Ok(())
+            })
+            .expect("serialized refresh operation");
+
+        assert!(slot.try_lock().is_ok(), "the slot must be released afterwards");
     }
 
     #[test]
