@@ -1,4 +1,7 @@
-use super::{default_user_command_bin_dir_label, warning_notification_messages};
+use super::{
+    default_user_command_bin_dir_label, popover_view::gateway_endpoint_subtitle,
+    warning_notification_messages,
+};
 use crate::app::root::{
     composer_capability_target_for_provider, composer_submission_plan_for_provider,
 };
@@ -6,6 +9,10 @@ use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
 use pioneer_client::composer::capabilities::{
     COMPOSER_CAPABILITY_MATRIX, ComposerCapability, ComposerCapabilityKind,
     ComposerCapabilityPolicy, ComposerCapabilityTarget, filter_composer_capabilities_for_target,
+};
+use pioneer_client::gateway::{
+    endpoint::GatewayBaseUrl,
+    types::{GatewayEndpoint, GatewayEndpointKind},
 };
 use pioneer_protocol::{
     CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillId,
@@ -40,6 +47,37 @@ fn local_ws_connect_spec_keeps_configured_timeout() {
         runtime.ws_timings().connect_timeout,
         Duration::from_millis(300)
     );
+}
+
+#[test]
+fn gateway_subtitles_interpolate_canonical_address() {
+    rust_i18n::set_locale("en");
+
+    let endpoint = |kind, address: &str| GatewayEndpoint {
+        id: "gateway-id".to_owned(),
+        name: "Gateway".to_owned(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation(address)
+            .expect("valid gateway base URL"),
+        kind,
+        session_ref: None,
+        server_gateway_id: None,
+        workspace_id: None,
+        service_name: None,
+    };
+
+    let local = gateway_endpoint_subtitle(&endpoint(
+        GatewayEndpointKind::Local,
+        "http://127.0.0.1:17878/",
+    ));
+    let remote = gateway_endpoint_subtitle(&endpoint(
+        GatewayEndpointKind::Remote,
+        "https://relay.example.com/pioneer/",
+    ));
+
+    assert_eq!(local, "Local - http://127.0.0.1:17878/");
+    assert_eq!(remote, "Remote - https://relay.example.com/pioneer/");
+    assert!(!local.contains("%{"));
+    assert!(!remote.contains("%{"));
 }
 
 #[test]

@@ -1,6 +1,18 @@
 use super::*;
 use crate::assets::PioneerIconName;
 
+pub(super) fn gateway_endpoint_subtitle(endpoint: &GatewayEndpoint) -> String {
+    let address = endpoint.gateway_base_url.as_str();
+    match endpoint.kind {
+        GatewayEndpointKind::Local => {
+            t!("gateway.endpoint.local_with_address", address = address).to_string()
+        }
+        GatewayEndpointKind::Remote => {
+            t!("gateway.endpoint.remote_with_address", address = address).to_string()
+        }
+    }
+}
+
 impl PioneerDesktop {
     pub(crate) fn render_gateways_popover(&self, cx: &mut Context<Self>) -> AnyElement {
         let show_spinner = !self.is_gateway_setup_required()
@@ -248,22 +260,10 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
-        let endpoint_address = endpoint.gateway_base_url.clone();
         let requires_reauthentication = endpoint.kind == GatewayEndpointKind::Remote
             && endpoint.session_ref.is_none()
             && endpoint.server_gateway_id.is_none();
-        let subtitle = match endpoint.kind {
-            GatewayEndpointKind::Local => t!(
-                "gateway.endpoint.local_with_address",
-                gateway_base_url = endpoint_address
-            )
-            .to_string(),
-            GatewayEndpointKind::Remote => t!(
-                "gateway.endpoint.remote_with_address",
-                gateway_base_url = endpoint_address
-            )
-            .to_string(),
-        };
+        let subtitle = gateway_endpoint_subtitle(endpoint);
         let endpoint_id_for_click = endpoint_id.clone();
         let endpoint_name_for_click = endpoint_name.clone();
         let is_active = active_gateway_id == Some(endpoint_id.as_str());
