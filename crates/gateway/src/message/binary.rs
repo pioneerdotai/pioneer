@@ -173,35 +173,7 @@ impl MessageProcessor {
             action,
         );
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
-        if let (Some(thread_id), Some(turn_id)) = (
-            session.thread_id.as_deref(),
-            session.planned_turn_id.as_deref(),
-        ) {
-            match resolver
-                .authorize_turn(
-                    request_context.principal(),
-                    &gate,
-                    action,
-                    turn_id,
-                    Some(session.workspace_id.as_str()),
-                    Some(thread_id),
-                )
-                .await
-            {
-                Ok(ProofResolution::Authorized(proof)) => proof.decision().clone(),
-                Ok(ProofResolution::Denied(decision)) => {
-                    self.authorize_binary_runtime_draft_after_missing(
-                        request_context,
-                        action,
-                        session.workspace_id.as_str(),
-                        thread_id,
-                        decision,
-                    )
-                    .await
-                }
-                Err(_) => missing_binary_resource(),
-            }
-        } else if let Some(thread_id) = session.thread_id.as_deref() {
+        if let Some(thread_id) = session.thread_id.as_deref() {
             match resolver
                 .authorize_thread(
                     request_context.principal(),

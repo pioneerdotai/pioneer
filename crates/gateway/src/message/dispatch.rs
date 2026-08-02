@@ -2004,10 +2004,11 @@ impl MessageProcessor {
             if params.workspace_id.trim().is_empty() {
                 return Err(validation());
             }
-            if let Some(turn_id) = params
+            if params
                 .planned_turn_id
                 .as_deref()
                 .filter(|turn_id| !turn_id.trim().is_empty())
+                .is_some()
             {
                 let Some(thread_id) = params
                     .thread_id
@@ -2023,19 +2024,18 @@ impl MessageProcessor {
                     turn_action,
                 );
                 return self
-                    .finish_turn_transfer_or_runtime_draft(
+                    .finish_thread_transfer_or_runtime_draft(
                         context,
                         request,
                         entry,
                         turn_action,
                         resolver
-                            .authorize_turn(
+                            .authorize_thread(
                                 context.principal(),
                                 &turn_gate,
                                 turn_action,
-                                turn_id.trim(),
+                                thread_id.trim(),
                                 Some(params.workspace_id.trim()),
-                                Some(thread_id.trim()),
                             )
                             .await
                             .map_err(|_| unavailable())?,
@@ -2123,10 +2123,11 @@ impl MessageProcessor {
                 record_method_decision(entry, &decision);
                 AuthorizationExternalError::NotFound.response(request.id.clone())
             })?;
-        if let (Some(thread_id), Some(turn_id)) = (
-            session.thread_id.as_deref(),
-            session.planned_turn_id.as_deref(),
-        ) {
+        if let Some(thread_id) = session
+            .thread_id
+            .as_deref()
+            .filter(|_| session.planned_turn_id.is_some())
+        {
             let turn_action = ResourceAction::ThreadWrite;
             let turn_gate = AuthorizationService::new().authorize_action(
                 context.principal().kind,
@@ -2134,19 +2135,18 @@ impl MessageProcessor {
                 turn_action,
             );
             return self
-                .finish_turn_transfer_or_runtime_draft(
+                .finish_thread_transfer_or_runtime_draft(
                     context,
                     request,
                     entry,
                     turn_action,
                     resolver
-                        .authorize_turn(
+                        .authorize_thread(
                             context.principal(),
                             &turn_gate,
                             turn_action,
-                            turn_id,
+                            thread_id,
                             Some(session.workspace_id.as_str()),
-                            Some(thread_id),
                         )
                         .await
                         .map_err(|_| unavailable())?,
@@ -2223,58 +2223,6 @@ impl MessageProcessor {
             ProofResolution::Authorized(proof) => {
                 record_method_decision(entry, proof.decision());
                 Ok(RequestAdmission::Thread(proof))
-            }
-            ProofResolution::Denied(decision)
-                if matches!(
-                    decision,
-                    AuthorizationDecision::Deny {
-                        reason: DenyReason::MissingAuthoritativeResource,
-                        ..
-                    }
-                ) =>
-            {
-                if let Some(access) = self
-                    .authorize_runtime_draft_request(
-                        context,
-                        request,
-                        entry,
-                        action,
-                        thread_id,
-                        Some(workspace_id),
-                    )
-                    .await?
-                {
-                    Ok(RequestAdmission::RuntimeDraft(access))
-                } else {
-                    record_method_decision(entry, &decision);
-                    Err(external_error_for_decision(&decision)
-                        .unwrap_or(AuthorizationExternalError::NotFound)
-                        .response(request.id.clone()))
-                }
-            }
-            ProofResolution::Denied(decision) => {
-                record_method_decision(entry, &decision);
-                Err(external_error_for_decision(&decision)
-                    .unwrap_or(AuthorizationExternalError::NotFound)
-                    .response(request.id.clone()))
-            }
-        }
-    }
-
-    async fn finish_turn_transfer_or_runtime_draft(
-        &self,
-        context: &crate::request_context::RequestContext,
-        request: &JsonRpcRequest,
-        entry: &'static crate::authorization::MethodAuthorizationEntry,
-        action: ResourceAction,
-        resolution: ProofResolution<AuthorizedTurn>,
-        thread_id: &str,
-        workspace_id: &str,
-    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
-        match resolution {
-            ProofResolution::Authorized(proof) => {
-                record_method_decision(entry, proof.decision());
-                Ok(RequestAdmission::Turn(proof))
             }
             ProofResolution::Denied(decision)
                 if matches!(
@@ -5308,19 +5256,15 @@ impl MessageProcessor {
                             let authorization = match (
                                 admission.workspace(),
                                 admission.thread(),
-                                admission.turn(),
                                 admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None, None) => {
+                                (Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None, None) => {
+                                (None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof), None) => {
-                                    ArtifactUploadAuthorization::Turn(proof)
-                                }
-                                (None, None, None, Some(access)) => {
+                                (None, None, Some(access)) => {
                                     ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(
@@ -5358,19 +5302,15 @@ impl MessageProcessor {
                             let authorization = match (
                                 admission.workspace(),
                                 admission.thread(),
-                                admission.turn(),
                                 admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None, None) => {
+                                (Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None, None) => {
+                                (None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof), None) => {
-                                    ArtifactUploadAuthorization::Turn(proof)
-                                }
-                                (None, None, None, Some(access)) => {
+                                (None, None, Some(access)) => {
                                     ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(
@@ -5408,19 +5348,15 @@ impl MessageProcessor {
                             let authorization = match (
                                 admission.workspace(),
                                 admission.thread(),
-                                admission.turn(),
                                 admission.runtime_draft(),
                             ) {
-                                (Some(proof), None, None, None) => {
+                                (Some(proof), None, None) => {
                                     ArtifactUploadAuthorization::Workspace(proof)
                                 }
-                                (None, Some(proof), None, None) => {
+                                (None, Some(proof), None) => {
                                     ArtifactUploadAuthorization::Thread(proof)
                                 }
-                                (None, None, Some(proof), None) => {
-                                    ArtifactUploadAuthorization::Turn(proof)
-                                }
-                                (None, None, None, Some(access)) => {
+                                (None, None, Some(access)) => {
                                     ArtifactUploadAuthorization::RuntimeDraft(access)
                                 }
                                 _ => unreachable!(

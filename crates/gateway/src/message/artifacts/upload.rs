@@ -24,7 +24,6 @@ const ARTIFACT_UPLOAD_TTL_SECS: i64 = 3600;
 pub(in crate::message) enum ArtifactUploadAuthorization<'a> {
     Workspace(&'a crate::authorization::AuthorizedWorkspace),
     Thread(&'a crate::authorization::AuthorizedThread),
-    Turn(&'a crate::authorization::AuthorizedTurn),
     RuntimeDraft(&'a crate::thread::RuntimeDraftAccess),
 }
 
@@ -32,13 +31,8 @@ impl ArtifactUploadAuthorization<'_> {
     fn permits(&self, workspace_id: &str, thread_id: Option<&str>, turn_id: Option<&str>) -> bool {
         match (self, thread_id, turn_id) {
             (Self::Workspace(proof), None, None) => proof.workspace_id() == workspace_id,
-            (Self::Thread(proof), Some(thread_id), None) => {
+            (Self::Thread(proof), Some(thread_id), _) => {
                 proof.workspace_id() == workspace_id && proof.thread_id() == thread_id
-            }
-            (Self::Turn(proof), Some(thread_id), Some(turn_id)) => {
-                proof.workspace_id() == workspace_id
-                    && proof.thread_id() == thread_id
-                    && proof.turn_id() == turn_id
             }
             (Self::RuntimeDraft(access), Some(thread_id), _) => {
                 access.workspace_id() == workspace_id && access.thread_id() == thread_id
@@ -855,37 +849,7 @@ impl MessageProcessor {
             action,
         );
         let resolver = crate::authorization::AuthorizationResolver::new((*self.crud_store).clone());
-        let resolution = if let (Some(thread_id), Some(turn_id)) = (
-            session.thread_id.as_deref(),
-            session.planned_turn_id.as_deref(),
-        ) {
-            resolver
-                .authorize_turn(
-                    request_context.principal(),
-                    &gate,
-                    action,
-                    turn_id,
-                    Some(session.workspace_id.as_str()),
-                    Some(thread_id),
-                )
-                .await
-                .map(|resolution| match resolution {
-                    crate::authorization::ProofResolution::Authorized(_) => Some(true),
-                    crate::authorization::ProofResolution::Denied(decision)
-                        if matches!(
-                            decision,
-                            crate::authorization::AuthorizationDecision::Deny {
-                                reason:
-                                    crate::authorization::DenyReason::MissingAuthoritativeResource,
-                                ..
-                            }
-                        ) =>
-                    {
-                        None
-                    }
-                    crate::authorization::ProofResolution::Denied(_) => Some(false),
-                })
-        } else if let Some(thread_id) = session.thread_id.as_deref() {
+        let resolution = if let Some(thread_id) = session.thread_id.as_deref() {
             resolver
                 .authorize_thread(
                     request_context.principal(),

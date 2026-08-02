@@ -22239,6 +22239,128 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_thread_accepts_attachment_for_not_yet_started_planned_turn() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = pioneer_protocol::generate_id(21);
+    let planned_turn_id = pioneer_protocol::generate_id(21);
+    let attachment = b"materialized thread attachment";
+
+    start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id.as_str(),
+    )
+    .await;
+    assert!(
+        crud_store
+            .get_turn(thread_id.as_str(), planned_turn_id.as_str())
+            .await
+            .expect("planned turn lookup should succeed")
+            .is_none(),
+        "composer upload must run before the planned turn exists"
+    );
+
+    let start_request_id = generate_test_request_id("matupload", "start");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "artifact/upload/start",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": thread_id,
+                    "planned_turn_id": planned_turn_id,
+                    "client_attachment_id": "attachment-materialized-thread",
+                    "file_name": "materialized.txt",
+                    "mime_type": "text/plain",
+                    "size_bytes": attachment.len() as u64,
+                    "sha256": hex::encode(Sha256::digest(attachment)),
+                    "source_kind": "user_composer"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let start_response = recv_response_by_id(&mut rx, start_request_id.as_str()).await;
+    let upload: ArtifactUploadStartResponse = serde_json::from_value(start_response.result)
+        .expect("materialized thread upload/start response should decode");
+
+    let header = ArtifactUploadChunkHeader {
+        workspace_id: workspace_id.clone(),
+        upload_id: upload.upload_id.clone(),
+        offset: 0,
+        len: attachment.len() as u64,
+        chunk_sha256: Some(hex::encode(Sha256::digest(attachment))),
+    };
+    processor
+        .process_binary_frame_for_connection(
+            connection_id,
+            upload_binary_test_frame(
+                super::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC,
+                &header,
+                attachment,
+            )
+            .as_slice(),
+        )
+        .await
+        .expect("materialized thread artifact chunk should reach binary dispatch");
+    let ack = recv_notification_by_method(&mut rx, events::ARTIFACT_UPLOAD_CHUNK_ACK).await;
+    let ack: pioneer_protocol::ArtifactUploadChunkAckNotification =
+        serde_json::from_value(ack.params.expect("materialized thread artifact ack params"))
+            .expect("materialized thread artifact ack should decode");
+    assert_eq!(ack.upload_id, upload.upload_id);
+    assert_eq!(ack.received_bytes, attachment.len() as u64);
+
+    let finish_request_id = generate_test_request_id("matupload", "finish");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": finish_request_id,
+                "method": "artifact/upload/finish",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "upload_id": upload.upload_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let finish_response = recv_response_by_id(&mut rx, finish_request_id.as_str()).await;
+    let finished: ArtifactUploadFinishResponse = serde_json::from_value(finish_response.result)
+        .expect("materialized thread upload/finish response should decode");
+    assert!(!finished.artifact.artifact_id.is_empty());
+    assert!(
+        crud_store
+            .get_turn(thread_id.as_str(), planned_turn_id.as_str())
+            .await
+            .expect("post-upload planned turn lookup should succeed")
+            .is_none(),
+        "upload must not create the planned turn before turn/start"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn internal_llm_context_event_persists_without_websocket_notification() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
