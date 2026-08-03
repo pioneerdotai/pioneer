@@ -2293,6 +2293,7 @@ impl TurnMcpRuntimeView for McpService {
             server_installation_id: binding.server_installation_id.clone(),
             server_name: row.name,
             raw_tool_name: tool.raw_tool_name,
+            description: Some(tool.description),
             catalog_version: catalog.catalog_version,
             installation_fingerprint: row.fingerprint,
             canonical_schema_fingerprint,

@@ -4,5 +4,6 @@ pub(crate) mod facade;
 pub(crate) mod grants;
 pub(crate) mod limits;
 pub(crate) mod readiness;
+pub(crate) mod recovery;
 pub(crate) mod server;
 pub(crate) mod supervisor;

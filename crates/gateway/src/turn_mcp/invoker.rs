@@ -120,6 +120,7 @@ pub(crate) struct CurrentMcpToolIdentity {
     pub(crate) server_installation_id: String,
     pub(crate) server_name: String,
     pub(crate) raw_tool_name: String,
+    pub(crate) description: Option<String>,
     pub(crate) catalog_version: String,
     pub(crate) installation_fingerprint: String,
     pub(crate) canonical_schema_fingerprint: String,
@@ -484,7 +485,7 @@ fn validate_required_identity(
     Ok(())
 }
 
-fn validate_frozen_identity(
+pub(crate) fn validate_frozen_identity(
     binding: &TurnMcpBindingRecord,
     current: &CurrentMcpToolIdentity,
 ) -> Result<(), TurnMcpInvocationError> {

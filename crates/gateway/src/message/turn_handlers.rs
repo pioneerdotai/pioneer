@@ -3859,19 +3859,52 @@ impl MessageProcessor {
                     .map(|path| path.display().to_string())
             })
             .context("CLI runtime recovery has no working directory")?;
+        let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+            cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+            approval_policy: binding.approval_policy.clone(),
+            env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+            enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
+            elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                .then_some(elevated_instructions.clone()),
+            ..Default::default()
+        };
+        let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
+        let mcp = crate::cli_runtime::mcp::recovery::restore_cli_mcp_session_launch(
+            self.crud_store.as_ref(),
+            self.mcp_service.as_ref(),
+            &binding,
+            runtime_kind,
+            crate::turn_mcp::McpProjectionLimits {
+                max_tools,
+                max_total_schema_bytes,
+                ..crate::turn_mcp::McpProjectionLimits::default()
+            },
+        )
+        .await
+        .context("CLI runtime recovery cannot restore its frozen MCP projection")?;
+        let launch_spec = match runtime_kind {
+            CLIAgentRuntimeKind::Codex => {
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
+                    session_options,
+                    mcp,
+                    Some(binding.native_thread_id.clone()),
+                )
+            }
+            CLIAgentRuntimeKind::Claude => {
+                let provider_session_id = uuid::Uuid::parse_str(binding.native_thread_id.as_str())
+                    .context("durable Claude recovery session identity is not a UUID")?;
+                if provider_session_id.is_nil() {
+                    anyhow::bail!("durable Claude recovery session identity cannot be nil");
+                }
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_resume(
+                    session_options,
+                    mcp,
+                    provider_session_id,
+                )
+            }
+        };
         let session_handle = manager
-            .get_or_start_with_options(
-                session_key.clone(),
-                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-                    cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
-                    approval_policy: binding.approval_policy.clone(),
-                    env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-                    enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
-                    elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                        .then_some(elevated_instructions.clone()),
-                    ..Default::default()
-                },
-            )
+            .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
             .await?;
         let cli_session = session_handle.session();
         self.ensure_cli_runtime_session_event_pumps(

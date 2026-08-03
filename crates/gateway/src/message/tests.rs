@@ -3,6 +3,9 @@ use super::{
     record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
+use crate::cli_runtime::continuation::{
+    CliMcpSessionLaunch, CliProviderContinuation, CliSessionLaunchSpec,
+};
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeManager, CLIAgentRuntimeMcpTurnMetadata, CLIAgentRuntimeObservedTurnStatus,
     CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
@@ -642,6 +645,7 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
 
 struct StaticCliRuntimeSessionFactory {
     session: Arc<RecordingCliRuntimeSession>,
+    launch_specs: Option<Arc<TokioMutex<Vec<CliSessionLaunchSpec>>>>,
 }
 
 #[async_trait]
@@ -652,14 +656,35 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
         Ok(self.session.clone())
     }
+
+    async fn start_session_with_launch_spec(
+        &self,
+        _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+        launch_spec: &CliSessionLaunchSpec,
+    ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
+        if let Some(launch_specs) = self.launch_specs.as_ref() {
+            launch_specs.lock().await.push(launch_spec.clone());
+        }
+        Ok(self.session.clone())
+    }
 }
 
 fn test_cli_runtime_manager(
     session: Arc<RecordingCliRuntimeSession>,
 ) -> Arc<CLIAgentRuntimeManager> {
+    test_cli_runtime_manager_with_launch_specs(session, None)
+}
+
+fn test_cli_runtime_manager_with_launch_specs(
+    session: Arc<RecordingCliRuntimeSession>,
+    launch_specs: Option<Arc<TokioMutex<Vec<CliSessionLaunchSpec>>>>,
+) -> Arc<CLIAgentRuntimeManager> {
     Arc::new(
         CLIAgentRuntimeManager::new(
-            Arc::new(StaticCliRuntimeSessionFactory { session }),
+            Arc::new(StaticCliRuntimeSessionFactory {
+                session,
+                launch_specs,
+            }),
             Duration::from_secs(60),
         )
         .expect("CLI runtime manager should build"),
@@ -30191,7 +30216,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let launch_specs = Arc::new(TokioMutex::new(Vec::new()));
+    let cli_manager =
+        test_cli_runtime_manager_with_launch_specs(cli_session.clone(), Some(launch_specs.clone()));
     let processor = MessageProcessor::new(
         thread_manager.clone(),
         test_provider(),
@@ -30407,6 +30434,10 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .await
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
+    cli_manager
+        .close_session(&key)
+        .await
+        .expect("interrupted test process should close before recovery");
 
     let recovery_events = processor
         .recovery_coordinator
@@ -30428,6 +30459,18 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     let resumes = cli_session.thread_resumes.lock().await.clone();
     assert_eq!(resumes.len(), 1);
     assert_eq!(resumes[0].0, native_thread_id);
+    let launches = launch_specs.lock().await.clone();
+    let recovery_launch = launches
+        .last()
+        .expect("recovery should allocate a typed CLI process");
+    assert_eq!(recovery_launch.mcp, CliMcpSessionLaunch::Disabled);
+    assert_eq!(
+        recovery_launch.continuation,
+        CliProviderContinuation::CodexRpcThread {
+            native_thread_id: Some(native_thread_id.to_owned()),
+        },
+        "recovery must bind the durable Codex thread before process allocation"
+    );
     let starts = cli_session.turn_starts.lock().await.clone();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].native_thread_id, native_thread_id);
