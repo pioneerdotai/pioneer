@@ -29,7 +29,7 @@ fn write_fixture_files(root: &std::path::Path) {
 
 fn continuation_checkpoint_payload() -> ExecutionCheckpointPayload {
     ExecutionCheckpointPayload {
-        schema_version: 1,
+        schema_version: pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
         workspace_id: "workspace_snapshot".to_owned(),
         thread_id: "thread_snapshot".to_owned(),
         turn_id: "turn_snapshot".to_owned(),
@@ -82,6 +82,7 @@ fn continuation_checkpoint_payload() -> ExecutionCheckpointPayload {
                 metadata: ToolMetadata::from_json(json!({ "path": "/tmp/source.md" })),
             }],
         },
+        tool_no_progress: Default::default(),
         strict_obligations: Vec::new(),
     }
 }
@@ -346,7 +347,7 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=1, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window
@@ -393,7 +394,7 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=1, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window

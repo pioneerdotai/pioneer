@@ -100,6 +100,23 @@ pub fn render_execution_continuation_runtime_facts(
             checkpoint.tools.detail_limit
         ));
     }
+
+    for strategy in checkpoint
+        .tool_no_progress
+        .strategies
+        .iter()
+        .filter(|strategy| strategy.warning_emitted || strategy.exhausted)
+    {
+        lines.push(format!(
+            "Tool no-progress strategy: id={}, tool={}, executable={}, timeout_count={}, cumulative_timeout_ms={}, status={}. Do not repeat it with only changed literal values or a larger timeout; use a materially different strategy.",
+            strategy.strategy_id,
+            strategy.tool_name,
+            strategy.executable.as_deref().unwrap_or("unknown"),
+            strategy.timeout_count,
+            strategy.cumulative_timeout_ms,
+            if strategy.exhausted { "exhausted" } else { "warning" },
+        ));
+    }
     for detail in &checkpoint.tools.details {
         lines.push(render_tool_detail(detail));
     }
@@ -496,7 +513,7 @@ mod tests {
             });
 
         insta::assert_snapshot!(rendered, @r###"
-Checkpoint: schema_version=1, workspace_id=ws_snapshot, thread_id=thr_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=2, workspace_id=ws_snapshot, thread_id=thr_snapshot, turn_id=turn_snapshot
 Original request preview: Create the proposal
 Original attachment kinds: local_file
 Completed window: index=2, agent_rounds=5, tool_calls=6, provider_tokens=unknown

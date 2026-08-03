@@ -420,7 +420,7 @@ fn classify_shell_result(raw_output_json: &JsonValue, success: bool) -> ToolOutc
     if payload.timed_out {
         return ToolOutcome::recoverable(
             ToolErrorClass::Timeout,
-            "Command timed out. Retry with a shorter command, polling via write_stdin, or a higher timeout.",
+            "Command reached its hard timeout and Pioneer terminated the process. Do not repeat the same command with only a larger timeout; materially change the strategy by decomposing the work, using a session with write_stdin polling, changing execution mode, or using another executable/tool.",
             true,
             Some("timeout".to_owned()),
         );
@@ -940,7 +940,7 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
             if lower.contains("timed out") {
                 return ToolOutcome::recoverable(
                     ToolErrorClass::Timeout,
-                    "Shell command timed out. Retry with adjusted timeout/scope.",
+                    "Shell command reached its hard timeout and the process was terminated. Do not retry the same command with only a larger timeout; materially change the execution strategy.",
                     true,
                     Some("timeout".to_owned()),
                 );
@@ -1392,6 +1392,50 @@ mod tests {
         let outcome = classifier.classify_result(&invocation, &serde_json::json!(payload), true);
         assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn shell_timeout_requires_a_material_strategy_change() {
+        let payload = build_exec_model_payload(ExecPayloadInput {
+            exit_code: None,
+            timed_out: true,
+            duration_ms: 30_000,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: None,
+            command: vec!["slow-command".to_owned()],
+            max_output_tokens: None,
+            force_truncated_stdout: false,
+            force_truncated_stderr: false,
+        });
+
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("exec_command"),
+            &serde_json::json!(payload),
+            false,
+        );
+
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::Timeout));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("timeout hint should exist");
+        assert!(hint.contains("hard timeout"));
+        assert!(hint.contains("terminated the process"));
+        assert!(hint.contains("only a larger timeout"));
+        assert!(hint.contains("materially change the strategy"));
+    }
+
+    #[test]
+    fn shell_timeout_error_does_not_recommend_only_a_larger_timeout() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("exec_command"),
+            &ToolError::ExecutionFailed("command timed out".to_owned()),
+        );
+
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::Timeout));
+        let hint = outcome.retry_hint.expect("timeout hint should exist");
+        assert!(hint.contains("process was terminated"));
+        assert!(hint.contains("only a larger timeout"));
+        assert!(hint.contains("materially change the execution strategy"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod file_policy;
 mod loop_guard;
 mod mcp_policy;
 mod network_policy;
+mod no_progress_guard;
 mod orchestrator;
 mod output_dynamic_policy;
 mod output_policy;
@@ -74,6 +75,10 @@ pub use mcp_policy::{enforce_mcp_network_policy, mcp_policy_classification_metad
 pub use network_policy::{
     NetworkPolicyChecker, NetworkPolicyDecision, NetworkPolicyDeny, NetworkPolicyDenyReason,
     NetworkPolicyGrant, enforce_network_url,
+};
+pub use no_progress_guard::{
+    ToolNoProgressFeedback, ToolNoProgressGuard, ToolNoProgressGuardConfig,
+    ToolNoProgressPreflightDecision,
 };
 pub use orchestrator::{ApprovalState, OrchestratorPolicy, SandboxTarget, ToolOrchestrator};
 pub use output_dynamic_policy::{

@@ -68,14 +68,15 @@ use pioneer_promt::{
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
     ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointProviderBudgetSummary,
-    ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemCompletedNotification,
-    ItemDeltaNotification, ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
-    RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot, TurnAcceptedCapability,
-    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolSummary,
+    ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    ItemCompletedNotification, ItemDeltaNotification, ItemStartedNotification, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderFailureDetails,
+    ProviderFailureStage, ProviderTransportKind, RecoveryAttemptContext, ThreadMode,
+    ToolRecoveryPolicySnapshot, TurnAcceptedCapability, TurnCapability,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
     TurnItemType, TurnPermissionProfileSnapshot, TurnRejectedCapability, UserInput,
@@ -95,10 +96,11 @@ use pioneer_tools::{
     FinalToolVisibility, PermissionApprovalBroker, PermissionEvaluationContext, PreflightToolIndex,
     REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass,
     ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
-    ToolLoopRoundAction, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope,
-    ToolResultView, ToolRetryController, ToolRetryDecision, ToolRetryObservation,
-    build_builtin_tools_with_security_snapshot, build_tools_with_environment_and_security_snapshot,
-    classify_tool_error,
+    ToolLoopRoundAction, ToolNoProgressGuard, ToolNoProgressGuardConfig,
+    ToolNoProgressPreflightDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
+    ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
+    build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -315,6 +317,7 @@ impl ExecutedToolResult {
             self.outcome.clone(),
         )
         .with_recovery_view(self.recovery_view.clone())
+        .with_model_visible_text(self.model_visible_text.clone())
     }
 }
 
@@ -705,10 +708,11 @@ fn build_execution_window_continuation(
     exhausted_limit: Option<u64>,
     exhausted_observed: Option<u64>,
     reason_code: &str,
+    tool_no_progress: ExecutionCheckpointToolNoProgressState,
 ) -> ExecutionWindowContinuation {
     let exhausted_window_id = execution_window_runtime_id(turn_id, stats.window_index);
     let checkpoint_id = execution_window_checkpoint_runtime_id(exhausted_window_id.as_str());
-    let payload = build_execution_checkpoint_payload(
+    let mut payload = build_execution_checkpoint_payload(
         workspace_id,
         thread_id,
         turn_id,
@@ -724,6 +728,7 @@ fn build_execution_window_continuation(
         stats.checkpoint_tool_summary(),
         Vec::new(),
     );
+    payload.tool_no_progress = tool_no_progress;
 
     ExecutionWindowContinuation {
         reason,
@@ -746,6 +751,7 @@ fn build_budget_execution_window_continuation(
     model_provider: &str,
     stats: &ChatExecutionWindowStats,
     budget_exceeded: &ToolLoopBudgetExceeded,
+    tool_no_progress: ExecutionCheckpointToolNoProgressState,
 ) -> ExecutionWindowContinuation {
     build_execution_window_continuation(
         workspace_id,
@@ -759,6 +765,7 @@ fn build_budget_execution_window_continuation(
         Some(u64::from(budget_exceeded.limit)),
         Some(u64::from(budget_exceeded.observed)),
         budget_exceeded.reason.code(),
+        tool_no_progress,
     )
 }
 
@@ -771,6 +778,7 @@ fn build_failure_execution_window_continuation(
     model_provider: &str,
     stats: &ChatExecutionWindowStats,
     error: &ChatTurnError,
+    tool_no_progress: ExecutionCheckpointToolNoProgressState,
 ) -> Option<ExecutionWindowContinuation> {
     let (reason, reason_code) = match error {
         ChatTurnError::ProviderFailure { .. } => (
@@ -792,6 +800,7 @@ fn build_failure_execution_window_continuation(
                 model_provider,
                 stats,
                 error,
+                tool_no_progress,
             );
         }
     };
@@ -808,6 +817,7 @@ fn build_failure_execution_window_continuation(
         None,
         None,
         reason_code,
+        tool_no_progress,
     ))
 }
 
@@ -3975,6 +3985,14 @@ async fn execute_agent_provider_response(
         tool_loop_final_answer_instruction(),
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
+    let restored_no_progress_state = execution_checkpoint_context
+        .as_ref()
+        .map(|context| context.payload.tool_no_progress.clone())
+        .unwrap_or_default();
+    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint(
+        ToolNoProgressGuardConfig::default(),
+        restored_no_progress_state,
+    );
     let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
     let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
     let mut post_turn_assistant_text = String::new();
@@ -4125,6 +4143,7 @@ async fn execute_agent_provider_response(
                     post_turn_model_provider.as_str(),
                     &window_stats,
                     &budget_exceeded,
+                    tool_no_progress_guard.checkpoint_state(),
                 );
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
@@ -4423,6 +4442,7 @@ async fn execute_agent_provider_response(
                         post_turn_model_provider.as_str(),
                         &window_stats,
                         &budget_exceeded,
+                        tool_no_progress_guard.checkpoint_state(),
                     );
                     emit_execution_window_exhausted_and_checkpointed(
                         workspace_id,
@@ -4921,10 +4941,21 @@ async fn execute_agent_provider_response(
             );
             messages.push(assistant_round);
 
-            let tool_tasks = round
+            let guarded_tool_calls = round
                 .tool_calls
                 .into_iter()
                 .map(|model_tool_call| {
+                    let decision = tool_no_progress_guard.preflight(
+                        model_tool_call.name.as_str(),
+                        model_tool_call.arguments.as_str(),
+                    );
+                    (model_tool_call, decision)
+                })
+                .collect::<Vec<_>>();
+
+            let tool_tasks = guarded_tool_calls
+                .into_iter()
+                .map(|(model_tool_call, no_progress_decision)| {
                     let router = router.clone();
                     let runtime = runtime.clone();
                     let turn_control = turn_control.clone();
@@ -4972,6 +5003,80 @@ async fn execute_agent_provider_response(
                             state.output_policy = router
                                 .find_spec(tool_name.as_str())
                                 .map(|configured| configured.output_policy.clone());
+                        }
+
+                        if let ToolNoProgressPreflightDecision::Block { message, .. } =
+                            no_progress_decision
+                        {
+                            let output_policy = router
+                                .find_spec(tool_name.as_str())
+                                .map(|configured| configured.output_policy.clone());
+                            let outcome = ToolOutcome::fatal(
+                                ToolErrorClass::NeedsNarrowing,
+                                Some(
+                                    "This no-progress strategy is exhausted. Use a materially different approach; other tools and strategies remain available."
+                                        .to_owned(),
+                                ),
+                            );
+                            {
+                                let mut pending = pending_tool_ui.lock().await;
+                                pending.remove(item_id.as_str());
+                            }
+                            let _ = event_tx
+                                .publish_durable(AgentDurableEvent::ItemStarted {
+                                    notification: ItemStartedNotification {
+                                        workspace_id: workspace_id.clone(),
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        item: tooling::build_started_tool_turn_item(
+                                            item_id.clone(),
+                                            tool_name.clone(),
+                                            arguments.clone(),
+                                            Some(recovery_policy.clone()),
+                                            output_policy.clone(),
+                                            None,
+                                        ),
+                                    },
+                                })
+                                .await;
+                            let _ = event_tx
+                                .publish_durable(AgentDurableEvent::ItemCompleted {
+                                    notification: ItemCompletedNotification {
+                                        workspace_id: workspace_id.clone(),
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        item: tooling::build_failed_tool_turn_item(
+                                            item_id.clone(),
+                                            tool_name.clone(),
+                                            arguments.clone(),
+                                            message.clone(),
+                                            outcome.clone(),
+                                            Some(recovery_policy.clone()),
+                                            output_policy,
+                                            None,
+                                        ),
+                                    },
+                                })
+                                .await;
+                            return ExecutedToolResult {
+                                item_id: item_id.clone(),
+                                item_type,
+                                attempt_number,
+                                tool_name: tool_name.clone(),
+                                arguments: arguments.clone(),
+                                model_visible_text: message.clone(),
+                                success: false,
+                                outcome: outcome.clone(),
+                                recovery_view: None,
+                                retained_llm_context: None,
+                                request_tools_result: None,
+                                message: tooling::build_tool_error_message(
+                                    model_tool_call.id,
+                                    tool_name,
+                                    message,
+                                    outcome,
+                                ),
+                            };
                         }
 
                         if let Some(descriptor) = runtime_tool_index.get(tool_name.as_str()) {
@@ -5384,6 +5489,7 @@ async fn execute_agent_provider_response(
                 .iter()
                 .map(ExecutedToolResult::retry_observation)
                 .collect::<Vec<_>>();
+            let no_progress_feedback = tool_no_progress_guard.observe(&retry_observations);
             let mut next_round_tools_enabled = true;
             pending_retry_instruction = match tool_retry_controller.decide(&retry_observations) {
                 ToolRetryDecision::None { drafts } => {
@@ -5448,6 +5554,22 @@ async fn execute_agent_provider_response(
                     }
                 }
             };
+
+            if !no_progress_feedback.is_empty() {
+                let guard_instruction = render_tool_retry_instruction(
+                    ToolRetryInstructionKind::Retry,
+                    no_progress_feedback.fact_lines.as_slice(),
+                );
+                pending_retry_instruction = match (
+                    pending_retry_instruction.take(),
+                    guard_instruction,
+                ) {
+                    (Some(current), Some(guard)) => Some(format!("{current}\n\n{guard}")),
+                    (Some(current), None) => Some(current),
+                    (None, Some(guard)) => Some(guard),
+                    (None, None) => None,
+                };
+            }
 
             let next_retry_instruction =
                 normalize_optional_prompt(pending_retry_instruction.clone());
@@ -5579,6 +5701,7 @@ async fn execute_agent_provider_response(
                 post_turn_model_provider.as_str(),
                 &window_stats,
                 &error,
+                tool_no_progress_guard.checkpoint_state(),
             ) {
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
@@ -5887,9 +6010,10 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutedToolResult, TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,
-        append_recovered_provider_history, apply_request_tools_results_to_visible_tools,
-        apply_request_tools_visibility_expansion, apply_review_required_tools_to_visible_tools,
+        ChatExecutionWindowStats, ExecutedToolResult, TaskMutationFinalizationGuard,
+        agent_skill_cards_have_read_path, append_recovered_provider_history,
+        apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
+        apply_review_required_tools_to_visible_tools, build_execution_window_continuation,
         build_user_message, compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, materialize_mcp_tooling,
         normalize_turn_capabilities, readable_agent_skill_overlay,
@@ -5913,10 +6037,12 @@ mod tests {
     };
     use pioneer_protocol::{
         ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
-        ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointToolSummary,
-        ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, McpScopeKind,
-        TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-        TurnCapabilityRejectedReason, TurnExecutionSecuritySnapshot, TurnItemType, UserInput,
+        ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointToolNoProgressExactVariant,
+        ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolNoProgressStrategy,
+        ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
+        ExecutionWindowExhaustionReason, McpScopeKind, TurnCapability,
+        TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+        TurnExecutionSecuritySnapshot, TurnItemType, UserInput,
     };
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
@@ -6102,7 +6228,7 @@ mod tests {
             checkpoint_kind: "execution_window_exhausted".to_owned(),
             usage: crate::ExecutionWindowUsageSnapshot::default(),
             payload: ExecutionCheckpointPayload {
-                schema_version: 1,
+                schema_version: pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
                 workspace_id: "workspace_1".to_owned(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
@@ -6150,9 +6276,50 @@ mod tests {
                     details_truncated: false,
                     details: Vec::new(),
                 },
+                tool_no_progress: Default::default(),
                 strict_obligations: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn execution_window_continuation_persists_tool_no_progress_state() {
+        let state = ExecutionCheckpointToolNoProgressState {
+            strategies: vec![ExecutionCheckpointToolNoProgressStrategy {
+                strategy_id: "strategy_1".to_owned(),
+                tool_name: "exec_command".to_owned(),
+                executable: Some("runner".to_owned()),
+                structural_fingerprint: "structural".to_owned(),
+                structural_features: vec!["feature".to_owned()],
+                exact_variants: vec![ExecutionCheckpointToolNoProgressExactVariant {
+                    arguments_fingerprint: "exact".to_owned(),
+                    timeout_count: 2,
+                }],
+                timeout_count: 2,
+                cumulative_timeout_ms: 60_000,
+                warning_emitted: true,
+                exhausted: true,
+            }],
+        };
+        let continuation = build_execution_window_continuation(
+            "workspace",
+            "thread",
+            "turn",
+            &[UserInput::Text {
+                text: "continue".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            "model",
+            "provider",
+            &ChatExecutionWindowStats::new(1),
+            ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+            Some(1),
+            Some(1),
+            "max_agent_rounds_per_window",
+            state.clone(),
+        );
+
+        assert_eq!(continuation.checkpoint_payload.tool_no_progress, state);
     }
 
     #[test]

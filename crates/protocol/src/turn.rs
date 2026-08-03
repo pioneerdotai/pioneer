@@ -1900,7 +1900,7 @@ pub enum ExecutionWindowExhaustionReason {
     RuntimeShutdownContinuation,
 }
 
-pub const EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 2;
 pub const EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT: usize = 32;
 pub const EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS: usize = 512;
 pub const EXECUTION_CHECKPOINT_METADATA_MAX_CHARS: usize = 256;
@@ -1917,8 +1917,51 @@ pub struct ExecutionCheckpointPayload {
     pub window: ExecutionCheckpointWindowSummary,
     pub provider_budget: ExecutionCheckpointProviderBudgetSummary,
     pub tools: ExecutionCheckpointToolSummary,
+    #[serde(
+        default,
+        skip_serializing_if = "ExecutionCheckpointToolNoProgressState::is_empty"
+    )]
+    pub tool_no_progress: ExecutionCheckpointToolNoProgressState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strict_obligations: Vec<ExecutionCheckpointStrictObligation>,
+}
+
+/// Language-neutral state used to prevent a model from repeatedly spending time on a tool
+/// strategy that has already timed out. Only hashes and structural features are persisted; raw
+/// command arguments are intentionally excluded from the checkpoint.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionCheckpointToolNoProgressState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strategies: Vec<ExecutionCheckpointToolNoProgressStrategy>,
+}
+
+impl ExecutionCheckpointToolNoProgressState {
+    pub fn is_empty(&self) -> bool {
+        self.strategies.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointToolNoProgressStrategy {
+    pub strategy_id: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    pub structural_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structural_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_variants: Vec<ExecutionCheckpointToolNoProgressExactVariant>,
+    pub timeout_count: u32,
+    pub cumulative_timeout_ms: u64,
+    pub warning_emitted: bool,
+    pub exhausted: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointToolNoProgressExactVariant {
+    pub arguments_fingerprint: String,
+    pub timeout_count: u32,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -2170,6 +2213,7 @@ pub fn build_execution_checkpoint_payload(
         window,
         provider_budget,
         tools,
+        tool_no_progress: ExecutionCheckpointToolNoProgressState::default(),
         strict_obligations: obligations,
     }
 }
@@ -4758,6 +4802,17 @@ mod tests {
             decoded.schema_version,
             EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
         );
+
+        let mut legacy = serde_json::to_value(&payload).expect("legacy checkpoint value");
+        legacy["schema_version"] = json!(1);
+        legacy
+            .as_object_mut()
+            .expect("checkpoint object")
+            .remove("tool_no_progress");
+        let legacy: ExecutionCheckpointPayload =
+            serde_json::from_value(legacy).expect("schema v1 checkpoint should remain readable");
+        assert_eq!(legacy.schema_version, 1);
+        assert!(legacy.tool_no_progress.is_empty());
     }
 
     #[test]

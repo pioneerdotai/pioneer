@@ -105,6 +105,7 @@ pub struct ToolRetryObservation {
     pub success: bool,
     pub outcome: ToolOutcome,
     pub recovery_view: Option<ToolRecoveryView>,
+    pub model_visible_text: String,
 }
 
 impl ToolRetryObservation {
@@ -126,11 +127,17 @@ impl ToolRetryObservation {
             success,
             outcome,
             recovery_view: None,
+            model_visible_text: String::new(),
         }
     }
 
     pub fn with_recovery_view(mut self, recovery_view: Option<ToolRecoveryView>) -> Self {
         self.recovery_view = recovery_view;
+        self
+    }
+
+    pub fn with_model_visible_text(mut self, model_visible_text: impl Into<String>) -> Self {
+        self.model_visible_text = model_visible_text.into();
         self
     }
 }

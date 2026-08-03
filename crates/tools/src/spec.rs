@@ -424,7 +424,7 @@ pub(crate) fn computer_use_configured_spec() -> ConfiguredToolSpec {
 fn exec_command_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
-        "description": "Execute a command by direct argv. For shell syntax such as pipes, redirects, globbing, or expansions, call an explicit shell in `command`, for example [\"/bin/sh\", \"-c\", \"printf ok | cat\"].",
+        "description": "Execute a command by direct argv. For shell syntax such as pipes, redirects, globbing, or expansions, call an explicit shell in `command`, for example [\"/bin/sh\", \"-c\", \"printf ok | cat\"]. `timeout_ms` is a hard execution deadline: when it expires Pioneer terminates the process. Retrying the same command with only a larger timeout is not a new strategy; after a timeout, materially change the executable, interaction mode, decomposition, or another structural part of the approach before retrying.",
         "properties": {
             "command": {
                 "type": "array",
@@ -433,7 +433,11 @@ fn exec_command_schema() -> JsonValue {
                 "description": "Command argv. The first item is the executable; remaining items are passed as arguments without implicit shell wrapping."
             },
             "workdir": { "type": "string" },
-            "timeout_ms": { "type": "integer", "minimum": 1 },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Hard deadline in milliseconds. Pioneer terminates the process when this expires. Do not retry a timed-out command with only a larger value; materially change the strategy first."
+            },
             "max_output_tokens": { "type": "integer", "minimum": 1 },
             "yield_time_ms": { "type": "integer", "minimum": 0 },
             "tty": { "type": "boolean" }
@@ -1097,6 +1101,16 @@ mod tests {
             exec.spec.parameters["required"],
             serde_json::json!(["command"])
         );
+        let description = exec.spec.parameters["description"]
+            .as_str()
+            .expect("exec_command description");
+        let timeout_description = properties["timeout_ms"]["description"]
+            .as_str()
+            .expect("timeout description");
+        assert!(description.contains("hard execution deadline"));
+        assert!(description.contains("larger timeout is not a new strategy"));
+        assert!(timeout_description.contains("terminates the process"));
+        assert!(timeout_description.contains("materially change the strategy"));
     }
 
     #[test]
