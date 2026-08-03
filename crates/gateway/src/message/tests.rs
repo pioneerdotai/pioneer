@@ -20662,6 +20662,79 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_inside_child_turn_hides_its_execution_wrapper() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_list_from_task_execution".to_owned(),
+            name: "task_list".to_owned(),
+            arguments: json!({ "limit": 100 }).to_string(),
+        }],
+        r#"<task_result>{"summary":"task list inspected"}</task_result>"#,
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "task-list-child",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "task-list-child"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_task_list_wrapper_parent",
+        "turn_task_list_wrapper_parent",
+        "Execution wrapper hidden from task_list",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .model_provider = Some("task-list-child".to_owned());
+    let task = create_task_for_test(&processor, params)
+        .await
+        .expect("task should start");
+    assert_eq!(
+        wait_for_task_status(
+            crud_store,
+            task.task.id.as_str(),
+            pioneer_protocol::TaskStatus::Completed,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::Completed
+    );
+
+    let requests = provider.snapshot_requests();
+    let tool_result = requests
+        .get(1)
+        .expect("task_list should produce a second provider round")
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == pioneer_provider::Role::Tool
+                && message.name.as_deref() == Some("task_list")
+        })
+        .expect("second round should contain task_list result");
+    assert!(
+        !tool_result.content.contains(task.task.id.as_str()),
+        "task_list exposed its own orchestration wrapper: {}",
+        tool_result.content
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_detach_updates_lifecycle_policy() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));

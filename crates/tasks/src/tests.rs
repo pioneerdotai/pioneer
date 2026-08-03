@@ -463,6 +463,44 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     }
 }
 
+async fn record_active_task_execution_turn(
+    runtime: &TaskRuntime,
+    task_id: &str,
+    run_id: &str,
+) -> (String, String) {
+    let thread_id = pioneer_protocol::generate_id(21);
+    let turn_id = pioneer_protocol::generate_id(21);
+    let appended = runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRunTurnStarted {
+                task_run_turn: TaskRunTurn {
+                    id: pioneer_protocol::generate_id(21),
+                    task_id: task_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    execution_id: None,
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    kind: TaskRunTurnKind::Initial,
+                    round: 0,
+                    sequence: 0,
+                    status: TaskRunTurnStatus::InProgress,
+                    reviews_candidate_id: None,
+                    requested_by_candidate_id: None,
+                    requested_by_review_event_id: None,
+                    created_at: 1_700_000_000,
+                    started_at: Some(1_700_000_000),
+                    completed_at: None,
+                },
+            },
+            1_700_000_000,
+        )
+        .await
+        .expect("active task execution turn should append");
+    runtime.service().publish_and_wake(vec![appended]).await;
+    (thread_id, turn_id)
+}
+
 fn test_permission_cap() -> pioneer_protocol::TurnPermissionProfileCap {
     pioneer_protocol::task_permission_cap_from_snapshot(
         &pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -4702,6 +4740,181 @@ async fn cancel_task_is_idempotent_and_cancels_trigger_and_runs() {
             .status,
         TaskRunStatus::Cancelled
     );
+}
+
+#[tokio::test]
+async fn executing_task_cannot_cancel_itself() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate task should have a run");
+    let (thread_id, turn_id) =
+        record_active_task_execution_turn(&runtime, response.task.id.as_str(), run.id.as_str())
+            .await;
+
+    let error = runtime
+        .service()
+        .cancel_task(
+            TaskMutationContext::parent_agent(thread_id, turn_id),
+            TaskCancelParams {
+                task_id: response.task.id.clone(),
+                reason: Some("mistaken self cleanup".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .expect_err("an executing task must not cancel itself");
+    assert!(
+        format!("{error:#}").contains("cannot_cancel_current_execution_task"),
+        "unexpected error: {error:#}"
+    );
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should remain readable");
+    assert_ne!(task.task.status, TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn executing_task_cannot_cancel_an_ancestor() {
+    let runtime = runtime().await;
+    let root = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("root task should create");
+    let mut child_params = create_params(TaskTriggerSpec::Immediate);
+    child_params.parent_task_id = Some(root.task.id.clone());
+    let child = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), child_params)
+        .await
+        .expect("child task should create");
+    let child_run = child.run.expect("immediate child should have a run");
+    let (thread_id, turn_id) =
+        record_active_task_execution_turn(&runtime, child.task.id.as_str(), child_run.id.as_str())
+            .await;
+
+    let error = runtime
+        .service()
+        .cancel_task(
+            TaskMutationContext::parent_agent(thread_id, turn_id),
+            TaskCancelParams {
+                task_id: root.task.id.clone(),
+                reason: Some("mistaken ancestor cleanup".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .expect_err("an executing task must not cancel an ancestor");
+    assert!(
+        format!("{error:#}").contains("cannot_cancel_current_execution_ancestor"),
+        "unexpected error: {error:#}"
+    );
+
+    let root_after = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: root.task.id,
+        })
+        .await
+        .expect("root task should remain readable");
+    assert_ne!(root_after.task.status, TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn authenticated_user_can_cancel_an_executing_task() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate task should have a run");
+    let _ = record_active_task_execution_turn(&runtime, response.task.id.as_str(), run.id.as_str())
+        .await;
+
+    let cancelled = runtime
+        .service()
+        .cancel_task(
+            TaskMutationContext::user("user_1"),
+            TaskCancelParams {
+                task_id: response.task.id,
+                reason: Some("user requested stop".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .expect("authenticated user cancellation should remain allowed");
+    assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn executing_task_can_cancel_an_unrelated_task() {
+    let runtime = runtime().await;
+    let execution_task = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("execution task should create");
+    let execution_run = execution_task
+        .run
+        .expect("immediate execution task should have a run");
+    let (thread_id, turn_id) = record_active_task_execution_turn(
+        &runtime,
+        execution_task.task.id.as_str(),
+        execution_run.id.as_str(),
+    )
+    .await;
+    let unrelated = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("unrelated task should create");
+
+    let cancelled = runtime
+        .service()
+        .cancel_task(
+            TaskMutationContext::parent_agent(thread_id, turn_id),
+            TaskCancelParams {
+                task_id: unrelated.task.id,
+                reason: Some("remove unrelated task".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
+        .await
+        .expect("an execution should retain permission to cancel unrelated tasks");
+    assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
 }
 
 #[tokio::test]

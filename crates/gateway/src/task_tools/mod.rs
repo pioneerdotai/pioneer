@@ -374,13 +374,19 @@ impl TaskToolAuthorizationScope {
         }
     }
 
-    fn mutation_context(&self) -> pioneer_tasks::TaskMutationContext {
-        match self {
+    fn mutation_context(
+        &self,
+        turn_context: &TaskTurnContext,
+    ) -> pioneer_tasks::TaskMutationContext {
+        let mut context = match self {
             Self::Unrestricted => pioneer_tasks::TaskMutationContext::default(),
             Self::Member { principal, .. } => {
                 pioneer_tasks::TaskMutationContext::user(principal.principal_id.to_string())
             }
-        }
+        };
+        context.thread_id = Some(turn_context.thread_id.clone());
+        context.turn_id = Some(turn_context.turn_id.clone());
+        context
     }
 
     fn constrain_create_params(&self, params: &mut TaskCreateParams) {
@@ -974,7 +980,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .cancel_task(authorization.mutation_context(), params)
+            .cancel_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({ "task": task_summary(&response.task) });
@@ -1010,7 +1016,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .update_task(authorization.mutation_context(), params)
+            .update_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = task_update_tool_output(&response);
@@ -1037,7 +1043,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .detach_task(authorization.mutation_context(), params)
+            .detach_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         Ok(function_output(
@@ -1057,6 +1063,21 @@ impl TaskToolHandler {
             input.owner_id,
             self.context.thread_id.as_str(),
         )?;
+        let requested_limit = input
+            .limit
+            .unwrap_or(DEFAULT_TASK_LIST_LIMIT)
+            .max(1)
+            .min(100);
+        let current_execution_task_id = self
+            .processor
+            .crud_store
+            .get_task_run_turn_by_turn(
+                self.context.thread_id.as_str(),
+                self.context.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+            .map(|task_run_turn| task_run_turn.task_id);
         let params = TaskListParams {
             workspace_id: self.context.workspace_id.clone(),
             owner_kind,
@@ -1064,13 +1085,9 @@ impl TaskToolHandler {
             parent_task_id: validate_optional_entity_id(input.parent_task_id, "parentTaskId")?,
             root_task_id: validate_optional_entity_id(input.root_task_id, "rootTaskId")?,
             status: input.status,
-            limit: Some(
-                input
-                    .limit
-                    .unwrap_or(DEFAULT_TASK_LIST_LIMIT)
-                    .max(1)
-                    .min(100),
-            ),
+            // Fetch one extra row so hiding the current orchestration task does
+            // not reduce the caller-requested result count.
+            limit: Some(requested_limit.saturating_add(1)),
         };
         let service = self.processor.task_runtime.service();
         let response = match authorization.task_root_access_filter() {
@@ -1078,7 +1095,11 @@ impl TaskToolHandler {
             None => service.list_tasks(params).await,
         }
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let tasks = response.tasks.iter().map(task_summary).collect::<Vec<_>>();
+        let tasks = task_list_summaries(
+            &response.tasks,
+            current_execution_task_id.as_deref(),
+            requested_limit as usize,
+        );
         Ok(function_output(json!({ "tasks": tasks })))
     }
 
@@ -1146,7 +1167,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .reschedule_task(authorization.mutation_context(), params)
+            .reschedule_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({
@@ -1184,7 +1205,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .pause_task(authorization.mutation_context(), params)
+            .pause_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({
@@ -1222,7 +1243,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .resume_task(authorization.mutation_context(), params)
+            .resume_task(authorization.mutation_context(&self.context), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({
@@ -3721,6 +3742,19 @@ fn task_summary(task: &Task) -> JsonValue {
     })
 }
 
+fn task_list_summaries(
+    tasks: &[Task],
+    current_execution_task_id: Option<&str>,
+    requested_limit: usize,
+) -> Vec<JsonValue> {
+    tasks
+        .iter()
+        .filter(|task| current_execution_task_id != Some(task.id.as_str()))
+        .take(requested_limit)
+        .map(task_summary)
+        .collect()
+}
+
 pub(crate) async fn task_turn_item_from_response(
     processor: &MessageProcessor,
     response: &TaskGetResponse,
@@ -5057,6 +5091,37 @@ mod tests {
         .expect_err("ownerId without ownerKind would be silently ignored by list_tasks");
 
         assert!(error.to_string().contains("`ownerId` requires `ownerKind`"));
+    }
+
+    #[test]
+    fn task_tool_mutation_context_preserves_current_turn_identity() {
+        let turn_context = TaskTurnContext {
+            workspace_id: "workspace_12345678901".to_owned(),
+            thread_id: "thread_12345678901234".to_owned(),
+            turn_id: "turn_123456789012345".to_owned(),
+        };
+
+        let context = TaskToolAuthorizationScope::Unrestricted.mutation_context(&turn_context);
+
+        assert_eq!(context.thread_id, Some(turn_context.thread_id));
+        assert_eq!(context.turn_id, Some(turn_context.turn_id));
+    }
+
+    #[test]
+    fn task_list_hides_current_execution_wrapper_without_reducing_limit() {
+        let mut current = sample_task(TaskStatus::Running);
+        current.id = "task_current_execution".to_owned();
+        let mut first = sample_task(TaskStatus::Scheduled);
+        first.id = "task_visible_first".to_owned();
+        let mut second = sample_task(TaskStatus::Scheduled);
+        second.id = "task_visible_second".to_owned();
+
+        let summaries =
+            task_list_summaries(&[current, first, second], Some("task_current_execution"), 2);
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0]["taskId"], "task_visible_first");
+        assert_eq!(summaries[1]["taskId"], "task_visible_second");
     }
 
     #[test]

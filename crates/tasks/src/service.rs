@@ -46,7 +46,7 @@ use pioneer_protocol::{
     TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path};
 use std::pin::Pin;
@@ -1833,12 +1833,14 @@ impl TaskService {
 
     pub async fn cancel_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskCancelParams,
     ) -> TaskRuntimeResult<TaskCancelResponse> {
         let Some(root_response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        self.ensure_execution_can_cancel_task(&context, params.task_id.as_str())
+            .await?;
         if is_terminal_task(root_response.task.status) {
             return Ok(TaskCancelResponse {
                 task: root_response.task,
@@ -1933,6 +1935,68 @@ impl TaskService {
             cancelled_runs,
             cancelled_deliveries,
         })
+    }
+
+    async fn ensure_execution_can_cancel_task(
+        &self,
+        context: &TaskMutationContext,
+        target_task_id: &str,
+    ) -> TaskRuntimeResult<()> {
+        let execution_turn = match (context.thread_id.as_deref(), context.turn_id.as_deref()) {
+            (None, None) => return Ok(()),
+            (Some(thread_id), Some(turn_id)) => {
+                self.store
+                    .get_task_run_turn_by_turn(thread_id, turn_id)
+                    .await?
+            }
+            _ => bail!("task cancellation execution context requires both thread_id and turn_id"),
+        };
+        let Some(execution_turn) = execution_turn else {
+            // Ordinary conversation turns are not task executions and retain
+            // their existing ability to manage tasks.
+            return Ok(());
+        };
+
+        if execution_turn.task_id == target_task_id {
+            bail!(
+                "cannot_cancel_current_execution_task: task `{}` cannot cancel itself while executing run `{}`",
+                execution_turn.task_id,
+                execution_turn.run_id
+            );
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut current_task_id = execution_turn.task_id.clone();
+        loop {
+            if !visited.insert(current_task_id.clone()) {
+                bail!(
+                    "task lineage cycle detected while authorizing cancellation from task `{}`",
+                    execution_turn.task_id
+                );
+            }
+            let current = self
+                .store
+                .get_task(current_task_id.as_str())
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "current execution task `{}` is unavailable",
+                        current_task_id
+                    )
+                })?;
+            let Some(parent_task_id) = current.task.parent_task_id else {
+                return Ok(());
+            };
+            if parent_task_id == target_task_id {
+                bail!(
+                    "cannot_cancel_current_execution_ancestor: task `{}` cannot cancel ancestor task `{}` while executing run `{}`",
+                    execution_turn.task_id,
+                    target_task_id,
+                    execution_turn.run_id
+                );
+            }
+            current_task_id = parent_task_id;
+        }
     }
 
     pub async fn detach_task(
