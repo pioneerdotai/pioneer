@@ -38030,6 +38030,301 @@ async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
+    let harness = setup_live_semantic_timeline_harness("historical_task_snapshot").await;
+    let base = super::now_timestamp_secs();
+    let task_item = |updated_at| TurnItem::Task {
+        item: TaskTurnItem {
+            id: "historical_task_anchor".to_owned(),
+            task_id: "historical_task".to_owned(),
+            created_by_turn_id: Some(harness.turn_id.clone()),
+            run_id: None,
+            parent_task_id: None,
+            root_task_id: None,
+            title: "Historical recurring task".to_owned(),
+            status: TaskStatus::Scheduled,
+            attachment: TaskAttachmentMode::Attached,
+            trigger_kind: TaskTriggerKind::Cron,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 0,
+            max_depth: 3,
+            next_fire_at: Some(updated_at + 60),
+            progress_preview: None,
+            result_preview: None,
+            error_preview: None,
+            started_at: None,
+            created_at: base,
+            updated_at,
+        },
+    };
+
+    harness
+        .processor
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: task_item(base + 1),
+            },
+            base + 1,
+        )
+        .await
+        .expect("historical task anchor should persist");
+    harness
+        .processor
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn: Turn {
+                    id: harness.turn_id.clone(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::default(),
+                    origin: TurnOrigin::default(),
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+            },
+            base + 2,
+        )
+        .await
+        .expect("historical turn should complete");
+
+    let before = harness
+        .processor
+        .crud_store
+        .get_turn_work_projection(harness.turn_id.as_str())
+        .await
+        .expect("terminal work summary should load")
+        .expect("terminal work summary should exist");
+    let work_item_id = pioneer_crud::work_item_projection_id(
+        harness.turn_id.as_str(),
+        "historical_task_anchor",
+    );
+    let before_item = harness
+        .processor
+        .crud_store
+        .get_turn_work_item_projection(work_item_id.as_str())
+        .await
+        .expect("historical task work item should load")
+        .expect("historical task work item should exist");
+    let late_update_at = base + 4_000_000;
+    harness
+        .processor
+        .crud_store
+        .materialize_item_updated(
+            ItemUpdatedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: task_item(late_update_at),
+            },
+            late_update_at,
+        )
+        .await
+        .expect("late task snapshot should persist");
+    let after = harness
+        .processor
+        .crud_store
+        .get_turn_work_projection(harness.turn_id.as_str())
+        .await
+        .expect("terminal work summary should reload")
+        .expect("terminal work summary should remain");
+
+    assert_eq!(after.elapsed_ms, before.elapsed_ms);
+    assert_eq!(after.completed_at, before.completed_at);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.source_high_watermark, before.source_high_watermark);
+    let snapshot_update_at = late_update_at + 1;
+    harness
+        .processor
+        .crud_store
+        .materialize_item_snapshot_updated(
+            ItemUpdatedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: task_item(snapshot_update_at),
+            },
+            snapshot_update_at,
+        )
+        .await
+        .expect("late task snapshot replacement should persist");
+    let after_snapshot = harness
+        .processor
+        .crud_store
+        .get_turn_work_projection(harness.turn_id.as_str())
+        .await
+        .expect("terminal work summary should reload after snapshot")
+        .expect("terminal work summary should remain after snapshot");
+    assert_eq!(after_snapshot.elapsed_ms, before.elapsed_ms);
+    assert_eq!(after_snapshot.completed_at, before.completed_at);
+    assert_eq!(after_snapshot.updated_at, before.updated_at);
+    assert_eq!(after_snapshot.source_high_watermark, before.source_high_watermark);
+    let after_item = harness
+        .processor
+        .crud_store
+        .get_turn_work_item_projection(work_item_id.as_str())
+        .await
+        .expect("updated task work item should load")
+        .expect("updated task work item should remain");
+    assert_eq!(after_item.started_at, before_item.started_at);
+    assert_eq!(after_item.completed_at, before_item.completed_at);
+    assert_eq!(after_item.created_at, before_item.created_at);
+    let TurnItem::Task { item } = harness
+        .processor
+        .crud_store
+        .get_turn_item(harness.turn_id.as_str(), "historical_task_anchor")
+        .await
+        .expect("updated task anchor should load")
+        .expect("updated task anchor should exist")
+    else {
+        panic!("updated anchor should stay a task item");
+    };
+    assert_eq!(item.updated_at, snapshot_update_at);
+
+    crate::database::startup::backfill_timeline_pagination_once(
+        harness.processor.crud_store.as_ref(),
+        16,
+    )
+    .await
+    .expect("semantic timeline v8 backfill should repair historical projections");
+    let after_backfill = harness
+        .processor
+        .crud_store
+        .get_turn_work_projection(harness.turn_id.as_str())
+        .await
+        .expect("backfilled work summary should load")
+        .expect("backfilled work summary should remain");
+    assert_eq!(after_backfill.elapsed_ms, before.elapsed_ms);
+    assert_eq!(after_backfill.completed_at, before.completed_at);
+    let backfilled_item = harness
+        .processor
+        .crud_store
+        .get_turn_work_item_projection(work_item_id.as_str())
+        .await
+        .expect("backfilled task work item should load")
+        .expect("backfilled task work item should remain");
+    assert_eq!(backfilled_item.completed_at, before_item.completed_at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
+    let (_workspace_manager, store, workspace_id) = setup_workspace_manager().await;
+    let base = super::now_timestamp_secs();
+    let thread_id = "thr_detached_wrapper_no_work";
+    let turn_id = "turn_detached_wrapper_no_work";
+    let thread = semantic_fixture_thread(
+        workspace_id.as_str(),
+        thread_id,
+        Some("Detached wrapper"),
+        base,
+    );
+    let turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::TaskRun,
+        origin: TurnOrigin::DetachedTask,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("detached wrapper should persist");
+    store
+        .materialize_item_started(
+            ItemStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::Task {
+                    item: TaskTurnItem {
+                        id: "detached_task_anchor".to_owned(),
+                        task_id: "detached_task".to_owned(),
+                        created_by_turn_id: None,
+                        run_id: Some("detached_run".to_owned()),
+                        parent_task_id: None,
+                        root_task_id: None,
+                        title: "Detached task".to_owned(),
+                        status: TaskStatus::Running,
+                        attachment: TaskAttachmentMode::Detached,
+                        trigger_kind: TaskTriggerKind::Immediate,
+                        executor_kind: TaskExecutorKind::Agent,
+                        child_thread_id: Some("detached_child".to_owned()),
+                        child_turn_id: Some("detached_child_turn".to_owned()),
+                        agent_role: None,
+                        depth: 0,
+                        max_depth: 3,
+                        next_fire_at: None,
+                        progress_preview: None,
+                        result_preview: None,
+                        error_preview: None,
+                        started_at: Some(base + 1),
+                        created_at: base,
+                        updated_at: base + 1,
+                    },
+                },
+            },
+            base + 1,
+        )
+        .await
+        .expect("detached task card should persist");
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::SystemEvent {
+                    id: "detached_delivery_error".to_owned(),
+                    level: pioneer_protocol::SystemEventLevel::Error,
+                    message: "Task delivery failed".to_owned(),
+                    code: Some("task_delivery_failed".to_owned()),
+                    details: None,
+                },
+            },
+            base + 2,
+        )
+        .await
+        .expect("wrapper diagnostic should persist");
+
+    assert!(
+        store
+            .get_turn_work_projection(turn_id)
+            .await
+            .expect("wrapper work summary should query")
+            .is_none(),
+        "detached wrapper diagnostics must not create a parent Worked group"
+    );
+    crate::database::startup::backfill_timeline_pagination_once(store.as_ref(), 16)
+        .await
+        .expect("semantic timeline v8 backfill should rebuild detached wrapper projections");
+    assert!(
+        store
+            .get_turn_work_projection(turn_id)
+            .await
+            .expect("backfilled wrapper work summary should query")
+            .is_none(),
+        "backfill must preserve the parent-card-only detached Task presentation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_pending_request_projects_approval_block() {
     let mut harness = setup_live_semantic_timeline_harness("approval").await;
     let now = chrono::Utc::now().fixed_offset();

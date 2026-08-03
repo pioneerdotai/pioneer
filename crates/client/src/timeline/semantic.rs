@@ -1123,12 +1123,19 @@ pub fn apply_conversation_event_to_semantic_timeline(
             thread_id,
             turn_id,
             item,
-        }
-        | ConversationEvent::ItemUpdated {
+        } => apply_item_completed_to_semantic_timeline(
+            state,
+            workspace_id,
             thread_id,
             turn_id,
             item,
-        } => apply_item_completed_to_semantic_timeline(
+            now_unix_ms,
+        ),
+        ConversationEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        } => apply_item_updated_to_semantic_timeline(
             state,
             workspace_id,
             thread_id,
@@ -1523,6 +1530,10 @@ fn apply_item_started_to_semantic_timeline(
             remove_turn_work_state(thread, turn_id);
         }
         LiveItemPlacement::TurnWork => {
+            if thread_has_detached_task_run(thread, turn_id) {
+                remove_turn_work_state(thread, turn_id);
+                return before != *thread;
+            }
             upsert_turn_work_item(
                 thread,
                 workspace_id,
@@ -1702,6 +1713,10 @@ fn apply_item_completed_to_semantic_timeline(
             remove_turn_work_state(thread, turn_id);
         }
         LiveItemPlacement::TurnWork => {
+            if thread_has_detached_task_run(thread, turn_id) {
+                remove_turn_work_state(thread, turn_id);
+                return before != *thread;
+            }
             upsert_turn_work_item(
                 thread,
                 workspace_id,
@@ -1727,6 +1742,56 @@ fn apply_item_completed_to_semantic_timeline(
         }
     }
     before != *thread
+}
+
+fn apply_item_updated_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: &TurnItem,
+    now_unix_ms: i64,
+) -> bool {
+    if matches!(
+        item,
+        TurnItem::Task { item } if item.attachment == TaskAttachmentMode::Attached
+    ) {
+        let work_item_id = work_item_projection_id(turn_id, item.item_id());
+        let Some(existing) = state
+            .thread(thread_id)
+            .and_then(|thread| thread.work_range(turn_id))
+            .and_then(|range| range.items_by_id.get(work_item_id.as_str()))
+        else {
+            // A late task snapshot may refer to a historical turn outside the
+            // loaded window. Let the canonical pagination APIs refresh that
+            // item; do not resurrect its old Worked group in the live tail.
+            return false;
+        };
+        let source_updated_at_unix_micros = existing
+            .source_updated_at_unix_micros
+            .max(now_unix_ms.saturating_mul(1_000));
+        let thread = state.thread_mut(thread_id.to_owned());
+        let before = thread.clone();
+        if let Some(existing) = thread
+            .work_range_mut(turn_id.to_owned())
+            .items_by_id
+            .get_mut(work_item_id.as_str())
+        {
+            existing.item = item.clone();
+            existing.item_type = item.item_type();
+            existing.source_updated_at_unix_micros = source_updated_at_unix_micros;
+        }
+        return before != *thread;
+    }
+
+    apply_item_completed_to_semantic_timeline(
+        state,
+        workspace_id,
+        thread_id,
+        turn_id,
+        item,
+        now_unix_ms,
+    )
 }
 
 pub fn remove_thread_semantic_timeline(state: &mut SemanticTimelineState, thread_id: &str) -> bool {
@@ -2722,6 +2787,27 @@ fn upsert_turn_work_summary(
     now_unix_ms: i64,
 ) {
     let existing = thread.cached_turn_work_block(turn_id).cloned();
+    let preserve_terminal_state = existing.as_ref().is_some_and(|work| {
+        is_terminal_turn_work_state(work.state) && !is_terminal_turn_work_state(state)
+    });
+    let state = if preserve_terminal_state {
+        existing.as_ref().map(|work| work.state).unwrap_or(state)
+    } else {
+        state
+    };
+    let presentation = if preserve_terminal_state {
+        existing
+            .as_ref()
+            .map(|work| work.presentation)
+            .unwrap_or(presentation)
+    } else {
+        presentation
+    };
+    let completed_at_unix_ms = completed_at_unix_ms.or_else(|| {
+        preserve_terminal_state
+            .then(|| existing.as_ref().and_then(|work| work.completed_at_unix_ms))
+            .flatten()
+    });
     let visible_count_from_range = thread
         .work_range(turn_id)
         .map(|range| range.items_by_id.len() as u64)
@@ -2747,7 +2833,12 @@ fn upsert_turn_work_summary(
         elapsed_ms: existing
             .as_ref()
             .and_then(|work| work.started_at_unix_ms)
-            .map(|started_at| now_unix_ms.saturating_sub(started_at).max(0) as u64),
+            .map(|started_at| {
+                completed_at_unix_ms
+                    .unwrap_or(now_unix_ms)
+                    .saturating_sub(started_at)
+                    .max(0) as u64
+            }),
         work_count: visible_work_count.saturating_add(hidden_work_count),
         visible_work_count,
         hidden_work_count,
@@ -2856,6 +2947,16 @@ fn completed_work_status_for_item(item: &TurnItem) -> TurnWorkItemStatus {
 
 fn is_terminal_turn_work_item_status(status: TurnWorkItemStatus) -> bool {
     !matches!(status, TurnWorkItemStatus::Running)
+}
+
+fn is_terminal_turn_work_state(state: TurnWorkState) -> bool {
+    matches!(
+        state,
+        TurnWorkState::Completed
+            | TurnWorkState::Blocked
+            | TurnWorkState::Failed
+            | TurnWorkState::Interrupted
+    )
 }
 
 fn append_delta_to_turn_item(
@@ -3512,6 +3613,179 @@ mod tests {
             Some(20_000),
             "running elapsed time must exclude the queued interval",
         );
+    }
+
+    #[test]
+    fn detached_task_diagnostics_do_not_recreate_parent_work_group() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnStarted {
+                thread_id: "thread_a".to_owned(),
+                turn: detached_task_turn("task_turn"),
+            },
+            1_000,
+        ));
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: task_turn_item(TaskAttachmentMode::Detached, TaskStatus::Running),
+            },
+            1_100,
+        ));
+
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemCompleted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "task_turn".to_owned(),
+                item: TurnItem::SystemEvent {
+                    id: "delivery_error".to_owned(),
+                    level: SystemEventLevel::Error,
+                    message: "Task delivery failed".to_owned(),
+                    code: Some("task_delivery_failed".to_owned()),
+                    details: None,
+                },
+            },
+            2_000,
+        );
+
+        let thread = state.thread("thread_a").expect("thread state should exist");
+        assert!(
+            thread
+                .top_level
+                .block("turn:task_turn:detached-task-run:task_anchor")
+                .is_some(),
+            "the detached Task card must remain visible"
+        );
+        assert!(
+            thread.top_level.block("turn:task_turn:work").is_none(),
+            "wrapper diagnostics belong to the Task card, not a parent Worked group"
+        );
+        assert!(thread.work_range("task_turn").is_none());
+    }
+
+    #[test]
+    fn unloaded_historical_task_update_does_not_create_live_work_group() {
+        let mut state = SemanticTimelineState::default();
+
+        assert!(!apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemUpdated {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "historical_turn".to_owned(),
+                item: task_turn_item(TaskAttachmentMode::Attached, TaskStatus::Scheduled),
+            },
+            4_000_000,
+        ));
+        assert!(
+            state.thread("thread_a").is_none(),
+            "a late snapshot outside the loaded window must not enter the live tail"
+        );
+    }
+
+    #[test]
+    fn historical_task_update_preserves_terminal_work_summary_timing() {
+        let mut state = SemanticTimelineState::default();
+        let original_task = task_turn_item(TaskAttachmentMode::Attached, TaskStatus::Scheduled);
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemCompleted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "historical_turn".to_owned(),
+                item: original_task,
+            },
+            1_000,
+        ));
+        let mut terminal_turn = detached_task_turn("historical_turn");
+        terminal_turn.status = TurnStatus::Completed;
+        terminal_turn.turn_kind = TurnKind::default();
+        terminal_turn.origin = TurnOrigin::default();
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnCompleted {
+                thread_id: "thread_a".to_owned(),
+                turn: terminal_turn,
+            },
+            2_000,
+        ));
+
+        let before_work = state
+            .thread("thread_a")
+            .and_then(|thread| thread.cached_turn_work_block("historical_turn"))
+            .cloned()
+            .expect("terminal work summary should exist");
+        assert_eq!(before_work.elapsed_ms, Some(1_000));
+
+        let mut updated_task = task_turn_item(TaskAttachmentMode::Attached, TaskStatus::Scheduled);
+        let TurnItem::Task { item } = &mut updated_task else {
+            unreachable!("task fixture must stay a task item");
+        };
+        item.updated_at = 4_000;
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemUpdated {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "historical_turn".to_owned(),
+                item: updated_task,
+            },
+            4_000_000,
+        ));
+
+        let thread = state.thread("thread_a").expect("thread state should exist");
+        assert_eq!(
+            thread.cached_turn_work_block("historical_turn"),
+            Some(&before_work),
+            "a task snapshot must not restart, resize, or move terminal work"
+        );
+        let updated_item = thread
+            .work_range("historical_turn")
+            .and_then(|range| {
+                range
+                    .items_by_id
+                    .get("turn:historical_turn:work:task_anchor")
+            })
+            .expect("existing task anchor should update in place");
+        assert!(matches!(
+            &updated_item.item,
+            TurnItem::Task { item } if item.updated_at == 4_000
+        ));
+        assert_eq!(updated_item.started_at_unix_ms, Some(1_000));
+        assert_eq!(updated_item.completed_at_unix_ms, Some(1_000));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemUpdated {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "historical_turn".to_owned(),
+                item: TurnItem::SystemEvent {
+                    id: "late_diagnostic".to_owned(),
+                    level: SystemEventLevel::Warning,
+                    message: "Context compacted".to_owned(),
+                    code: Some("agent_context_compaction".to_owned()),
+                    details: None,
+                },
+            },
+            5_000_000,
+        ));
+        let work = state
+            .thread("thread_a")
+            .and_then(|thread| thread.cached_turn_work_block("historical_turn"))
+            .expect("terminal work summary should remain");
+        assert_eq!(work.state, TurnWorkState::Completed);
+        assert_eq!(work.presentation, before_work.presentation);
+        assert_eq!(work.completed_at_unix_ms, Some(2_000));
+        assert_eq!(work.elapsed_ms, Some(1_000));
     }
 
     #[test]

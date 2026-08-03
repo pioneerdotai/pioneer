@@ -316,10 +316,12 @@ async fn project_turn_item_event<C: ConnectionTrait>(
         .await;
     };
 
+    let classification = classify_turn_item_row_for_turn(&item_model, &turn_model);
     let refresh_work_summary = !matches!(
-        classify_turn_item_row_for_turn(&item_model, &turn_model).placement,
+        classification.placement,
         ProjectionPlacement::TopLevelUserMessage
-    );
+    ) && !(matches!(event.payload, TurnEventPayload::ItemUpdated(_))
+        && is_attached_task_projection(&item_model, &classification));
 
     project_turn_item_row(db, &thread_model, &turn_model, &item_model, event).await?;
     if !refresh_work_summary {
@@ -363,10 +365,11 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
         .await;
     };
 
+    let classification = classify_turn_item_row_for_turn(&item_model, &turn_model);
     let refresh_work_summary = !matches!(
-        classify_turn_item_row_for_turn(&item_model, &turn_model).placement,
+        classification.placement,
         ProjectionPlacement::TopLevelUserMessage
-    );
+    ) && !is_attached_task_projection(&item_model, &classification);
 
     project_snapshot_turn_item_row(
         db,
@@ -523,6 +526,14 @@ async fn project_turn_item_row<C: ConnectionTrait>(
             let source_order =
                 resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
             let order_key = work_item_order_key(item_model, Some(&source_order));
+            let timing = resolve_turn_work_item_timing(
+                db,
+                turn_model.id.as_str(),
+                item_model,
+                matches!(event.payload, TurnEventPayload::ItemUpdated(_))
+                    && is_attached_task_projection(item_model, &classification),
+            )
+            .await?;
             timeline_repository::delete_thread_timeline_block(
                 db,
                 assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
@@ -546,10 +557,10 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                     visibility: classification.visibility_str().to_owned(),
                     classification: classification.classification_str().to_owned(),
                     status: classification.status.to_owned(),
-                    started_at: Some(item_model.created_at),
-                    completed_at: Some(item_model.updated_at),
+                    started_at: timing.started_at,
+                    completed_at: timing.completed_at,
                     metadata_json: classification_metadata_json(&classification),
-                    created_at: item_model.created_at,
+                    created_at: timing.created_at,
                     updated_at: event.created_at,
                 },
             )
@@ -646,6 +657,13 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
             let order_key = work_item_order_key(item_model, Some(&source_order));
             let source_event_id =
                 (!source_order.event_id.is_empty()).then(|| source_order.event_id.clone());
+            let timing = resolve_turn_work_item_timing(
+                db,
+                turn_model.id.as_str(),
+                item_model,
+                is_attached_task_projection(item_model, &classification),
+            )
+            .await?;
             timeline_repository::delete_thread_timeline_block(
                 db,
                 assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
@@ -669,10 +687,10 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                     visibility: classification.visibility_str().to_owned(),
                     classification: classification.classification_str().to_owned(),
                     status: classification.status.to_owned(),
-                    started_at: Some(item_model.created_at),
-                    completed_at: Some(item_model.updated_at),
+                    started_at: timing.started_at,
+                    completed_at: timing.completed_at,
                     metadata_json: classification_metadata_json(&classification),
-                    created_at: item_model.created_at,
+                    created_at: timing.created_at,
                     updated_at: refreshed_at,
                 },
             )
@@ -906,15 +924,16 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     )
     .await?
         > 0;
-    let has_detached_task_run =
-        turn_has_detached_task_run_block(db, turn_model.id.as_str()).await?;
-    // A collaborative Composer admission turn durably owns only the user's
-    // message. Once it completes, the detached Task card represents the agent
-    // work separately. Do not leave an empty "Worked" block behind for that
-    // successful message-only turn (or for any other successful empty turn).
+    let has_detached_task_run = turn_has_detached_task_run_block(db, turn_model.id.as_str())
+        .await?
+        || detached_task_run_origin_hint(turn_model);
+    // A detached Task card represents the wrapper lifecycle in the parent.
+    // Its actual work belongs to the child thread, so wrapper diagnostics must
+    // never create a second, misleading "Worked" group beside the card.
+    // Successful message-only turns likewise do not need an empty work block.
     let completed_without_work = turn_model.status == "completed" && work_count == 0;
     let needs_work_block =
-        work_count > 0 || (!has_final && !has_detached_task_run && !completed_without_work);
+        !has_detached_task_run && (work_count > 0 || (!has_final && !completed_without_work));
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
@@ -954,6 +973,9 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         running_item_state.stale,
     );
 
+    let terminal_completed_at = terminal_completed_at(turn_model);
+    let elapsed_through = turn_work_elapsed_through(terminal_completed_at, summary_updated_at);
+
     timeline_repository::upsert_turn_work_projection(
         db,
         TurnWorkProjectionRecord {
@@ -968,8 +990,8 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             first_work_item_id: first_work_item_id.clone(),
             last_work_item_id: last_work_item_id.clone(),
             started_at: Some(turn_model.created_at),
-            completed_at: terminal_completed_at(turn_model),
-            elapsed_ms: Some(elapsed_ms(turn_model.created_at, summary_updated_at)),
+            completed_at: terminal_completed_at,
+            elapsed_ms: Some(elapsed_ms(turn_model.created_at, elapsed_through)),
             source_high_watermark,
             metadata_json: json!({
                 "hasFinalAssistantMessage": has_final,
@@ -998,7 +1020,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             source_kind: Some("turn_work".to_owned()),
             source_key: Some(turn_model.id.clone()),
             started_at: Some(turn_model.created_at),
-            completed_at: terminal_completed_at(turn_model),
+            completed_at: terminal_completed_at,
             metadata_json: json!({
                 "turnId": turn_model.id,
                 "workCount": work_count,
@@ -1170,8 +1192,55 @@ fn count_to_i64(count: u64) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
 
+fn is_attached_task_projection(
+    item_model: &turn_item_entity::Model,
+    classification: &crate::timeline_projection::TurnItemProjectionClassification,
+) -> bool {
+    item_model.item_type == "task"
+        && matches!(classification.placement, ProjectionPlacement::TurnWork)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnWorkItemTiming {
+    started_at: Option<DateTimeWithTimeZone>,
+    completed_at: Option<DateTimeWithTimeZone>,
+    created_at: DateTimeWithTimeZone,
+}
+
+async fn resolve_turn_work_item_timing<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_model: &turn_item_entity::Model,
+    preserve_existing: bool,
+) -> Result<TurnWorkItemTiming> {
+    let work_item_id = work_item_projection_id(turn_id, item_model.item_id.as_str());
+    if preserve_existing
+        && let Some(existing) =
+            timeline_repository::find_turn_work_item_projection(db, work_item_id.as_str()).await?
+    {
+        return Ok(TurnWorkItemTiming {
+            started_at: existing.started_at,
+            completed_at: existing.completed_at,
+            created_at: existing.created_at,
+        });
+    }
+
+    Ok(TurnWorkItemTiming {
+        started_at: Some(item_model.created_at),
+        completed_at: Some(item_model.updated_at),
+        created_at: item_model.created_at,
+    })
+}
+
 fn max_datetime(left: DateTimeWithTimeZone, right: DateTimeWithTimeZone) -> DateTimeWithTimeZone {
     if left >= right { left } else { right }
+}
+
+fn turn_work_elapsed_through(
+    terminal_completed_at: Option<DateTimeWithTimeZone>,
+    refreshed_at: DateTimeWithTimeZone,
+) -> DateTimeWithTimeZone {
+    terminal_completed_at.unwrap_or(refreshed_at)
 }
 
 #[cfg(test)]
@@ -1258,6 +1327,18 @@ mod tests {
 
         let running = detached_task_item_row(Some(12), TaskStatus::Running);
         assert_eq!(detached_task_run_timing(&running).completed_at, None);
+    }
+
+    #[test]
+    fn terminal_work_elapsed_time_ignores_late_projection_refresh() {
+        let completed_at = unix_to_datetime(20);
+        let refreshed_at = unix_to_datetime(4_000_000);
+
+        assert_eq!(
+            turn_work_elapsed_through(Some(completed_at), refreshed_at),
+            completed_at
+        );
+        assert_eq!(turn_work_elapsed_through(None, refreshed_at), refreshed_at);
     }
 
     #[test]

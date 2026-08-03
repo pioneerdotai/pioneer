@@ -82,6 +82,7 @@ struct TurnBackfillStats {
 struct ItemEventOrder {
     event_id: String,
     sequence: i64,
+    completed_at: Option<DateTimeWithTimeZone>,
 }
 
 fn classification_metadata_json(classification: &TurnItemProjectionClassification) -> String {
@@ -103,6 +104,18 @@ fn elapsed_ms(started_at: DateTimeWithTimeZone, completed_at: DateTimeWithTimeZo
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0)
+}
+
+fn min_datetime(left: DateTimeWithTimeZone, right: DateTimeWithTimeZone) -> DateTimeWithTimeZone {
+    if left <= right { left } else { right }
+}
+
+fn detached_task_run_origin_hint(turn_model: &turn::Model) -> bool {
+    turn_model.turn_kind == "task_run"
+        && matches!(
+            turn_model.origin.as_str(),
+            "scheduled_task" | "detached_task"
+        )
 }
 
 fn work_item_order_key(item: &turn_item::Model, source_order: Option<&ItemEventOrder>) -> String {
@@ -542,6 +555,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     let mut has_running_item = false;
     let mut has_stale_running_item = false;
     let projection_now = now_datetime();
+    let turn_completed_at = terminal_completed_at(turn_model);
 
     let mut item_cursor: Option<(DateTimeWithTimeZone, String)> = None;
     loop {
@@ -625,7 +639,16 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                             classification: classification.classification_str().to_owned(),
                             status: classification.status.to_owned(),
                             started_at: Some(item_model.created_at),
-                            completed_at: Some(item_model.updated_at),
+                            completed_at: Some(
+                                source_order
+                                    .and_then(|order| order.completed_at)
+                                    .or_else(|| {
+                                        turn_completed_at.map(|completed_at| {
+                                            min_datetime(item_model.updated_at, completed_at)
+                                        })
+                                    })
+                                    .unwrap_or(item_model.updated_at),
+                            ),
                             metadata_json: classification_metadata_json(&classification),
                             created_at: item_model.created_at,
                             updated_at: item_model.updated_at,
@@ -673,9 +696,12 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     }
 
     let has_final = !assistant_blocks.is_empty();
-    let has_detached_task_run = !detached_task_run_blocks.is_empty();
+    let has_detached_task_run =
+        !detached_task_run_blocks.is_empty() || detached_task_run_origin_hint(turn_model);
     let work_count = visible_work_count.saturating_add(hidden_work_count);
-    let needs_work_block = work_count > 0 || (!has_final && !has_detached_task_run);
+    let completed_without_work = turn_model.status == "completed" && work_count == 0;
+    let needs_work_block =
+        !has_detached_task_run && (work_count > 0 || (!has_final && !completed_without_work));
 
     if needs_work_block {
         let pending_request_count = count_pending_cli_runtime_requests(
@@ -691,7 +717,8 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
             has_running_item,
             has_stale_running_item,
         );
-        let elapsed_ms = elapsed_ms(turn_model.created_at, turn_model.updated_at);
+        let elapsed_through = turn_completed_at.unwrap_or(turn_model.updated_at);
+        let elapsed_ms = elapsed_ms(turn_model.created_at, elapsed_through);
         timeline_repository::upsert_turn_work_projection(
             db,
             TurnWorkProjectionRecord {
@@ -706,7 +733,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                 first_work_item_id: first_work_item_id.clone(),
                 last_work_item_id: last_work_item_id.clone(),
                 started_at: Some(turn_model.created_at),
-                completed_at: terminal_completed_at(turn_model),
+                completed_at: turn_completed_at,
                 elapsed_ms: Some(elapsed_ms),
                 source_high_watermark,
                 metadata_json: json!({
@@ -737,7 +764,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                 source_kind: Some("turn_work".to_owned()),
                 source_key: Some(turn_model.id.clone()),
                 started_at: Some(turn_model.created_at),
-                completed_at: terminal_completed_at(turn_model),
+                completed_at: turn_completed_at,
                 metadata_json: json!({
                     "turnId": turn_model.id,
                     "workCount": work_count,
@@ -1090,11 +1117,15 @@ async fn collect_item_event_orders<C: ConnectionTrait>(
 
         for event in &events {
             high_watermark = high_watermark.max(event.sequence);
-            if let Some(item_id) = event_payload_item_id(event.payload.as_str()) {
-                result.entry(item_id).or_insert_with(|| ItemEventOrder {
+            if let Some((item_id, completed)) = event_payload_item(event.payload.as_str()) {
+                let order = result.entry(item_id).or_insert_with(|| ItemEventOrder {
                     event_id: event.id.clone(),
                     sequence: event.sequence,
+                    completed_at: None,
                 });
+                if completed {
+                    order.completed_at = Some(event.created_at);
+                }
             }
         }
 
@@ -1107,7 +1138,7 @@ async fn collect_item_event_orders<C: ConnectionTrait>(
     Ok((result, high_watermark))
 }
 
-fn event_payload_item_id(raw_payload: &str) -> Option<String> {
+fn event_payload_item(raw_payload: &str) -> Option<(String, bool)> {
     let value = serde_json::from_str::<JsonValue>(raw_payload).ok()?;
     let kind = value.get("kind")?.as_str()?;
     if !matches!(
@@ -1130,13 +1161,14 @@ fn event_payload_item_id(raw_payload: &str) -> Option<String> {
     }
 
     let payload = value.get("payload")?;
-    payload
+    let item_id = payload
         .get("item")
         .and_then(|item| item.get("id"))
         .or_else(|| payload.get("item_id"))
         .and_then(JsonValue::as_str)
         .filter(|item_id| !item_id.is_empty())
-        .map(str::to_owned)
+        .map(str::to_owned)?;
+    Some((item_id, kind == "item_completed"))
 }
 
 async fn count_pending_cli_runtime_requests<C: ConnectionTrait>(
