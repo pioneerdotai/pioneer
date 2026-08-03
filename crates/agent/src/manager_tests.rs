@@ -44,7 +44,8 @@ use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse, InputTypeSupport,
     MessageContentPart, Provider, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderRegistry, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
+    ProviderRegistry, ProviderReplayState, ProviderToolCall, ReasoningConfig, ReasoningEffort,
+    Role, StreamChunk,
 };
 use pioneer_skills::{
     AgentSkillRuntimeEntry, SkillAuditAction, SkillAuditDecision, SkillCatalogInstallation,
@@ -1514,6 +1515,7 @@ struct SequencedToolProvider {
     second_text: String,
     preflight_response_text: String,
     first_response_delay: Duration,
+    first_provider_replay_state: Option<ProviderReplayState>,
     next_index: AtomicUsize,
 }
 
@@ -1528,6 +1530,7 @@ impl SequencedToolProvider {
             second_text: second_text.into(),
             preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
             first_response_delay: Duration::ZERO,
+            first_provider_replay_state: None,
             next_index: AtomicUsize::new(0),
         }
     }
@@ -1543,12 +1546,18 @@ impl SequencedToolProvider {
             second_text: second_text.into(),
             preflight_response_text: preflight_response_text.into(),
             first_response_delay: Duration::ZERO,
+            first_provider_replay_state: None,
             next_index: AtomicUsize::new(0),
         }
     }
 
     fn with_first_response_delay(mut self, delay: Duration) -> Self {
         self.first_response_delay = delay;
+        self
+    }
+
+    fn with_first_provider_replay_state(mut self, state: ProviderReplayState) -> Self {
+        self.first_provider_replay_state = Some(state);
         self
     }
 
@@ -2742,7 +2751,7 @@ impl Provider for SequencedToolProvider {
                 usage: None,
                 reasoning_content: None,
                 tool_calls: self.first_tool_calls.clone(),
-                provider_replay_state: None,
+                provider_replay_state: self.first_provider_replay_state.clone(),
             });
         }
 
@@ -5046,6 +5055,66 @@ async fn agent_tool_loop_requests_include_selected_reasoning_effort_each_round()
             Some(ReasoningConfig::effort(ReasoningEffort::Medium))
         );
     }
+}
+
+#[tokio::test]
+async fn agent_tool_loop_replays_provider_state_when_display_reasoning_is_empty() {
+    let replay_state = ProviderReplayState::new(
+        "sequenced-tools",
+        serde_json::json!({
+            "schema_version": 1,
+            "assistant_message": {
+                "reasoning_content": "",
+                "sentinel": "exact-provider-replay"
+            }
+        }),
+    );
+    let provider = Arc::new(
+        SequencedToolProvider::new(
+            vec![ProviderToolCall {
+                id: "call_replay_state_list_dir".to_owned(),
+                name: "list_dir".to_owned(),
+                arguments: serde_json::json!({"path": ".", "depth": 0, "limit": 1}).to_string(),
+            }],
+            "final after replayed tool round",
+        )
+        .with_first_provider_replay_state(replay_state.clone()),
+    );
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let observed = start_simple_turn(
+        &manager,
+        "thr_provider_replay_state",
+        "ws_provider_replay_state",
+        "turn_provider_replay_state",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "list files and continue",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let assistant_round = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == Role::Assistant
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+        })
+        .expect("second provider request must replay the assistant tool-call round");
+    assert!(assistant_round.reasoning_content.is_none());
+    assert_eq!(
+        assistant_round.provider_replay_state.as_ref(),
+        Some(&replay_state)
+    );
 }
 
 #[tokio::test]

@@ -7,9 +7,8 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
-        ProviderCapabilities, ProviderFailureClassification, ProviderInputCapabilities,
-        ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice,
-        ToolDefinition,
+        ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
+        ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -20,11 +19,9 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
-use pioneer_protocol::{
-    ProviderFailureClass, ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
-};
+use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 /// How to pass the credential in HTTP requests.
 #[derive(Debug, Clone)]
@@ -55,22 +52,20 @@ pub struct OpenAiCompatibleProvider {
     client: Client,
 }
 
-#[derive(Debug)]
-struct MissingDeepSeekReasoningReplay {
-    model: String,
+const COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CompatibleAssistantReplayState {
+    schema_version: u32,
+    assistant_message: CompatibleAssistantReplayMessage,
 }
 
-impl fmt::Display for MissingDeepSeekReasoningReplay {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "DeepSeek thinking replay for model `{}` is missing required `reasoning_content` on an assistant tool-call round",
-            self.model
-        )
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(super) struct CompatibleAssistantReplayMessage {
+    content: Option<String>,
+    pub(super) reasoning_content: Option<String>,
+    tool_calls: Vec<ApiToolCall>,
 }
-
-impl std::error::Error for MissingDeepSeekReasoningReplay {}
 
 // ── OpenAI-compatible API request types ─────────────────────────────────────
 
@@ -179,7 +174,7 @@ struct ApiToolChoiceFunction {
     name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApiToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -187,7 +182,7 @@ struct ApiToolCall {
     function: ApiToolCallFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApiToolCallFunction {
     name: String,
     arguments: String,
@@ -726,6 +721,19 @@ impl OpenAiCompatibleProvider {
         provider_name: &str,
         replay_reasoning_content: bool,
     ) -> Result<ApiMessage> {
+        if message.role == Role::Assistant
+            && let Some(replay) = Self::decode_assistant_replay_state(message, provider_name)?
+        {
+            return Ok(ApiMessage {
+                role: role.to_owned(),
+                content: replay.content.map(ApiMessageContent::Text),
+                reasoning_content: replay.reasoning_content,
+                tool_calls: Some(replay.tool_calls),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+
         Ok(ApiMessage {
             role: role.to_owned(),
             content: Self::build_content(message, attachments, override_text, provider_name)?,
@@ -734,19 +742,7 @@ impl OpenAiCompatibleProvider {
             } else {
                 None
             },
-            tool_calls: message.tool_calls.as_ref().map(|tool_calls| {
-                tool_calls
-                    .iter()
-                    .map(|call| ApiToolCall {
-                        id: call.id.clone(),
-                        kind: "function".to_owned(),
-                        function: ApiToolCallFunction {
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        },
-                    })
-                    .collect()
-            }),
+            tool_calls: message.tool_calls.as_deref().map(Self::convert_tool_calls),
             tool_call_id: message.tool_call_id.clone(),
             name: message.name.clone(),
         })
@@ -865,6 +861,86 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    fn convert_tool_calls(tool_calls: &[crate::types::ProviderToolCall]) -> Vec<ApiToolCall> {
+        tool_calls
+            .iter()
+            .map(|call| ApiToolCall {
+                id: call.id.clone(),
+                kind: "function".to_owned(),
+                function: ApiToolCallFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            })
+            .collect()
+    }
+
+    pub(super) fn assistant_replay_state(
+        provider_name: &str,
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: &[crate::types::ProviderToolCall],
+    ) -> ProviderReplayState {
+        ProviderReplayState::new(
+            provider_name,
+            serde_json::to_value(CompatibleAssistantReplayState {
+                schema_version: COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION,
+                assistant_message: CompatibleAssistantReplayMessage {
+                    content,
+                    reasoning_content,
+                    tool_calls: Self::convert_tool_calls(tool_calls),
+                },
+            })
+            .expect("compatible assistant replay state must serialize"),
+        )
+    }
+
+    fn decode_assistant_replay_state(
+        message: &ChatMessage,
+        provider_name: &str,
+    ) -> Result<Option<CompatibleAssistantReplayMessage>> {
+        let Some(state) = message.provider_replay_state.as_ref() else {
+            return Ok(None);
+        };
+        Self::decode_replay_state(state, provider_name).map(Some)
+    }
+
+    pub(super) fn decode_replay_state(
+        state: &ProviderReplayState,
+        provider_name: &str,
+    ) -> Result<CompatibleAssistantReplayMessage> {
+        let payload = state.payload_for(provider_name).ok_or_else(|| {
+            anyhow!(
+                "provider replay state `{}` cannot be rendered by `{provider_name}`",
+                state.provider
+            )
+        })?;
+        let replay = serde_json::from_value::<CompatibleAssistantReplayState>(payload.clone())
+            .map_err(|error| anyhow!("invalid {provider_name} replay state: {error}"))?;
+        if replay.schema_version != COMPATIBLE_REPLAY_STATE_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "unsupported {provider_name} replay state schema version {}",
+                replay.schema_version
+            ));
+        }
+        Ok(replay.assistant_message)
+    }
+
+    pub(super) fn replay_message(
+        &self,
+        message: &ChatMessage,
+    ) -> Result<Option<CompatibleAssistantReplayMessage>> {
+        Self::decode_assistant_replay_state(message, self.name.as_str())
+    }
+
+    #[cfg(test)]
+    fn replay_state_message(
+        &self,
+        state: &ProviderReplayState,
+    ) -> Result<CompatibleAssistantReplayMessage> {
+        Self::decode_replay_state(state, self.name.as_str())
+    }
+
     fn convert_tool_choice(choice: ToolChoice) -> ApiToolChoice {
         match choice {
             ToolChoice::Auto => ApiToolChoice::Literal("auto".to_owned()),
@@ -877,47 +953,7 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn validate_provider_replay_contract(&self, request: &ChatRequest) -> Result<()> {
-        if self.name != "deepseek" || !self.deepseek_thinking_replay_required(request) {
-            return Ok(());
-        }
-
-        let missing_reasoning = request.messages.iter().any(|message| {
-            message.role == Role::Assistant
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|tool_calls| !tool_calls.is_empty())
-                && message
-                    .reasoning_content
-                    .as_deref()
-                    .is_none_or(|reasoning| reasoning.trim().is_empty())
-        });
-        if missing_reasoning {
-            return Err(anyhow!(MissingDeepSeekReasoningReplay {
-                model: request.model.clone(),
-            }));
-        }
-
-        Ok(())
-    }
-
-    fn deepseek_thinking_replay_required(&self, request: &ChatRequest) -> bool {
-        let model_is_reasoner = request.model.to_ascii_lowercase().contains("reasoner");
-        let reasoning_is_enabled = matches!(request.reasoning, Some(ReasoningConfig::Effort(_)));
-        let history_contains_reasoning = request.messages.iter().any(|message| {
-            message.role == Role::Assistant
-                && message
-                    .reasoning_content
-                    .as_deref()
-                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
-        });
-
-        model_is_reasoner || reasoning_is_enabled || history_contains_reasoning
-    }
-
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
-        self.validate_provider_replay_contract(&request)?;
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_provider(
@@ -951,6 +987,32 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+fn finish_compatible_stream(
+    tool_call_accumulator: &mut StreamToolCallAccumulator,
+    provider_name: &str,
+    replay_reasoning_content: bool,
+    content: Option<String>,
+    reasoning_content: Option<String>,
+) -> Vec<StreamChunk> {
+    let tool_calls = tool_call_accumulator.take_tool_calls();
+    let mut chunks = Vec::new();
+    if replay_reasoning_content && !tool_calls.is_empty() {
+        chunks.push(StreamChunk::provider_replay_state(
+            OpenAiCompatibleProvider::assistant_replay_state(
+                provider_name,
+                content,
+                reasoning_content,
+                tool_calls.as_slice(),
+            ),
+        ));
+    }
+    if !tool_calls.is_empty() {
+        chunks.push(StreamChunk::tool_calls(tool_calls));
+    }
+    chunks.push(StreamChunk::final_chunk());
+    chunks
+}
+
 // ── Provider trait implementation ───────────────────────────────────────────
 
 #[async_trait]
@@ -968,12 +1030,6 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             transcription: false,
             input_types: self.input_types.clone(),
         }
-    }
-
-    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        error
-            .downcast_ref::<MissingDeepSeekReasoningReplay>()
-            .map(|_| ProviderFailureClassification::new(ProviderFailureClass::InvalidRequest))
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
@@ -1028,12 +1084,22 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             return Err(anyhow!("no response from {}", self.name));
         }
 
+        let provider_replay_state =
+            (self.replay_reasoning_content && !tool_calls.is_empty()).then(|| {
+                Self::assistant_replay_state(
+                    self.name.as_str(),
+                    raw_content,
+                    reasoning_content.clone(),
+                    tool_calls.as_slice(),
+                )
+            });
+
         Ok(ChatResponse {
             text,
             usage,
             reasoning_content,
             tool_calls,
-            provider_replay_state: None,
+            provider_replay_state,
         })
     }
 
@@ -1055,12 +1121,15 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
         let byte_stream = response.bytes_stream();
         let provider_name = self.name.clone();
+        let replay_reasoning_content = self.replay_reasoning_content;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
             let mut buffer = String::new();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut response_content: Option<String> = None;
+            let mut response_reasoning_content: Option<String> = None;
 
             tokio::pin!(byte_stream);
 
@@ -1089,11 +1158,15 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                     };
 
                     if data.trim() == "[DONE]" {
-                        let tool_calls = tool_call_accumulator.take_tool_calls();
-                        if !tool_calls.is_empty() {
-                            let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
+                        for chunk in finish_compatible_stream(
+                            &mut tool_call_accumulator,
+                            provider_name.as_str(),
+                            replay_reasoning_content,
+                            response_content,
+                            response_reasoning_content,
+                        ) {
+                            let _ = tx.send(Ok(chunk)).await;
                         }
-                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                         return;
                     }
 
@@ -1122,11 +1195,17 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
+                                    response_reasoning_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(rc.as_str());
                                     if !rc.is_empty() {
                                         let _ = tx.send(Ok(StreamChunk::reasoning(rc))).await;
                                     }
                                 }
                                 if let Some(content) = choice.delta.content {
+                                    response_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(content.as_str());
                                     if !content.is_empty() {
                                         let _ = tx.send(Ok(StreamChunk::delta(content))).await;
                                     }
@@ -1144,12 +1223,15 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                     }]);
                                 }
                                 if choice.finish_reason.is_some() {
-                                    let tool_calls = tool_call_accumulator.take_tool_calls();
-                                    if !tool_calls.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
+                                    for chunk in finish_compatible_stream(
+                                        &mut tool_call_accumulator,
+                                        provider_name.as_str(),
+                                        replay_reasoning_content,
+                                        response_content,
+                                        response_reasoning_content,
+                                    ) {
+                                        let _ = tx.send(Ok(chunk)).await;
                                     }
-                                    let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                                     return;
                                 }
                             }
@@ -1164,11 +1246,15 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 }
             }
 
-            let tool_calls = tool_call_accumulator.take_tool_calls();
-            if !tool_calls.is_empty() {
-                let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
+            for chunk in finish_compatible_stream(
+                &mut tool_call_accumulator,
+                provider_name.as_str(),
+                replay_reasoning_content,
+                response_content,
+                response_reasoning_content,
+            ) {
+                let _ = tx.send(Ok(chunk)).await;
             }
-            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -1380,18 +1466,29 @@ mod tests {
         assert!(api_messages[0].reasoning_content.is_none());
     }
 
-    fn deepseek_replay_request(model: &str, reasoning_content: Option<&str>) -> ChatRequest {
-        ChatRequest {
-            model: model.to_owned(),
-            messages: vec![ChatMessage::assistant_tool_calls_with_reasoning(
-                None::<String>,
-                reasoning_content.map(str::to_owned),
-                vec![ProviderToolCall {
-                    id: "call_1".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments: "{\"path\":\"README.md\"}".to_owned(),
-                }],
-            )],
+    #[test]
+    fn compatible_provider_replay_state_preserves_present_empty_reasoning() {
+        let provider = test_provider();
+        let tool_calls = vec![ProviderToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: "{\"path\":\"README.md\"}".to_owned(),
+        }];
+        let replay_state = OpenAiCompatibleProvider::assistant_replay_state(
+            provider.name(),
+            Some(String::new()),
+            Some(String::new()),
+            tool_calls.as_slice(),
+        );
+        let message = ChatMessage::assistant_tool_calls_with_provider_state(
+            None::<String>,
+            None::<String>,
+            tool_calls,
+            Some(replay_state),
+        );
+        let request = ChatRequest {
+            model: "compatible-model".to_owned(),
+            messages: vec![message],
             temperature: None,
             max_tokens: None,
             tools: None,
@@ -1399,73 +1496,63 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: None,
-        }
-    }
-
-    #[test]
-    fn deepseek_reasoner_replay_missing_reasoning_is_rejected_before_http() {
-        let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
-            "https://api.deepseek.com",
-            "key",
-            AuthStyle::Bearer,
-        );
-
-        let error = provider
-            .build_chat_request(deepseek_replay_request("deepseek-reasoner", None), false)
-            .expect_err("incomplete DeepSeek replay must fail locally");
-
-        assert!(
-            error
-                .downcast_ref::<MissingDeepSeekReasoningReplay>()
-                .is_some()
-        );
-        assert_eq!(
-            provider
-                .classify_failure(&error)
-                .expect("adapter should classify its replay error")
-                .class,
-            ProviderFailureClass::InvalidRequest
-        );
-    }
-
-    #[test]
-    fn deepseek_reasoner_replay_with_reasoning_is_rendered_losslessly() {
-        let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
-            "https://api.deepseek.com",
-            "key",
-            AuthStyle::Bearer,
-        );
+        };
 
         let rendered = provider
-            .build_chat_request(
-                deepseek_replay_request(
-                    "deepseek-reasoner",
-                    Some("reasoning that produced call_1"),
-                ),
-                false,
-            )
-            .expect("complete DeepSeek replay should render");
+            .build_chat_request(request, false)
+            .expect("an explicitly present empty replay field must remain replayable");
 
+        assert_eq!(rendered.messages[0].reasoning_content.as_deref(), Some(""));
+        assert_eq!(text_content(&rendered.messages[0].content), Some(""));
         assert_eq!(
-            rendered.messages[0].reasoning_content.as_deref(),
-            Some("reasoning that produced call_1")
+            rendered.messages[0]
+                .tool_calls
+                .as_ref()
+                .expect("tool calls must be replayed")[0]
+                .function
+                .arguments,
+            "{\"path\":\"README.md\"}"
         );
     }
 
     #[test]
-    fn deepseek_non_thinking_chat_is_not_subject_to_reasoner_replay_contract() {
-        let provider = OpenAiCompatibleProvider::new(
-            "deepseek",
-            "https://api.deepseek.com",
-            "key",
-            AuthStyle::Bearer,
+    fn compatible_stream_completion_captures_absent_reasoning_losslessly() {
+        let mut tool_calls = StreamToolCallAccumulator::default();
+        tool_calls.ingest(vec![StreamToolCallDelta {
+            index: Some(0),
+            id: Some("call_1".to_owned()),
+            function: Some(StreamToolFunctionDelta {
+                name: Some("read_file".to_owned()),
+                arguments: Some("{\"path\":\"README.md\"}".to_owned()),
+            }),
+            name: None,
+            arguments: None,
+        }]);
+
+        let chunks = finish_compatible_stream(
+            &mut tool_calls,
+            "test-provider",
+            true,
+            Some(String::new()),
+            None,
         );
 
-        provider
-            .build_chat_request(deepseek_replay_request("deepseek-chat", None), false)
-            .expect("non-thinking DeepSeek replay should remain supported");
+        let replay = OpenAiCompatibleProvider::new(
+            "test-provider",
+            "https://api.example.com/v1",
+            "key",
+            AuthStyle::Bearer,
+        )
+        .replay_state_message(
+            chunks[0]
+                .provider_replay_state
+                .as_ref()
+                .expect("tool-call response must carry exact compatible replay state"),
+        )
+        .expect("compatible replay state must decode");
+        assert!(replay.reasoning_content.is_none());
+        assert_eq!(chunks[1].tool_calls.len(), 1);
+        assert!(chunks[2].is_final);
     }
 
     #[test]

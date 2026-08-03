@@ -1,7 +1,7 @@
 use crate::providers::{
     AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, CopilotProvider,
-    GeminiProvider, GlmProvider, LocalProvider, OllamaProvider, OpenAiCompatibleProvider,
-    OpenAiProvider, OpenRouterProvider, TelnyxProvider,
+    DeepSeekProvider, GeminiProvider, GlmProvider, LocalProvider, OllamaProvider,
+    OpenAiCompatibleProvider, OpenAiProvider, OpenRouterProvider, TelnyxProvider,
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
@@ -108,11 +108,10 @@ fn create_provider_with_timeout_policy_inner(
             api_key,
         ))),
         "xai" | "grok" => Ok(Box::new(compat("xai", "https://api.x.ai", api_key))),
-        "deepseek" => Ok(Box::new(compat(
-            "deepseek",
-            "https://api.deepseek.com",
-            api_key,
-        ))),
+        "deepseek" => Ok(Box::new(
+            DeepSeekProvider::with_timeout_policy(api_key, timeout_policy)
+                .with_input_capabilities(compat_input_capabilities()),
+        )),
         "together" | "together-ai" => Ok(Box::new(compat(
             "together",
             "https://api.together.xyz",
