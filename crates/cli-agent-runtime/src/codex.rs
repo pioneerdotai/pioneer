@@ -613,6 +613,7 @@ impl CodexAppServerClient {
         Ok(CodexThreadMetadataSnapshot {
             native_thread_id: response.thread.id,
             cwd: response.thread.cwd,
+            rollout_path: response.thread.path,
         })
     }
 
@@ -639,8 +640,20 @@ impl CodexAppServerClient {
         params: CodexThreadStartParams,
         timeout: Duration,
     ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
+        self.thread_resume_at_path(thread_id, params, None, timeout)
+            .await
+    }
+
+    pub async fn thread_resume_at_path(
+        &self,
+        thread_id: impl Into<String>,
+        params: CodexThreadStartParams,
+        rollout_path: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
         let params = serde_json::to_value(CodexThreadResumeParams {
             thread_id: thread_id.into(),
+            path: rollout_path,
             start: params,
         })
         .map_err(|error| CodexJsonlRpcClientError::Encode {
@@ -1088,12 +1101,15 @@ struct CodexThreadReadMetadataResponse {
 struct CodexThreadReadMetadataWire {
     id: String,
     cwd: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexThreadMetadataSnapshot {
     pub native_thread_id: String,
     pub cwd: String,
+    pub rollout_path: Option<PathBuf>,
 }
 
 fn decode_codex_config_read_response(
@@ -1755,6 +1771,161 @@ pub fn cleanup_codex_generation_overlay(
             error,
         )
     })
+}
+
+/// Recovers a stale Codex rollout path through the durable shared home used
+/// behind a generation overlay. An existing path needs no override because
+/// Codex should resume it by thread id. Once a generation has been removed,
+/// the lexical `CODEX_HOME/sessions` path is stale while the rollout itself is
+/// still present in the shared home, so the caller must explicitly resume the
+/// durable path.
+pub fn recover_codex_stale_rollout_path(
+    descriptor: &CodexGenerationOverlayDescriptor,
+    persisted_path: &Path,
+) -> Result<Option<PathBuf>, CodexShadowHomeError> {
+    let persisted_path = normalize_absolute_codex_path(persisted_path)?;
+    match fs::canonicalize(persisted_path.as_path()) {
+        Ok(canonical_path) => {
+            validate_codex_shared_rollout_path(descriptor, canonical_path.as_path())?;
+            return Ok(None);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CodexShadowHomeError::with_context(
+                "resolve persisted Codex rollout path",
+                persisted_path.as_path(),
+                error,
+            ));
+        }
+    }
+
+    let logical_thread_root = descriptor
+        .effective_home_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            CodexShadowHomeError::new("Codex generation overlay has no logical thread root")
+        })?;
+    let relative = persisted_path
+        .strip_prefix(logical_thread_root)
+        .map_err(|_| {
+            CodexShadowHomeError::new(format!(
+                "stale Codex rollout path `{}` is outside the logical thread overlay",
+                persisted_path.display()
+            ))
+        })?;
+    let mut components = relative.components();
+    let boot = codex_normal_component(components.next(), "boot generation")?;
+    let generation = codex_normal_component(components.next(), "process generation")?;
+    let storage = codex_normal_component(components.next(), "rollout storage")?;
+    if !codex_overlay_digest_component(boot, "boot")
+        || !codex_overlay_generation_component(generation)
+        || !matches!(storage, "sessions" | "archived_sessions")
+    {
+        return Err(CodexShadowHomeError::new(format!(
+            "stale Codex rollout path `{}` does not match the managed generation layout",
+            persisted_path.display()
+        )));
+    }
+
+    let mut candidate = descriptor.shared_home_path.join(storage);
+    let mut has_rollout_relative_path = false;
+    for component in components {
+        let Component::Normal(part) = component else {
+            return Err(CodexShadowHomeError::new(format!(
+                "stale Codex rollout path `{}` contains an invalid storage-relative component",
+                persisted_path.display()
+            )));
+        };
+        candidate.push(part);
+        has_rollout_relative_path = true;
+    }
+    if !has_rollout_relative_path {
+        return Err(CodexShadowHomeError::new(format!(
+            "stale Codex rollout path `{}` does not identify a rollout file",
+            persisted_path.display()
+        )));
+    }
+    let canonical_path = fs::canonicalize(candidate.as_path()).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "resolve shared Codex rollout path",
+            candidate.as_path(),
+            error,
+        )
+    })?;
+    validate_codex_shared_rollout_path(descriptor, canonical_path.as_path()).map(Some)
+}
+
+fn validate_codex_shared_rollout_path(
+    descriptor: &CodexGenerationOverlayDescriptor,
+    canonical_path: &Path,
+) -> Result<PathBuf, CodexShadowHomeError> {
+    let metadata = fs::metadata(canonical_path).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "inspect shared Codex rollout path",
+            canonical_path,
+            error,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(CodexShadowHomeError::new(format!(
+            "shared Codex rollout path `{}` is not a file",
+            canonical_path.display()
+        )));
+    }
+    for storage in ["sessions", "archived_sessions"] {
+        let storage_root = descriptor.shared_home_path.join(storage);
+        let canonical_root = fs::canonicalize(storage_root.as_path()).map_err(|error| {
+            CodexShadowHomeError::with_context(
+                "resolve shared Codex rollout storage",
+                storage_root.as_path(),
+                error,
+            )
+        })?;
+        if canonical_path.starts_with(canonical_root.as_path()) {
+            return Ok(canonical_path.to_path_buf());
+        }
+    }
+    Err(CodexShadowHomeError::new(format!(
+        "Codex rollout path `{}` escapes the shared rollout storage",
+        canonical_path.display()
+    )))
+}
+
+fn codex_normal_component<'a>(
+    component: Option<Component<'a>>,
+    label: &str,
+) -> Result<&'a str, CodexShadowHomeError> {
+    let Some(Component::Normal(component)) = component else {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex rollout path is missing its {label} component"
+        )));
+    };
+    component.to_str().ok_or_else(|| {
+        CodexShadowHomeError::new(format!(
+            "Codex rollout path {label} component is not valid UTF-8"
+        ))
+    })
+}
+
+fn codex_overlay_digest_component(component: &str, label: &str) -> bool {
+    component
+        .strip_prefix(label)
+        .and_then(|value| value.strip_prefix('-'))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn codex_overlay_generation_component(component: &str) -> bool {
+    component
+        .strip_prefix("generation-")
+        .is_some_and(|generation| {
+            generation.len() == 20 && generation.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// Fence and stage one exact managed MCP config in an already-created,
@@ -3142,6 +3313,8 @@ impl fmt::Debug for CodexThreadStartParams {
 #[serde(rename_all = "camelCase")]
 struct CodexThreadResumeParams {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     #[serde(flatten)]
     pub start: CodexThreadStartParams,
 }
@@ -3151,6 +3324,7 @@ impl fmt::Debug for CodexThreadResumeParams {
         formatter
             .debug_struct("CodexThreadResumeParams")
             .field("thread_id", &self.thread_id)
+            .field("path", &self.path)
             .field("start", &self.start)
             .finish()
     }
@@ -6573,7 +6747,13 @@ while read line; do :; done
         );
         fake.write_result_response(
             request["id"].clone(),
-            json!({ "thread": { "id": "native-thread", "cwd": "/persisted/workspace" } }),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/persisted/workspace",
+                    "path": "/stable/sessions/rollout.jsonl"
+                }
+            }),
         )
         .await;
         let metadata = read
@@ -6581,6 +6761,10 @@ while read line; do :; done
             .expect("thread/read task should join")
             .expect("thread metadata should decode");
         assert_eq!(metadata.cwd, "/persisted/workspace");
+        assert_eq!(
+            metadata.rollout_path.as_deref(),
+            Some(Path::new("/stable/sessions/rollout.jsonl"))
+        );
     }
 
     #[tokio::test]
@@ -7404,7 +7588,7 @@ while read line; do :; done
         let client = fake.client.clone();
         let resume = tokio::spawn(async move {
             client
-                .thread_resume(
+                .thread_resume_at_path(
                     "codex-thread-existing",
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
@@ -7415,6 +7599,7 @@ while read line; do :; done
                         model: None,
                         service_tier: None,
                     },
+                    Some(PathBuf::from("/stable/sessions/rollout.jsonl")),
                     Duration::from_secs(2),
                 )
                 .await
@@ -7426,6 +7611,7 @@ while read line; do :; done
             request["params"],
             json!({
                 "threadId": "codex-thread-existing",
+                "path": "/stable/sessions/rollout.jsonl",
                 "cwd": "/tmp/project",
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access"
@@ -7796,6 +7982,71 @@ while read line; do :; done
         cleanup_codex_generation_overlay(&first_again).expect("idempotent cleanup");
         cleanup_codex_generation_overlay(&second_thread).expect("clean second thread");
         cleanup_codex_generation_overlay(&second_generation).expect("clean second generation");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_rollout_path_survives_generation_overlay_cleanup() {
+        let root = unique_temp_dir("codex-rollout-stable-path");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+
+        let (_, first) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("first overlay");
+        let relative_rollout = Path::new("2026/08/03/rollout-thread-a.jsonl");
+        let shared_rollout = shared.join("sessions").join(relative_rollout);
+        fs::create_dir_all(shared_rollout.parent().expect("rollout parent"))
+            .expect("create rollout parent");
+        fs::write(shared_rollout.as_path(), "{}\n").expect("write rollout");
+        let persisted_generation_path = first
+            .effective_home_path
+            .join("sessions")
+            .join(relative_rollout);
+        assert_eq!(
+            recover_codex_stale_rollout_path(&first, persisted_generation_path.as_path())
+                .expect("live generation path should validate"),
+            None,
+        );
+
+        cleanup_codex_generation_overlay(&first).expect("clean first overlay");
+        assert!(!persisted_generation_path.exists());
+        let (_, second) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 2),
+        )
+        .expect("second overlay");
+        assert_eq!(
+            recover_codex_stale_rollout_path(&second, persisted_generation_path.as_path())
+                .expect("stale generation path should rebase to shared storage"),
+            Some(fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout"))
+        );
+
+        let (_, other_thread) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-b", 3),
+        )
+        .expect("other thread overlay");
+        let error =
+            recover_codex_stale_rollout_path(&other_thread, persisted_generation_path.as_path())
+                .expect_err("another logical thread must not adopt the rollout alias");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the logical thread overlay")
+        );
+
+        cleanup_codex_generation_overlay(&second).expect("clean second overlay");
+        cleanup_codex_generation_overlay(&other_thread).expect("clean other thread overlay");
         let _ = fs::remove_dir_all(root);
     }
 

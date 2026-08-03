@@ -46,8 +46,8 @@ use pioneer_cli_agent_runtime::codex::{
     CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
     cleanup_codex_generation_overlay, codex_config_read_max_origins,
     codex_config_value_fingerprint, codex_generation_app_server_process_config,
-    serialize_codex_managed_mcp_config, stage_codex_generation_mcp_config,
-    verify_codex_generation_mcp_config,
+    recover_codex_stale_rollout_path, serialize_codex_managed_mcp_config,
+    stage_codex_generation_mcp_config, verify_codex_generation_mcp_config,
 };
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
@@ -1673,6 +1673,28 @@ async fn resume_codex_thread_with_exact_isolation(
             return Err(error.into());
         }
     };
+    let stable_rollout_path = if let Some(persisted_path) = persisted.rollout_path.as_deref() {
+        let resolved = overlay
+            .ok_or_else(|| {
+                anyhow!("Codex generation overlay is unavailable for rollout resolution")
+            })
+            .and_then(|overlay| {
+                recover_codex_stale_rollout_path(overlay, persisted_path).map_err(|error| {
+                    anyhow!("failed to resolve stable Codex rollout path: {error}")
+                })
+            });
+        match resolved {
+            Ok(path) => path,
+            Err(error) => {
+                if let Some(required_bridge) = required_bridge {
+                    required_bridge.fail_closed().await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = attest_codex_exact_isolation(
         client,
         persisted_cwd.as_str(),
@@ -1690,14 +1712,14 @@ async fn resume_codex_thread_with_exact_isolation(
     let open_params = codex_read_only_thread_open_params(params, persisted_cwd);
     let Some(required_bridge) = required_bridge else {
         return client
-            .thread_resume(native_thread_id, open_params, timeout)
+            .thread_resume_at_path(native_thread_id, open_params, stable_rollout_path, timeout)
             .await
             .context("Codex thread/resume failed after isolation attestation");
     };
     let outcome = tokio::try_join!(
         async {
             client
-                .thread_resume(native_thread_id, open_params, timeout)
+                .thread_resume_at_path(native_thread_id, open_params, stable_rollout_path, timeout)
                 .await
                 .context("Codex thread/resume failed after isolation attestation")
         },
@@ -2479,10 +2501,11 @@ mod tests {
     use crate::turn_mcp::result::CanonicalMcpToolResult;
     use async_trait::async_trait;
     use pioneer_cli_agent_runtime::codex::{
-        CodexConfigIsolationEvidence, CodexConfigIsolationFeatures,
+        CodexAccountProbeConfig, CodexConfigIsolationEvidence, CodexConfigIsolationFeatures,
         CodexConfigLayerIsolationEvidence, CodexConfigLayerSourceKind,
     };
     use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
+    use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
     use pioneer_cli_mcp_bridge::helper::run_hidden_helper_with_io;
     use serde_json::{Value as JsonValue, json};
     use sha2::{Digest, Sha256};
@@ -3394,6 +3417,128 @@ mod tests {
         )
         .await;
         assert!(resume.await.expect("resume task should join").is_ok());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn codex_thread_resume_uses_shared_rollout_after_previous_generation_cleanup() {
+        let temporary = tempfile::tempdir_in("/tmp").expect("temporary root");
+        let shared_home = temporary.path().join("shared-codex-home");
+        let managed_root = temporary.path().join("managed-overlays");
+        std::fs::create_dir_all(shared_home.as_path()).expect("create shared Codex home");
+        let config = CodexAccountProbeConfig {
+            executable: "codex".to_owned(),
+            home_path: shared_home.to_string_lossy().into_owned(),
+            shadow_home_path: None,
+            cwd: Some(temporary.path().to_path_buf()),
+            home_dir: None,
+            env: SensitiveEnvironment::new(),
+            initialize_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            shutdown_grace: Duration::from_millis(10),
+            stderr_ring_lines: 16,
+        };
+        let first_identity = CodexGenerationOverlayIdentity::new(
+            "workspace",
+            "codex",
+            "logical-thread",
+            "gateway-boot",
+            1,
+        )
+        .expect("first identity");
+        let (_, first_overlay) = codex_generation_app_server_process_config(
+            &config,
+            managed_root.as_path(),
+            first_identity,
+        )
+        .expect("first overlay");
+        let relative_rollout = PathBuf::from("2026/08/03/rollout-native-thread.jsonl");
+        let shared_rollout = shared_home
+            .join("sessions")
+            .join(relative_rollout.as_path());
+        std::fs::create_dir_all(shared_rollout.parent().expect("rollout parent"))
+            .expect("create rollout parent");
+        std::fs::write(shared_rollout.as_path(), "{}\n").expect("write rollout");
+        let stale_rollout = first_overlay
+            .effective_home_path
+            .join("sessions")
+            .join(relative_rollout.as_path());
+        cleanup_codex_generation_overlay(&first_overlay).expect("clean stopped generation");
+        assert!(!stale_rollout.exists());
+
+        let second_identity = CodexGenerationOverlayIdentity::new(
+            "workspace",
+            "codex",
+            "logical-thread",
+            "gateway-boot",
+            2,
+        )
+        .expect("second identity");
+        let (_, second_overlay) = codex_generation_app_server_process_config(
+            &config,
+            managed_root.as_path(),
+            second_identity,
+        )
+        .expect("second overlay");
+        let resume_overlay = second_overlay.clone();
+        let mut fake = FakeCodexIsolationServer::new();
+        let client = fake.client.clone();
+        let stale_rollout_for_response = stale_rollout.clone();
+        let resume = tokio::spawn(async move {
+            resume_codex_thread_with_exact_isolation(
+                &client,
+                "native-thread",
+                thread_open_params("/new-request-cwd"),
+                &empty_attestation(),
+                Some(&resume_overlay),
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let thread_read = fake.read_request().await;
+        assert_eq!(thread_read["method"], json!("thread/read"));
+        fake.write_result(
+            thread_read["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/persisted-cwd",
+                    "path": stale_rollout_for_response
+                }
+            }),
+        )
+        .await;
+        let config_read = fake.read_request().await;
+        assert_eq!(config_read["method"], json!("config/read"));
+        fake.write_result(config_read["id"].clone(), safe_empty_config_read_result())
+            .await;
+        let thread_resume = fake.read_request().await;
+        assert_eq!(thread_resume["method"], json!("thread/resume"));
+        assert_eq!(
+            thread_resume["params"]["path"],
+            json!(
+                std::fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout")
+            )
+        );
+        fake.write_result(
+            thread_resume["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/persisted-cwd",
+                    "model": "gpt-test"
+                }
+            }),
+        )
+        .await;
+        resume
+            .await
+            .expect("resume task should join")
+            .expect("resume should use the durable rollout path");
+
+        cleanup_codex_generation_overlay(&second_overlay).expect("clean resumed generation");
     }
 
     #[tokio::test]
