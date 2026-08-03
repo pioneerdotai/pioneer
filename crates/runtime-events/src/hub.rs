@@ -231,6 +231,13 @@ impl ExecutionEventHub {
     pub async fn take_durable_receiver(&self) -> Option<DurableEventReceiver> {
         self.durable_rx.lock().await.take()
     }
+
+    /// Returns true once the durable consumer has gone away. Callers that
+    /// cache hubs use this to replace a poisoned execution lane instead of
+    /// handing every later event to a permanently closed channel.
+    pub fn durable_lane_is_closed(&self) -> bool {
+        self.durable_tx.is_closed()
+    }
 }
 
 impl Default for ExecutionEventHub {

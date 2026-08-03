@@ -6,6 +6,7 @@ use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark,
     MarkdownMarkKind,
 };
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[derive(Debug, Clone, Default)]
 struct InlineStyle {
@@ -68,15 +69,32 @@ pub(super) fn parse_markdown_document(source: &str) -> MarkdownDocument {
         return MarkdownDocument::default();
     }
 
-    let root = match markdown::to_mdast(&normalized, &ParseOptions::gfm()) {
+    match catch_markdown_unwind(|| parse_markdown_document_inner(normalized.as_str())) {
+        Some(document) => document,
+        None => {
+            tracing::warn!(
+                source_bytes = normalized.len(),
+                "markdown conversion panicked; preserving event content as plain text"
+            );
+            MarkdownDocument::from_plain_text(normalized)
+        }
+    }
+}
+
+fn catch_markdown_unwind<T>(convert: impl FnOnce() -> T) -> Option<T> {
+    catch_unwind(AssertUnwindSafe(convert)).ok()
+}
+
+fn parse_markdown_document_inner(normalized: &str) -> MarkdownDocument {
+    let root = match markdown::to_mdast(normalized, &ParseOptions::gfm()) {
         Ok(Node::Root(root)) => root,
         Ok(node) => return MarkdownDocument::from_plain_text(node.to_string()),
-        Err(_) => return MarkdownDocument::from_plain_text(normalized),
+        Err(_) => return MarkdownDocument::from_plain_text(normalized.to_owned()),
     };
 
     let blocks = parse_blocks(&root.children);
     if blocks.is_empty() {
-        MarkdownDocument::from_plain_text(normalized)
+        MarkdownDocument::from_plain_text(normalized.to_owned())
     } else {
         MarkdownDocument { blocks }
     }
@@ -304,4 +322,18 @@ fn push_inline_node(out: &mut MarkdownInline, node: &Node, style: &InlineStyle) 
 fn is_html_break(raw_html: &str) -> bool {
     let html = raw_html.trim().to_ascii_lowercase();
     html == "<br>" || html == "<br/>" || html == "<br />"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catch_markdown_unwind;
+
+    #[test]
+    fn markdown_conversion_panic_is_contained() {
+        let converted = catch_markdown_unwind(|| -> () {
+            panic!("malformed markdown parser state");
+        });
+
+        assert!(converted.is_none());
+    }
 }

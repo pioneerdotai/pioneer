@@ -164,6 +164,21 @@ async fn commit_rejection_is_reported_to_publisher() {
 }
 
 #[tokio::test]
+async fn durable_lane_reports_when_its_consumer_is_gone() {
+    let hub = ExecutionEventHub::with_capacity(8, 8);
+    let receiver = hub.take_durable_receiver().await.expect("receiver");
+    assert!(!hub.durable_lane_is_closed());
+
+    drop(receiver);
+
+    assert!(hub.durable_lane_is_closed());
+    assert_eq!(
+        hub.publish_durable(completed("turn_closed")).await,
+        Err(ExecutionEventHubError::DurableLaneClosed)
+    );
+}
+
+#[tokio::test]
 async fn item_completion_flushes_coalesced_progress_first() {
     let hub = ExecutionEventHub::with_progress_config(8, 8, test_config());
     let mut live = hub.subscribe_live();

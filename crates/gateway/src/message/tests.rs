@@ -30065,6 +30065,163 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_cli_runtime_durable_hub_is_replaced() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let key = CLIAgentRuntimeSessionKey::new(
+        workspace_id,
+        "codex",
+        "thread_closed_cli_runtime_durable_hub",
+    )
+    .expect("session key should build");
+    let instance = crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
+        key,
+        u64::MAX,
+    )
+    .expect("test session instance should build");
+    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let receiver = poisoned
+        .take_durable_receiver()
+        .await
+        .expect("poisoned hub should expose receiver");
+    drop(receiver);
+    assert!(poisoned.durable_lane_is_closed());
+    processor
+        .cli_runtime_event_hubs
+        .lock()
+        .await
+        .insert(instance.clone(), poisoned.clone());
+
+    let replacement = processor
+        .ensure_cli_runtime_execution_event_hub(&instance)
+        .await;
+
+    assert!(!Arc::ptr_eq(&poisoned, &replacement));
+    assert!(!replacement.durable_lane_is_closed());
+    let active = processor
+        .cli_runtime_event_hubs
+        .lock()
+        .await
+        .remove(&instance)
+        .expect("replacement hub should remain cached");
+    active.shutdown_progress().await;
+    drop(replacement);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_cli_completed_attempt_reconciliation";
+    let turn_id = "turn_cli_completed_attempt_reconciliation";
+    let native_thread_id = "native_thread_cli_completed_attempt_reconciliation";
+    let native_turn_id = "native_turn_cli_completed_attempt_reconciliation";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    let (_, attempt) = crud_store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            },
+            "cli_completed_attempt_reconciliation_1".to_owned(),
+            1,
+        )
+        .await
+        .expect("initial CLI attempt should prepare");
+    crud_store
+        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), native_turn_id, None, now)
+        .await
+        .expect("initial CLI attempt should activate");
+    assert!(
+        crud_store
+            .mark_cli_runtime_turn_attempt_terminal(
+                attempt.id.as_str(),
+                CliRuntimeTurnAttemptStatus::Completed,
+                None,
+                now,
+            )
+            .await
+            .expect("attempt should terminalize")
+    );
+
+    assert!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines(turn_id, chrono::Utc::now().timestamp())
+            .await
+            .expect("completed attempt reconciliation should succeed")
+    );
+
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_terminal_attempt_fences_late_native_events() {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());

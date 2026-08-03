@@ -1,5 +1,7 @@
 use super::*;
 use anyhow::{Context, Result, bail};
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
@@ -487,7 +489,16 @@ impl MessageProcessor {
                     }, if live_receiver.is_some() => {
                         match live {
                             Some(Ok(event)) => {
-                                this.handle_progress_agent_event(event).await;
+                                if AssertUnwindSafe(this.handle_progress_agent_event(event))
+                                    .catch_unwind()
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!(
+                                        thread_id = %thread_id_owned,
+                                        "contained panic while projecting agent progress event"
+                                    );
+                                }
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                                 warn!(
@@ -505,7 +516,21 @@ impl MessageProcessor {
                         let Some(event) = durable else {
                             break;
                         };
-                        let committed = this.handle_durable_agent_event(event).await;
+                        let committed = match AssertUnwindSafe(
+                            this.handle_durable_agent_event(event),
+                        )
+                        .catch_unwind()
+                        .await
+                        {
+                            Ok(committed) => committed,
+                            Err(_) => {
+                                warn!(
+                                    thread_id = %thread_id_owned,
+                                    "contained panic while projecting durable agent event"
+                                );
+                                false
+                            }
+                        };
                         durable_receiver.acknowledge_last(if committed {
                             Ok(())
                         } else {

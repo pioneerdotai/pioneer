@@ -19,6 +19,7 @@ use crate::cli_runtime::mcp::readiness::CliRuntimeCapabilityPolicy;
 use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
 use crate::thread::ThreadSubscriptionIdentity;
 use anyhow::Context as AnyhowContext;
+use futures_util::FutureExt;
 use pioneer_cli_agent_runtime::claude::{
     ClaudeAccountProbeSnapshot, ClaudeAccountProbeStatus, ClaudeAccountSnapshot,
     ClaudeModelListSnapshot, ClaudeModelSnapshot, ClaudeProbe, ClaudeProbeDiagnostic,
@@ -46,6 +47,7 @@ use pioneer_config::{
 use pioneer_crud::NewCliRuntimeNativeEvent;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_CHARS: usize = 16_384;
@@ -2555,8 +2557,19 @@ impl MessageProcessor {
     ) -> Arc<ExecutionEventHub> {
         let mut hubs = self.cli_runtime_event_hubs.lock().await;
         if let Some(hub) = hubs.get(instance) {
-            return hub.clone();
+            if !hub.durable_lane_is_closed() {
+                return hub.clone();
+            }
+
+            warn!(
+                workspace_id = instance.key().workspace_id.as_str(),
+                runtime_id = instance.key().runtime_id.as_str(),
+                thread_id = instance.key().thread_id.as_str(),
+                session_generation = instance.generation(),
+                "replacing CLI runtime execution event hub after durable listener closed"
+            );
         }
+        let poisoned_hub = hubs.remove(instance);
 
         let hub = Arc::new(ExecutionEventHub::new());
         let durable_receiver = hub
@@ -2571,8 +2584,13 @@ impl MessageProcessor {
         hubs.insert(instance.clone(), hub.clone());
         drop(hubs);
 
+        if let Some(poisoned_hub) = poisoned_hub {
+            poisoned_hub.shutdown_progress().await;
+        }
+
         self.spawn_cli_runtime_execution_event_listener(
             instance.clone(),
+            Arc::downgrade(&hub),
             durable_receiver,
             snapshot_receiver,
             live_receiver,
@@ -2583,6 +2601,7 @@ impl MessageProcessor {
     fn spawn_cli_runtime_execution_event_listener(
         &self,
         instance: CliSessionInstanceId,
+        hub: std::sync::Weak<ExecutionEventHub>,
         mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
         mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
         mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
@@ -2590,78 +2609,145 @@ impl MessageProcessor {
         let processor = self.clone();
         tokio::spawn(async move {
             let key = instance.key();
-            let mut durable_open = true;
-            let mut snapshot_open = true;
-            let mut live_open = true;
-            while durable_open || snapshot_open || live_open {
-                tokio::select! {
-                    biased;
-                    snapshot = snapshot_receiver.recv(), if snapshot_open => {
-                        match snapshot {
-                            Some(event) => {
-                                if processor.cli_runtime_instance_is_current(&instance).await {
-                                    processor.handle_snapshot_agent_event(event).await;
-                                } else {
-                                    processor.audit_stale_cli_runtime_process_activity(
-                                        &instance,
-                                        "snapshot_projection",
-                                    );
+            let listener_processor = processor.clone();
+            let listener_instance = instance.clone();
+            let listener = async move {
+                let mut durable_open = true;
+                let mut snapshot_open = true;
+                let mut live_open = true;
+                while durable_open || snapshot_open || live_open {
+                    tokio::select! {
+                        biased;
+                        snapshot = snapshot_receiver.recv(), if snapshot_open => {
+                            match snapshot {
+                                Some(event) => {
+                                    if listener_processor
+                                        .cli_runtime_instance_is_current(&listener_instance)
+                                        .await
+                                    {
+                                        if AssertUnwindSafe(
+                                            listener_processor.handle_snapshot_agent_event(event),
+                                        )
+                                        .catch_unwind()
+                                        .await
+                                        .is_err()
+                                        {
+                                            warn!(
+                                                workspace_id = key.workspace_id.as_str(),
+                                                runtime_id = key.runtime_id.as_str(),
+                                                thread_id = key.thread_id.as_str(),
+                                                "contained panic while projecting CLI runtime snapshot event"
+                                            );
+                                        }
+                                    } else {
+                                        listener_processor.audit_stale_cli_runtime_process_activity(
+                                            &listener_instance,
+                                            "snapshot_projection",
+                                        );
+                                    }
                                 }
-                            }
-                            None => snapshot_open = false,
-                        }
-                    }
-                    live = live_receiver.recv(), if live_open => {
-                        match live {
-                            Ok(event) => {
-                                if processor.cli_runtime_instance_is_current(&instance).await {
-                                    processor.handle_progress_agent_event(event).await;
-                                } else {
-                                    processor.audit_stale_cli_runtime_process_activity(
-                                        &instance,
-                                        "progress_projection",
-                                    );
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!(
-                                    workspace_id = key.workspace_id.as_str(),
-                                    runtime_id = key.runtime_id.as_str(),
-                                    thread_id = key.thread_id.as_str(),
-                                    skipped,
-                                    "CLI runtime live progress listener lagged"
-                                );
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                live_open = false;
+                                None => snapshot_open = false,
                             }
                         }
-                    }
-                    durable = durable_receiver.recv(), if durable_open => {
-                        match durable {
-                            Some(event) => {
-                                let committed = if processor
-                                    .cli_runtime_instance_is_current(&instance)
-                                    .await
-                                {
-                                    processor.handle_durable_agent_event(event).await
-                                } else {
-                                    processor.audit_stale_cli_runtime_process_activity(
-                                        &instance,
-                                        "durable_projection",
+                        live = live_receiver.recv(), if live_open => {
+                            match live {
+                                Ok(event) => {
+                                    if listener_processor
+                                        .cli_runtime_instance_is_current(&listener_instance)
+                                        .await
+                                    {
+                                        if AssertUnwindSafe(
+                                            listener_processor.handle_progress_agent_event(event),
+                                        )
+                                        .catch_unwind()
+                                        .await
+                                        .is_err()
+                                        {
+                                            warn!(
+                                                workspace_id = key.workspace_id.as_str(),
+                                                runtime_id = key.runtime_id.as_str(),
+                                                thread_id = key.thread_id.as_str(),
+                                                "contained panic while projecting CLI runtime progress event"
+                                            );
+                                        }
+                                    } else {
+                                        listener_processor.audit_stale_cli_runtime_process_activity(
+                                            &listener_instance,
+                                            "progress_projection",
+                                        );
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(
+                                        workspace_id = key.workspace_id.as_str(),
+                                        runtime_id = key.runtime_id.as_str(),
+                                        thread_id = key.thread_id.as_str(),
+                                        skipped,
+                                        "CLI runtime live progress listener lagged"
                                     );
-                                    true
-                                };
-                                durable_receiver.acknowledge_last(if committed {
-                                    Ok(())
-                                } else {
-                                    Err("gateway failed to commit durable CLI runtime event".to_owned())
-                                });
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    live_open = false;
+                                }
                             }
-                            None => durable_open = false,
+                        }
+                        durable = durable_receiver.recv(), if durable_open => {
+                            match durable {
+                                Some(event) => {
+                                    let committed = if listener_processor
+                                        .cli_runtime_instance_is_current(&listener_instance)
+                                        .await
+                                    {
+                                        match AssertUnwindSafe(
+                                            listener_processor.handle_durable_agent_event(event),
+                                        )
+                                        .catch_unwind()
+                                        .await
+                                        {
+                                            Ok(committed) => committed,
+                                            Err(_) => {
+                                                warn!(
+                                                    workspace_id = key.workspace_id.as_str(),
+                                                    runtime_id = key.runtime_id.as_str(),
+                                                    thread_id = key.thread_id.as_str(),
+                                                    "contained panic while projecting CLI runtime durable event"
+                                                );
+                                                false
+                                            }
+                                        }
+                                    } else {
+                                        listener_processor.audit_stale_cli_runtime_process_activity(
+                                            &listener_instance,
+                                            "durable_projection",
+                                        );
+                                        true
+                                    };
+                                    durable_receiver.acknowledge_last(if committed {
+                                        Ok(())
+                                    } else {
+                                        Err("gateway failed to commit durable CLI runtime event".to_owned())
+                                    });
+                                }
+                                None => durable_open = false,
+                            }
                         }
                     }
                 }
+            };
+            let listener_panicked = AssertUnwindSafe(listener).catch_unwind().await.is_err();
+            let key = instance.key();
+            if listener_panicked {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    "CLI runtime execution event listener panicked; evicting poisoned hub"
+                );
+            }
+            if let Some(hub) = hub.upgrade() {
+                processor
+                    .invalidate_cli_runtime_execution_event_hub_if_same(&instance, &hub)
+                    .await;
             }
             debug!(
                 workspace_id = key.workspace_id.as_str(),
@@ -2670,6 +2756,53 @@ impl MessageProcessor {
                 "CLI runtime execution event listener closed"
             );
         });
+    }
+
+    async fn invalidate_cli_runtime_execution_event_hub_if_same(
+        &self,
+        instance: &CliSessionInstanceId,
+        expected: &Arc<ExecutionEventHub>,
+    ) {
+        let removed = {
+            let mut hubs = self.cli_runtime_event_hubs.lock().await;
+            match hubs.get(instance) {
+                Some(current) if Arc::ptr_eq(current, expected) => hubs.remove(instance),
+                _ => None,
+            }
+        };
+        if let Some(hub) = removed {
+            hub.shutdown_progress().await;
+        }
+    }
+
+    pub(super) async fn publish_cli_runtime_durable_and_wait(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: AgentDurableEvent,
+    ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
+        for attempt in 0..2 {
+            let hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
+            match hub.publish_durable_and_wait(event.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(
+                    error @ (pioneer_runtime_events::ExecutionEventHubError::DurableLaneClosed
+                    | pioneer_runtime_events::ExecutionEventHubError::CommitAcknowledgementDropped),
+                ) if attempt == 0 => {
+                    warn!(
+                        workspace_id = instance.key().workspace_id.as_str(),
+                        runtime_id = instance.key().runtime_id.as_str(),
+                        thread_id = instance.key().thread_id.as_str(),
+                        session_generation = instance.generation(),
+                        error = %error,
+                        "retrying CLI runtime durable event after listener loss"
+                    );
+                    self.invalidate_cli_runtime_execution_event_hub_if_same(instance, &hub)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded durable publish retry loop must return")
     }
 
     async fn close_cli_runtime_execution_event_hub(&self, instance: &CliSessionInstanceId) {
@@ -4376,10 +4509,12 @@ impl MessageProcessor {
             turn_id: turn_binding.turn_id.clone(),
             recovery: recovery.clone(),
         };
-        let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
-            if let Err(error) = event_hub.publish_durable_and_wait(durable).await {
+            if let Err(error) = self
+                .publish_cli_runtime_durable_and_wait(instance, durable)
+                .await
+            {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
                     runtime_id = key.runtime_id.as_str(),
@@ -4390,17 +4525,10 @@ impl MessageProcessor {
                     error = %error,
                     "failed to commit CLI runtime durable event"
                 );
-                if let Some(status) = terminal_status {
-                    self.cleanup_cli_runtime_terminal_turn_status(
-                        &turn_binding,
-                        status,
-                        event_label.as_str(),
-                    )
-                    .await;
-                }
                 return false;
             }
         }
+        let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
             if !event_hub.publish_snapshot(snapshot) {
                 warn!(
@@ -5096,6 +5224,69 @@ impl MessageProcessor {
         workspace_id: &str,
         turn: &Turn,
     ) -> anyhow::Result<bool> {
+        if let Some(attempt) = self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await?
+            && attempt.status == pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+        {
+            if attempt.turn_id != binding.turn_id
+                || attempt.runtime_id != binding.runtime_id
+                || attempt.native_thread_id != binding.native_thread_id
+            {
+                anyhow::bail!(
+                    "completed CLI runtime attempt `{}` does not match turn binding `{}`",
+                    attempt.id,
+                    binding.turn_id
+                );
+            }
+            let recovery = match self.cli_runtime_attempt_recovery_state(&attempt).await? {
+                CLIRuntimeAttemptRecoveryState::Normal => None,
+                CLIRuntimeAttemptRecoveryState::Active(recovery) => Some(recovery),
+                CLIRuntimeAttemptRecoveryState::Inactive { job_id, status } => {
+                    debug!(
+                        turn_id = binding.turn_id.as_str(),
+                        attempt_id = attempt.id.as_str(),
+                        recovery_job_id = job_id,
+                        recovery_status = ?status,
+                        "deferred completed CLI attempt reconciliation for inactive recovery"
+                    );
+                    return Ok(false);
+                }
+            };
+            self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+                workspace_id,
+                binding.thread_id.as_str(),
+                turn,
+            )
+            .await?;
+            if !self
+                .complete_turn(binding.thread_id.clone(), binding.turn_id.clone(), recovery)
+                .await
+            {
+                anyhow::bail!(
+                    "completed CLI runtime attempt `{}` could not reconcile Pioneer turn `{}`",
+                    attempt.id,
+                    binding.turn_id
+                );
+            }
+            self.cleanup_cli_runtime_terminal_turn_status(
+                binding,
+                TurnStatus::Completed,
+                "completed CLI runtime attempt reconciliation",
+            )
+            .await;
+            info!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                attempt_id = attempt.id.as_str(),
+                "reconciled Pioneer turn from completed CLI runtime attempt"
+            );
+            return Ok(true);
+        }
+
         let Some(native_turn_id) = self.cli_runtime_running_native_turn_id(binding).await? else {
             return Ok(false);
         };
@@ -5209,18 +5400,19 @@ impl MessageProcessor {
                 }
                 self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id.as_str())
                     .await;
-                self.ensure_cli_runtime_execution_event_hub(handle.instance())
-                    .await
-                    .publish_durable_and_wait(AgentDurableEvent::TurnBlocked {
+                self.publish_cli_runtime_durable_and_wait(
+                    handle.instance(),
+                    AgentDurableEvent::TurnBlocked {
                         thread_id: binding.thread_id.clone(),
                         turn_id: binding.turn_id.clone(),
                         reason,
                         recovery: None,
-                    })
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to commit reconciled blocked event: {error}")
-                    })?;
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to commit reconciled blocked event: {error}")
+                })?;
                 return Ok(true);
             }
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),

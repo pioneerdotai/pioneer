@@ -3637,11 +3637,9 @@ impl MessageProcessor {
             .started_at
             .unwrap_or(attempt.created_at)
             .timestamp_millis();
-        let event_hub = self
-            .ensure_cli_runtime_execution_event_hub(session_instance)
-            .await;
-        event_hub
-            .publish_durable_and_wait(AgentDurableEvent::TurnExecutionWindowStarted {
+        self.publish_cli_runtime_durable_and_wait(
+            session_instance,
+            AgentDurableEvent::TurnExecutionWindowStarted {
                 notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
                     workspace_id: binding.workspace_id.clone(),
                     thread_id: binding.thread_id.clone(),
@@ -3651,9 +3649,10 @@ impl MessageProcessor {
                     status: pioneer_protocol::ExecutionWindowStatus::Running,
                     started_at_unix_ms: started_at,
                 },
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to commit execution window: {error}"))
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to commit execution window: {error}"))
     }
 
     async fn fail_initial_cli_runtime_turn_attempt(&self, turn_id: &str, reason: String) {
