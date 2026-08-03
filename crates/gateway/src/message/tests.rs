@@ -7541,11 +7541,70 @@ async fn materialize_loaded_test_thread_for_durable_operation(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
 {
+    let base_dir = unique_temp_dir("collaborative_composer_pack_presentation");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    for root in [&system_root, &user_root, &workspace_root, &registry_root] {
+        std::fs::create_dir_all(root).expect("create Composer skill root");
+    }
+    let first_skill_path = write_test_skill(&user_root, "pack-first", "", "first body");
+    let second_skill_path = write_test_skill(&user_root, "pack-second", "", "second body");
+
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    let (workspace_manager, _crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("valid pack id");
+    let first_skill_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("first skill id");
+    let second_skill_id = pioneer_protocol::SkillId::new("B".repeat(21)).expect("second skill id");
+    crud_store
+        .insert_skill_pack_installation_with_children(
+            &SkillPackInstallationRecord {
+                pack_id: pack_id.clone(),
+                name: "ASO".to_owned(),
+                scope_key: workspace_id.clone(),
+                source_kind: "user".to_owned(),
+                created_at_unix: 1,
+                updated_at_unix: 1,
+            },
+            &[
+                SkillInstallationRecord {
+                    skill_id: first_skill_id.clone(),
+                    owner: Some("tests".to_owned()),
+                    slug: "pack-first".to_owned(),
+                    version: None,
+                    source_kind: "user".to_owned(),
+                    scope_key: workspace_id.clone(),
+                    source_ref: "test:user:pack-first".to_owned(),
+                    install_path: first_skill_path.display().to_string(),
+                    trust_level: "community".to_owned(),
+                    fingerprint: "pack-first-fingerprint".to_owned(),
+                    updated_at_unix: 1,
+                    pack_id: Some(pack_id.clone()),
+                    pack_member_key: Some("first".to_owned()),
+                },
+                SkillInstallationRecord {
+                    skill_id: second_skill_id,
+                    owner: Some("tests".to_owned()),
+                    slug: "pack-second".to_owned(),
+                    version: None,
+                    source_kind: "user".to_owned(),
+                    scope_key: workspace_id.clone(),
+                    source_ref: "test:user:pack-second".to_owned(),
+                    install_path: second_skill_path.display().to_string(),
+                    trust_level: "community".to_owned(),
+                    fingerprint: "pack-second-fingerprint".to_owned(),
+                    updated_at_unix: 1,
+                    pack_id: Some(pack_id.clone()),
+                    pack_member_key: Some("second".to_owned()),
+                },
+            ],
+        )
+        .await
+        .expect("persist Composer skill pack");
     let processor = MessageProcessor::new(
         thread_manager.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -7554,11 +7613,11 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         )),
         session_manager,
         workspace_manager,
-        _crud_store,
+        crud_store,
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
     let parent_thread_id = "thr_collaborative_composer";
     let started = processor
@@ -7607,6 +7666,11 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
                     "thread_id": parent_thread_id,
                     "turn_id": turn_id,
                     "input": [{"type": "text", "text": "research this asynchronously"}],
+                    "capabilities": [{
+                        "id": pioneer_protocol::skill_pack_capability_key(&pack_id),
+                        "kind": { "type": "skillPack", "packId": pack_id.clone() },
+                        "label": "ASO"
+                    }],
                     "model": "test-model",
                     "model_provider": "openai",
                     "mode": "Agent"
@@ -7649,6 +7713,13 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         .launch;
     assert_eq!(launch.thread_id, parent_thread_id);
     assert_eq!(launch.turn_id, turn_id);
+    assert!(matches!(
+        launch.capabilities.as_slice(),
+        [TurnCapability {
+            kind: TurnCapabilityKind::SkillPack { pack_id: actual_pack_id },
+            ..
+        }] if actual_pack_id == &pack_id
+    ));
 
     let parent = thread_manager
         .thread_get(parent_thread_id)
@@ -7659,6 +7730,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         ThreadOriginKind::TaskRun.composer_execution_mode(),
         pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn
     );
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

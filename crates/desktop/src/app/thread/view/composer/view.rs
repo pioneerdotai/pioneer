@@ -425,82 +425,28 @@ impl PioneerDesktop {
     }
 
     fn render_composer_chip_badges(&self, cx: &mut Context<Self>) -> AnyElement {
-        let attachment_rows =
-            self.composer_attachments
-                .chunks(3)
-                .enumerate()
-                .map(|(row_index, chunk)| ComposerChipRow::Attachments {
-                    start_index: row_index * 3,
-                    items: chunk.to_vec(),
-                });
-        let effective_capabilities = self.effective_composer_capabilities();
-        let skill_chips = self.composer_skill_chips();
-        let skill_rows = skill_chips.chunks(3).enumerate().map(|(row_index, chunk)| {
-            ComposerChipRow::SkillSelections {
-                start_index: row_index * 3,
-                items: chunk.to_vec(),
-            }
-        });
-        let capability_rows =
-            effective_capabilities
-                .chunks(3)
-                .enumerate()
-                .map(|(row_index, chunk)| ComposerChipRow::Capabilities {
-                    start_index: row_index * 3,
-                    items: chunk.to_vec(),
-                });
-        let rows = attachment_rows
-            .chain(skill_rows)
-            .chain(capability_rows)
-            .collect::<Vec<_>>();
+        let mut chips = Vec::new();
+        for (index, attachment) in self.composer_attachments.iter().cloned().enumerate() {
+            chips.push(self.render_composer_attachment_badge(attachment, index, cx));
+        }
 
-        v_flex()
+        let effective_capabilities = self.effective_composer_capabilities();
+        for (index, chip) in self.composer_skill_chips().into_iter().enumerate() {
+            chips.push(self.render_composer_skill_selection_badge(chip, index, cx));
+        }
+        for (index, capability) in effective_capabilities.into_iter().enumerate() {
+            chips.push(self.render_composer_capability_badge(capability, index, cx));
+        }
+
+        h_flex()
+            .id("composer-attachment-chips")
             .w_full()
             .min_w_0()
             .pt_2()
             .px_2()
+            .flex_wrap()
             .gap_1p5()
-            .children(rows.into_iter().enumerate().map(|(row_index, row)| {
-                h_flex()
-                    .id(("composer-attachment-row", row_index))
-                    .w_full()
-                    .min_w_0()
-                    .gap_1p5()
-                    .children(match row {
-                        ComposerChipRow::Attachments { start_index, items } => items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(column_index, attachment)| {
-                                let absolute_index = start_index + column_index;
-                                self.render_composer_attachment_badge(
-                                    attachment,
-                                    absolute_index,
-                                    cx,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        ComposerChipRow::Capabilities { start_index, items } => items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(column_index, capability)| {
-                                let absolute_index = start_index + column_index;
-                                self.render_composer_capability_badge(
-                                    capability,
-                                    absolute_index,
-                                    cx,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        ComposerChipRow::SkillSelections { start_index, items } => items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(column_index, chip)| {
-                                let absolute_index = start_index + column_index;
-                                self.render_composer_skill_selection_badge(chip, absolute_index, cx)
-                            })
-                            .collect::<Vec<_>>(),
-                    })
-            }))
+            .children(chips)
             .into_any_element()
     }
 
@@ -796,21 +742,6 @@ fn composer_skill_selection_from_chip(chip: &ComposerSkillChip) -> Option<Compos
             })
         }
     }
-}
-
-enum ComposerChipRow {
-    Attachments {
-        start_index: usize,
-        items: Vec<crate::app::root::ComposerAttachment>,
-    },
-    Capabilities {
-        start_index: usize,
-        items: Vec<ComposerCapability>,
-    },
-    SkillSelections {
-        start_index: usize,
-        items: Vec<ComposerSkillChip>,
-    },
 }
 
 #[cfg(test)]

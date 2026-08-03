@@ -871,6 +871,11 @@ impl MessageProcessor {
             .await;
             return;
         }
+        // The detached Task must replay the exact presentation selected in the
+        // Composer. Skill packs are expanded only at the execution boundary;
+        // persisting the expanded capabilities here would make the child
+        // message render every pack member as an individually selected skill.
+        let launch = params.clone();
         params.capabilities = normalized_capabilities.execution.clone();
         if let Err(error) = self
             .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
@@ -934,7 +939,6 @@ impl MessageProcessor {
         // execution backend. CLI clients intentionally omit `model_provider`,
         // so leaving the field empty here would keep the parent's previous
         // API provider even though the detached child runs in Codex/Claude.
-        let launch = params.clone();
         canonicalize_cli_runtime_model_provider(&mut params);
         let outcome = match self.thread_manager.turn_start(connection_id, params).await {
             Ok(outcome) => outcome,
