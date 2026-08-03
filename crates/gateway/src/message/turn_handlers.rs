@@ -111,6 +111,8 @@ pub(super) enum TurnStartSuccessResponse {
     Task {
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        execution_authorization_context:
+            Option<crate::authorization::ExecutionAuthorizationContext>,
         continuation_thread_id: String,
         context_thread_id: String,
         task_run_id: String,
@@ -167,6 +169,18 @@ impl TurnStartSuccessResponse {
                 execution_security_snapshot,
                 ..
             } => Some(execution_security_snapshot.clone()),
+            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
+        }
+    }
+
+    fn task_execution_authorization_context(
+        &self,
+    ) -> Option<&crate::authorization::ExecutionAuthorizationContext> {
+        match self {
+            Self::Task {
+                execution_authorization_context,
+                ..
+            } => execution_authorization_context.as_ref(),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
         }
     }
@@ -988,6 +1002,7 @@ impl MessageProcessor {
                 &launch,
                 &outcome,
                 None,
+                None,
                 execution_admission.as_ref(),
             )
             .await
@@ -1351,6 +1366,7 @@ impl MessageProcessor {
                 &security_params,
                 &outcome,
                 None,
+                None,
                 execution_admission.as_ref(),
             )
             .await
@@ -1648,6 +1664,9 @@ impl MessageProcessor {
         runtime_kind: CLIAgentRuntimeKind,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        execution_authorization_context: Option<
+            crate::authorization::ExecutionAuthorizationContext,
+        >,
         continuation_thread_id: String,
         context_thread_id: String,
         task_run_id: String,
@@ -1658,6 +1677,7 @@ impl MessageProcessor {
         let response = TurnStartSuccessResponse::Task {
             permission_profile,
             execution_security_snapshot,
+            execution_authorization_context,
             continuation_thread_id,
             context_thread_id,
             task_run_id,
@@ -2238,8 +2258,15 @@ impl MessageProcessor {
                     if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Codex {
                         let (max_tools, max_schema_bytes) =
                             self.mcp_service.projection_limit_values();
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                        #[cfg(test)]
+                        let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                        #[cfg(not(test))]
+                        let readiness_override: Option<
+                            pioneer_protocol::CliMcpAdapterReadiness,
+                        > = None;
+                        let readiness = match readiness_override {
+                            Some(readiness) => readiness,
+                            None => crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
                                 &runtime_config,
                                 self.artifact_runtime_home.as_path(),
                                 matches!(readiness_summary.status, RuntimeStatus::Ready),
@@ -2248,7 +2275,8 @@ impl MessageProcessor {
                                 max_tools,
                                 max_schema_bytes,
                             )
-                            .await;
+                            .await,
+                        };
                         if !readiness.supported {
                             let diagnostic = readiness
                                 .diagnostics
@@ -2282,8 +2310,15 @@ impl MessageProcessor {
                     } else if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Claude {
                         let (max_tools, max_schema_bytes) =
                             self.mcp_service.projection_limit_values();
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                        #[cfg(test)]
+                        let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                        #[cfg(not(test))]
+                        let readiness_override: Option<
+                            pioneer_protocol::CliMcpAdapterReadiness,
+                        > = None;
+                        let readiness = match readiness_override {
+                            Some(readiness) => readiness,
+                            None => crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
                                 &runtime_config,
                                 self.artifact_runtime_home.as_path(),
                                 matches!(readiness_summary.status, RuntimeStatus::Ready),
@@ -2292,7 +2327,8 @@ impl MessageProcessor {
                                 max_tools,
                                 max_schema_bytes,
                             )
-                            .await;
+                            .await,
+                        };
                         if !readiness.supported {
                             let diagnostic = readiness
                                 .diagnostics
@@ -2566,6 +2602,7 @@ impl MessageProcessor {
                     &security_params,
                     &outcome,
                     success_response.task_execution_security_snapshot(),
+                    success_response.task_execution_authorization_context(),
                     execution_admission.as_ref(),
                 )
                 .await
@@ -4262,6 +4299,9 @@ impl MessageProcessor {
         params: &TurnStartParams,
         outcome: &crate::thread::TurnStartOutcome,
         resolved_override: Option<pioneer_protocol::TurnExecutionSecuritySnapshot>,
+        resolved_authorization_context: Option<
+            &crate::authorization::ExecutionAuthorizationContext,
+        >,
         execution_admission: Option<&ExecutionAuthorizationAdmission>,
     ) -> Result<pioneer_protocol::TurnExecutionSecuritySnapshot, String> {
         let permission_profile = self
@@ -4319,7 +4359,24 @@ impl MessageProcessor {
                 .await?;
             return Err(format!("turn execution security unavailable: {reason}"));
         }
-        let authorization_context_json = if let Some(admission) = execution_admission {
+        let authorization_context_json = if let Some(context) = resolved_authorization_context {
+            if execution_admission.is_some() {
+                return Err(
+                    "failed to persist execution authorization context: resolved context and admission cannot both be present"
+                        .to_owned(),
+                );
+            }
+            if outcome.started_notification.workspace_id != context.workspace_id() {
+                return Err(
+                    "failed to persist execution authorization context: resolved context belongs to a different workspace"
+                        .to_owned(),
+                );
+            }
+            let context_json = context.to_persisted_json().map_err(|error| {
+                format!("failed to encode execution authorization context: {error:#}")
+            })?;
+            Some(context_json)
+        } else if let Some(admission) = execution_admission {
             if outcome.started_notification.thread_id != admission.root_thread_id()
                 || outcome.started_notification.workspace_id != admission.workspace_id()
             {

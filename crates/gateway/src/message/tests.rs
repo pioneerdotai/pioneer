@@ -368,6 +368,7 @@ struct RecordingCliRuntimeSession {
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
+    projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     goal_resets: TokioMutex<Vec<String>>,
     goal_clears: TokioMutex<Vec<String>>,
@@ -388,6 +389,10 @@ impl RecordingCliRuntimeSession {
 
     async fn set_next_native_turn_id(&self, native_turn_id: impl Into<String>) {
         *self.next_native_turn_id.lock().await = Some(native_turn_id.into());
+    }
+
+    async fn enable_projected_mcp_metadata(&self, crud_store: Arc<CrudStore>) {
+        *self.projected_mcp_store.lock().await = Some(crud_store);
     }
 }
 
@@ -479,7 +484,22 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             .lock()
             .await
             .push((pioneer_thread_id.to_owned(), pioneer_turn_id.to_owned()));
-        Ok(None)
+        let Some(crud_store) = self.projected_mcp_store.lock().await.clone() else {
+            return Ok(None);
+        };
+        let projection = crud_store
+            .get_turn_mcp_projection(pioneer_turn_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("test CLI MCP projection is missing"))?;
+        Ok(Some(CLIAgentRuntimeMcpTurnMetadata {
+            adapter_kind: "recording_cli_mcp".to_owned(),
+            manifest_hash: projection.manifest_hash,
+            projection_fingerprint: "a".repeat(64),
+            provider_contract_fingerprint: "b".repeat(64),
+            isolation_contract_fingerprint: "c".repeat(64),
+            session_generation: 1,
+            projection_activation_generation: 1,
+        }))
     }
 
     async fn retarget_mcp_turn(
@@ -671,6 +691,33 @@ fn with_enabled_test_cli_runtime_catalog(processor: MessageProcessor) -> Message
     crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
         .expect("test CLI runtime catalog should persist");
     processor.with_runtime_home_for_tests(runtime_home)
+}
+
+fn supported_test_cli_mcp_readiness(
+    runtime_kind: CLIAgentRuntimeKind,
+) -> pioneer_protocol::CliMcpAdapterReadiness {
+    let (injection, projection_update) = match runtime_kind {
+        CLIAgentRuntimeKind::Codex => (
+            pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::CodexRestartAppServerResumeThread,
+        ),
+        CLIAgentRuntimeKind::Claude => (
+            pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
+        ),
+    };
+    pioneer_protocol::CliMcpAdapterReadiness {
+        supported: true,
+        injection,
+        projection_update,
+        strict_isolation: true,
+        contract_fingerprint: "d".repeat(64),
+        local_executable_fingerprint: "e".repeat(64),
+        provider_version: Some("recording-runtime".to_owned()),
+        max_tools: 1_024,
+        max_schema_bytes: 8 * 1_024 * 1_024,
+        diagnostics: Vec::new(),
+    }
 }
 
 struct CliRuntimeSecurityHarness {
@@ -18259,8 +18306,11 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
         let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        cli_session
+            .enable_projected_mcp_metadata(crud_store.clone())
+            .await;
         let cli_manager = test_cli_runtime_manager(cli_session.clone());
-        let processor = Arc::new(
+        let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager.clone(),
                 test_provider(),
@@ -18272,10 +18322,19 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 test_context_budget(),
                 test_tool_loop_config(),
             )
-            .with_cli_runtime_manager_for_tests(cli_manager.clone()),
-        );
+            .with_cli_runtime_manager_for_tests(cli_manager.clone())
+            .with_cli_mcp_readiness_override_for_tests(
+                supported_test_cli_mcp_readiness(runtime_kind),
+            ),
+        ));
         processor.bind_task_bridge().await;
         processor.start_task_event_listener().await;
+        seed_ready_fake_mcp_server(
+            processor.as_ref(),
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+        )
+        .await;
 
         let parent_thread_id = format!("thr_dynamic_native_{runtime_id}");
         let started = thread_manager
@@ -18319,7 +18378,15 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 text: input_marker.clone(),
                 text_elements: Vec::new(),
             }],
-            capabilities: Vec::new(),
+            capabilities: vec![TurnCapability {
+                id: "mcp-tool:workspace:resend:send".to_owned(),
+                kind: TurnCapabilityKind::McpTool {
+                    server_name: "resend".to_owned(),
+                    raw_tool_name: "send".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+                label: Some("resend/send".to_owned()),
+            }],
             model: Some(model.to_owned()),
             // This is the real shell contract for CLI runtimes. The backend,
             // not the parent thread's API provider, owns provider identity.
@@ -18575,6 +18642,62 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             child_thread.model_provider,
             format!("cli_runtime:{runtime_id}")
         );
+
+        let projection = crud_store
+            .get_turn_mcp_projection(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task child MCP projection should load")
+            .expect("native Task child MCP projection should exist");
+        let authorization_context = processor
+            .load_turn_execution_authorization_context(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task child execution authorization should load")
+            .expect("native Task child execution authorization should exist");
+        let projection_version = u32::try_from(projection.projection_version)
+            .expect("native Task child MCP projection version should fit u32");
+        assert_eq!(
+            authorization_context.mcp_projection(),
+            Some((projection_version, projection.manifest_hash.as_str())),
+            "the hidden Task authorization envelope must atomically bind its MCP projection"
+        );
+
+        let projected_tool = crud_store
+            .list_turn_mcp_bindings(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task child MCP bindings should load")
+            .into_iter()
+            .find(|binding| binding.raw_tool_name == "send")
+            .expect("native Task child should bind the selected MCP tool");
+        let runtime_binding = crud_store
+            .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
+            .await
+            .expect("native Task child CLI runtime binding should load")
+            .expect("native Task child CLI runtime binding should exist");
+        let session_generation = runtime_binding
+            .mcp
+            .as_ref()
+            .map(|metadata| metadata.session_generation)
+            .and_then(|generation| u64::try_from(generation).ok())
+            .expect("native Task child MCP session generation should be valid");
+        let mcp_result = processor
+            .cli_turn_mcp_invoker()
+            .invoke(
+                crate::turn_mcp::invoker::TurnMcpInvocation {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: lineage.child_thread_id.clone(),
+                    turn_id: lineage.child_turn_id.clone(),
+                    runtime_id: Some(runtime_id.to_owned()),
+                    session_generation: Some(session_generation),
+                    provider_call_id: format!("provider-call-{runtime_id}"),
+                    canonical_callable_name: projected_tool.canonical_callable_name,
+                    arguments: json!({"message": format!("{runtime_id} MCP authorization")}),
+                    origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("native Task child must execute its bound MCP tool");
+        assert_eq!(mcp_result.content[0]["text"], "called send");
 
         complete_recorded_cli_task_turn(
             &processor,

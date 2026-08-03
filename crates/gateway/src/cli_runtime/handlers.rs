@@ -8078,17 +8078,27 @@ impl MessageProcessor {
                 let provider_version = probe.version.clone();
                 let mut summary = apply_codex_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                let readiness =
-                    crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                        &instance,
-                        self.artifact_runtime_home.as_path(),
-                        normal_runtime_ready,
-                        provider_version.as_deref(),
-                        proxy_url.as_deref(),
-                        max_tools,
-                        max_schema_bytes,
-                    )
-                    .await;
+                #[cfg(test)]
+                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                #[cfg(not(test))]
+                let readiness_override: Option<
+                    pioneer_protocol::CliMcpAdapterReadiness,
+                > = None;
+                let readiness = match readiness_override {
+                    Some(readiness) => readiness,
+                    None => {
+                        crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                            &instance,
+                            self.artifact_runtime_home.as_path(),
+                            normal_runtime_ready,
+                            provider_version.as_deref(),
+                            proxy_url.as_deref(),
+                            max_tools,
+                            max_schema_bytes,
+                        )
+                        .await
+                    }
+                };
                 let policy = CliRuntimeCapabilityPolicy::from_readiness(
                     true,
                     normal_runtime_ready,
@@ -8111,17 +8121,27 @@ impl MessageProcessor {
                 let provider_version = probe.version.clone();
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                let readiness =
-                    crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                        &instance,
-                        self.artifact_runtime_home.as_path(),
-                        normal_runtime_ready,
-                        provider_version.as_deref(),
-                        proxy_url.as_deref(),
-                        max_tools,
-                        max_schema_bytes,
-                    )
-                    .await;
+                #[cfg(test)]
+                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                #[cfg(not(test))]
+                let readiness_override: Option<
+                    pioneer_protocol::CliMcpAdapterReadiness,
+                > = None;
+                let readiness = match readiness_override {
+                    Some(readiness) => readiness,
+                    None => {
+                        crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                            &instance,
+                            self.artifact_runtime_home.as_path(),
+                            normal_runtime_ready,
+                            provider_version.as_deref(),
+                            proxy_url.as_deref(),
+                            max_tools,
+                            max_schema_bytes,
+                        )
+                        .await
+                    }
+                };
                 let policy = CliRuntimeCapabilityPolicy::from_readiness(
                     true,
                     normal_runtime_ready,
