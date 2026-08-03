@@ -52,6 +52,7 @@ pub mod task_delivery;
 pub mod task_delivery_attempt;
 pub mod task_dependency;
 pub mod task_event;
+pub mod task_event_fanout_cursor;
 pub mod task_result_candidate;
 pub mod task_result_review_event;
 pub mod task_run;

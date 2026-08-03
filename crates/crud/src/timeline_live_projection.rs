@@ -693,7 +693,7 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
     let causal_turn =
         detached_task_run_causal_turn(db, thread_model, turn_model, item_model).await?;
     let sort_turn = causal_turn.as_ref().unwrap_or(turn_model);
-    let started_at = detached_task_run_started_at(item_model);
+    let timing = detached_task_run_timing(item_model);
     timeline_repository::delete_turn_work_item_projection_for_item(
         db,
         turn_model.id.as_str(),
@@ -723,8 +723,8 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
             ),
             source_kind: Some("turn_item".to_owned()),
             source_key: Some(item_model.item_id.clone()),
-            started_at: Some(started_at),
-            completed_at: None,
+            started_at: Some(timing.started_at),
+            completed_at: timing.completed_at,
             metadata_json: json!({
                 "turnId": turn_model.id,
                 "itemId": item_model.item_id,
@@ -733,22 +733,37 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
             })
             .to_string(),
             created_at: item_model.created_at,
-            updated_at: projected_at,
+            updated_at: timing.completed_at.unwrap_or(projected_at),
         },
     )
     .await
 }
 
-fn detached_task_run_started_at(item_model: &turn_item_entity::Model) -> DateTimeWithTimeZone {
-    let run_started_at = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetachedTaskRunTiming {
+    started_at: DateTimeWithTimeZone,
+    completed_at: Option<DateTimeWithTimeZone>,
+}
+
+fn detached_task_run_timing(item_model: &turn_item_entity::Model) -> DetachedTaskRunTiming {
+    let task = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
         .ok()
         .and_then(|item| match item {
-            TurnItem::Task { item } => item.started_at,
+            TurnItem::Task { item } => Some(item),
             _ => None,
         });
-    run_started_at
+    let started_at = task
+        .as_ref()
+        .and_then(|item| item.started_at)
         .map(unix_to_datetime)
-        .unwrap_or(item_model.created_at)
+        .unwrap_or(item_model.created_at);
+    let completed_at = task
+        .filter(|item| item.status.is_terminal())
+        .map(|item| unix_to_datetime(item.updated_at));
+    DetachedTaskRunTiming {
+        started_at,
+        completed_at,
+    }
 }
 
 async fn detached_task_run_causal_turn<C: ConnectionTrait>(
@@ -1166,7 +1181,10 @@ mod tests {
         TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
     };
 
-    fn detached_task_item_row(started_at: Option<i64>) -> turn_item_entity::Model {
+    fn detached_task_item_row(
+        started_at: Option<i64>,
+        status: TaskStatus,
+    ) -> turn_item_entity::Model {
         let created_at = unix_to_datetime(10);
         turn_item_entity::Model {
             id: "row_1".to_owned(),
@@ -1183,7 +1201,7 @@ mod tests {
                     parent_task_id: None,
                     root_task_id: None,
                     title: "Queued task".to_owned(),
-                    status: TaskStatus::Running,
+                    status,
                     attachment: TaskAttachmentMode::Detached,
                     trigger_kind: TaskTriggerKind::Immediate,
                     executor_kind: TaskExecutorKind::Agent,
@@ -1214,11 +1232,32 @@ mod tests {
 
     #[test]
     fn detached_task_projection_prefers_run_start_over_queue_creation() {
-        let running = detached_task_item_row(Some(20));
-        assert_eq!(detached_task_run_started_at(&running), unix_to_datetime(20));
+        let running = detached_task_item_row(Some(20), TaskStatus::Running);
+        assert_eq!(
+            detached_task_run_timing(&running).started_at,
+            unix_to_datetime(20)
+        );
 
-        let queued = detached_task_item_row(None);
-        assert_eq!(detached_task_run_started_at(&queued), unix_to_datetime(10));
+        let queued = detached_task_item_row(None, TaskStatus::Queued);
+        assert_eq!(
+            detached_task_run_timing(&queued).started_at,
+            unix_to_datetime(10)
+        );
+    }
+
+    #[test]
+    fn detached_task_projection_uses_terminal_run_timestamp() {
+        let completed = detached_task_item_row(Some(12), TaskStatus::Completed);
+        assert_eq!(
+            detached_task_run_timing(&completed),
+            DetachedTaskRunTiming {
+                started_at: unix_to_datetime(12),
+                completed_at: Some(unix_to_datetime(20)),
+            }
+        );
+
+        let running = detached_task_item_row(Some(12), TaskStatus::Running);
+        assert_eq!(detached_task_run_timing(&running).completed_at, None);
     }
 
     #[test]

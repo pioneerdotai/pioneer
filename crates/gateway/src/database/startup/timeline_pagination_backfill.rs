@@ -11,6 +11,7 @@ use pioneer_crud::{
 use pioneer_entity::{
     cli_runtime_pending_request, thread, turn, turn_event, turn_input, turn_item,
 };
+use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
@@ -64,6 +65,7 @@ struct AssistantBlockCandidate {
 struct DetachedTaskRunBlockCandidate {
     item_id: String,
     started_at: DateTimeWithTimeZone,
+    completed_at: Option<DateTimeWithTimeZone>,
     updated_at: DateTimeWithTimeZone,
 }
 
@@ -562,11 +564,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
             match classification.placement {
                 ProjectionPlacement::TopLevelUserMessage => {}
                 ProjectionPlacement::TopLevelDetachedTaskRun => {
-                    detached_task_run_blocks.push(DetachedTaskRunBlockCandidate {
-                        item_id: item_model.item_id.clone(),
-                        started_at: item_model.created_at,
-                        updated_at: item_model.updated_at,
-                    });
+                    detached_task_run_blocks.push(detached_task_run_block_candidate(item_model));
                 }
                 ProjectionPlacement::TopLevelAssistantMessage => {
                     assistant_blocks.push(AssistantBlockCandidate {
@@ -775,7 +773,7 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                 source_kind: Some("turn_item".to_owned()),
                 source_key: Some(task_run.item_id.clone()),
                 started_at: Some(task_run.started_at),
-                completed_at: None,
+                completed_at: task_run.completed_at,
                 metadata_json: json!({
                     "turnId": turn_model.id,
                     "itemId": task_run.item_id,
@@ -860,6 +858,38 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     }
 
     Ok(stats)
+}
+
+fn detached_task_run_block_candidate(
+    item_model: &turn_item::Model,
+) -> DetachedTaskRunBlockCandidate {
+    let task = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+        .ok()
+        .and_then(|item| match item {
+            TurnItem::Task { item } => Some(item),
+            _ => None,
+        });
+    let started_at = task
+        .as_ref()
+        .and_then(|item| item.started_at)
+        .map(unix_timestamp_to_datetime)
+        .unwrap_or(item_model.created_at);
+    let completed_at = task
+        .as_ref()
+        .filter(|item| item.status.is_terminal())
+        .map(|item| unix_timestamp_to_datetime(item.updated_at));
+    DetachedTaskRunBlockCandidate {
+        item_id: item_model.item_id.clone(),
+        started_at,
+        completed_at,
+        updated_at: completed_at.unwrap_or(item_model.updated_at),
+    }
+}
+
+fn unix_timestamp_to_datetime(timestamp: i64) -> DateTimeWithTimeZone {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .fixed_offset()
 }
 
 async fn projection_is_current(db: &DatabaseConnection) -> Result<bool> {

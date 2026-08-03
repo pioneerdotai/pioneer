@@ -8832,6 +8832,29 @@ impl CrudStore {
         task_event::list_event_task_ids(&self.connection).await
     }
 
+    pub async fn get_task_event_fanout_cursor(&self, task_id: &str) -> Result<Option<i64>> {
+        task_event::find_fanout_cursor(&self.connection, task_id).await
+    }
+
+    pub async fn advance_task_event_fanout_cursor(
+        &self,
+        task_id: &str,
+        sequence: i64,
+    ) -> Result<()> {
+        task_event::advance_fanout_cursor(
+            &self.connection,
+            task_id,
+            sequence,
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+    }
+
+    pub async fn backfill_task_event_fanout_cursors_batch(&self, limit: u64) -> Result<usize> {
+        self.run_serialized_write(|| self.backfill_task_event_fanout_cursors_batch_once(limit))
+            .await
+    }
+
     pub async fn list_task_events_for_thread_turn(
         &self,
         thread_id: &str,
@@ -16934,6 +16957,20 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             return Err(error);
         }
 
+        if appended_event.append_status.is_inserted()
+            && let Err(error) = task_event::initialize_fanout_cursor(
+                &transaction,
+                appended_event.task_id.as_str(),
+                appended_event.sequence.saturating_sub(1),
+                created_at,
+            )
+            .await
+            .context("failed to initialize task event fanout cursor")
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
         transaction
             .commit()
             .await
@@ -17051,6 +17088,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .project(db, &appended_event)
                     .await
                     .context("failed to project task event to read models")?;
+                task_event::initialize_fanout_cursor(
+                    db,
+                    appended_event.task_id.as_str(),
+                    appended_event.sequence.saturating_sub(1),
+                    created_at,
+                )
+                .await
+                .context("failed to initialize task event fanout cursor")?;
             }
 
             hydrate_task_event_metadata(db, &mut appended_event)
@@ -17060,6 +17105,44 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         }
 
         Ok(appended_events)
+    }
+
+    async fn backfill_task_event_fanout_cursors_batch_once(&self, limit: u64) -> Result<usize> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin task event fanout cursor backfill transaction")?;
+        let result = async {
+            let candidates =
+                task_event::list_missing_fanout_cursor_high_watermarks(&transaction, limit).await?;
+            let initialized_at = chrono::Utc::now().fixed_offset();
+            for candidate in &candidates {
+                task_event::initialize_fanout_cursor(
+                    &transaction,
+                    candidate.task_id.as_str(),
+                    candidate.last_sequence,
+                    initialized_at,
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(candidates.len())
+        }
+        .await;
+
+        match result {
+            Ok(processed) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit task event fanout cursor backfill transaction")?;
+                Ok(processed)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
@@ -21154,6 +21237,14 @@ mod tests {
             .append_task_events(events, timestamp + 10)
             .await
             .expect("legacy replay should be idempotent");
+        assert_eq!(
+            store
+                .backfill_task_event_fanout_cursors_batch(256)
+                .await
+                .expect("orphaned legacy events should not stall cursor backfill"),
+            0,
+            "events without a materialized task are not fanout candidates"
+        );
 
         let binding = store
             .get_task_run_primary_thread_binding(run.id.as_str())
@@ -21874,6 +21965,126 @@ mod tests {
         assert!(
             duplicate_run_number.is_err(),
             "duplicate (task_id, run_number) must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_event_fanout_cursor_is_durable_and_monotonic() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let task = sample_task(timestamp);
+        let created = store
+            .append_task_event(
+                TaskEventPayload::TaskCreated { task: task.clone() },
+                timestamp,
+            )
+            .await
+            .expect("task created event should append");
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("new task cursor should load"),
+            Some(0),
+            "the event transaction must establish a zero cursor before its first wake"
+        );
+
+        store
+            .advance_task_event_fanout_cursor(task.id.as_str(), created.sequence)
+            .await
+            .expect("fanout cursor should persist");
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("persisted cursor should load"),
+            Some(created.sequence)
+        );
+
+        store
+            .advance_task_event_fanout_cursor(task.id.as_str(), 0)
+            .await
+            .expect("a stale writer should be harmless");
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("cursor should remain monotonic"),
+            Some(created.sequence),
+            "an older concurrent writer must not move the durable cursor backwards"
+        );
+
+        pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task.id.clone())
+            .exec(&store.database_connection())
+            .await
+            .expect("legacy cursor fixture should delete");
+        let mut updated_task = task.clone();
+        updated_task.title = "Updated after cursor migration".to_owned();
+        updated_task.updated_at = timestamp + 1;
+        let updated = store
+            .append_task_event(
+                TaskEventPayload::TaskUpdated {
+                    task: updated_task,
+                    trigger: None,
+                    agent_spec: None,
+                    changed_fields: vec!["title".to_owned()],
+                    updated_at: timestamp + 1,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("a new event for a legacy task should append");
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("legacy task cursor should initialize atomically"),
+            Some(updated.sequence.saturating_sub(1)),
+            "the first post-upgrade event must remain pending for fanout while older events stay skipped"
+        );
+        store
+            .advance_task_event_fanout_cursor(task.id.as_str(), updated.sequence)
+            .await
+            .expect("new legacy task event should be acknowledged");
+
+        pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task.id.clone())
+            .exec(&store.database_connection())
+            .await
+            .expect("background backfill fixture should delete");
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("missing legacy cursor should load"),
+            None
+        );
+        assert_eq!(
+            store
+                .backfill_task_event_fanout_cursors_batch(256)
+                .await
+                .expect("legacy cursor should backfill"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_task_event_fanout_cursor(task.id.as_str())
+                .await
+                .expect("backfilled cursor should load"),
+            Some(updated.sequence)
+        );
+        assert_eq!(
+            store
+                .backfill_task_event_fanout_cursors_batch(256)
+                .await
+                .expect("completed cursor backfill should be a no-op"),
+            0
         );
     }
 

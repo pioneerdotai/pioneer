@@ -40,6 +40,7 @@ mod m20260729_000001_refresh_credentials_v2;
 mod m20260730_000001_authorization_foundation;
 mod m20260730_000002_execution_authorization_context;
 mod m20260731_000001_invitations_member_management;
+mod m20260802_000001_task_event_fanout_cursor;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -81,6 +82,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260730_000001_authorization_foundation::Migration),
             Box::new(m20260730_000002_execution_authorization_context::Migration),
             Box::new(m20260731_000001_invitations_member_management::Migration),
+            Box::new(m20260802_000001_task_event_fanout_cursor::Migration),
         ]
     }
 }

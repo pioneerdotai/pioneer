@@ -120,7 +120,7 @@ use pioneer_protocol::{
     TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
     TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitParams,
+    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskValue, TaskWaitParams,
     TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
     ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
@@ -20032,6 +20032,174 @@ async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_history() {
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(16);
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+
+    let response = create_task_for_test(
+        &processor,
+        TaskCreateParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: TaskOwnerKind::Workspace,
+            owner_id: Some(workspace_id),
+            created_by_thread_id: None,
+            created_by_turn_id: None,
+            parent_task_id: None,
+            executor_kind: TaskExecutorKind::System,
+            title: "Durable fanout cursor".to_owned(),
+            goal: "Do not replay historical notifications after restart".to_owned(),
+            priority: 0,
+            trigger: TaskTriggerInput {
+                spec: TaskTriggerSpec::Manual {
+                    allowed_actor: None,
+                },
+            },
+            agent_spec: None,
+            lifecycle_policy: None,
+            delivery_policy: None,
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: None,
+        },
+    )
+    .await
+    .expect("task should create");
+    let task_id = response.task.id;
+    let committed = crud_store
+        .list_task_events_after(task_id.as_str(), 0)
+        .await
+        .expect("committed task events should load");
+    let initial_high_watermark = committed
+        .last()
+        .expect("task creation should append at least one event")
+        .sequence;
+    assert_eq!(
+        crud_store
+            .get_task_event_fanout_cursor(task_id.as_str())
+            .await
+            .expect("fanout cursor should load"),
+        Some(0)
+    );
+
+    let mut first_process_cursors = HashMap::new();
+    processor
+        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut first_process_cursors)
+        .await
+        .expect("initial fanout should succeed");
+    assert_eq!(
+        crud_store
+            .get_task_event_fanout_cursor(task_id.as_str())
+            .await
+            .expect("durable fanout cursor should load"),
+        Some(initial_high_watermark)
+    );
+    while rx.try_recv().is_ok() {}
+
+    // An empty in-memory map models a freshly restarted Gateway process. The
+    // durable high-watermark must prevent the historical task log from being
+    // emitted again.
+    let mut restarted_process_cursors = HashMap::new();
+    processor
+        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .await
+        .expect("post-restart fanout scan should succeed");
+    assert!(
+        rx.try_recv().is_err(),
+        "a Gateway restart must not replay already fanned-out task events"
+    );
+
+    processor
+        .task_runtime
+        .service()
+        .update_task(
+            pioneer_tasks::TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: task_id.clone(),
+                title: Some("Durable fanout cursor updated".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("task update should append a new event");
+    processor
+        .emit_committed_task_events_after_cursor(task_id.as_str(), &mut restarted_process_cursors)
+        .await
+        .expect("new post-restart event should fan out");
+    let updated = recv_notification_by_method(&mut rx, events::TASK_UPDATED).await;
+    let params = updated
+        .params
+        .expect("task updated notification should have params");
+    assert_eq!(params["task"]["id"], task_id);
+    assert!(
+        params["context"]["sequence"]
+            .as_i64()
+            .is_some_and(|sequence| sequence > initial_high_watermark),
+        "only the event appended after restart should be emitted"
+    );
+
+    let updated_high_watermark = params["context"]["sequence"]
+        .as_i64()
+        .expect("updated event should expose its sequence");
+    while rx.try_recv().is_ok() {}
+    pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task_id.clone())
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("durable cursor fixture should delete");
+    let mut missing_cursor_process_state = HashMap::new();
+    let error = processor
+        .emit_committed_task_events_after_cursor(
+            task_id.as_str(),
+            &mut missing_cursor_process_state,
+        )
+        .await
+        .expect_err("a missing durable cursor must violate the listener invariant");
+    assert!(
+        format!("{error:#}").contains("missing durable task event fanout cursor"),
+        "unexpected invariant error: {error:#}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an invariant failure must not replay historical task events"
+    );
+    let backfilled =
+        crate::database::startup::backfill_task_event_fanout_cursors_once(crud_store.as_ref())
+            .await
+            .expect("background cursor backfill should complete");
+    assert_eq!(backfilled.tasks_initialized, 1);
+    assert_eq!(
+        crud_store
+            .get_task_event_fanout_cursor(task_id.as_str())
+            .await
+            .expect("backfilled cursor should load"),
+        Some(updated_high_watermark)
+    );
+    assert!(
+        crate::database::startup::backfill_task_event_fanout_cursors_once(crud_store.as_ref())
+            .await
+            .expect("completed cursor backfill should be idempotent")
+            .skipped
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_agent_without_explicit_model_or_provider_is_rejected() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("global-default-model", "openai"));
@@ -20809,6 +20977,7 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
     }
 
     let mut stale_anchor = refreshed_anchor.clone();
+    stale_anchor.status = TaskStatus::Running;
     stale_anchor.child_thread_id = None;
     stale_anchor.child_turn_id = None;
     stale_anchor.progress_preview = Some("stale progress".to_owned());
@@ -20825,6 +20994,19 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         )
         .await
         .expect("stale task anchor should persist");
+
+    // A recurring task returns to Scheduled after a successful occurrence.
+    // Model that global state explicitly: rebuilding this historical run card
+    // must still use the terminal TaskRun status, never the task container.
+    pioneer_entity::task::Entity::update_many()
+        .col_expr(
+            pioneer_entity::task::Column::Status,
+            Expr::value("scheduled"),
+        )
+        .filter(pioneer_entity::task::Column::Id.eq(anchor_task_id.clone()))
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("test task should return to recurring scheduled state");
 
     let backfill = crate::database::startup::backfill_task_anchors_once(crud_store.as_ref())
         .await
@@ -20850,6 +21032,11 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
     assert!(
         backfilled_anchor.progress_preview.is_none(),
         "backfill should not keep stale live progress on terminal task anchors"
+    );
+    assert_eq!(
+        backfilled_anchor.status,
+        TaskStatus::Completed,
+        "a completed occurrence must not inherit the recurring task's Scheduled status"
     );
     assert!(backfilled_anchor.result_preview.is_some());
 

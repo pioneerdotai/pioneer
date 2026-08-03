@@ -50,6 +50,7 @@ pub use super::task_delivery::Entity as TaskDelivery;
 pub use super::task_delivery_attempt::Entity as TaskDeliveryAttempt;
 pub use super::task_dependency::Entity as TaskDependency;
 pub use super::task_event::Entity as TaskEvent;
+pub use super::task_event_fanout_cursor::Entity as TaskEventFanoutCursor;
 pub use super::task_result_candidate::Entity as TaskResultCandidate;
 pub use super::task_result_review_event::Entity as TaskResultReviewEvent;
 pub use super::task_run::Entity as TaskRun;

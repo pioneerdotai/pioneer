@@ -1915,7 +1915,20 @@ impl MessageProcessor {
         task_id: &str,
         cursors_by_task: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
-        let after_sequence = cursors_by_task.get(task_id).copied().unwrap_or(0);
+        let after_sequence = match cursors_by_task.get(task_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = self
+                    .crud_store
+                    .get_task_event_fanout_cursor(task_id)
+                    .await?
+                    .with_context(|| {
+                        format!("missing durable task event fanout cursor for `{task_id}`")
+                    })?;
+                cursors_by_task.insert(task_id.to_owned(), sequence);
+                sequence
+            }
+        };
         let events = self
             .task_runtime
             .service()
@@ -1925,6 +1938,9 @@ impl MessageProcessor {
         for event in events {
             let sequence = event.sequence;
             self.emit_task_event(event).await?;
+            self.crud_store
+                .advance_task_event_fanout_cursor(task_id, sequence)
+                .await?;
             cursors_by_task.insert(task_id.to_owned(), sequence);
         }
 

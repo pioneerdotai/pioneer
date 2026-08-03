@@ -3,6 +3,7 @@ mod authorization_legacy_backfill;
 mod cli_runtime_native_event_compaction;
 mod stable_skill_id_backfill;
 mod task_anchor_backfill;
+mod task_event_fanout_cursor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod timeline_pagination_backfill;
 mod turn_item_attempt_payload_compaction;
@@ -135,6 +136,7 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
+        task_event_fanout_cursor_backfill::run(crud_store.as_ref()).await;
         authorization_legacy_backfill::run(crud_store.as_ref()).await;
         stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
         task_anchor_backfill::run(crud_store.as_ref()).await;
@@ -284,6 +286,8 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
 
 #[cfg(test)]
 pub(crate) use task_anchor_backfill::backfill_once as backfill_task_anchors_once;
+#[cfg(test)]
+pub(crate) use task_event_fanout_cursor_backfill::backfill_once as backfill_task_event_fanout_cursors_once;
 #[cfg(test)]
 pub(crate) use timeline_pagination_backfill::backfill_once as backfill_timeline_pagination_once;
 

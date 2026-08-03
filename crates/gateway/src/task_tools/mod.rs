@@ -3829,7 +3829,7 @@ async fn task_turn_item_from_response_with_run(
         parent_task_id: task.parent_task_id.clone(),
         root_task_id: task.root_task_id.clone(),
         title: task.title.clone(),
-        status: task.status,
+        status: task_anchor_status(task.status, run),
         attachment: task
             .lifecycle_policy
             .as_ref()
@@ -3846,7 +3846,11 @@ async fn task_turn_item_from_response_with_run(
         max_depth: agent_spec
             .map(|spec| spec.max_depth)
             .unwrap_or(DEFAULT_ROOT_MAX_DEPTH),
-        next_fire_at: trigger.and_then(|trigger| trigger.next_fire_at),
+        next_fire_at: if run.is_some() {
+            None
+        } else {
+            trigger.and_then(|trigger| trigger.next_fire_at)
+        },
         progress_preview,
         result_preview: result_preview(
             run.and_then(|run| run.result.as_ref())
@@ -3858,8 +3862,33 @@ async fn task_turn_item_from_response_with_run(
         ),
         started_at: run.and_then(|run| run.started_at),
         created_at: task.created_at,
-        updated_at: task.updated_at,
+        updated_at: task_anchor_updated_at(task.updated_at, run),
     })
+}
+
+fn task_anchor_status(task_status: TaskStatus, run: Option<&TaskRun>) -> TaskStatus {
+    let Some(run) = run else {
+        return task_status;
+    };
+    task_run_anchor_status(run.status)
+}
+
+fn task_run_anchor_status(status: TaskRunStatus) -> TaskStatus {
+    match status {
+        TaskRunStatus::Queued => TaskStatus::Queued,
+        TaskRunStatus::Starting | TaskRunStatus::Running => TaskStatus::Running,
+        TaskRunStatus::Waiting => TaskStatus::Waiting,
+        TaskRunStatus::WaitingReview => TaskStatus::WaitingReview,
+        TaskRunStatus::Succeeded => TaskStatus::Completed,
+        TaskRunStatus::Failed | TaskRunStatus::TimedOut => TaskStatus::Failed,
+        TaskRunStatus::Blocked => TaskStatus::Blocked,
+        TaskRunStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+fn task_anchor_updated_at(task_updated_at: i64, run: Option<&TaskRun>) -> i64 {
+    run.map(|run| run.completed_at.unwrap_or(run.updated_at))
+        .unwrap_or(task_updated_at)
 }
 
 fn select_task_anchor_run(response: &TaskGetResponse) -> Option<&TaskRun> {
@@ -3995,6 +4024,35 @@ mod tests {
             terminal_count,
             review_required_count,
         }
+    }
+
+    #[test]
+    fn task_run_anchor_status_is_independent_of_recurring_task_status() {
+        let mut succeeded_run = sample_run(TaskRunStatus::Succeeded);
+        succeeded_run.completed_at = Some(90);
+        succeeded_run.updated_at = 100;
+        assert_eq!(
+            task_anchor_status(TaskStatus::Scheduled, Some(&succeeded_run)),
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            task_anchor_updated_at(110, Some(&succeeded_run)),
+            90,
+            "a terminal occurrence must retain its actual completion timestamp"
+        );
+        assert_eq!(task_anchor_updated_at(110, None), 110);
+        assert_eq!(
+            task_run_anchor_status(TaskRunStatus::TimedOut),
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            task_run_anchor_status(TaskRunStatus::WaitingReview),
+            TaskStatus::WaitingReview
+        );
+        assert_eq!(
+            task_anchor_status(TaskStatus::Scheduled, None),
+            TaskStatus::Scheduled
+        );
     }
 
     #[test]
