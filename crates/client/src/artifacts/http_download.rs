@@ -233,12 +233,8 @@ impl ArtifactHttpDownloadService {
                 return Err(error);
             }
         };
-        let response_mode = validate_get_response(
-            &response,
-            &request,
-            &representation,
-            resume_from,
-        );
+        let response_mode =
+            validate_get_response(&response, &request, &representation, resume_from);
         let response_mode = match response_mode {
             Ok(mode) => mode,
             Err(error) => {
@@ -337,7 +333,8 @@ impl ArtifactHttpDownloadService {
         etag: &str,
         cancellation: CancellationToken,
     ) -> Result<GatewayHttpResponse, ArtifactHttpDownloadError> {
-        let mut request = GatewayHttpRequest::get(storage_path.to_owned()).map_err(map_http_error)?;
+        let mut request =
+            GatewayHttpRequest::get(storage_path.to_owned()).map_err(map_http_error)?;
         if resume_from > 0 {
             request = request
                 .with_range(format!("bytes={resume_from}-"))
@@ -388,9 +385,7 @@ struct ValidatedRequest {
 
 impl ValidatedRequest {
     fn new(request: ArtifactHttpDownloadRequest) -> Result<Self, ArtifactHttpDownloadError> {
-        for value in [
-            request.gateway_profile_id.as_str(),
-        ] {
+        for value in [request.gateway_profile_id.as_str()] {
             if value.trim().is_empty() || value.len() > MAX_ID_BYTES || value.contains('\0') {
                 return Err(ArtifactHttpDownloadError::InvalidRequest);
             }
@@ -431,9 +426,7 @@ impl ValidatedRequest {
     fn storage_path(&self) -> String {
         format!(
             "storage/workspaces/{}/artifacts/{}/versions/{}/content",
-            self.workspace_id,
-            self.artifact_id,
-            self.version_id,
+            self.workspace_id, self.artifact_id, self.version_id,
         )
     }
 
@@ -673,7 +666,9 @@ async fn persist_partial_metadata(
     if !metadata_is_plain_file(&file.metadata().await.map_err(map_disk_error)?) {
         return Err(ArtifactHttpDownloadError::DiskWrite);
     }
-    file.write_all(bytes.as_slice()).await.map_err(map_disk_error)?;
+    file.write_all(bytes.as_slice())
+        .await
+        .map_err(map_disk_error)?;
     file.sync_all().await.map_err(map_disk_error)?;
     drop(file);
     if fs::rename(paths.metadata_temp.as_path(), paths.metadata.as_path())
@@ -908,9 +903,7 @@ fn notify_progress(
     }
 }
 
-fn ensure_not_cancelled(
-    cancellation: &CancellationToken,
-) -> Result<(), ArtifactHttpDownloadError> {
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ArtifactHttpDownloadError> {
     if cancellation.is_cancelled() {
         Err(ArtifactHttpDownloadError::Cancelled)
     } else {
@@ -948,9 +941,7 @@ fn map_http_error(error: GatewayHttpError) -> ArtifactHttpDownloadError {
         GatewayHttpError::Transport
         | GatewayHttpError::ServiceUnavailable
         | GatewayHttpError::TooManyRequests
-        | GatewayHttpError::Server => {
-            ArtifactHttpDownloadError::Transport
-        }
+        | GatewayHttpError::Server => ArtifactHttpDownloadError::Transport,
         GatewayHttpError::InvalidEndpoint
         | GatewayHttpError::InvalidStoragePath
         | GatewayHttpError::InvalidHeader
@@ -958,9 +949,7 @@ fn map_http_error(error: GatewayHttpError) -> ArtifactHttpDownloadError {
         | GatewayHttpError::SessionMismatch => ArtifactHttpDownloadError::InvalidRequest,
         GatewayHttpError::InvalidResponse
         | GatewayHttpError::Conflict
-        | GatewayHttpError::RangeNotSatisfiable => {
-            ArtifactHttpDownloadError::InvalidResponse
-        }
+        | GatewayHttpError::RangeNotSatisfiable => ArtifactHttpDownloadError::InvalidResponse,
     }
 }
 
@@ -997,9 +986,7 @@ mod tests {
         sync::{Arc, Mutex as StdMutex},
     };
 
-    use crate::transport::http::{
-        GatewayHttpBody, GatewayHttpMethod, GatewayHttpResponseHead,
-    };
+    use crate::transport::http::{GatewayHttpBody, GatewayHttpMethod, GatewayHttpResponseHead};
 
     #[derive(Clone)]
     struct FakeHttp {
@@ -1040,12 +1027,15 @@ mod tests {
             request: GatewayHttpRequest,
             cancellation: CancellationToken,
         ) -> Result<GatewayHttpResponse, GatewayHttpError> {
-            self.requests.lock().expect("request lock").push(RecordedRequest {
-                method: request.method(),
-                path: request.storage_path().to_owned(),
-                range: request.range().map(ToOwned::to_owned),
-                if_range: request.if_range().map(ToOwned::to_owned),
-            });
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(RecordedRequest {
+                    method: request.method(),
+                    path: request.storage_path().to_owned(),
+                    range: request.range().map(ToOwned::to_owned),
+                    if_range: request.if_range().map(ToOwned::to_owned),
+                });
             let response = self
                 .responses
                 .lock()
@@ -1086,7 +1076,11 @@ mod tests {
         );
         assert!(result.local_path.as_path().starts_with(temp.path()));
         assert_ne!(
-            result.local_path.as_path().file_name().and_then(|name| name.to_str()),
+            result
+                .local_path
+                .as_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
             Some("../report?.txt")
         );
         let paths = owned_paths(temp.path(), &request);
@@ -1137,7 +1131,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let bytes = b"current bytes";
         let request = request(bytes);
-        seed_partial(temp.path(), &request, b"stale", "\"sha256-stale\"".to_owned()).await;
+        seed_partial(
+            temp.path(),
+            &request,
+            b"stale",
+            "\"sha256-stale\"".to_owned(),
+        )
+        .await;
         let http = Arc::new(FakeHttp::new(vec![head(bytes), full(bytes, vec![bytes])]));
         let service = ArtifactHttpDownloadService::with_http(http.clone(), temp.path());
 
@@ -1166,7 +1166,13 @@ mod tests {
                 .await
                 .expect_err(name);
             assert_eq!(error, ArtifactHttpDownloadError::InvalidResponse);
-            assert!(!owned_paths(temp.path(), &request).cache.final_path.as_path().exists());
+            assert!(
+                !owned_paths(temp.path(), &request)
+                    .cache
+                    .final_path
+                    .as_path()
+                    .exists()
+            );
         }
     }
 
@@ -1271,7 +1277,9 @@ mod tests {
         let request = request(bytes);
         let paths = owned_paths(temp.path(), &request);
         fs::create_dir_all(paths.parent()).await.expect("parent");
-        fs::write(paths.cache.final_path.as_path(), bytes).await.expect("final");
+        fs::write(paths.cache.final_path.as_path(), bytes)
+            .await
+            .expect("final");
         let http = Arc::new(FakeHttp::new(Vec::new()));
         let service = ArtifactHttpDownloadService::with_http(http.clone(), temp.path());
 
@@ -1313,12 +1321,17 @@ mod tests {
             .expect("download");
 
         assert_eq!(fs::read(result.local_path.as_path()).await.unwrap(), bytes);
-        assert_eq!(fs::read(outside.as_path()).await.unwrap(), b"do not overwrite");
-        assert!(!fs::symlink_metadata(result.local_path.as_path())
-            .await
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert_eq!(
+            fs::read(outside.as_path()).await.unwrap(),
+            b"do not overwrite"
+        );
+        assert!(
+            !fs::symlink_metadata(result.local_path.as_path())
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1398,7 +1411,13 @@ mod tests {
     }
 
     fn head(bytes: &[u8]) -> FakeResponse {
-        response_head(200, Some(bytes.len() as u64), Some(etag(bytes)), None, vec![])
+        response_head(
+            200,
+            Some(bytes.len() as u64),
+            Some(etag(bytes)),
+            None,
+            vec![],
+        )
     }
 
     fn full(bytes: &[u8], chunks: Vec<&[u8]>) -> FakeResponse {
@@ -1416,7 +1435,11 @@ mod tests {
             206,
             Some(bytes.len() as u64 - offset),
             Some(etag(bytes)),
-            Some(format!("bytes {offset}-{}/{}", bytes.len() - 1, bytes.len())),
+            Some(format!(
+                "bytes {offset}-{}/{}",
+                bytes.len() - 1,
+                bytes.len()
+            )),
             chunks.into_iter().map(Ok).collect(),
         )
     }
@@ -1470,7 +1493,9 @@ mod tests {
         let validated = ValidatedRequest::new(request.clone()).expect("validated request");
         let paths = OwnedDownloadPaths::new(runtime_home, &validated).expect("paths");
         fs::create_dir_all(paths.parent()).await.expect("parent");
-        fs::write(paths.cache.part_path.as_path(), bytes).await.expect("partial");
+        fs::write(paths.cache.part_path.as_path(), bytes)
+            .await
+            .expect("partial");
         persist_partial_metadata(
             &paths,
             &PartialDownloadMetadata::new(&validated, partial_etag.as_str(), bytes.len() as u64),

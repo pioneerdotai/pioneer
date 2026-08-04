@@ -2412,6 +2412,13 @@ pub(super) async fn execute_chat_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
+    if mode == ThreadMode::Message {
+        return Err(ChatTurnError::Terminal(
+            "message turns must complete in gateway admission without provider execution"
+                .to_owned(),
+        ));
+    }
+
     let user_message = build_user_message(input.as_slice(), resolved_artifacts.as_slice());
 
     if execution_security_snapshot.is_none() {
@@ -2441,6 +2448,7 @@ pub(super) async fn execute_chat_turn_flow(
     .await?;
 
     let result = match mode {
+        ThreadMode::Message => unreachable!("message mode is rejected before provider execution"),
         ThreadMode::Agent => {
             execute_agent_provider_response(
                 provider_registry,

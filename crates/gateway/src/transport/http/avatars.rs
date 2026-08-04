@@ -32,13 +32,9 @@ pub(super) async fn member_avatar_route(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    let context = authenticate_native_storage_request(
-        &state,
-        peer_addr,
-        &headers,
-        "storage/member/avatar",
-    )
-    .await?;
+    let context =
+        authenticate_native_storage_request(&state, peer_addr, &headers, "storage/member/avatar")
+            .await?;
     let request_id = context
         .request_id()
         .cloned()
@@ -97,7 +93,10 @@ fn avatar_response(
         .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
     let headers = response.headers_mut();
     insert_header(headers, ETAG, etag.as_str(), request_id)?;
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static(AVATAR_CACHE_CONTROL));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(AVATAR_CACHE_CONTROL),
+    );
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     insert_header(headers, REQUEST_ID_HEADER, request_id.as_str(), request_id)?;
 
@@ -220,29 +219,42 @@ mod tests {
 
     #[tokio::test]
     async fn get_head_and_not_modified_share_immutable_private_headers() {
-        let get = avatar_response(snapshot(), Method::GET, &HeaderMap::new(), &request_id())
-            .unwrap();
+        let get =
+            avatar_response(snapshot(), Method::GET, &HeaderMap::new(), &request_id()).unwrap();
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(get.headers()[CONTENT_TYPE], "image/png");
         assert_eq!(get.headers()[CONTENT_LENGTH], "4");
         assert_eq!(get.headers()[CACHE_CONTROL], AVATAR_CACHE_CONTROL);
         assert_eq!(get.headers()[X_CONTENT_TYPE_OPTIONS], "nosniff");
-        assert_eq!(to_bytes(get.into_body(), 8).await.unwrap().as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(
+            to_bytes(get.into_body(), 8).await.unwrap().as_ref(),
+            &[1, 2, 3, 4]
+        );
 
-        let head = avatar_response(snapshot(), Method::HEAD, &HeaderMap::new(), &request_id())
-            .unwrap();
+        let head =
+            avatar_response(snapshot(), Method::HEAD, &HeaderMap::new(), &request_id()).unwrap();
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers()[CONTENT_LENGTH], "4");
         assert!(to_bytes(head.into_body(), 8).await.unwrap().is_empty());
 
         let mut conditional = HeaderMap::new();
-        conditional.insert(IF_NONE_MATCH, HeaderValue::from_static("W/\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        conditional.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_static(
+                "W/\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            ),
+        );
         let not_modified =
             avatar_response(snapshot(), Method::GET, &conditional, &request_id()).unwrap();
         assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
         assert!(not_modified.headers().get(CONTENT_LENGTH).is_none());
         assert_eq!(not_modified.headers()[CACHE_CONTROL], AVATAR_CACHE_CONTROL);
-        assert!(to_bytes(not_modified.into_body(), 8).await.unwrap().is_empty());
+        assert!(
+            to_bytes(not_modified.into_body(), 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

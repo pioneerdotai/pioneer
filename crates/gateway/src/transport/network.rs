@@ -67,7 +67,10 @@ fn parse_forwarded_for_value(value: &str) -> Option<IpAddr> {
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(value);
-    if let Some(ipv6) = value.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+    if let Some(ipv6) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
         return ipv6.parse().ok();
     }
     parse_single_ip(value)

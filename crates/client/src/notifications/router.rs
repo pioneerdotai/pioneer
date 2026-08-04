@@ -187,13 +187,15 @@ pub fn reduce_turn_started_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
-    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
+    let is_conversation = notification.turn.turn_kind == TurnKind::Conversation;
+    let owns_foreground =
+        is_conversation && notification.turn.mode != pioneer_protocol::ThreadMode::Message;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
         workspace_id,
         turn_id,
-        promote_thread_from_draft: owns_foreground,
+        promote_thread_from_draft: is_conversation,
         queue_thread_list_refresh: true,
         thread_status: owns_foreground.then_some(ThreadStatus::Active),
         conversation_event: ConversationEvent::TurnStarted {
@@ -214,7 +216,8 @@ pub fn reduce_turn_completed_notification(
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
     let turn_id = notification.turn.id.clone();
-    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation;
+    let owns_foreground = notification.turn.turn_kind == TurnKind::Conversation
+        && notification.turn.mode != pioneer_protocol::ThreadMode::Message;
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
@@ -1075,6 +1078,12 @@ mod tests {
             status,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -1199,6 +1208,33 @@ mod tests {
             failed.conversation_event,
             ConversationEvent::TurnFailed { .. }
         ));
+    }
+
+    #[test]
+    fn message_lifecycle_does_not_claim_or_release_foreground_execution() {
+        let mut message = turn("message_a", TurnStatus::InProgress);
+        message.mode = pioneer_protocol::ThreadMode::Message;
+
+        let started = reduce_turn_started_notification(TurnStartedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "thr_a".to_owned(),
+            turn: message.clone(),
+        });
+        assert!(started.promote_thread_from_draft);
+        assert!(started.queue_thread_list_refresh);
+        assert_eq!(started.thread_status, None);
+        assert!(!started.reset_thread_resume);
+        assert!(!started.sync_composer_model_selection);
+
+        message.status = TurnStatus::Completed;
+        let completed = reduce_turn_completed_notification(TurnCompletedNotification {
+            workspace_id: "ws_a".to_owned(),
+            thread_id: "thr_a".to_owned(),
+            turn: message,
+        });
+        assert_eq!(completed.thread_status, None);
+        assert!(!completed.tick_conversation);
+        assert!(!completed.reset_thread_resume);
     }
 
     #[test]

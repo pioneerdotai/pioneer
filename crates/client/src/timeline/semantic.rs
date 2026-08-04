@@ -7,7 +7,7 @@
 use crate::conversation::ConversationEvent;
 use pioneer_protocol::{
     AgentMessagePhase, ItemDeltaStream, MarkdownDocument, SystemEventLevel, TaskAttachmentMode,
-    TaskStatus, TaskTriggerKind, ThreadComposerExecutionMode,
+    TaskStatus, TaskTriggerKind, ThreadComposerExecutionMode, ThreadMode,
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
     TurnItem, TurnKind, TurnOrigin, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
@@ -1013,6 +1013,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
         ConversationEvent::LocalTurnStartRequested {
             thread_id,
             turn_id,
+            mode,
             user_text,
             attachments,
             ..
@@ -1021,21 +1022,34 @@ pub fn apply_conversation_event_to_semantic_timeline(
             workspace_id,
             thread_id,
             turn_id,
+            *mode,
             user_text,
             attachments,
             now_unix_ms,
         ),
         ConversationEvent::LocalTurnStartAccepted {
-            thread_id, turn_id, ..
-        } => apply_turn_state_to_semantic_timeline(
-            state,
-            workspace_id,
             thread_id,
             turn_id,
-            TurnWorkState::Running,
-            None,
-            now_unix_ms,
-        ),
+            mode,
+            ..
+        } => {
+            if *mode == ThreadMode::Message {
+                let thread = state.thread_mut(thread_id.to_owned());
+                let before = thread.clone();
+                remove_turn_work_state(thread, turn_id);
+                before != *thread
+            } else {
+                apply_turn_state_to_semantic_timeline(
+                    state,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    TurnWorkState::Running,
+                    None,
+                    now_unix_ms,
+                )
+            }
+        }
         ConversationEvent::TurnStarted { thread_id, turn } => {
             apply_started_turn_to_semantic_timeline(
                 state,
@@ -1048,6 +1062,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
         ConversationEvent::LocalTurnStartRejected {
             thread_id,
             turn_id,
+            mode,
             error,
             ..
         } => apply_local_turn_start_rejected_to_semantic_timeline(
@@ -1055,6 +1070,7 @@ pub fn apply_conversation_event_to_semantic_timeline(
             workspace_id,
             thread_id,
             turn_id,
+            *mode,
             error,
             now_unix_ms,
         ),
@@ -1234,6 +1250,7 @@ fn apply_local_turn_start_requested_to_semantic_timeline(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
+    mode: ThreadMode,
     user_text: &str,
     attachments: &[UserMessageAttachment],
     now_unix_ms: i64,
@@ -1246,20 +1263,25 @@ fn apply_local_turn_start_requested_to_semantic_timeline(
         thread_id,
         turn_id,
         None,
+        mode,
         user_text.to_owned(),
         attachments.to_vec(),
         now_unix_ms,
     );
-    upsert_turn_work_summary(
-        thread,
-        workspace_id,
-        thread_id,
-        turn_id,
-        TurnWorkState::Starting,
-        TurnWorkPresentation::ExpandedLive,
-        None,
-        now_unix_ms,
-    );
+    if mode == ThreadMode::Message {
+        remove_turn_work_state(thread, turn_id);
+    } else {
+        upsert_turn_work_summary(
+            thread,
+            workspace_id,
+            thread_id,
+            turn_id,
+            TurnWorkState::Starting,
+            TurnWorkPresentation::ExpandedLive,
+            None,
+            now_unix_ms,
+        );
+    }
     before != *thread
 }
 
@@ -1270,6 +1292,12 @@ fn apply_started_turn_to_semantic_timeline(
     turn: &Turn,
     now_unix_ms: i64,
 ) -> bool {
+    if turn.mode == ThreadMode::Message {
+        let thread = state.thread_mut(thread_id.to_owned());
+        let before = thread.clone();
+        remove_turn_work_state(thread, turn.id.as_str());
+        return before != *thread;
+    }
     if !turn_is_detached_task_run(turn) {
         return apply_turn_state_to_semantic_timeline(
             state,
@@ -1297,6 +1325,12 @@ fn apply_terminal_or_detached_turn_to_semantic_timeline(
     fallback_state: TurnWorkState,
     now_unix_ms: i64,
 ) -> bool {
+    if turn.mode == ThreadMode::Message {
+        let thread = state.thread_mut(thread_id.to_owned());
+        let before = thread.clone();
+        remove_turn_work_state(thread, turn.id.as_str());
+        return before != *thread;
+    }
     if turn_is_detached_task_run(turn) {
         let thread = state.thread_mut(thread_id.to_owned());
         let before = thread.clone();
@@ -1432,18 +1466,26 @@ fn apply_local_turn_start_rejected_to_semantic_timeline(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
+    mode: ThreadMode,
     error: &str,
     now_unix_ms: i64,
 ) -> bool {
-    let changed = apply_turn_state_to_semantic_timeline(
-        state,
-        workspace_id,
-        thread_id,
-        turn_id,
-        TurnWorkState::Failed,
-        Some(now_unix_ms),
-        now_unix_ms,
-    );
+    let changed = if mode == ThreadMode::Message {
+        let thread = state.thread_mut(thread_id.to_owned());
+        let before = thread.clone();
+        remove_turn_work_state(thread, turn_id);
+        before != *thread
+    } else {
+        apply_turn_state_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            TurnWorkState::Failed,
+            Some(now_unix_ms),
+            now_unix_ms,
+        )
+    };
     let thread = state.thread_mut(thread_id.to_owned());
     let before = thread.clone();
     upsert_terminal_state_block(
@@ -1485,6 +1527,7 @@ fn apply_item_started_to_semantic_timeline(
                 thread_id,
                 turn_id,
                 Some(id.clone()),
+                ThreadMode::Agent,
                 text.clone(),
                 attachments.clone(),
                 now_unix_ms,
@@ -1667,6 +1710,7 @@ fn apply_item_completed_to_semantic_timeline(
                     thread_id,
                     turn_id,
                     Some(id.clone()),
+                    ThreadMode::Agent,
                     text.clone(),
                     attachments.clone(),
                     now_unix_ms,
@@ -2496,6 +2540,7 @@ fn upsert_user_message_block(
     thread_id: &str,
     turn_id: &str,
     item_id: Option<String>,
+    mode: ThreadMode,
     text: String,
     attachments: Vec<UserMessageAttachment>,
     now_unix_ms: i64,
@@ -2519,6 +2564,13 @@ fn upsert_user_message_block(
             inputs: Vec::new(),
             text,
             attachments,
+            mode,
+            author: None,
+            reply: None,
+            mentions: Vec::new(),
+            revision: 0,
+            edited: false,
+            deleted: false,
         },
     };
     upsert_top_level_block(thread, block);
@@ -3361,9 +3413,11 @@ fn merge_work_loaded_range(
 mod tests {
     use super::*;
     use pioneer_protocol::{
+        ArtifactKind, ArtifactRef, ArtifactStatus, PersistedActorRef, PrincipalId,
         SystemEventLevel, TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind,
-        TaskTurnItem, TimelineBlockKind, TurnItem, TurnItemType, TurnWorkItemStatus,
-        TurnWorkPresentation, TurnWorkState,
+        TaskTurnItem, ThreadMode, TimelineBlockKind, TimelineReplySummary, TurnAuthorSnapshot,
+        TurnItem, TurnItemType, TurnMention, TurnWorkItemStatus, TurnWorkPresentation,
+        TurnWorkState,
     };
 
     #[test]
@@ -3383,6 +3437,144 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.ordered_block_ids, vec!["block_b"]);
+    }
+
+    #[test]
+    fn authoritative_user_message_snapshot_replaces_optimism_and_preserves_exact_refs() {
+        let principal_id = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("valid principal id");
+        let author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::Principal(principal_id.clone()),
+            display_name: "Alice".to_owned(),
+            nickname: "alice".to_owned(),
+            avatar_revision: Some("avatar-r3".to_owned()),
+        };
+        let mention = TurnMention {
+            principal_id,
+            nickname: "alice".to_owned(),
+        };
+        let artifact = ArtifactRef {
+            artifact_id: "artifact_a".to_owned(),
+            version_id: Some("version_exact".to_owned()),
+            display_name: "report.pdf".to_owned(),
+            kind: ArtifactKind::Pdf,
+            mime_type: Some("application/pdf".to_owned()),
+            size_bytes: Some(42),
+            sha256: Some("sha256-exact".to_owned()),
+            status: ArtifactStatus::Ready,
+            preview: None,
+        };
+        let authoritative = TimelineBlock {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            block_id: "turn:turn_message:user".to_owned(),
+            turn_id: Some("turn_message".to_owned()),
+            sort_key: "001".to_owned(),
+            started_at_unix_ms: Some(10),
+            updated_at_unix_ms: Some(20),
+            kind: TimelineBlockKind::UserMessage {
+                item_id: Some("item_message".to_owned()),
+                inputs: Vec::new(),
+                text: "edited body".to_owned(),
+                attachments: vec![UserMessageAttachment::Artifact {
+                    artifact: artifact.clone(),
+                }],
+                mode: ThreadMode::Message,
+                author: Some(author.clone()),
+                reply: Some(TimelineReplySummary {
+                    turn_id: "turn_parent".to_owned(),
+                    author: Some(author.clone()),
+                    text: Some("parent".to_owned()),
+                    deleted: false,
+                }),
+                mentions: vec![mention.clone()],
+                revision: 1,
+                edited: true,
+                deleted: false,
+            },
+        };
+
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_message".to_owned(),
+                pending_request_id: "pending_message".to_owned(),
+                mode: ThreadMode::Message,
+                user_text: "optimistic body".to_owned(),
+                attachments: Vec::new(),
+            },
+            1,
+        ));
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![authoritative.clone()]),
+            TopLevelPageMergeMode::Reset,
+        ));
+
+        let cached = state
+            .thread("thread_a")
+            .and_then(|thread| thread.top_level.block("turn:turn_message:user"))
+            .expect("authoritative user message");
+        assert_eq!(cached, &authoritative);
+        let TimelineBlockKind::UserMessage { attachments, .. } = &cached.kind else {
+            panic!("expected user message block");
+        };
+        assert_eq!(
+            attachments,
+            &vec![UserMessageAttachment::Artifact { artifact }],
+            "timeline state retains only the exact typed artifact ref"
+        );
+
+        let changed = ThreadTimelineBlocksChangedNotification {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            changed_block_ids: vec!["turn:turn_message:user".to_owned()],
+            removed_block_ids: Vec::new(),
+            before_cursor: None,
+            after_cursor: None,
+            reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+        };
+        assert!(apply_thread_timeline_blocks_changed(
+            &mut state,
+            changed.clone(),
+        ));
+        assert!(!apply_thread_timeline_blocks_changed(&mut state, changed));
+
+        let mut tombstone = authoritative;
+        tombstone.updated_at_unix_ms = Some(30);
+        tombstone.kind = TimelineBlockKind::UserMessage {
+            item_id: Some("item_message".to_owned()),
+            inputs: Vec::new(),
+            text: String::new(),
+            attachments: Vec::new(),
+            mode: ThreadMode::Message,
+            author: Some(author),
+            reply: None,
+            mentions: vec![mention],
+            revision: 2,
+            edited: true,
+            deleted: true,
+        };
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![tombstone.clone()]),
+            TopLevelPageMergeMode::Reset,
+        ));
+        let cached = state
+            .thread("thread_a")
+            .and_then(|thread| thread.top_level.block("turn:turn_message:user"))
+            .expect("authoritative tombstone");
+        assert_eq!(cached, &tombstone);
+        assert!(
+            state
+                .thread("thread_a")
+                .expect("thread cache")
+                .top_level
+                .stale_block_ids()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3438,6 +3630,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "source_turn".to_owned(),
                 pending_request_id: "pending_source".to_owned(),
+                mode: ThreadMode::Agent,
                 user_text: "Start background analysis".to_owned(),
                 attachments: Vec::new(),
             },
@@ -3482,6 +3675,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "user_turn".to_owned(),
                 pending_request_id: "pending_user".to_owned(),
+                mode: ThreadMode::Agent,
                 user_text: "A later parent message".to_owned(),
                 attachments: Vec::new(),
             },
@@ -4097,6 +4291,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                mode: ThreadMode::Agent,
                 user_text: "hello".to_owned(),
                 attachments: Vec::new(),
             },
@@ -4134,6 +4329,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             turn_id: turn_id.to_owned(),
             pending_request_id: "pending_a".to_owned(),
+            mode: ThreadMode::Agent,
             user_text: "run this asynchronously".to_owned(),
             attachments: Vec::new(),
         };
@@ -4176,6 +4372,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: turn_id.to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                mode: ThreadMode::Agent,
             },
             20,
         ));
@@ -4189,6 +4386,12 @@ mod tests {
                     status: TurnStatus::InProgress,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
+                    mode: ThreadMode::Agent,
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
@@ -4209,7 +4412,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_message_only_turn_removes_optimistic_empty_work_block() {
+    fn message_only_turn_never_creates_an_optimistic_work_block() {
         let mut state = SemanticTimelineState::default();
         apply_conversation_event_to_semantic_timeline(
             &mut state,
@@ -4218,10 +4421,19 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_message_only".to_owned(),
                 pending_request_id: "pending_message_only".to_owned(),
+                mode: ThreadMode::Message,
                 user_text: "run this in the background".to_owned(),
                 attachments: Vec::new(),
             },
             10,
+        );
+        assert!(
+            state
+                .thread("thread_a")
+                .expect("thread cache")
+                .top_level
+                .block("turn:turn_message_only:work")
+                .is_none()
         );
 
         let patch = apply_conversation_event_to_semantic_timeline_with_patch(
@@ -4234,6 +4446,12 @@ mod tests {
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
+                    mode: ThreadMode::Message,
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
@@ -4243,7 +4461,7 @@ mod tests {
             20,
         );
 
-        assert_eq!(patch.removed_block_ids, vec!["turn:turn_message_only:work"]);
+        assert!(patch.removed_block_ids.is_empty());
         let thread = state.thread("thread_a").expect("thread cache");
         assert!(
             thread
@@ -4293,6 +4511,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                mode: ThreadMode::Agent,
                 user_text: "research".to_owned(),
                 attachments: attachments.clone(),
             },
@@ -4335,6 +4554,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "pending_a".to_owned(),
+                mode: ThreadMode::Agent,
                 user_text: "hello".to_owned(),
                 attachments: Vec::new(),
             },
@@ -4995,6 +5215,12 @@ mod tests {
                     status: TurnStatus::Failed,
                     turn_kind: pioneer_protocol::TurnKind::Conversation,
                     origin: pioneer_protocol::TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: Some("provider disconnected".to_owned()),
                     prompt_manifest: None,
                     permission_profile: pioneer_protocol::compile_turn_permission_profile(
@@ -5064,6 +5290,12 @@ mod tests {
                     status: TurnStatus::Failed,
                     turn_kind: pioneer_protocol::TurnKind::Conversation,
                     origin: pioneer_protocol::TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: Some("failed after final".to_owned()),
                     prompt_manifest: None,
                     permission_profile: pioneer_protocol::compile_turn_permission_profile(
@@ -5557,6 +5789,13 @@ mod tests {
                 inputs: Vec::new(),
                 text: "user input".to_owned(),
                 attachments: Vec::new(),
+                mode: Default::default(),
+                author: None,
+                reply: None,
+                mentions: Vec::new(),
+                revision: 0,
+                edited: false,
+                deleted: false,
             },
         }
     }
@@ -5606,6 +5845,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
             origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::compile_turn_permission_profile(

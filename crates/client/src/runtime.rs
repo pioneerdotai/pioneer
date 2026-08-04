@@ -665,6 +665,13 @@ pub fn reduce_gateway_notification(
                 SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
             ))
         }
+        GatewayNotification::ThreadReadCursorChanged(notification) => Some(
+            ClientRuntimeNotification::WorkspaceRefresh(WorkspaceRefreshReduction {
+                queue_thread_list_refresh: context.active_workspace_id
+                    == Some(notification.workspace_id.as_str()),
+                workspace_id: notification.workspace_id,
+            }),
+        ),
         GatewayNotification::TurnWorkItemsChanged(notification) => {
             Some(ClientRuntimeNotification::SemanticTimeline(
                 SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification),
@@ -764,7 +771,10 @@ mod tests {
             endpoint_id: endpoint_id.to_owned(),
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "127.0.0.1:17878",
+            )
+            .unwrap(),
             auth_token: None,
             session: None,
             timings: timings(),
@@ -840,7 +850,10 @@ mod tests {
                 connection_id: 1,
                 endpoint_id: "old".to_owned(),
                 endpoint_name: "Old".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:1").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:1",
+                )
+                .unwrap(),
             }),
         );
         assert!(events.is_empty());
@@ -851,7 +864,10 @@ mod tests {
                 connection_id: 2,
                 endpoint_id: "new".to_owned(),
                 endpoint_name: "New".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:2").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:2",
+                )
+                .unwrap(),
             }),
         );
         assert_eq!(events.len(), 1);
@@ -863,7 +879,10 @@ mod tests {
             connection_id: 7,
             endpoint_id: "remote".to_owned(),
             endpoint_name: "Remote".to_owned(),
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "127.0.0.1:17878",
+            )
+            .unwrap(),
         };
 
         let reduced = reduce_gateway_ws_event(
@@ -1200,6 +1219,46 @@ mod tests {
         };
         assert_eq!(notification.thread_id, "thread_a");
         assert_eq!(notification.changed_block_ids, vec!["block_a"]);
+    }
+
+    #[test]
+    fn read_cursor_notification_is_only_a_thread_snapshot_refresh_hint() {
+        let notification = GatewayNotification::ThreadReadCursorChanged(
+            pioneer_protocol::ThreadReadCursorChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                thread_id: "thread_a".to_owned(),
+                cursor: pioneer_protocol::ThreadReadCursor {
+                    through_turn_id: "turn_a".to_owned(),
+                    sort_key: "0001".to_owned(),
+                },
+                unread_count: 0,
+            },
+        );
+
+        let reduced = reduce_gateway_notification(
+            notification.clone(),
+            ClientRuntimeNotificationContext {
+                active_workspace_id: Some("ws_a"),
+                ..Default::default()
+            },
+        );
+        let Some(ClientRuntimeNotification::WorkspaceRefresh(reduction)) = reduced else {
+            panic!("expected authoritative thread-tree refresh hint");
+        };
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert!(reduction.queue_thread_list_refresh);
+
+        let foreign = reduce_gateway_notification(
+            notification,
+            ClientRuntimeNotificationContext {
+                active_workspace_id: Some("ws_b"),
+                ..Default::default()
+            },
+        );
+        let Some(ClientRuntimeNotification::WorkspaceRefresh(reduction)) = foreign else {
+            panic!("expected scoped refresh reduction");
+        };
+        assert!(!reduction.queue_thread_list_refresh);
     }
 
     #[test]

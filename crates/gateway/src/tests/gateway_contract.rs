@@ -188,19 +188,97 @@ pub(crate) struct WsAdmissionCase {
 }
 
 pub(crate) const WS_ADMISSION_CASES: &[WsAdmissionCase] = &[
-    ws_case("access", ProtocolHeaderCase::ExactV1, CredentialCase::Access, true, WsAdmissionOutcome::NormalUpgrade),
-    ws_case("refresh", ProtocolHeaderCase::ExactV1, CredentialCase::Refresh, true, WsAdmissionOutcome::RestrictedUpgrade),
-    ws_case("activation", ProtocolHeaderCase::ExactV1, CredentialCase::DeviceActivation, true, WsAdmissionOutcome::RestrictedUpgrade),
-    ws_case("invitation", ProtocolHeaderCase::ExactV1, CredentialCase::Invitation, true, WsAdmissionOutcome::RestrictedUpgrade),
-    ws_case("missing_version", ProtocolHeaderCase::Missing, CredentialCase::Access, true, WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST)),
-    ws_case("duplicate_version", ProtocolHeaderCase::Duplicate, CredentialCase::Access, true, WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST)),
-    ws_case("malformed_version", ProtocolHeaderCase::Malformed, CredentialCase::Access, true, WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST)),
-    ws_case("unsupported_version", ProtocolHeaderCase::Unsupported, CredentialCase::Access, true, WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST)),
-    ws_case("missing_credential", ProtocolHeaderCase::ExactV1, CredentialCase::Missing, true, WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED)),
-    ws_case("duplicate_credential", ProtocolHeaderCase::ExactV1, CredentialCase::Duplicate, true, WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED)),
-    ws_case("malformed_credential", ProtocolHeaderCase::ExactV1, CredentialCase::Malformed, true, WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED)),
-    ws_case("invalid_access", ProtocolHeaderCase::ExactV1, CredentialCase::InvalidOrExpired, true, WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED)),
-    ws_case("invalid_ws_headers", ProtocolHeaderCase::ExactV1, CredentialCase::Access, false, WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST)),
+    ws_case(
+        "access",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Access,
+        true,
+        WsAdmissionOutcome::NormalUpgrade,
+    ),
+    ws_case(
+        "refresh",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Refresh,
+        true,
+        WsAdmissionOutcome::RestrictedUpgrade,
+    ),
+    ws_case(
+        "activation",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::DeviceActivation,
+        true,
+        WsAdmissionOutcome::RestrictedUpgrade,
+    ),
+    ws_case(
+        "invitation",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Invitation,
+        true,
+        WsAdmissionOutcome::RestrictedUpgrade,
+    ),
+    ws_case(
+        "missing_version",
+        ProtocolHeaderCase::Missing,
+        CredentialCase::Access,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST),
+    ),
+    ws_case(
+        "duplicate_version",
+        ProtocolHeaderCase::Duplicate,
+        CredentialCase::Access,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST),
+    ),
+    ws_case(
+        "malformed_version",
+        ProtocolHeaderCase::Malformed,
+        CredentialCase::Access,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST),
+    ),
+    ws_case(
+        "unsupported_version",
+        ProtocolHeaderCase::Unsupported,
+        CredentialCase::Access,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST),
+    ),
+    ws_case(
+        "missing_credential",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Missing,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED),
+    ),
+    ws_case(
+        "duplicate_credential",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Duplicate,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED),
+    ),
+    ws_case(
+        "malformed_credential",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Malformed,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED),
+    ),
+    ws_case(
+        "invalid_access",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::InvalidOrExpired,
+        true,
+        WsAdmissionOutcome::Reject(StatusCode::UNAUTHORIZED),
+    ),
+    ws_case(
+        "invalid_ws_headers",
+        ProtocolHeaderCase::ExactV1,
+        CredentialCase::Access,
+        false,
+        WsAdmissionOutcome::Reject(StatusCode::BAD_REQUEST),
+    ),
     WsAdmissionCase {
         name: "legacy_path",
         path: "/ws",
@@ -279,16 +357,10 @@ pub(crate) enum ContentDispositionPolicy {
 
 pub(crate) fn disposition_for_mime(mime: &str) -> ContentDispositionPolicy {
     match mime.as_bytes() {
-        b"image/png"
-        | b"image/jpeg"
-        | b"image/webp"
-        | b"image/gif"
-        | b"application/pdf"
-        | b"text/plain"
-        | b"audio/mpeg"
-        | b"audio/ogg"
-        | b"video/mp4"
-        | b"video/webm" => ContentDispositionPolicy::Inline,
+        b"image/png" | b"image/jpeg" | b"image/webp" | b"image/gif" | b"application/pdf"
+        | b"text/plain" | b"audio/mpeg" | b"audio/ogg" | b"video/mp4" | b"video/webm" => {
+            ContentDispositionPolicy::Inline
+        }
         _ => ContentDispositionPolicy::Attachment,
     }
 }
@@ -672,7 +744,10 @@ impl AsyncRead for FakeBlobHandle {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         if self.cancelled.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(Error::new(ErrorKind::Interrupted, "fake blob cancelled")));
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::Interrupted,
+                "fake blob cancelled",
+            )));
         }
         if self.fail_at.is_some_and(|offset| self.position >= offset) {
             return Poll::Ready(Err(Error::other("injected fake blob read failure")));
@@ -716,7 +791,10 @@ impl AsyncSeek for FakeBlobHandle {
             SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
         };
         if next < 0 || next > i128::from(self.logical_len) {
-            return Err(Error::new(ErrorKind::InvalidInput, "fake blob seek out of bounds"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "fake blob seek out of bounds",
+            ));
         }
         self.position = next as u64;
         Ok(())
@@ -741,27 +819,37 @@ pub(crate) fn assert_snapshot_redacted(rendered: &str) {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     use super::*;
 
     #[test]
     fn matrices_cover_canonical_and_reserved_namespaces() {
-        assert_eq!(PROTOCOL_VERSION_HEADER, pioneer_protocol::PIONEER_PROTOCOL_VERSION_HEADER);
-        assert_eq!(PROTOCOL_VERSION_V1, pioneer_protocol::PIONEER_PROTOCOL_VERSION);
+        assert_eq!(
+            PROTOCOL_VERSION_HEADER,
+            pioneer_protocol::PIONEER_PROTOCOL_VERSION_HEADER
+        );
+        assert_eq!(
+            PROTOCOL_VERSION_V1,
+            pioneer_protocol::PIONEER_PROTOCOL_VERSION
+        );
         assert_eq!(ROUTE_CONTRACTS.len(), 8);
-        assert!(ROUTE_CONTRACTS.iter().all(|route| {
-            !route.methods.is_empty() && route.path.starts_with('/')
-        }));
+        assert!(
+            ROUTE_CONTRACTS
+                .iter()
+                .all(|route| { !route.methods.is_empty() && route.path.starts_with('/') })
+        );
         assert!(ROUTE_CONTRACTS.iter().any(|route| {
             route.owner == RouteOwner::ViewGrant
                 && route.version == RouteVersion::ServerBoundV1
                 && route.authentication == RouteAuthentication::ServerBoundViewGrant
         }));
-        assert!(ROUTE_CONTRACTS.iter().any(|route| {
-            route.owner == RouteOwner::ReservedWebhooks && !route.registered
-        }));
+        assert!(
+            ROUTE_CONTRACTS
+                .iter()
+                .any(|route| { route.owner == RouteOwner::ReservedWebhooks && !route.registered })
+        );
         assert!(REJECTED_WS_PATHS.contains(&"/api/v1/ws"));
 
         assert_eq!(WS_ADMISSION_CASES.len(), 14);
@@ -772,7 +860,11 @@ mod tests {
             ProtocolHeaderCase::Malformed,
             ProtocolHeaderCase::Unsupported,
         ] {
-            assert!(WS_ADMISSION_CASES.iter().any(|case| case.protocol == protocol));
+            assert!(
+                WS_ADMISSION_CASES
+                    .iter()
+                    .any(|case| case.protocol == protocol)
+            );
         }
         for credential in [
             CredentialCase::Access,
@@ -790,12 +882,13 @@ mod tests {
                     .any(|case| case.credential == credential)
             );
         }
-        assert!(WS_ADMISSION_CASES.iter().all(|case| {
-            !case.name.is_empty() && case.path.starts_with('/')
-        }));
+        assert!(
+            WS_ADMISSION_CASES
+                .iter()
+                .all(|case| { !case.name.is_empty() && case.path.starts_with('/') })
+        );
         assert!(WS_ADMISSION_CASES.iter().any(|case| {
-            case.standard_upgrade_headers_valid
-                && case.outcome == WsAdmissionOutcome::NormalUpgrade
+            case.standard_upgrade_headers_valid && case.outcome == WsAdmissionOutcome::NormalUpgrade
         }));
         assert!(WS_ADMISSION_CASES.iter().any(|case| {
             case.standard_upgrade_headers_valid
@@ -806,9 +899,11 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             StatusCode::NOT_FOUND,
         ] {
-            assert!(WS_ADMISSION_CASES.iter().any(|case| {
-                case.outcome == WsAdmissionOutcome::Reject(status)
-            }));
+            assert!(
+                WS_ADMISSION_CASES
+                    .iter()
+                    .any(|case| { case.outcome == WsAdmissionOutcome::Reject(status) })
+            );
         }
         assert_eq!(
             (
@@ -827,18 +922,30 @@ mod tests {
             (HttpFailure::UnknownPath, StatusCode::NOT_FOUND),
             (HttpFailure::OrdinaryRoot, StatusCode::BAD_REQUEST),
             (HttpFailure::InvalidProtocolHeader, StatusCode::BAD_REQUEST),
-            (HttpFailure::InvalidWebSocketHeaders, StatusCode::BAD_REQUEST),
+            (
+                HttpFailure::InvalidWebSocketHeaders,
+                StatusCode::BAD_REQUEST,
+            ),
             (HttpFailure::InvalidAccess, StatusCode::UNAUTHORIZED),
             (HttpFailure::HiddenOrMissingResource, StatusCode::NOT_FOUND),
             (HttpFailure::DisclosedForbidden, StatusCode::FORBIDDEN),
             (HttpFailure::ExpiredOrRevokedGrant, StatusCode::NOT_FOUND),
             (HttpFailure::MalformedRange, StatusCode::BAD_REQUEST),
-            (HttpFailure::UnsatisfiableRange, StatusCode::RANGE_NOT_SATISFIABLE),
+            (
+                HttpFailure::UnsatisfiableRange,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
             (HttpFailure::MultipleRanges, StatusCode::BAD_REQUEST),
-            (HttpFailure::StorageInvariant, StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                HttpFailure::StorageInvariant,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
             (HttpFailure::PerScopeCapacity, StatusCode::TOO_MANY_REQUESTS),
             (HttpFailure::GlobalCapacity, StatusCode::SERVICE_UNAVAILABLE),
-            (HttpFailure::TemporaryBackend, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                HttpFailure::TemporaryBackend,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             assert_eq!(status_for_failure(failure), expected);
         }
@@ -859,7 +966,10 @@ mod tests {
         }
         assert!(ENTITY_TAG_CONTRACTS.iter().all(|contract| contract.strong));
         assert_eq!(strong_etag("revision-test"), "\"revision-test\"");
-        assert_eq!(CONTENT_SECURITY_HEADERS[0], ("x-content-type-options", "nosniff"));
+        assert_eq!(
+            CONTENT_SECURITY_HEADERS[0],
+            ("x-content-type-options", "nosniff")
+        );
         assert!(VIEW_SECURITY_HEADERS.contains(&("referrer-policy", "no-referrer")));
     }
 
@@ -874,11 +984,20 @@ mod tests {
         assert_eq!(grant.expires_at_unix - grant.issued_at_unix, 180);
         assert_eq!(TEST_GATEWAY_ID, "G00000000000000000001");
         assert_eq!(active_session_fixture().state, FixtureSessionState::Active);
-        assert_eq!(revoked_session_fixture().state, FixtureSessionState::Revoked);
+        assert_eq!(
+            revoked_session_fixture().state,
+            FixtureSessionState::Revoked
+        );
         assert_eq!(active_session_fixture().principal_id, TEST_PRINCIPAL_ID);
-        assert_eq!(revoked_session_fixture().session_id, TEST_REVOKED_SESSION_ID);
+        assert_eq!(
+            revoked_session_fixture().session_id,
+            TEST_REVOKED_SESSION_ID
+        );
         assert!(!hidden_artifact_fixture().visible);
-        assert_eq!(hidden_artifact_fixture().artifact_id, TEST_HIDDEN_ARTIFACT_ID);
+        assert_eq!(
+            hidden_artifact_fixture().artifact_id,
+            TEST_HIDDEN_ARTIFACT_ID
+        );
         assert_eq!(projection_fixture().kind, "thumbnail");
         assert_eq!(avatar_fixture().principal_id, TEST_PRINCIPAL_ID);
         assert_eq!(avatar_fixture().revision, "avatar-revision-test");
@@ -914,11 +1033,16 @@ mod tests {
         assert_eq!(blob.read(&mut bytes).await.expect("tail read"), 2);
 
         let mut failed = FakeBlobHandle::from_bytes(b"abcdef".to_vec()).with_failure_at(1);
-        assert_eq!(failed.read(&mut bytes).await.expect("read before failure"), 1);
+        assert_eq!(
+            failed.read(&mut bytes).await.expect("read before failure"),
+            1
+        );
         assert!(failed.read(&mut bytes).await.is_err());
 
         let mut cancelled = FakeBlobHandle::from_bytes(b"abcdef".to_vec());
-        cancelled.cancellation_handle().store(true, Ordering::SeqCst);
+        cancelled
+            .cancellation_handle()
+            .store(true, Ordering::SeqCst);
         assert!(cancelled.read(&mut bytes).await.is_err());
 
         let large = FakeBlobHandle::large_logical(8 * 1024 * 1024 * 1024, 0x61);

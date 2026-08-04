@@ -34,8 +34,6 @@ mod message;
 mod operations;
 mod permissions;
 mod prompt_hooks;
-#[cfg(test)]
-mod tests;
 mod request_context;
 mod resilience;
 mod secrets;
@@ -44,6 +42,8 @@ mod session;
 mod settings;
 mod system_skills;
 mod task_tools;
+#[cfg(test)]
+mod tests;
 mod thread;
 mod thread_episodic;
 mod thread_episodic_embedding;
@@ -53,8 +53,8 @@ mod transport;
 mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
-mod voice;
 mod view_grants;
+mod voice;
 mod workspace;
 
 use anyhow::{Context, Result};

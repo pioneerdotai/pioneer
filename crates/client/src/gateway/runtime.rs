@@ -319,7 +319,9 @@ pub fn plan_update_remote_gateway_profile(
     }
 
     let previous_endpoint = registry.remotes[existing_index].clone();
-    if previous_endpoint.session_ref.is_some() && gateway_base_url != previous_endpoint.gateway_base_url {
+    if previous_endpoint.session_ref.is_some()
+        && gateway_base_url != previous_endpoint.gateway_base_url
+    {
         return Err(GatewayProfileError::SessionBoundGatewayBaseUrlChange {
             endpoint_id: id.to_owned(),
         });

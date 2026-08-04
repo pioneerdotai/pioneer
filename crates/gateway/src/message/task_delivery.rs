@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{Result, anyhow, bail};
-use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus};
+use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus, ThreadMode};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -260,7 +260,12 @@ impl MessageProcessor {
                     model: None,
                     model_provider: None,
                     sandbox_policy: None,
-                    mode: None,
+                    // Delivery is an internal system projection, not a user-authored ordinary
+                    // Message. Keep the pre-Epic-6 execution-free Chat semantics explicit so a
+                    // target thread whose composer default is Message cannot reclassify it.
+                    mode: Some(ThreadMode::Chat),
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,

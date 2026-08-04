@@ -37,10 +37,35 @@ pub struct Model {
     pub initiated_by_actor_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_authorization_context_json: Option<String>,
+    pub send_mode: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub author_display_name_snapshot: Option<String>,
+    pub author_nickname_snapshot: Option<String>,
+    pub author_avatar_revision_snapshot: Option<String>,
+    pub reply_to_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub mentions_json: String,
+    pub message_revision: i64,
+    pub message_deleted_at: Option<DateTimeWithTimeZone>,
+    pub message_deleted_by_actor_id: Option<String>,
+    pub message_deleted_by_actor_kind: Option<String>,
+    #[sea_orm(has_many)]
+    pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
+    #[sea_orm(
+        self_ref,
+        relation_enum = "SelfRef",
+        from = "reply_to_turn_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "Restrict"
+    )]
+    pub turn: HasOne<Entity>,
     #[sea_orm(has_one)]
     pub turn_cli_runtime_instruction: HasOne<super::turn_cli_runtime_instruction::Entity>,
     #[sea_orm(has_one)]
     pub turn_mcp_projection: HasOne<super::turn_mcp_projection::Entity>,
+    #[sea_orm(has_many)]
+    pub turn_message_revisions: HasMany<super::turn_message_revision::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

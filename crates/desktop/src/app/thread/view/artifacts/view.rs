@@ -361,77 +361,83 @@ impl PioneerDesktop {
             .when_some(action_status.as_ref(), |this, status| {
                 this.child(render_thread_artifact_action_status(status, cx))
             })
-            .child(h_flex().w_full().gap_1().children([
-                {
-                    let summary = summary.clone();
-                    artifact_action_button(
-                        Button::new("artifact-download-action")
-                            .icon(IconName::ArrowDown)
-                            .tooltip(t!("artifacts.action.download_tooltip").to_string())
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.choose_thread_artifact_download_destination(
-                                    summary.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })),
-                        can_download,
-                        cx,
-                    )
-                },
-                {
-                    let summary = summary.clone();
-                    artifact_action_button(
-                        Button::new("artifact-open-action")
-                            .icon(IconName::ExternalLink)
-                            .tooltip(t!("artifacts.action.open_tooltip").to_string())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.open_thread_artifact(summary.clone(), cx);
-                            })),
-                        can_download,
-                        cx,
-                    )
-                },
-                {
-                    let artifact = artifact.clone();
-                    artifact_action_button(
-                        Button::new("artifact-reveal-action")
-                            .icon(IconName::FolderOpen)
-                            .tooltip(t!("artifacts.action.reveal_tooltip").to_string())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.reveal_thread_artifact(artifact.clone(), cx);
-                            })),
-                        reveal_enabled,
-                        cx,
-                    )
-                },
-                {
-                    let artifact = artifact.clone();
-                    let attach_enabled = artifact.status == ArtifactStatus::Ready;
-                    artifact_action_button(
-                        Button::new("artifact-attach-action")
-                            .icon(IconName::Plus)
-                            .tooltip(t!("artifacts.action.attach_tooltip").to_string())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.attach_artifact_to_composer(artifact.clone(), cx);
-                            })),
-                        attach_enabled,
-                        cx,
-                    )
-                },
-            ]).when(download_can_cancel, |this| {
-                let artifact = artifact.clone();
-                this.child(artifact_action_button(
-                    Button::new("artifact-cancel-download-action")
-                        .icon(IconName::Close)
-                        .tooltip(t!("artifacts.action.cancel_tooltip").to_string())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.cancel_thread_artifact_download(artifact.clone(), cx);
-                        })),
-                    true,
-                    cx,
-                ))
-            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .children([
+                        {
+                            let summary = summary.clone();
+                            artifact_action_button(
+                                Button::new("artifact-download-action")
+                                    .icon(IconName::ArrowDown)
+                                    .tooltip(t!("artifacts.action.download_tooltip").to_string())
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.choose_thread_artifact_download_destination(
+                                            summary.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                can_download,
+                                cx,
+                            )
+                        },
+                        {
+                            let summary = summary.clone();
+                            artifact_action_button(
+                                Button::new("artifact-open-action")
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip(t!("artifacts.action.open_tooltip").to_string())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.open_thread_artifact(summary.clone(), cx);
+                                    })),
+                                can_download,
+                                cx,
+                            )
+                        },
+                        {
+                            let artifact = artifact.clone();
+                            artifact_action_button(
+                                Button::new("artifact-reveal-action")
+                                    .icon(IconName::FolderOpen)
+                                    .tooltip(t!("artifacts.action.reveal_tooltip").to_string())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.reveal_thread_artifact(artifact.clone(), cx);
+                                    })),
+                                reveal_enabled,
+                                cx,
+                            )
+                        },
+                        {
+                            let artifact = artifact.clone();
+                            let attach_enabled = artifact.status == ArtifactStatus::Ready;
+                            artifact_action_button(
+                                Button::new("artifact-attach-action")
+                                    .icon(IconName::Plus)
+                                    .tooltip(t!("artifacts.action.attach_tooltip").to_string())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.attach_artifact_to_composer(artifact.clone(), cx);
+                                    })),
+                                attach_enabled,
+                                cx,
+                            )
+                        },
+                    ])
+                    .when(download_can_cancel, |this| {
+                        let artifact = artifact.clone();
+                        this.child(artifact_action_button(
+                            Button::new("artifact-cancel-download-action")
+                                .icon(IconName::Close)
+                                .tooltip(t!("artifacts.action.cancel_tooltip").to_string())
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.cancel_thread_artifact_download(artifact.clone(), cx);
+                                })),
+                            true,
+                            cx,
+                        ))
+                    }),
+            )
             .into_any_element()
     }
 

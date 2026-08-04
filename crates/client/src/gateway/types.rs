@@ -53,6 +53,8 @@ where
     if version == super::registry::CURRENT_GATEWAY_REGISTRY_VERSION {
         Ok(version)
     } else {
-        Err(serde::de::Error::custom("unsupported Gateway registry version"))
+        Err(serde::de::Error::custom(
+            "unsupported Gateway registry version",
+        ))
     }
 }

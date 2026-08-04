@@ -100,15 +100,11 @@ impl ArtifactHttpPreviewService {
             .sha256
             .as_deref()
             .map(str::to_ascii_lowercase)
-            .filter(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or_else(|| anyhow::anyhow!("artifact thumbnail sha256 is invalid"))?;
         let path = format!(
             "storage/workspaces/{}/artifacts/{}/versions/{}/projections/thumbnail",
-            workspace_id,
-            artifact.artifact_id,
-            version_id,
+            workspace_id, artifact.artifact_id, version_id,
         );
         let mut response = self
             .http
@@ -118,9 +114,10 @@ impl ArtifactHttpPreviewService {
         if response.head.status != 200
             || response.head.content_length != Some(expected_size)
             || response.head.etag.as_deref() != Some(expected_etag.as_str())
-            || preview.mime_type.as_deref().is_some_and(|expected| {
-                response.head.content_type.as_deref() != Some(expected)
-            })
+            || preview
+                .mime_type
+                .as_deref()
+                .is_some_and(|expected| response.head.content_type.as_deref() != Some(expected))
         {
             bail!("artifact thumbnail response metadata mismatch");
         }
@@ -524,12 +521,10 @@ fn artifact_preview_safe_path_segment(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::http::{GatewayHttpBody, GatewayHttpMethod, GatewayHttpResponseHead};
     use pioneer_protocol::{
         ArtifactKind, ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus,
         ArtifactStatus,
-    };
-    use crate::transport::http::{
-        GatewayHttpBody, GatewayHttpMethod, GatewayHttpResponseHead,
     };
     use std::{cell::RefCell, sync::Mutex as StdMutex};
 
@@ -729,10 +724,10 @@ mod tests {
             request: GatewayHttpRequest,
             _cancellation: CancellationToken,
         ) -> std::result::Result<GatewayHttpResponse, GatewayHttpError> {
-            self.requests.lock().expect("requests lock").push((
-                request.method(),
-                request.storage_path().to_owned(),
-            ));
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push((request.method(), request.storage_path().to_owned()));
             self.response
                 .lock()
                 .expect("response lock")

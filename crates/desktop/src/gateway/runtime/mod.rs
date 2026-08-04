@@ -10,9 +10,7 @@ use crate::gateway::activation::{
 };
 use crate::gateway::connectivity::validate_remote_gateway_base_url;
 use crate::gateway::control::{GatewayInstallWarning, create_local_pending_device_session};
-use crate::gateway::registry::{
-    load_registry_for_runtime, save_registry, setup_required,
-};
+use crate::gateway::registry::{load_registry_for_runtime, save_registry, setup_required};
 use crate::gateway::secrets::DesktopSecrets;
 use crate::gateway::timings::{
     GatewayTimings, GatewayWsTimings, gateway_timings_from_config, gateway_ws_timings_from_config,
@@ -468,7 +466,10 @@ fn map_gateway_profile_error(error: client_gateway_runtime::GatewayProfileError)
             )
         }
         client_gateway_runtime::GatewayProfileError::InvalidGatewayBaseUrl { .. } => {
-            anyhow::anyhow!("{}", t!("errors.gateway.invalid_address", normalized = "[redacted]"))
+            anyhow::anyhow!(
+                "{}",
+                t!("errors.gateway.invalid_address", normalized = "[redacted]")
+            )
         }
         client_gateway_runtime::GatewayProfileError::SessionBoundGatewayBaseUrlChange {
             endpoint_id,
@@ -679,5 +680,4 @@ mod tests {
         );
         assert!(durable_local.server_gateway_id.is_some());
     }
-
 }

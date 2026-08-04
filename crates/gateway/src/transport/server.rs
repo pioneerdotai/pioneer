@@ -99,10 +99,7 @@ pub async fn spawn_server(
     })
 }
 
-async fn shutdown_signal(
-    mut shutdown_rx: watch::Receiver<bool>,
-    state: GatewayHttpState,
-) {
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>, state: GatewayHttpState) {
     loop {
         if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
             break;
@@ -134,9 +131,8 @@ pub(super) async fn run_admitted_connection(
             .await
         }
         AdmittedConnection::Restricted { admission, permit } => {
-            let deadline = Duration::from_secs(
-                state.config.gateway.auth.auth_exchange_timeout_seconds,
-            );
+            let deadline =
+                Duration::from_secs(state.config.gateway.auth.auth_exchange_timeout_seconds);
             let result = tokio::select! {
                 result = run_restricted_exchange(ws, admission, deadline, state.auth_service) => {
                     result.map(Some)
@@ -146,22 +142,15 @@ pub(super) async fn run_admitted_connection(
             match &result {
                 Ok(Some(RestrictedExchangeOutcome::Succeeded)) => {
                     permit.record_success();
-                    tracing::debug!(
-                        event = "websocket_auth",
-                        outcome = "restricted_succeeded",
-                    );
+                    tracing::debug!(event = "websocket_auth", outcome = "restricted_succeeded",);
                 }
                 Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => {
                     permit.record_failure();
-                    tracing::debug!(
-                        event = "websocket_auth",
-                        outcome = "restricted_failed",
-                    );
+                    tracing::debug!(event = "websocket_auth", outcome = "restricted_failed",);
                 }
-                Ok(None) => tracing::debug!(
-                    event = "websocket_auth",
-                    outcome = "restricted_cancelled",
-                ),
+                Ok(None) => {
+                    tracing::debug!(event = "websocket_auth", outcome = "restricted_cancelled",)
+                }
             }
             result.map(|_| ())
         }
@@ -372,7 +361,7 @@ async fn run_normal_connection(
                 writer_task.abort();
                 let _ = writer_task.await;
             }
-        }
+        },
     }
     access_lease_task
         .await
@@ -599,7 +588,9 @@ mod tests {
         tokio::pin!(pending);
         assert!(pending.as_mut().now_or_never().is_none());
         assert!(matches!(receiver.recv().await, Some(Message::Text(_))));
-        pending.await.expect("writer progress releases backpressure");
+        pending
+            .await
+            .expect("writer progress releases backpressure");
 
         drop(receiver);
         assert!(sender.send(Message::Close(None)).await.is_err());

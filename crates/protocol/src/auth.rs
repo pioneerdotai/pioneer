@@ -340,9 +340,8 @@ impl AuthDeviceActivationPresentation {
             match key.as_ref() {
                 "gateway_base_url" if gateway_base_url.is_none() => {
                     gateway_base_url = Some(
-                        GatewayBaseUrl::parse_presentation(value.as_ref()).map_err(|_| {
-                            "device activation URI has an invalid Gateway base URL"
-                        })?,
+                        GatewayBaseUrl::parse_presentation(value.as_ref())
+                            .map_err(|_| "device activation URI has an invalid Gateway base URL")?,
                     );
                 }
                 "gateway_base_url" => {

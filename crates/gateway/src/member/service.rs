@@ -1,17 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Error};
-use pioneer_crud::CrudStore;
 use pioneer_artifacts::mime::detect_mime_from_bytes;
+use pioneer_crud::CrudStore;
 use pioneer_protocol::{
     AuthSessionId, AuthSessionRevokeReason, DeviceId, GatewayId, InvitationId,
     InvitationRevokeReason, MemberListParams, MemberListResponse, MemberManagementErrorReason,
-    MemberMutationResponse, MemberRemoveParams,
-    MemberRestoreParams, MemberSummary, MemberSuspendParams, PROFILE_AVATAR_MAX_DECODED_BYTES,
-    PROFILE_AVATAR_MAX_DIMENSION, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus,
-    ProfileAvatarMediaType, RoleKey, WorkspaceId, WorkspaceMemberAddParams,
-    WorkspaceMemberListParams, WorkspaceMemberListResponse, WorkspaceMemberMutationResponse,
-    WorkspaceMemberRemoveParams,
+    MemberMutationResponse, MemberRemoveParams, MemberRestoreParams, MemberSummary,
+    MemberSuspendParams, PROFILE_AVATAR_MAX_DECODED_BYTES, PROFILE_AVATAR_MAX_DIMENSION,
+    PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, ProfileAvatarMediaType,
+    RoleKey, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
+    WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
 };
 use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
 use sha2::Digest as _;
@@ -20,8 +19,8 @@ use crate::administrative_audit::AdministrativeAuditWriter;
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::authorization::{
     AuthorizationDecision, AuthorizationResolver, AuthorizationService, AuthorizedMemberDirectory,
-    AuthorizedMemberPrincipal, AuthorizedWorkspace, DenyReason,
-    DisclosurePolicy, ProofResolution, ResourceAction, persisted_actor_is_current,
+    AuthorizedMemberPrincipal, AuthorizedWorkspace, DenyReason, DisclosurePolicy, ProofResolution,
+    ResourceAction, persisted_actor_is_current,
 };
 use crate::epic5_observability::Epic5RateLimits;
 use crate::secrets::GatewaySecrets;
@@ -1109,8 +1108,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::authorization::{AuthorizationResolver, AuthorizationService, ProofResolution};
-    use crate::tests::authorization::{IsolatedEpic4Harness, MEMBER_A_ID, MEMBER_B_ID};
     use crate::secrets::GatewaySecrets;
+    use crate::tests::authorization::{IsolatedEpic4Harness, MEMBER_A_ID, MEMBER_B_ID};
 
     use super::*;
 
@@ -1450,12 +1449,8 @@ mod tests {
         let viewer = member_a();
         let self_id = viewer.principal_id.clone();
         let shared = PrincipalId::new(MEMBER_B_ID).unwrap();
-        let suspended = PrincipalId::new(
-            crate::tests::authorization::SUSPENDED_MEMBER_ID,
-        )
-        .unwrap();
-        let removed =
-            PrincipalId::new(crate::tests::authorization::REMOVED_MEMBER_ID).unwrap();
+        let suspended = PrincipalId::new(crate::tests::authorization::SUSPENDED_MEMBER_ID).unwrap();
+        let removed = PrincipalId::new(crate::tests::authorization::REMOVED_MEMBER_ID).unwrap();
         let missing = PrincipalId::new("P0000000000000000000Z").unwrap();
 
         let self_revision = seed_avatar(&harness.database, &self_id).await;
@@ -1482,7 +1477,9 @@ mod tests {
             (&missing, missing_revision.as_str()),
         ] {
             assert!(matches!(
-                service.avatar_snapshot(&viewer, target, Some(revision)).await,
+                service
+                    .avatar_snapshot(&viewer, target, Some(revision))
+                    .await,
                 Err(MemberServiceError::Authorization(_))
             ));
         }

@@ -68,13 +68,8 @@ mod tests {
     use pioneer_client::{
         artifacts::http_download::ArtifactHttpDownloadRequest,
         avatars::AvatarCacheRequest,
-        gateway::endpoint::{
-            GatewayBaseUrl, PIONEER_PROTOCOL_VERSION_HEADER,
-        },
-        transport::{
-            http::BrowserViewUrl,
-            ws::rpc::build_ws_request,
-        },
+        gateway::endpoint::{GatewayBaseUrl, PIONEER_PROTOCOL_VERSION_HEADER},
+        transport::{http::BrowserViewUrl, ws::rpc::build_ws_request},
     };
     use pioneer_protocol::PrincipalId;
 
@@ -119,10 +114,14 @@ mod tests {
         let view = BrowserViewUrl::resolve(&base, format!("/storage/views/{grant}").as_str())
             .expect("same-origin view");
         let launcher = FakeSystemViewerLauncher::default();
-        launcher.open_url(view.expose_url()).expect("record view intent");
+        launcher
+            .open_url(view.expose_url())
+            .expect("record view intent");
         assert_eq!(
             launcher.opened_urls(),
-            vec![format!("https://gateway.test/pioneer/storage/views/{grant}")]
+            vec![format!(
+                "https://gateway.test/pioneer/storage/views/{grant}"
+            )]
         );
 
         let download = ArtifactHttpDownloadRequest {
@@ -144,7 +143,12 @@ mod tests {
             serde_json::to_string(&avatar).unwrap()
         )
         .to_ascii_lowercase();
-        for forbidden in ["authorization", "access_token", "content_base64", "data:image"] {
+        for forbidden in [
+            "authorization",
+            "access_token",
+            "content_base64",
+            "data:image",
+        ] {
             assert!(!boundary.contains(forbidden));
         }
     }

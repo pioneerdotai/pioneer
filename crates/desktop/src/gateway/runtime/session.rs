@@ -168,7 +168,12 @@ impl GatewayRuntime {
             refresh_slot,
             exchange_refresh,
             |gateway_base_url, access_token, session_id| {
-                revoke_session_best_effort(gateway_base_url, access_token, session_id, cleanup_timeout)
+                revoke_session_best_effort(
+                    gateway_base_url,
+                    access_token,
+                    session_id,
+                    cleanup_timeout,
+                )
             },
         )
     }
@@ -245,22 +250,21 @@ impl GatewayRuntime {
                 return Ok(None);
             }
 
-            let outcome =
-                match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
-                    DesktopSessionPreparation::Terminal(terminal) => {
-                        DesktopSessionConnectionOutcome::Terminal(terminal)
+            let outcome = match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
+                DesktopSessionPreparation::Terminal(terminal) => {
+                    DesktopSessionConnectionOutcome::Terminal(terminal)
+                }
+                DesktopSessionPreparation::Ready(ready) => {
+                    let expires_at = ready.spec.identity.access_expires_at_unix;
+                    let connection_id =
+                        sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
+                    DesktopSessionConnectionOutcome::Connected {
+                        connection_id,
+                        metadata: ready.metadata,
+                        access_expires_at_unix: expires_at,
                     }
-                    DesktopSessionPreparation::Ready(ready) => {
-                        let expires_at = ready.spec.identity.access_expires_at_unix;
-                        let connection_id =
-                            sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
-                        DesktopSessionConnectionOutcome::Connected {
-                            connection_id,
-                            metadata: ready.metadata,
-                            access_expires_at_unix: expires_at,
-                        }
-                    }
-                };
+                }
+            };
             Ok(Some(outcome))
         })
     }
@@ -277,7 +281,8 @@ impl GatewayRuntime {
                 }
                 DesktopSessionPreparation::Ready(ready) => {
                     let expires_at = ready.spec.identity.access_expires_at_unix;
-                    let connection_id = sender.connect_with_retry(ready.spec.into_connect_spec())?;
+                    let connection_id =
+                        sender.connect_with_retry(ready.spec.into_connect_spec())?;
                     Ok(DesktopSessionConnectionOutcome::Connected {
                         connection_id,
                         metadata: ready.metadata,
@@ -1168,7 +1173,10 @@ mod tests {
             })
             .expect("serialized refresh operation");
 
-        assert!(slot.try_lock().is_ok(), "the slot must be released afterwards");
+        assert!(
+            slot.try_lock().is_ok(),
+            "the slot must be released afterwards"
+        );
     }
 
     #[test]

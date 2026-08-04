@@ -796,6 +796,14 @@ impl MessageProcessor {
         else {
             return;
         };
+        self.complete_runtime_draft_materialization_record(runtime_draft)
+            .await;
+    }
+
+    pub(super) async fn complete_runtime_draft_materialization_record(
+        &self,
+        runtime_draft: &RuntimeDraftMaterialization,
+    ) {
         let access = runtime_draft.access();
         if !self.thread_manager.mark_runtime_draft_durable(access).await {
             warn!(
@@ -871,6 +879,18 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if let Err(error) = super::message_turn::normalize_turn_collaboration_params(&mut params) {
+            self.send_turn_start_failure(
+                connection_id,
+                request_id.clone(),
+                &success_response,
+                thread.id.as_str(),
+                turn_id.as_str(),
+                format!("invalid Turn collaboration metadata: {error}"),
+            )
+            .await;
+            return;
+        }
         // The detached Task must replay the exact presentation selected in the
         // Composer. Skill packs are expanded only at the execution boundary;
         // persisting the expanded capabilities here would make the child
@@ -878,7 +898,11 @@ impl MessageProcessor {
         let launch = params.clone();
         params.capabilities = normalized_capabilities.execution.clone();
         if let Err(error) = self
-            .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
+            .validate_turn_artifact_user_inputs(
+                thread.workspace_id.as_str(),
+                thread.id.as_str(),
+                params.input.as_slice(),
+            )
             .await
         {
             self.send_turn_start_failure(
@@ -940,7 +964,52 @@ impl MessageProcessor {
         // so leaving the field empty here would keep the parent's previous
         // API provider even though the detached child runs in Codex/Claude.
         canonicalize_cli_runtime_model_provider(&mut params);
-        let outcome = match self.thread_manager.turn_start(connection_id, params).await {
+        let author = match super::message_turn::resolve_turn_author_snapshot(
+            self.crud_store.as_ref(),
+            &request_actor,
+        )
+        .await
+        {
+            Ok(author) => author,
+            Err(error) => {
+                self.send_turn_start_failure(
+                    connection_id,
+                    request_id.clone(),
+                    &success_response,
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    format!("failed to resolve Turn author: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
+            self.crud_store.as_ref(),
+            &request_actor,
+            &params,
+        )
+        .await
+        {
+            Ok(mentions) => mentions,
+            Err(error) => {
+                self.send_turn_start_failure(
+                    connection_id,
+                    request_id.clone(),
+                    &success_response,
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    format!("invalid Turn collaboration metadata: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let outcome = match self
+            .thread_manager
+            .turn_start_with_user_metadata(connection_id, params, author, mentions)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.send_turn_start_failure(
@@ -1225,10 +1294,32 @@ impl MessageProcessor {
             .await?;
         }
         params.capabilities = normalized_capabilities.execution.clone();
+        super::message_turn::normalize_turn_collaboration_params(&mut params)
+            .map_err(|error| format!("invalid Turn collaboration metadata: {error}"))?;
+        self.validate_turn_artifact_user_inputs(
+            thread.workspace_id.as_str(),
+            thread.id.as_str(),
+            params.input.as_slice(),
+        )
+        .await
+        .map_err(|error| format!("failed to validate artifact input: {error}"))?;
         let security_params = params.clone();
+        let author = super::message_turn::resolve_turn_author_snapshot(
+            self.crud_store.as_ref(),
+            &request_actor,
+        )
+        .await
+        .map_err(|error| format!("failed to resolve Turn author: {error:#}"))?;
+        let mentions = super::message_turn::resolve_turn_collaboration_metadata(
+            self.crud_store.as_ref(),
+            &request_actor,
+            &params,
+        )
+        .await
+        .map_err(|error| format!("invalid Turn collaboration metadata: {error}"))?;
         let outcome = self
             .thread_manager
-            .turn_start(connection_id, params)
+            .turn_start_with_user_metadata(connection_id, params, author, mentions)
             .await
             .map_err(|error| format!("failed to start turn: {error:#}"))?;
         let effective_reasoning_effort = match self
@@ -1250,18 +1341,6 @@ impl MessageProcessor {
                 return Err(message);
             }
         };
-        if let Err(error) = self
-            .validate_artifact_user_inputs(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            return Err(format!("failed to validate artifact input: {error:#}"));
-        }
         let skill_catalog = match self
             .validate_turn_skill_capabilities(
                 outcome.started_notification.workspace_id.as_str(),
@@ -1501,7 +1580,7 @@ impl MessageProcessor {
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.thread.mode,
+                outcome.materialization.turn.mode,
                 &hook_runtime_context,
                 &outcome.materialization.thread.model,
                 &outcome.materialization.thread.model_provider,
@@ -1587,7 +1666,7 @@ impl MessageProcessor {
             .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.thread.mode,
+                outcome.materialization.turn.mode,
                 &outcome.materialization.thread.model,
                 &outcome.materialization.thread.model_provider,
                 prepared.workspace_skill_policies,
@@ -2381,8 +2460,9 @@ impl MessageProcessor {
                 }
             };
             if let Err(error) = self
-                .validate_artifact_user_inputs(
+                .validate_turn_artifact_user_inputs(
                     thread.workspace_id.as_str(),
+                    thread.id.as_str(),
                     params.input.as_slice(),
                 )
                 .await
@@ -2476,12 +2556,45 @@ impl MessageProcessor {
                 .as_ref()
                 .and_then(|options| options.summary.clone());
 
+            if let Err(error) =
+                super::message_turn::normalize_turn_collaboration_params(&mut params)
+            {
+                send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
+                return;
+            }
             let security_params = params.clone();
             #[cfg(test)]
             self.cli_runtime_skill_preflight_test_events
                 .lock()
                 .await
                 .push("thread_manager_turn_start".to_owned());
+            let author = match super::message_turn::resolve_turn_author_snapshot(
+                self.crud_store.as_ref(),
+                &request_actor,
+            )
+            .await
+            {
+                Ok(author) => author,
+                Err(error) => {
+                    send_turn_start_failure!(format!("failed to resolve Turn author: {error:#}"));
+                    return;
+                }
+            };
+            let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
+                self.crud_store.as_ref(),
+                &request_actor,
+                &params,
+            )
+            .await
+            {
+                Ok(mentions) => mentions,
+                Err(error) => {
+                    send_turn_start_failure!(format!(
+                        "invalid Turn collaboration metadata: {error}"
+                    ));
+                    return;
+                }
+            };
             let outcome = match if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
@@ -2489,7 +2602,9 @@ impl MessageProcessor {
                     .system_turn_start_with_permission_profile(params, permission_profile)
                     .await
             } else {
-                self.thread_manager.turn_start(connection_id, params).await
+                self.thread_manager
+                    .turn_start_with_user_metadata(connection_id, params, author, mentions)
+                    .await
             } {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -4893,6 +5008,8 @@ impl MessageProcessor {
             user_message_capability_attachments,
         ))
         .await;
+        self.notify_thread_tree_changed(outcome.started_notification.workspace_id.clone())
+            .await;
 
         // Spawn background title generation on first turn (fire-and-forget) only for user-origin threads.
         if outcome.materialization.thread.name.is_none()

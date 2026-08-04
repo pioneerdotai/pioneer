@@ -1,8 +1,6 @@
 use pioneer_client::{
     gateway::{
-        endpoint::{
-            GatewayBaseUrl, PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
-        },
+        endpoint::{GatewayBaseUrl, PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER},
         registry::{
             GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
         },
@@ -39,10 +37,8 @@ fn remote_spec() -> GatewayWsConnectSpec {
         endpoint_id: "remote-prod".to_owned(),
         endpoint_name: "Remote Prod".to_owned(),
         endpoint_kind: GatewayEndpointKind::Remote,
-        gateway_base_url: GatewayBaseUrl::parse_presentation(
-            "https://gateway.example.com/pioneer",
-        )
-        .unwrap(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation("https://gateway.example.com/pioneer")
+            .unwrap(),
         auth_token: Some(pioneer_protocol::AuthSecretString::new("remote-token")),
         session: None,
         timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 5_000, 0).expect("timings"),
@@ -199,6 +195,13 @@ fn user_message_block(sort_key: &str) -> TimelineBlock {
             inputs: Vec::new(),
             text: "Run a large plan".to_owned(),
             attachments: Vec::new(),
+            mode: Default::default(),
+            author: None,
+            reply: None,
+            mentions: Vec::new(),
+            revision: 0,
+            edited: false,
+            deleted: false,
         },
     }
 }
@@ -374,10 +377,8 @@ fn remote_gateway_session_access_smoke_builds_authenticated_ws_request() {
     registry.remotes.push(GatewayEndpoint {
         id: "remote-prod".to_owned(),
         name: "Remote Prod".to_owned(),
-        gateway_base_url: GatewayBaseUrl::parse_presentation(
-            "https://gateway.example.com/pioneer",
-        )
-        .unwrap(),
+        gateway_base_url: GatewayBaseUrl::parse_presentation("https://gateway.example.com/pioneer")
+            .unwrap(),
         kind: GatewayEndpointKind::Local,
         session_ref: Some("remote-prod".to_owned()),
         server_gateway_id: Some(

@@ -1,10 +1,11 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
     AuthSessionId, PrincipalId, SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification,
     ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
     ThreadStartedNotification, ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
     Turn, TurnKind, TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    UserInput,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
@@ -13,7 +14,7 @@ use crate::helpers::unix_timestamp_secs;
 use crate::session::ConnectionId;
 
 const DEFAULT_SANDBOX_MODE: SandboxMode = SandboxMode::FullAccess;
-const DEFAULT_THREAD_MODE: ThreadMode = ThreadMode::Chat;
+const DEFAULT_THREAD_MODE: ThreadMode = ThreadMode::Message;
 
 #[derive(Debug)]
 pub struct ThreadStartOutcome {
@@ -29,6 +30,16 @@ pub struct TurnStartOutcome {
     pub started_notification_connection_ids: Vec<ConnectionId>,
     pub materialization: TurnStartMaterialization,
     pub rollback_context: TurnStartRollbackContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedMessageTurnStartOutcome {
+    pub response: TurnStartResponse,
+    pub started_notification: TurnStartedNotification,
+    pub completed_notification: pioneer_protocol::TurnCompletedNotification,
+    pub notification_connection_ids: Vec<ConnectionId>,
+    pub materialization: TurnStartMaterialization,
+    final_thread: Thread,
 }
 
 #[derive(Debug, Clone)]
@@ -683,6 +694,42 @@ impl ThreadManager {
         merge_thread_metadata(&mut entry.thread, thread);
     }
 
+    /// Applies the committed mutable fields of one Message Turn without
+    /// replacing unrelated foreground execution state held by the loaded
+    /// thread. The persisted snapshot remains authoritative for preview and
+    /// the mutated Turn itself.
+    pub async fn sync_message_mutation_from_persisted(
+        &self,
+        persisted_thread: &Thread,
+        turn_id: &str,
+    ) -> Result<()> {
+        let persisted_turn = persisted_thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .filter(|turn| turn.mode == ThreadMode::Message && turn.status == TurnStatus::Completed)
+            .context("persisted Message mutation snapshot is unavailable")?
+            .clone();
+
+        let mut state = self.state.write().await;
+        let Some(entry) = state.threads.get_mut(persisted_thread.id.as_str()) else {
+            return Ok(());
+        };
+        if entry.thread.workspace_id != persisted_thread.workspace_id {
+            bail!("persisted Message mutation workspace differs from loaded thread");
+        }
+        let loaded_turn = entry
+            .thread
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == turn_id)
+            .context("persisted Message mutation target is missing from loaded thread")?;
+        *loaded_turn = persisted_turn;
+        entry.thread.preview = persisted_thread.preview.clone();
+        entry.thread.updated_at = entry.thread.updated_at.max(persisted_thread.updated_at);
+        Ok(())
+    }
+
     pub async fn list_threads_for_workspace_visible_to(
         &self,
         workspace_id: &str,
@@ -753,12 +800,25 @@ impl ThreadManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn turn_start(
         &self,
         connection_id: ConnectionId,
         params: TurnStartParams,
     ) -> Result<TurnStartOutcome> {
-        self.turn_start_for_actor(Some(connection_id), params).await
+        self.turn_start_for_actor(Some(connection_id), params, None, Vec::new())
+            .await
+    }
+
+    pub async fn turn_start_with_user_metadata(
+        &self,
+        connection_id: ConnectionId,
+        params: TurnStartParams,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor(Some(connection_id), params, author, mentions)
+            .await
     }
 
     pub async fn system_turn_start_with_permission_profile(
@@ -766,17 +826,31 @@ impl ThreadManager {
         params: TurnStartParams,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     ) -> Result<TurnStartOutcome> {
-        self.turn_start_for_actor_with_permission_profile(None, params, Some(permission_profile))
-            .await
+        self.turn_start_for_actor_with_permission_profile(
+            None,
+            params,
+            Some(permission_profile),
+            None,
+            Vec::new(),
+        )
+        .await
     }
 
     async fn turn_start_for_actor(
         &self,
         connection_id: Option<ConnectionId>,
         params: TurnStartParams,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
     ) -> Result<TurnStartOutcome> {
-        self.turn_start_for_actor_with_permission_profile(connection_id, params, None)
-            .await
+        self.turn_start_for_actor_with_permission_profile(
+            connection_id,
+            params,
+            None,
+            author,
+            mentions,
+        )
+        .await
     }
 
     async fn turn_start_for_actor_with_permission_profile(
@@ -784,6 +858,8 @@ impl ThreadManager {
         connection_id: Option<ConnectionId>,
         params: TurnStartParams,
         resolved_permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
     ) -> Result<TurnStartOutcome> {
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
@@ -857,9 +933,7 @@ impl ThreadManager {
             .filter(|effort| !effort.is_empty())
             .map(str::to_owned);
 
-        if let Some(mode) = requested_mode {
-            entry.thread.mode = mode;
-        }
+        let effective_mode = requested_mode.unwrap_or(entry.thread.mode);
         if let Some(model) = requested_model {
             entry.thread.model = model;
         }
@@ -872,6 +946,12 @@ impl ThreadManager {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: effective_mode,
+            author,
+            reply_to_turn_id: params.reply_to_turn_id.clone(),
+            mentions,
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile,
@@ -932,6 +1012,146 @@ impl ThreadManager {
         })
     }
 
+    /// Prepares one ordinary Message Turn as Started + immediately Completed
+    /// without mutating in-memory state or acquiring foreground execution
+    /// ownership. The caller persists both canonical events atomically before
+    /// applying the final state with `commit_completed_message_turn`.
+    pub async fn prepare_completed_message_turn(
+        &self,
+        connection_id: ConnectionId,
+        params: &TurnStartParams,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<CompletedMessageTurnStartOutcome> {
+        let thread_id = params.thread_id.trim();
+        if thread_id.is_empty() {
+            bail!("`thread_id` is required for `turn/start`");
+        }
+        let turn_id = params.turn_id.trim();
+        if turn_id.is_empty() {
+            bail!("`turn_id` is required for `turn/start`");
+        }
+
+        let now = unix_timestamp_secs()? as i64;
+        let state = self.state.read().await;
+        let Some(entry) = state.threads.get(thread_id) else {
+            bail!("thread `{thread_id}` is not loaded");
+        };
+        if !entry.subscribers.contains_key(&connection_id) {
+            bail!("connection `{connection_id}` is not subscribed to thread `{thread_id}`");
+        }
+        if entry.thread.turns.iter().any(|turn| turn.id == turn_id) {
+            bail!("turn `{turn_id}` already exists in thread `{thread_id}`");
+        }
+        let effective_mode = params.mode.unwrap_or(entry.thread.mode);
+        if effective_mode != ThreadMode::Message {
+            bail!("completed-on-start transition requires Message mode");
+        }
+
+        let permission_profile = pioneer_protocol::resolve_turn_permission_profile(None);
+        let started_turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: ThreadMode::Message,
+            author: Some(author),
+            reply_to_turn_id: params.reply_to_turn_id.clone(),
+            mentions,
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile,
+        };
+        let mut completed_turn = started_turn.clone();
+        completed_turn.status = TurnStatus::Completed;
+
+        let mut started_thread = entry.thread.clone();
+        if started_thread.preview.is_empty()
+            && let Some(text) = params.input.iter().find_map(|input| match input {
+                UserInput::Text { text, .. } => Some(text.trim()),
+                _ => None,
+            })
+            && !text.is_empty()
+        {
+            started_thread.preview = text.to_owned();
+        }
+        started_thread.updated_at = now;
+        started_thread.turns.push(started_turn.clone());
+
+        let mut final_thread = started_thread.clone();
+        if let Some(turn) = final_thread.turns.last_mut() {
+            *turn = completed_turn.clone();
+        }
+
+        Ok(CompletedMessageTurnStartOutcome {
+            response: TurnStartResponse {
+                turn: completed_turn.clone(),
+            },
+            started_notification: TurnStartedNotification {
+                workspace_id: started_thread.workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: started_turn.clone(),
+            },
+            completed_notification: pioneer_protocol::TurnCompletedNotification {
+                workspace_id: started_thread.workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: completed_turn,
+            },
+            notification_connection_ids: entry.subscribers.keys().copied().collect(),
+            materialization: TurnStartMaterialization {
+                thread: started_thread,
+                turn: started_turn,
+                input: params.input.clone(),
+                capabilities: Vec::new(),
+                sandbox_mode: entry.sandbox_mode,
+            },
+            final_thread,
+        })
+    }
+
+    /// Applies only the already-committed terminal Message projection to the
+    /// loaded Thread. Durable state remains authoritative if the Thread was
+    /// unloaded between prepare and commit.
+    pub async fn commit_completed_message_turn(
+        &self,
+        outcome: &CompletedMessageTurnStartOutcome,
+    ) -> Result<()> {
+        let thread_id = outcome.completed_notification.thread_id.as_str();
+        let turn_id = outcome.completed_notification.turn.id.as_str();
+        let mut state = self.state.write().await;
+        let Some(entry) = state.threads.get_mut(thread_id) else {
+            bail!("thread `{thread_id}` is not loaded");
+        };
+        if let Some(existing) = entry.thread.turns.iter().find(|turn| turn.id == turn_id) {
+            if existing == &outcome.completed_notification.turn {
+                return Ok(());
+            }
+            bail!("turn `{turn_id}` already exists with different state");
+        }
+        if entry.thread.preview.is_empty()
+            && let Some(preview) =
+                outcome
+                    .materialization
+                    .input
+                    .iter()
+                    .find_map(|input| match input {
+                        UserInput::Text { text, .. } => Some(text.trim()),
+                        _ => None,
+                    })
+            && !preview.is_empty()
+        {
+            entry.thread.preview = preview.to_owned();
+        }
+        entry.thread.updated_at = entry.thread.updated_at.max(outcome.final_thread.updated_at);
+        entry
+            .thread
+            .turns
+            .push(outcome.completed_notification.turn.clone());
+        Ok(())
+    }
+
     pub async fn rollback_turn_start(&self, context: TurnStartRollbackContext) {
         let mut state = self.state.write().await;
         let Some(entry) = state.threads.get_mut(&context.thread_id) else {
@@ -949,10 +1169,7 @@ impl ThreadManager {
         entry.sandbox_mode = context.previous_sandbox_mode;
 
         let discard_disconnected_runtime_draft = entry.subscribers.is_empty()
-            && matches!(
-                &entry.lifecycle,
-                ThreadEntryLifecycle::RuntimeDraft { .. }
-            )
+            && matches!(&entry.lifecycle, ThreadEntryLifecycle::RuntimeDraft { .. })
             && !has_in_progress_conversation_turn(&entry.thread);
         if discard_disconnected_runtime_draft {
             state.threads.remove(&context.thread_id);
@@ -1397,7 +1614,7 @@ mod tests {
             model: None,
             model_provider: None,
             sandbox: None,
-            mode: None,
+            mode: Some(ThreadMode::Chat),
             origin_kind: None,
             sidebar_visibility: None,
             visibility: None,
@@ -1435,6 +1652,224 @@ mod tests {
             outcome.response.thread.workspace_id,
             "ws_000000000000000001"
         );
+    }
+
+    #[tokio::test]
+    async fn new_user_thread_without_mode_defaults_to_message() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let mut params = start_params("thr_message_default");
+        params.mode = None;
+        let outcome = manager
+            .thread_start(10, "ws_000000000000000001".to_owned(), params)
+            .await
+            .expect("thread start should succeed");
+        assert_eq!(outcome.response.thread.mode, ThreadMode::Message);
+    }
+
+    #[tokio::test]
+    async fn completed_message_does_not_take_foreground_ownership() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_message_during_agent";
+        let thread_start = manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread start should succeed");
+        let running = manager
+            .turn_start(
+                10,
+                TurnStartParams {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: "turn_running_agent".to_owned(),
+                    input: vec![UserInput::Text {
+                        text: "run".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+            )
+            .await
+            .expect("Agent turn should start");
+        assert_eq!(running.response.turn.status, TurnStatus::InProgress);
+
+        let message = manager
+            .prepare_completed_message_turn(
+                10,
+                &TurnStartParams {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: "turn_message".to_owned(),
+                    input: vec![UserInput::Text {
+                        text: "hello".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Message),
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                pioneer_protocol::TurnAuthorSnapshot {
+                    actor: pioneer_protocol::PersistedActorRef::System,
+                    display_name: "System".to_owned(),
+                    nickname: "system".to_owned(),
+                    avatar_revision: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("Message should prepare while Agent runs");
+        assert_eq!(message.response.turn.status, TurnStatus::Completed);
+        assert_eq!(
+            message.started_notification.turn.status,
+            TurnStatus::InProgress
+        );
+        assert_eq!(
+            message.completed_notification.turn.status,
+            TurnStatus::Completed
+        );
+        assert_eq!(
+            manager
+                .thread_get(thread_id)
+                .await
+                .expect("thread")
+                .turns
+                .len(),
+            1,
+            "prepare must not expose a running Message"
+        );
+
+        manager
+            .commit_completed_message_turn(&message)
+            .await
+            .expect("committed Message should apply");
+        let loaded_thread = manager.thread_get(thread_id).await.expect("thread");
+        assert_eq!(loaded_thread.status, ThreadStatus::Active);
+        assert_eq!(loaded_thread.mode, ThreadMode::Chat);
+        assert_eq!(loaded_thread.turns.len(), 2);
+        assert_eq!(loaded_thread.turns[0].status, TurnStatus::InProgress);
+        assert_eq!(loaded_thread.turns[1].status, TurnStatus::Completed);
+        assert_eq!(loaded_thread.turns[1].mode, ThreadMode::Message);
+        assert_eq!(
+            loaded_thread.workspace_id,
+            thread_start.response.thread.workspace_id
+        );
+
+        let mut persisted_thread = loaded_thread.clone();
+        persisted_thread.preview.clear();
+        persisted_thread.updated_at = persisted_thread.updated_at.saturating_add(1);
+        let persisted_message = persisted_thread
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == "turn_message")
+            .expect("persisted Message");
+        persisted_message.message_revision = 1;
+        persisted_message.message_deleted = true;
+        manager
+            .sync_message_mutation_from_persisted(&persisted_thread, "turn_message")
+            .await
+            .expect("Message mutation should synchronize");
+        let synchronized = manager.thread_get(thread_id).await.expect("thread");
+        assert_eq!(synchronized.status, ThreadStatus::Active);
+        assert_eq!(synchronized.turns[0].status, TurnStatus::InProgress);
+        assert!(synchronized.turns[1].message_deleted);
+        assert_eq!(synchronized.turns[1].message_revision, 1);
+        assert!(synchronized.preview.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_completed_messages_merge_without_regressing_loaded_thread_state() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_concurrent_messages";
+        let started = manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread should start");
+        let base_updated_at = started.response.thread.updated_at;
+        let author = pioneer_protocol::TurnAuthorSnapshot {
+            actor: pioneer_protocol::PersistedActorRef::System,
+            display_name: "System".to_owned(),
+            nickname: "system".to_owned(),
+            avatar_revision: None,
+        };
+        let params = |turn_id: &str, text: &str| TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            input: vec![UserInput::Text {
+                text: text.to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: Some(ThreadMode::Message),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+        };
+        let mut older = manager
+            .prepare_completed_message_turn(
+                10,
+                &params("turn_message_older", "older"),
+                author.clone(),
+                Vec::new(),
+            )
+            .await
+            .expect("older Message should prepare");
+        let mut newer = manager
+            .prepare_completed_message_turn(
+                10,
+                &params("turn_message_newer", "newer"),
+                author,
+                Vec::new(),
+            )
+            .await
+            .expect("newer Message should prepare");
+        older.final_thread.updated_at = base_updated_at + 1;
+        newer.final_thread.updated_at = base_updated_at + 2;
+
+        manager
+            .commit_completed_message_turn(&newer)
+            .await
+            .expect("newer committed Message should apply");
+        manager
+            .commit_completed_message_turn(&older)
+            .await
+            .expect("older committed Message should merge");
+
+        let thread = manager.thread_get(thread_id).await.expect("thread");
+        assert_eq!(thread.preview, "newer");
+        assert_eq!(thread.updated_at, base_updated_at + 2);
+        assert_eq!(thread.turns.len(), 2);
+        assert!(thread.turns.iter().all(|turn| {
+            turn.mode == ThreadMode::Message && turn.status == TurnStatus::Completed
+        }));
     }
 
     #[tokio::test]
@@ -1510,6 +1945,12 @@ mod tests {
                 status: TurnStatus::Completed,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -1591,6 +2032,12 @@ mod tests {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -1642,6 +2089,12 @@ mod tests {
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::TaskRun,
                 origin: TurnOrigin::DetachedTask,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -1686,6 +2139,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,
@@ -1837,6 +2292,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,
@@ -1981,6 +2438,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,
@@ -2034,6 +2493,8 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: Some(TurnReasoningSelection {
                         effort: "high".to_owned(),
@@ -2084,6 +2545,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: Some(TurnPermissionProfileSelection {
@@ -2131,6 +2594,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,
@@ -2173,6 +2638,8 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: Some(TurnReasoningSelection {
                         effort: "high".to_owned(),
@@ -2217,6 +2684,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
                     reasoning: None,
                     permission_profile: None,

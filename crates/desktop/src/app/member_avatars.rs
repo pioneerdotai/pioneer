@@ -67,15 +67,16 @@ impl DesktopMemberAvatarState {
                     );
                 }
                 Some(revision) => {
-                    let entry = self.visible.entry(member.principal_id.clone()).or_insert_with(|| {
-                        DesktopMemberAvatarPresentation {
+                    let entry = self
+                        .visible
+                        .entry(member.principal_id.clone())
+                        .or_insert_with(|| DesktopMemberAvatarPresentation {
                             principal_id: member.principal_id.clone(),
                             avatar_revision: Some(revision.to_owned()),
                             cached_image_path: None,
                             media_type: None,
                             status: DesktopMemberAvatarStatus::Loading,
-                        }
-                    });
+                        });
                     if entry.avatar_revision.as_deref() != Some(revision) {
                         entry.avatar_revision = Some(revision.to_owned());
                         entry.cached_image_path = None;

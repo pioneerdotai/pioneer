@@ -36,7 +36,11 @@ fn skill_upload_chunk_sends_binary_frame_and_receives_ack() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("upload-chunk", "Upload Chunk", server.gateway_base_url.as_str());
+    let spec = connect_spec(
+        "upload-chunk",
+        "Upload Chunk",
+        server.gateway_base_url.as_str(),
+    );
 
     let _connection_id = sender
         .connect_and_wait(spec)
@@ -203,7 +207,11 @@ fn reconnects_after_server_returns() {
     let gateway_base_url = server.gateway_base_url.clone();
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("remote-reconnect", "Remote Reconnect", gateway_base_url.as_str());
+    let spec = connect_spec(
+        "remote-reconnect",
+        "Remote Reconnect",
+        gateway_base_url.as_str(),
+    );
 
     let connection_id = sender
         .connect_with_retry(spec)
@@ -252,7 +260,11 @@ fn dropping_client_clone_does_not_shutdown_worker() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
-    let spec = connect_spec("remote-clone", "Remote Clone", server.gateway_base_url.as_str());
+    let spec = connect_spec(
+        "remote-clone",
+        "Remote Clone",
+        server.gateway_base_url.as_str(),
+    );
 
     {
         let transient_clone = client.clone();
@@ -419,6 +431,8 @@ fn turn_start_request_receives_response_and_started_notification() {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: None,
@@ -479,6 +493,8 @@ fn turn_start_request_sends_reasoning_effort() {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: Some(TurnReasoningSelection {
                 effort: "high".to_owned(),
@@ -531,6 +547,8 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                 runtime_id: "codex".to_owned(),
                 runtime_kind: CLIAgentRuntimeKind::Codex,
@@ -594,6 +612,8 @@ fn turn_start_request_sends_permission_profile_selection() {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: Some(TurnPermissionProfileSelection {
@@ -777,16 +797,19 @@ fn concurrent_clients_receive_broadcast_thread_started_events() {
     server.stop();
 }
 
-fn connect_spec(endpoint_id: &str, endpoint_name: &str, gateway_base_url: &str) -> GatewayWsConnectSpec {
+fn connect_spec(
+    endpoint_id: &str,
+    endpoint_name: &str,
+    gateway_base_url: &str,
+) -> GatewayWsConnectSpec {
     GatewayWsConnectSpec {
         endpoint_id: endpoint_id.to_owned(),
         endpoint_name: endpoint_name.to_owned(),
         endpoint_kind: GatewayEndpointKind::Remote,
-        gateway_base_url:
-            pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                gateway_base_url,
-            )
-            .unwrap(),
+        gateway_base_url: pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+            gateway_base_url,
+        )
+        .unwrap(),
         auth_token: None,
         session: None,
         timings: GatewayWsTimings {
@@ -845,8 +868,8 @@ fn default_turn_permission_profile_json() -> serde_json::Value {
 }
 
 fn reserve_unused_local_address() -> String {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to reserve local test gateway_base_url");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve local test gateway_base_url");
     let gateway_base_url = listener
         .local_addr()
         .expect("failed to resolve reserved local test gateway_base_url")

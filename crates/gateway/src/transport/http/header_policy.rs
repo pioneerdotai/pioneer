@@ -18,12 +18,15 @@ pub(super) async fn enforce(request: Request<Body>, next: Next) -> Response {
     // Count the serialized `name: value\r\n` representation plus the final
     // empty line. Hyper also bounds header count; this limit owns aggregate
     // bytes and must not omit per-field framing overhead.
-    let bytes = request.headers().iter().try_fold(2usize, |total, (name, value)| {
-        total
-            .checked_add(name.as_str().len())?
-            .checked_add(value.as_bytes().len())
-            .and_then(|total| total.checked_add(4))
-    });
+    let bytes = request
+        .headers()
+        .iter()
+        .try_fold(2usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+                .and_then(|total| total.checked_add(4))
+        });
     let response = if bytes.is_none_or(|bytes| bytes > MAX_REQUEST_HEADER_BYTES) {
         HttpError::bad_request(new_request_id()).into_response()
     } else {
@@ -45,10 +48,7 @@ pub(super) async fn enforce(request: Request<Body>, next: Next) -> Response {
     protect_view_grant_referrer(response, is_view_grant_request)
 }
 
-fn protect_view_grant_referrer(
-    mut response: Response,
-    is_view_grant_request: bool,
-) -> Response {
+fn protect_view_grant_referrer(mut response: Response, is_view_grant_request: bool) -> Response {
     if is_view_grant_request {
         response.headers_mut().insert(
             header::REFERRER_POLICY,
@@ -104,7 +104,9 @@ mod tests {
                 .header(header::CONTENT_LENGTH, "0")
                 .body(Body::empty())
                 .unwrap(),
-            Request::get("/").body(Body::from("unframed-in-process-body")).unwrap(),
+            Request::get("/")
+                .body(Body::from("unframed-in-process-body"))
+                .unwrap(),
         ] {
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -134,11 +136,7 @@ mod tests {
         }
 
         let ordinary = app
-            .oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert!(ordinary.headers().get(header::REFERRER_POLICY).is_none());

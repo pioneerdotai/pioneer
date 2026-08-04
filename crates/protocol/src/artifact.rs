@@ -580,7 +580,6 @@ mod tests {
                 .expect("upload header decode"),
             upload
         );
-
     }
 
     #[test]
@@ -646,10 +645,12 @@ mod tests {
         assert!(!rendered.contains(response.relative_url.as_str()));
         assert!(rendered.contains("[redacted]"));
         let response_json = serde_json::to_value(&response).unwrap();
-        assert!(response_json["relative_url"]
-            .as_str()
-            .unwrap()
-            .starts_with("/storage/views/"));
+        assert!(
+            response_json["relative_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("/storage/views/")
+        );
         assert_eq!(response_json["expires_at"], 1_180);
     }
 

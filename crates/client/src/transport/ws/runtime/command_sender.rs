@@ -2,11 +2,13 @@ use super::*;
 use crate::composer::turn_prepare as client_composer_turn_prepare;
 use crate::transport::ws::command_sender as client_ws_commands;
 use crate::{
-    artifacts::{
-        upload::ArtifactUploadTransport,
-    },
-    platform::ClientFileSystem,
+    artifacts::upload::ArtifactUploadTransport, platform::ClientFileSystem,
     skills::catalog::SkillSnapshotTransport,
+};
+use pioneer_protocol::{
+    ThreadReadParams, ThreadReadResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
+    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageRevisionsPageParams,
+    TurnMessageRevisionsPageResponse,
 };
 
 impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
@@ -376,6 +378,31 @@ impl GatewayWsCommandSender {
 
     pub fn turn_start(&self, params: TurnStartParams) -> Result<TurnStartResponse> {
         client_ws_commands::turn_start(self, params)
+    }
+
+    pub fn turn_message_edit(
+        &self,
+        params: TurnMessageEditParams,
+    ) -> Result<TurnMessageEditResponse> {
+        client_ws_commands::turn_message_edit(self, params)
+    }
+
+    pub fn turn_message_delete(
+        &self,
+        params: TurnMessageDeleteParams,
+    ) -> Result<TurnMessageDeleteResponse> {
+        client_ws_commands::turn_message_delete(self, params)
+    }
+
+    pub fn turn_message_revisions_page(
+        &self,
+        params: TurnMessageRevisionsPageParams,
+    ) -> Result<TurnMessageRevisionsPageResponse> {
+        client_ws_commands::turn_message_revisions_page(self, params)
+    }
+
+    pub fn thread_read(&self, params: ThreadReadParams) -> Result<ThreadReadResponse> {
+        client_ws_commands::thread_read(self, params)
     }
 
     pub fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResponse> {

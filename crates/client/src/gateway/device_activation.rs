@@ -110,11 +110,8 @@ mod tests {
     #[test]
     fn activation_qr_and_manual_code_round_trip_without_debug_leakage() {
         let base = GatewayBaseUrl::parse_presentation("91.224.86.172:17878").unwrap();
-        let presentation = DeviceActivationQrPresentation::from_created_device(
-            &base,
-            created_device(),
-        )
-        .unwrap();
+        let presentation =
+            DeviceActivationQrPresentation::from_created_device(&base, created_device()).unwrap();
         assert_eq!(
             presentation.gateway_base_url.as_str(),
             "http://91.224.86.172:17878/"

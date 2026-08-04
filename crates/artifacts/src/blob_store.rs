@@ -81,10 +81,7 @@ impl AsyncSeek for ArtifactReadHandle {
         Pin::new(&mut *self.reader).start_seek(position)
     }
 
-    fn poll_complete(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<u64>> {
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
         Pin::new(&mut *self.reader).poll_complete(cx)
     }
 }

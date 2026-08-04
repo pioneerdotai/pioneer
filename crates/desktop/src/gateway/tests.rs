@@ -214,7 +214,11 @@ kind = "remote"
     let error = load_registry_for_runtime(&registry_path, &config)
         .expect_err("custom WS path must require reconfiguration");
     assert!(format!("{error:#}").contains("custom"));
-    assert!(fs::read_to_string(&registry_path).unwrap().contains("version = 2"));
+    assert!(
+        fs::read_to_string(&registry_path)
+            .unwrap()
+            .contains("version = 2")
+    );
     let _ = fs::remove_dir_all(temp_dir);
 }
 
@@ -223,7 +227,10 @@ fn registry_serialization_contains_session_binding_without_credentials() {
     let endpoint = GatewayEndpoint {
         id: "remote-123".to_owned(),
         name: "Remote".to_owned(),
-        gateway_base_url: pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:22000").unwrap(),
+        gateway_base_url: pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+            "127.0.0.1:22000",
+        )
+        .unwrap(),
         kind: GatewayEndpointKind::Remote,
         session_ref: Some("remote-123".to_owned()),
         server_gateway_id: Some(

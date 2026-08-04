@@ -100,8 +100,9 @@ impl GatewaySetupFormState {
     ) {
         self.name_input_state
             .update(cx, |state, cx| state.set_value(name.clone(), window, cx));
-        self.address_input_state
-            .update(cx, |state, cx| state.set_value(gateway_base_url.clone(), window, cx));
+        self.address_input_state.update(cx, |state, cx| {
+            state.set_value(gateway_base_url.clone(), window, cx)
+        });
         self.activation_input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
@@ -212,7 +213,12 @@ pub(crate) fn render_gateway_setup_form(
 
     let mut form = v_form();
 
-    if let GatewaySetupFormMode::ReauthenticateGateway { name, gateway_base_url, .. } = &mode {
+    if let GatewaySetupFormMode::ReauthenticateGateway {
+        name,
+        gateway_base_url,
+        ..
+    } = &mode
+    {
         form = form
             .child(
                 field()

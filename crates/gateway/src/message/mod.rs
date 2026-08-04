@@ -16,6 +16,8 @@ mod markdown;
 mod mcp;
 mod member_handlers;
 mod memory_handlers;
+mod message_mutations;
+mod message_turn;
 mod notifications;
 mod permission_handlers;
 mod provider_handlers;
@@ -135,21 +137,23 @@ use pioneer_protocol::{
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
     ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind, ThreadParticipantMutationParams,
     ThreadParticipantsListParams, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
-    ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification, ThreadVisibility,
-    ToolCallStatus, ToolStoragePayload, Turn, TurnBlockedNotification, TurnCancelParams,
-    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
-    TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
-    TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
-    TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
-    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnResumeParams,
-    TurnResumeResponse, TurnStartParams, TurnStatus, VoiceError, VoiceErrorKind,
-    VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
-    VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus,
-    VoiceStatusParams, VoiceStatusResponse, Workspace, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnreadSummary,
+    ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ThreadVisibility, ToolCallStatus, ToolStoragePayload, Turn, TurnBlockedNotification,
+    TurnCancelParams, TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification,
+    TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType,
+    TurnItemsParams, TurnMessageDeleteParams, TurnMessageEditParams,
+    TurnMessageRevisionsPageParams, TurnPermissionApprovalRequest,
+    TurnPermissionApprovalResolution, TurnPermissionRequestOpenedNotification,
+    TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnResumeParams, TurnResumeResponse, TurnStartParams,
+    TurnStatus, VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams, VoiceStatusResponse, Workspace,
+    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse,
     constants::{events, methods},
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
     validate_voice_streaming_audio_format,
@@ -167,9 +171,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
@@ -736,10 +740,8 @@ impl MessageProcessor {
             crud_store: crud_store.clone(),
             gateway_secrets,
             invitation_gateway_base_url: Arc::new(
-                pioneer_protocol::GatewayBaseUrl::parse_presentation(
-                    "http://127.0.0.1:17878",
-                )
-                .expect("static Gateway base URL is valid"),
+                pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
+                    .expect("static Gateway base URL is valid"),
             ),
             summary_config: Arc::new(summary_config),
             context_budget,
@@ -1115,11 +1117,7 @@ impl MessageProcessor {
             .and_then(Weak::upgrade)
     }
 
-    pub(crate) fn cancel_artifact_streams(
-        &self,
-        workspace_id: &str,
-        artifact_id: &str,
-    ) -> usize {
+    pub(crate) fn cancel_artifact_streams(&self, workspace_id: &str, artifact_id: &str) -> usize {
         self.artifact_stream_invalidation()
             .map(|invalidation| invalidation.cancel_artifact(workspace_id, artifact_id))
             .unwrap_or(0)
@@ -1134,9 +1132,7 @@ impl MessageProcessor {
             .unwrap_or(0)
     }
 
-    fn artifact_stream_invalidation(
-        &self,
-    ) -> Option<Arc<dyn ArtifactStreamInvalidation>> {
+    fn artifact_stream_invalidation(&self) -> Option<Arc<dyn ArtifactStreamInvalidation>> {
         self.artifact_stream_invalidation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2198,6 +2194,82 @@ impl MessageProcessor {
         Ok(())
     }
 
+    /// Validates user-authored Turn attachments as exact, immutable artifact
+    /// versions scoped to the already-authorized target thread. The persisted
+    /// reference is metadata only; content remains behind the existing Axum
+    /// HTTP authorization path.
+    async fn validate_turn_artifact_user_inputs(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<()> {
+        let database = self.crud_store.database_connection();
+
+        for value in input {
+            let pioneer_protocol::UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } = value
+            else {
+                continue;
+            };
+            let requested_version_id = version_id.as_deref();
+            let Some(version_id) = requested_version_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|version_id| !version_id.is_empty())
+            else {
+                anyhow::bail!("artifact reference requires an exact version");
+            };
+            if artifact_id.trim() != artifact_id || requested_version_id != Some(version_id) {
+                anyhow::bail!("artifact reference is unavailable");
+            }
+            let summary = self
+                .artifact_service
+                .get_artifact(workspace_id, artifact_id, Some(version_id))
+                .await
+                .map_err(|_| anyhow::anyhow!("artifact reference is unavailable"))?;
+            if summary.workspace_id != workspace_id
+                || summary.artifact.artifact_id != *artifact_id
+                || summary.artifact.version_id.as_deref() != Some(version_id)
+                || summary.artifact.status != pioneer_protocol::ArtifactStatus::Ready
+            {
+                anyhow::bail!("artifact reference is unavailable");
+            }
+
+            let durable_scope_matches = pioneer_crud::resolve_artifact_authorization_scope(
+                &database,
+                artifact_id,
+                Some(workspace_id),
+                None,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("artifact reference is unavailable"))?
+            .is_some_and(|scope| {
+                scope
+                    .thread_id
+                    .as_deref()
+                    .map_or(true, |artifact_thread_id| artifact_thread_id == thread_id)
+            });
+            // Planned-turn uploads can refer to the not-yet-created Turn, so
+            // the generic resolver may not materialize that binding yet. Its
+            // existing direct thread scope is still authoritative only when
+            // every stored binding agrees with the exact target thread.
+            let direct_thread_scope_matches = summary.primary_thread_id.as_deref()
+                == Some(thread_id)
+                && summary.bindings.iter().all(|binding| {
+                    binding.workspace_id == workspace_id
+                        && binding.thread_id.as_deref() == Some(thread_id)
+                });
+            if !durable_scope_matches && !direct_thread_scope_matches {
+                anyhow::bail!("artifact reference is unavailable");
+            }
+        }
+
+        Ok(())
+    }
+
     async fn resolve_provider_artifact_inputs(
         &self,
         workspace_id: &str,
@@ -2798,10 +2870,8 @@ impl MessageProcessor {
             crud_store: crud_store.clone(),
             gateway_secrets,
             invitation_gateway_base_url: Arc::new(
-                pioneer_protocol::GatewayBaseUrl::parse_presentation(
-                    "http://127.0.0.1:17878",
-                )
-                .expect("static Gateway base URL is valid"),
+                pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
+                    .expect("static Gateway base URL is valid"),
             ),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),

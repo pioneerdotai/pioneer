@@ -154,9 +154,7 @@ impl std::fmt::Debug for HttpStreamRegistry {
 }
 
 impl HttpStreamRegistry {
-    pub(super) fn new(
-        config: &GatewayArtifactsConfig,
-    ) -> Result<Arc<Self>, HttpStreamConfigError> {
+    pub(super) fn new(config: &GatewayArtifactsConfig) -> Result<Arc<Self>, HttpStreamConfigError> {
         let limits = HttpStreamLimits::from_config(config)?;
         Ok(Arc::new(Self {
             limits,
@@ -188,9 +186,9 @@ impl HttpStreamRegistry {
         }
 
         let now = Instant::now();
-        state
-            .tiny_ranges
-            .retain(|_, window| now.duration_since(window.started_at) < self.limits.tiny_range_window);
+        state.tiny_ranges.retain(|_, window| {
+            now.duration_since(window.started_at) < self.limits.tiny_range_window
+        });
         let session_key = session_id.as_str();
         if !state.tiny_ranges.contains_key(session_key)
             && state.tiny_ranges.len() >= MAX_TINY_RANGE_TRACKED_SESSIONS
@@ -485,13 +483,12 @@ impl HttpStreamLease {
 impl Drop for HttpStreamLease {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
-            let outcome = if self.outcome == StreamOutcome::Abandoned
-                && self.cancellation.is_cancelled()
-            {
-                StreamOutcome::Cancelled
-            } else {
-                self.outcome
-            };
+            let outcome =
+                if self.outcome == StreamOutcome::Abandoned && self.cancellation.is_cancelled() {
+                    StreamOutcome::Cancelled
+                } else {
+                    self.outcome
+                };
             registry.release(
                 self.stream_id,
                 self.bytes,
@@ -777,7 +774,12 @@ mod tests {
             .acquire(&second_session, "principal-b", "workspace-b", "artifact-b")
             .unwrap();
         assert!(matches!(
-            registry.acquire(&session("S00000000000000000003"), "principal-c", "workspace-c", "artifact-c"),
+            registry.acquire(
+                &session("S00000000000000000003"),
+                "principal-c",
+                "workspace-c",
+                "artifact-c"
+            ),
             Err(StreamAdmissionError::GlobalCapacity)
         ));
         assert_eq!(registry.active_count(), 2);
@@ -825,14 +827,16 @@ mod tests {
             Err(StreamAdmissionError::PrincipalCapacity)
         ));
         drop(first);
-        assert!(registry
-            .acquire(
-                &session("S00000000000000000003"),
-                "principal-a",
-                "workspace-a",
-                "artifact-c",
-            )
-            .is_ok());
+        assert!(
+            registry
+                .acquire(
+                    &session("S00000000000000000003"),
+                    "principal-a",
+                    "workspace-a",
+                    "artifact-c",
+                )
+                .is_ok()
+        );
         drop(second);
     }
 
@@ -842,10 +846,20 @@ mod tests {
         let first_session = session("S00000000000000000001");
         let second_session = session("S00000000000000000002");
         let first = registry
-            .acquire(&first_session, "P00000000000000000001", "workspace-a", "artifact-a")
+            .acquire(
+                &first_session,
+                "P00000000000000000001",
+                "workspace-a",
+                "artifact-a",
+            )
             .unwrap();
         let second = registry
-            .acquire(&second_session, "P00000000000000000002", "workspace-a", "artifact-b")
+            .acquire(
+                &second_session,
+                "P00000000000000000002",
+                "workspace-a",
+                "artifact-b",
+            )
             .unwrap();
         let signal = AccessChangeSignal {
             authorization_revision: 7,
@@ -892,8 +906,10 @@ mod tests {
         let second_lease = registry
             .acquire(&second_session, "principal-b", "workspace-b", "artifact-b")
             .unwrap();
-        let mut first = ManagedArtifactReader::new(PendingReader, 1, first_lease, Duration::from_secs(60));
-        let second = ManagedArtifactReader::new(PendingReader, 1, second_lease, Duration::from_secs(60));
+        let mut first =
+            ManagedArtifactReader::new(PendingReader, 1, first_lease, Duration::from_secs(60));
+        let second =
+            ManagedArtifactReader::new(PendingReader, 1, second_lease, Duration::from_secs(60));
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
@@ -1003,7 +1019,12 @@ mod tests {
         assert_eq!(registry.metrics_observation().0, 1);
 
         let replacement = registry
-            .acquire(&session, "principal-a", "workspace-a", "artifact-replacement")
+            .acquire(
+                &session,
+                "principal-a",
+                "workspace-a",
+                "artifact-replacement",
+            )
             .unwrap();
         drop(replacement);
         assert_eq!(registry.active_count(), 0);

@@ -14,8 +14,7 @@ use pioneer_client::rpc::{JsonRpcAuthorizationFailure, json_rpc_authorization_fa
 use pioneer_client::transport::http::{BrowserViewUrl, GatewayHttpError};
 use pioneer_client::{ClientError, ClientResult};
 use pioneer_protocol::{
-    ArtifactRef, ArtifactSummary, ArtifactViewGrantCreateParams,
-    ArtifactViewGrantDisposition,
+    ArtifactRef, ArtifactSummary, ArtifactViewGrantCreateParams, ArtifactViewGrantDisposition,
 };
 use std::{
     path::{Path, PathBuf},
@@ -188,9 +187,7 @@ impl PioneerDesktop {
                     Ok(grant) if grant.expires_at > unix_timestamp_secs() => http_client
                         .resolve_view_url(grant.relative_url.as_str())
                         .map_err(map_gateway_http_error)
-                        .and_then(|url| {
-                            launch_artifact_view(&SystemArtifactViewLauncher, &url)
-                        }),
+                        .and_then(|url| launch_artifact_view(&SystemArtifactViewLauncher, &url)),
                     Ok(_) => Err(DesktopArtifactActionError::GrantExpired),
                     Err(error) => Err(map_view_grant_error(&error)),
                 };
@@ -697,8 +694,9 @@ fn map_gateway_http_error(error: GatewayHttpError) -> DesktopArtifactActionError
 
 fn map_download_error(error: ArtifactHttpDownloadError) -> DesktopArtifactActionError {
     match error {
-        ArtifactHttpDownloadError::InvalidRequest
-        | ArtifactHttpDownloadError::InvalidResponse => DesktopArtifactActionError::InvalidArtifact,
+        ArtifactHttpDownloadError::InvalidRequest | ArtifactHttpDownloadError::InvalidResponse => {
+            DesktopArtifactActionError::InvalidArtifact
+        }
         ArtifactHttpDownloadError::Authentication => DesktopArtifactActionError::Authentication,
         ArtifactHttpDownloadError::RevokedOrUnavailable => {
             DesktopArtifactActionError::RevokedOrUnavailable
@@ -735,9 +733,7 @@ fn desktop_artifact_error_message(error: DesktopArtifactActionError) -> String {
         DesktopArtifactActionError::DownloadIntegrity => {
             t!("artifacts.action.error.integrity").to_string()
         }
-        DesktopArtifactActionError::DiskFull => {
-            t!("artifacts.action.error.disk_full").to_string()
-        }
+        DesktopArtifactActionError::DiskFull => t!("artifacts.action.error.disk_full").to_string(),
         DesktopArtifactActionError::DownloadFailed => {
             t!("artifacts.action.error.download_failed").to_string()
         }
@@ -847,14 +843,12 @@ fn spawn_command(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactFileOpener, ArtifactRef, ArtifactViewLauncher, BrowserViewUrl,
-        ClientPath, ClientResult, DesktopArtifactActionError,
-        desktop_artifact_error_message, launch_artifact_view,
-        reveal_verified_local_file,
+        ArtifactFileOpener, ArtifactRef, ArtifactViewLauncher, BrowserViewUrl, ClientPath,
+        ClientResult, DesktopArtifactActionError, desktop_artifact_error_message,
+        launch_artifact_view, reveal_verified_local_file,
     };
     use pioneer_client::{
-        artifacts::actions::ArtifactLocalFile,
-        gateway::endpoint::GatewayBaseUrl,
+        artifacts::actions::ArtifactLocalFile, gateway::endpoint::GatewayBaseUrl,
     };
     use pioneer_protocol::{ArtifactKind, ArtifactStatus};
     use sha2::{Digest, Sha256};
@@ -870,7 +864,10 @@ mod tests {
 
     impl ArtifactViewLauncher for FakeViewLauncher {
         fn open_view(&self, url: &BrowserViewUrl) -> ClientResult<()> {
-            assert!(url.expose_url().starts_with("https://relay.test/storage/views/"));
+            assert!(
+                url.expose_url()
+                    .starts_with("https://relay.test/storage/views/")
+            );
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }

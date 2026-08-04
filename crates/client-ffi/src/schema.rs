@@ -651,6 +651,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             "thread_timeline_page_response.json",
             pioneer_protocol::ThreadTimelinePageResponse
         ),
+        schema_doc!(
+            "thread_read_params.json",
+            pioneer_protocol::ThreadReadParams
+        ),
+        schema_doc!(
+            "thread_read_response.json",
+            pioneer_protocol::ThreadReadResponse
+        ),
         schema_doc!("timeline_block.json", pioneer_protocol::TimelineBlock),
         schema_doc!(
             "timeline_block_kind.json",
@@ -666,6 +674,30 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::TimelinePageInfo
         ),
         schema_doc!("turn_work_block.json", pioneer_protocol::TurnWorkBlock),
+        schema_doc!(
+            "turn_message_edit_params.json",
+            pioneer_protocol::TurnMessageEditParams
+        ),
+        schema_doc!(
+            "turn_message_edit_response.json",
+            pioneer_protocol::TurnMessageEditResponse
+        ),
+        schema_doc!(
+            "turn_message_delete_params.json",
+            pioneer_protocol::TurnMessageDeleteParams
+        ),
+        schema_doc!(
+            "turn_message_delete_response.json",
+            pioneer_protocol::TurnMessageDeleteResponse
+        ),
+        schema_doc!(
+            "turn_message_revisions_page_params.json",
+            pioneer_protocol::TurnMessageRevisionsPageParams
+        ),
+        schema_doc!(
+            "turn_message_revisions_page_response.json",
+            pioneer_protocol::TurnMessageRevisionsPageResponse
+        ),
         schema_doc!("turn_work_item.json", pioneer_protocol::TurnWorkItem),
         schema_doc!(
             "turn_work_item_status.json",
@@ -806,6 +838,43 @@ mod tests {
             assert!(
                 !schema.contains(forbidden),
                 "ClientEvent exposes secret field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn epic6_ffi_contracts_are_registered_and_content_bytes_are_absent() {
+        let documents = client_ffi_schema_documents();
+        for expected in [
+            "client_thread_tree_snapshot.json",
+            "thread_read_params.json",
+            "thread_read_response.json",
+            "turn_message_edit_params.json",
+            "turn_message_edit_response.json",
+            "turn_message_delete_params.json",
+            "turn_message_delete_response.json",
+            "turn_message_revisions_page_params.json",
+            "turn_message_revisions_page_response.json",
+        ] {
+            let document = documents
+                .iter()
+                .find(|document| document.file_name == expected)
+                .unwrap_or_else(|| panic!("missing Epic 6 FFI contract {expected}"));
+            let schema = serde_json::to_string(&document.schema).expect("schema serializes");
+            for forbidden in [
+                "access_token",
+                "refresh_token",
+                "authorization_header",
+                "bearer",
+            ] {
+                assert!(
+                    !schema.to_ascii_lowercase().contains(forbidden),
+                    "Epic 6 FFI contract {expected} exposes `{forbidden}`"
+                );
+            }
+            assert!(
+                !schema.contains("\"bytes\""),
+                "Epic 6 FFI contract {expected} exposes attachment bytes"
             );
         }
     }

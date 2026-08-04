@@ -7,14 +7,13 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use pioneer_protocol::{
-    AuthSessionId, GatewayId, PrincipalId, ProfileAvatarMediaType,
-    PROFILE_AVATAR_MAX_DECODED_BYTES,
+    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId, ProfileAvatarMediaType,
 };
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
@@ -22,11 +21,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::platform::ClientPath;
 use crate::local_file::{
     configure_tokio_no_follow, ensure_owned_directory, metadata_is_plain_file,
     remove_owned_directory,
 };
+use crate::platform::ClientPath;
 use crate::transport::http::{
     GatewayHttpError, GatewayHttpRequest, GatewayHttpResponse, GatewayHttpSession,
 };
@@ -181,7 +180,10 @@ impl AvatarCacheService {
                 .with_if_none_match(request.etag())
                 .map_err(|_| AvatarCacheError::InvalidRequest)?;
         }
-        let response = self.http.execute(native_request, cancellation.clone()).await;
+        let response = self
+            .http
+            .execute(native_request, cancellation.clone())
+            .await;
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -229,7 +231,8 @@ impl AvatarCacheService {
             }
             bytes.extend_from_slice(chunk.as_slice());
         }
-        if bytes.len() as u64 != expected_length || sha256_hex(bytes.as_slice()) != request.revision {
+        if bytes.len() as u64 != expected_length || sha256_hex(bytes.as_slice()) != request.revision
+        {
             return Err(AvatarCacheError::Corrupt);
         }
         if detect_avatar_media_type(bytes.as_slice()) != Some(media_type) {
@@ -242,8 +245,8 @@ impl AvatarCacheService {
     }
 
     pub async fn invalidate_gateway(&self) -> Result<(), AvatarCacheError> {
-        let gateway_root = avatar_cache_root(self.runtime_home.as_path())
-            .join(self.gateway_id.as_str());
+        let gateway_root =
+            avatar_cache_root(self.runtime_home.as_path()).join(self.gateway_id.as_str());
         let operation_gate = avatar_cache_gate_for(gateway_root.as_path());
         let _operation = operation_gate.lock().await;
         let runtime_home = self.runtime_home.clone();
@@ -278,8 +281,11 @@ impl AvatarCacheService {
 }
 
 pub fn invalidate_avatar_cache(runtime_home: &Path) -> Result<(), AvatarCacheError> {
-    remove_owned_directory(runtime_home, runtime_home.join("cache").join("avatars").as_path())
-        .map_err(|_| AvatarCacheError::Disk)
+    remove_owned_directory(
+        runtime_home,
+        runtime_home.join("cache").join("avatars").as_path(),
+    )
+    .map_err(|_| AvatarCacheError::Disk)
 }
 
 struct ValidatedAvatarRequest {
@@ -420,7 +426,10 @@ fn validate_response_head(
     }
 }
 
-async fn persist_atomically(paths: &AvatarCachePaths, bytes: &[u8]) -> Result<(), AvatarCacheError> {
+async fn persist_atomically(
+    paths: &AvatarCachePaths,
+    bytes: &[u8],
+) -> Result<(), AvatarCacheError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     configure_tokio_no_follow(&mut options);
@@ -495,7 +504,9 @@ async fn verify_cached(
     let valid = !bytes.is_empty()
         && bytes.len() <= PROFILE_AVATAR_MAX_DECODED_BYTES
         && sha256_hex(bytes.as_slice()) == request.revision;
-    Ok(valid.then(|| detect_avatar_media_type(bytes.as_slice())).flatten())
+    Ok(valid
+        .then(|| detect_avatar_media_type(bytes.as_slice()))
+        .flatten())
 }
 
 async fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, AvatarCacheError> {
@@ -534,10 +545,22 @@ async fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, AvatarCacheEr
 }
 
 async fn prune_other_revisions(parent: &Path, keep: &Path) -> Result<(), AvatarCacheError> {
-    let mut entries = fs::read_dir(parent).await.map_err(|_| AvatarCacheError::Disk)?;
-    while let Some(entry) = entries.next_entry().await.map_err(|_| AvatarCacheError::Disk)? {
+    let mut entries = fs::read_dir(parent)
+        .await
+        .map_err(|_| AvatarCacheError::Disk)?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| AvatarCacheError::Disk)?
+    {
         let path = entry.path();
-        if path != keep && entry.file_type().await.map_err(|_| AvatarCacheError::Disk)?.is_file() {
+        if path != keep
+            && entry
+                .file_type()
+                .await
+                .map_err(|_| AvatarCacheError::Disk)?
+                .is_file()
+        {
             remove_owned_file(path.as_path()).await;
         }
     }
@@ -566,15 +589,23 @@ async fn prune_avatar_cache(runtime_home: &Path) -> Result<u64, AvatarCacheError
 fn collect_cache_files<'a>(
     root: &'a Path,
     output: &'a mut Vec<(PathBuf, SystemTime)>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AvatarCacheError>> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AvatarCacheError>> + Send + 'a>>
+{
     Box::pin(async move {
         let mut entries = match fs::read_dir(root).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(AvatarCacheError::Disk),
         };
-        while let Some(entry) = entries.next_entry().await.map_err(|_| AvatarCacheError::Disk)? {
-            let file_type = entry.file_type().await.map_err(|_| AvatarCacheError::Disk)?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|_| AvatarCacheError::Disk)?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|_| AvatarCacheError::Disk)?;
             if file_type.is_dir() {
                 collect_cache_files(entry.path().as_path(), output).await?;
             } else if file_type.is_file() {
@@ -704,11 +735,7 @@ mod tests {
         bytes
     }
 
-    fn response(
-        status: u16,
-        request: &AvatarCacheRequest,
-        bytes: Vec<u8>,
-    ) -> GatewayHttpResponse {
+    fn response(status: u16, request: &AvatarCacheRequest, bytes: Vec<u8>) -> GatewayHttpResponse {
         GatewayHttpResponse {
             head: GatewayHttpResponseHead {
                 status,
@@ -720,7 +747,11 @@ mod tests {
                 content_disposition: None,
             },
             body: GatewayHttpBody::from_test_chunks(
-                if bytes.is_empty() { vec![] } else { vec![Ok(bytes)] },
+                if bytes.is_empty() {
+                    vec![]
+                } else {
+                    vec![Ok(bytes)]
+                },
                 CancellationToken::new(),
             ),
         }
@@ -738,19 +769,18 @@ mod tests {
             ])),
             requests: TokioMutex::new(Vec::new()),
         });
-        let service = AvatarCacheService::with_http(
-            http.clone(),
-            temp.path(),
-            gateway_id(),
-            session_id(),
-        );
+        let service =
+            AvatarCacheService::with_http(http.clone(), temp.path(), gateway_id(), session_id());
 
         let downloaded = service
             .resolve(request.clone(), CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(downloaded.source, AvatarCacheSource::Downloaded);
-        assert_eq!(fs::read(downloaded.local_path.as_path()).await.unwrap(), bytes);
+        assert_eq!(
+            fs::read(downloaded.local_path.as_path()).await.unwrap(),
+            bytes
+        );
 
         let revalidated = service
             .resolve(request.clone(), CancellationToken::new())
@@ -759,7 +789,10 @@ mod tests {
         assert_eq!(revalidated.source, AvatarCacheSource::Revalidated);
         let requests = http.requests.lock().await;
         assert_eq!(requests[0].1, None);
-        assert_eq!(requests[1].1, Some(format!("\"{}\"", request.avatar_revision)));
+        assert_eq!(
+            requests[1].1,
+            Some(format!("\"{}\"", request.avatar_revision))
+        );
         assert!(requests[0].0.starts_with("storage/members/"));
     }
 
@@ -778,8 +811,7 @@ mod tests {
             ])),
             requests: TokioMutex::new(Vec::new()),
         });
-        let service =
-            AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
+        let service = AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
         let first_result = service
             .resolve(first, CancellationToken::new())
             .await
@@ -789,9 +821,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!first_result.local_path.as_path().exists());
-        assert_eq!(fs::read(second_result.local_path.as_path()).await.unwrap(), second_bytes);
+        assert_eq!(
+            fs::read(second_result.local_path.as_path()).await.unwrap(),
+            second_bytes
+        );
 
-        fs::write(second_result.local_path.as_path(), b"broken").await.unwrap();
+        fs::write(second_result.local_path.as_path(), b"broken")
+            .await
+            .unwrap();
         assert_eq!(
             service.resolve(second, CancellationToken::new()).await,
             Err(AvatarCacheError::Corrupt)
@@ -811,8 +848,7 @@ mod tests {
             ])),
             requests: TokioMutex::new(Vec::new()),
         });
-        let service =
-            AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
+        let service = AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
         let first = service
             .resolve(request.clone(), CancellationToken::new())
             .await
@@ -841,8 +877,7 @@ mod tests {
             ])),
             requests: TokioMutex::new(Vec::new()),
         });
-        let service =
-            AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
+        let service = AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
         let cached = service
             .resolve(request.clone(), CancellationToken::new())
             .await
@@ -869,9 +904,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let outside = temp.path().join("outside-avatar");
         let linked = temp.path().join("cached-avatar");
-        fs::write(outside.as_path(), png(b"outside"))
-            .await
-            .unwrap();
+        fs::write(outside.as_path(), png(b"outside")).await.unwrap();
         symlink(outside.as_path(), linked.as_path()).unwrap();
 
         assert_eq!(read_regular_file(linked.as_path()).await.unwrap(), None);

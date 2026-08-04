@@ -23,9 +23,7 @@ pub(crate) fn configure_tokio_no_follow(options: &mut tokio::fs::OpenOptions) {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
     #[cfg(windows)]
-    options.custom_flags(
-        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-    );
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 pub(crate) fn metadata_is_plain_file(metadata: &Metadata) -> bool {
@@ -66,10 +64,7 @@ pub(crate) fn metadata_is_plain_directory(metadata: &Metadata) -> bool {
 /// `owned_root` is the caller-selected app-data authority. Its parent chain is
 /// intentionally outside this helper's ownership, but the root itself and all
 /// descendants used for private caches must be real directories.
-pub(crate) async fn ensure_owned_directory(
-    owned_root: &Path,
-    directory: &Path,
-) -> io::Result<()> {
+pub(crate) async fn ensure_owned_directory(owned_root: &Path, directory: &Path) -> io::Result<()> {
     let relative = owned_descendant(owned_root, directory)?;
     tokio::fs::create_dir_all(owned_root).await?;
     require_plain_directory(owned_root).await?;
@@ -128,7 +123,9 @@ fn owned_descendant<'a>(owned_root: &'a Path, path: &'a Path) -> io::Result<&'a 
     if !owned_root.is_absolute() || !path.is_absolute() {
         return Err(invalid_owned_path());
     }
-    let relative = path.strip_prefix(owned_root).map_err(|_| invalid_owned_path())?;
+    let relative = path
+        .strip_prefix(owned_root)
+        .map_err(|_| invalid_owned_path())?;
     if relative
         .components()
         .any(|component| !matches!(component, Component::Normal(_)))
@@ -194,6 +191,9 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(std::fs::read(outside.join("avatars/keep")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(outside.join("avatars/keep")).unwrap(),
+            b"keep"
+        );
     }
 }

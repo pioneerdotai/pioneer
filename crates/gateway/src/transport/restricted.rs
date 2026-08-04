@@ -88,7 +88,9 @@ async fn run_one_exchange(
                             log_exchange_completed(exchange_method.as_str());
                             let response = JsonRpcResponse::from_result(request_id, &result)
                                 .map_err(anyhow::Error::from)
-                                .and_then(|value| serde_json::to_value(value).map_err(Into::into))?;
+                                .and_then(|value| {
+                                    serde_json::to_value(value).map_err(Into::into)
+                                })?;
                             send_bounded_json(ws, &response).await?;
                             close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete").await?;
                             return Ok(RestrictedExchangeOutcome::Succeeded);
@@ -185,14 +187,15 @@ fn decode_request_frame(
                     "auth_request_too_large",
                 ));
             }
-            let request = serde_json::from_str::<JsonRpcRequest>(payload.as_ref()).map_err(|_| {
-                read_error(
-                    None,
-                    PARSE_ERROR_CODE,
-                    "invalid JSON-RPC request",
-                    "auth_invalid_request",
-                )
-            })?;
+            let request =
+                serde_json::from_str::<JsonRpcRequest>(payload.as_ref()).map_err(|_| {
+                    read_error(
+                        None,
+                        PARSE_ERROR_CODE,
+                        "invalid JSON-RPC request",
+                        "auth_invalid_request",
+                    )
+                })?;
             if request.jsonrpc != JSONRPC_VERSION {
                 return Err(read_error(
                     Some(request.id),
@@ -290,9 +293,7 @@ async fn close(ws: &mut WebSocket, code: u16, reason: &'static str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{
-        DeviceActivationContext, InvitationExchangeContext, RefreshExchangeContext,
-    };
+    use crate::auth::{DeviceActivationContext, InvitationExchangeContext, RefreshExchangeContext};
     use pioneer_protocol::{GatewayId, InvitationTransportSecurity};
 
     #[test]
@@ -342,9 +343,11 @@ mod tests {
             .expect("text request");
         assert_eq!(decoded.method, AUTH_REFRESH);
         assert!(decode_request_frame(Message::Binary(vec![1].into())).is_err());
-        assert!(decode_request_frame(Message::Ping(vec![1].into()))
-            .unwrap()
-            .is_none());
+        assert!(
+            decode_request_frame(Message::Ping(vec![1].into()))
+                .unwrap()
+                .is_none()
+        );
         assert!(decode_request_frame(Message::Close(None)).is_err());
     }
 

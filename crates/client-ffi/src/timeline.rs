@@ -4,14 +4,23 @@ use pioneer_client::{
     transport::ws::{command_sender as ws_commands, worker},
 };
 use pioneer_protocol::{
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnWorkItemsGetParams,
-    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
+    TurnMessageEditResponse, TurnMessageErrorReason, TurnMessageRevisionsPageParams,
+    TurnMessageRevisionsPageResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse,
 };
 
 pub const TIMELINE_ERROR_CANCELLED: &str = "pioneer_timeline_cancelled";
 pub const TIMELINE_ERROR_RECONNECT_REQUIRED: &str = "pioneer_timeline_reconnect_required";
 pub const TIMELINE_ERROR_STALE_CURSOR: &str = "pioneer_timeline_stale_cursor";
 pub const TIMELINE_ERROR_VALIDATION: &str = "pioneer_timeline_validation_error";
+pub const TURN_MESSAGE_ERROR_INVALID_INPUT: &str = "pioneer_turn_message_invalid_input";
+pub const TURN_MESSAGE_ERROR_INVALID_TARGET: &str = "pioneer_turn_message_invalid_target";
+pub const TURN_MESSAGE_ERROR_IMMUTABLE: &str = "pioneer_turn_message_immutable";
+pub const TURN_MESSAGE_ERROR_DELETED: &str = "pioneer_turn_message_deleted";
+pub const TURN_MESSAGE_ERROR_REVISION_CONFLICT: &str = "pioneer_turn_message_revision_conflict";
+pub const THREAD_READ_ERROR: &str = "pioneer_thread_read_error";
 
 pub fn thread_timeline_page(
     transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
@@ -32,6 +41,47 @@ pub fn turn_work_items_get(
     params: TurnWorkItemsGetParams,
 ) -> Result<TurnWorkItemsGetResponse, ClientFfiError> {
     ws_commands::turn_work_items_get(transport, params).map_err(map_timeline_page_error)
+}
+
+pub fn turn_message_edit(
+    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
+    params: TurnMessageEditParams,
+) -> Result<TurnMessageEditResponse, ClientFfiError> {
+    ws_commands::turn_message_edit(transport, params).map_err(map_turn_message_error)
+}
+
+pub fn turn_message_delete(
+    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
+    params: TurnMessageDeleteParams,
+) -> Result<TurnMessageDeleteResponse, ClientFfiError> {
+    ws_commands::turn_message_delete(transport, params).map_err(map_turn_message_error)
+}
+
+pub fn turn_message_revisions_page(
+    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
+    params: TurnMessageRevisionsPageParams,
+) -> Result<TurnMessageRevisionsPageResponse, ClientFfiError> {
+    ws_commands::turn_message_revisions_page(transport, params).map_err(map_turn_message_error)
+}
+
+pub fn thread_read(
+    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
+    params: ThreadReadParams,
+) -> Result<ThreadReadResponse, ClientFfiError> {
+    ws_commands::thread_read(transport, params)
+        .map_err(|error| ClientFfiError::new(format!("{error:#}"), THREAD_READ_ERROR))
+}
+
+fn map_turn_message_error(error: anyhow::Error) -> ClientFfiError {
+    let code = match ws_commands::turn_message_error_reason(&error) {
+        Some(TurnMessageErrorReason::InvalidInput) => TURN_MESSAGE_ERROR_INVALID_INPUT,
+        Some(TurnMessageErrorReason::InvalidTarget) => TURN_MESSAGE_ERROR_INVALID_TARGET,
+        Some(TurnMessageErrorReason::ImmutableMessage) => TURN_MESSAGE_ERROR_IMMUTABLE,
+        Some(TurnMessageErrorReason::DeletedMessage) => TURN_MESSAGE_ERROR_DELETED,
+        Some(TurnMessageErrorReason::RevisionConflict) => TURN_MESSAGE_ERROR_REVISION_CONFLICT,
+        None => ClientFfiError::GENERIC_CODE,
+    };
+    ClientFfiError::new(format!("{error:#}"), code)
 }
 
 fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {
@@ -111,6 +161,20 @@ mod tests {
         assert_eq!(
             map_timeline_page_error(anyhow!("websocket read failed: closed")).code,
             TIMELINE_ERROR_RECONNECT_REQUIRED
+        );
+    }
+
+    #[test]
+    fn message_revision_conflict_maps_to_stable_refetch_code() {
+        let error = anyhow::Error::new(pioneer_client::rpc::JsonRpcResponseError::server(
+            Some(pioneer_protocol::INVALID_REQUEST_CODE),
+            "message revision conflict",
+            Some("revision_conflict".to_owned()),
+        ));
+
+        assert_eq!(
+            map_turn_message_error(error).code,
+            TURN_MESSAGE_ERROR_REVISION_CONFLICT
         );
     }
 }

@@ -521,6 +521,35 @@ impl MessageProcessor {
             .iter()
             .map(|thread| thread.id.clone())
             .collect::<HashSet<_>>();
+        let unread_counts = match self
+            .crud_store
+            .unread_counts_for_threads(
+                &request_context.principal().principal_id,
+                &accessible_thread_ids.iter().cloned().collect::<Vec<_>>(),
+            )
+            .await
+        {
+            Ok(counts) => counts,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load thread unread summaries: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let unread = threads
+            .iter()
+            .map(|thread| ThreadUnreadSummary {
+                thread_id: thread.id.clone(),
+                unread_count: unread_counts.get(thread.id.as_str()).copied().unwrap_or(0),
+            })
+            .collect();
         retain_accessible_thread_placements(&mut placements, &accessible_thread_ids);
 
         let mut agents_docs = match self
@@ -557,6 +586,7 @@ impl MessageProcessor {
         let response_payload = ThreadTreeResponse {
             workspace_id,
             threads,
+            unread,
             folders,
             placements,
             agents_docs,
@@ -668,7 +698,32 @@ impl MessageProcessor {
             return;
         }
 
-        let response_payload = ThreadGetResponse { thread };
+        let unread_count = match self
+            .crud_store
+            .unread_counts_for_threads(
+                &request_context.principal().principal_id,
+                std::slice::from_ref(&thread.id),
+            )
+            .await
+        {
+            Ok(counts) => counts.get(thread.id.as_str()).copied().unwrap_or(0),
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load thread unread count: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let response_payload = ThreadGetResponse {
+            thread,
+            unread_count,
+        };
 
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,

@@ -174,10 +174,18 @@ mod tests {
     #[tokio::test]
     async fn domain_error_matrix_is_typed_bounded_and_detail_free() {
         for (kind, expected_status, expected_code) in [
-            (HttpErrorKind::Unauthorized, StatusCode::UNAUTHORIZED, "unauthorized"),
+            (
+                HttpErrorKind::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ),
             (HttpErrorKind::Forbidden, StatusCode::FORBIDDEN, "forbidden"),
             (HttpErrorKind::NotFound, StatusCode::NOT_FOUND, "not_found"),
-            (HttpErrorKind::BadRequest, StatusCode::BAD_REQUEST, "bad_request"),
+            (
+                HttpErrorKind::BadRequest,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
             (HttpErrorKind::Conflict, StatusCode::CONFLICT, "conflict"),
             (
                 HttpErrorKind::RangeNotSatisfiable {

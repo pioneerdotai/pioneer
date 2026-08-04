@@ -255,6 +255,7 @@ pub(crate) fn build_model_safe_full_thread_snapshot(
                 conversation_thread_id: payload.thread.id.clone(),
                 parent_turn_id: payload.turn.id.clone(),
                 origin_kind: payload.thread.origin_kind,
+                mode: payload.turn.mode,
                 blocks: Vec::new(),
             });
         }
@@ -275,6 +276,7 @@ pub(crate) fn build_model_safe_full_thread_snapshot(
         };
         let collaborative_admission_completion = exchange.origin_kind
             == pioneer_protocol::ThreadOriginKind::Collaborative
+            && exchange.mode != pioneer_protocol::ThreadMode::Message
             && record.thread_id == exchange.conversation_thread_id
             && record.turn_id == exchange.parent_turn_id
             && matches!(
@@ -361,8 +363,19 @@ pub(crate) fn build_model_safe_full_thread_snapshot(
                     )
             }
             pioneer_protocol::ThreadOriginKind::Collaborative => {
-                record.thread_id == exchange.conversation_thread_id
-                    && completed_task_delivery_id(&record.payload).is_some()
+                if exchange.mode == pioneer_protocol::ThreadMode::Message {
+                    record.thread_id == exchange.conversation_thread_id
+                        && record.turn_id == exchange.parent_turn_id
+                        && matches!(
+                            &record.payload,
+                            CanonicalTurnEventPayload::TurnCompleted(_)
+                                | CanonicalTurnEventPayload::TurnFailed(_)
+                                | CanonicalTurnEventPayload::TurnBlocked(_)
+                        )
+                } else {
+                    record.thread_id == exchange.conversation_thread_id
+                        && completed_task_delivery_id(&record.payload).is_some()
+                }
             }
             pioneer_protocol::ThreadOriginKind::TaskRun
             | pioneer_protocol::ThreadOriginKind::System => false,
@@ -432,6 +445,7 @@ struct LogicalHistoryExchange {
     conversation_thread_id: String,
     parent_turn_id: String,
     origin_kind: pioneer_protocol::ThreadOriginKind,
+    mode: pioneer_protocol::ThreadMode,
     blocks: Vec<SelfImprovementHistoryBlock>,
 }
 
@@ -980,6 +994,8 @@ fn map_record(
         | CanonicalTurnEventPayload::TurnExecutionWindowCheckpointed(_)
         | CanonicalTurnEventPayload::TurnExecutionWindowContinued(_)
         | CanonicalTurnEventPayload::TurnExecutionWindowBlocked(_)
+        | CanonicalTurnEventPayload::TurnMessageEdited(_)
+        | CanonicalTurnEventPayload::TurnMessageDeleted(_)
         | CanonicalTurnEventPayload::TurnPermissionAudit(_) => {}
     }
     Ok(blocks)
@@ -1513,6 +1529,12 @@ mod tests {
             status,
             turn_kind,
             origin,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_turn_permission_profile_snapshot(),
@@ -2023,6 +2045,68 @@ mod tests {
                 .all(|block| block.event_id != "parent-admitted"),
             "the early Collaborative admission completion is not a model-visible terminal"
         );
+    }
+
+    #[test]
+    fn collaborative_message_closes_at_its_own_completion_without_task_delivery() {
+        let source = source(7, "turn_message", "message-terminal");
+        let thread = history_thread(
+            "thread_history",
+            ThreadOriginKind::Collaborative,
+            ThreadSidebarVisibility::Visible,
+        );
+        let mut message = history_turn(
+            "turn_message",
+            TurnStatus::InProgress,
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        message.mode = ThreadMode::Message;
+        let records = vec![
+            record(
+                "message-start",
+                "turn_message",
+                1,
+                CanonicalTurnEventPayload::TurnStarted(CanonicalTurnStartedEventPayload {
+                    thread,
+                    sandbox_mode: SandboxMode::FullAccess,
+                    turn: message.clone(),
+                    input: vec![UserInput::Text {
+                        text: "current ordinary message".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    actor: Some(principal_actor()),
+                    reasoning_effort: None,
+                }),
+            ),
+            record(
+                "message-terminal",
+                "turn_message",
+                2,
+                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: "ws_history".to_owned(),
+                    thread_id: "thread_history".to_owned(),
+                    turn: Turn {
+                        status: TurnStatus::Completed,
+                        ..message
+                    },
+                }),
+            ),
+        ];
+
+        let snapshot =
+            build_model_safe_full_thread_snapshot(&frozen_range(6, &[source]), records.as_slice())
+                .expect("ordinary collaborative Message should be a complete exchange");
+        let blocks = &snapshot.threads[0].turns[0].blocks;
+        assert!(blocks.iter().any(|block| matches!(
+            &block.content,
+            SelfImprovementHistoryContent::UserText { text }
+                if text == "current ordinary message"
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            &block.content,
+            SelfImprovementHistoryContent::Terminal { .. }
+        )));
     }
 
     #[test]

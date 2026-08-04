@@ -7,7 +7,7 @@ use pioneer_entity::{
 use pioneer_protocol::{
     ItemCompletedNotification, TASK_COMPOSER_WORK_VERSION, TaskDeliveryMode, TaskMetadata,
     TaskResult, TaskResultCandidateStatus, TaskRunStatus, TaskRunThreadBindingKind,
-    TaskRunTurnKind, TaskStatus, ThreadOriginKind, ThreadSidebarVisibility,
+    TaskRunTurnKind, TaskStatus, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
     TurnCompletedNotification, TurnItem, TurnKind, TurnOrigin, TurnStatus,
     task_delivery_id_from_result_item_id,
 };
@@ -82,6 +82,7 @@ pub async fn project_completed_source_turn<C: ConnectionTrait>(
                 || value == thread_origin_kind_to_db(ThreadOriginKind::User)
     ) && notification.turn.turn_kind == TurnKind::Conversation
         && notification.turn.origin == TurnOrigin::User
+        && notification.turn.mode != ThreadMode::Message
         && notification.turn.status == TurnStatus::Completed;
     if !eligible {
         return Ok(None);

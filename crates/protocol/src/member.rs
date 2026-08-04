@@ -463,11 +463,10 @@ mod tests {
         MEMBER_DIRECTORY_CURSOR_MAX_BYTES, MEMBER_DIRECTORY_DEFAULT_LIMIT,
         MEMBER_DIRECTORY_MAX_LIMIT, MEMBER_DISPLAY_NAME_MAX_SCALARS,
         MEMBER_DISPLAY_NAME_MAX_UTF8_BYTES, MEMBER_NICKNAME_MAX_LEN, MemberDeviceCreateParams,
-        MemberListParams, MemberRemoveParams, MemberRestoreParams,
-        MemberSuspendParams, NewMemberProfile, PROFILE_AVATAR_MAX_BASE64_LEN,
-        PROFILE_AVATAR_MAX_DECODED_BYTES, PROFILE_AVATAR_MAX_DIMENSION, ProfileAvatarInput,
-        ProfileAvatarMediaType, WorkspaceMemberAddParams, WorkspaceMemberListParams,
-        WorkspaceMemberRemoveParams,
+        MemberListParams, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
+        NewMemberProfile, PROFILE_AVATAR_MAX_BASE64_LEN, PROFILE_AVATAR_MAX_DECODED_BYTES,
+        PROFILE_AVATAR_MAX_DIMENSION, ProfileAvatarInput, ProfileAvatarMediaType,
+        WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
     };
     use serde_json::json;
 

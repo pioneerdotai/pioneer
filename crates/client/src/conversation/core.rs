@@ -91,10 +91,12 @@ impl Conversation {
                     ts_unix_ms,
                 );
             }
-            ConversationEvent::LocalTurnStartAccepted { turn_id, .. } => {
+            ConversationEvent::LocalTurnStartAccepted { turn_id, mode, .. } => {
                 self.pending_completion_turn_id = None;
-                self.projector
-                    .apply_local_turn_start_accepted(turn_id.as_str(), ts_unix_ms);
+                if mode != pioneer_protocol::ThreadMode::Message {
+                    self.projector
+                        .apply_local_turn_start_accepted(turn_id.as_str(), ts_unix_ms);
+                }
             }
             ConversationEvent::LocalTurnStartRejected { turn_id, error, .. } => {
                 self.pending_completion_turn_id = None;
@@ -480,12 +482,10 @@ impl Conversation {
             return;
         }
 
-        let Some(turn) = thread
-            .turns
-            .iter()
-            .rev()
-            .find(|turn| turn.turn_kind == TurnKind::Conversation)
-        else {
+        let Some(turn) = thread.turns.iter().rev().find(|turn| {
+            turn.turn_kind == TurnKind::Conversation
+                && turn.mode != pioneer_protocol::ThreadMode::Message
+        }) else {
             return;
         };
 

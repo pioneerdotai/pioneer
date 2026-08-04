@@ -113,6 +113,21 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(super) async fn notify_semantic_user_message_changed(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
+        self.notify_semantic_timeline_blocks_changed(
+            workspace_id,
+            thread_id,
+            vec![user_block_id(turn_id)],
+            Vec::new(),
+        )
+        .await;
+    }
+
     async fn is_detached_task_run_turn(&self, thread_id: &str, turn_id: &str) -> bool {
         let Ok(Some((_, turn))) = self.crud_store.get_turn(thread_id, turn_id).await else {
             return false;

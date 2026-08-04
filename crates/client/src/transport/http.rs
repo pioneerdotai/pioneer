@@ -20,8 +20,7 @@ use zeroize::Zeroize;
 use tokio::sync::Mutex;
 
 use crate::gateway::endpoint::{
-    GatewayBaseUrl, GatewayBaseUrlError, PIONEER_PROTOCOL_VERSION,
-    PIONEER_PROTOCOL_VERSION_HEADER,
+    GatewayBaseUrl, GatewayBaseUrlError, PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER,
     canonical_storage_path,
 };
 use crate::gateway::session_lifecycle::SessionTerminalReason;
@@ -104,12 +103,11 @@ impl GatewayHttpRequest {
     }
 
     fn new(method: GatewayHttpMethod, storage_path: String) -> Result<Self, GatewayHttpError> {
-        if storage_path.is_empty()
-            || storage_path.len() > MAX_STORAGE_PATH_BYTES
-        {
+        if storage_path.is_empty() || storage_path.len() > MAX_STORAGE_PATH_BYTES {
             return Err(GatewayHttpError::InvalidStoragePath);
         }
-        let canonical = canonical_storage_path(storage_path.as_str()).map_err(map_base_url_error)?;
+        let canonical =
+            canonical_storage_path(storage_path.as_str()).map_err(map_base_url_error)?;
         if canonical.starts_with("storage/views/") {
             return Err(GatewayHttpError::InvalidStoragePath);
         }
@@ -404,7 +402,11 @@ impl GatewayHttpSession {
         if cancellation.is_cancelled() {
             return Err(GatewayHttpError::Cancelled);
         }
-        let mut access = self.authority.current_access().await.map_err(map_authority_error)?;
+        let mut access = self
+            .authority
+            .current_access()
+            .await
+            .map_err(map_authority_error)?;
         self.validate_access(&access)?;
         if access.access_expires_at_unix <= now_unix()? {
             access = self.refresh_access(access.generation).await?;
@@ -429,9 +431,14 @@ impl GatewayHttpSession {
         &self,
         rejected_generation: u64,
     ) -> Result<GatewayHttpAccess, GatewayHttpError> {
-        let current = self.authority.current_access().await.map_err(map_authority_error)?;
+        let current = self
+            .authority
+            .current_access()
+            .await
+            .map_err(map_authority_error)?;
         self.validate_access(&current)?;
-        if current.generation != rejected_generation && current.access_expires_at_unix > now_unix()? {
+        if current.generation != rejected_generation && current.access_expires_at_unix > now_unix()?
+        {
             return Ok(current);
         }
         let refreshed = self
@@ -579,9 +586,11 @@ impl GatewayHttpExecutor for ReqwestGatewayHttpExecutor {
             },
         };
         let head = response_head(&response)?;
-        let body_stream = response
-            .bytes_stream()
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|_| GatewayHttpError::Transport));
+        let body_stream = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(|_| GatewayHttpError::Transport)
+        });
         Ok(GatewayHttpResponse {
             head,
             body: GatewayHttpBody {
@@ -593,7 +602,9 @@ impl GatewayHttpExecutor for ReqwestGatewayHttpExecutor {
     }
 }
 
-fn response_head(response: &reqwest::Response) -> Result<GatewayHttpResponseHead, GatewayHttpError> {
+fn response_head(
+    response: &reqwest::Response,
+) -> Result<GatewayHttpResponseHead, GatewayHttpError> {
     Ok(GatewayHttpResponseHead {
         status: response.status().as_u16(),
         request_id: bounded_response_header(response, REQUEST_ID_HEADER)?,
@@ -621,7 +632,9 @@ fn bounded_response_header(
     let Some(value) = single_response_header(response, name)? else {
         return Ok(None);
     };
-    let value = value.to_str().map_err(|_| GatewayHttpError::InvalidResponse)?;
+    let value = value
+        .to_str()
+        .map_err(|_| GatewayHttpError::InvalidResponse)?;
     if value.len() > MAX_RESPONSE_HEADER_BYTES {
         return Err(GatewayHttpError::InvalidResponse);
     }
@@ -642,7 +655,9 @@ fn single_response_header<'a>(
     Ok(Some(value))
 }
 
-fn classify_response(response: GatewayHttpResponse) -> Result<GatewayHttpResponse, GatewayHttpError> {
+fn classify_response(
+    response: GatewayHttpResponse,
+) -> Result<GatewayHttpResponse, GatewayHttpError> {
     match response.head.status {
         200 | 206 | 304 => Ok(response),
         401 => Err(GatewayHttpError::Unauthorized),
@@ -796,10 +811,8 @@ mod tests {
 
     fn access() -> GatewayHttpAccess {
         GatewayHttpAccess {
-            gateway_base_url: GatewayBaseUrl::parse_presentation(
-                "https://gateway.test/pioneer/",
-            )
-            .unwrap(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("https://gateway.test/pioneer/")
+                .unwrap(),
             gateway_id: gateway_id(),
             session_id: session_id(),
             generation: 1,
@@ -827,10 +840,7 @@ mod tests {
         }
     }
 
-    fn session(
-        authority: Arc<FakeAuthority>,
-        executor: Arc<FakeExecutor>,
-    ) -> GatewayHttpSession {
+    fn session(authority: Arc<FakeAuthority>, executor: Arc<FakeExecutor>) -> GatewayHttpSession {
         GatewayHttpSession::with_executor(
             GatewayBaseUrl::parse_presentation("https://gateway.test/pioneer/").unwrap(),
             gateway_id(),
@@ -895,8 +905,14 @@ mod tests {
         assert_eq!(authority.refreshes.load(Ordering::SeqCst), 1);
         let requests = executor.requests.lock().await;
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].access_token.expose_secret(), "raw-access-secret");
-        assert_eq!(requests[1].access_token.expose_secret(), "fresh-access-secret");
+        assert_eq!(
+            requests[0].access_token.expose_secret(),
+            "raw-access-secret"
+        );
+        assert_eq!(
+            requests[1].access_token.expose_secret(),
+            "fresh-access-secret"
+        );
     }
 
     #[tokio::test]
@@ -918,8 +934,7 @@ mod tests {
             executor.clone(),
         );
         let first = session.execute(
-            GatewayHttpRequest::get("storage/workspaces/w/artifacts/a/versions/v/content")
-                .unwrap(),
+            GatewayHttpRequest::get("storage/workspaces/w/artifacts/a/versions/v/content").unwrap(),
             CancellationToken::new(),
         );
         let second = session.execute(

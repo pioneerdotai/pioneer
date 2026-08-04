@@ -794,6 +794,16 @@ mod tests {
             execution_security_snapshot_version: None,
             execution_security_snapshot_json: None,
             execution_authorization_context_json: None,
+            send_mode: None,
+            author_display_name_snapshot: None,
+            author_nickname_snapshot: None,
+            author_avatar_revision_snapshot: None,
+            reply_to_turn_id: None,
+            mentions_json: "[]".to_owned(),
+            message_revision: 0,
+            message_deleted_at: None,
+            message_deleted_by_actor_id: None,
+            message_deleted_by_actor_kind: None,
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, MarkdownDocument, TaskTurnItem,
-    TurnItem, TurnItemType, UserInput, UserMessageAttachment,
+    ThreadMode, TurnAuthorSnapshot, TurnItem, TurnItemType, TurnMention, UserInput,
+    UserMessageAttachment,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,20 @@ pub enum TimelineBlockKind {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<UserMessageAttachment>,
+        #[serde(default)]
+        mode: ThreadMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<TurnAuthorSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<TimelineReplySummary>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<TurnMention>,
+        #[serde(default)]
+        revision: u64,
+        #[serde(default)]
+        edited: bool,
+        #[serde(default)]
+        deleted: bool,
     },
     #[serde(rename_all = "camelCase")]
     TurnWork { work: TurnWorkBlock },
@@ -130,6 +145,18 @@ pub enum TimelineBlockKind {
         item_id: Option<String>,
         request: CLIRuntimePendingRequest,
     },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineReplySummary {
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<TurnAuthorSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

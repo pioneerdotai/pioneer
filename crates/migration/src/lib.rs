@@ -41,6 +41,7 @@ mod m20260730_000001_authorization_foundation;
 mod m20260730_000002_execution_authorization_context;
 mod m20260731_000001_invitations_member_management;
 mod m20260802_000001_task_event_fanout_cursor;
+mod m20260804_000001_shared_messages_authorship;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -83,6 +84,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260730_000002_execution_authorization_context::Migration),
             Box::new(m20260731_000001_invitations_member_management::Migration),
             Box::new(m20260802_000001_task_event_fanout_cursor::Migration),
+            Box::new(m20260804_000001_shared_messages_authorship::Migration),
         ]
     }
 }

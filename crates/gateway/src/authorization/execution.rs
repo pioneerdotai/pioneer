@@ -692,6 +692,38 @@ pub(crate) enum RuntimeDraftCreator {
 }
 
 impl RuntimeDraftMaterialization {
+    pub(crate) fn from_authorized_runtime_draft(
+        request: &RequestContext,
+        access: RuntimeDraftAccess,
+    ) -> Result<Self> {
+        let owner = access.owner();
+        if owner.connection_id != request.connection_id()
+            || owner.identity.principal_id != request.principal().principal_id
+            || owner.identity.session_id != request.principal().session_id
+        {
+            bail!("runtime draft authorization owner does not match request");
+        }
+        let creator = match request.principal().kind {
+            PrincipalKind::User => {
+                if access.visibility() == Some(ThreadVisibility::Workspace) {
+                    bail!("Member runtime draft cannot be workspace-visible");
+                }
+                RuntimeDraftCreator::Member {
+                    gateway_id: request.principal().gateway_id.clone(),
+                    principal_id: request.principal().principal_id.clone(),
+                }
+            }
+            PrincipalKind::Superuser => RuntimeDraftCreator::Superuser {
+                access_class: if access.visibility() == Some(ThreadVisibility::Workspace) {
+                    PersistedThreadAccessClass::Workspace
+                } else {
+                    PersistedThreadAccessClass::Private
+                },
+            },
+        };
+        Ok(Self { access, creator })
+    }
+
     pub(crate) fn access(&self) -> &RuntimeDraftAccess {
         &self.access
     }
@@ -723,38 +755,15 @@ impl ExecutionAuthorizationAdmission {
         access: RuntimeDraftAccess,
         policy_revision: u64,
     ) -> Result<Self> {
-        let owner = access.owner();
-        if owner.connection_id != request.connection_id()
-            || owner.identity.principal_id != request.principal().principal_id
-            || owner.identity.session_id != request.principal().session_id
-        {
-            bail!("runtime draft authorization owner does not match request");
-        }
-        let creator = match request.principal().kind {
-            PrincipalKind::User => {
-                if access.visibility() == Some(ThreadVisibility::Workspace) {
-                    bail!("Member runtime draft cannot be workspace-visible");
-                }
-                RuntimeDraftCreator::Member {
-                    gateway_id: request.principal().gateway_id.clone(),
-                    principal_id: request.principal().principal_id.clone(),
-                }
-            }
-            PrincipalKind::Superuser => RuntimeDraftCreator::Superuser {
-                access_class: if access.visibility() == Some(ThreadVisibility::Workspace) {
-                    PersistedThreadAccessClass::Workspace
-                } else {
-                    PersistedThreadAccessClass::Private
-                },
-            },
-        };
+        let materialization =
+            RuntimeDraftMaterialization::from_authorized_runtime_draft(request, access)?;
         let mut admission = Self::from_revalidated_thread(
             request,
-            access.workspace_id(),
-            access.thread_id(),
+            materialization.access.workspace_id(),
+            materialization.access.thread_id(),
             policy_revision,
         )?;
-        admission.runtime_draft = Some(RuntimeDraftMaterialization { access, creator });
+        admission.runtime_draft = Some(materialization);
         Ok(admission)
     }
 

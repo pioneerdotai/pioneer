@@ -24,7 +24,8 @@ use pioneer_protocol::{
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    ThreadTimelinePageParams, TurnCancelParams, TurnPermissionRequestRespondParams,
+    ThreadReadParams, ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams,
+    TurnMessageEditParams, TurnMessageRevisionsPageParams, TurnPermissionRequestRespondParams,
     TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
     WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
@@ -42,7 +43,7 @@ use crate::authorization::{
     record_method_decision, record_method_decision_for_action,
 };
 
-enum RequestAdmission {
+pub(super) enum RequestAdmission {
     Superuser,
     InvitationGrants(AuthorizedInvitationGrants),
     InvitationCollection(AuthorizedInvitationCollection),
@@ -114,14 +115,14 @@ impl RequestAdmission {
         }
     }
 
-    fn thread(&self) -> Option<&AuthorizedThread> {
+    pub(super) fn thread(&self) -> Option<&AuthorizedThread> {
         match self {
             Self::Thread(proof) => Some(proof),
             _ => None,
         }
     }
 
-    fn runtime_draft(&self) -> Option<&crate::thread::RuntimeDraftAccess> {
+    pub(super) fn runtime_draft(&self) -> Option<&crate::thread::RuntimeDraftAccess> {
         match self {
             Self::RuntimeDraft(access) => Some(access),
             _ => None,
@@ -302,7 +303,7 @@ impl MessageProcessor {
                     self.send_error(
                         context.connection_id(),
                         JsonRpcErrorResponse::new(
-                            Some(request.id),
+                            Some(request.id.clone()),
                             INVALID_REQUEST_CODE,
                             format!("unsupported jsonrpc version `{}`", request.jsonrpc),
                         ),
@@ -1516,6 +1517,7 @@ impl MessageProcessor {
                     request.method.as_str(),
                     methods::THREAD_GET
                         | methods::THREAD_TIMELINE_PAGE
+                        | methods::THREAD_READ
                         | methods::THREAD_UNSUBSCRIBE
                         | methods::TURN_START
                         | methods::ARTIFACT_LIST_FOR_THREAD
@@ -2395,8 +2397,76 @@ impl MessageProcessor {
     ) -> MessageFuture<'a, ()> {
         let connection_id = context.connection_id();
         let params_value = request.params.unwrap_or_else(empty_object_value);
+        let client_author_override =
+            super::message_turn::contains_client_author_snapshot(&params_value);
         match serde_json::from_value::<TurnStartParams>(params_value) {
-            Ok(params) => message_future(async move {
+            Ok(mut params) => message_future(async move {
+                if client_author_override {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request.id.clone()),
+                            INVALID_PARAMS_CODE,
+                            "invalid params for `turn/start`: Turn author is server-owned",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                let thread = match self
+                    .thread_manager
+                    .thread_get(params.thread_id.trim())
+                    .await
+                {
+                    Some(thread) => thread,
+                    None => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_REQUEST_CODE,
+                                format!("thread `{}` is not loaded", params.thread_id.trim()),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let effective_mode =
+                    super::message_turn::effective_turn_mode(params.mode, thread.mode);
+                params.mode = Some(effective_mode);
+
+                if effective_mode == pioneer_protocol::ThreadMode::Message {
+                    match super::message_turn::MessageTurnAdmission::from_dispatch(
+                        &context,
+                        &admission,
+                        params.thread_id.trim(),
+                    ) {
+                        Ok(message_admission) => {
+                            self.turn_start_message(
+                                &context,
+                                message_admission,
+                                request.id,
+                                params,
+                                client_author_override,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_REQUEST_CODE,
+                                    format!("failed to bind message authorization: {error:#}"),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+
                 let execution_admission = if let Some(proof) = admission.thread() {
                     debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                     crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
@@ -3774,6 +3844,32 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::THREAD_READ => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ThreadReadParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_read(&context, proof, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::THREAD_READ
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::TURN_WORK_PAGE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TurnWorkPageParams>(params_value) {
@@ -3849,6 +3945,93 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_CANCEL
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_MESSAGE_EDIT => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnMessageEditParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies message Turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_message_edit(&context, proof, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_MESSAGE_EDIT
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_MESSAGE_DELETE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnMessageDeleteParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies message Turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_message_delete(&context, proof, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_MESSAGE_DELETE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_MESSAGE_REVISIONS_PAGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnMessageRevisionsPageParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies message Turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_message_revisions_page(
+                                &context,
+                                proof,
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_MESSAGE_REVISIONS_PAGE
                                     ),
                                 ),
                             )

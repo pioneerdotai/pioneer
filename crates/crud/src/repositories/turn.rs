@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{turn, turn_input, turn_item, turn_status_history};
+use pioneer_entity::{turn, turn_input, turn_item, turn_message_revision, turn_status_history};
 use pioneer_protocol::{
-    PersistedActorRef, Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnKind, TurnStatus,
-    UserInput, generate_id,
+    PersistedActorRef, Turn, TurnAuthorSnapshot, TurnExecutionSecuritySnapshot, TurnItem, TurnKind,
+    TurnMention, TurnMessageRevision, TurnMessageRevisionChangeKind, TurnStatus, UserInput,
+    generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
@@ -12,12 +13,36 @@ use sea_orm::{
 };
 
 use crate::convention::{
-    input_type_and_text, turn_item_id_and_type_to_db, turn_kind_to_db, turn_origin_to_db,
-    turn_permission_mode_to_db, turn_permission_profile_source_to_db, turn_status_to_db,
+    PersistedTurnSendMode, canonical_turn_mentions_json, input_type_and_text,
+    turn_item_id_and_type_to_db, turn_kind_to_db, turn_mentions_from_db, turn_origin_to_db,
+    turn_permission_mode_to_db, turn_permission_profile_source_to_db, turn_send_mode_from_db,
+    turn_send_mode_to_db, turn_status_to_db, validate_turn_author_snapshot,
 };
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
+const TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES: usize = 1_048_576;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTurnCollaboration {
+    pub mode: PersistedTurnSendMode,
+    pub author: Option<TurnAuthorSnapshot>,
+    pub reply_to_turn_id: Option<String>,
+    pub mentions: Vec<TurnMention>,
+    pub message_revision: u64,
+    pub message_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTurnMessageRevision<'a> {
+    pub turn_id: &'a str,
+    pub revision: u64,
+    pub input: &'a [UserInput],
+    pub mentions: &'a [TurnMention],
+    pub changed_by: &'a PersistedActorRef,
+    pub change_kind: TurnMessageRevisionChangeKind,
+    pub created_at: DateTimeWithTimeZone,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPromptManifestColumns {
@@ -65,6 +90,23 @@ pub async fn find_turn_by_thread_and_id<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn by thread and id")
+}
+
+pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_ids: &[String],
+) -> Result<Vec<turn::Model>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    turn::Entity::find()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.is_in(turn_ids.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to query turns by thread and ids")
 }
 
 pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(
@@ -176,6 +218,10 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let existing_collaboration = find_turn_by_id(db, turn_id).await?;
+    let preserve_legacy_null_mode = existing_collaboration
+        .as_ref()
+        .is_some_and(|existing| existing.send_mode.is_none());
     let mut update_columns = vec![
         turn::Column::ThreadId,
         turn::Column::Status,
@@ -183,6 +229,13 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         turn::Column::Origin,
         turn::Column::Error,
         turn::Column::UpdatedAt,
+        turn::Column::SendMode,
+        turn::Column::AuthorDisplayNameSnapshot,
+        turn::Column::AuthorNicknameSnapshot,
+        turn::Column::AuthorAvatarRevisionSnapshot,
+        turn::Column::ReplyToTurnId,
+        turn::Column::MentionsJson,
+        turn::Column::MessageRevision,
     ];
     update_columns.extend([
         turn::Column::PermissionProfileMode,
@@ -196,6 +249,74 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         ]);
     }
     let permission_profile_columns = build_turn_permission_profile_columns(turn_model)?;
+    let supplied_initiator = actor_ref_from_db(
+        initiated_by_actor_kind.as_deref(),
+        initiated_by_actor_id.as_deref(),
+    )?;
+    let effective_initiator = if supplied_initiator.is_some() {
+        supplied_initiator
+    } else if let Some(existing) = existing_collaboration.as_ref() {
+        actor_ref_from_db(
+            existing.initiated_by_actor_kind.as_deref(),
+            existing.initiated_by_actor_id.as_deref(),
+        )
+        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))?
+    } else {
+        None
+    };
+    if let Some(author) = turn_model.author.as_ref() {
+        if effective_initiator.as_ref() != Some(&author.actor) {
+            anyhow::bail!("Turn author snapshot does not match its persisted initiator");
+        }
+    }
+    let author = turn_model
+        .author
+        .as_ref()
+        .map(|snapshot| {
+            validate_turn_author_snapshot(snapshot)?;
+            Ok::<_, anyhow::Error>((
+                Some(snapshot.display_name.clone()),
+                Some(snapshot.nickname.clone()),
+                snapshot.avatar_revision.clone(),
+            ))
+        })
+        .transpose()?
+        .unwrap_or((None, None, None));
+    let mentions_json = canonical_turn_mentions_json(&turn_model.mentions)?;
+    let message_revision = i64::try_from(turn_model.message_revision)
+        .context("Turn message revision exceeds database integer range")?;
+    let (
+        send_mode,
+        author_display_name_snapshot,
+        author_nickname_snapshot,
+        author_avatar_revision_snapshot,
+        reply_to_turn_id,
+        mentions_json,
+        message_revision,
+    ) = if preserve_legacy_null_mode {
+        let existing = existing_collaboration
+            .as_ref()
+            .expect("legacy preservation requires an existing Turn");
+        (
+            None,
+            existing.author_display_name_snapshot.clone(),
+            existing.author_nickname_snapshot.clone(),
+            existing.author_avatar_revision_snapshot.clone(),
+            existing.reply_to_turn_id.clone(),
+            existing.mentions_json.clone(),
+            existing.message_revision,
+        )
+    } else {
+        (
+            Some(turn_send_mode_to_db(turn_model.mode).to_owned()),
+            author.0,
+            author.1,
+            author.2,
+            turn_model.reply_to_turn_id.clone(),
+            mentions_json,
+            message_revision,
+        )
+    };
 
     turn::Entity::insert(turn::ActiveModel {
         id: Set(turn_id.to_owned()),
@@ -229,6 +350,16 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         execution_security_snapshot_version: Set(None),
         execution_security_snapshot_json: Set(None),
         execution_authorization_context_json: Set(None),
+        send_mode: Set(send_mode),
+        author_display_name_snapshot: Set(author_display_name_snapshot),
+        author_nickname_snapshot: Set(author_nickname_snapshot),
+        author_avatar_revision_snapshot: Set(author_avatar_revision_snapshot),
+        reply_to_turn_id: Set(reply_to_turn_id),
+        mentions_json: Set(mentions_json),
+        message_revision: Set(message_revision),
+        message_deleted_at: Set(None),
+        message_deleted_by_actor_id: Set(None),
+        message_deleted_by_actor_kind: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })
@@ -242,6 +373,208 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     .context("failed to upsert turn")?;
 
     Ok(())
+}
+
+pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnCollaboration> {
+    let mode = turn_send_mode_from_db(model.send_mode.as_deref())?;
+    let actor = actor_ref_from_db(
+        model.initiated_by_actor_kind.as_deref(),
+        model.initiated_by_actor_id.as_deref(),
+    )
+    .context("Turn has an invalid persisted initiator pair")?;
+    let author = match (
+        actor,
+        model.author_display_name_snapshot.as_ref(),
+        model.author_nickname_snapshot.as_ref(),
+    ) {
+        (Some(actor), Some(display_name), Some(nickname)) => {
+            let snapshot = TurnAuthorSnapshot {
+                actor,
+                display_name: display_name.clone(),
+                nickname: nickname.clone(),
+                avatar_revision: model.author_avatar_revision_snapshot.clone(),
+            };
+            validate_turn_author_snapshot(&snapshot)?;
+            Some(snapshot)
+        }
+        (None, None, None) => None,
+        (Some(actor), None, None) => {
+            let (display_name, nickname) = match &actor {
+                PersistedActorRef::Principal(principal_id) => {
+                    (principal_id.to_string(), principal_id.to_string())
+                }
+                PersistedActorRef::System => ("System".to_owned(), "system".to_owned()),
+            };
+            Some(TurnAuthorSnapshot {
+                actor,
+                display_name,
+                nickname,
+                avatar_revision: None,
+            })
+        }
+        _ => anyhow::bail!("Turn has an incomplete persisted author snapshot"),
+    };
+    let message_revision = u64::try_from(model.message_revision)
+        .context("Turn has a negative persisted message revision")?;
+    Ok(PersistedTurnCollaboration {
+        mode,
+        author,
+        reply_to_turn_id: model.reply_to_turn_id.clone(),
+        mentions: turn_mentions_from_db(model.mentions_json.as_str())?,
+        message_revision,
+        message_deleted: model.message_deleted_at.is_some(),
+    })
+}
+
+pub async fn find_turn_collaboration<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<(turn::Model, PersistedTurnCollaboration)>> {
+    let Some(model) = find_turn_by_thread_and_id(db, thread_id, turn_id).await? else {
+        return Ok(None);
+    };
+    let collaboration = collaboration_from_model(&model)?;
+    Ok(Some((model, collaboration)))
+}
+
+pub async fn insert_turn_message_revision<C: ConnectionTrait>(
+    db: &C,
+    revision: NewTurnMessageRevision<'_>,
+) -> Result<()> {
+    let revision_number = i64::try_from(revision.revision)
+        .context("Turn message revision exceeds database integer range")?;
+    let input_json = serde_json::to_string(revision.input)
+        .context("failed to encode Turn message revision input")?;
+    if input_json.len() > TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "Turn message revision input exceeds {TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES} bytes"
+        );
+    }
+    let mentions_json = canonical_turn_mentions_json(revision.mentions)?;
+    let (changed_by_actor_kind, changed_by_actor_id) = actor_ref_to_db(revision.changed_by);
+    let changed_by_actor_kind =
+        changed_by_actor_kind.context("Turn message revision actor kind must be persisted")?;
+    let change_kind = match revision.change_kind {
+        TurnMessageRevisionChangeKind::Edit => "edit",
+        TurnMessageRevisionChangeKind::Delete => "delete",
+    };
+    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
+        turn_id: Set(revision.turn_id.to_owned()),
+        revision: Set(revision_number),
+        input_json: Set(input_json),
+        mentions_json: Set(mentions_json),
+        changed_by_actor_kind: Set(changed_by_actor_kind),
+        changed_by_actor_id: Set(changed_by_actor_id),
+        change_kind: Set(change_kind.to_owned()),
+        created_at: Set(revision.created_at),
+    })
+    .exec(db)
+    .await
+    .context("failed to insert Turn message revision")?;
+    Ok(())
+}
+
+pub async fn insert_turn_message_revision_if_absent<C: ConnectionTrait>(
+    db: &C,
+    revision: NewTurnMessageRevision<'_>,
+) -> Result<()> {
+    let revision_number = i64::try_from(revision.revision)
+        .context("Turn message revision exceeds database integer range")?;
+    let input_json = serde_json::to_string(revision.input)
+        .context("failed to encode Turn message revision input")?;
+    if input_json.len() > TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "Turn message revision input exceeds {TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES} bytes"
+        );
+    }
+    let mentions_json = canonical_turn_mentions_json(revision.mentions)?;
+    let (changed_by_actor_kind, changed_by_actor_id) = actor_ref_to_db(revision.changed_by);
+    let changed_by_actor_kind =
+        changed_by_actor_kind.context("Turn message revision actor kind must be persisted")?;
+    let change_kind = match revision.change_kind {
+        TurnMessageRevisionChangeKind::Edit => "edit",
+        TurnMessageRevisionChangeKind::Delete => "delete",
+    };
+    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
+        turn_id: Set(revision.turn_id.to_owned()),
+        revision: Set(revision_number),
+        input_json: Set(input_json),
+        mentions_json: Set(mentions_json),
+        changed_by_actor_kind: Set(changed_by_actor_kind),
+        changed_by_actor_id: Set(changed_by_actor_id),
+        change_kind: Set(change_kind.to_owned()),
+        created_at: Set(revision.created_at),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            turn_message_revision::Column::TurnId,
+            turn_message_revision::Column::Revision,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .exec(db)
+    .await
+    .context("failed to idempotently insert Turn message revision")?;
+    Ok(())
+}
+
+pub async fn list_turn_message_revisions<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    before_revision: Option<u64>,
+    limit: u64,
+) -> Result<Vec<turn_message_revision::Model>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut query = turn_message_revision::Entity::find()
+        .filter(turn_message_revision::Column::TurnId.eq(turn_id.to_owned()));
+    if let Some(before_revision) = before_revision {
+        let before_revision = i64::try_from(before_revision)
+            .context("Turn message revision cursor exceeds database integer range")?;
+        query = query.filter(turn_message_revision::Column::Revision.lt(before_revision));
+    }
+    query
+        .order_by_desc(turn_message_revision::Column::Revision)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list Turn message revisions")
+}
+
+pub fn turn_message_revision_from_model(
+    model: turn_message_revision::Model,
+) -> Result<TurnMessageRevision> {
+    let revision = u64::try_from(model.revision)
+        .context("Turn message revision has a negative persisted revision")?;
+    let changed_by = actor_ref_from_db(
+        Some(model.changed_by_actor_kind.as_str()),
+        model.changed_by_actor_id.as_deref(),
+    )?
+    .context("Turn message revision is missing its persisted actor")?;
+    let change_kind = match model.change_kind.as_str() {
+        "edit" => TurnMessageRevisionChangeKind::Edit,
+        "delete" => TurnMessageRevisionChangeKind::Delete,
+        unknown => anyhow::bail!("unknown Turn message revision change kind `{unknown}`"),
+    };
+    if model.input_json.len() > TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "persisted Turn message revision input exceeds {TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES} bytes"
+        );
+    }
+    let input = serde_json::from_str::<Vec<UserInput>>(model.input_json.as_str())
+        .context("failed to decode Turn message revision input")?;
+    Ok(TurnMessageRevision {
+        turn_id: model.turn_id,
+        revision,
+        change_kind,
+        changed_by,
+        created_at: model.created_at.timestamp(),
+        input: Some(input),
+        mentions: turn_mentions_from_db(model.mentions_json.as_str())?,
+    })
 }
 
 pub async fn set_turn_execution_security_snapshot<C: ConnectionTrait>(
@@ -481,6 +814,96 @@ pub async fn replace_turn_input<C: ConnectionTrait>(
     Ok(())
 }
 
+pub async fn compare_and_set_message_turn_mutation<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    expected_revision: u64,
+    mentions: &[TurnMention],
+    deleted_by: Option<&PersistedActorRef>,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let expected_revision = i64::try_from(expected_revision)
+        .context("expected Turn message revision exceeds database integer range")?;
+    let next_revision = expected_revision
+        .checked_add(1)
+        .context("Turn message revision exceeds database integer range")?;
+    let mentions_json = canonical_turn_mentions_json(mentions)?;
+    let (deleted_by_actor_kind, deleted_by_actor_id) = match deleted_by {
+        Some(actor) => actor_ref_to_db(actor),
+        None => (None, None),
+    };
+
+    let result = turn::Entity::update_many()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::SendMode.eq("message"))
+        .filter(turn::Column::MessageRevision.eq(expected_revision))
+        .filter(turn::Column::MessageDeletedAt.is_null())
+        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
+        .col_expr(turn::Column::MessageRevision, Expr::value(next_revision))
+        .col_expr(
+            turn::Column::MessageDeletedAt,
+            Expr::value(deleted_by.map(|_| updated_at)),
+        )
+        .col_expr(
+            turn::Column::MessageDeletedByActorKind,
+            Expr::value(deleted_by_actor_kind),
+        )
+        .col_expr(
+            turn::Column::MessageDeletedByActorId,
+            Expr::value(deleted_by_actor_id),
+        )
+        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
+        .exec(db)
+        .await
+        .context("failed to compare-and-set Turn message mutation")?;
+
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn project_message_turn_mutation_state<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    revision: u64,
+    mentions: &[TurnMention],
+    deleted_by: Option<&PersistedActorRef>,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let revision = i64::try_from(revision)
+        .context("projected Turn message revision exceeds database integer range")?;
+    let mentions_json = canonical_turn_mentions_json(mentions)?;
+    let (deleted_by_actor_kind, deleted_by_actor_id) = match deleted_by {
+        Some(actor) => actor_ref_to_db(actor),
+        None => (None, None),
+    };
+    let result = turn::Entity::update_many()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::SendMode.eq("message"))
+        .filter(turn::Column::MessageRevision.lte(revision))
+        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
+        .col_expr(turn::Column::MessageRevision, Expr::value(revision))
+        .col_expr(
+            turn::Column::MessageDeletedAt,
+            Expr::value(deleted_by.map(|_| updated_at)),
+        )
+        .col_expr(
+            turn::Column::MessageDeletedByActorKind,
+            Expr::value(deleted_by_actor_kind),
+        )
+        .col_expr(
+            turn::Column::MessageDeletedByActorId,
+            Expr::value(deleted_by_actor_id),
+        )
+        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
+        .exec(db)
+        .await
+        .context("failed to project Turn message mutation state")?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn append_turn_status_history<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -716,6 +1139,26 @@ pub async fn list_turn_items_by_type<C: ConnectionTrait>(
         .context("failed to query turn item rows by type")
 }
 
+pub async fn list_turn_items_by_type_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+    item_type: &str,
+) -> Result<Vec<turn_item::Model>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.is_in(turn_ids.iter().cloned()))
+        .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
+        .order_by_asc(turn_item::Column::TurnId)
+        .order_by_asc(turn_item::Column::CreatedAt)
+        .order_by_asc(turn_item::Column::ItemId)
+        .all(db)
+        .await
+        .context("failed to query turn item rows by type for turns")
+}
+
 pub async fn find_terminal_turns_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -819,6 +1262,23 @@ pub async fn find_turn_inputs<C: ConnectionTrait>(
         .context("failed to query turn inputs")
 }
 
+pub async fn find_turn_inputs_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+) -> Result<Vec<turn_input::Model>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    turn_input::Entity::find()
+        .filter(turn_input::Column::TurnId.is_in(turn_ids.iter().cloned()))
+        .order_by_asc(turn_input::Column::TurnId)
+        .order_by_asc(turn_input::Column::InputIndex)
+        .all(db)
+        .await
+        .context("failed to query turn inputs for turns")
+}
+
 pub async fn find_completed_turn_items<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -866,8 +1326,46 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::AgentMessagePhase;
+    use pioneer_protocol::ThreadMode;
     use sea_orm::{Database, DatabaseConnection, DbBackend};
     use serde_json::json;
+
+    #[test]
+    fn legacy_null_send_mode_is_chat_compatible_but_not_message_mutable() {
+        let model = collaboration_test_turn(None, None, None, "[]");
+        let collaboration = collaboration_from_model(&model).expect("legacy Turn should decode");
+        assert_eq!(collaboration.mode.effective_mode, ThreadMode::Chat);
+        assert!(!collaboration.mode.message_mutation_eligible);
+        assert_eq!(
+            collaboration
+                .author
+                .expect("stable legacy fallback")
+                .display_name,
+            "System"
+        );
+    }
+
+    #[test]
+    fn persisted_message_collaboration_roundtrips_without_a_second_identity() {
+        let model = collaboration_test_turn(
+            Some("message"),
+            Some("Member A"),
+            Some("member_a"),
+            r#"[{"principal_id":"P00000000000000000002","nickname":"member_b"}]"#,
+        );
+        let collaboration = collaboration_from_model(&model).expect("Message Turn should decode");
+        assert_eq!(collaboration.mode.effective_mode, ThreadMode::Message);
+        assert!(collaboration.mode.message_mutation_eligible);
+        assert_eq!(collaboration.mentions.len(), 1);
+        assert_eq!(collaboration.message_revision, 2);
+        assert!(collaboration.message_deleted);
+        assert_eq!(
+            collaboration.author.expect("author snapshot").actor,
+            PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap()
+            )
+        );
+    }
 
     #[tokio::test]
     async fn upsert_turn_item_supports_sqlite_zstd_view() {
@@ -928,6 +1426,99 @@ mod tests {
         assert_eq!(backing_rows, 1);
     }
 
+    #[tokio::test]
+    async fn epic6_turn_columns_and_revision_use_existing_turn_repository() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        connection
+            .execute_unprepared(
+                "INSERT INTO workspace (id, name, is_active, is_current) \
+                 VALUES ('workspace_epic6_repo', 'Epic 6', 1, 1); \
+                 INSERT INTO thread \
+                    (id, workspace_id, preview, mode, model, model_provider, status) \
+                 VALUES \
+                    ('H00000000000000000001', 'workspace_epic6_repo', '', 'Chat', \
+                     'model', 'provider', 'active');",
+            )
+            .await
+            .expect("Turn owner fixture should insert");
+
+        let now = fixed_test_datetime();
+        let actor = PersistedActorRef::System;
+        let message = Turn {
+            id: "T00000000000000000001".to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: TurnKind::Conversation,
+            origin: pioneer_protocol::TurnOrigin::User,
+            mode: ThreadMode::Message,
+            author: Some(TurnAuthorSnapshot {
+                actor: actor.clone(),
+                display_name: "System".to_owned(),
+                nickname: "system".to_owned(),
+                avatar_revision: None,
+            }),
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        upsert_turn_with_initiator(
+            &connection,
+            message.id.as_str(),
+            "H00000000000000000001",
+            &message,
+            None,
+            None,
+            &actor,
+            now,
+            now,
+        )
+        .await
+        .expect("Message Turn should persist through the existing repository");
+
+        let (_, collaboration) =
+            find_turn_collaboration(&connection, "H00000000000000000001", message.id.as_str())
+                .await
+                .expect("Message Turn should load")
+                .expect("Message Turn should exist");
+        assert_eq!(collaboration.mode.effective_mode, ThreadMode::Message);
+        assert!(collaboration.mode.message_mutation_eligible);
+
+        insert_turn_message_revision(
+            &connection,
+            NewTurnMessageRevision {
+                turn_id: message.id.as_str(),
+                revision: 0,
+                input: &[UserInput::Text {
+                    text: "original".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                mentions: &[],
+                changed_by: &actor,
+                change_kind: TurnMessageRevisionChangeKind::Edit,
+                created_at: now,
+            },
+        )
+        .await
+        .expect("previous Turn version should persist");
+        let revisions = list_turn_message_revisions(&connection, message.id.as_str(), None, 10)
+            .await
+            .expect("revisions should list");
+        assert_eq!(revisions.len(), 1);
+        let revision = turn_message_revision_from_model(revisions[0].clone())
+            .expect("revision should map to protocol");
+        assert_eq!(revision.turn_id, message.id);
+        assert_eq!(revision.revision, 0);
+        assert_eq!(revision.changed_by, actor);
+    }
+
     async fn enable_turn_item_payload_zstd(connection: &DatabaseConnection) {
         let sqlite_zstd_config = json!({
             "table": "turn_item",
@@ -961,6 +1552,54 @@ mod tests {
 
     fn fixed_later_test_datetime() -> DateTimeWithTimeZone {
         chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z").expect("valid fixed test date")
+    }
+
+    fn collaboration_test_turn(
+        send_mode: Option<&str>,
+        display_name: Option<&str>,
+        nickname: Option<&str>,
+        mentions_json: &str,
+    ) -> turn::Model {
+        let now = fixed_test_datetime();
+        turn::Model {
+            id: "T00000000000000000001".to_owned(),
+            thread_id: "H00000000000000000001".to_owned(),
+            status: "completed".to_owned(),
+            error: None,
+            prompt_manifest_json: "{}".to_owned(),
+            prompt_compiler_version: None,
+            prompt_profile: None,
+            prompt_fingerprint_stable: None,
+            prompt_fingerprint_dynamic: None,
+            prompt_fingerprint_full: None,
+            created_at: now,
+            updated_at: now,
+            turn_kind: "conversation".to_owned(),
+            origin: "user".to_owned(),
+            reasoning_effort: None,
+            permission_profile_mode: None,
+            permission_profile_source: None,
+            permission_profile_snapshot_json: None,
+            execution_security_snapshot_version: None,
+            execution_security_snapshot_json: None,
+            initiated_by_actor_id: send_mode.map(|_| "P00000000000000000001".to_owned()),
+            initiated_by_actor_kind: Some(if send_mode.is_some() {
+                "principal".to_owned()
+            } else {
+                "system".to_owned()
+            }),
+            execution_authorization_context_json: None,
+            send_mode: send_mode.map(str::to_owned),
+            author_display_name_snapshot: display_name.map(str::to_owned),
+            author_nickname_snapshot: nickname.map(str::to_owned),
+            author_avatar_revision_snapshot: None,
+            reply_to_turn_id: send_mode.map(|_| "T00000000000000000000".to_owned()),
+            mentions_json: mentions_json.to_owned(),
+            message_revision: if send_mode.is_some() { 2 } else { 0 },
+            message_deleted_at: send_mode.map(|_| now),
+            message_deleted_by_actor_id: None,
+            message_deleted_by_actor_kind: send_mode.map(|_| "system".to_owned()),
+        }
     }
 
     async fn query_i64(connection: &DatabaseConnection, sql: &str) -> i64 {

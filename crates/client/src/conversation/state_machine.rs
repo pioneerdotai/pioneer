@@ -1,5 +1,5 @@
 use super::events::ConversationEvent;
-use pioneer_protocol::{TurnKind, TurnStatus};
+use pioneer_protocol::{ThreadMode, TurnKind, TurnStatus};
 
 pub const DEFAULT_TURN_FAILED_ERROR: &str = "Turn failed";
 
@@ -128,8 +128,9 @@ impl TurnStateMachine {
             ConversationEvent::LocalTurnStartRequested {
                 turn_id,
                 pending_request_id,
+                mode,
                 ..
-            } => {
+            } if *mode != ThreadMode::Message => {
                 self.state = TurnFlowState::Starting {
                     turn_id: turn_id.clone(),
                     pending_request_id: pending_request_id.clone(),
@@ -138,8 +139,9 @@ impl TurnStateMachine {
             ConversationEvent::LocalTurnStartAccepted {
                 turn_id,
                 pending_request_id,
+                mode,
                 ..
-            } => {
+            } if *mode != ThreadMode::Message => {
                 if self.matches_starting(turn_id.as_str(), pending_request_id.as_str()) {
                     self.state = TurnFlowState::Running {
                         turn_id: turn_id.clone(),
@@ -149,9 +151,10 @@ impl TurnStateMachine {
             ConversationEvent::LocalTurnStartRejected {
                 turn_id,
                 pending_request_id,
+                mode,
                 error,
                 ..
-            } => {
+            } if *mode != ThreadMode::Message => {
                 if self.matches_starting(turn_id.as_str(), pending_request_id.as_str())
                     || self.can_start_new_turn()
                 {
@@ -162,7 +165,7 @@ impl TurnStateMachine {
                 }
             }
             ConversationEvent::TurnStarted { turn, .. }
-                if turn.turn_kind == TurnKind::Conversation =>
+                if turn.turn_kind == TurnKind::Conversation && turn.mode != ThreadMode::Message =>
             {
                 if self.matches_turn(turn.id.as_str()) || self.can_start_new_turn() {
                     self.state = TurnFlowState::Running {
@@ -190,7 +193,7 @@ impl TurnStateMachine {
                 }
             }
             ConversationEvent::TurnCompleted { turn, .. }
-                if turn.turn_kind == TurnKind::Conversation =>
+                if turn.turn_kind == TurnKind::Conversation && turn.mode != ThreadMode::Message =>
             {
                 if matches!(
                     &self.state,
@@ -226,7 +229,7 @@ impl TurnStateMachine {
                 }
             }
             ConversationEvent::TurnFailed { turn, .. }
-                if turn.turn_kind == TurnKind::Conversation =>
+                if turn.turn_kind == TurnKind::Conversation && turn.mode != ThreadMode::Message =>
             {
                 if matches!(
                     &self.state,
@@ -256,7 +259,7 @@ impl TurnStateMachine {
                 }
             }
             ConversationEvent::TurnBlocked { turn, .. }
-                if turn.turn_kind == TurnKind::Conversation =>
+                if turn.turn_kind == TurnKind::Conversation && turn.mode != ThreadMode::Message =>
             {
                 if self.matches_turn(turn.id.as_str()) || self.in_flight_turn_id().is_none() {
                     self.state = TurnFlowState::Blocked {
@@ -332,7 +335,10 @@ impl TurnStateMachine {
                     };
                 }
             }
-            ConversationEvent::TurnStarted { .. }
+            ConversationEvent::LocalTurnStartRequested { .. }
+            | ConversationEvent::LocalTurnStartAccepted { .. }
+            | ConversationEvent::LocalTurnStartRejected { .. }
+            | ConversationEvent::TurnStarted { .. }
             | ConversationEvent::TurnCompleted { .. }
             | ConversationEvent::TurnFailed { .. }
             | ConversationEvent::TurnBlocked { .. }
@@ -341,7 +347,7 @@ impl TurnStateMachine {
     }
 
     pub fn sync_snapshot_turn(&mut self, turn: &pioneer_protocol::Turn) {
-        if turn.turn_kind != TurnKind::Conversation {
+        if turn.turn_kind != TurnKind::Conversation || turn.mode == ThreadMode::Message {
             return;
         }
         self.state = match turn.status {
@@ -442,6 +448,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             pending_request_id: "request_1".to_owned(),
+            mode: ThreadMode::Agent,
             user_text: "hello".to_owned(),
             attachments: Vec::new(),
         });
@@ -454,6 +461,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             pending_request_id: "request_1".to_owned(),
+            mode: ThreadMode::Agent,
         });
 
         assert_eq!(machine.status_label(), "running");
@@ -544,6 +552,12 @@ mod tests {
             status,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),

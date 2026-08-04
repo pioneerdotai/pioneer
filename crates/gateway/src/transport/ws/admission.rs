@@ -55,7 +55,9 @@ pub(crate) struct AuthAttemptPermit {
 
 impl std::fmt::Debug for AuthAbuseLimiter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("AuthAbuseLimiter").finish_non_exhaustive()
+        formatter
+            .debug_struct("AuthAbuseLimiter")
+            .finish_non_exhaustive()
     }
 }
 
@@ -177,9 +179,8 @@ pub(crate) async fn admit(
     client_ip: IpAddr,
     headers: &HeaderMap,
 ) -> Result<AdmittedConnection, Response> {
-    crate::transport::protocol::validate_protocol_version(headers).map_err(|_| {
-        bounded_error(StatusCode::BAD_REQUEST, "unsupported protocol version")
-    })?;
+    crate::transport::protocol::validate_protocol_version(headers)
+        .map_err(|_| bounded_error(StatusCode::BAD_REQUEST, "unsupported protocol version"))?;
     validate_standard_websocket_headers(headers)?;
 
     let permit = state
@@ -202,14 +203,10 @@ pub(crate) async fn admit(
 
     match admission {
         CapturedAdmission::Access(credential) => {
-            let deadline = Duration::from_secs(
-                state.config.gateway.auth.auth_exchange_timeout_seconds,
-            );
-            match tokio::time::timeout(
-                deadline,
-                state.auth_service.authenticate_access(credential),
-            )
-            .await
+            let deadline =
+                Duration::from_secs(state.config.gateway.auth.auth_exchange_timeout_seconds);
+            match tokio::time::timeout(deadline, state.auth_service.authenticate_access(credential))
+                .await
             {
                 Ok(Ok(principal)) => {
                     permit.record_success();
@@ -229,7 +226,10 @@ pub(crate) async fn admit(
                 }
                 Err(_) => {
                     permit.record_failure();
-                    Err(bounded_error(StatusCode::REQUEST_TIMEOUT, "request timed out"))
+                    Err(bounded_error(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "request timed out",
+                    ))
                 }
             }
         }
@@ -264,13 +264,21 @@ fn require_single_header(
 ) -> Result<(), Response> {
     let values = headers.get_all(&name).iter().collect::<Vec<_>>();
     if values.len() != 1 || !validate(values[0].as_bytes()) {
-        return Err(bounded_error(StatusCode::BAD_REQUEST, "invalid websocket request"));
+        return Err(bounded_error(
+            StatusCode::BAD_REQUEST,
+            "invalid websocket request",
+        ));
     }
     Ok(())
 }
 
 fn bounded_error(status: StatusCode, message: &'static str) -> Response {
-    (status, [("content-type", "text/plain; charset=utf-8")], message).into_response()
+    (
+        status,
+        [("content-type", "text/plain; charset=utf-8")],
+        message,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -344,10 +352,11 @@ mod tests {
                 limiter.try_acquire(address).expect("global permit")
             })
             .collect::<Vec<_>>();
-        assert_eq!(limiter.test_observation(first_address).0, MAX_AUTH_IN_FLIGHT_GLOBAL);
-        assert!(limiter
-            .try_acquire("192.0.2.42".parse().unwrap())
-            .is_none());
+        assert_eq!(
+            limiter.test_observation(first_address).0,
+            MAX_AUTH_IN_FLIGHT_GLOBAL
+        );
+        assert!(limiter.try_acquire("192.0.2.42".parse().unwrap()).is_none());
         drop(permits);
         assert_eq!(limiter.test_observation(first_address).0, 0);
     }

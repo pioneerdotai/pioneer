@@ -1366,6 +1366,13 @@ async fn execute_turn_flow(
     event_hub: Arc<AgentEventHub>,
 ) -> TurnTaskCompletion {
     match mode {
+        ThreadMode::Message => TurnTaskCompletion {
+            result: Err(TurnTaskFailure::Terminal(
+                "message turns must complete in gateway admission without entering agent execution"
+                    .to_owned(),
+            )),
+            post_turn_dispatch: None,
+        },
         ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(chat::execute_chat_turn_flow(
             thread_id,
             turn_id,

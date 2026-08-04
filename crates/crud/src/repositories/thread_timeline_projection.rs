@@ -7,8 +7,9 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{OnConflict, Query, SelectStatement};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    QuerySelect, Set, Statement,
 };
+use std::collections::HashMap;
 
 pub const SEMANTIC_TIMELINE_PROJECTION_KEY: &str = "semantic_timeline";
 pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 8;
@@ -385,6 +386,124 @@ pub async fn find_thread_timeline_block_by_sort_key<C: ConnectionTrait>(
     query.one(db).await.with_context(|| {
         format!("failed to query timeline block for thread `{thread_id}` sort key `{sort_key}`")
     })
+}
+
+pub async fn find_user_message_block_by_turn_id<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<thread_timeline_block::Model>> {
+    thread_timeline_block::Entity::find()
+        .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(thread_timeline_block::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(thread_timeline_block::Column::BlockKind.eq(BLOCK_KIND_USER_MESSAGE))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query user-message timeline block for turn `{turn_id}` in thread `{thread_id}`"
+            )
+        })
+}
+
+pub async fn count_unread_user_message_blocks<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    principal_id: &str,
+    after_sort_key: &str,
+) -> Result<u64> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            r#"
+                SELECT COUNT(*) AS unread_count
+                FROM thread_timeline_block AS block
+                INNER JOIN turn
+                    ON turn.id = block.turn_id
+                    AND turn.thread_id = block.thread_id
+                WHERE block.thread_id = ?
+                    AND block.block_kind = 'user_message'
+                    AND block.sort_key > ?
+                    AND turn.turn_kind = 'conversation'
+                    AND turn.origin = 'user'
+                    AND turn.message_deleted_at IS NULL
+                    AND turn.initiated_by_actor_kind = 'principal'
+                    AND turn.initiated_by_actor_id <> ?
+            "#,
+            vec![
+                thread_id.to_owned().into(),
+                after_sort_key.to_owned().into(),
+                principal_id.to_owned().into(),
+            ],
+        ))
+        .await
+        .context("failed to count unread user-message timeline blocks")?
+        .context("unread count query returned no row")?;
+    let count = row
+        .try_get::<i64>("", "unread_count")
+        .context("failed to decode unread user-message count")?;
+    u64::try_from(count).context("unread user-message count is negative")
+}
+
+pub async fn count_unread_user_message_blocks_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[String],
+    principal_id: &str,
+) -> Result<HashMap<String, u64>> {
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(thread_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+            SELECT block.thread_id, COUNT(*) AS unread_count
+            FROM thread_timeline_block AS block
+            INNER JOIN turn
+                ON turn.id = block.turn_id
+                AND turn.thread_id = block.thread_id
+            LEFT JOIN thread_read_cursor AS cursor
+                ON cursor.thread_id = block.thread_id
+                AND cursor.principal_id = ?
+            WHERE block.thread_id IN ({placeholders})
+                AND block.block_kind = 'user_message'
+                AND block.sort_key > COALESCE(cursor.last_read_sort_key, '')
+                AND turn.turn_kind = 'conversation'
+                AND turn.origin = 'user'
+                AND turn.message_deleted_at IS NULL
+                AND turn.initiated_by_actor_kind = 'principal'
+                AND turn.initiated_by_actor_id <> ?
+            GROUP BY block.thread_id
+        "#
+    );
+    let mut values = Vec::with_capacity(thread_ids.len() + 2);
+    values.push(principal_id.to_owned().into());
+    values.extend(thread_ids.iter().cloned().map(Into::into));
+    values.push(principal_id.to_owned().into());
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await
+        .context("failed to count unread user-message blocks for thread batch")?;
+    rows.into_iter()
+        .map(|row| {
+            let thread_id = row
+                .try_get::<String>("", "thread_id")
+                .context("failed to decode unread thread id")?;
+            let count = row
+                .try_get::<i64>("", "unread_count")
+                .context("failed to decode unread thread count")?;
+            Ok((
+                thread_id,
+                u64::try_from(count).context("unread thread count is negative")?,
+            ))
+        })
+        .collect()
 }
 
 fn thread_timeline_approval_visibility(approval_scope: &ThreadTimelineApprovalScope) -> Condition {

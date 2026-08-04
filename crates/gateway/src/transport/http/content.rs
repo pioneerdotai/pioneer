@@ -20,13 +20,13 @@ use tracing::Instrument;
 
 use crate::authorization::{AuthorizationExternalError, external_error_for_decision};
 
-use crate::artifact_delivery::{
-    ArtifactDeliveryError, ArtifactDeliveryService, AuthorizedArtifactContent,
-};
 use super::auth::authenticate_native_storage_request;
 use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 use super::streams::{ManagedArtifactReader, StreamAdmissionError};
+use crate::artifact_delivery::{
+    ArtifactDeliveryError, ArtifactDeliveryService, AuthorizedArtifactContent,
+};
 use crate::view_grants::{ViewGrantDisposition, ViewGrantLease};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
@@ -200,32 +200,35 @@ async fn artifact_route(
             Some(parse_projection_kind(value.as_str(), request_id.clone())?)
         }
     };
-    let content_result = tokio::time::timeout(state.http_streams.limits().open_timeout(), async {
-        match target {
-            ContentRouteTarget::Original => {
-                service
-                    .authorize_exact_content(
-                        &context,
-                        workspace_id.as_str(),
-                        artifact_id.as_str(),
-                        version_id.as_str(),
-                    )
-                    .await
-            }
-            ContentRouteTarget::Projection(_) => {
-                service
-                    .authorize_exact_projection(
-                        &context,
-                        workspace_id.as_str(),
-                        artifact_id.as_str(),
-                        version_id.as_str(),
-                        projection_kind.expect("projection route has a typed kind"),
-                    )
-                    .await
+    let content_result = tokio::time::timeout(
+        state.http_streams.limits().open_timeout(),
+        async {
+            match target {
+                ContentRouteTarget::Original => {
+                    service
+                        .authorize_exact_content(
+                            &context,
+                            workspace_id.as_str(),
+                            artifact_id.as_str(),
+                            version_id.as_str(),
+                        )
+                        .await
+                }
+                ContentRouteTarget::Projection(_) => {
+                    service
+                        .authorize_exact_projection(
+                            &context,
+                            workspace_id.as_str(),
+                            artifact_id.as_str(),
+                            version_id.as_str(),
+                            projection_kind.expect("projection route has a typed kind"),
+                        )
+                        .await
+                }
             }
         }
-    }
-    .instrument(request_span))
+        .instrument(request_span),
+    )
     .await
     .map_err(|_| HttpError::service_unavailable(request_id.clone()))?;
     let content = content_result.map_err(|error| map_content_error(error, request_id.clone()))?;
@@ -257,11 +260,8 @@ pub(super) async fn serve_authorized_content(
         .cloned()
         .expect("authenticated content context always assigns a request ID");
     let etag = strong_content_etag(content.snapshot().sha256());
-    let selection = match select_response(
-        &headers,
-        content.snapshot().size_bytes(),
-        etag.as_str(),
-    ) {
+    let selection = match select_response(&headers, content.snapshot().size_bytes(), etag.as_str())
+    {
         Ok(selection) => selection,
         Err(rejection) => {
             record_artifact_http_rejection(context, content.snapshot(), rejection);
@@ -275,21 +275,19 @@ pub(super) async fn serve_authorized_content(
     let send_body = method == Method::GET;
 
     let (response, cache_outcome, range_kind) = match selection {
-        ResponseSelection::NotModified => {
-            (
-                representation_response(
-                    &content,
-                    &request_id,
-                    &etag,
-                    StatusCode::NOT_MODIFIED,
-                    None,
-                    Body::empty(),
-                    policy,
-                ),
-                "304",
-                "none",
-            )
-        }
+        ResponseSelection::NotModified => (
+            representation_response(
+                &content,
+                &request_id,
+                &etag,
+                StatusCode::NOT_MODIFIED,
+                None,
+                Body::empty(),
+                policy,
+            ),
+            "304",
+            "none",
+        ),
         ResponseSelection::Full => {
             let size = content.snapshot().size_bytes();
             let body = if send_body && size > 0 {
@@ -358,12 +356,7 @@ pub(super) async fn serve_authorized_content(
         }
     };
     let response = response?;
-    record_artifact_http_response(
-        context,
-        content.snapshot(),
-        cache_outcome,
-        range_kind,
-    );
+    record_artifact_http_response(context, content.snapshot(), cache_outcome, range_kind);
     Ok(response)
 }
 
@@ -600,13 +593,7 @@ where
             producer,
             cancellation: stream_cancellation,
         },
-        |mut state| async move {
-            state
-                .receiver
-                .recv()
-                .await
-                .map(|item| (item, state))
-        },
+        |mut state| async move { state.receiver.recv().await.map(|item| (item, state)) },
     );
     Body::from_stream(stream)
 }
@@ -672,9 +659,10 @@ fn representation_response(
     policy: ContentResponsePolicy,
 ) -> Result<Response, HttpError> {
     let snapshot = content.snapshot();
-    let mut response = Response::builder().status(status).body(body).map_err(|_| {
-        HttpError::new(HttpErrorKind::Internal, request_id.clone())
-    })?;
+    let mut response = Response::builder()
+        .status(status)
+        .body(body)
+        .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
     let headers = response.headers_mut();
     insert_header(headers, ETAG, etag, request_id)?;
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -693,7 +681,12 @@ fn representation_response(
     insert_header(headers, REQUEST_ID_HEADER, request_id.as_str(), request_id)?;
 
     if let Some((length, range)) = selected_length {
-        insert_header(headers, CONTENT_LENGTH, length.to_string().as_str(), request_id)?;
+        insert_header(
+            headers,
+            CONTENT_LENGTH,
+            length.to_string().as_str(),
+            request_id,
+        )?;
         let mime_type = response_mime_type(snapshot.effective_mime_type());
         insert_header(headers, CONTENT_TYPE, mime_type.as_str(), request_id)?;
         let requested_disposition = policy
@@ -742,16 +735,10 @@ fn response_mime_type(effective_mime_type: &str) -> String {
 
 fn disposition_for_mime(effective_mime_type: &str) -> Disposition {
     match effective_mime_type {
-        "image/png"
-        | "image/jpeg"
-        | "image/webp"
-        | "image/gif"
-        | "application/pdf"
-        | "text/plain"
-        | "audio/mpeg"
-        | "audio/ogg"
-        | "video/mp4"
-        | "video/webm" => Disposition::Inline,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "application/pdf"
+        | "text/plain" | "audio/mpeg" | "audio/ogg" | "video/mp4" | "video/webm" => {
+            Disposition::Inline
+        }
         _ => Disposition::Attachment,
     }
 }
@@ -794,7 +781,10 @@ fn encode_rfc8187(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
         {
             encoded.push(char::from(byte));
         } else {
@@ -984,8 +974,9 @@ fn http_kind_for_artifact_error(error: &ArtifactError) -> HttpErrorKind {
         ArtifactError::NotFound { .. } | ArtifactError::InvalidRequest { .. } => {
             HttpErrorKind::NotFound
         }
-        ArtifactError::EmptyWorkspaceId
-        | ArtifactError::InvalidWorkspaceId { .. } => HttpErrorKind::BadRequest,
+        ArtifactError::EmptyWorkspaceId | ArtifactError::InvalidWorkspaceId { .. } => {
+            HttpErrorKind::BadRequest
+        }
         ArtifactError::ContentInvariant { .. }
         | ArtifactError::ExistingBlobCorruption { .. }
         | ArtifactError::ReadMissingBlob { .. }
@@ -1011,7 +1002,8 @@ mod tests {
     use super::*;
     use crate::transport::http::streams::HttpStreamRegistry;
 
-    const ETAG: &str = "\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+    const ETAG: &str =
+        "\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
 
     fn headers(values: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1027,11 +1019,41 @@ mod tests {
     #[test]
     fn range_normalization_covers_prefix_suffix_open_and_clamped_end() {
         for (value, expected) in [
-            ("bytes=2-5", NormalizedRange { start: 2, end_inclusive: 5 }),
-            ("bytes=-4", NormalizedRange { start: 6, end_inclusive: 9 }),
-            ("bytes=7-", NormalizedRange { start: 7, end_inclusive: 9 }),
-            ("bytes=8-99", NormalizedRange { start: 8, end_inclusive: 9 }),
-            ("bytes=-99", NormalizedRange { start: 0, end_inclusive: 9 }),
+            (
+                "bytes=2-5",
+                NormalizedRange {
+                    start: 2,
+                    end_inclusive: 5,
+                },
+            ),
+            (
+                "bytes=-4",
+                NormalizedRange {
+                    start: 6,
+                    end_inclusive: 9,
+                },
+            ),
+            (
+                "bytes=7-",
+                NormalizedRange {
+                    start: 7,
+                    end_inclusive: 9,
+                },
+            ),
+            (
+                "bytes=8-99",
+                NormalizedRange {
+                    start: 8,
+                    end_inclusive: 9,
+                },
+            ),
+            (
+                "bytes=-99",
+                NormalizedRange {
+                    start: 0,
+                    end_inclusive: 9,
+                },
+            ),
         ] {
             let headers = headers(&[(RANGE.as_str(), value)]);
             assert_eq!(parse_single_range(&headers, 10), Ok(Some(expected)));
@@ -1051,7 +1073,10 @@ mod tests {
             Err(RangeRejection::Multiple)
         );
         let duplicate = headers(&[(RANGE.as_str(), "bytes=0-1"), (RANGE.as_str(), "bytes=3-4")]);
-        assert_eq!(parse_single_range(&duplicate, 10), Err(RangeRejection::Multiple));
+        assert_eq!(
+            parse_single_range(&duplicate, 10),
+            Err(RangeRejection::Multiple)
+        );
         assert_eq!(
             parse_single_range(&headers(&[(RANGE.as_str(), "bytes=10-")]), 10),
             Err(RangeRejection::Unsatisfiable)
@@ -1064,21 +1089,44 @@ mod tests {
 
     #[test]
     fn conditional_decision_table_precedes_open_and_range() {
-        let not_modified = headers(&[(IF_NONE_MATCH.as_str(), ETAG), (RANGE.as_str(), "bytes=2-5")]);
-        assert_eq!(select_response(&not_modified, 10, ETAG), Ok(ResponseSelection::NotModified));
-
-        let weak_match = headers(&[(IF_NONE_MATCH.as_str(), "W/\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")]);
-        assert_eq!(select_response(&weak_match, 10, ETAG), Ok(ResponseSelection::NotModified));
-
-        let matching_if_range = headers(&[(RANGE.as_str(), "bytes=2-5"), (IF_RANGE.as_str(), ETAG)]);
+        let not_modified = headers(&[
+            (IF_NONE_MATCH.as_str(), ETAG),
+            (RANGE.as_str(), "bytes=2-5"),
+        ]);
         assert_eq!(
-            select_response(&matching_if_range, 10, ETAG),
-            Ok(ResponseSelection::Partial(NormalizedRange { start: 2, end_inclusive: 5 }))
+            select_response(&not_modified, 10, ETAG),
+            Ok(ResponseSelection::NotModified)
         );
 
-        for mismatch in ["\"different\"", "W/\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "Sat, 01 Jan 2000 00:00:00 GMT"] {
+        let weak_match = headers(&[(
+            IF_NONE_MATCH.as_str(),
+            "W/\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        )]);
+        assert_eq!(
+            select_response(&weak_match, 10, ETAG),
+            Ok(ResponseSelection::NotModified)
+        );
+
+        let matching_if_range =
+            headers(&[(RANGE.as_str(), "bytes=2-5"), (IF_RANGE.as_str(), ETAG)]);
+        assert_eq!(
+            select_response(&matching_if_range, 10, ETAG),
+            Ok(ResponseSelection::Partial(NormalizedRange {
+                start: 2,
+                end_inclusive: 5
+            }))
+        );
+
+        for mismatch in [
+            "\"different\"",
+            "W/\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "Sat, 01 Jan 2000 00:00:00 GMT",
+        ] {
             let request = headers(&[(RANGE.as_str(), "bytes=2-5"), (IF_RANGE.as_str(), mismatch)]);
-            assert_eq!(select_response(&request, 10, ETAG), Ok(ResponseSelection::Full));
+            assert_eq!(
+                select_response(&request, 10, ETAG),
+                Ok(ResponseSelection::Full)
+            );
         }
     }
 
@@ -1089,7 +1137,9 @@ mod tests {
             HttpErrorKind::NotFound
         );
         assert_eq!(
-            http_kind_for_artifact_error(&ArtifactError::NotFound { message: "missing".to_owned() }),
+            http_kind_for_artifact_error(&ArtifactError::NotFound {
+                message: "missing".to_owned()
+            }),
             HttpErrorKind::NotFound
         );
     }
@@ -1137,7 +1187,11 @@ mod tests {
             "application/octet-stream",
             "application/x-unknown-active-content",
         ] {
-            assert_eq!(disposition_for_mime(mime), Disposition::Attachment, "{mime}");
+            assert_eq!(
+                disposition_for_mime(mime),
+                Disposition::Attachment,
+                "{mime}"
+            );
         }
         for mime in [
             "image/png",
@@ -1153,15 +1207,15 @@ mod tests {
         ] {
             assert_eq!(disposition_for_mime(mime), Disposition::Inline, "{mime}");
         }
-        assert_eq!(response_mime_type("text/plain"), "text/plain; charset=utf-8");
+        assert_eq!(
+            response_mime_type("text/plain"),
+            "text/plain; charset=utf-8"
+        );
     }
 
     #[test]
     fn unicode_and_header_metacharacters_have_safe_bounded_disposition() {
-        let disposition = content_disposition(
-            Disposition::Inline,
-            "отчёт \"Q3\"; résumé 你好.pdf",
-        );
+        let disposition = content_disposition(Disposition::Inline, "отчёт \"Q3\"; résumé 你好.pdf");
         assert!(disposition.starts_with("inline; filename=\""));
         assert!(disposition.contains("filename*=UTF-8''"));
         assert!(disposition.contains("%D0%BE%D1%82%D1%87%D1%91%D1%82"));

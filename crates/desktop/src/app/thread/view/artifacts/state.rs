@@ -361,12 +361,7 @@ fn write_artifact_preview_cache_file(
     preview_data: &client_artifact_preview::ArtifactPreviewReadData,
 ) -> Result<ThreadArtifactPreviewImagePaths> {
     let runtime_home = desktop_state::runtime_home_dir()?;
-    write_artifact_preview_cache_files(
-        runtime_home.as_path(),
-        workspace_id,
-        artifact,
-        preview_data,
-    )
+    write_artifact_preview_cache_files(runtime_home.as_path(), workspace_id, artifact, preview_data)
 }
 
 fn write_artifact_preview_cache_files(
@@ -506,13 +501,9 @@ mod tests {
             sha256: "thumb_sha".to_owned(),
         };
 
-        let image_paths = write_artifact_preview_cache_files(
-            temp.path(),
-            "ws",
-            &artifact,
-            &preview_data,
-        )
-        .expect("write preview variants");
+        let image_paths =
+            write_artifact_preview_cache_files(temp.path(), "ws", &artifact, &preview_data)
+                .expect("write preview variants");
 
         let square = image::open(image_paths.square_path.as_path()).expect("open square");
         let detail = image::open(image_paths.detail_path.as_path()).expect("open detail");

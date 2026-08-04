@@ -94,6 +94,7 @@ impl AgentMemoryTurnPolicyProvider for GatewayMemoryTurnPolicyProvider {
 
 fn thread_mode_label(mode: ThreadMode) -> &'static str {
     match mode {
+        ThreadMode::Message => "message",
         ThreadMode::Agent => "agent",
         ThreadMode::Chat => "chat",
     }

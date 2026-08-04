@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use pioneer_protocol::{PersistedActorRef, ThreadStatus, TurnItemAttemptStatus, TurnKind};
+use pioneer_protocol::{
+    PersistedActorRef, ThreadMode, ThreadStatus, TurnItemAttemptStatus, TurnKind,
+    TurnMessageDeletedEvent, TurnMessageEditedEvent, TurnMessageRevisionChangeKind, TurnOrigin,
+    TurnStatus, UserInput,
+};
 use sea_orm::ConnectionTrait;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,6 +27,23 @@ where
     F: Future<Output = Result<()>> + Send + 'a,
 {
     Box::pin(future)
+}
+
+fn message_thread_preview(input: &[UserInput]) -> String {
+    input
+        .iter()
+        .find_map(|input| match input {
+            UserInput::Text { text, .. } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+enum TurnMessageMutationProjection<'a> {
+    Edit(&'a TurnMessageEditedEvent),
+    Delete(&'a TurnMessageDeletedEvent),
 }
 
 #[derive(Clone, Default)]
@@ -150,6 +171,20 @@ impl TurnProjector {
             | TurnEventPayload::TurnExecutionWindowContinued(_)
             | TurnEventPayload::TurnExecutionWindowBlocked(_)
             | TurnEventPayload::TurnPermissionAudit(_) => project_future(async { Ok(()) }),
+            TurnEventPayload::TurnMessageEdited(payload) => {
+                project_future(self.project_turn_message_mutation(
+                    db,
+                    TurnMessageMutationProjection::Edit(payload),
+                    created_at,
+                ))
+            }
+            TurnEventPayload::TurnMessageDeleted(payload) => {
+                project_future(self.project_turn_message_mutation(
+                    db,
+                    TurnMessageMutationProjection::Delete(payload),
+                    created_at,
+                ))
+            }
             TurnEventPayload::TurnCompleted(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(
                     db,
@@ -205,6 +240,149 @@ impl TurnProjector {
             }),
         };
         future.await
+    }
+
+    async fn project_turn_message_mutation<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        mutation: TurnMessageMutationProjection<'_>,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<()> {
+        let (thread_id, event_turn, projected_input, changed_by, change_kind, deleted_by) =
+            match mutation {
+                TurnMessageMutationProjection::Edit(payload) => (
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    payload.input.as_slice(),
+                    &payload.changed_by,
+                    TurnMessageRevisionChangeKind::Edit,
+                    None,
+                ),
+                TurnMessageMutationProjection::Delete(payload) => (
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    &[] as &[UserInput],
+                    &payload.deleted_by,
+                    TurnMessageRevisionChangeKind::Delete,
+                    Some(&payload.deleted_by),
+                ),
+            };
+        let is_delete = deleted_by.is_some();
+        if event_turn.mode != ThreadMode::Message
+            || event_turn.status != TurnStatus::Completed
+            || event_turn.turn_kind != TurnKind::Conversation
+            || event_turn.origin != TurnOrigin::User
+            || event_turn.message_revision == 0
+            || event_turn.message_deleted != is_delete
+            || (is_delete && (!projected_input.is_empty() || !event_turn.mentions.is_empty()))
+        {
+            anyhow::bail!("invalid post-terminal Turn message mutation event");
+        }
+
+        let (turn_model, collaboration) =
+            turn::find_turn_collaboration(db, thread_id, event_turn.id.as_str())
+                .await?
+                .context("message mutation event targets a missing Turn")?;
+
+        if !collaboration.mode.message_mutation_eligible
+            || turn_model.status != "completed"
+            || turn_model.turn_kind != "conversation"
+            || turn_model.origin != "user"
+        {
+            anyhow::bail!("message mutation event targets an immutable Turn");
+        }
+
+        let current_revision = collaboration.message_revision;
+        if current_revision > event_turn.message_revision {
+            return Ok(());
+        }
+        if current_revision < event_turn.message_revision
+            && current_revision.checked_add(1) != Some(event_turn.message_revision)
+        {
+            anyhow::bail!("Turn message mutation replay has a revision gap");
+        }
+
+        let current_input = turn::find_turn_inputs(db, event_turn.id.as_str())
+            .await?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str::<UserInput>(row.payload.as_str())
+                    .context("failed to decode current Turn input during mutation replay")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let previous_input = if current_revision < event_turn.message_revision {
+            current_input.clone()
+        } else {
+            let previous_revision = turn::list_turn_message_revisions(
+                db,
+                event_turn.id.as_str(),
+                Some(event_turn.message_revision),
+                1,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .map(turn::turn_message_revision_from_model)
+            .transpose()?
+            .filter(|revision| {
+                revision.revision.checked_add(1) == Some(event_turn.message_revision)
+            })
+            .context("message mutation replay is missing its previous revision")?;
+            previous_revision
+                .input
+                .context("message mutation replay previous revision has no input")?
+        };
+        let previous_preview = message_thread_preview(previous_input.as_slice());
+        let replacement_preview = if is_delete {
+            String::new()
+        } else {
+            message_thread_preview(projected_input)
+        };
+        thread::replace_thread_preview_if_matches(
+            db,
+            thread_id,
+            previous_preview.as_str(),
+            replacement_preview.as_str(),
+            updated_at,
+        )
+        .await?;
+        if current_revision == event_turn.message_revision
+            && collaboration.mentions == event_turn.mentions
+            && collaboration.message_deleted == event_turn.message_deleted
+            && current_input == projected_input
+        {
+            return Ok(());
+        }
+
+        if current_revision < event_turn.message_revision {
+            turn::insert_turn_message_revision_if_absent(
+                db,
+                turn::NewTurnMessageRevision {
+                    turn_id: event_turn.id.as_str(),
+                    revision: current_revision,
+                    input: current_input.as_slice(),
+                    mentions: collaboration.mentions.as_slice(),
+                    changed_by,
+                    change_kind,
+                    created_at: updated_at,
+                },
+            )
+            .await?;
+        }
+        if !turn::project_message_turn_mutation_state(
+            db,
+            turn_model.thread_id.as_str(),
+            event_turn.id.as_str(),
+            event_turn.message_revision,
+            event_turn.mentions.as_slice(),
+            deleted_by,
+            updated_at,
+        )
+        .await?
+        {
+            anyhow::bail!("Turn message mutation replay lost its target");
+        }
+        turn::replace_turn_input(db, event_turn.id.as_str(), projected_input, updated_at).await
     }
 
     async fn project_turn_started<C: ConnectionTrait + Sync>(
@@ -285,6 +463,39 @@ impl TurnProjector {
                 policy::upsert_thread_sandbox_policy(
                     db,
                     parent.id.as_str(),
+                    payload.sandbox_mode,
+                    thread_created_at,
+                    thread_updated_at,
+                )
+                .await?;
+            }
+        } else if payload.turn.mode == ThreadMode::Message
+            && thread::find_thread_by_id(db, payload.thread.id.as_str())
+                .await?
+                .is_some()
+        {
+            // Message reuses the canonical TurnStarted envelope, but it must
+            // not replay the envelope's full Thread snapshot over concurrent
+            // execution or management changes. New threads still take the
+            // normal insertion path below.
+            let derived_preview = message_thread_preview(payload.input.as_slice());
+            thread::touch_thread_for_completed_message(
+                db,
+                payload.thread.id.as_str(),
+                derived_preview.as_str(),
+                thread_updated_at,
+            )
+            .await?;
+            if policy::find_thread_sandbox_mode(db, payload.thread.id.as_str())
+                .await?
+                .is_none()
+            {
+                // Atomic first-Message materialization inserts the user thread
+                // before this event is projected. Seed its existing policy row
+                // without replacing a policy changed by another operation.
+                policy::upsert_thread_sandbox_policy(
+                    db,
+                    payload.thread.id.as_str(),
                     payload.sandbox_mode,
                     thread_created_at,
                     thread_updated_at,
@@ -549,7 +760,7 @@ fn liveness_observation_from_event(
     let mut item_id = None;
     let mut item_type = None;
     let meaningful = match &event.payload {
-        TurnEventPayload::TurnStarted(_) => true,
+        TurnEventPayload::TurnStarted(payload) => payload.turn.mode != ThreadMode::Message,
         TurnEventPayload::ItemStarted(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
@@ -582,6 +793,8 @@ fn liveness_observation_from_event(
         | TurnEventPayload::TurnExecutionWindowExhausted(_)
         | TurnEventPayload::TurnExecutionWindowBlocked(_)
         | TurnEventPayload::TurnPermissionAudit(_)
+        | TurnEventPayload::TurnMessageEdited(_)
+        | TurnEventPayload::TurnMessageDeleted(_)
         | TurnEventPayload::TurnCompleted(_)
         | TurnEventPayload::TurnFailed(_)
         | TurnEventPayload::TurnBlocked(_) => false,
@@ -596,4 +809,108 @@ fn liveness_observation_from_event(
         item_type,
         observed_at: event.created_at,
     })
+}
+
+#[cfg(test)]
+mod epic6_tests {
+    use super::*;
+    use pioneer_protocol::{
+        Turn, TurnMessageDeletedEvent, TurnMessageEditedEvent, TurnStatus,
+        default_turn_permission_profile_snapshot,
+    };
+
+    fn completed_turn() -> Turn {
+        Turn {
+            id: "turn-message".to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: pioneer_protocol::ThreadMode::Message,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 1,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_turn_permission_profile_snapshot(),
+        }
+    }
+
+    fn event(payload: TurnEventPayload) -> AppendedTurnEvent {
+        AppendedTurnEvent {
+            id: "event-message-mutation".to_owned(),
+            thread_id: "thread-message".to_owned(),
+            turn_id: "turn-message".to_owned(),
+            sequence: 9,
+            payload,
+            created_at: unix_to_datetime(1_700_000_000),
+        }
+    }
+
+    #[test]
+    fn message_mutations_are_not_execution_liveness_events() {
+        let edit = event(TurnEventPayload::TurnMessageEdited(
+            TurnMessageEditedEvent {
+                workspace_id: "workspace".to_owned(),
+                thread_id: "thread-message".to_owned(),
+                turn: completed_turn(),
+                input: Vec::new(),
+                changed_by: PersistedActorRef::System,
+                changed_at: 1_700_000_000,
+            },
+        ));
+        let mut deleted_turn = completed_turn();
+        deleted_turn.message_deleted = true;
+        let delete = event(TurnEventPayload::TurnMessageDeleted(
+            TurnMessageDeletedEvent {
+                workspace_id: "workspace".to_owned(),
+                thread_id: "thread-message".to_owned(),
+                turn: deleted_turn,
+                deleted_by: PersistedActorRef::System,
+                deleted_at: 1_700_000_001,
+            },
+        ));
+
+        assert!(liveness_observation_from_event(&edit).is_none());
+        assert!(liveness_observation_from_event(&delete).is_none());
+    }
+
+    #[test]
+    fn message_start_is_not_an_execution_liveness_event() {
+        let mut turn = completed_turn();
+        turn.status = TurnStatus::InProgress;
+        turn.message_revision = 0;
+        let started = event(TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: pioneer_protocol::Thread {
+                workspace_id: "workspace".to_owned(),
+                id: "thread-message".to_owned(),
+                name: None,
+                preview: "hello".to_owned(),
+                mode: ThreadMode::Message,
+                model: "unused".to_owned(),
+                model_provider: "unused".to_owned(),
+                reasoning_effort: None,
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_000,
+                status: ThreadStatus::Idle,
+                origin_kind: pioneer_protocol::ThreadOriginKind::User,
+                sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: vec![turn.clone()],
+            },
+            sandbox_mode: pioneer_protocol::SandboxMode::FullAccess,
+            turn,
+            input: vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            actor: Some(PersistedActorRef::System),
+            reasoning_effort: None,
+        }));
+
+        assert!(liveness_observation_from_event(&started).is_none());
+    }
 }

@@ -535,6 +535,7 @@ impl MemoryActiveRecallDecisionRequest {
                 .as_deref()
                 .is_some_and(|provider| !provider.trim().is_empty()),
             thread_mode: match context.mode {
+                ThreadMode::Message => "message".to_owned(),
                 ThreadMode::Agent => "agent".to_owned(),
                 ThreadMode::Chat => "chat".to_owned(),
             },

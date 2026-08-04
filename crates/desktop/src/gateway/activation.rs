@@ -4,9 +4,7 @@ use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use pioneer_client::{
-    gateway::{
-        endpoint::GatewayBaseUrl, registry::commit_registry_v3_binding,
-    },
+    gateway::{endpoint::GatewayBaseUrl, registry::commit_registry_v3_binding},
     transport::ws::auth_exchange::AuthExchangeClient,
 };
 use pioneer_protocol::{
@@ -193,7 +191,11 @@ pub(crate) fn activate_device_session(
         .build()
         .context("failed to initialize desktop auth exchange runtime")?;
     runtime
-        .block_on(AuthExchangeClient::new(timeout).activate_device(gateway_base_url, credential, params))
+        .block_on(AuthExchangeClient::new(timeout).activate_device(
+            gateway_base_url,
+            credential,
+            params,
+        ))
         .map_err(anyhow::Error::new)
 }
 
@@ -306,7 +308,11 @@ mod tests {
             local: Some(GatewayEndpoint {
                 id: ENDPOINT_ID.to_owned(),
                 name: "Local Gateway".to_owned(),
-                gateway_base_url: pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url:
+                    pioneer_client::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                        "127.0.0.1:17878",
+                    )
+                    .unwrap(),
                 kind: GatewayEndpointKind::Local,
                 session_ref: None,
                 server_gateway_id: None,

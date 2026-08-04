@@ -253,7 +253,10 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 
 impl fmt::Debug for GatewayBaseUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("GatewayBaseUrl").field(&self.0).finish()
+        formatter
+            .debug_tuple("GatewayBaseUrl")
+            .field(&self.0)
+            .finish()
     }
 }
 

@@ -33,9 +33,7 @@ pub(super) use pioneer_client::{
     agents_doc::scope::{
         AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
     },
-    artifacts::actions::{
-        ArtifactActionStatus as ThreadArtifactActionStatus, ArtifactVersionKey,
-    },
+    artifacts::actions::{ArtifactActionStatus as ThreadArtifactActionStatus, ArtifactVersionKey},
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
     cli_runtime::approvals::{PendingRequest, PendingRequestState},

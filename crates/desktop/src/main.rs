@@ -10,10 +10,10 @@ mod code_highlight;
 mod components;
 mod gateway;
 mod menu;
-#[cfg(test)]
-mod tests;
 mod settings;
 mod state;
+#[cfg(test)]
+mod tests;
 mod theme;
 mod updater;
 mod window;

@@ -6,9 +6,7 @@ use crate::{
     cli_runtime::approvals::{
         PendingRequestsReduction, reduce_pending_request_thread_closed_cleanup,
     },
-    gateway::{
-        endpoint::GatewayBaseUrl, runtime::ActiveGatewayState, types::GatewayEndpointKind,
-    },
+    gateway::{endpoint::GatewayBaseUrl, runtime::ActiveGatewayState, types::GatewayEndpointKind},
     notifications::effects::ClientEffect,
     state::client_state::{ClientState, ThreadAgentsDocSummaryKey},
     threads::{
@@ -375,7 +373,9 @@ fn unreachable_gateway_status(
     active_endpoint: Option<GatewayStatusEndpoint>,
 ) -> GatewayStatusMessage {
     match active_endpoint {
-        Some(active) => unavailable_gateway_status(active.name, active.kind, active.gateway_base_url),
+        Some(active) => {
+            unavailable_gateway_status(active.name, active.kind, active.gateway_base_url)
+        }
         None => GatewayStatusMessage::Unavailable,
     }
 }
@@ -1161,7 +1161,10 @@ mod tests {
     fn connection_reducer_projects_connected_effects() {
         let reduction = reduce_gateway_connection_event(GatewayConnectionEvent::Connected {
             endpoint_name: "Local".to_owned(),
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "127.0.0.1:17878",
+            )
+            .unwrap(),
             queue_skills_refresh: true,
         });
 
@@ -1169,7 +1172,10 @@ mod tests {
             reduction.status,
             GatewayStatusMessage::ConnectedEndpoint {
                 endpoint_name: "Local".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:17878"
+                )
+                .unwrap(),
             }
         );
         assert_eq!(reduction.status_level, GatewayStatusLevel::Connected);
@@ -1330,7 +1336,10 @@ mod tests {
             GatewayStatusProjection {
                 status: GatewayStatusTextUpdate::Set(GatewayStatusMessage::ConnectedEndpoint {
                     endpoint_name: "Remote".to_owned(),
-                    gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("https://gateway.example").unwrap(),
+                    gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                        "https://gateway.example"
+                    )
+                    .unwrap(),
                 }),
                 status_level: GatewayStatusLevel::Connected,
                 connection_state: GatewayConnectionState::Connected,
@@ -1354,7 +1363,10 @@ mod tests {
         assert_eq!(
             unreachable.status,
             GatewayStatusTextUpdate::Set(GatewayStatusMessage::LocalStopped {
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:17878"
+                )
+                .unwrap(),
             })
         );
         assert_eq!(unreachable.status_level, GatewayStatusLevel::Failed);
@@ -1451,7 +1463,10 @@ mod tests {
         let reduction = reduce_gateway_connection_event(GatewayConnectionEvent::Disconnected {
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("example.test").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "example.test",
+            )
+            .unwrap(),
             reason: "closed".to_owned(),
             should_resume_in_flight_turn: false,
         });
@@ -1460,7 +1475,10 @@ mod tests {
             reduction.status,
             GatewayStatusMessage::RemoteUnavailable {
                 endpoint_name: "Remote".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("example.test").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "example.test"
+                )
+                .unwrap(),
             }
         );
         assert_eq!(reduction.status_level, GatewayStatusLevel::Failed);

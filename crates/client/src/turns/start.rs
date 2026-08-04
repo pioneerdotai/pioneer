@@ -2,7 +2,7 @@
 
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
-    AgentExecutionBackend, REQUEST_ID_LEN, Thread, ThreadMode, TurnCLIRuntimeOptions,
+    AgentExecutionBackend, PrincipalId, REQUEST_ID_LEN, Thread, ThreadMode, TurnCLIRuntimeOptions,
     TurnCapability, TurnPermissionProfileSelection, TurnReasoningSelection, TurnStartParams,
     TurnStartResponse, UserInput, UserMessageAttachment, generate_id,
 };
@@ -32,6 +32,8 @@ pub struct TurnStartParamsPlan {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub mode: Option<ThreadMode>,
+    pub reply_to_turn_id: Option<String>,
+    pub mentioned_principal_ids: Vec<PrincipalId>,
     pub execution_backend: Option<AgentExecutionBackend>,
     pub reasoning: Option<TurnReasoningSelection>,
     pub permission_profile: TurnPermissionProfileSelection,
@@ -43,6 +45,7 @@ pub struct TurnStartSendContext {
     pub thread_id: String,
     pub turn_id: String,
     pub pending_request_id: String,
+    pub mode: ThreadMode,
 }
 
 #[derive(Clone, Debug)]
@@ -82,19 +85,38 @@ pub fn text_user_input(text: &str) -> Option<UserInput> {
 }
 
 pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams {
+    let is_message = plan.mode == Some(ThreadMode::Message);
     TurnStartParams {
         thread_id: plan.thread_id,
         turn_id: plan.turn_id,
         input: plan.input,
-        capabilities: plan.capabilities,
-        model: plan.model,
-        model_provider: plan.model_provider,
+        capabilities: if is_message {
+            Vec::new()
+        } else {
+            plan.capabilities
+        },
+        model: if is_message { None } else { plan.model },
+        model_provider: if is_message {
+            None
+        } else {
+            plan.model_provider
+        },
         sandbox_policy: None,
         mode: plan.mode,
-        execution_backend: plan.execution_backend,
-        reasoning: plan.reasoning,
-        permission_profile: Some(plan.permission_profile),
-        cli_runtime_options: plan.cli_runtime_options,
+        reply_to_turn_id: plan.reply_to_turn_id,
+        mentioned_principal_ids: plan.mentioned_principal_ids,
+        execution_backend: if is_message {
+            None
+        } else {
+            plan.execution_backend
+        },
+        reasoning: if is_message { None } else { plan.reasoning },
+        permission_profile: (!is_message).then_some(plan.permission_profile),
+        cli_runtime_options: if is_message {
+            None
+        } else {
+            plan.cli_runtime_options
+        },
     }
 }
 
@@ -116,17 +138,36 @@ pub fn reduce_turn_start_send_success(
     context: TurnStartSendContext,
     response: TurnStartResponse,
 ) -> TurnStartSendReduction {
+    let turn_event = match response.turn.status {
+        pioneer_protocol::TurnStatus::InProgress => ConversationEvent::TurnStarted {
+            thread_id: context.thread_id.clone(),
+            turn: response.turn,
+        },
+        pioneer_protocol::TurnStatus::Completed => ConversationEvent::TurnCompleted {
+            thread_id: context.thread_id.clone(),
+            turn: response.turn,
+        },
+        pioneer_protocol::TurnStatus::Failed | pioneer_protocol::TurnStatus::Interrupted => {
+            ConversationEvent::TurnFailed {
+                thread_id: context.thread_id.clone(),
+                turn: response.turn,
+            }
+        }
+        pioneer_protocol::TurnStatus::Blocked => ConversationEvent::TurnBlocked {
+            thread_id: context.thread_id.clone(),
+            turn: response.turn,
+            resume: None,
+        },
+    };
     TurnStartSendReduction::Accepted {
         events: vec![
             local_turn_start_accepted_event(
                 context.thread_id.clone(),
                 context.turn_id,
                 context.pending_request_id,
+                context.mode,
             ),
-            ConversationEvent::TurnStarted {
-                thread_id: context.thread_id,
-                turn: response.turn,
-            },
+            turn_event,
         ],
     }
 }
@@ -140,6 +181,7 @@ pub fn reduce_turn_start_send_failure(
             context.thread_id,
             context.turn_id,
             context.pending_request_id,
+            context.mode,
             error,
         ),
     }
@@ -147,20 +189,23 @@ pub fn reduce_turn_start_send_failure(
 
 pub fn apply_prepared_turn_to_thread_snapshot(
     thread: &mut Thread,
+    mode: ThreadMode,
     selected_model: Option<&str>,
     selected_provider: Option<&str>,
     selected_reasoning_effort: Option<&str>,
     user_text: &str,
     updated_at_unix: i64,
 ) {
-    if let (Some(model), Some(provider)) = (selected_model, selected_provider) {
-        thread.model = model.to_owned();
-        thread.model_provider = provider.to_owned();
+    if mode != ThreadMode::Message {
+        if let (Some(model), Some(provider)) = (selected_model, selected_provider) {
+            thread.model = model.to_owned();
+            thread.model_provider = provider.to_owned();
+        }
+        thread.reasoning_effort = selected_reasoning_effort
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_owned);
     }
-    thread.reasoning_effort = selected_reasoning_effort
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(str::to_owned);
     if thread.preview.trim().is_empty() {
         thread.preview = user_text.to_owned();
     }
@@ -171,6 +216,7 @@ pub fn local_turn_start_requested_event(
     thread_id: impl Into<String>,
     turn_id: impl Into<String>,
     pending_request_id: impl Into<String>,
+    mode: ThreadMode,
     user_text: impl Into<String>,
     attachments: Vec<UserMessageAttachment>,
 ) -> ConversationEvent {
@@ -178,6 +224,7 @@ pub fn local_turn_start_requested_event(
         thread_id: thread_id.into(),
         turn_id: turn_id.into(),
         pending_request_id: pending_request_id.into(),
+        mode,
         user_text: user_text.into(),
         attachments,
     }
@@ -187,11 +234,13 @@ pub fn local_turn_start_accepted_event(
     thread_id: impl Into<String>,
     turn_id: impl Into<String>,
     pending_request_id: impl Into<String>,
+    mode: ThreadMode,
 ) -> ConversationEvent {
     ConversationEvent::LocalTurnStartAccepted {
         thread_id: thread_id.into(),
         turn_id: turn_id.into(),
         pending_request_id: pending_request_id.into(),
+        mode,
     }
 }
 
@@ -199,12 +248,14 @@ pub fn local_turn_start_rejected_event(
     thread_id: impl Into<String>,
     turn_id: impl Into<String>,
     pending_request_id: impl Into<String>,
+    mode: ThreadMode,
     error: impl Into<String>,
 ) -> ConversationEvent {
     ConversationEvent::LocalTurnStartRejected {
         thread_id: thread_id.into(),
         turn_id: turn_id.into(),
         pending_request_id: pending_request_id.into(),
+        mode,
         error: error.into(),
     }
 }
@@ -269,6 +320,8 @@ mod tests {
             model: Some("gpt-5.4".to_owned()),
             model_provider: Some("openai".to_owned()),
             mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: permission_profile_selection(TurnPermissionMode::FullAccess),
@@ -293,6 +346,38 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_params_from_plan_keeps_message_collaboration_and_omits_execution_fields() {
+        let mentioned_principal_id =
+            PrincipalId::new("P00000000000000000001").expect("principal id");
+        let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            thread_id: "thread".to_owned(),
+            turn_id: "turn".to_owned(),
+            input: vec![text_user_input("hello").expect("text input")],
+            capabilities: vec![skill_capability()],
+            model: Some("must-not-cross".to_owned()),
+            model_provider: Some("must-not-cross".to_owned()),
+            mode: Some(ThreadMode::Message),
+            reply_to_turn_id: Some("parent-turn".to_owned()),
+            mentioned_principal_ids: vec![mentioned_principal_id.clone()],
+            execution_backend: None,
+            reasoning: turn_reasoning_selection_from_effort(Some("high".to_owned())),
+            permission_profile: permission_profile_selection(TurnPermissionMode::FullAccess),
+            cli_runtime_options: None,
+        });
+
+        assert_eq!(params.mode, Some(ThreadMode::Message));
+        assert_eq!(params.reply_to_turn_id.as_deref(), Some("parent-turn"));
+        assert_eq!(params.mentioned_principal_ids, vec![mentioned_principal_id]);
+        assert!(params.capabilities.is_empty());
+        assert!(params.model.is_none());
+        assert!(params.model_provider.is_none());
+        assert!(params.execution_backend.is_none());
+        assert!(params.reasoning.is_none());
+        assert!(params.permission_profile.is_none());
+        assert!(params.cli_runtime_options.is_none());
+    }
+
+    #[test]
     fn turn_start_params_from_plan_preserves_reasoning_selection() {
         let params = turn_start_params_from_plan(TurnStartParamsPlan {
             thread_id: "thread".to_owned(),
@@ -302,6 +387,8 @@ mod tests {
             model: Some("gpt-5.4".to_owned()),
             model_provider: Some("openai".to_owned()),
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: turn_reasoning_selection_from_effort(Some(" high ".to_owned())),
             permission_profile: permission_profile_selection(TurnPermissionMode::FullAccess),
@@ -327,6 +414,8 @@ mod tests {
             model: None,
             model_provider: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: permission_profile_selection(TurnPermissionMode::Supervised),
@@ -363,6 +452,7 @@ mod tests {
 
         apply_prepared_turn_to_thread_snapshot(
             &mut thread,
+            ThreadMode::Agent,
             Some("new-model"),
             Some("new-provider"),
             Some(" high "),
@@ -401,6 +491,7 @@ mod tests {
 
         apply_prepared_turn_to_thread_snapshot(
             &mut thread,
+            ThreadMode::Agent,
             Some("new-model"),
             None,
             None,
@@ -412,6 +503,45 @@ mod tests {
         assert_eq!(thread.model_provider, "old-provider");
         assert!(thread.reasoning_effort.is_none());
         assert_eq!(thread.preview, "existing");
+        assert_eq!(thread.updated_at, 42);
+    }
+
+    #[test]
+    fn message_snapshot_update_preserves_execution_selection() {
+        let mut thread = Thread {
+            workspace_id: "ws_1".to_owned(),
+            id: "thr_1".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Message,
+            model: "old-model".to_owned(),
+            model_provider: "old-provider".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
+            created_at: 10,
+            updated_at: 10,
+            status: pioneer_protocol::ThreadStatus::Idle,
+            origin_kind: pioneer_protocol::ThreadOriginKind::User,
+            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+
+        apply_prepared_turn_to_thread_snapshot(
+            &mut thread,
+            ThreadMode::Message,
+            None,
+            None,
+            None,
+            "ordinary message",
+            42,
+        );
+
+        assert_eq!(thread.model, "old-model");
+        assert_eq!(thread.model_provider, "old-provider");
+        assert_eq!(thread.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(thread.preview, "ordinary message");
         assert_eq!(thread.updated_at, 42);
     }
 
@@ -433,6 +563,7 @@ mod tests {
             "thread",
             "turn",
             "pending",
+            ThreadMode::Agent,
             "hello",
             vec![attachment],
         );
@@ -442,11 +573,13 @@ mod tests {
                 ref thread_id,
                 ref turn_id,
                 ref pending_request_id,
+                mode,
                 ref user_text,
                 ref attachments,
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"
+                && mode == ThreadMode::Agent
                 && user_text == "hello"
                 && matches!(
                     attachments.as_slice(),
@@ -456,27 +589,35 @@ mod tests {
                 )
         ));
 
-        let accepted = local_turn_start_accepted_event("thread", "turn", "pending");
+        let accepted =
+            local_turn_start_accepted_event("thread", "turn", "pending", ThreadMode::Agent);
         assert!(matches!(
             accepted,
             ConversationEvent::LocalTurnStartAccepted {
                 ref thread_id,
                 ref turn_id,
                 ref pending_request_id,
-            } if thread_id == "thread" && turn_id == "turn" && pending_request_id == "pending"
+                mode,
+            } if thread_id == "thread"
+                && turn_id == "turn"
+                && pending_request_id == "pending"
+                && mode == ThreadMode::Agent
         ));
 
-        let rejected = local_turn_start_rejected_event("thread", "turn", "pending", "boom");
+        let rejected =
+            local_turn_start_rejected_event("thread", "turn", "pending", ThreadMode::Agent, "boom");
         assert!(matches!(
             rejected,
             ConversationEvent::LocalTurnStartRejected {
                 ref thread_id,
                 ref turn_id,
                 ref pending_request_id,
+                mode,
                 ref error,
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"
+                && mode == ThreadMode::Agent
                 && error == "boom"
         ));
     }
@@ -488,6 +629,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -498,6 +645,7 @@ mod tests {
                 thread_id: "thread".to_owned(),
                 turn_id: "turn".to_owned(),
                 pending_request_id: "pending".to_owned(),
+                mode: ThreadMode::Agent,
             },
             TurnStartResponse { turn: turn.clone() },
         );
@@ -512,7 +660,11 @@ mod tests {
                 thread_id,
                 turn_id,
                 pending_request_id,
-            } if thread_id == "thread" && turn_id == "turn" && pending_request_id == "pending"
+                mode,
+            } if thread_id == "thread"
+                && turn_id == "turn"
+                && pending_request_id == "pending"
+                && *mode == ThreadMode::Agent
         ));
         assert!(matches!(
             &events[1],
@@ -528,6 +680,7 @@ mod tests {
                 thread_id: "thread".to_owned(),
                 turn_id: "turn".to_owned(),
                 pending_request_id: "pending".to_owned(),
+                mode: ThreadMode::Agent,
             },
             "boom",
         );
@@ -541,11 +694,50 @@ mod tests {
                 thread_id,
                 turn_id,
                 pending_request_id,
+                mode,
                 error,
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"
+                && mode == ThreadMode::Agent
                 && error == "boom"
+        ));
+    }
+
+    #[test]
+    fn completed_turn_start_response_reduces_to_completed_event() {
+        let turn = Turn {
+            id: "turn".to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode: ThreadMode::Message,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        let reduction = reduce_turn_start_send_success(
+            TurnStartSendContext {
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                pending_request_id: "pending".to_owned(),
+                mode: ThreadMode::Message,
+            },
+            TurnStartResponse { turn: turn.clone() },
+        );
+
+        let TurnStartSendReduction::Accepted { events } = reduction else {
+            panic!("success should accept the completed Message");
+        };
+        assert!(matches!(
+            &events[1],
+            ConversationEvent::TurnCompleted { thread_id, turn: completed }
+                if thread_id == "thread" && completed == &turn
         ));
     }
 }

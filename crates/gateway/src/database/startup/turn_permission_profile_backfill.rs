@@ -764,6 +764,16 @@ mod tests {
             execution_security_snapshot_version: Set(None),
             execution_security_snapshot_json: Set(None),
             execution_authorization_context_json: Set(None),
+            send_mode: Set(None),
+            author_display_name_snapshot: Set(None),
+            author_nickname_snapshot: Set(None),
+            author_avatar_revision_snapshot: Set(None),
+            reply_to_turn_id: Set(None),
+            mentions_json: Set("[]".to_owned()),
+            message_revision: Set(0),
+            message_deleted_at: Set(None),
+            message_deleted_by_actor_id: Set(None),
+            message_deleted_by_actor_kind: Set(None),
         })
         .exec(&connection)
         .await
@@ -876,6 +886,16 @@ mod tests {
                     .expect("synthetic security snapshot should serialize"),
             )),
             execution_authorization_context_json: Set(None),
+            send_mode: Set(None),
+            author_display_name_snapshot: Set(None),
+            author_nickname_snapshot: Set(None),
+            author_avatar_revision_snapshot: Set(None),
+            reply_to_turn_id: Set(None),
+            mentions_json: Set("[]".to_owned()),
+            message_revision: Set(0),
+            message_deleted_at: Set(None),
+            message_deleted_by_actor_id: Set(None),
+            message_deleted_by_actor_kind: Set(None),
         })
         .exec(&connection)
         .await

@@ -18,6 +18,9 @@ impl PioneerDesktop {
         match mode {
             ThreadMode::Agent => PioneerIconName::Infinity,
             ThreadMode::Chat => PioneerIconName::MessageCircle,
+            ThreadMode::Message => {
+                unreachable!("the Message composer UI is introduced in Epic 7")
+            }
         }
     }
 
@@ -30,6 +33,9 @@ impl PioneerDesktop {
         let trigger_label = match selected_mode {
             ThreadMode::Agent => t!("chat.composer.mode.agent_label").to_string(),
             ThreadMode::Chat => t!("chat.composer.mode.chat_label").to_string(),
+            ThreadMode::Message => {
+                unreachable!("the Message composer UI is introduced in Epic 7")
+            }
         };
 
         let desktop_entity = cx.entity();
@@ -153,6 +159,9 @@ impl PioneerDesktop {
                                     "composer-mode-chat",
                                     t!("chat.composer.mode.chat_description").to_string(),
                                 ),
+                                ThreadMode::Message => {
+                                    unreachable!("the Message composer UI is introduced in Epic 7")
+                                }
                             };
                             render_option(
                                 id,
@@ -164,6 +173,11 @@ impl PioneerDesktop {
                                     }
                                     ThreadMode::Chat => {
                                         t!("chat.composer.mode.chat_label").to_string()
+                                    }
+                                    ThreadMode::Message => {
+                                        unreachable!(
+                                            "the Message composer UI is introduced in Epic 7"
+                                        )
                                     }
                                 },
                                 description,

@@ -57,6 +57,12 @@ fn turn_snapshot(id: &str, status: TurnStatus, error: Option<String>) -> Turn {
         status,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -75,6 +81,12 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -103,6 +115,74 @@ fn thread_snapshot_hydration_locks_composer_for_running_turn() {
 }
 
 #[test]
+fn message_lifecycle_preserves_running_agent_execution_flow() {
+    let agent_turn_id = "turn_agent_000000000001";
+    let message_turn_id = "turn_message_0000000001";
+    let mut agent = turn_snapshot(agent_turn_id, TurnStatus::InProgress, None);
+    agent.mode = ThreadMode::Agent;
+    let mut message = turn_snapshot(message_turn_id, TurnStatus::Completed, None);
+    message.mode = ThreadMode::Message;
+
+    let mut conversation = Conversation::new(THREAD_ID);
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: agent.clone(),
+    });
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: message_turn_id.to_owned(),
+        pending_request_id: "request_message_000001".to_owned(),
+        mode: ThreadMode::Message,
+        user_text: "ordinary message".to_owned(),
+        attachments: Vec::new(),
+    });
+    conversation.apply(ConversationEvent::LocalTurnStartAccepted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: message_turn_id.to_owned(),
+        pending_request_id: "request_message_000001".to_owned(),
+        mode: ThreadMode::Message,
+    });
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: message.clone(),
+    });
+
+    assert_eq!(conversation.in_flight_turn_id(), Some(agent_turn_id));
+    assert_eq!(conversation.status_label(), "running");
+    assert!(!conversation.can_submit_message());
+
+    let mut snapshot = thread_snapshot_with_turn(agent);
+    snapshot.turns.push(message);
+    let mut reloaded = Conversation::new(THREAD_ID);
+    reloaded.sync_thread_snapshot(&snapshot);
+    assert_eq!(reloaded.in_flight_turn_id(), Some(agent_turn_id));
+    assert_eq!(reloaded.status_label(), "running");
+}
+
+#[test]
+fn rejected_message_does_not_lock_idle_execution_flow() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: "turn_message_0000000001".to_owned(),
+        pending_request_id: "request_message_000001".to_owned(),
+        mode: ThreadMode::Message,
+        user_text: "ordinary message".to_owned(),
+        attachments: Vec::new(),
+    });
+    conversation.apply(ConversationEvent::LocalTurnStartRejected {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: "turn_message_0000000001".to_owned(),
+        pending_request_id: "request_message_000001".to_owned(),
+        mode: ThreadMode::Message,
+        error: "rejected".to_owned(),
+    });
+
+    assert!(conversation.can_submit_message());
+    assert_eq!(conversation.status_label(), "idle");
+}
+
+#[test]
 fn task_run_occurrence_does_not_claim_foreground_on_notification_or_reload() {
     let mut conversation = Conversation::new(THREAD_ID);
     let task_turn_id = "run_0000000000000000001";
@@ -111,6 +191,12 @@ fn task_run_occurrence_does_not_claim_foreground_on_notification_or_reload() {
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
         origin: TurnOrigin::DetachedTask,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -168,6 +254,7 @@ fn stale_terminal_thread_snapshot_does_not_unlock_local_start() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: local_turn_id.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "hello".to_owned(),
         attachments: Vec::new(),
     });
@@ -228,6 +315,12 @@ fn turn_started_projection_preserves_permission_profile() {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: permission_profile.clone(),
@@ -304,6 +397,12 @@ fn permission_audit_history_hydrates_shared_projection_and_timeline_row() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -520,6 +619,7 @@ fn send_stays_blocked_until_terminal_event() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "hello".to_owned(),
         attachments: Vec::new(),
     });
@@ -530,6 +630,7 @@ fn send_stays_blocked_until_terminal_event() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
     });
     assert!(!conversation.can_submit_message());
 
@@ -540,6 +641,12 @@ fn send_stays_blocked_until_terminal_event() {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -556,6 +663,12 @@ fn send_stays_blocked_until_terminal_event() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -720,6 +833,7 @@ fn local_turn_start_projects_optimistic_user_message_with_artifacts() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "what is this?".to_owned(),
         attachments: vec![UserMessageAttachment::Artifact {
             artifact: artifact.clone(),
@@ -777,6 +891,7 @@ fn durable_pack_attachments_replace_optimistic_message_without_duplicates() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "research this".to_owned(),
         attachments: attachments.clone(),
     });
@@ -820,6 +935,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "hello".to_owned(),
         attachments: Vec::new(),
     });
@@ -831,6 +947,12 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
             status: TurnStatus::Failed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: Some("network".to_owned()),
 
             prompt_manifest: None,
@@ -846,6 +968,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: "turn_000000000000000002".to_owned(),
         pending_request_id: "req_000000000000000002".to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "again".to_owned(),
         attachments: Vec::new(),
     });
@@ -858,6 +981,12 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
             status: TurnStatus::Interrupted,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: Some("cancelled".to_owned()),
 
             prompt_manifest: None,
@@ -885,6 +1014,7 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
         user_text: "hello".to_owned(),
         attachments: Vec::new(),
     });
@@ -892,6 +1022,7 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        mode: ThreadMode::Agent,
     });
 
     conversation.apply(ConversationEvent::LocalTurnCancelRequested {
@@ -929,6 +1060,12 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
             status: TurnStatus::Interrupted,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: Some("stopped by user".to_owned()),
 
             prompt_manifest: None,
@@ -1092,6 +1229,12 @@ fn conversation_codex_reasoning_summary_does_not_overwrite_agent_message_text() 
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -1482,6 +1625,12 @@ fn terminal_turn_stamps_running_items_completed_at() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -1793,6 +1942,12 @@ fn history_hydration_preserves_tool_recovery_policy_snapshot() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -1865,6 +2020,12 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -2065,6 +2226,12 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -2131,6 +2298,12 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                     status: TurnStatus::Failed,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: Some(format!(
                         "recovery failed for item `{item_id}`: recovery policy marks this failure as terminal"
                     )),
@@ -2174,6 +2347,12 @@ fn foreign_thread_events_do_not_modify_local_projection() {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2198,6 +2377,12 @@ fn replay_style_sequence_restores_final_state() {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2262,6 +2447,12 @@ fn replay_style_sequence_restores_final_state() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2294,6 +2485,12 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2309,6 +2506,12 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2327,6 +2530,12 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2358,6 +2567,12 @@ fn turn_completed_finalizes_projection_even_when_flow_is_not_in_flight() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
 
             prompt_manifest: None,
@@ -2600,6 +2815,12 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
             status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -2685,6 +2906,12 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
         status: TurnStatus::Blocked,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: Some("model unavailable".to_owned()),
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -2735,6 +2962,12 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -2819,6 +3052,12 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -2921,6 +3160,12 @@ fn history_hydration_replays_execution_window_events_like_live_events() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -3021,6 +3266,12 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
 
                     prompt_manifest: None,
@@ -3155,6 +3406,12 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                     status: TurnStatus::Completed,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
 
                     prompt_manifest: None,
@@ -3234,6 +3491,12 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                     status: TurnStatus::InProgress,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
 
                     prompt_manifest: None,
@@ -3304,6 +3567,12 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                     status: TurnStatus::Completed,
                     turn_kind: Default::default(),
                     origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
 
                     prompt_manifest: None,

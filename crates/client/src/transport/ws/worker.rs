@@ -154,7 +154,10 @@ mod tests {
             endpoint_id: "remote".to_owned(),
             endpoint_name: "Remote".to_owned(),
             endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:22000").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "127.0.0.1:22000",
+            )
+            .unwrap(),
             auth_token: None,
             session: None,
             timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),

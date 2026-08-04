@@ -539,6 +539,36 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
 
     let input_count = count_turn_inputs(db, turn_model.id.as_str()).await?;
+    if turn_model.send_mode.as_deref() == Some("message") {
+        let mut stats = TurnBackfillStats::default();
+        if input_count > 0 {
+            timeline_repository::upsert_thread_timeline_block(
+                db,
+                ThreadTimelineBlockRecord {
+                    block_id: user_block_id(turn_model.id.as_str()),
+                    workspace_id: thread_model.workspace_id.clone(),
+                    thread_id: thread_model.id.clone(),
+                    turn_id: Some(turn_model.id.clone()),
+                    block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
+                    sort_key: turn_block_sort_key(turn_model, 0, "user"),
+                    source_kind: Some("turn_input".to_owned()),
+                    source_key: Some(turn_model.id.clone()),
+                    started_at: Some(turn_model.created_at),
+                    completed_at: Some(turn_model.created_at),
+                    metadata_json: json!({
+                        "turnId": turn_model.id,
+                        "inputCount": input_count,
+                    })
+                    .to_string(),
+                    created_at: turn_model.created_at,
+                    updated_at: turn_model.updated_at,
+                },
+            )
+            .await?;
+            stats.timeline_blocks_upserted = 1;
+        }
+        return Ok(stats);
+    }
     let (item_event_orders, source_high_watermark) =
         collect_item_event_orders(db, turn_model.id.as_str(), batch_size).await?;
 

@@ -5,8 +5,8 @@ use pioneer_entity::{
     self_improvement_source_turn, task, task_delivery, task_run_turn, thread, turn, turn_event,
 };
 use pioneer_protocol::{
-    SystemEventLevel, ThreadOriginKind, ThreadSidebarVisibility, TurnItem, TurnKind, TurnOrigin,
-    TurnStatus, task_delivery_id_from_result_item_id,
+    SystemEventLevel, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, TurnItem, TurnKind,
+    TurnOrigin, TurnStatus, UserInput, task_delivery_id_from_result_item_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
@@ -266,6 +266,18 @@ async fn collaborative_exchange_bundle<C: ConnectionTrait>(
     logical_boundary: &SelfImprovementThreadTerminalBoundary,
     terminal_boundary_event: &CanonicalTurnEventRecord,
 ) -> Result<Option<Vec<CanonicalTurnEventRecord>>> {
+    if parent_turn.send_mode.as_deref() == Some("message") {
+        return foreground_exchange_bundle(
+            db,
+            workspace_id,
+            parent_turn,
+            source,
+            source_upper_inclusive,
+            logical_boundary,
+            terminal_boundary_event,
+        )
+        .await;
+    }
     if turn_status_from_db(parent_turn.status.as_str()) != Some(TurnStatus::Completed)
         || source.is_some_and(|source| source.id > source_upper_inclusive)
         || !parent_turn_at_or_before_boundary(parent_turn, logical_boundary)
@@ -841,6 +853,27 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         owning_turn.initiated_by_actor_id.as_deref(),
     )
     .with_context(|| format!("canonical turn `{turn_id}` has an invalid owning actor"))?;
+    let current_message_input = if owning_turn.send_mode.as_deref() == Some("message") {
+        let input = if owning_turn.message_deleted_at.is_some() {
+            Vec::new()
+        } else {
+            super::turn::find_turn_inputs(db, turn_id)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    serde_json::from_str::<UserInput>(row.payload.as_str()).with_context(|| {
+                        format!(
+                            "failed to decode current Message input `{}` for canonical history",
+                            row.input_index
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Some(input)
+    } else {
+        None
+    };
 
     let mut rows = turn_event::Entity::find()
         .filter(turn_event::Column::ThreadId.eq(thread_id.to_owned()))
@@ -857,9 +890,29 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         .map(|row| {
             let mut record = decode_event(row, workspace_id)?;
             hydrate_legacy_turn_start_actor(&mut record, owning_actor.as_ref())?;
+            if let Some(input) = current_message_input.as_deref() {
+                project_current_message_input(&mut record, input)?;
+            }
             Ok(record)
         })
         .collect()
+}
+
+fn project_current_message_input(
+    record: &mut CanonicalTurnEventRecord,
+    input: &[UserInput],
+) -> Result<()> {
+    let CanonicalTurnEventPayload::TurnStarted(started) = &mut record.payload else {
+        return Ok(());
+    };
+    if started.turn.mode != ThreadMode::Message {
+        bail!(
+            "canonical Message turn-start event `{}` has non-Message mode",
+            record.event_id
+        );
+    }
+    started.input = input.to_vec();
+    Ok(())
 }
 
 fn hydrate_legacy_turn_start_actor(
@@ -949,5 +1002,93 @@ fn terminal_status(payload: &CanonicalTurnEventPayload) -> Option<TurnStatus> {
         CanonicalTurnEventPayload::TurnFailed(notification) => Some(notification.turn.status),
         CanonicalTurnEventPayload::TurnBlocked(notification) => Some(notification.turn.status),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use pioneer_protocol::{
+        SandboxMode, Thread, ThreadSidebarVisibility, ThreadStatus, Turn,
+        default_turn_permission_profile_snapshot,
+    };
+
+    use super::*;
+    use crate::CanonicalTurnStartedEventPayload;
+
+    fn message_start_record(mode: ThreadMode) -> CanonicalTurnEventRecord {
+        let turn = Turn {
+            id: "turn_message".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_turn_permission_profile_snapshot(),
+        };
+        CanonicalTurnEventRecord {
+            event_id: "event_start".to_owned(),
+            thread_id: "thread_message".to_owned(),
+            turn_id: turn.id.clone(),
+            sequence: 1,
+            created_at: chrono::FixedOffset::east_opt(0)
+                .expect("UTC offset")
+                .timestamp_opt(1_900_000_000, 0)
+                .single()
+                .expect("timestamp"),
+            payload: CanonicalTurnEventPayload::TurnStarted(CanonicalTurnStartedEventPayload {
+                thread: Thread {
+                    workspace_id: "workspace_message".to_owned(),
+                    id: "thread_message".to_owned(),
+                    name: None,
+                    preview: String::new(),
+                    mode: ThreadMode::Message,
+                    model: "model".to_owned(),
+                    model_provider: "provider".to_owned(),
+                    reasoning_effort: None,
+                    created_at: 1_900_000_000,
+                    updated_at: 1_900_000_000,
+                    status: ThreadStatus::Idle,
+                    origin_kind: ThreadOriginKind::Collaborative,
+                    sidebar_visibility: ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                },
+                sandbox_mode: SandboxMode::FullAccess,
+                turn,
+                input: vec![UserInput::Text {
+                    text: "append-only original".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                actor: None,
+                reasoning_effort: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn canonical_message_history_uses_current_input_and_rejects_mode_mismatch() {
+        let current = vec![UserInput::Text {
+            text: "current edited text".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let mut message = message_start_record(ThreadMode::Message);
+        project_current_message_input(&mut message, current.as_slice())
+            .expect("Message projection should accept current input");
+        let CanonicalTurnEventPayload::TurnStarted(started) = message.payload else {
+            panic!("fixture must remain a TurnStarted event");
+        };
+        assert_eq!(started.input, current);
+
+        let mut inconsistent = message_start_record(ThreadMode::Agent);
+        assert!(project_current_message_input(&mut inconsistent, &[]).is_err());
     }
 }

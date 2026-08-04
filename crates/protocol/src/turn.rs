@@ -1,12 +1,12 @@
 use crate::{
-    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, SkillId, SkillPackId, TaskTurnItem,
-    ThreadMode,
+    ArtifactRef, MarkdownDocument, McpScopeKind, PersistedActorRef, PrincipalId, SandboxPolicy,
+    SkillId, SkillPackId, TaskTurnItem, ThreadMode,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ByteRange {
@@ -333,6 +333,10 @@ pub struct TurnStartParams {
     pub sandbox_policy: Option<SandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ThreadMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentioned_principal_ids: Vec<PrincipalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_backend: Option<AgentExecutionBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1428,6 +1432,224 @@ pub struct TurnStartResponse {
     pub turn: Turn,
 }
 
+pub const TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT: u32 = 50;
+pub const TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT: u32 = 100;
+pub const TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES: usize = 1_024;
+pub const TURN_MESSAGE_INPUT_MAX_BYTES: usize = 1_048_576;
+pub const TURN_MESSAGE_INPUT_MAX_ITEMS: usize = 128;
+pub const TURN_MESSAGE_MENTION_MAX_COUNT: usize = 64;
+
+/// Validates the shared content shape used by initial Message send and edit.
+/// Resource existence and ACL remain storage-layer checks.
+pub fn validate_turn_message_content(
+    input: &[UserInput],
+    mention_count: usize,
+) -> Result<(), &'static str> {
+    if input.len() > TURN_MESSAGE_INPUT_MAX_ITEMS {
+        return Err("Message input exceeds the item limit");
+    }
+    if mention_count > TURN_MESSAGE_MENTION_MAX_COUNT {
+        return Err("Message mentions exceed the item limit");
+    }
+
+    let mut has_content = false;
+    for value in input {
+        match value {
+            UserInput::Text { text, .. } => {
+                has_content |= !text.trim().is_empty();
+            }
+            UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } => {
+                if artifact_id.trim().is_empty()
+                    || version_id
+                        .as_deref()
+                        .is_none_or(|version_id| version_id.trim().is_empty())
+                {
+                    return Err("Message artifact reference is invalid");
+                }
+                has_content = true;
+            }
+            _ => return Err("Message accepts only text and artifact references"),
+        }
+    }
+    if !has_content {
+        return Err("Message requires non-empty text or an artifact reference");
+    }
+    let input_bytes = serde_json::to_vec(input)
+        .map_err(|_| "Message input cannot be encoded")?
+        .len();
+    if input_bytes > TURN_MESSAGE_INPUT_MAX_BYTES {
+        return Err("Message input exceeds the byte limit");
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnMessageEditParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub expected_revision: u64,
+    #[serde(default)]
+    pub input: Vec<UserInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentioned_principal_ids: Vec<PrincipalId>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnMessageEditResponse {
+    pub turn: Turn,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnMessageDeleteParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnMessageDeleteResponse {
+    pub turn: Turn,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMessageRevisionChangeKind {
+    Edit,
+    Delete,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnMessageRevision {
+    pub turn_id: String,
+    pub revision: u64,
+    pub change_kind: TurnMessageRevisionChangeKind,
+    pub changed_by: PersistedActorRef,
+    pub created_at: i64,
+    /// `None` is the intentional content-redacted representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<UserInput>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<TurnMention>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnMessageRevisionsPageParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 1024))]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<u32>,
+}
+
+impl TurnMessageRevisionsPageParams {
+    pub fn validated_limit(&self) -> Result<u32, TurnMessageParamsError> {
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES)
+        {
+            return Err(TurnMessageParamsError::InvalidCursor);
+        }
+        match self.limit {
+            None => Ok(TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT),
+            Some(limit) if (1..=TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT).contains(&limit) => Ok(limit),
+            Some(_) => Err(TurnMessageParamsError::InvalidLimit),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnMessageRevisionsPageResponse {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    #[serde(default)]
+    pub revisions: Vec<TurnMessageRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadParams {
+    pub thread_id: String,
+    pub through_turn_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadCursor {
+    pub through_turn_id: String,
+    pub sort_key: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadResponse {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub cursor: ThreadReadCursor,
+    pub unread_count: u64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadCursorChangedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub cursor: ThreadReadCursor,
+    pub unread_count: u64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMessageErrorReason {
+    InvalidInput,
+    InvalidTarget,
+    ImmutableMessage,
+    DeletedMessage,
+    RevisionConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMessageParamsError {
+    InvalidCursor,
+    InvalidLimit,
+}
+
+impl fmt::Display for TurnMessageParamsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCursor => formatter.write_str("invalid message revision cursor"),
+            Self::InvalidLimit => formatter.write_str("invalid message revision page limit"),
+        }
+    }
+}
+
+impl std::error::Error for TurnMessageParamsError {}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnMessageEditedEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn: Turn,
+    #[serde(default)]
+    pub input: Vec<UserInput>,
+    pub changed_by: PersistedActorRef,
+    pub changed_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnMessageDeletedEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn: Turn,
+    pub deleted_by: PersistedActorRef,
+    pub deleted_at: i64,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnCancelParams {
     pub thread_id: String,
@@ -1738,11 +1960,51 @@ pub struct Turn {
     pub turn_kind: TurnKind,
     #[serde(default)]
     pub origin: TurnOrigin,
+    #[serde(default = "legacy_turn_mode")]
+    pub mode: ThreadMode,
+    #[serde(default)]
+    pub author: Option<TurnAuthorSnapshot>,
+    #[serde(default)]
+    pub reply_to_turn_id: Option<String>,
+    #[serde(default)]
+    pub mentions: Vec<TurnMention>,
+    #[serde(default)]
+    pub message_revision: u64,
+    #[serde(default)]
+    pub message_deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_manifest: Option<PromptManifest>,
     pub permission_profile: TurnPermissionProfileSnapshot,
+}
+
+fn legacy_turn_mode() -> ThreadMode {
+    ThreadMode::Chat
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnAuthorSnapshot {
+    pub actor: PersistedActorRef,
+    #[schemars(length(min = 1, max = 128))]
+    pub display_name: String,
+    #[schemars(
+        length(min = 2, max = 32),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$")
+    )]
+    pub nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_revision: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnMention {
+    pub principal_id: PrincipalId,
+    #[schemars(
+        length(min = 2, max = 32),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$")
+    )]
+    pub nickname: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -5277,6 +5539,8 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: None,
@@ -5361,6 +5625,8 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: None,

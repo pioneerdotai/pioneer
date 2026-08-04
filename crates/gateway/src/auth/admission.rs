@@ -135,8 +135,7 @@ fn extract_single_bearer(headers: &HeaderMap) -> Result<&str, AuthError> {
     let header = header
         .to_str()
         .map_err(|_| AuthError::new(AuthErrorCode::MalformedCredential))?;
-    extract_bearer_token(header)
-        .ok_or_else(|| AuthError::new(AuthErrorCode::MalformedCredential))
+    extract_bearer_token(header).ok_or_else(|| AuthError::new(AuthErrorCode::MalformedCredential))
 }
 
 fn extract_bearer_token(value: &str) -> Option<&str> {
@@ -187,10 +186,7 @@ mod tests {
     #[test]
     fn cookies_and_non_bearer_schemes_never_supply_access_credentials() {
         let mut cookie_only = HeaderMap::new();
-        cookie_only.insert(
-            "cookie",
-            HeaderValue::from_static("access_token=private"),
-        );
+        cookie_only.insert("cookie", HeaderValue::from_static("access_token=private"));
         assert_eq!(
             extract_single_bearer(&cookie_only).unwrap_err().code(),
             AuthErrorCode::MissingCredential

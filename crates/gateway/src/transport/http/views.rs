@@ -11,15 +11,13 @@ use serde::Deserialize;
 use tracing::Instrument;
 use zeroize::Zeroize;
 
-use crate::request_context::{
-    AuthenticatedRequestContext, CanonicalMethod, SourceTransport,
-};
+use crate::request_context::{AuthenticatedRequestContext, CanonicalMethod, SourceTransport};
 
-use crate::artifact_delivery::{ArtifactDeliveryError, ArtifactDeliveryService};
 use super::auth::new_request_id;
 use super::content::{ContentResponsePolicy, serve_authorized_content};
 use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
+use crate::artifact_delivery::{ArtifactDeliveryError, ArtifactDeliveryService};
 use crate::view_grants::{ViewGrantError, ViewGrantLease};
 
 #[derive(Deserialize)]
@@ -75,16 +73,13 @@ pub(super) async fn view_grant_route(
             | ViewGrantError::Capacity,
         ) => return Err(HttpError::service_unavailable(request_id)),
     };
-    if lease.grant.protocol_version
-        != crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER
-    {
+    if lease.grant.protocol_version != crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER {
         record_view_grant_route_rejection(&request_id, "protocol_version_mismatch");
         return Err(HttpError::not_found(request_id));
     }
 
-    let auth_deadline = Duration::from_secs(
-        state.config.gateway.auth.auth_exchange_timeout_seconds,
-    );
+    let auth_deadline =
+        Duration::from_secs(state.config.gateway.auth.auth_exchange_timeout_seconds);
     let principal = tokio::time::timeout(
         auth_deadline,
         state.auth_service.resolve_active_view_grant_principal(
@@ -120,32 +115,35 @@ pub(super) async fn view_grant_route(
         CanonicalMethod::binary("storage/view"),
     );
     let service = ArtifactDeliveryService::new(state.message_processor.clone());
-    let content_result = tokio::time::timeout(state.http_streams.limits().open_timeout(), async {
-        match lease.grant.scope.projection_kind {
-            Some(projection_kind) => {
-                service
-                    .authorize_exact_projection(
-                        &context,
-                        lease.grant.scope.workspace_id.as_str(),
-                        lease.grant.scope.artifact_id.as_str(),
-                        lease.grant.scope.version_id.as_str(),
-                        projection_kind,
-                    )
-                    .await
-            }
-            None => {
-                service
-                    .authorize_exact_content(
-                        &context,
-                        lease.grant.scope.workspace_id.as_str(),
-                        lease.grant.scope.artifact_id.as_str(),
-                        lease.grant.scope.version_id.as_str(),
-                    )
-                    .await
+    let content_result = tokio::time::timeout(
+        state.http_streams.limits().open_timeout(),
+        async {
+            match lease.grant.scope.projection_kind {
+                Some(projection_kind) => {
+                    service
+                        .authorize_exact_projection(
+                            &context,
+                            lease.grant.scope.workspace_id.as_str(),
+                            lease.grant.scope.artifact_id.as_str(),
+                            lease.grant.scope.version_id.as_str(),
+                            projection_kind,
+                        )
+                        .await
+                }
+                None => {
+                    service
+                        .authorize_exact_content(
+                            &context,
+                            lease.grant.scope.workspace_id.as_str(),
+                            lease.grant.scope.artifact_id.as_str(),
+                            lease.grant.scope.version_id.as_str(),
+                        )
+                        .await
+                }
             }
         }
-    }
-    .instrument(context.request_span()))
+        .instrument(context.request_span()),
+    )
     .await
     .map_err(|_| HttpError::service_unavailable(request_id.clone()))?;
     let content = content_result.map_err(|error| {

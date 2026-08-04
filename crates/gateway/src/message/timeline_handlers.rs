@@ -15,14 +15,16 @@ use pioneer_crud::{
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
-    TaskThreadLineage, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock,
-    TimelineBlockKind, TimelinePageInfo, TurnItem, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
-    TurnWorkPresentation, TurnWorkState, UserInput, UserMessageAttachment,
+    TaskThreadLineage, ThreadReadParams, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    TimelineBlock, TimelineBlockKind, TimelinePageInfo, TimelineReplySummary, Turn, TurnItem,
+    TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
+    TurnWorkState, UserInput, UserMessageAttachment,
 };
 
 const TURN_WORK_ITEMS_GET_MAX_IDS: usize = 200;
 const TURN_WORK_SNAPSHOT_MAX_ATTEMPTS: usize = 4;
+const TIMELINE_REPLY_TEXT_MAX_CHARS: usize = 280;
 
 struct ThreadTimelineRowsPage {
     rows: Vec<thread_timeline_block::Model>,
@@ -48,7 +50,145 @@ struct TurnWorkItemsSnapshot {
     removed_work_item_ids: Vec<String>,
 }
 
+#[derive(Default)]
+struct UserMessageTimelineBatch {
+    turns: HashMap<String, Turn>,
+    inputs: HashMap<String, Vec<UserInput>>,
+    attachments: HashMap<String, Vec<UserMessageAttachment>>,
+}
+
+fn log_thread_read_outcome(
+    thread_id: &str,
+    through_turn_id: &str,
+    outcome: &'static str,
+    unread_count: u64,
+    started: std::time::Instant,
+) {
+    debug!(
+        thread_id,
+        through_turn_id,
+        operation = "thread_read",
+        outcome,
+        unread_count,
+        latency_ms = started.elapsed().as_millis(),
+        "Thread read cursor outcome"
+    );
+}
+
 impl MessageProcessor {
+    pub(super) async fn thread_read(
+        &self,
+        request_context: &RequestContext,
+        authorization: &AuthorizedThread,
+        request_id: RequestId,
+        params: ThreadReadParams,
+    ) {
+        let started = std::time::Instant::now();
+        let connection_id = request_context.connection_id();
+        let thread_id = params.thread_id.trim();
+        let through_turn_id = params.through_turn_id.trim();
+        if authorization.thread_id() != thread_id
+            || thread_id.is_empty()
+            || through_turn_id.is_empty()
+        {
+            log_thread_read_outcome(thread_id, through_turn_id, "rejected", 0, started);
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
+            )
+            .await;
+            return;
+        }
+
+        let response_payload = match self
+            .crud_store
+            .mark_thread_read(pioneer_crud::MarkThreadReadRequest {
+                workspace_id: authorization.workspace_id().to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: request_context.principal().principal_id.clone(),
+                through_turn_id: through_turn_id.to_owned(),
+                read_at_unix: now_timestamp_secs(),
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error)
+                if error
+                    .downcast_ref::<pioneer_crud::ThreadReadFailure>()
+                    .is_some() =>
+            {
+                log_thread_read_outcome(thread_id, through_turn_id, "rejected", 0, started);
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                log_thread_read_outcome(thread_id, through_turn_id, "rejected", 0, started);
+                warn!(
+                    connection_id,
+                    thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to advance thread read cursor"
+                );
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        log_thread_read_outcome(
+            thread_id,
+            through_turn_id,
+            "accepted",
+            response_payload.unread_count,
+            started,
+        );
+        let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send thread/read response"
+            );
+        }
+        let notification = pioneer_protocol::ThreadReadCursorChangedNotification {
+            workspace_id: response_payload.workspace_id,
+            thread_id: response_payload.thread_id.clone(),
+            cursor: response_payload.cursor,
+            unread_count: response_payload.unread_count,
+        };
+        let candidate_connection_ids = self
+            .session_manager
+            .connection_ids_for_principal(&request_context.principal().principal_id)
+            .await;
+        self.send_thread_scoped_notification_to_connections(
+            response_payload.thread_id.as_str(),
+            events::THREAD_READ_CURSOR_CHANGED,
+            &notification,
+            candidate_connection_ids,
+        )
+        .await;
+    }
+
     pub(super) async fn thread_timeline_page(
         &self,
         request_context: &RequestContext,
@@ -1119,16 +1259,147 @@ impl MessageProcessor {
         rows: Vec<thread_timeline_block::Model>,
         approval_scope: Option<&ThreadTimelineApprovalScope>,
     ) -> Result<Vec<TimelineBlock>> {
+        let user_messages = self.user_message_timeline_batch(rows.as_slice()).await?;
         let mut blocks = Vec::with_capacity(rows.len());
         for row in rows {
             if let Some(block) = self
-                .thread_timeline_block_from_row(row, approval_scope)
+                .thread_timeline_block_from_row(row, approval_scope, &user_messages)
                 .await?
             {
                 blocks.push(block);
             }
         }
         Ok(blocks)
+    }
+
+    async fn user_message_timeline_batch(
+        &self,
+        rows: &[thread_timeline_block::Model],
+    ) -> Result<UserMessageTimelineBatch> {
+        let mut page_turn_ids = Vec::new();
+        let mut seen_turn_ids = HashSet::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.block_kind == BLOCK_KIND_USER_MESSAGE)
+        {
+            let turn_id = row
+                .turn_id
+                .as_deref()
+                .or(row.source_key.as_deref())
+                .context("user message timeline block is missing turn_id")?;
+            if seen_turn_ids.insert(turn_id.to_owned()) {
+                page_turn_ids.push(turn_id.to_owned());
+            }
+        }
+        if page_turn_ids.is_empty() {
+            return Ok(UserMessageTimelineBatch::default());
+        }
+
+        let first_row = rows
+            .first()
+            .context("timeline user-message batch has no source row")?;
+        let thread_id = first_row.thread_id.as_str();
+        let workspace_id = first_row.workspace_id.as_str();
+        let mut turns = self
+            .crud_store
+            .get_turns_by_thread_and_ids(thread_id, page_turn_ids.as_slice())
+            .await?;
+        let reply_turn_ids = page_turn_ids
+            .iter()
+            .filter_map(|turn_id| turns.get(turn_id))
+            .filter_map(|turn| turn.reply_to_turn_id.as_ref())
+            .filter(|turn_id| !turns.contains_key(turn_id.as_str()))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        turns.extend(
+            self.crud_store
+                .get_turns_by_thread_and_ids(thread_id, reply_turn_ids.as_slice())
+                .await?,
+        );
+
+        for turn_id in &page_turn_ids {
+            if !turns.contains_key(turn_id.as_str()) {
+                anyhow::bail!("user message timeline block references a missing Turn `{turn_id}`");
+            }
+        }
+
+        let input_turn_ids = turns
+            .values()
+            .filter(|turn| !turn.message_deleted)
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>();
+        let inputs = self
+            .crud_store
+            .get_turn_inputs_for_turns(input_turn_ids.as_slice())
+            .await?;
+
+        let requested_artifacts = inputs
+            .values()
+            .flatten()
+            .filter_map(|input| match input {
+                UserInput::Artifact {
+                    artifact_id,
+                    version_id: Some(version_id),
+                } => Some((artifact_id.clone(), version_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let exact_artifact_refs = self
+            .crud_store
+            .list_exact_artifact_refs(workspace_id, requested_artifacts.as_slice())
+            .await?;
+
+        let item_attachments = self
+            .crud_store
+            .list_turn_items_by_type_for_turns(page_turn_ids.as_slice(), "user_message")
+            .await?;
+        let mut attachments = HashMap::new();
+        for turn_id in &page_turn_ids {
+            let Some(turn) = turns.get(turn_id.as_str()) else {
+                continue;
+            };
+            if turn.message_deleted {
+                attachments.insert(turn_id.clone(), Vec::new());
+                continue;
+            }
+            let mut resolved = Vec::new();
+            if let Some(items) = item_attachments.get(turn_id.as_str()) {
+                for item in items {
+                    if let TurnItem::UserMessage {
+                        attachments: item_attachments,
+                        ..
+                    } = item
+                    {
+                        resolved.extend(item_attachments.iter().cloned());
+                    }
+                }
+            }
+            if let Some(inputs) = inputs.get(turn_id.as_str()) {
+                let exact = inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        UserInput::Artifact {
+                            artifact_id,
+                            version_id: Some(version_id),
+                        } => exact_artifact_refs
+                            .get(&(artifact_id.clone(), version_id.clone()))
+                            .cloned()
+                            .map(|artifact| UserMessageAttachment::Artifact { artifact }),
+                        _ => None,
+                    })
+                    .collect();
+                resolved = merge_user_message_attachments(resolved, exact);
+            }
+            attachments.insert(turn_id.clone(), resolved);
+        }
+
+        Ok(UserMessageTimelineBatch {
+            turns,
+            inputs,
+            attachments,
+        })
     }
 
     async fn descendant_pending_request_blocks(
@@ -1210,9 +1481,10 @@ impl MessageProcessor {
         &self,
         row: thread_timeline_block::Model,
         approval_scope: Option<&ThreadTimelineApprovalScope>,
+        user_messages: &UserMessageTimelineBatch,
     ) -> Result<Option<TimelineBlock>> {
         let kind = match row.block_kind.as_str() {
-            BLOCK_KIND_USER_MESSAGE => self.user_message_timeline_block_kind(&row).await?,
+            BLOCK_KIND_USER_MESSAGE => user_message_timeline_block_kind(&row, user_messages)?,
             BLOCK_KIND_TURN_WORK => self.turn_work_timeline_block_kind(&row).await?,
             BLOCK_KIND_DETACHED_TASK_RUN => {
                 self.detached_task_run_timeline_block_kind(&row).await?
@@ -1307,47 +1579,6 @@ impl MessageProcessor {
             item_id: record.native_item_id,
             request,
         }))
-    }
-
-    async fn user_message_timeline_block_kind(
-        &self,
-        row: &thread_timeline_block::Model,
-    ) -> Result<TimelineBlockKind> {
-        let turn_id = row
-            .turn_id
-            .as_deref()
-            .or(row.source_key.as_deref())
-            .context("user message timeline block is missing turn_id")?;
-        let inputs = self.crud_store.get_turn_inputs(turn_id).await?;
-        let (text, input_attachments) = user_message_text_and_attachments(inputs.as_slice());
-        let item_attachments = self.user_message_item_attachments(turn_id).await?;
-        Ok(TimelineBlockKind::UserMessage {
-            item_id: None,
-            inputs,
-            text,
-            attachments: merge_user_message_attachments(input_attachments, item_attachments),
-        })
-    }
-
-    async fn user_message_item_attachments(
-        &self,
-        turn_id: &str,
-    ) -> Result<Vec<UserMessageAttachment>> {
-        let items = self
-            .crud_store
-            .list_turn_items_by_type(turn_id, "user_message")
-            .await?;
-        let mut attachments = Vec::new();
-        for item in items {
-            if let TurnItem::UserMessage {
-                attachments: item_attachments,
-                ..
-            } = item
-            {
-                attachments.extend(item_attachments);
-            }
-        }
-        Ok(attachments)
     }
 
     async fn turn_work_timeline_block_kind(
@@ -1594,6 +1825,91 @@ fn turn_work_projection_revision(projection: &turn_work_projection::Model) -> (i
     )
 }
 
+fn user_message_timeline_block_kind(
+    row: &thread_timeline_block::Model,
+    batch: &UserMessageTimelineBatch,
+) -> Result<TimelineBlockKind> {
+    let turn_id = row
+        .turn_id
+        .as_deref()
+        .or(row.source_key.as_deref())
+        .context("user message timeline block is missing turn_id")?;
+    let turn = batch.turns.get(turn_id).with_context(|| {
+        format!("user message timeline block references missing Turn `{turn_id}`")
+    })?;
+    let inputs = if turn.message_deleted {
+        Vec::new()
+    } else {
+        batch.inputs.get(turn_id).cloned().unwrap_or_default()
+    };
+    let (text, input_attachments) = user_message_text_and_attachments(inputs.as_slice());
+    let attachments = if turn.message_deleted {
+        Vec::new()
+    } else {
+        merge_user_message_attachments(
+            input_attachments,
+            batch.attachments.get(turn_id).cloned().unwrap_or_default(),
+        )
+    };
+    let reply = turn
+        .reply_to_turn_id
+        .as_deref()
+        .map(|reply_turn_id| {
+            let target = batch.turns.get(reply_turn_id).with_context(|| {
+                format!(
+                    "reply target `{reply_turn_id}` for timeline Turn `{turn_id}` is unavailable"
+                )
+            })?;
+            let text = if target.message_deleted {
+                None
+            } else {
+                let target_inputs = batch
+                    .inputs
+                    .get(reply_turn_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let (text, _) = user_message_text_and_attachments(target_inputs);
+                bounded_timeline_reply_text(text.as_str())
+            };
+            Ok::<_, anyhow::Error>(TimelineReplySummary {
+                turn_id: reply_turn_id.to_owned(),
+                author: target.author.clone(),
+                text,
+                deleted: target.message_deleted,
+            })
+        })
+        .transpose()?;
+
+    Ok(TimelineBlockKind::UserMessage {
+        item_id: None,
+        inputs,
+        text,
+        attachments,
+        mode: turn.mode,
+        author: turn.author.clone(),
+        reply,
+        mentions: turn.mentions.clone(),
+        revision: turn.message_revision,
+        edited: turn.message_revision > 0,
+        deleted: turn.message_deleted,
+    })
+}
+
+fn bounded_timeline_reply_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut bounded = text
+        .chars()
+        .take(TIMELINE_REPLY_TEXT_MAX_CHARS)
+        .collect::<String>();
+    if text.chars().count() > TIMELINE_REPLY_TEXT_MAX_CHARS {
+        bounded.push('…');
+    }
+    Some(bounded)
+}
+
 fn user_message_text_and_attachments(input: &[UserInput]) -> (String, Vec<UserMessageAttachment>) {
     let mut text_parts = Vec::new();
     let mut attachments = Vec::new();
@@ -1629,9 +1945,7 @@ fn user_message_text_and_attachments(input: &[UserInput]) -> (String, Vec<UserMe
             UserInput::LocalVideo { path } => {
                 attachments.push(UserMessageAttachment::LocalVideo { path: path.clone() });
             }
-            UserInput::Artifact { artifact_id, .. } => {
-                text_parts.push(format!("artifact: {artifact_id}"));
-            }
+            UserInput::Artifact { .. } => {}
             UserInput::Mention { name, .. } => {
                 text_parts.push(format!("mention: {name}"));
             }

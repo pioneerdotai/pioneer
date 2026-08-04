@@ -159,6 +159,12 @@ mod tests {
                 status: TurnStatus::Interrupted,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: Some("stopped".to_owned()),
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::system_turn_permission_profile_snapshot(

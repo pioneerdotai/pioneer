@@ -38,6 +38,8 @@ pub struct Model {
     pub gateway_identity: HasOne<super::gateway_identity::Entity>,
     #[sea_orm(has_one)]
     pub principal_avatar: HasOne<super::principal_avatar::Entity>,
+    #[sea_orm(has_many)]
+    pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(has_many, via = "thread_membership")]
     pub threads: HasMany<super::thread::Entity>,
     #[sea_orm(has_many, via = "workspace_membership")]

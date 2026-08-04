@@ -39,9 +39,7 @@ impl RemoteGatewayValidation {
             }
             | Self::Unreachable {
                 gateway_base_url, ..
-            } => {
-                gateway_base_url
-            }
+            } => gateway_base_url,
         }
     }
 

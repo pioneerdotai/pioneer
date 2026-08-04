@@ -2,12 +2,12 @@ use crate::constants::events;
 use crate::{
     AccessChangedNotification, ArtifactCreatedNotification, ArtifactDeletedNotification,
     ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
-    ArtifactUploadProgressNotification,
-    AuthAccessExpiringNotification, AuthSessionRevokedNotification,
-    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification,
-    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolvedNotification,
-    CLIRuntimeStatusChangedNotification, ContextCompressedNotification,
-    ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
+    ArtifactUploadProgressNotification, AuthAccessExpiringNotification,
+    AuthSessionRevokedNotification, CLIRuntimeAccountUpdatedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
+    ContextCompressedNotification, ContextCompressingNotification,
+    GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     GatewayVoiceInputStatusChangedNotification, InvitationChangedNotification,
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
@@ -29,7 +29,8 @@ use crate::{
     TaskRunFailedNotification, TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadParticipantsChangedNotification, ThreadStartedNotification,
+    ThreadClosedNotification, ThreadParticipantsChangedNotification,
+    ThreadReadCursorChangedNotification, ThreadStartedNotification,
     ThreadTimelineBlocksChangedNotification, ThreadTreeChangedNotification,
     ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
     TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
@@ -77,6 +78,7 @@ pub enum GatewayNotification {
     ThreadTreeChanged(ThreadTreeChangedNotification),
     ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
     ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification),
+    ThreadReadCursorChanged(ThreadReadCursorChangedNotification),
     TurnStarted(TurnStartedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
@@ -249,6 +251,11 @@ impl GatewayNotification {
                 serde_json::from_value::<ThreadTimelineBlocksChangedNotification>(params)
                     .ok()
                     .map(Self::ThreadTimelineBlocksChanged)
+            }
+            events::THREAD_READ_CURSOR_CHANGED => {
+                serde_json::from_value::<ThreadReadCursorChangedNotification>(params)
+                    .ok()
+                    .map(Self::ThreadReadCursorChanged)
             }
             events::TURN_STARTED => serde_json::from_value::<TurnStartedNotification>(params)
                 .ok()

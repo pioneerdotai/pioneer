@@ -320,6 +320,7 @@ pub fn build_prepared_voice_composer_snapshot(
         .iter()
         .map(|prepared_attachment| prepared_attachment.artifact.clone())
         .collect::<Vec<_>>();
+    let selected_mode = context.selected_mode.unwrap_or(ThreadMode::Agent);
     let selected_reasoning_effort = context.selected_reasoning_effort.clone();
     let cli_runtime_options = if matches!(
         &context.execution_backend,
@@ -345,7 +346,7 @@ pub fn build_prepared_voice_composer_snapshot(
             model: context.selected_model,
             model_provider: context.turn_model_provider,
             sandbox_policy: None,
-            mode: context.selected_mode,
+            mode: Some(selected_mode),
             execution_backend: context.execution_backend,
             reasoning: turn_start::turn_reasoning_selection_from_effort(selected_reasoning_effort),
             permission_profile: Some(
@@ -614,6 +615,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
     context: PreparedComposerTurnSubmitContext,
     prepared: PreparedComposerTurn,
 ) -> PreparedComposerTurnSubmitReduction {
+    let selected_mode = context.selected_mode.unwrap_or(ThreadMode::Agent);
     let uploaded_attachment_artifacts = prepared
         .attachments
         .iter()
@@ -623,6 +625,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
         thread_id: context.thread_id.clone(),
         turn_id: context.turn_id.clone(),
         pending_request_id: context.pending_request_id.clone(),
+        mode: selected_mode,
     };
     let selected_reasoning_effort = context.selected_reasoning_effort.clone();
     let reasoning =
@@ -658,6 +661,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
             context.thread_id.clone(),
             context.turn_id.clone(),
             context.pending_request_id.clone(),
+            selected_mode,
             prepared.user_message_text.clone(),
             prepared.user_attachments.clone(),
         ),
@@ -668,7 +672,9 @@ pub fn reduce_prepared_composer_turn_submit_success(
             capabilities: prepared.capabilities,
             model: context.selected_model,
             model_provider: context.turn_model_provider,
-            mode: context.selected_mode,
+            mode: Some(selected_mode),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: context.execution_backend,
             reasoning,
             permission_profile:
@@ -1550,6 +1556,20 @@ mod tests {
     }
 
     #[test]
+    fn voice_snapshot_fallback_is_serialized_as_explicit_agent_mode() {
+        let mut context = voice_snapshot_context();
+        context.selected_mode = None;
+
+        let snapshot = build_prepared_voice_composer_snapshot(
+            context,
+            build_prepared_composer_turn(String::new(), Vec::new(), Vec::new()),
+        )
+        .expect("voice snapshot");
+
+        assert_eq!(snapshot.context.mode, Some(ThreadMode::Agent));
+    }
+
+    #[test]
     fn voice_snapshot_rejects_text_input_because_transcript_is_gateway_owned() {
         let prepared =
             build_prepared_composer_turn("typed text".to_owned(), Vec::new(), Vec::new());
@@ -1697,11 +1717,13 @@ mod tests {
                 ref thread_id,
                 ref turn_id,
                 ref pending_request_id,
+                mode,
                 ref user_text,
                 ref attachments,
             } if thread_id == "thread_a"
                 && turn_id == "turn_a"
                 && pending_request_id == "pending_a"
+                && mode == ThreadMode::Agent
                 && user_text == "hello"
                 && attachments.len() == 1
         ));
@@ -1734,6 +1756,43 @@ mod tests {
         assert_eq!(reduction.send_context.thread_id, "thread_a");
         assert_eq!(reduction.send_context.turn_id, "turn_a");
         assert_eq!(reduction.send_context.pending_request_id, "pending_a");
+    }
+
+    #[test]
+    fn prepared_composer_submit_fallback_is_serialized_as_explicit_agent_mode() {
+        let prepared = build_prepared_composer_turn("hello".to_owned(), Vec::new(), Vec::new());
+
+        let reduction = reduce_prepared_composer_turn_submit_success(
+            PreparedComposerTurnSubmitContext {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                composer_execution_mode: ThreadComposerExecutionMode::ForegroundTurn,
+                selected_model: Some("gpt-5".to_owned()),
+                selected_provider: Some("openai".to_owned()),
+                turn_model_provider: Some("openai".to_owned()),
+                selected_mode: None,
+                permission_mode: TurnPermissionMode::Supervised,
+                execution_backend: None,
+                selected_reasoning_effort: None,
+                cli_runtime_options: None,
+                updated_at_unix: 42,
+            },
+            prepared,
+        );
+
+        assert_eq!(
+            reduction.turn_start_params_plan.mode,
+            Some(ThreadMode::Agent)
+        );
+        assert_eq!(reduction.send_context.mode, ThreadMode::Agent);
+        assert!(matches!(
+            reduction.local_turn_start_requested_event,
+            crate::conversation::ConversationEvent::LocalTurnStartRequested {
+                mode: ThreadMode::Agent,
+                ..
+            }
+        ));
     }
 
     #[test]

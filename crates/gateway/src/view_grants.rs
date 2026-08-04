@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use pioneer_config::GatewayArtifactsConfig;
-use pioneer_protocol::{
-    ArtifactProjectionKind, AuthSessionId, GatewayId, PrincipalId,
-};
+use pioneer_protocol::{ArtifactProjectionKind, AuthSessionId, GatewayId, PrincipalId};
 use rand::fill;
 use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -183,7 +181,10 @@ impl fmt::Debug for StoredViewGrant {
             .field("protocol_version", &self.protocol_version)
             .field("issued_at_unix", &self.issued_at_unix)
             .field("expires_at_unix", &self.expires_at_unix)
-            .field("available_concurrency", &self.concurrency.available_permits())
+            .field(
+                "available_concurrency",
+                &self.concurrency.available_permits(),
+            )
             .finish()
     }
 }
@@ -294,10 +295,7 @@ impl ViewGrantService {
         }))
     }
 
-    pub(crate) fn mint(
-        &self,
-        scope: ViewGrantScope,
-    ) -> Result<IssuedViewGrant, ViewGrantError> {
+    pub(crate) fn mint(&self, scope: ViewGrantScope) -> Result<IssuedViewGrant, ViewGrantError> {
         if let Err(error) = scope.validate() {
             record_view_grant_event("rejected", "invalid_scope");
             return Err(error);
@@ -306,10 +304,12 @@ impl ViewGrantService {
             record_view_grant_event("rejected", "clock");
             error
         })?;
-        let expires_at_unix = issued_at_unix.checked_add(self.limits.ttl_secs).ok_or_else(|| {
-            record_view_grant_event("rejected", "clock");
-            ViewGrantError::Clock
-        })?;
+        let expires_at_unix = issued_at_unix
+            .checked_add(self.limits.ttl_secs)
+            .ok_or_else(|| {
+                record_view_grant_event("rejected", "clock");
+                ViewGrantError::Clock
+            })?;
         let mut state = self.lock_state();
         if !state.accepting {
             record_view_grant_event("rejected", "shutting_down");
@@ -440,8 +440,7 @@ impl ViewGrantService {
             if let Some(grant) = state.grants.remove(&hash) {
                 record_view_grant_event("expired", "ttl_elapsed");
                 grant.cancellation.cancel();
-                if let Some(session_grants) =
-                    state.by_session.get_mut(&grant.scope.auth_session_id)
+                if let Some(session_grants) = state.by_session.get_mut(&grant.scope.auth_session_id)
                 {
                     session_grants.remove(&hash);
                     if session_grants.is_empty() {
@@ -461,16 +460,14 @@ impl ViewGrantService {
     }
 
     fn lock_state(&self) -> MutexGuard<'_, ViewGrantState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 fn record_view_grant_event(outcome: &'static str, reason_code: &'static str) {
-    tracing::debug!(
-        event = "view_grant_lifecycle",
-        outcome,
-        reason_code,
-    );
+    tracing::debug!(event = "view_grant_lifecycle", outcome, reason_code,);
 }
 
 #[async_trait]
@@ -714,7 +711,10 @@ mod tests {
 
         let mut invalid = scope("2");
         invalid.version_id = "x".repeat(MAX_SCOPE_ID_BYTES + 1);
-        assert!(matches!(service.mint(invalid), Err(ViewGrantError::InvalidScope)));
+        assert!(matches!(
+            service.mint(invalid),
+            Err(ViewGrantError::InvalidScope)
+        ));
     }
 
     #[test]

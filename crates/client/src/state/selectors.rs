@@ -669,6 +669,7 @@ mod tests {
                 thread_id: "thread_a".to_owned(),
                 turn_id: "turn_a".to_owned(),
                 pending_request_id: "request_a".to_owned(),
+                mode: pioneer_protocol::ThreadMode::Agent,
                 user_text: "hello".to_owned(),
                 attachments: Vec::new(),
             });
@@ -720,6 +721,7 @@ mod tests {
                     thread_id: thread_id.to_owned(),
                     turn_id: format!("{thread_id}_turn"),
                     pending_request_id: format!("{thread_id}_request"),
+                    mode: pioneer_protocol::ThreadMode::Agent,
                     user_text: "hello".to_owned(),
                     attachments: Vec::new(),
                 });
@@ -769,6 +771,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             turn_id: "turn_a".to_owned(),
             pending_request_id: "request_a".to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             user_text: "hello".to_owned(),
             attachments: Vec::new(),
         });
@@ -781,6 +784,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             turn_id: "turn_a".to_owned(),
             pending_request_id: "request_a".to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
         });
         assert_eq!(
             active_thread_phase_snapshot(Some(&conversation)),

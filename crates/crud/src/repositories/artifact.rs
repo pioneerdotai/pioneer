@@ -371,6 +371,100 @@ impl ArtifactRepository {
         summary_from_models(artifact, version, blob, bindings, preview)
     }
 
+    pub async fn list_exact_artifact_refs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace_id: &str,
+        requested: &[(String, String)],
+    ) -> ArtifactCrudResult<HashMap<(String, String), ArtifactRef>> {
+        let requested = requested.iter().cloned().collect::<HashSet<_>>();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let artifact_ids = requested
+            .iter()
+            .map(|(artifact_id, _)| artifact_id.clone())
+            .collect::<HashSet<_>>();
+        let version_ids = requested
+            .iter()
+            .map(|(_, version_id)| version_id.clone())
+            .collect::<HashSet<_>>();
+        let artifacts = artifact::Entity::find()
+            .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact::Column::Id.is_in(artifact_ids.into_iter().collect::<Vec<_>>()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to load exact artifact references".to_owned(),
+                source,
+            })?
+            .into_iter()
+            .map(|artifact| (artifact.id.clone(), artifact))
+            .collect::<HashMap<_, _>>();
+        let versions = artifact_version::Entity::find()
+            .filter(artifact_version::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_version::Column::Id.is_in(version_ids.into_iter().collect::<Vec<_>>()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to load exact artifact versions".to_owned(),
+                source,
+            })?
+            .into_iter()
+            .filter(|version| {
+                requested.contains(&(version.artifact_id.clone(), version.id.clone()))
+            })
+            .map(|version| (version.id.clone(), version))
+            .collect::<HashMap<_, _>>();
+        let blob_ids = versions
+            .values()
+            .map(|version| version.blob_id.clone())
+            .collect::<HashSet<_>>();
+        let blobs = artifact_blob::Entity::find()
+            .filter(artifact_blob::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_blob::Column::Id.is_in(blob_ids.into_iter().collect::<Vec<_>>()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to load exact artifact blobs".to_owned(),
+                source,
+            })?
+            .into_iter()
+            .map(|blob| (blob.id.clone(), blob))
+            .collect::<HashMap<_, _>>();
+
+        let mut refs = HashMap::new();
+        for (artifact_id, version_id) in requested {
+            let Some(artifact) = artifacts.get(artifact_id.as_str()) else {
+                continue;
+            };
+            let Some(version) = versions
+                .get(version_id.as_str())
+                .filter(|version| version.artifact_id == artifact_id)
+            else {
+                continue;
+            };
+            let Some(blob) = blobs.get(version.blob_id.as_str()) else {
+                continue;
+            };
+            refs.insert(
+                (artifact_id.clone(), version_id.clone()),
+                ArtifactRef {
+                    artifact_id,
+                    version_id: Some(version_id),
+                    display_name: artifact.display_name.clone(),
+                    kind: kind_from_db(artifact.kind.as_str())?,
+                    mime_type: artifact.mime_type.clone(),
+                    size_bytes: u64::try_from(blob.size_bytes).ok(),
+                    sha256: Some(blob.sha256.clone()),
+                    status: status_from_db(artifact.status.as_str())?,
+                    preview: None,
+                },
+            );
+        }
+        Ok(refs)
+    }
+
     pub async fn get_artifact_version_blob<C: ConnectionTrait>(
         &self,
         db: &C,

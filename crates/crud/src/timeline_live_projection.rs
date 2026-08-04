@@ -66,6 +66,12 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
                 )
             })?;
         }
+        TurnEventPayload::TurnMessageEdited(payload) => {
+            project_turn_message_mutation(db, event, payload.input.len()).await?;
+        }
+        TurnEventPayload::TurnMessageDeleted(_) => {
+            project_turn_message_mutation(db, event, 0).await?;
+        }
         TurnEventPayload::TurnCompleted(_)
         | TurnEventPayload::TurnFailed(_)
         | TurnEventPayload::TurnBlocked(_) => {
@@ -86,6 +92,47 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
     }
 
     Ok(())
+}
+
+async fn project_turn_message_mutation<C: ConnectionTrait>(
+    db: &C,
+    event: &AppendedTurnEvent,
+    input_count: usize,
+) -> Result<()> {
+    let turn_model = turn::find_turn_by_id(db, event.turn_id.as_str())
+        .await?
+        .context("Turn message mutation projection cannot find its Turn")?;
+    if turn_model.send_mode.as_deref() != Some("message") {
+        anyhow::bail!("Turn message mutation projection found a non-Message Turn");
+    }
+    let thread_model = thread::find_thread_by_id(db, turn_model.thread_id.as_str())
+        .await?
+        .context("Turn message mutation projection cannot find its thread")?;
+    timeline_repository::upsert_thread_timeline_block(
+        db,
+        ThreadTimelineBlockRecord {
+            block_id: user_block_id(turn_model.id.as_str()),
+            workspace_id: thread_model.workspace_id,
+            thread_id: thread_model.id,
+            turn_id: Some(turn_model.id.clone()),
+            block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
+            sort_key: turn_block_sort_key(&turn_model, 0, "user"),
+            source_kind: Some("turn_input".to_owned()),
+            source_key: Some(turn_model.id),
+            started_at: Some(turn_model.created_at),
+            completed_at: Some(turn_model.created_at),
+            metadata_json: json!({
+                "turnId": event.turn_id,
+                "inputCount": input_count,
+                "messageRevision": turn_model.message_revision,
+                "messageDeleted": turn_model.message_deleted_at.is_some(),
+            })
+            .to_string(),
+            created_at: turn_model.created_at,
+            updated_at: event.created_at,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
@@ -203,6 +250,17 @@ async fn project_turn_started<C: ConnectionTrait>(
             },
         )
         .await?;
+    }
+
+    if turn_model.send_mode.as_deref() == Some("message") {
+        timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_turn_work_items_for_turn(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            work_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        return Ok(());
     }
 
     if detached_task_run_origin_hint(&turn_model) {
@@ -410,6 +468,22 @@ async fn project_terminal_turn_event<C: ConnectionTrait>(
             turn_model.thread_id
         );
     };
+
+    if turn_model.send_mode.as_deref() == Some("message") {
+        timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_turn_work_items_for_turn(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            work_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            terminal_state_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let mut after_order_key: Option<String> = None;
     loop {
@@ -1173,6 +1247,8 @@ fn payload_item_id(payload: &TurnEventPayload) -> Option<&str> {
         | TurnEventPayload::TurnExecutionWindowContinued(_)
         | TurnEventPayload::TurnExecutionWindowBlocked(_)
         | TurnEventPayload::TurnPermissionAudit(_)
+        | TurnEventPayload::TurnMessageEdited(_)
+        | TurnEventPayload::TurnMessageDeleted(_)
         | TurnEventPayload::TurnCompleted(_)
         | TurnEventPayload::TurnFailed(_)
         | TurnEventPayload::TurnBlocked(_) => None,

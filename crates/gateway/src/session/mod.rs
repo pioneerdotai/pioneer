@@ -186,6 +186,25 @@ impl SessionManager {
         session_ids
     }
 
+    /// Returns every live connection for one durable principal. Callers must
+    /// still reauthorize the concrete resource immediately before delivery.
+    pub(crate) async fn connection_ids_for_principal(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Vec<ConnectionId> {
+        let mut connection_ids = self
+            .connections
+            .read()
+            .await
+            .iter()
+            .filter_map(|(connection_id, connection)| {
+                (&connection.principal.principal_id == principal_id).then_some(*connection_id)
+            })
+            .collect::<Vec<_>>();
+        connection_ids.sort_unstable();
+        connection_ids
+    }
+
     pub(crate) async fn connection_context(
         &self,
         connection_id: ConnectionId,
@@ -358,9 +377,9 @@ mod tests {
         register_authenticated_test_connection,
     };
     use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use axum::extract::ws::Message;
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use axum::extract::ws::Message;
 
     fn peer_session_principal() -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
         let mut principal = (*authenticated_test_superuser()).clone();
@@ -544,6 +563,12 @@ mod tests {
                 .session_ids_for_principal(&principal_a.principal_id)
                 .await,
             vec![principal_a.session_id.clone()]
+        );
+        assert_eq!(
+            manager
+                .connection_ids_for_principal(&principal_a.principal_id)
+                .await,
+            vec![connection_a, connection_b]
         );
     }
 

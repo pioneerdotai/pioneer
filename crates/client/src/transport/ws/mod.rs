@@ -172,7 +172,10 @@ mod tests {
                 connection_id: 7,
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:17878",
+                )
+                .unwrap(),
             },
             GatewayWsEvent::Reconnecting {
                 connection_id: 7,
@@ -187,7 +190,10 @@ mod tests {
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
                 endpoint_kind: GatewayEndpointKind::Local,
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:17878",
+                )
+                .unwrap(),
                 reason: "closed".to_owned(),
             },
             GatewayWsEvent::ConnectFailed {
@@ -195,7 +201,10 @@ mod tests {
                 endpoint_id: "local".to_owned(),
                 endpoint_name: "Local".to_owned(),
                 endpoint_kind: GatewayEndpointKind::Local,
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                    "127.0.0.1:17878",
+                )
+                .unwrap(),
                 error: "refused".to_owned(),
             },
             GatewayWsEvent::Notification {
@@ -215,7 +224,10 @@ mod tests {
             connection_id: 7,
             endpoint_id: "local".to_owned(),
             endpoint_name: "Local".to_owned(),
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("127.0.0.1:17878").unwrap(),
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "127.0.0.1:17878",
+            )
+            .unwrap(),
         };
 
         assert!(should_apply_ws_event(Some(7), &event));

@@ -65,21 +65,19 @@ impl ClientFfiAvatarCache {
         let authority = Arc::new(FfiAvatarHttpAuthority {
             sender: sender.clone(),
         });
-        let session = GatewayHttpSession::from_access(&access, authority)
-            .map_err(|_| {
-                ClientFfiError::new(
-                    "Gateway endpoint is unavailable for avatar access",
-                    AVATAR_RECONFIGURATION_CODE,
-                )
-            })?;
-        let service = AvatarCacheService::new(
-            session,
-            runtime_home,
-            access.gateway_id,
-            access.session_id,
-        );
+        let session = GatewayHttpSession::from_access(&access, authority).map_err(|_| {
+            ClientFfiError::new(
+                "Gateway endpoint is unavailable for avatar access",
+                AVATAR_RECONFIGURATION_CODE,
+            )
+        })?;
+        let service =
+            AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
         let runtime = Runtime::new().map_err(|_| {
-            ClientFfiError::new("avatar cache runtime is unavailable", "avatar_cache_unavailable")
+            ClientFfiError::new(
+                "avatar cache runtime is unavailable",
+                "avatar_cache_unavailable",
+            )
         })?;
         let result = runtime
             .block_on(service.resolve(
@@ -175,7 +173,10 @@ mod tests {
         let value = serde_json::to_value(result).unwrap();
         assert!(value.get("cached_image_path").is_some());
         for forbidden in ["content", "content_base64", "access_token", "authorization"] {
-            assert!(value.get(forbidden).is_none(), "forbidden FFI field {forbidden}");
+            assert!(
+                value.get(forbidden).is_none(),
+                "forbidden FFI field {forbidden}"
+            );
         }
     }
 

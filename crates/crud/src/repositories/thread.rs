@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
-use pioneer_entity::thread;
+use pioneer_entity::{thread, thread_read_cursor};
 use pioneer_protocol::{
-    PersistedActorRef, PrincipalId, Thread, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+    PersistedActorRef, PrincipalId, Thread, ThreadOriginKind, ThreadReadCursor,
+    ThreadSidebarVisibility, ThreadStatus,
 };
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement,
 };
 
 use crate::convention::{
@@ -16,6 +17,131 @@ use crate::convention::{
     thread_status_to_db,
 };
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
+
+pub async fn find_thread_read_cursor<C: ConnectionTrait>(
+    db: &C,
+    principal_id: &PrincipalId,
+    thread_id: &str,
+) -> Result<Option<thread_read_cursor::Model>> {
+    thread_read_cursor::Entity::find_by_id((principal_id.to_string(), thread_id.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query thread read cursor")
+}
+
+pub fn thread_read_cursor_from_model(model: &thread_read_cursor::Model) -> ThreadReadCursor {
+    ThreadReadCursor {
+        through_turn_id: model.last_read_turn_id.clone(),
+        sort_key: model.last_read_sort_key.clone(),
+    }
+}
+
+/// Replaces an automatically-derived thread preview without overwriting a
+/// preview that another committed operation has already changed.
+pub async fn replace_thread_preview_if_matches<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    expected_preview: &str,
+    replacement_preview: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = thread::Entity::update_many()
+        .col_expr(
+            thread::Column::Preview,
+            Expr::value(replacement_preview.to_owned()),
+        )
+        .col_expr(thread::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(thread::Column::Id.eq(thread_id.to_owned()))
+        .filter(thread::Column::Preview.eq(expected_preview.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to replace derived thread preview")?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Applies only the thread fields owned by an immediately-completed Message.
+///
+/// The TurnStarted payload carries a full Thread snapshot for compatibility
+/// with the canonical event envelope. Re-upserting that snapshot would let a
+/// concurrent Message restore stale execution or management state. The
+/// Message transition owns only the first derived preview and a monotonic
+/// activity timestamp on an already-persisted Thread.
+pub async fn touch_thread_for_completed_message<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    derived_preview: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    if !derived_preview.is_empty() {
+        thread::Entity::update_many()
+            .col_expr(
+                thread::Column::Preview,
+                Expr::value(derived_preview.to_owned()),
+            )
+            .filter(thread::Column::Id.eq(thread_id.to_owned()))
+            .filter(thread::Column::Preview.eq(String::new()))
+            .exec(db)
+            .await
+            .context("failed to initialize thread preview from Message")?;
+    }
+
+    thread::Entity::update_many()
+        .col_expr(thread::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(thread::Column::Id.eq(thread_id.to_owned()))
+        .filter(thread::Column::UpdatedAt.lt(updated_at))
+        .exec(db)
+        .await
+        .context("failed to advance thread activity from Message")?;
+
+    Ok(())
+}
+
+/// Atomically advances a cursor and never permits a concurrent older position
+/// to overwrite a newer one. Authorization and anchor validation remain with
+/// the caller's existing transaction owner.
+pub async fn advance_thread_read_cursor<C: ConnectionTrait>(
+    db: &C,
+    principal_id: &PrincipalId,
+    thread_id: &str,
+    last_read_sort_key: &str,
+    last_read_turn_id: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    if last_read_sort_key.is_empty() || last_read_sort_key.len() > 128 {
+        anyhow::bail!("thread read sort key must contain between 1 and 128 bytes");
+    }
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        anyhow::bail!("thread read cursor persistence requires the SQLite store");
+    }
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            r#"
+                INSERT INTO thread_read_cursor (
+                    principal_id,
+                    thread_id,
+                    last_read_sort_key,
+                    last_read_turn_id,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(principal_id, thread_id) DO UPDATE SET
+                    last_read_sort_key = excluded.last_read_sort_key,
+                    last_read_turn_id = excluded.last_read_turn_id,
+                    updated_at = excluded.updated_at
+                WHERE excluded.last_read_sort_key > thread_read_cursor.last_read_sort_key
+            "#,
+            vec![
+                principal_id.to_string().into(),
+                thread_id.to_owned().into(),
+                last_read_sort_key.to_owned().into(),
+                last_read_turn_id.to_owned().into(),
+                updated_at.into(),
+            ],
+        ))
+        .await
+        .context("failed to advance thread read cursor")?;
+    Ok(result.rows_affected() > 0)
+}
 
 pub async fn upsert_thread<C: ConnectionTrait>(
     db: &C,

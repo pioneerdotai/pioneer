@@ -26,8 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     ArtifactBoundedReadRequest, ArtifactProjectionRecord, ArtifactRegistrationCandidate,
     ArtifactRegistrationContext, ArtifactRegistrationSource, ArtifactService,
-    PIONEER_ARTIFACT_OUTPUT_DIR_ENV,
-    mime::display_name_with_mime_extension,
+    PIONEER_ARTIFACT_OUTPUT_DIR_ENV, mime::display_name_with_mime_extension,
 };
 
 pub const ARTIFACT_PREPARE_TOOL: &str = "artifact_prepare";

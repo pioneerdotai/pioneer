@@ -1,23 +1,27 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, MemoryActorKind, MemoryCandidateStatus,
     MemoryCategory, MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind,
     MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
     MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
-    PromptManifestProfile, ProviderFailureClass, ProviderFailureStage, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
+    NewMemberProfile, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
+    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
     TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
     TaskOwnerKind, TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind,
     TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
     TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
-    TurnItemType, TurnPermissionMode, TurnPermissionProfileSource, TurnStatus, UserInput,
+    ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus,
+    TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
+    TurnPermissionProfileSource, TurnStatus, UserInput,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
 pub const DB_ID_LEN: usize = 21;
+pub const TURN_MENTIONS_JSON_MAX_BYTES: usize = 65_536;
+pub const TURN_MENTION_MAX_COUNT: usize = 64;
+pub const TURN_AUTHOR_AVATAR_REVISION_MAX_BYTES: usize = 64;
 
 pub const TURN_ITEM_STATUS_IN_PROGRESS: &str = "in_progress";
 pub const TURN_ITEM_STATUS_COMPLETED: &str = "completed";
@@ -366,6 +370,7 @@ pub fn sandbox_mode_to_db(mode: SandboxMode) -> &'static str {
 
 pub fn thread_mode_to_db(mode: ThreadMode) -> &'static str {
     match mode {
+        ThreadMode::Message => "message",
         ThreadMode::Chat => "chat",
         ThreadMode::Agent => "agent",
     }
@@ -417,10 +422,105 @@ pub fn thread_sidebar_visibility_from_db(value: &str) -> Option<ThreadSidebarVis
 
 pub fn thread_mode_from_db(value: &str) -> Option<ThreadMode> {
     match value {
+        "message" => Some(ThreadMode::Message),
         "chat" => Some(ThreadMode::Chat),
         "agent" => Some(ThreadMode::Agent),
         _ => None,
     }
+}
+
+/// Read-time interpretation of a persisted Turn mode.
+///
+/// A pre-Epic-6 null value renders as Chat for compatibility, but it never
+/// becomes eligible for Message mutations. Eligibility is derived only from
+/// the raw persisted `message` discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedTurnSendMode {
+    pub effective_mode: ThreadMode,
+    pub message_mutation_eligible: bool,
+}
+
+pub fn turn_send_mode_to_db(mode: ThreadMode) -> &'static str {
+    thread_mode_to_db(mode)
+}
+
+pub fn turn_send_mode_from_db(value: Option<&str>) -> Result<PersistedTurnSendMode> {
+    match value {
+        None => Ok(PersistedTurnSendMode {
+            effective_mode: ThreadMode::Chat,
+            message_mutation_eligible: false,
+        }),
+        Some("message") => Ok(PersistedTurnSendMode {
+            effective_mode: ThreadMode::Message,
+            message_mutation_eligible: true,
+        }),
+        Some("chat") => Ok(PersistedTurnSendMode {
+            effective_mode: ThreadMode::Chat,
+            message_mutation_eligible: false,
+        }),
+        Some("agent") => Ok(PersistedTurnSendMode {
+            effective_mode: ThreadMode::Agent,
+            message_mutation_eligible: false,
+        }),
+        Some(unknown) => bail!("unknown persisted Turn send mode `{unknown}`"),
+    }
+}
+
+pub fn canonical_turn_mentions_json(mentions: &[TurnMention]) -> Result<String> {
+    if mentions.len() > TURN_MENTION_MAX_COUNT {
+        bail!("Turn mentions exceed the maximum of {TURN_MENTION_MAX_COUNT} entries");
+    }
+
+    let mut canonical = mentions.to_vec();
+    canonical.sort_by(|left, right| left.principal_id.cmp(&right.principal_id));
+    canonical.dedup_by(|left, right| left.principal_id == right.principal_id);
+    for mention in &canonical {
+        validate_turn_mention(mention)?;
+    }
+
+    let encoded = serde_json::to_string(&canonical).context("failed to encode Turn mentions")?;
+    if encoded.len() > TURN_MENTIONS_JSON_MAX_BYTES {
+        bail!("encoded Turn mentions exceed {TURN_MENTIONS_JSON_MAX_BYTES} bytes");
+    }
+    Ok(encoded)
+}
+
+pub fn turn_mentions_from_db(value: &str) -> Result<Vec<TurnMention>> {
+    if value.len() > TURN_MENTIONS_JSON_MAX_BYTES {
+        bail!("persisted Turn mentions exceed {TURN_MENTIONS_JSON_MAX_BYTES} bytes");
+    }
+    let decoded = serde_json::from_str::<Vec<TurnMention>>(value)
+        .context("failed to decode persisted Turn mentions")?;
+    let canonical = canonical_turn_mentions_json(&decoded)?;
+    let canonical_decoded = serde_json::from_str::<Vec<TurnMention>>(&canonical)
+        .context("failed to decode canonical Turn mentions")?;
+    Ok(canonical_decoded)
+}
+
+pub fn validate_turn_author_snapshot(snapshot: &TurnAuthorSnapshot) -> Result<()> {
+    let validated = NewMemberProfile::new(
+        snapshot.display_name.clone(),
+        snapshot.nickname.clone(),
+        None,
+    )
+    .context("invalid Turn author profile snapshot")?;
+    if validated.display_name != snapshot.display_name {
+        bail!("Turn author display-name snapshot is not canonical");
+    }
+    if snapshot.avatar_revision.as_ref().is_some_and(|revision| {
+        revision.is_empty()
+            || revision.len() > TURN_AUTHOR_AVATAR_REVISION_MAX_BYTES
+            || revision.chars().any(char::is_control)
+    }) {
+        bail!("invalid Turn author avatar revision snapshot");
+    }
+    Ok(())
+}
+
+fn validate_turn_mention(mention: &TurnMention) -> Result<()> {
+    NewMemberProfile::new("Mention snapshot", mention.nickname.clone(), None)
+        .context("invalid Turn mention nickname snapshot")?;
+    Ok(())
 }
 
 pub fn thread_status_from_db(value: &str) -> Option<ThreadStatus> {
@@ -1184,15 +1284,20 @@ pub fn prompt_manifest_profile_to_db(profile: PromptManifestProfile) -> &'static
 #[cfg(test)]
 mod tests {
     use super::{
-        recovery_job_status_from_db, recovery_job_status_to_db, sandbox_mode_to_db,
-        thread_mode_from_db, thread_mode_to_db, thread_status_from_db, thread_status_to_db,
+        canonical_turn_mentions_json, recovery_job_status_from_db, recovery_job_status_to_db,
+        sandbox_mode_to_db, thread_mode_from_db, thread_mode_to_db, thread_status_from_db,
+        thread_status_to_db, turn_mentions_from_db, turn_send_mode_from_db, turn_send_mode_to_db,
         turn_status_from_db, turn_status_to_db,
     };
-    use pioneer_protocol::{RecoveryJobStatus, SandboxMode, ThreadMode, ThreadStatus, TurnStatus};
+    use pioneer_protocol::{
+        PrincipalId, RecoveryJobStatus, SandboxMode, ThreadMode, ThreadStatus, TurnMention,
+        TurnStatus,
+    };
 
     #[test]
     fn db_values_are_snake_case() {
         assert_eq!(sandbox_mode_to_db(SandboxMode::FullAccess), "full_access");
+        assert_eq!(thread_mode_to_db(ThreadMode::Message), "message");
         assert_eq!(thread_mode_to_db(ThreadMode::Chat), "chat");
         assert_eq!(thread_mode_to_db(ThreadMode::Agent), "agent");
         assert_eq!(thread_status_to_db(ThreadStatus::Active), "active");
@@ -1238,6 +1343,7 @@ mod tests {
 
     #[test]
     fn thread_mode_and_status_parser_accept_snake_case_only() {
+        assert_eq!(thread_mode_from_db("message"), Some(ThreadMode::Message));
         assert_eq!(thread_mode_from_db("chat"), Some(ThreadMode::Chat));
         assert_eq!(thread_mode_from_db("agent"), Some(ThreadMode::Agent));
         assert_eq!(thread_mode_from_db("Chat"), None);
@@ -1246,6 +1352,44 @@ mod tests {
         assert_eq!(thread_status_from_db("idle"), Some(ThreadStatus::Idle));
         assert_eq!(thread_status_from_db("closed"), Some(ThreadStatus::Closed));
         assert_eq!(thread_status_from_db("Active"), None);
+    }
+
+    #[test]
+    fn persisted_turn_mode_keeps_legacy_null_history_immutable() {
+        let legacy = turn_send_mode_from_db(None).expect("legacy null mode should remain readable");
+        assert_eq!(legacy.effective_mode, ThreadMode::Chat);
+        assert!(!legacy.message_mutation_eligible);
+
+        let message = turn_send_mode_from_db(Some(turn_send_mode_to_db(ThreadMode::Message)))
+            .expect("message mode should decode");
+        assert_eq!(message.effective_mode, ThreadMode::Message);
+        assert!(message.message_mutation_eligible);
+        assert!(turn_send_mode_from_db(Some("Message")).is_err());
+    }
+
+    #[test]
+    fn turn_mentions_are_deduplicated_and_encoded_in_principal_order() {
+        let principal_a = PrincipalId::new("P00000000000000000001").unwrap();
+        let principal_b = PrincipalId::new("P00000000000000000002").unwrap();
+        let encoded = canonical_turn_mentions_json(&[
+            TurnMention {
+                principal_id: principal_b.clone(),
+                nickname: "member_b".to_owned(),
+            },
+            TurnMention {
+                principal_id: principal_a.clone(),
+                nickname: "member_a".to_owned(),
+            },
+            TurnMention {
+                principal_id: principal_b,
+                nickname: "member_b".to_owned(),
+            },
+        ])
+        .expect("mentions should encode");
+        let decoded = turn_mentions_from_db(encoded.as_str()).expect("mentions should decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].principal_id, principal_a);
+        assert_eq!(canonical_turn_mentions_json(&decoded).unwrap(), encoded);
     }
 }
 

@@ -1,10 +1,10 @@
 use pioneer_protocol::{
     AuthSessionId, AuthSessionTerminationReason, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
     InvitationId, JsonRpcErrorResponse, JsonRpcResponse, MemberChangedNotification,
-    MemberDeviceCreateParams, MemberDeviceCreateResponse,
-    MemberListParams, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, PrincipalId,
-    RequestId, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
-    WorkspaceMemberRemoveParams, WorkspaceMembersChangedNotification, constants::events,
+    MemberDeviceCreateParams, MemberDeviceCreateResponse, MemberListParams, MemberRemoveParams,
+    MemberRestoreParams, MemberSuspendParams, PrincipalId, RequestId, WorkspaceId,
+    WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
+    WorkspaceMembersChangedNotification, constants::events,
 };
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -12,8 +12,7 @@ use tracing::warn;
 use crate::auth::AuthErrorCode;
 use crate::authorization::{
     AccessChangeKind, AuthorizationExternalError, AuthorizedMemberDirectory,
-    AuthorizedMemberPrincipal, AuthorizedWorkspace,
-    external_error_for_decision,
+    AuthorizedMemberPrincipal, AuthorizedWorkspace, external_error_for_decision,
 };
 use crate::epic5_observability::{Epic5Operation, Epic5Outcome, record_latency, record_outcome};
 use crate::member::{MemberService, MemberServiceError};

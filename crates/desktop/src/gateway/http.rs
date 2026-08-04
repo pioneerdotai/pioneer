@@ -5,12 +5,10 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use pioneer_client::{
     artifacts::http_download::{
-        ArtifactHttpDownloadError, ArtifactHttpDownloadProgressSink,
-        ArtifactHttpDownloadRequest, ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
+        ArtifactHttpDownloadError, ArtifactHttpDownloadProgressSink, ArtifactHttpDownloadRequest,
+        ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
     },
-    artifacts::preview::{
-        ArtifactHttpPreviewService, ArtifactPreviewReadData,
-    },
+    artifacts::preview::{ArtifactHttpPreviewService, ArtifactPreviewReadData},
     gateway::endpoint::GatewayBaseUrl,
     transport::{
         http::{
@@ -67,11 +65,8 @@ impl DesktopGatewayHttpClient {
             endpoint_id: endpoint.id.clone(),
             sender,
         });
-        let session = GatewayHttpSession::from_endpoint(
-            endpoint,
-            access.session_id.clone(),
-            authority,
-        )?;
+        let session =
+            GatewayHttpSession::from_endpoint(endpoint, access.session_id.clone(), authority)?;
         let downloads = ArtifactHttpDownloadService::new(session.clone(), runtime_home.clone());
         let previews = ArtifactHttpPreviewService::new(session.clone());
         let runtime = Runtime::new().map_err(|_| GatewayHttpError::ServiceUnavailable)?;
@@ -121,11 +116,10 @@ impl DesktopGatewayHttpClient {
         artifact: &ArtifactRef,
         cancellation: CancellationToken,
     ) -> anyhow::Result<ArtifactPreviewReadData> {
-        self.runtime.block_on(self.previews.fetch_thumbnail(
-            workspace_id,
-            artifact,
-            cancellation,
-        ))
+        self.runtime.block_on(
+            self.previews
+                .fetch_thumbnail(workspace_id, artifact, cancellation),
+        )
     }
 }
 

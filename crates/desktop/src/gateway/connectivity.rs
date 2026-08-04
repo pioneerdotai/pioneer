@@ -13,8 +13,13 @@ pub(crate) fn is_gateway_reachable(
     gateway_base_url: &GatewayBaseUrl,
     connect_timeout: Duration,
 ) -> Result<bool> {
-    is_client_gateway_reachable(gateway_base_url, connect_timeout)
-        .context(t!("errors.gateway.resolve_failed", listen_addr = gateway_base_url.as_str()).to_string())
+    is_client_gateway_reachable(gateway_base_url, connect_timeout).context(
+        t!(
+            "errors.gateway.resolve_failed",
+            listen_addr = gateway_base_url.as_str()
+        )
+        .to_string(),
+    )
 }
 
 pub(crate) fn is_local_gateway_reachable(
@@ -45,13 +50,14 @@ pub(crate) fn validate_remote_gateway_base_url(
         ),
         Err(RemoteGatewayValidationError::InvalidTimeout { timeout_ms }) => bail!(
             "{}",
-            t!("errors.gateway.validation_timeout_positive", timeout_ms = timeout_ms)
+            t!(
+                "errors.gateway.validation_timeout_positive",
+                timeout_ms = timeout_ms
+            )
         ),
-        Err(RemoteGatewayValidationError::InvalidGatewayBaseUrl(error)) => {
-            Err(error).context(t!("errors.gateway.invalid_address", normalized = "[redacted]").to_string())
-        }
-        Err(RemoteGatewayValidationError::ResolveFailed { source, .. }) => {
-            Err(source).context(t!("errors.gateway.resolve_failed", listen_addr = "[redacted]").to_string())
-        }
+        Err(RemoteGatewayValidationError::InvalidGatewayBaseUrl(error)) => Err(error)
+            .context(t!("errors.gateway.invalid_address", normalized = "[redacted]").to_string()),
+        Err(RemoteGatewayValidationError::ResolveFailed { source, .. }) => Err(source)
+            .context(t!("errors.gateway.resolve_failed", listen_addr = "[redacted]").to_string()),
     }
 }

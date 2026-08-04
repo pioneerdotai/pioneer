@@ -1,8 +1,7 @@
 use pioneer_artifacts::ArtifactError;
 use pioneer_protocol::{
-    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
-    ArtifactViewGrantDisposition, JsonRpcErrorResponse, RequestId,
-    constants::methods,
+    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse, ArtifactViewGrantDisposition,
+    JsonRpcErrorResponse, RequestId, constants::methods,
 };
 
 use super::super::*;
@@ -194,7 +193,9 @@ mod tests {
     fn view_grant_scope_identifiers_are_non_empty_and_bounded() {
         assert!(valid_scope_id("artifact-1"));
         assert!(!valid_scope_id(""));
-        assert!(valid_scope_id("x".repeat(MAX_VIEW_GRANT_SCOPE_ID_BYTES).as_str()));
+        assert!(valid_scope_id(
+            "x".repeat(MAX_VIEW_GRANT_SCOPE_ID_BYTES).as_str()
+        ));
         assert!(!valid_scope_id(
             "x".repeat(MAX_VIEW_GRANT_SCOPE_ID_BYTES + 1).as_str()
         ));

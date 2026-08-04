@@ -266,11 +266,8 @@ pub fn copy_cached_download_to_destination(
             download.sha256.as_str(),
             Some(download.size_bytes),
         )?;
-        let final_path = publish_without_overwrite(
-            part_path.as_path(),
-            destination_dir,
-            display_name,
-        )?;
+        let final_path =
+            publish_without_overwrite(part_path.as_path(), destination_dir, display_name)?;
         let _ = fs::remove_file(part_path.as_path());
         sync_directory(destination_dir)?;
         Ok(final_path)
@@ -551,7 +548,10 @@ fn path_is_occupied(path: &Path) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).with_context(|| {
-            format!("failed to inspect artifact destination `{}`", path.display())
+            format!(
+                "failed to inspect artifact destination `{}`",
+                path.display()
+            )
         }),
     }
 }
@@ -564,9 +564,8 @@ fn bounded_artifact_file_name(file_name: &str) -> String {
         .extension()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty() && value.len() <= MAX_DESTINATION_EXTENSION_BYTES);
-    let suffix_len = 1
-        + DESTINATION_FILE_NAME_HASH_CHARS
-        + extension.map_or(0, |value| value.len() + 1);
+    let suffix_len =
+        1 + DESTINATION_FILE_NAME_HASH_CHARS + extension.map_or(0, |value| value.len() + 1);
     let stem_budget = MAX_DESTINATION_FILE_NAME_BYTES.saturating_sub(suffix_len);
     let stem = path
         .file_stem()
@@ -586,7 +585,12 @@ fn sync_directory(path: &Path) -> Result<()> {
     fs::File::open(path)
         .with_context(|| format!("failed to open artifact destination `{}`", path.display()))?
         .sync_all()
-        .with_context(|| format!("failed to synchronize artifact destination `{}`", path.display()))
+        .with_context(|| {
+            format!(
+                "failed to synchronize artifact destination `{}`",
+                path.display()
+            )
+        })
 }
 
 #[cfg(not(unix))]
@@ -825,11 +829,8 @@ mod tests {
             Some(digest.clone()),
         ));
 
-        let request = plan_artifact_http_download_request(
-            Some(" remote-1 ".to_owned()),
-            &summary,
-        )
-        .expect("HTTP plan");
+        let request = plan_artifact_http_download_request(Some(" remote-1 ".to_owned()), &summary)
+            .expect("HTTP plan");
 
         assert_eq!(request.gateway_profile_id, "remote-1");
         assert_eq!(request.workspace_id, "ws_1");

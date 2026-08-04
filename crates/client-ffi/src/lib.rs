@@ -35,13 +35,13 @@ use artifacts::{
     ClientArtifactDownloadProgressResult, ClientArtifactDownloadRequest,
     ClientArtifactDownloadResult, ClientArtifactTargetRequest, ClientArtifactViewOpenResult,
 };
-use avatars::{
-    ClientFfiAvatarCache, ClientMemberAvatarCacheRequest, ClientMemberAvatarCacheResult,
-};
 use auth::{
     ClientAuthDeviceActivateRequest, ClientAuthRefreshRequest,
     ClientGatewaySessionReplaceAccessRequest, ClientGatewaySessionReplaceAccessResult,
     auth_exchange_error, auth_exchange_runtime,
+};
+use avatars::{
+    ClientFfiAvatarCache, ClientMemberAvatarCacheRequest, ClientMemberAvatarCacheResult,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
@@ -69,14 +69,13 @@ use contracts::{
 };
 use diagnostics::{ClientDiagnosticEvent, ClientFfiDiagnostics};
 use gateway::{
-    AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanActivateGatewayRequest,
-    LoadGatewayRegistryRequest, LoadGatewayRegistryResult, PlanAddRemoteGatewayRequest,
+    AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, LoadGatewayRegistryRequest,
+    LoadGatewayRegistryResult, PlanActivateGatewayRequest, PlanAddRemoteGatewayRequest,
     PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest, PlanUpdateRemoteGatewayRequest,
-    RemoteGatewayValidationRequest, gateway_settings_error_code,
-    gateway_settings_get_for_bridge, gateway_settings_update_for_bridge,
+    RemoteGatewayValidationRequest, gateway_settings_error_code, gateway_settings_get_for_bridge,
+    gateway_settings_update_for_bridge, load_gateway_registry_request,
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
-    load_gateway_registry_request, plan_add_remote_gateway_request,
-    plan_delete_remote_gateway_registry_request,
+    plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
     provider_list_transcription_models_for_bridge, validate_remote_gateway_request,
     voice_input_plan_for_bridge,
@@ -133,7 +132,9 @@ use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
+    ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    TimelinePageAnchor, TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
+    TurnMessageEditResponse, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
     TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
     TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
     VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
@@ -896,14 +897,13 @@ impl ClientFfiRuntime {
         input_json: &str,
     ) -> Result<ClientMemberAvatarCacheResult, ClientFfiError> {
         self.require_initialized_and_connected()?;
-        let request = serde_json::from_str::<ClientMemberAvatarCacheRequest>(input_json).map_err(
-            |_| {
+        let request =
+            serde_json::from_str::<ClientMemberAvatarCacheRequest>(input_json).map_err(|_| {
                 ClientFfiError::new(
                     "invalid member avatar cache request",
                     "avatar_invalid_request",
                 )
-            },
-        )?;
+            })?;
         self.avatar_cache.resolve(
             &self.client_runtime.ws_command_sender(),
             self.native_cache_runtime_home()?,
@@ -1109,14 +1109,13 @@ impl ClientFfiRuntime {
         input_json: &str,
     ) -> Result<ClientArtifactViewOpenResult, ClientFfiError> {
         self.require_initialized_and_connected()?;
-        let request = serde_json::from_str::<ClientArtifactTargetRequest>(input_json).map_err(
-            |_| {
+        let request =
+            serde_json::from_str::<ClientArtifactTargetRequest>(input_json).map_err(|_| {
                 ClientFfiError::new(
                     "invalid artifact view request",
                     artifacts::INVALID_ARTIFACT_ACTION_CODE,
                 )
-            },
-        )?;
+            })?;
         artifacts::open_artifact_view(&self.client_runtime.ws_command_sender(), request)
     }
 
@@ -1125,14 +1124,13 @@ impl ClientFfiRuntime {
         input_json: &str,
     ) -> Result<ClientArtifactDownloadResult, ClientFfiError> {
         self.require_initialized_and_connected()?;
-        let request = serde_json::from_str::<ClientArtifactDownloadRequest>(input_json).map_err(
-            |_| {
+        let request =
+            serde_json::from_str::<ClientArtifactDownloadRequest>(input_json).map_err(|_| {
                 ClientFfiError::new(
                     "invalid artifact download request",
                     artifacts::INVALID_ARTIFACT_ACTION_CODE,
                 )
-            },
-        )?;
+            })?;
         let runtime_home = self.native_cache_runtime_home()?;
         artifacts::download_artifact(
             &self.client_runtime.ws_command_sender(),
@@ -1147,15 +1145,13 @@ impl ClientFfiRuntime {
         input_json: &str,
     ) -> Result<ClientArtifactDownloadProgressResult, ClientFfiError> {
         self.require_initialized()?;
-        let request =
-            serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json).map_err(
-                |_| {
-                    ClientFfiError::new(
-                        "invalid artifact download progress request",
-                        artifacts::INVALID_ARTIFACT_ACTION_CODE,
-                    )
-                },
-            )?;
+        let request = serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid artifact download progress request",
+                    artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                )
+            })?;
         self.artifact_downloads.progress(request)
     }
 
@@ -1164,15 +1160,13 @@ impl ClientFfiRuntime {
         input_json: &str,
     ) -> Result<ClientArtifactDownloadCancelResult, ClientFfiError> {
         self.require_initialized()?;
-        let request =
-            serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json).map_err(
-                |_| {
-                    ClientFfiError::new(
-                        "invalid artifact download cancel request",
-                        artifacts::INVALID_ARTIFACT_ACTION_CODE,
-                    )
-                },
-            )?;
+        let request = serde_json::from_str::<ClientArtifactDownloadOperationRequest>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid artifact download cancel request",
+                    artifacts::INVALID_ARTIFACT_ACTION_CODE,
+                )
+            })?;
         self.artifact_downloads.cancel(request)
     }
 
@@ -1937,6 +1931,59 @@ impl ClientFfiRuntime {
             })?;
 
         Ok(page)
+    }
+
+    fn turn_message_edit(
+        &self,
+        input_json: &str,
+    ) -> Result<TurnMessageEditResponse, ClientFfiError> {
+        let params =
+            serde_json::from_str::<TurnMessageEditParams>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid Turn message edit params: {error}"),
+                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
+                )
+            })?;
+        timeline::turn_message_edit(&self.client_runtime.ws_command_sender(), params)
+    }
+
+    fn turn_message_delete(
+        &self,
+        input_json: &str,
+    ) -> Result<TurnMessageDeleteResponse, ClientFfiError> {
+        let params =
+            serde_json::from_str::<TurnMessageDeleteParams>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid Turn message delete params: {error}"),
+                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
+                )
+            })?;
+        timeline::turn_message_delete(&self.client_runtime.ws_command_sender(), params)
+    }
+
+    fn turn_message_revisions_page(
+        &self,
+        input_json: &str,
+    ) -> Result<TurnMessageRevisionsPageResponse, ClientFfiError> {
+        let params = serde_json::from_str::<TurnMessageRevisionsPageParams>(input_json).map_err(
+            |error| {
+                ClientFfiError::new(
+                    format!("invalid Turn message revisions params: {error}"),
+                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
+                )
+            },
+        )?;
+        timeline::turn_message_revisions_page(&self.client_runtime.ws_command_sender(), params)
+    }
+
+    fn thread_read(&self, input_json: &str) -> Result<ThreadReadResponse, ClientFfiError> {
+        let params = serde_json::from_str::<ThreadReadParams>(input_json).map_err(|error| {
+            ClientFfiError::new(
+                format!("invalid thread read params: {error}"),
+                timeline::THREAD_READ_ERROR,
+            )
+        })?;
+        timeline::thread_read(&self.client_runtime.ws_command_sender(), params)
     }
 
     fn turn_work_page(&self, input_json: &str) -> Result<TurnWorkPageResponse, ClientFfiError> {
@@ -2753,6 +2800,13 @@ ffi_client_json_typed_method!(
     pioneer_client_ffi_thread_timeline_page,
     thread_timeline_page
 );
+ffi_client_json_typed_method!(pioneer_client_ffi_turn_message_edit, turn_message_edit);
+ffi_client_json_typed_method!(pioneer_client_ffi_turn_message_delete, turn_message_delete);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_turn_message_revisions_page,
+    turn_message_revisions_page
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_thread_read, thread_read);
 ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_page, turn_work_page);
 ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_items_get, turn_work_items_get);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_get, agents_doc_get);
@@ -3867,27 +3921,23 @@ mod tests {
 
     #[test]
     fn authorization_and_directory_events_invalidate_private_avatar_cache() {
-        let access_changed = ClientEvent::GatewayNotification(
-            pioneer_protocol::GatewayNotification::AccessChanged(
+        let access_changed =
+            ClientEvent::GatewayNotification(pioneer_protocol::GatewayNotification::AccessChanged(
                 pioneer_protocol::AccessChangedNotification {
                     authorization_revision: 7,
                     workspace_id: "workspace-one".to_owned(),
                     thread_id: None,
                     change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
                 },
-            ),
-        );
-        let member_changed = ClientEvent::GatewayNotification(
-            pioneer_protocol::GatewayNotification::MemberChanged(
+            ));
+        let member_changed =
+            ClientEvent::GatewayNotification(pioneer_protocol::GatewayNotification::MemberChanged(
                 pioneer_protocol::MemberChangedNotification {
                     revision: 8,
-                    principal_id: pioneer_protocol::PrincipalId::new(
-                        "P00000000000000000001",
-                    )
-                    .unwrap(),
+                    principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001")
+                        .unwrap(),
                 },
-            ),
-        );
+            ));
 
         assert!(contains_avatar_authorization_boundary(&[
             access_changed,

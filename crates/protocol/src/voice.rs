@@ -453,6 +453,8 @@ impl VoiceTurnContext {
             model_provider: self.model_provider,
             sandbox_policy: self.sandbox_policy,
             mode: self.mode,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: self.execution_backend,
             reasoning: self.reasoning,
             permission_profile: self.permission_profile,

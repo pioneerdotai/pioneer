@@ -773,6 +773,8 @@ fn composer_work_create_params(
                 model_provider: Some("openai".to_owned()),
                 sandbox_policy: None,
                 mode: Some(pioneer_protocol::ThreadMode::Agent),
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(pioneer_protocol::AgentExecutionBackend::ApiProvider {
                     provider: "openai".to_owned(),
                 }),

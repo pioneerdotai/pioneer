@@ -140,6 +140,12 @@ fn turn_with_identity(turn_id: &str, turn_kind: TurnKind, origin: TurnOrigin) ->
         status: TurnStatus::InProgress,
         turn_kind,
         origin,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_turn_permission_profile_snapshot(),
@@ -291,6 +297,8 @@ async fn seed_failed_collaborative_context(
             model_provider: Some("fake".to_owned()),
             sandbox_policy: None,
             mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: None,
@@ -448,6 +456,8 @@ fn exhaustive_canonical_variant_event_type(payload: &CanonicalTurnEventPayload) 
         | CanonicalTurnEventPayload::TurnExecutionWindowContinued(_)
         | CanonicalTurnEventPayload::TurnExecutionWindowBlocked(_)
         | CanonicalTurnEventPayload::TurnPermissionAudit(_)
+        | CanonicalTurnEventPayload::TurnMessageEdited(_)
+        | CanonicalTurnEventPayload::TurnMessageDeleted(_)
         | CanonicalTurnEventPayload::TurnCompleted(_)
         | CanonicalTurnEventPayload::TurnFailed(_)
         | CanonicalTurnEventPayload::TurnBlocked(_) => payload.event_type(),
@@ -962,6 +972,8 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
             model_provider: Some("fake".to_owned()),
             sandbox_policy: None,
             mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: None,
             reasoning: None,
             permission_profile: None,

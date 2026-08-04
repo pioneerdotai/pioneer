@@ -207,11 +207,11 @@ pub fn decode_json_rpc_response_value(
             .and_then(serde_json::Value::as_str)
             .unwrap_or(JSON_RPC_REQUEST_FAILED_MESSAGE);
         let code = error.get("code").and_then(serde_json::Value::as_i64);
-        let machine_code = error
-            .get("data")
-            .and_then(|data| data.get("code"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+        let machine_code = error.get("data").and_then(|data| {
+            data.as_str()
+                .or_else(|| data.get("code").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        });
         return Some((
             response_id,
             Err(JsonRpcResponseError::server(code, message, machine_code)),
@@ -375,6 +375,24 @@ mod tests {
             Some((
                 "request-1".to_owned(),
                 Err(JsonRpcResponseError::server(None, "boom", None))
+            ))
+        );
+        assert_eq!(
+            decode_json_rpc_response_value(&json!({
+                "id": "request-1",
+                "error": {
+                    "code": -32600,
+                    "message": "message revision conflict",
+                    "data": "revision_conflict"
+                }
+            })),
+            Some((
+                "request-1".to_owned(),
+                Err(JsonRpcResponseError::server(
+                    Some(-32600),
+                    "message revision conflict",
+                    Some("revision_conflict".to_owned())
+                ))
             ))
         );
         assert_eq!(

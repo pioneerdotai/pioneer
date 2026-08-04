@@ -6,9 +6,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayBaseUrl,
-    GatewayTransportSecurity, GatewayId, InvitationId, MemberSummary, NewMemberProfile,
-    PrincipalId, PrincipalKind, WorkspaceId,
+    AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayBaseUrl, GatewayId,
+    GatewayTransportSecurity, InvitationId, MemberSummary, NewMemberProfile, PrincipalId,
+    PrincipalKind, WorkspaceId,
 };
 
 pub const INVITATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;

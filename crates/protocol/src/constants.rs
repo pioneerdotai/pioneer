@@ -40,8 +40,12 @@ pub mod methods {
     pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
     pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
+    pub const THREAD_READ: &str = "thread/read";
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
     pub const TURN_START: &str = "turn/start";
+    pub const TURN_MESSAGE_EDIT: &str = "turn/message/edit";
+    pub const TURN_MESSAGE_DELETE: &str = "turn/message/delete";
+    pub const TURN_MESSAGE_REVISIONS_PAGE: &str = "turn/message/revisions/page";
     pub const TURN_CANCEL: &str = "turn/cancel";
     pub const TURN_RESUME: &str = "turn/resume";
     pub const TURN_GET: &str = "turn/get";
@@ -180,8 +184,12 @@ pub mod methods {
         THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
         THREAD_GET,
         THREAD_TIMELINE_PAGE,
+        THREAD_READ,
         THREAD_UNSUBSCRIBE,
         TURN_START,
+        TURN_MESSAGE_EDIT,
+        TURN_MESSAGE_DELETE,
+        TURN_MESSAGE_REVISIONS_PAGE,
         TURN_CANCEL,
         TURN_RESUME,
         TURN_GET,
@@ -304,7 +312,10 @@ pub mod events {
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
     pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";
     pub const THREAD_TIMELINE_BLOCKS_CHANGED: &str = "thread/timeline/blocks/changed";
+    pub const THREAD_READ_CURSOR_CHANGED: &str = "thread/read/changed";
     pub const TURN_STARTED: &str = "turn/started";
+    pub const TURN_MESSAGE_EDITED: &str = "turn/message/edited";
+    pub const TURN_MESSAGE_DELETED: &str = "turn/message/deleted";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_FAILED: &str = "turn/failed";
     pub const TURN_BLOCKED: &str = "turn/blocked";

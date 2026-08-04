@@ -81,12 +81,12 @@ use pioneer_protocol::{
     AgentDurableEvent, AgentExecutionBackend, AgentProgressEvent, ArtifactCapabilitiesResponse,
     ArtifactUploadChunkHeader, ArtifactUploadFinishResponse, ArtifactUploadSourceKind,
     ArtifactUploadStartParams, ArtifactUploadStartResponse, CLIAgentRuntimeKind,
-    CLIRuntimePendingRequest,
-    CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
-    CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
-    CLIRuntimeRequestRespondResponse, CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus, INVALID_REQUEST_CODE,
-    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
+    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondResponse,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
+    ExecutionWindowStatus, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, ItemCompletedNotification,
+    ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcErrorResponse,
     JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE, McpChangedAction,
     McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
@@ -98,25 +98,26 @@ use pioneer_protocol::{
     MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
     MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
-    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
-    PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
-    ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
-    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    ProviderTransportKind, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, RoleKey,
-    SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
-    SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
-    SkillsPackInstallResponse, SkillsPackUninstallResponse, SkillsPackUpdateResponse,
-    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
-    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
-    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
-    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PersistedActorRef, PrincipalId,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
+    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
+    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
+    SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
+    SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
+    SkillsUninstallResponse, SkillsUpdateResponse, SkillsUploadAbortResponse,
+    SkillsUploadChunkHeader, SkillsUploadFinishResponse, SkillsUploadStartResponse,
+    TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
+    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
+    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
+    TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
     TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
     TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
@@ -1202,7 +1203,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
         .unwrap();
     crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
 
-    let (tx, rx) = mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(512);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -2395,7 +2396,8 @@ async fn seed_vertical_self_improvement_thread(
                     "sandbox": SandboxMode::FullAccess,
                     "mode": "Agent",
                     "origin_kind": origin_kind,
-                    "sidebar_visibility": "visible"
+                    "sidebar_visibility": "visible",
+                    "visibility": "workspace"
                 }
             })
             .to_string(),
@@ -2407,20 +2409,9 @@ async fn seed_vertical_self_improvement_thread(
     assert_eq!(started.thread.id, thread_id);
     assert_eq!(started.thread.origin_kind, origin_kind);
     assert_eq!(
-        harness
-            .crud_store
-            .update_user_thread_management(
-                harness.workspace_id.as_str(),
-                thread_id,
-                None,
-                None,
-                Some(pioneer_crud::PersistedThreadAccessClass::Workspace),
-                None,
-            )
-            .await
-            .expect("self-improvement source visibility should persist"),
-        Some(true),
-        "self-improvement vertical source must be explicitly workspace-visible"
+        started.thread.visibility,
+        Some(pioneer_protocol::ThreadVisibility::Workspace),
+        "self-improvement vertical source runtime draft must be explicitly workspace-visible"
     );
 }
 
@@ -2444,6 +2435,7 @@ fn cli_runtime_turn_start_request(
     let mut params = json!({
         "thread_id": thread_id,
         "turn_id": turn_id,
+        "mode": "Agent",
         "execution_backend": execution_backend,
         "permission_profile": {
             "mode": permission_mode
@@ -5832,6 +5824,8 @@ fn detached_cli_task_create_params(
                     SandboxMode::FullAccess,
                 )),
                 mode: Some(ThreadMode::Agent),
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id: runtime_id.to_owned(),
                     runtime_kind,
@@ -5967,6 +5961,12 @@ async fn ensure_task_create_parent_turn_for_test(
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -6046,6 +6046,12 @@ async fn seed_completed_task_parent_with_history(
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
@@ -6072,6 +6078,12 @@ async fn seed_completed_task_parent_with_history(
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
@@ -6722,6 +6734,12 @@ async fn setup_progress_delta_harness(
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -7102,6 +7120,12 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -7182,6 +7206,12 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -7268,6 +7298,12 @@ async fn title_generation_retries_after_transient_failure() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -7354,6 +7390,12 @@ async fn child_thread_scope_skips_auto_title_generation() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -7477,7 +7519,7 @@ async fn start_thread_for_artifact_test(
                 model: None,
                 model_provider: None,
                 sandbox: None,
-                mode: None,
+                mode: Some(ThreadMode::Chat),
                 origin_kind: None,
                 sidebar_visibility: None,
                 visibility: None,
@@ -7516,6 +7558,12 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -8505,6 +8553,12 @@ async fn setup_write_file_artifact_registration_gateway(
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -8684,6 +8738,12 @@ async fn materialize_artifact_api_thread(
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -14996,6 +15056,12 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -16403,6 +16469,12 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -16486,6 +16558,12 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -17395,6 +17473,12 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         status: TurnStatus::Completed,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -17707,6 +17791,12 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -18108,6 +18198,12 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         status: TurnStatus::Completed,
         turn_kind: TurnKind::Conversation,
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -18160,6 +18256,12 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -18179,6 +18281,12 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -18217,6 +18325,8 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
             SandboxMode::FullAccess,
         )),
         mode: Some(ThreadMode::Agent),
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
         execution_backend: Some(AgentExecutionBackend::ApiProvider {
             provider: "openai".to_owned(),
         }),
@@ -18492,6 +18602,8 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 SandboxMode::FullAccess,
             )),
             mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                 runtime_id: runtime_id.to_owned(),
                 runtime_kind,
@@ -19679,6 +19791,8 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
         model_provider: Some("openai".to_owned()),
         sandbox_policy: None,
         mode: Some(ThreadMode::Agent),
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
         execution_backend: None,
         reasoning: None,
         permission_profile: None,
@@ -19936,6 +20050,8 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
             SandboxMode::FullAccess,
         )),
         mode: Some(ThreadMode::Agent),
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
         execution_backend: Some(AgentExecutionBackend::ApiProvider {
             provider: "openai".to_owned(),
         }),
@@ -21477,6 +21593,12 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         status: TurnStatus::Completed,
         turn_kind: TurnKind::TaskRun,
         origin: TurnOrigin::ScheduledTask,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -21772,7 +21894,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
                 model: Some("o4-mini".to_owned()),
                 model_provider: Some("openai".to_owned()),
                 sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
+                mode: Some(ThreadMode::Message),
                 origin_kind: None,
                 sidebar_visibility: None,
                 visibility: None,
@@ -21863,6 +21985,11 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
         Some("system")
     );
     assert_eq!(delivered_turn.initiated_by_actor_id, None);
+    assert_eq!(
+        delivered_turn.send_mode.as_deref(),
+        Some("chat"),
+        "system delivery must remain an explicit Chat projection even when the target thread defaults to Message"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23102,6 +23229,12 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -23228,6 +23361,12 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -23395,6 +23534,12 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
@@ -23518,6 +23663,12 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -23831,6 +23982,8 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: None,
@@ -23852,6 +24005,12 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -24409,6 +24568,8 @@ async fn setup_execution_window_terminal_turn(
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: None,
@@ -24429,6 +24590,12 @@ async fn setup_execution_window_terminal_turn(
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -24870,7 +25037,8 @@ async fn connection_closed_keeps_active_turn_running_without_subscribers() {
         "method": "thread/start",
         "params": {
             "thread_id": "thr_000000000000000013",
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
+            "mode": "Chat"
         }
     });
     processor
@@ -25585,18 +25753,49 @@ async fn workspace_select_broadcasts_current_change_only_when_current_changes() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_start_returns_response_and_started_notification() {
-    let (tx, mut rx) = mpsc::channel(8);
+async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispatches_provider() {
+    let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let avatar_hash = [0xabu8; 32];
+    let avatar_revision = hex::encode(avatar_hash);
+    let avatar_transaction = crud_store
+        .database_connection()
+        .begin()
+        .await
+        .expect("avatar transaction should begin");
+    pioneer_crud::insert_principal_avatar(
+        &avatar_transaction,
+        pioneer_crud::NewPrincipalAvatarRow {
+            principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001")
+                .expect("test principal id"),
+            media_type: pioneer_protocol::ProfileAvatarMediaType::Png,
+            content: vec![1, 2, 3],
+            content_hash: avatar_hash,
+            width: 1,
+            height: 1,
+            now: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("test avatar should insert");
+    avatar_transaction
+        .commit()
+        .await
+        .expect("avatar transaction should commit");
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("must not be called"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
     let processor = MessageProcessor::new(
         thread_manager.clone(),
-        test_provider(),
+        provider_registry,
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -25630,6 +25829,7 @@ async fn turn_start_returns_response_and_started_notification() {
         "params": {
             "thread_id": thread_response.thread.id,
             "turn_id": "turn_000000000000000003",
+            "mode": "Message",
             "input": [
                 {
                     "type": "text",
@@ -25643,14 +25843,1785 @@ async fn turn_start_returns_response_and_started_notification() {
         .await;
 
     let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let notification = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _timeline_changed =
+        recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
     assert_eq!(
         turn_result.turn.status,
-        pioneer_protocol::TurnStatus::InProgress
+        pioneer_protocol::TurnStatus::Completed
     );
-    assert_eq!(notification.method, "turn/started");
+    assert_eq!(turn_result.turn.mode, ThreadMode::Message);
+    let historical_author = turn_result
+        .turn
+        .author
+        .clone()
+        .expect("Message should expose its server-owned author snapshot");
+    assert_eq!(historical_author.display_name, "Superuser");
+    assert_eq!(historical_author.nickname, "superuser");
+    assert_eq!(
+        historical_author.avatar_revision.as_deref(),
+        Some(avatar_revision.as_str())
+    );
+    assert_eq!(started.method, events::TURN_STARTED);
+    assert_eq!(completed.method, events::TURN_COMPLETED);
+    assert!(capture_provider.snapshot_requests().is_empty());
+
+    let persisted = crud_store
+        .get_turn(
+            thread_response.thread.id.as_str(),
+            turn_result.turn.id.as_str(),
+        )
+        .await
+        .expect("turn read should succeed")
+        .expect("Message should persist")
+        .1;
+    assert_eq!(persisted.status, TurnStatus::Completed);
+    assert_eq!(persisted.mode, ThreadMode::Message);
+    assert_eq!(persisted.author.as_ref(), Some(&historical_author));
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE gateway_principal SET display_name='Renamed', nickname='renamed', nickname_key='renamed' WHERE id='P00000000000000000001';
+             UPDATE principal_avatar SET content_hash=zeroblob(32) WHERE principal_id='P00000000000000000001';",
+        )
+        .await
+        .expect("profile mutation should succeed");
+    let persisted_after_profile_change = crud_store
+        .get_turn(
+            thread_response.thread.id.as_str(),
+            turn_result.turn.id.as_str(),
+        )
+        .await
+        .expect("turn reread should succeed")
+        .expect("Message should remain persisted")
+        .1;
+    assert_eq!(
+        persisted_after_profile_change.author.as_ref(),
+        Some(&historical_author),
+        "profile changes must not rewrite a historical Turn author snapshot"
+    );
+    let turn_events = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_result.turn.id.clone()))
+        .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+        .all(&crud_store.database_connection())
+        .await
+        .expect("events should load");
+    assert_eq!(
+        turn_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            events::TURN_STARTED,
+            events::TURN_COMPLETED,
+            events::TURN_PERMISSION_AUDIT,
+        ]
+    );
+
+    let retry = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbbbbbc",
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_response.thread.id,
+            "turn_id": "turn_000000000000000003",
+            "mode": "Message",
+            "input": [{"type": "text", "text": "Hello"}]
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &retry.to_string())
+        .await;
+    let retry_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbc").await;
+    let retry_turn: TurnStartResponse =
+        serde_json::from_value(retry_response.result).expect("idempotent response should decode");
+    assert_eq!(retry_turn.turn, turn_result.turn);
+    assert!(
+        timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "idempotent retry must not publish duplicate notifications"
+    );
+    assert!(capture_provider.snapshot_requests().is_empty());
+
+    let conflict = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbbbbbd",
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_response.thread.id,
+            "turn_id": "turn_000000000000000003",
+            "mode": "Message",
+            "input": [{"type": "text", "text": "Different"}]
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &conflict.to_string())
+        .await;
+    let conflict_error = recv_error_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbd").await;
+    assert!(conflict_error.error.message.contains("different request"));
+    assert!(capture_provider.snapshot_requests().is_empty());
+
+    let second_thread_request = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbcross",
+        "method": "thread/start",
+        "params": {
+            "thread_id": "thr_000000000000000011",
+            "workspace_id": workspace_id
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &second_thread_request.to_string())
+        .await;
+    let second_thread_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbcross").await;
+    let second_thread: ThreadStartResponse = serde_json::from_value(second_thread_response.result)
+        .expect("second thread/start response should decode");
+    let _second_thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    let cross_thread_conflict = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbxid01",
+        "method": "turn/start",
+        "params": {
+            "thread_id": second_thread.thread.id,
+            "turn_id": "turn_000000000000000003",
+            "mode": "Message",
+            "input": [{"type": "text", "text": "Hello"}]
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &cross_thread_conflict.to_string())
+        .await;
+    let cross_thread_error = recv_error_by_id(&mut rx, "bbbbbbbbbbbbbbbbxid01").await;
+    assert_eq!(
+        cross_thread_error.error.message,
+        "turn_id is already used by a different request"
+    );
+    let cross_thread_error_json =
+        serde_json::to_string(&cross_thread_error).expect("conflict should serialize");
+    assert!(!cross_thread_error_json.contains(thread_response.thread.id.as_str()));
+    assert!(
+        crud_store
+            .get_turn(second_thread.thread.id.as_str(), "turn_000000000000000003")
+            .await
+            .expect("cross-thread duplicate lookup should succeed")
+            .is_none()
+    );
+    assert!(capture_provider.snapshot_requests().is_empty());
+
+    let spoof = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbbbbbe",
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_response.thread.id,
+            "turn_id": "turn_000000000000000004",
+            "mode": "Message",
+            "author": {
+                "displayName": "Forged",
+                "nickname": "forged"
+            },
+            "input": [{"type": "text", "text": "forged"}]
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &spoof.to_string())
+        .await;
+    let spoof_error = recv_error_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbe").await;
+    assert!(spoof_error.error.message.contains("author"));
+    assert!(
+        crud_store
+            .get_turn(
+                thread_response.thread.id.as_str(),
+                "turn_000000000000000004"
+            )
+            .await
+            .expect("spoofed Turn lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped() {
+    const MEMBER_ID: &str = "P0000000000000000000A";
+    const HIDDEN_MEMBER_ID: &str = "P0000000000000000000B";
+    const SUPERUSER_ID: &str = "P00000000000000000001";
+    const FIRST_THREAD_ID: &str = "thrE6ReplyScopeA00001";
+    const SECOND_THREAD_ID: &str = "thrE6ReplyScopeB00001";
+    const TARGET_TURN_ID: &str = "trnE6ReplyTarget00001";
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES\
+                ('P0000000000000000000A','G00000000000000000001','user','member','active',\
+                 'Member A','member-a','member-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL),\
+                ('P0000000000000000000B','G00000000000000000001','user','member','active',\
+                 'Hidden Member','hidden-member','hidden-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize scoped mention principals");
+
+    let mut member_principal = (*authenticated_test_superuser()).clone();
+    member_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(MEMBER_ID).expect("Member principal id");
+    member_principal.kind = pioneer_protocol::PrincipalKind::User;
+    member_principal.role_key = Some(RoleKey::member());
+    member_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("Member device id");
+    member_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager
+        .register_connection(tx, Arc::new(member_principal))
+        .await
+        .expect("register Member connection");
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    for (request_id, thread_id) in [
+        ("epic6replythread00001", FIRST_THREAD_ID),
+        ("epic6replythread00002", SECOND_THREAD_ID),
+    ] {
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "thread/start",
+                    "params": {"thread_id": thread_id, "workspace_id": workspace_id}
+                })
+                .to_string(),
+            )
+            .await;
+        let _ = recv_response_by_id(&mut rx, request_id).await;
+        let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    }
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "epic6replytarget00001",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": FIRST_THREAD_ID,
+                    "turn_id": TARGET_TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "target"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "epic6replytarget00001").await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "epic6replyvalid000001",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": FIRST_THREAD_ID,
+                    "turn_id": "trnE6ReplyValid000001",
+                    "mode": "Message",
+                    "reply_to_turn_id": TARGET_TURN_ID,
+                    "mentioned_principal_ids": [SUPERUSER_ID, SUPERUSER_ID],
+                    "input": [{"type": "text", "text": "reply"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, "epic6replyvalid000001").await;
+    let response: TurnStartResponse =
+        serde_json::from_value(response.result).expect("reply response should decode");
+    assert_eq!(
+        response.turn.reply_to_turn_id.as_deref(),
+        Some(TARGET_TURN_ID)
+    );
+    assert_eq!(response.turn.mentions.len(), 1);
+    assert_eq!(
+        response.turn.mentions[0].principal_id.as_str(),
+        SUPERUSER_ID
+    );
+    assert_eq!(response.turn.mentions[0].nickname, "superuser");
+    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+
+    for (request_id, thread_id, reply_to_turn_id, mentioned_principal_ids) in [
+        (
+            "epic6replycross000001",
+            SECOND_THREAD_ID,
+            Some(TARGET_TURN_ID),
+            Vec::<&str>::new(),
+        ),
+        (
+            "epic6mentionhidden001",
+            FIRST_THREAD_ID,
+            None,
+            vec![HIDDEN_MEMBER_ID],
+        ),
+    ] {
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": thread_id,
+                        "turn_id": generate_test_request_id("turn", request_id),
+                        "mode": "Message",
+                        "reply_to_turn_id": reply_to_turn_id,
+                        "mentioned_principal_ids": mentioned_principal_ids,
+                        "input": [{"type": "text", "text": "must fail"}]
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let error = recv_error_by_id(&mut rx, request_id).await;
+        assert!(error.error.message.contains("unavailable"));
+        assert!(!error.error.message.contains(TARGET_TURN_ID));
+        assert!(!error.error.message.contains(HIDDEN_MEMBER_ID));
+        assert!(!error.error.message.contains("hidden-member"));
+    }
+
+    let persisted = crud_store
+        .get_turn(FIRST_THREAD_ID, "trnE6ReplyValid000001")
+        .await
+        .expect("reply lookup should succeed")
+        .expect("reply should persist")
+        .1;
+    assert_eq!(persisted.reply_to_turn_id.as_deref(), Some(TARGET_TURN_ID));
+    assert_eq!(persisted.mentions, response.turn.mentions);
+
+    let page = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        FIRST_THREAD_ID,
+        "epic6replytimeline001",
+    )
+    .await;
+    let reply_block = page
+        .blocks
+        .iter()
+        .find(|block| block.turn_id.as_deref() == Some("trnE6ReplyValid000001"))
+        .expect("reply Message should have one timeline block");
+    let pioneer_protocol::TimelineBlockKind::UserMessage {
+        mode,
+        author,
+        reply,
+        mentions,
+        deleted,
+        ..
+    } = &reply_block.kind
+    else {
+        panic!("reply Message must use the existing user-message block");
+    };
+    assert_eq!(*mode, ThreadMode::Message);
+    assert_eq!(
+        author.as_ref().map(|author| author.nickname.as_str()),
+        Some("member-a")
+    );
+    let reply = reply
+        .as_ref()
+        .expect("reply summary should resolve in batch");
+    assert_eq!(reply.turn_id, TARGET_TURN_ID);
+    assert_eq!(reply.text.as_deref(), Some("target"));
+    assert!(!reply.deleted);
+    assert_eq!(mentions, &response.turn.mentions);
+    assert!(!deleted);
+    for turn_id in [TARGET_TURN_ID, "trnE6ReplyValid000001"] {
+        let blocks = page
+            .blocks
+            .iter()
+            .filter(|block| block.turn_id.as_deref() == Some(turn_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "Message must have exactly one timeline block"
+        );
+        assert!(matches!(
+            &blocks[0].kind,
+            pioneer_protocol::TimelineBlockKind::UserMessage { .. }
+        ));
+    }
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn SET message_deleted_at=CURRENT_TIMESTAMP WHERE id='trnE6ReplyTarget00001'",
+        )
+        .await
+        .expect("deleted reply target fixture should persist");
+    let deleted_page = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        FIRST_THREAD_ID,
+        "epic6replydeleted0001",
+    )
+    .await;
+    let reply = deleted_page
+        .blocks
+        .iter()
+        .find_map(|block| {
+            if block.turn_id.as_deref() != Some("trnE6ReplyValid000001") {
+                return None;
+            }
+            let pioneer_protocol::TimelineBlockKind::UserMessage { reply, .. } = &block.kind else {
+                return None;
+            };
+            reply.as_ref()
+        })
+        .expect("deleted target should retain a reply tombstone");
+    assert!(reply.deleted);
+    assert!(
+        reply.text.is_none(),
+        "deleted reply body must not be disclosed"
+    );
+    assert_eq!(
+        reply.author.as_ref().map(|author| author.nickname.as_str()),
+        Some("member-a"),
+        "reply tombstone should retain only the historical author snapshot"
+    );
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE gateway_principal SET status='suspended' WHERE id='P0000000000000000000A'",
+        )
+        .await
+        .expect("Member suspension fixture should succeed");
+    let historical = crud_store
+        .get_turn(FIRST_THREAD_ID, TARGET_TURN_ID)
+        .await
+        .expect("historical author lookup should succeed")
+        .expect("historical Message should remain")
+        .1
+        .author
+        .expect("historical Member author should remain stored");
+    assert_eq!(historical.nickname, "member-a");
+    assert_eq!(historical.display_name, "Member A");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_attachment_requires_exact_version_and_current_thread_scope() {
+    const FIRST_THREAD_ID: &str = "thrE6ArtifactScopeA01";
+    const SECOND_THREAD_ID: &str = "thrE6ArtifactScopeB01";
+    const SECRET_BYTES: &[u8] = b"epic6-secret-file-bytes";
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    for (suffix, thread_id) in [("a", FIRST_THREAD_ID), ("b", SECOND_THREAD_ID)] {
+        let request_id = generate_test_request_id("epic6artifactthread", suffix);
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "thread/start",
+                    "params": {"thread_id": thread_id, "workspace_id": workspace_id}
+                })
+                .to_string(),
+            )
+            .await;
+        let _ = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    }
+
+    let artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        FIRST_THREAD_ID,
+        "trnE6ArtifactPlan0001",
+        "msgE6ArtifactPlan0001",
+        "epic6.txt",
+        SECRET_BYTES.to_vec(),
+    )
+    .await;
+    let version_id = artifact
+        .version_id
+        .clone()
+        .expect("ingested artifact should have an exact version");
+    let success_request_id = generate_test_request_id("epic6artifact", "exact");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                    "id": success_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": FIRST_THREAD_ID,
+                    "turn_id": "trnE6ArtifactExact001",
+                    "mode": "Message",
+                    "input": [{
+                        "type": "artifact",
+                        "artifactId": artifact.artifact_id.clone(),
+                        "versionId": version_id.clone()
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, success_request_id.as_str()).await;
+    let started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let timeline =
+        recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let wire = serde_json::to_string(&(response, started, completed, timeline))
+        .expect("wire metadata should serialize");
+    assert!(!wire.contains("epic6-secret-file-bytes"));
+    assert_eq!(
+        crud_store
+            .get_turn_inputs("trnE6ArtifactExact001")
+            .await
+            .expect("exact attachment input should load"),
+        vec![UserInput::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            version_id: Some(version_id.clone()),
+        }]
+    );
+    let page = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        FIRST_THREAD_ID,
+        "e6artifacttimeline001",
+    )
+    .await;
+    let attachment = page
+        .blocks
+        .iter()
+        .find_map(|block| {
+            if block.turn_id.as_deref() != Some("trnE6ArtifactExact001") {
+                return None;
+            }
+            let pioneer_protocol::TimelineBlockKind::UserMessage { attachments, .. } = &block.kind
+            else {
+                return None;
+            };
+            attachments.iter().find_map(|attachment| match attachment {
+                UserMessageAttachment::Artifact { artifact } => Some(artifact),
+                _ => None,
+            })
+        })
+        .expect("Message timeline should contain an exact artifact reference");
+    assert_eq!(attachment.artifact_id, artifact.artifact_id);
+    assert_eq!(attachment.version_id.as_deref(), Some(version_id.as_str()));
+    assert_eq!(attachment.status, pioneer_protocol::ArtifactStatus::Ready);
+    assert!(
+        !serde_json::to_string(&page)
+            .expect("timeline page should serialize")
+            .contains("epic6-secret-file-bytes")
+    );
+
+    for (suffix, thread_id, requested_version, expected_code, expected_message) in [
+        (
+            "cross",
+            SECOND_THREAD_ID,
+            Some(version_id.as_str()),
+            INVALID_REQUEST_CODE,
+            "unavailable",
+        ),
+        (
+            "missing",
+            FIRST_THREAD_ID,
+            None,
+            INVALID_PARAMS_CODE,
+            "artifact reference is invalid",
+        ),
+        (
+            "wrong",
+            FIRST_THREAD_ID,
+            Some("not-an-artifact-version"),
+            INVALID_REQUEST_CODE,
+            "unavailable",
+        ),
+    ] {
+        let request_id = generate_test_request_id("epic6artifact", suffix);
+        let turn_id = generate_test_request_id("trnE6Artifact", suffix);
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id.clone(),
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "mode": "Message",
+                        "input": [{
+                            "type": "artifact",
+                            "artifactId": artifact.artifact_id.clone(),
+                            "versionId": requested_version
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
+        assert_eq!(error.error.code, expected_code);
+        assert!(error.error.message.contains(expected_message));
+        assert!(!error.error.message.contains(artifact.artifact_id.as_str()));
+        assert!(
+            crud_store
+                .get_turn(thread_id, turn_id.as_str())
+                .await
+                .expect("rejected attachment Turn lookup should succeed")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_timeline_pagination_is_stable_batched_and_repairable() {
+    let (tx, mut rx) = mpsc::channel(256);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (workspace_manager, crud_store, workspace_id, select_count) =
+        setup_workspace_manager_with_query_counter().await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    const THREAD_ID: &str = "thrE6TimelineBatch001";
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "epic6batchthread00010",
+                "method": "thread/start",
+                "params": {"thread_id": THREAD_ID, "workspace_id": workspace_id}
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "epic6batchthread00010").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    for index in 0..20 {
+        send_epic6_test_message(
+            &processor,
+            connection_id,
+            &mut rx,
+            THREAD_ID,
+            format!("trnE6Batch{index:011}").as_str(),
+            format!("message {index}").as_str(),
+        )
+        .await;
+    }
+
+    select_count.store(0, Ordering::SeqCst);
+    let one = request_thread_timeline_page_with_anchor_and_limit(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "epic6batchpageone0010",
+        json!({"kind": "oldest"}),
+        1,
+    )
+    .await;
+    let one_selects = select_count.load(Ordering::SeqCst);
+    assert_eq!(one.blocks.len(), 1);
+
+    select_count.store(0, Ordering::SeqCst);
+    let first_page = request_thread_timeline_page_with_anchor_and_limit(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "epic6batchpagefive010",
+        json!({"kind": "oldest"}),
+        5,
+    )
+    .await;
+    let five_selects = select_count.load(Ordering::SeqCst);
+    assert_eq!(first_page.blocks.len(), 5);
+    assert!(
+        five_selects <= one_selects.saturating_add(1),
+        "user-message page queries must be bounded, one={one_selects}, five={five_selects}"
+    );
+    assert!(first_page.blocks.windows(2).all(|window| {
+        (window[0].sort_key.as_str(), window[0].block_id.as_str())
+            < (window[1].sort_key.as_str(), window[1].block_id.as_str())
+    }));
+    let boundary = first_page
+        .page
+        .after_cursor
+        .clone()
+        .expect("first page should expose an after cursor");
+
+    send_epic6_test_message(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "trnE6Batch00000000020",
+        "concurrent message",
+    )
+    .await;
+    let second_page = request_thread_timeline_page_with_anchor_and_limit(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "epic6batchpageafter01",
+        json!({"kind": "after", "cursor": boundary}),
+        100,
+    )
+    .await;
+    let first_ids = first_page
+        .blocks
+        .iter()
+        .map(|block| block.block_id.as_str())
+        .collect::<HashSet<_>>();
+    assert!(
+        second_page
+            .blocks
+            .iter()
+            .all(|block| !first_ids.contains(block.block_id.as_str()))
+    );
+    assert!(second_page.blocks.iter().any(|block| {
+        block.turn_id.as_deref() == Some("trnE6Batch00000000020")
+            && matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::UserMessage {
+                    mode: ThreadMode::Message,
+                    ..
+                }
+            )
+    }));
+    assert!(second_page.blocks.iter().all(|block| {
+        matches!(
+            &block.kind,
+            pioneer_protocol::TimelineBlockKind::UserMessage { .. }
+        )
+    }));
+
+    let before_repair = first_page
+        .blocks
+        .iter()
+        .chain(second_page.blocks.iter())
+        .map(|block| (block.block_id.clone(), block.sort_key.clone()))
+        .collect::<Vec<_>>();
+    let _ = crate::database::startup::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
+        .await
+        .expect("Message timeline repair should succeed");
+    let repaired = request_thread_timeline_page_with_anchor_and_limit(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "epic6batchpagerepair1",
+        json!({"kind": "oldest"}),
+        100,
+    )
+    .await;
+    assert_eq!(
+        repaired
+            .blocks
+            .iter()
+            .map(|block| (block.block_id.clone(), block.sort_key.clone()))
+            .collect::<Vec<_>>(),
+        before_repair
+    );
+    assert!(repaired.blocks.iter().all(|block| matches!(
+        &block.kind,
+        pioneer_protocol::TimelineBlockKind::UserMessage { .. }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_policy() {
+    const AUTHOR_ID: &str = "P0000000000000000000A";
+    const PEER_ID: &str = "P0000000000000000000B";
+    const THREAD_ID: &str = "thrE6MutationRpc0001";
+    const TURN_ID: &str = "trnE6MutationRpc00001";
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES\
+                ('P0000000000000000000A','G00000000000000000001','user','member','active',\
+                 'Message Author','message-author','message-author',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL),\
+                ('P0000000000000000000B','G00000000000000000001','user','member','active',\
+                 'Message Peer','message-peer','message-peer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize Epic 6 mutation principals");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let (author_tx, mut author_rx) = mpsc::channel(64);
+    let mut author_principal = (*authenticated_test_superuser()).clone();
+    author_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(AUTHOR_ID).expect("author principal id");
+    author_principal.kind = pioneer_protocol::PrincipalKind::User;
+    author_principal.role_key = Some(RoleKey::member());
+    author_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000A").expect("author device id");
+    author_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000A").expect("author session id");
+    let author_connection_id = session_manager
+        .register_connection(author_tx, Arc::new(author_principal))
+        .await
+        .expect("register author connection");
+
+    let (peer_tx, mut peer_rx) = mpsc::channel(32);
+    let mut peer_principal = (*authenticated_test_superuser()).clone();
+    peer_principal.principal_id =
+        pioneer_protocol::PrincipalId::new(PEER_ID).expect("peer principal id");
+    peer_principal.kind = pioneer_protocol::PrincipalKind::User;
+    peer_principal.role_key = Some(RoleKey::member());
+    peer_principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000B").expect("peer device id");
+    peer_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S0000000000000000000B").expect("peer session id");
+    let peer_connection_id = session_manager
+        .register_connection(peer_tx, Arc::new(peer_principal))
+        .await
+        .expect("register peer connection");
+
+    let (superuser_tx, mut superuser_rx) = mpsc::channel(32);
+    let superuser_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), superuser_tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        Arc::clone(&session_manager),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6mutationthread00001",
+                "method": "thread/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id,
+                    "visibility": "workspace"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut superuser_rx, "e6mutationthread00001").await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_STARTED).await;
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6mutationseedmsg0001",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": "trnE6MutationA0000001",
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "shared thread seed"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut superuser_rx, "e6mutationseedmsg0001").await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+        .await;
+    assert!(
+        thread_manager
+            .subscribe_connection(THREAD_ID, author_connection_id)
+            .await,
+        "author should subscribe to the shared thread"
+    );
+    session_manager
+        .set_connection_workspace(peer_connection_id, Some(workspace_id.clone()))
+        .await;
+    assert!(
+        !thread_manager
+            .subscribed_connections(THREAD_ID)
+            .await
+            .iter()
+            .any(|subscriber| subscriber.connection_id == peer_connection_id),
+        "peer should remain off the thread subscription while observing workspace unread hints"
+    );
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerreadseed0000001",
+                "method": "thread/read",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "through_turn_id": "trnE6MutationA0000001"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut peer_rx, "e6peerreadseed0000001").await;
+    processor
+        .process_request_for_connection(
+            author_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6mutationmessage0010",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "original body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut author_rx, "e6mutationmessage0010").await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+        .await;
+    let peer_tree_changed =
+        recv_notification_by_method(&mut peer_rx, events::THREAD_TREE_CHANGED).await;
+    let peer_tree_changed: pioneer_protocol::ThreadTreeChangedNotification =
+        serde_json::from_value(
+            peer_tree_changed
+                .params
+                .expect("thread tree notification should include params"),
+        )
+        .expect("thread tree notification should decode");
+    assert_eq!(peer_tree_changed.workspace_id, workspace_id);
+
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerturnidconflict1",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "original body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let actor_conflict = recv_error_by_id(&mut peer_rx, "e6peerturnidconflict1").await;
+    assert!(actor_conflict.error.message.contains("different request"));
+    let actor_conflict_json = serde_json::to_string(&actor_conflict).unwrap();
+    assert!(!actor_conflict_json.contains("message-author"));
+    assert!(!actor_conflict_json.contains(AUTHOR_ID));
+
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerunreadinitial01",
+                "method": "thread/get",
+                "params": {"thread_id": THREAD_ID}
+            })
+            .to_string(),
+        )
+        .await;
+    let initial_unread = recv_response_by_id(&mut peer_rx, "e6peerunreadinitial01").await;
+    let initial_unread: ThreadGetResponse =
+        serde_json::from_value(initial_unread.result).expect("initial peer unread");
+    assert_eq!(initial_unread.unread_count, 1);
+
+    for (request_id, method) in [
+        ("e6peereditforbidden01", "turn/message/edit"),
+        ("e6peerdeleteforbid010", "turn/message/delete"),
+    ] {
+        let params = if method.ends_with("edit") {
+            json!({
+                "thread_id": THREAD_ID,
+                "turn_id": TURN_ID,
+                "expected_revision": 0,
+                "input": [{"type": "text", "text": "peer overwrite"}]
+            })
+        } else {
+            json!({
+                "thread_id": THREAD_ID,
+                "turn_id": TURN_ID,
+                "expected_revision": 0
+            })
+        };
+        processor
+            .process_request_for_connection(
+                peer_connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params
+                })
+                .to_string(),
+            )
+            .await;
+        let error = recv_error_by_id(&mut peer_rx, request_id).await;
+        assert_eq!(error.error.message, "forbidden");
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("original body")
+        );
+    }
+
+    processor
+        .process_request_for_connection(
+            author_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6authoredit000000010",
+                "method": "turn/message/edit",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "expected_revision": 0,
+                    "input": [{"type": "text", "text": "author edit"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut author_rx, "e6authoredit000000010").await;
+    let response: pioneer_protocol::TurnMessageEditResponse =
+        serde_json::from_value(response.result).expect("author edit response");
+    assert_eq!(response.turn.message_revision, 1);
+    assert_eq!(response.turn.status, TurnStatus::Completed);
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+        .await;
+
+    let event_count_before_retry = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN_ID))
+        .all(&crud_store.database_connection())
+        .await
+        .expect("edited Message events should load")
+        .len();
+    processor
+        .process_request_for_connection(
+            author_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6retryafteredit00001",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "original body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let retried = recv_response_by_id(&mut author_rx, "e6retryafteredit00001").await;
+    let retried: TurnStartResponse =
+        serde_json::from_value(retried.result).expect("edited Message retry response");
+    assert_eq!(retried.turn, response.turn);
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN_ID))
+            .all(&crud_store.database_connection())
+            .await
+            .expect("retried edited Message events should load")
+            .len(),
+        event_count_before_retry,
+        "idempotent retry after edit must not append events"
+    );
+
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6moderatoredit000010",
+                "method": "turn/message/edit",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "expected_revision": 1,
+                    "input": [{"type": "text", "text": "moderated body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut superuser_rx, "e6moderatoredit000010").await;
+    let response: pioneer_protocol::TurnMessageEditResponse =
+        serde_json::from_value(response.result).expect("moderator edit response");
+    assert_eq!(response.turn.message_revision, 2);
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+        .await;
+
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerunreadafteredit",
+                "method": "thread/get",
+                "params": {"thread_id": THREAD_ID}
+            })
+            .to_string(),
+        )
+        .await;
+    let edited_unread = recv_response_by_id(&mut peer_rx, "e6peerunreadafteredit").await;
+    let edited_unread: ThreadGetResponse =
+        serde_json::from_value(edited_unread.result).expect("edited peer unread");
+    assert_eq!(edited_unread.unread_count, 1);
+
+    processor
+        .process_request_for_connection(
+            author_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6staleedit0000000010",
+                "method": "turn/message/edit",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "expected_revision": 1,
+                    "input": [{"type": "text", "text": "stale body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let stale = recv_error_by_id(&mut author_rx, "e6staleedit0000000010").await;
+    assert_eq!(
+        stale.error.data,
+        Some(json!({
+            "code": pioneer_protocol::TurnMessageErrorReason::RevisionConflict,
+            "current_revision": 2,
+        }))
+    );
+
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6moderatordelete0010",
+                "method": "turn/message/delete",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "expected_revision": 2
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let deleted = recv_response_by_id(&mut superuser_rx, "e6moderatordelete0010").await;
+    let deleted: pioneer_protocol::TurnMessageDeleteResponse =
+        serde_json::from_value(deleted.result).expect("moderator delete response");
+    assert!(deleted.turn.message_deleted);
+    assert_eq!(deleted.turn.message_revision, 3);
+    assert_eq!(deleted.turn.status, TurnStatus::Completed);
+    let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
+        .await;
+
+    let event_count_before_retry = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN_ID))
+        .all(&crud_store.database_connection())
+        .await
+        .expect("deleted Message events should load")
+        .len();
+    processor
+        .process_request_for_connection(
+            author_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6retryafterdelete001",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "original body"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let retried = recv_response_by_id(&mut author_rx, "e6retryafterdelete001").await;
+    let retried: TurnStartResponse =
+        serde_json::from_value(retried.result).expect("deleted Message retry response");
+    assert_eq!(retried.turn, deleted.turn);
+    assert_eq!(
+        pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN_ID))
+            .all(&crud_store.database_connection())
+            .await
+            .expect("retried deleted Message events should load")
+            .len(),
+        event_count_before_retry,
+        "idempotent retry after delete must not append events"
+    );
+
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerunreadafterdel0",
+                "method": "thread/get",
+                "params": {"thread_id": THREAD_ID}
+            })
+            .to_string(),
+        )
+        .await;
+    let deleted_unread = recv_response_by_id(&mut peer_rx, "e6peerunreadafterdel0").await;
+    let deleted_unread: ThreadGetResponse =
+        serde_json::from_value(deleted_unread.result).expect("deleted peer unread");
+    assert_eq!(deleted_unread.unread_count, 0);
+
+    processor
+        .process_request_for_connection(
+            peer_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6peerrevisions000010",
+                "method": "turn/message/revisions/page",
+                "params": {"thread_id": THREAD_ID, "turn_id": TURN_ID, "limit": 10}
+            })
+            .to_string(),
+        )
+        .await;
+    let peer_page = recv_response_by_id(&mut peer_rx, "e6peerrevisions000010").await;
+    let peer_page: pioneer_protocol::TurnMessageRevisionsPageResponse =
+        serde_json::from_value(peer_page.result).expect("peer revision page");
+    assert_eq!(peer_page.revisions.len(), 3);
+    assert!(
+        peer_page
+            .revisions
+            .iter()
+            .all(|revision| revision.input.is_none())
+    );
+    assert!(
+        peer_page
+            .revisions
+            .iter()
+            .all(|revision| revision.mentions.is_empty())
+    );
+
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6superrevisions00010",
+                "method": "turn/message/revisions/page",
+                "params": {"thread_id": THREAD_ID, "turn_id": TURN_ID, "limit": 10}
+            })
+            .to_string(),
+        )
+        .await;
+    let super_page = recv_response_by_id(&mut superuser_rx, "e6superrevisions00010").await;
+    let super_page: pioneer_protocol::TurnMessageRevisionsPageResponse =
+        serde_json::from_value(super_page.result).expect("superuser revision page");
+    assert_eq!(super_page.revisions.len(), 3);
+    assert!(
+        super_page
+            .revisions
+            .iter()
+            .all(|revision| revision.input.is_some())
+    );
+
+    processor
+        .process_request_for_connection(
+            superuser_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6duplicatedelete0010",
+                "method": "turn/message/delete",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "expected_revision": 2
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let duplicate = recv_response_by_id(&mut superuser_rx, "e6duplicatedelete0010").await;
+    let duplicate: pioneer_protocol::TurnMessageDeleteResponse =
+        serde_json::from_value(duplicate.result).expect("duplicate delete response");
+    assert_eq!(duplicate.turn, deleted.turn);
+    assert!(
+        timeout(Duration::from_millis(50), superuser_rx.recv())
+            .await
+            .is_err(),
+        "duplicate delete must not publish another event"
+    );
+
+    let timeline = request_thread_timeline_page_for_test(
+        &processor,
+        peer_connection_id,
+        &mut peer_rx,
+        THREAD_ID,
+        "e6peertombstone000010",
+    )
+    .await;
+    let block = timeline
+        .blocks
+        .iter()
+        .find(|block| block.turn_id.as_deref() == Some(TURN_ID))
+        .expect("deleted Message timeline block");
+    let pioneer_protocol::TimelineBlockKind::UserMessage { text, deleted, .. } = &block.kind else {
+        panic!("deleted Message remains a user-message Turn block");
+    };
+    assert!(*deleted);
+    assert!(text.is_empty());
+
+    let mutation_events = pioneer_entity::turn_event::Entity::find()
+        .filter(pioneer_entity::turn_event::Column::TurnId.eq(TURN_ID))
+        .filter(
+            pioneer_entity::turn_event::Column::EventType
+                .is_in([events::TURN_MESSAGE_EDITED, events::TURN_MESSAGE_DELETED]),
+        )
+        .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+        .all(&crud_store.database_connection())
+        .await
+        .expect("durable mutation events");
+    let superuser_actor =
+        PersistedActorRef::Principal(authenticated_test_superuser().principal_id.clone());
+    assert_eq!(
+        mutation_events
+            .into_iter()
+            .map(|event| {
+                let payload = serde_json::from_str::<pioneer_crud::CanonicalTurnEventPayload>(
+                    event.payload.as_str(),
+                )
+                .expect("mutation event payload should decode");
+                match payload {
+                    pioneer_crud::CanonicalTurnEventPayload::TurnMessageEdited(event) => {
+                        ("edit", event.changed_by)
+                    }
+                    pioneer_crud::CanonicalTurnEventPayload::TurnMessageDeleted(event) => {
+                        ("delete", event.deleted_by)
+                    }
+                    _ => unreachable!("query selected only Message mutation events"),
+                }
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "edit",
+                PersistedActorRef::Principal(
+                    PrincipalId::new(AUTHOR_ID).expect("author principal id")
+                ),
+            ),
+            ("edit", superuser_actor.clone()),
+            ("delete", superuser_actor),
+        ],
+        "the canonical Turn stream must durably audit both author mutations and Superuser moderation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
+    const THREAD_ID: &str = "thrE6ReadRpc00000001";
+    const FIRST_TURN_ID: &str = "trnE6ReadRpc00000001";
+    const SECOND_TURN_ID: &str = "trnE6ReadRpc00000002";
+
+    let (primary_tx, mut primary_rx) = mpsc::channel(64);
+    let (secondary_tx, mut secondary_rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let primary_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), primary_tx).await;
+    let _secondary_connection_id =
+        register_authenticated_test_connection(session_manager.as_ref(), secondary_tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    processor
+        .process_request_for_connection(
+            primary_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6readthread000000010",
+                "method": "thread/start",
+                "params": {"thread_id": THREAD_ID, "workspace_id": workspace_id}
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut primary_rx, "e6readthread000000010").await;
+    let _ = recv_notification_by_method(&mut primary_rx, events::THREAD_STARTED).await;
+    for (turn_id, body) in [
+        (FIRST_TURN_ID, "first Message"),
+        (SECOND_TURN_ID, "second Message"),
+    ] {
+        send_epic6_test_message(
+            &processor,
+            primary_connection_id,
+            &mut primary_rx,
+            THREAD_ID,
+            turn_id,
+            body,
+        )
+        .await;
+    }
+
+    for (request_id, through_turn_id) in [
+        ("e6readnewer0000000010", SECOND_TURN_ID),
+        ("e6readstale0000000010", FIRST_TURN_ID),
+    ] {
+        processor
+            .process_request_for_connection(
+                primary_connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "thread/read",
+                    "params": {
+                        "thread_id": THREAD_ID,
+                        "through_turn_id": through_turn_id
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let (response, primary_notification) = recv_response_and_notification_by_id_method(
+            &mut primary_rx,
+            request_id,
+            events::THREAD_READ_CURSOR_CHANGED,
+        )
+        .await;
+        let response: pioneer_protocol::ThreadReadResponse =
+            serde_json::from_value(response.result).expect("thread/read response");
+        assert_eq!(response.cursor.through_turn_id, SECOND_TURN_ID);
+        assert_eq!(response.unread_count, 0);
+        let primary_notification: pioneer_protocol::ThreadReadCursorChangedNotification =
+            serde_json::from_value(primary_notification.params.expect("read params"))
+                .expect("primary read notification");
+        assert_eq!(primary_notification.cursor, response.cursor);
+
+        let secondary_notification =
+            recv_notification_by_method(&mut secondary_rx, events::THREAD_READ_CURSOR_CHANGED)
+                .await;
+        let secondary_notification: pioneer_protocol::ThreadReadCursorChangedNotification =
+            serde_json::from_value(secondary_notification.params.expect("read params"))
+                .expect("secondary read notification");
+        assert_eq!(secondary_notification.cursor, response.cursor);
+        assert_eq!(secondary_notification.unread_count, response.unread_count);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_message_turn_starts_commit_once_and_keep_stable_timeline_order() {
+    const THREAD_ID: &str = "thrE6ConcurrentMsg001";
+    const TURN_IDS: [&str; 4] = [
+        "trnE6ConcurrentMsg001",
+        "trnE6ConcurrentMsg002",
+        "trnE6ConcurrentMsg003",
+        "trnE6ConcurrentMsg004",
+    ];
+    const REQUEST_IDS: [&str; 4] = [
+        "e6concurrentmsg000010",
+        "e6concurrentmsg000020",
+        "e6concurrentmsg000030",
+        "e6concurrentmsg000040",
+    ];
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6concurrentthread001",
+                "method": "thread/start",
+                "params": {"thread_id": THREAD_ID, "workspace_id": workspace_id}
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "e6concurrentthread001").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    let requests: [String; 4] = std::array::from_fn(|index| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": REQUEST_IDS[index],
+            "method": "turn/start",
+            "params": {
+                "thread_id": THREAD_ID,
+                "turn_id": TURN_IDS[index],
+                "mode": "Message",
+                "input": [{"type": "text", "text": format!("message {index}")}]
+            }
+        })
+        .to_string()
+    });
+    let ((), (), (), ()) = tokio::join!(
+        processor.process_request_for_connection(connection_id, &requests[0]),
+        processor.process_request_for_connection(connection_id, &requests[1]),
+        processor.process_request_for_connection(connection_id, &requests[2]),
+        processor.process_request_for_connection(connection_id, &requests[3]),
+    );
+
+    let mut response_ids = HashSet::new();
+    let mut started_count = 0;
+    let mut completed_count = 0;
+    let mut timeline_count = 0;
+    let mut tree_count = 0;
+    for _ in 0..20 {
+        let payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+        let value: JsonValue = serde_json::from_str(&payload).expect("concurrent payload");
+        if let Some(id) = value.get("id").and_then(JsonValue::as_str) {
+            response_ids.insert(id.to_owned());
+            let result = value
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| panic!("concurrent turn/start should succeed: payload={value}"));
+            let response: TurnStartResponse =
+                serde_json::from_value(result).expect("concurrent turn/start response");
+            assert_eq!(response.turn.status, TurnStatus::Completed);
+            continue;
+        }
+        match value.get("method").and_then(JsonValue::as_str) {
+            Some(method) if method == events::TURN_STARTED => started_count += 1,
+            Some(method) if method == events::TURN_COMPLETED => completed_count += 1,
+            Some(method) if method == events::THREAD_TIMELINE_BLOCKS_CHANGED => {
+                timeline_count += 1;
+            }
+            Some(method) if method == events::THREAD_TREE_CHANGED => tree_count += 1,
+            other => {
+                panic!("unexpected concurrent Message payload method: {other:?}; payload={value}")
+            }
+        }
+    }
+    assert_eq!(
+        response_ids,
+        REQUEST_IDS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect::<HashSet<_>>()
+    );
+    assert_eq!(started_count, TURN_IDS.len());
+    assert_eq!(completed_count, TURN_IDS.len());
+    assert_eq!(timeline_count, TURN_IDS.len());
+    assert_eq!(tree_count, TURN_IDS.len());
+
+    let page = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        THREAD_ID,
+        "e6concurrentpage00010",
+    )
+    .await;
+    let message_blocks = page
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| TURN_IDS.contains(&turn_id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(message_blocks.len(), TURN_IDS.len());
+    assert!(message_blocks.windows(2).all(|window| {
+        (window[0].sort_key.as_str(), window[0].block_id.as_str())
+            < (window[1].sort_key.as_str(), window[1].block_id.as_str())
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_persistence_failure_rolls_back_and_emits_no_realtime() {
+    const THREAD_ID: &str = "thrE6AtomicFailure001";
+    const TURN_ID: &str = "trnE6AtomicFailure001";
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6atomicthread0000010",
+                "method": "thread/start",
+                "params": {"thread_id": THREAD_ID, "workspace_id": workspace_id}
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "e6atomicthread0000010").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER epic6_fail_message_event BEFORE INSERT ON turn_event \
+             WHEN NEW.turn_id='trnE6AtomicFailure001' \
+             BEGIN SELECT RAISE(ABORT, 'injected Epic 6 transaction failure'); END;",
+        )
+        .await
+        .expect("install atomic failure trigger");
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "e6atomicmessage000010",
+                "method": "turn/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "turn_id": TURN_ID,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": "must roll back"}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_error_by_id(&mut rx, "e6atomicmessage000010").await;
+    assert!(
+        crud_store
+            .get_turn(THREAD_ID, TURN_ID)
+            .await
+            .expect("failed Message lookup")
+            .is_none(),
+        "failed Message transaction must leave no Turn"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "failed Message transaction must emit no realtime notification"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25670,7 +27641,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
         provider_registry,
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -25706,6 +27677,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
                 "params": {
                     "thread_id": "thr_turn_start_api_old",
                     "turn_id": "turn_start_api_old",
+                    "mode": "Chat",
                     "input": [{
                         "type": "text",
                         "text": "api backend route marker"
@@ -25725,6 +27697,16 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
                 .iter()
                 .any(|message| message.content.contains("api backend route marker"))
         }) {
+            let author = crud_store
+                .get_turn("thr_turn_start_api_old", "turn_start_api_old")
+                .await
+                .expect("Chat turn lookup should succeed")
+                .expect("Chat turn should persist")
+                .1
+                .author
+                .expect("Chat turn should persist its server-owned author snapshot");
+            assert_eq!(author.display_name, "Superuser");
+            assert_eq!(author.nickname, "superuser");
             return;
         }
         sleep(Duration::from_millis(50)).await;
@@ -25778,7 +27760,10 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
     processor
         .prepare_api_provider_turn_start(
             connection_id,
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001")
+                    .expect("test principal id"),
+            ),
             None,
             pioneer_protocol::TurnStartParams {
                 thread_id: "thread_security_native".to_owned(),
@@ -25792,6 +27777,8 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
@@ -25804,6 +27791,17 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         )
         .await
         .expect("native turn/start preparation should succeed");
+
+    let author = crud_store
+        .get_turn("thread_security_native", "turn_security_native")
+        .await
+        .expect("Agent turn lookup should succeed")
+        .expect("Agent turn should persist")
+        .1
+        .author
+        .expect("Agent turn should persist its server-owned author snapshot");
+    assert_eq!(author.display_name, "Superuser");
+    assert_eq!(author.nickname, "superuser");
 
     let persisted = crud_store
         .get_turn_execution_security_snapshot("turn_security_native")
@@ -25910,6 +27908,8 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
@@ -26029,6 +28029,7 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
                 "params": {
                     "thread_id": "thr_turn_start_cli_disabled",
                     "turn_id": "turn_start_cli_disabled",
+                    "mode": "Agent",
                     "execution_backend": execution_backend,
                     "input": [{
                         "type": "text",
@@ -26878,6 +28879,8 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
                 SandboxMode::FullAccess,
             )),
             mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                 runtime_id: runtime_id.to_owned(),
                 runtime_kind,
@@ -27854,6 +29857,12 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -28307,6 +30316,7 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
         "params": {
             "thread_id": thread_id,
             "turn_id": turn_id,
+            "mode": "Agent",
             "input": [{
                 "type": "text",
                 "text": "start"
@@ -28479,6 +30489,12 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
                     origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -28933,6 +30949,12 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -30435,6 +32457,8 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id: "codex".to_owned(),
                     runtime_kind: CLIAgentRuntimeKind::Codex,
@@ -31054,6 +33078,12 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -31181,6 +33211,12 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
                     origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -33711,6 +35747,12 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -34272,6 +36314,12 @@ async fn materialize_cli_runtime_approval_turn(
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::default(),
         origin: TurnOrigin::User,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -34466,7 +36514,8 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         "method": "thread/start",
         "params": {
             "thread_id": "thr_000000000000000012",
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
+            "mode": "Chat"
         }
     });
     processor
@@ -35496,6 +37545,7 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .expect("default workspace should exist")
         .id;
     let crud_store = Arc::new(CrudStore::new(connection.clone()));
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
     let processor = MessageProcessor::with_agent_manager(
         thread_manager,
         Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
@@ -35510,7 +37560,8 @@ async fn turn_start_materializes_thread_and_turn_state() {
         "method": "thread/start",
         "params": {
             "thread_id": "thr_000000000000000011",
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
+            "mode": "Chat"
         }
     });
     processor
@@ -35885,7 +37936,7 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime() {
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
@@ -38287,6 +40338,12 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::default(),
                     origin: TurnOrigin::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
                     error: None,
                     prompt_manifest: None,
                     permission_profile: default_test_permission_profile(),
@@ -38304,10 +40361,8 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
         .await
         .expect("terminal work summary should load")
         .expect("terminal work summary should exist");
-    let work_item_id = pioneer_crud::work_item_projection_id(
-        harness.turn_id.as_str(),
-        "historical_task_anchor",
-    );
+    let work_item_id =
+        pioneer_crud::work_item_projection_id(harness.turn_id.as_str(), "historical_task_anchor");
     let before_item = harness
         .processor
         .crud_store
@@ -38367,7 +40422,10 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
     assert_eq!(after_snapshot.elapsed_ms, before.elapsed_ms);
     assert_eq!(after_snapshot.completed_at, before.completed_at);
     assert_eq!(after_snapshot.updated_at, before.updated_at);
-    assert_eq!(after_snapshot.source_high_watermark, before.source_high_watermark);
+    assert_eq!(
+        after_snapshot.source_high_watermark,
+        before.source_high_watermark
+    );
     let after_item = harness
         .processor
         .crud_store
@@ -38432,6 +40490,12 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
         origin: TurnOrigin::DetachedTask,
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -39108,6 +41172,8 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: None,
@@ -39129,6 +41195,12 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
@@ -39367,6 +41439,67 @@ async fn request_thread_timeline_page_for_test(
         .await;
     let response = recv_response_by_id(rx, request_id).await;
     serde_json::from_value(response.result).expect("thread/timeline/page should decode")
+}
+
+async fn request_thread_timeline_page_with_anchor_and_limit(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    request_id: &str,
+    anchor: JsonValue,
+    limit: u32,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "thread/timeline/page",
+                "params": {
+                    "threadId": thread_id,
+                    "anchor": anchor,
+                    "limit": limit
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(rx, request_id).await;
+    serde_json::from_value(response.result).expect("thread/timeline/page should decode")
+}
+
+async fn send_epic6_test_message(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+) {
+    let request_id = generate_test_request_id("epic6batchsend", turn_id);
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "mode": "Message",
+                    "input": [{"type": "text", "text": text}]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(rx, request_id.as_str()).await;
+    let _ = recv_notification_by_method(rx, events::TURN_STARTED).await;
+    let _ = recv_notification_by_method(rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method(rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
 }
 
 async fn request_live_turn_work_page(
@@ -40092,6 +42225,12 @@ fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
         status,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -40160,6 +42299,12 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         status: TurnStatus::InProgress,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -42928,7 +45073,8 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
         "method": "thread/start",
         "params": {
             "thread_id": "thr_000000000000000012",
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
+            "mode": "Chat"
         }
     });
     processor
@@ -43070,7 +45216,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -48713,6 +50859,52 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
     (workspace_manager, crud_store, workspace_id)
 }
 
+async fn setup_workspace_manager_with_query_counter() -> (
+    Arc<WorkspaceManager>,
+    Arc<CrudStore>,
+    String,
+    Arc<AtomicUsize>,
+) {
+    let mut connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("must connect to sqlite memory");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migrations must succeed");
+    bootstrap(&connection)
+        .await
+        .expect("gateway bootstrap should create default workspace");
+    let select_count = Arc::new(AtomicUsize::new(0));
+    let callback_count = select_count.clone();
+    connection.set_metric_callback(move |info| {
+        if info
+            .statement
+            .sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("SELECT")
+        {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let crud_store = Arc::new(CrudStore::new(connection.clone()));
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let workspace_manager = Arc::new(WorkspaceManager::new(connection));
+    let workspaces = workspace_manager
+        .list_workspaces()
+        .await
+        .expect("workspace/list should succeed in tests");
+    let workspace_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active && workspace.is_current)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
+        .or_else(|| workspaces.first())
+        .expect("default workspace should exist after bootstrap")
+        .id
+        .clone();
+    (workspace_manager, crud_store, workspace_id, select_count)
+}
+
 async fn setup_workspace_message_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
@@ -48843,6 +51035,12 @@ fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
         status,
         turn_kind: Default::default(),
         origin: Default::default(),
+        mode: Default::default(),
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
         error: None,
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
@@ -48938,6 +51136,12 @@ async fn detached_composer_history_orders_each_delivered_answer_after_its_user_m
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -48980,6 +51184,12 @@ async fn detached_composer_history_orders_each_delivered_answer_after_its_user_m
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
             origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: default_test_permission_profile(),
@@ -50838,6 +53048,12 @@ async fn memory_provider_recall_calls_memory_service() {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),

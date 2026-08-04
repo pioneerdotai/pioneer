@@ -5,8 +5,8 @@ use crate::threads::coordinator::ThreadCoordinator;
 use pioneer_protocol::{
     Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadFolderCreateParams,
     ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement,
-    ThreadSidebarVisibility, ThreadTreeParams, ThreadTreeResponse, ThreadUpdateParams,
-    ThreadUpdateResponse,
+    ThreadSidebarVisibility, ThreadTreeParams, ThreadTreeResponse, ThreadUnreadSummary,
+    ThreadUpdateParams, ThreadUpdateResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -199,6 +199,7 @@ pub struct ThreadTreeThreadAction {
 pub struct ThreadTreeRefreshSuccessReduction {
     pub workspace_id: String,
     pub threads: Vec<Thread>,
+    pub unread: Vec<ThreadUnreadSummary>,
     pub folders: Vec<ThreadFolder>,
     pub placements: Vec<ThreadPlacement>,
     pub agents_docs: Vec<ThreadAgentsDocSummary>,
@@ -261,6 +262,7 @@ pub fn reduce_thread_tree_refresh_success(
     ThreadTreeRefreshSuccessReduction {
         workspace_id: response.workspace_id,
         threads: response.threads,
+        unread: response.unread,
         folders: response.folders,
         placements: response.placements,
         agents_docs: response.agents_docs,
@@ -1208,11 +1210,16 @@ mod tests {
         let response_placement = placement("thread_draft", Some("folder_a"));
         let response_agents_doc =
             agents_doc_summary_for_workspace("ws_a", None, ThreadAgentsDocStatus::Active);
+        let response_unread = ThreadUnreadSummary {
+            thread_id: "thread_draft".to_owned(),
+            unread_count: 3,
+        };
 
         let reduction = reduce_thread_tree_refresh_success(
             ThreadTreeResponse {
                 workspace_id: "ws_a".to_owned(),
                 threads: vec![response_thread.clone()],
+                unread: vec![response_unread.clone()],
                 folders: vec![response_folder.clone()],
                 placements: vec![response_placement.clone()],
                 agents_docs: vec![response_agents_doc.clone()],
@@ -1228,6 +1235,7 @@ mod tests {
 
         assert_eq!(reduction.workspace_id, "ws_a");
         assert_eq!(reduction.threads, vec![response_thread]);
+        assert_eq!(reduction.unread, vec![response_unread]);
         assert_eq!(reduction.folders, vec![response_folder]);
         assert_eq!(reduction.placements, vec![response_placement]);
         assert_eq!(reduction.agents_docs, vec![response_agents_doc]);
@@ -1261,6 +1269,7 @@ mod tests {
             ThreadTreeResponse {
                 workspace_id: "ws_a".to_owned(),
                 threads: Vec::new(),
+                unread: Vec::new(),
                 folders: Vec::new(),
                 placements: Vec::new(),
                 agents_docs: Vec::new(),

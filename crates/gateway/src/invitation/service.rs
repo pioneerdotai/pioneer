@@ -7,15 +7,14 @@ use pioneer_crud::{
     NewMemberPrincipalRow, NewPrincipalAvatarRow, NewWorkspaceMembership,
 };
 use pioneer_protocol::{
-    ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, INVITATION_MAX_WORKSPACE_GRANTS,
-    GatewayBaseUrl,
-    InvitationAcceptParams, InvitationAcceptResponse, InvitationCreateParams,
-    InvitationCreateResponse, InvitationCredential, InvitationErrorReason, InvitationId,
-    InvitationInviterSummary, InvitationListParams, InvitationListResponse, InvitationPresentation,
-    InvitationPreviewResponse, InvitationRevokeParams, InvitationRevokeReason,
-    InvitationRevokeResponse, InvitationStatus, InvitationSummary, InvitationTransportSecurity,
-    InvitationWorkspaceSummary, MemberSummary, PersistedActorRef, PrincipalId, PrincipalKind,
-    PrincipalStatus, RoleKey, WorkspaceId, generate_id,
+    ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, GatewayBaseUrl,
+    INVITATION_MAX_WORKSPACE_GRANTS, InvitationAcceptParams, InvitationAcceptResponse,
+    InvitationCreateParams, InvitationCreateResponse, InvitationCredential, InvitationErrorReason,
+    InvitationId, InvitationInviterSummary, InvitationListParams, InvitationListResponse,
+    InvitationPresentation, InvitationPreviewResponse, InvitationRevokeParams,
+    InvitationRevokeReason, InvitationRevokeResponse, InvitationStatus, InvitationSummary,
+    InvitationTransportSecurity, InvitationWorkspaceSummary, MemberSummary, PersistedActorRef,
+    PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId, generate_id,
 };
 use sea_orm::{
     DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait,
@@ -1417,11 +1416,11 @@ mod tests {
         AuthorizationResolver, AuthorizationService, AuthorizedMemberPrincipal,
         AuthorizedWorkspace, ProofResolution,
     };
+    use crate::member::MemberService;
+    use crate::secrets::{AuthKeyMaterial, GatewaySecrets};
     use crate::tests::authorization::{
         IsolatedEpic4Harness, MEMBER_A_ID, WORKSPACE_BLUE_ID, WORKSPACE_GREEN_ID, WORKSPACE_RED_ID,
     };
-    use crate::member::MemberService;
-    use crate::secrets::{AuthKeyMaterial, GatewaySecrets};
 
     use super::*;
 

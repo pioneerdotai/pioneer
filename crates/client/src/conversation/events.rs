@@ -52,6 +52,8 @@ pub enum ConversationEvent {
         thread_id: String,
         turn_id: String,
         pending_request_id: String,
+        #[serde(default)]
+        mode: pioneer_protocol::ThreadMode,
         user_text: String,
         #[serde(default)]
         attachments: Vec<UserMessageAttachment>,
@@ -60,11 +62,15 @@ pub enum ConversationEvent {
         thread_id: String,
         turn_id: String,
         pending_request_id: String,
+        #[serde(default)]
+        mode: pioneer_protocol::ThreadMode,
     },
     LocalTurnStartRejected {
         thread_id: String,
         turn_id: String,
         pending_request_id: String,
+        #[serde(default)]
+        mode: pioneer_protocol::ThreadMode,
         error: String,
     },
     LocalTurnCancelRequested {
@@ -486,6 +492,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             pending_request_id: "request_1".to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             user_text: "hello".to_owned(),
             attachments: Vec::new(),
         };

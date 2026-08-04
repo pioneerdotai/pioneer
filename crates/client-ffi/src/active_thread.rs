@@ -59,7 +59,7 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     AccessChangeKind, AccessChangedNotification, AgentExecutionBackend, GatewayNotification,
-    RuntimeSummary, Thread, ThreadGetParams, ThreadMode, ThreadTimelinePageParams,
+    PrincipalId, RuntimeSummary, Thread, ThreadGetParams, ThreadMode, ThreadTimelinePageParams,
     ThreadTimelinePageResponse, TimelinePageAnchor, TurnWorkItemsGetParams,
     TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
@@ -167,6 +167,10 @@ pub struct ClientActiveThreadSendTextRequest {
     pub selected_reasoning_effort: Option<String>,
     #[serde(default)]
     pub selected_mode: Option<ThreadMode>,
+    #[serde(default)]
+    pub reply_to_turn_id: Option<String>,
+    #[serde(default)]
+    pub mentioned_principal_ids: Vec<PrincipalId>,
     pub permission_mode: TurnPermissionMode,
     #[serde(default)]
     pub attachments: Vec<ComposerAttachment>,
@@ -240,8 +244,8 @@ pub struct ClientActiveThreadCancelTurnResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ClientActiveThreadTurnSelection {
-    selected_model: String,
-    selected_provider: String,
+    selected_model: Option<String>,
+    selected_provider: Option<String>,
     selected_mode: ThreadMode,
 }
 
@@ -619,6 +623,8 @@ impl ClientFfiActiveThreadState {
             selected_provider,
             selected_reasoning_effort,
             selected_mode,
+            reply_to_turn_id,
+            mentioned_principal_ids,
             permission_mode,
             attachments,
             capabilities,
@@ -626,6 +632,27 @@ impl ClientFfiActiveThreadState {
             skill_picker,
             expanded_keys,
         } = request;
+
+        let message_requested = selected_mode == Some(ThreadMode::Message);
+        let message_has_execution_overrides = message_requested
+            && [
+                selected_model.as_deref(),
+                selected_provider.as_deref(),
+                selected_reasoning_effort.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty());
+        if message_has_execution_overrides {
+            return Err(anyhow::anyhow!(
+                "Message does not accept model, provider, or reasoning overrides"
+            ));
+        }
+        if message_requested && (!capabilities.is_empty() || !skill_selections.is_empty()) {
+            return Err(anyhow::anyhow!(
+                "Message does not accept execution capabilities"
+            ));
+        }
 
         let thread_id = thread_session::require_thread_id(thread_id, "sending text")
             .map_err(anyhow::Error::msg)?;
@@ -680,14 +707,21 @@ impl ClientFfiActiveThreadState {
                 !capabilities.is_empty() || !skill_selections.is_empty(),
             )?
         };
-        let execution_target = resolve_selected_execution_target(
-            runtime,
-            workspace_id.as_str(),
-            Some(selection.selected_provider.as_str()),
-        )?;
+        let is_message = selection.selected_mode == ThreadMode::Message;
+        let execution_target = if is_message {
+            SelectedExecutionTarget {
+                execution_backend: None,
+            }
+        } else {
+            resolve_selected_execution_target(
+                runtime,
+                workspace_id.as_str(),
+                selection.selected_provider.as_deref(),
+            )?
+        };
         let cli_runtime_selected = execution_target.execution_backend.is_some();
         let submission = plan_composer_submission(
-            Some(selection.selected_provider.as_str()),
+            selection.selected_provider.as_deref(),
             text.as_str(),
             !attachments.is_empty(),
             capabilities.as_slice(),
@@ -713,10 +747,10 @@ impl ClientFfiActiveThreadState {
                 skill_picker,
             },
         )?;
-        let turn_model_provider = if cli_runtime_selected {
+        let turn_model_provider = if is_message || cli_runtime_selected {
             None
         } else {
-            Some(selection.selected_provider.clone())
+            selection.selected_provider.clone()
         };
         let submit_reduction = reduce_prepared_composer_turn_submit_success(
             PreparedComposerTurnSubmitContext {
@@ -724,8 +758,8 @@ impl ClientFfiActiveThreadState {
                 turn_id: turn_id.clone(),
                 pending_request_id: pending_request_id.clone(),
                 composer_execution_mode,
-                selected_model: Some(selection.selected_model),
-                selected_provider: Some(selection.selected_provider.clone()),
+                selected_model: selection.selected_model,
+                selected_provider: selection.selected_provider,
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 permission_mode,
@@ -739,8 +773,10 @@ impl ClientFfiActiveThreadState {
         let thread_snapshot_update = submit_reduction.thread_snapshot_update.clone();
         let local_turn_start_requested_event =
             submit_reduction.local_turn_start_requested_event.clone();
-        let turn_start_params =
-            turn_start_params_from_plan(submit_reduction.turn_start_params_plan);
+        let mut turn_start_params_plan = submit_reduction.turn_start_params_plan;
+        turn_start_params_plan.reply_to_turn_id = reply_to_turn_id;
+        turn_start_params_plan.mentioned_principal_ids = mentioned_principal_ids;
+        let turn_start_params = turn_start_params_from_plan(turn_start_params_plan);
 
         let semantic_timeline_patch = {
             let mut inner = self
@@ -761,6 +797,7 @@ impl ClientFfiActiveThreadState {
             if let Some(thread) = coordinator.thread_mut() {
                 apply_prepared_turn_to_thread_snapshot(
                     thread,
+                    selection.selected_mode,
                     thread_snapshot_update.selected_model.as_deref(),
                     thread_snapshot_update.selected_provider.as_deref(),
                     thread_snapshot_update.selected_reasoning_effort.as_deref(),
@@ -857,14 +894,20 @@ impl ClientFfiActiveThreadState {
                 selected_mode,
             )?
         };
+        let selected_provider = selection.selected_provider.ok_or_else(|| {
+            anyhow::anyhow!("model and provider must be selected before starting voice")
+        })?;
+        let selected_model = selection.selected_model.ok_or_else(|| {
+            anyhow::anyhow!("model and provider must be selected before starting voice")
+        })?;
         let execution_target = resolve_selected_execution_target(
             runtime,
             workspace_id.as_str(),
-            Some(selection.selected_provider.as_str()),
+            Some(selected_provider.as_str()),
         )?;
         let cli_runtime_selected = execution_target.execution_backend.is_some();
         let capabilities = plan_composer_submission(
-            Some(selection.selected_provider.as_str()),
+            Some(selected_provider.as_str()),
             "",
             !attachments.is_empty(),
             capabilities.as_slice(),
@@ -873,7 +916,7 @@ impl ClientFfiActiveThreadState {
         let turn_model_provider = if cli_runtime_selected {
             None
         } else {
-            Some(selection.selected_provider.clone())
+            Some(selected_provider.clone())
         };
 
         prepare_voice_composer_snapshot(
@@ -888,8 +931,8 @@ impl ClientFfiActiveThreadState {
                 capabilities,
                 skill_selections,
                 skill_picker,
-                selected_model: Some(selection.selected_model),
-                selected_provider: Some(selection.selected_provider),
+                selected_model: Some(selected_model),
+                selected_provider: Some(selected_provider),
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 permission_mode,
@@ -1894,6 +1937,38 @@ fn resolve_turn_selection(
     has_attachments: bool,
     has_capabilities: bool,
 ) -> anyhow::Result<ClientActiveThreadTurnSelection> {
+    let selected_mode =
+        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
+    let coordinator = inner
+        .coordinators
+        .get(thread_id)
+        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting turn"))?;
+
+    if selected_mode == ThreadMode::Message {
+        if !can_submit_composer_message(ComposerSubmitAvailabilityInput {
+            gateway_connected: true,
+            upload_in_progress: false,
+            has_active_thread: true,
+            has_complete_model_selection: true,
+            // Message is an instant-completed Turn and never claims the
+            // foreground execution slot held by Chat/Agent.
+            conversation_can_submit: true,
+            text,
+            has_attachments,
+            has_capabilities,
+        }) {
+            return Err(anyhow::anyhow!(
+                "active thread is not ready to start a new turn"
+            ));
+        }
+
+        return Ok(ClientActiveThreadTurnSelection {
+            selected_model: None,
+            selected_provider: None,
+            selected_mode,
+        });
+    }
+
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
     let requested_selection = match (requested_provider, requested_model) {
@@ -1909,10 +1984,6 @@ fn resolve_turn_selection(
             ));
         }
     };
-    let coordinator = inner
-        .coordinators
-        .get(thread_id)
-        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting turn"))?;
     let resolved_selection = match requested_selection {
         Some(selection) => selection,
         None => client_selectors::resolve_composer_model_selection_from(
@@ -1924,9 +1995,6 @@ fn resolve_turn_selection(
             anyhow::anyhow!("model and provider must be selected before starting turn")
         })?,
     };
-    let selected_mode =
-        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
-
     if !can_submit_composer_message(ComposerSubmitAvailabilityInput {
         gateway_connected: true,
         upload_in_progress: false,
@@ -1943,8 +2011,8 @@ fn resolve_turn_selection(
     }
 
     Ok(ClientActiveThreadTurnSelection {
-        selected_model: resolved_selection.model,
-        selected_provider: resolved_selection.provider,
+        selected_model: Some(resolved_selection.model),
+        selected_provider: Some(resolved_selection.provider),
         selected_mode,
     })
 }
@@ -1956,6 +2024,14 @@ fn resolve_voice_turn_selection(
     requested_model: Option<String>,
     requested_mode: Option<ThreadMode>,
 ) -> anyhow::Result<ClientActiveThreadTurnSelection> {
+    let selected_mode =
+        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
+    if selected_mode == ThreadMode::Message {
+        return Err(anyhow::anyhow!(
+            "voice composer does not support Message mode"
+        ));
+    }
+
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
     let requested_selection = match (requested_provider, requested_model) {
@@ -1986,9 +2062,6 @@ fn resolve_voice_turn_selection(
             anyhow::anyhow!("model and provider must be selected before starting voice")
         })?,
     };
-    let selected_mode =
-        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
-
     if !coordinator.conversation.can_submit_message() {
         return Err(anyhow::anyhow!(
             "active thread is not ready to start a new voice turn"
@@ -1996,8 +2069,8 @@ fn resolve_voice_turn_selection(
     }
 
     Ok(ClientActiveThreadTurnSelection {
-        selected_model: resolved_selection.model,
-        selected_provider: resolved_selection.provider,
+        selected_model: Some(resolved_selection.model),
+        selected_provider: Some(resolved_selection.provider),
         selected_mode,
     })
 }
@@ -2270,6 +2343,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -2640,11 +2719,77 @@ mod tests {
     fn active_thread_send_text_decodes_explicit_permission_mode() {
         let request: ClientActiveThreadSendTextRequest = serde_json::from_value(json!({
             "text": "hello",
+            "selected_mode": "Message",
+            "reply_to_turn_id": "parent-turn",
+            "mentioned_principal_ids": ["P00000000000000000001"],
             "permission_mode": "supervised"
         }))
         .expect("request decodes");
 
         assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
+        assert_eq!(request.selected_mode, Some(ThreadMode::Message));
+        assert_eq!(request.reply_to_turn_id.as_deref(), Some("parent-turn"));
+        assert_eq!(
+            request
+                .mentioned_principal_ids
+                .iter()
+                .map(PrincipalId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["P00000000000000000001"]
+        );
+    }
+
+    #[test]
+    fn message_turn_selection_needs_no_model_or_provider() {
+        let mut inner = ClientFfiActiveThreadInner::default();
+        let mut message_thread = thread("thread_a", "ws_a");
+        message_thread.model.clear();
+        message_thread.model_provider.clear();
+        let mut coordinator = ThreadCoordinator::new(message_thread);
+        coordinator.conversation.apply(
+            pioneer_client::conversation::ConversationEvent::TurnStarted {
+                thread_id: "thread_a".to_owned(),
+                turn: running_turn("running_agent"),
+            },
+        );
+        assert!(!coordinator.conversation.can_submit_message());
+        inner
+            .coordinators
+            .insert("thread_a".to_owned(), coordinator);
+
+        let selection = resolve_turn_selection(
+            &inner,
+            "thread_a",
+            None,
+            None,
+            Some(ThreadMode::Message),
+            "hello",
+            false,
+            false,
+        )
+        .expect("Message selection");
+
+        assert_eq!(selection.selected_mode, ThreadMode::Message);
+        assert!(selection.selected_model.is_none());
+        assert!(selection.selected_provider.is_none());
+    }
+
+    #[test]
+    fn voice_composer_rejects_message_mode_before_provider_resolution() {
+        let error = resolve_voice_turn_selection(
+            &ClientFfiActiveThreadInner::default(),
+            "thread_a",
+            None,
+            None,
+            Some(ThreadMode::Message),
+        )
+        .expect_err("Message voice mode must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("voice composer does not support Message mode")
+        );
     }
 
     #[test]
@@ -3031,6 +3176,7 @@ mod tests {
             thread_id: "thread_a".to_owned(),
             turn_id: "turn_a".to_owned(),
             pending_request_id: "pending_a".to_owned(),
+            mode: ThreadMode::Agent,
             user_text: "start detached work".to_owned(),
             attachments: Vec::new(),
         };

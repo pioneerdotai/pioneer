@@ -144,8 +144,21 @@ mod tests {
 
         assert!(paths.final_path.as_path().starts_with(&runtime_home));
         assert!(paths.part_path.as_path().starts_with(&runtime_home));
-        assert!(paths.part_path.as_path().to_string_lossy().ends_with(".part"));
-        assert_eq!(paths.final_path.as_path().extension().and_then(|value| value.to_str()), Some("txt"));
+        assert!(
+            paths
+                .part_path
+                .as_path()
+                .to_string_lossy()
+                .ends_with(".part")
+        );
+        assert_eq!(
+            paths
+                .final_path
+                .as_path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("txt")
+        );
     }
 
     #[test]
@@ -178,6 +191,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(first.final_path.as_path().extension().and_then(|value| value.to_str()), Some("pdf"));
+        assert_eq!(
+            first
+                .final_path
+                .as_path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("pdf")
+        );
     }
 }

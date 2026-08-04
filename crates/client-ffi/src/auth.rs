@@ -283,8 +283,7 @@ mod tests {
     fn exchange_request_debug_redacts_credential() {
         let raw = "prf_super_secret_refresh_value";
         let request = ClientAuthRefreshRequest {
-            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878")
-                .unwrap(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878").unwrap(),
             credential: AuthSecretString::new(raw),
             params: AuthRefreshParams {
                 refresh_request_id: "Q00000000000000000001".to_owned(),
@@ -299,8 +298,7 @@ mod tests {
     fn cleanup_request_debug_redacts_access_token() {
         let raw = "access-super-secret-value";
         let request = ClientAuthSessionCleanupRequest {
-            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878")
-                .unwrap(),
+            gateway_base_url: GatewayBaseUrl::parse_presentation("http://localhost:17878").unwrap(),
             access_token: AuthSecretString::new(raw),
             session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
             timeout_ms: 100,

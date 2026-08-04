@@ -213,8 +213,7 @@ fn migrate_address(input: &str, local: bool) -> Result<GatewayBaseUrl, AddressMi
             } else {
                 format!("0.0.0.0:{port}")
             };
-            return GatewayBaseUrl::from_local_listen_addr(listen.as_str())
-                .map_err(map_base_error);
+            return GatewayBaseUrl::from_local_listen_addr(listen.as_str()).map_err(map_base_error);
         }
         return GatewayBaseUrl::parse_presentation(url.as_str()).map_err(map_base_error);
     }
@@ -250,12 +249,7 @@ mod tests {
         };
         assert_eq!(registry.version, CURRENT_GATEWAY_REGISTRY_VERSION);
         assert_eq!(
-            registry
-                .local
-                .as_ref()
-                .unwrap()
-                .gateway_base_url
-                .as_str(),
+            registry.local.as_ref().unwrap().gateway_base_url.as_str(),
             "http://127.0.0.1:17878/"
         );
         assert_eq!(

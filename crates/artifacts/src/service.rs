@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::pin::Pin;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -769,9 +769,7 @@ impl ArtifactService {
                 sanitize_display_name(summary.artifact.display_name.as_str()),
                 summary.artifact.mime_type.as_deref(),
             ),
-            effective_mime_type: normalized_effective_mime(
-                summary.artifact.mime_type.as_deref(),
-            ),
+            effective_mime_type: normalized_effective_mime(summary.artifact.mime_type.as_deref()),
             size_bytes: blob.size_bytes,
             sha256: blob.sha256,
         };
@@ -1366,7 +1364,11 @@ mod tests {
             .exact_content_snapshot(
                 "ws_a",
                 summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref().expect("exact version"),
+                summary
+                    .artifact
+                    .version_id
+                    .as_deref()
+                    .expect("exact version"),
             )
             .await
             .expect("content snapshot");
@@ -1537,11 +1539,7 @@ mod tests {
         ));
         let mut projection_reader = harness
             .service
-            .open_content_range(
-                &projection_snapshot,
-                0,
-                projection_snapshot.size_bytes(),
-            )
+            .open_content_range(&projection_snapshot, 0, projection_snapshot.size_bytes())
             .await
             .expect("open projection stream");
         let mut projection_bytes = Vec::new();
@@ -1549,7 +1547,10 @@ mod tests {
             .read_to_end(&mut projection_bytes)
             .await
             .expect("stream projection");
-        assert_eq!(projection_bytes.len() as u64, projection_snapshot.size_bytes());
+        assert_eq!(
+            projection_bytes.len() as u64,
+            projection_snapshot.size_bytes()
+        );
 
         let preview = summary.artifact.preview.expect("thumbnail preview");
         assert_eq!(preview.projection_kind, ArtifactProjectionKind::Thumbnail);
@@ -2247,7 +2248,11 @@ mod tests {
             .exact_content_snapshot(
                 "ws_a",
                 created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref().expect("exact version"),
+                created
+                    .artifact
+                    .version_id
+                    .as_deref()
+                    .expect("exact version"),
             )
             .await
             .expect("exact content snapshot");
@@ -2346,7 +2351,11 @@ mod tests {
         let created = harness
             .service
             .ingest_bytes(ingest_request(
-                "ws_a", "thr_a", "turn_a", b"x", "pending.txt",
+                "ws_a",
+                "thr_a",
+                "turn_a",
+                b"x",
+                "pending.txt",
             ))
             .await
             .expect("ingest bytes");
@@ -2385,7 +2394,11 @@ mod tests {
         let created = harness
             .service
             .ingest_bytes(ingest_request(
-                "ws_a", "thr_a", "turn_a", b"seed", "large.bin",
+                "ws_a",
+                "thr_a",
+                "turn_a",
+                b"seed",
+                "large.bin",
             ))
             .await
             .expect("ingest seed");
@@ -2978,7 +2991,10 @@ mod tests {
     }
 
     impl tokio::io::AsyncSeek for MemoryReader {
-        fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        fn start_seek(
+            mut self: Pin<&mut Self>,
+            position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
             self.position = resolve_fake_seek(self.bytes.len() as u64, self.position, position)?;
             Ok(())
         }
@@ -3026,7 +3042,10 @@ mod tests {
     }
 
     impl tokio::io::AsyncSeek for LogicalZeroReader {
-        fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        fn start_seek(
+            mut self: Pin<&mut Self>,
+            position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
             self.position = resolve_fake_seek(self.size_bytes, self.position, position)?;
             Ok(())
         }

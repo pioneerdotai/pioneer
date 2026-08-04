@@ -314,7 +314,9 @@ impl AuthExchangeClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let (stream, remaining) = self.connect_with_credential(gateway_base_url, credential).await?;
+        let (stream, remaining) = self
+            .connect_with_credential(gateway_base_url, credential)
+            .await?;
         exchange_over_stream(stream, method, params, remaining).await
     }
 
@@ -329,7 +331,9 @@ impl AuthExchangeClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let (stream, remaining) = self.connect_with_credential(gateway_base_url, credential).await?;
+        let (stream, remaining) = self
+            .connect_with_credential(gateway_base_url, credential)
+            .await?;
         request_once_over_stream(stream, method, params, remaining).await
     }
 
@@ -865,8 +869,7 @@ mod tests {
     async fn invitation_preview_uses_the_connected_endpoint_transport_classification() {
         let invitation = InvitationQrPresentation::from_presentation(
             InvitationPresentation::new(
-                GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer")
-                    .unwrap(),
+                GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer").unwrap(),
                 GatewayId::new("G00000000000000000001").unwrap(),
                 InvitationCredential::parse(format!(
                     "{}{}",
@@ -1060,10 +1063,9 @@ mod tests {
         let gateway_base_url = listener.local_addr().unwrap();
         drop(listener);
 
-        let base = GatewayBaseUrl::parse_presentation(
-            format!("http://{gateway_base_url}").as_str(),
-        )
-        .unwrap();
+        let base =
+            GatewayBaseUrl::parse_presentation(format!("http://{gateway_base_url}").as_str())
+                .unwrap();
         let result = AuthExchangeClient::new(Duration::from_secs(1))
             .connect_with_credential(&base, "credential")
             .await;
@@ -1181,9 +1183,12 @@ mod tests {
 
     #[test]
     fn auth_endpoint_is_the_typed_shared_gateway_base() {
-        let base = GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer")
-            .unwrap();
-        assert_eq!(base.websocket_url().as_str(), "wss://gateway.example.test/pioneer/");
+        let base =
+            GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer").unwrap();
+        assert_eq!(
+            base.websocket_url().as_str(),
+            "wss://gateway.example.test/pioneer/"
+        );
         assert!(GatewayBaseUrl::parse_presentation("wss://gateway.example.test/ws").is_err());
     }
 

@@ -18,8 +18,12 @@ pub enum SandboxMode {
     FullAccess,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThreadMode {
+    Message,
+    /// Compatibility default for pre-Epic-6 persisted and wire values. New
+    /// user-thread creation selects `Message` explicitly.
+    #[default]
     Chat,
     Agent,
 }
@@ -205,11 +209,19 @@ pub struct ThreadTreeResponse {
     #[serde(default)]
     pub threads: Vec<Thread>,
     #[serde(default)]
+    pub unread: Vec<ThreadUnreadSummary>,
+    #[serde(default)]
     pub folders: Vec<ThreadFolder>,
     #[serde(default)]
     pub placements: Vec<ThreadPlacement>,
     #[serde(default)]
     pub agents_docs: Vec<ThreadAgentsDocSummary>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadUnreadSummary {
+    pub thread_id: String,
+    pub unread_count: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -289,6 +301,8 @@ pub struct ThreadGetParams {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadGetResponse {
     pub thread: Thread,
+    #[serde(default)]
+    pub unread_count: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -687,6 +701,7 @@ mod tests {
         let encoded = serde_json::to_value(ThreadTreeResponse {
             workspace_id: "ws_123".to_owned(),
             threads: Vec::new(),
+            unread: Vec::new(),
             folders: Vec::new(),
             placements: Vec::new(),
             agents_docs: vec![ThreadAgentsDocSummary {

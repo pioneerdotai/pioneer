@@ -32,15 +32,15 @@ pub(crate) use registry::{
     BinaryAuthorizationEntry, BinaryIngressKind, MethodAuthorizationEntry, RegistryLookupError,
     ResourceResolverKind, binary_ingress_entry, normal_method_entry,
 };
+#[cfg(test)]
+pub(crate) use resolver::AuthorizedMemberAvatar;
 pub(crate) use resolver::{
     AuthorizationResolver, AuthorizedArtifact, AuthorizedInvitation,
     AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberDirectory,
-    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask,
-    AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace, AuthorizedWorkspaceCollection,
-    ProofResolution, persisted_actor_is_current,
+    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
+    AuthorizedWorkspace, AuthorizedWorkspaceCollection, ProofResolution,
+    persisted_actor_is_current,
 };
-#[cfg(test)]
-pub(crate) use resolver::AuthorizedMemberAvatar;
 pub(crate) use service::{
     AuthorizationService, ResolvedResourceAccess, ThreadAccessFacts, WorkspaceAccessFacts,
 };

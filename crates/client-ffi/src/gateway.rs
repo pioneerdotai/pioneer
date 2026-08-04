@@ -132,9 +132,7 @@ pub fn load_gateway_registry_request(
 ) -> Result<LoadGatewayRegistryResult, GatewayRegistryLoadError> {
     Ok(match load_registry_json(request.document.as_str())? {
         GatewayRegistryLoad::Current(registry) => LoadGatewayRegistryResult::Current { registry },
-        GatewayRegistryLoad::Migrated(registry) => {
-            LoadGatewayRegistryResult::Migrated { registry }
-        }
+        GatewayRegistryLoad::Migrated(registry) => LoadGatewayRegistryResult::Migrated { registry },
         GatewayRegistryLoad::ReconfigurationRequired { endpoint_ids } => {
             LoadGatewayRegistryResult::ReconfigurationRequired { endpoint_ids }
         }

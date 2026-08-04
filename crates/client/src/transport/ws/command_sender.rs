@@ -13,13 +13,12 @@ use anyhow::{Result, anyhow};
 use pioneer_protocol::constants::methods;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactCapabilitiesParams,
-    ArtifactCapabilitiesResponse, ArtifactDeleteParams, ArtifactDeleteResponse,
-    ArtifactGetParams, ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactCapabilitiesResponse, ArtifactDeleteParams, ArtifactDeleteResponse, ArtifactGetParams,
+    ArtifactGetResponse, ArtifactListForMessageParams, ArtifactListForThreadParams,
     ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactRestoreParams,
-    ArtifactRestoreResponse,
-    ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
-    ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadFinishParams,
-    ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    ArtifactRestoreResponse, ArtifactUploadAbortParams, ArtifactUploadAbortResponse,
+    ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadStartParams,
+    ArtifactUploadStartResponse, ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
     AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthSessionListResponse,
     AuthSessionRevokeParams, AuthSessionRevokeResponse, CLIRuntimeListModelsParams,
     CLIRuntimeListModelsResponse, CLIRuntimeListParams, CLIRuntimeListResponse,
@@ -38,17 +37,16 @@ use pioneer_protocol::{
     McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse,
     McpServerRestartParams, McpServerRestartResponse, McpUninstallParams, McpUninstallResponse,
     MemberDeviceCreateParams, MemberDeviceCreateResponse, MemberListParams, MemberListResponse,
-    MemberMutationResponse,
-    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, ProviderConfigureParams,
-    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, SkillListParams, SkillListResponse,
-    SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse,
-    SkillsPackInstallParams, SkillsPackInstallResponse, SkillsPackUninstallParams,
-    SkillsPackUninstallResponse, SkillsPackUpdateParams, SkillsPackUpdateResponse,
-    SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
-    SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
-    SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    MemberMutationResponse, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
+    ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    SkillListParams, SkillListResponse, SkillsHealthParams, SkillsHealthResponse,
+    SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
+    SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
+    SkillsPackUpdateResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
+    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
+    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
     SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
     TaskCancelResponse, TaskReviseParams, TaskReviseResponse, ThreadAgentsDocArchiveParams,
@@ -57,20 +55,23 @@ use pioneer_protocol::{
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadStartParams, ThreadStartResponse,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
-    TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
-    TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
-    TurnStartParams, TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams,
-    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
-    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
-    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceMemberAddParams,
-    WorkspaceMemberListParams, WorkspaceMemberListResponse, WorkspaceMemberMutationResponse,
-    WorkspaceMemberRemoveParams, WorkspaceSelectParams, WorkspaceSelectResponse,
-    WorkspaceUpdateParams, WorkspaceUpdateResponse, validate_voice_streaming_audio_format,
+    ThreadMoveParams, ThreadMoveResponse, ThreadReadParams, ThreadReadResponse, ThreadStartParams,
+    ThreadStartResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams,
+    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams,
+    ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse,
+    TurnItemsParams, TurnItemsResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
+    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageErrorReason,
+    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
+    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
+    TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams,
+    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceMemberAddParams, WorkspaceMemberListParams,
+    WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    validate_voice_streaming_audio_format,
 };
 use std::time::Duration;
 
@@ -751,6 +752,120 @@ where
     require_non_empty_field(params.turn_id.as_str(), "turn_id", methods::TURN_START)?;
 
     send_json_rpc_request_typed(transport, methods::TURN_START, &params, RPC_REQUEST_TIMEOUT)
+}
+
+pub fn turn_message_edit<TTransport>(
+    transport: &TTransport,
+    params: TurnMessageEditParams,
+) -> Result<TurnMessageEditResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_MESSAGE_EDIT,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_MESSAGE_EDIT,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_MESSAGE_EDIT,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+/// Returns the stable server reason for a failed Message mutation.
+///
+/// Callers use `RevisionConflict` as a refetch signal. The shared client does
+/// not maintain an optimistic second copy of the message, so recovery is the
+/// existing authoritative Turn/timeline reload rather than a rollback state
+/// machine.
+pub fn turn_message_error_reason(error: &anyhow::Error) -> Option<TurnMessageErrorReason> {
+    let code = crate::rpc::json_rpc_response_error(error)?.machine_code()?;
+    match code {
+        "invalid_input" => Some(TurnMessageErrorReason::InvalidInput),
+        "invalid_target" => Some(TurnMessageErrorReason::InvalidTarget),
+        "immutable_message" => Some(TurnMessageErrorReason::ImmutableMessage),
+        "deleted_message" => Some(TurnMessageErrorReason::DeletedMessage),
+        "revision_conflict" => Some(TurnMessageErrorReason::RevisionConflict),
+        _ => None,
+    }
+}
+
+pub fn turn_message_delete<TTransport>(
+    transport: &TTransport,
+    params: TurnMessageDeleteParams,
+) -> Result<TurnMessageDeleteResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_MESSAGE_DELETE,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_MESSAGE_DELETE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_MESSAGE_DELETE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_message_revisions_page<TTransport>(
+    transport: &TTransport,
+    params: TurnMessageRevisionsPageParams,
+) -> Result<TurnMessageRevisionsPageResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_MESSAGE_REVISIONS_PAGE,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_MESSAGE_REVISIONS_PAGE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_MESSAGE_REVISIONS_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_read<TTransport>(
+    transport: &TTransport,
+    params: ThreadReadParams,
+) -> Result<ThreadReadResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(params.thread_id.as_str(), "thread_id", methods::THREAD_READ)?;
+    require_non_empty_field(
+        params.through_turn_id.as_str(),
+        "through_turn_id",
+        methods::THREAD_READ,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_READ,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
 }
 
 pub fn turn_cancel<TTransport>(
@@ -2637,6 +2752,83 @@ mod tests {
     }
 
     #[test]
+    fn epic6_turn_centric_wrappers_serialize_existing_methods_and_ids() {
+        let transport = RecordingFailureTransport::default();
+        let thread_id = "TAAAAAAAAAAAAAAAAAAAA";
+        let turn_id = "UAAAAAAAAAAAAAAAAAAAA";
+
+        let _ = turn_start(
+            &transport,
+            params(json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "input": [{"type": "text", "text": "hello", "textElements": []}],
+                "mode": "Message"
+            })),
+        );
+        let _ = turn_message_edit(
+            &transport,
+            params(json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "expected_revision": 0,
+                "input": [{"type": "text", "text": "edited", "textElements": []}]
+            })),
+        );
+        let _ = turn_message_delete(
+            &transport,
+            params(json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "expected_revision": 1
+            })),
+        );
+        let _ = turn_message_revisions_page(
+            &transport,
+            params(json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "limit": 20
+            })),
+        );
+        let _ = thread_read(
+            &transport,
+            params(json!({
+                "thread_id": thread_id,
+                "through_turn_id": turn_id
+            })),
+        );
+
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                methods::TURN_START,
+                methods::TURN_MESSAGE_EDIT,
+                methods::TURN_MESSAGE_DELETE,
+                methods::TURN_MESSAGE_REVISIONS_PAGE,
+                methods::THREAD_READ,
+            ]
+        );
+        for request in requests.iter() {
+            let payload = request.params.as_ref().expect("request params");
+            assert_eq!(payload["thread_id"], json!(thread_id));
+            assert_eq!(
+                payload
+                    .get("turn_id")
+                    .or_else(|| payload.get("through_turn_id")),
+                Some(&json!(turn_id))
+            );
+            assert!(payload.get("source_message_id").is_none());
+            assert!(payload.get("bearer").is_none());
+            assert!(payload.get("bytes").is_none());
+        }
+    }
+
+    #[test]
     fn auth_rpc_errors_preserve_machine_codes_without_peer_controlled_messages() {
         let secret = "eyJhbGciOiJIUzI1NiJ9.peer-controlled.signature";
         let structured = sanitize_auth_rpc_error(anyhow::Error::new(
@@ -2670,6 +2862,20 @@ mod tests {
         );
         assert_eq!(generic, "Gateway authentication request failed");
         assert!(!generic.contains(secret));
+    }
+
+    #[test]
+    fn message_revision_conflict_is_a_typed_authoritative_refetch_signal() {
+        let error = anyhow::Error::new(crate::rpc::JsonRpcResponseError::server(
+            Some(pioneer_protocol::INVALID_REQUEST_CODE),
+            "message revision conflict",
+            Some("revision_conflict".to_owned()),
+        ));
+
+        assert_eq!(
+            turn_message_error_reason(&error),
+            Some(TurnMessageErrorReason::RevisionConflict)
+        );
     }
 
     struct ExactSkillTurnTransport;
@@ -3114,6 +3320,8 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
                         execution_backend: None,
                         reasoning: None,
                         permission_profile: None,
@@ -3138,6 +3346,8 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
                         execution_backend: None,
                         reasoning: None,
                         permission_profile: None,
@@ -3168,6 +3378,8 @@ mod tests {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
                 reasoning: None,
                 permission_profile: None,

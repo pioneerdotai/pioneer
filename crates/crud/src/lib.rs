@@ -92,26 +92,36 @@ pub use repositories::principal_avatar::{
     list_principal_avatar_revisions, load_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
-pub use repositories::turn::find_turn_initiator;
+pub use repositories::thread::{
+    advance_thread_read_cursor, find_thread_read_cursor, thread_read_cursor_from_model,
+};
+pub use repositories::turn::{
+    NewTurnMessageRevision, PersistedTurnCollaboration, collaboration_from_model,
+    find_turn_collaboration, find_turn_initiator, insert_turn_message_revision,
+    list_turn_message_revisions, turn_message_revision_from_model,
+};
 
 use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
-    ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
-    ArtifactSummary, GatewayId, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope,
-    MemoryScopeKind, PersistedActorRef, PrincipalId, PromptManifest, ProviderFailureClass,
-    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId,
-    SkillPackId, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
-    TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    ArtifactBindingDirection, ArtifactBindingKind, ArtifactBindingSummary, ArtifactProjectionKind,
+    ArtifactProjectionStatus, ArtifactRole, ArtifactStatus, ArtifactSummary, GatewayId,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
+    PersistedActorRef, PrincipalId, PromptManifest, ProviderFailureClass, ProviderFailureStage,
+    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SkillPackId,
+    StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
     TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind, TaskGetResponse,
     TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus,
     TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
-    ThreadStatus, ThreadVisibility, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload,
-    ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent,
-    TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind,
-    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
+    ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility, TimelineOutputPolicy,
+    ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
+    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsResponse, TurnKind, TurnMention, TurnMessageDeletedEvent, TurnMessageEditedEvent,
+    TurnMessageRevision, TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -827,15 +837,16 @@ pub use crate::repositories::thread_timeline_projection::{
     SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineApprovalScope, ThreadTimelineBlockRecord,
     TurnWorkItemProjectionRecord, TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN,
     WORK_VISIBILITY_VISIBLE, count_thread_timeline_blocks, count_turn_work_items,
+    count_unread_user_message_blocks, count_unread_user_message_blocks_for_threads,
     delete_thread_timeline_block, delete_thread_timeline_blocks_for_thread,
     delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
     delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
     find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
-    find_turn_work_projection, list_projection_meta_by_key_prefix,
-    list_thread_timeline_blocks_page, list_turn_work_item_projections_by_ids,
-    list_turn_work_items_page, update_projection_meta_status, upsert_projection_meta,
-    upsert_projection_meta_with_config, upsert_thread_timeline_block,
-    upsert_turn_work_item_projection, upsert_turn_work_projection,
+    find_turn_work_projection, find_user_message_block_by_turn_id,
+    list_projection_meta_by_key_prefix, list_thread_timeline_blocks_page,
+    list_turn_work_item_projections_by_ids, list_turn_work_items_page,
+    update_projection_meta_status, upsert_projection_meta, upsert_projection_meta_with_config,
+    upsert_thread_timeline_block, upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
 pub use crate::repositories::turn_mcp_projection::{
     TurnMcpProjectionPersistenceError, TurnMcpProjectionReplaceOutcome,
@@ -1633,6 +1644,262 @@ pub struct CrudStore {
     write_coordinator: SqliteWriteCoordinator,
 }
 
+#[derive(Debug, Clone)]
+pub struct EditTurnMessageRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub expected_revision: u64,
+    pub input: Vec<UserInput>,
+    pub mentions: Vec<TurnMention>,
+    pub changed_by: PersistedActorRef,
+    pub changed_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteTurnMessageRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub expected_revision: u64,
+    pub changed_by: PersistedActorRef,
+    pub changed_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarkThreadReadRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub principal_id: PrincipalId,
+    pub through_turn_id: String,
+    pub read_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadReadFailure {
+    InvalidTarget,
+}
+
+impl fmt::Display for ThreadReadFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("thread read target was not found")
+    }
+}
+
+impl StdError for ThreadReadFailure {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteTurnMessageResult {
+    pub turn: Turn,
+    /// `None` means the requested tombstone already existed. No revision,
+    /// event, audit row or notification is produced for that idempotent retry.
+    pub event: Option<TurnMessageDeletedEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMessageMutationFailure {
+    NotFound,
+    Forbidden,
+    InvalidInput,
+    InvalidTarget,
+    ImmutableMessage,
+    DeletedMessage,
+    RevisionConflict,
+}
+
+impl fmt::Display for TurnMessageMutationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::NotFound => "Turn message was not found",
+            Self::Forbidden => "Turn message mutation is forbidden",
+            Self::InvalidInput => "Turn message input is invalid",
+            Self::InvalidTarget => "Turn message target is unavailable",
+            Self::ImmutableMessage => "Turn is not a mutable Message",
+            Self::DeletedMessage => "Message is deleted",
+            Self::RevisionConflict => "Turn message revision conflict",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl StdError for TurnMessageMutationFailure {}
+
+async fn principal_current_thread_access_kind(
+    transaction: &DatabaseTransaction,
+    workspace_id: &str,
+    thread_id: &str,
+    principal_id: &PrincipalId,
+) -> Result<Option<pioneer_protocol::PrincipalKind>> {
+    let Some(principal) = load_principal_by_id(transaction, principal_id).await? else {
+        return Ok(None);
+    };
+    if principal.status != pioneer_protocol::PrincipalStatus::Active {
+        return Ok(None);
+    }
+
+    match principal.kind {
+        pioneer_protocol::PrincipalKind::Superuser => Ok(principal
+            .role_key
+            .is_none()
+            .then_some(pioneer_protocol::PrincipalKind::Superuser)),
+        pioneer_protocol::PrincipalKind::User => {
+            let role = principal
+                .role_key
+                .as_deref()
+                .map(pioneer_protocol::RoleKey::new)
+                .transpose()
+                .context("message mutation actor has an invalid persisted role")?;
+            if !role
+                .as_ref()
+                .is_some_and(pioneer_protocol::RoleKey::is_supported)
+                || find_active_workspace_for_principal(transaction, principal_id, workspace_id)
+                    .await?
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            Ok(find_accessible_thread_for_principal(
+                transaction,
+                principal_id,
+                workspace_id,
+                thread_id,
+            )
+            .await?
+            .is_some()
+            .then_some(pioneer_protocol::PrincipalKind::User))
+        }
+    }
+}
+
+async fn message_mutation_actor_current_thread_write_kind(
+    transaction: &DatabaseTransaction,
+    workspace_id: &str,
+    thread_id: &str,
+    changed_by: &PersistedActorRef,
+) -> Result<Option<pioneer_protocol::PrincipalKind>> {
+    let PersistedActorRef::Principal(principal_id) = changed_by else {
+        return Ok(None);
+    };
+    principal_current_thread_access_kind(transaction, workspace_id, thread_id, principal_id).await
+}
+
+async fn revalidate_turn_message_edit_targets(
+    transaction: &DatabaseTransaction,
+    workspace_id: &str,
+    thread_id: &str,
+    changed_by: &PersistedActorRef,
+    input: &[UserInput],
+    mentions: &[TurnMention],
+) -> Result<()> {
+    if pioneer_protocol::validate_turn_message_content(input, mentions.len()).is_err() {
+        return Err(anyhow::Error::new(TurnMessageMutationFailure::InvalidInput));
+    }
+
+    let PersistedActorRef::Principal(viewer_principal_id) = changed_by else {
+        return Err(anyhow::Error::new(
+            TurnMessageMutationFailure::InvalidTarget,
+        ));
+    };
+    let viewer = load_principal_by_id(transaction, viewer_principal_id)
+        .await?
+        .filter(|principal| principal.status == pioneer_protocol::PrincipalStatus::Active)
+        .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::InvalidTarget))?;
+
+    let mut seen_mentions = HashSet::with_capacity(mentions.len());
+    for mention in mentions {
+        if !seen_mentions.insert(mention.principal_id.clone()) {
+            return Err(anyhow::Error::new(
+                TurnMessageMutationFailure::InvalidTarget,
+            ));
+        }
+        let target = load_principal_by_id(transaction, &mention.principal_id)
+            .await?
+            .filter(|principal| {
+                principal.gateway_id == viewer.gateway_id
+                    && principal.status == pioneer_protocol::PrincipalStatus::Active
+                    && (principal.kind == pioneer_protocol::PrincipalKind::Superuser
+                        || (principal.kind == pioneer_protocol::PrincipalKind::User
+                            && principal.role_key.as_deref()
+                                == Some(pioneer_protocol::MEMBER_ROLE_KEY)))
+            })
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::InvalidTarget))?;
+        let visible = match viewer.kind {
+            pioneer_protocol::PrincipalKind::Superuser => true,
+            pioneer_protocol::PrincipalKind::User => {
+                target.id == viewer.id
+                    || target.kind == pioneer_protocol::PrincipalKind::Superuser
+                    || find_shared_workspace_principal_for_principal(
+                        transaction,
+                        &viewer.gateway_id,
+                        &viewer.id,
+                        &target.id,
+                    )
+                    .await?
+                    .is_some()
+            }
+        };
+        if !visible || target.nickname != mention.nickname {
+            return Err(anyhow::Error::new(
+                TurnMessageMutationFailure::InvalidTarget,
+            ));
+        }
+    }
+
+    for value in input {
+        let UserInput::Artifact {
+            artifact_id,
+            version_id: Some(version_id),
+        } = value
+        else {
+            continue;
+        };
+        let artifact = pioneer_entity::artifact::Entity::find_by_id(artifact_id.clone())
+            .one(transaction)
+            .await
+            .context("failed to revalidate Message artifact")?
+            .filter(|artifact| {
+                artifact.workspace_id == workspace_id
+                    && artifact.status == "ready"
+                    && artifact.deleted_at.is_none()
+            })
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::InvalidTarget))?;
+        let exact_version =
+            pioneer_entity::artifact_version::Entity::find_by_id(version_id.clone())
+                .filter(
+                    pioneer_entity::artifact_version::Column::WorkspaceId
+                        .eq(workspace_id.to_owned()),
+                )
+                .filter(
+                    pioneer_entity::artifact_version::Column::ArtifactId.eq(artifact.id.clone()),
+                )
+                .one(transaction)
+                .await
+                .context("failed to revalidate exact Message artifact version")?
+                .is_some();
+        let scope = resolve_artifact_authorization_scope(
+            transaction,
+            artifact_id,
+            Some(workspace_id),
+            None,
+        )
+        .await?
+        .filter(|scope| {
+            scope.workspace_is_active
+                && scope
+                    .thread_id
+                    .as_deref()
+                    .map_or(true, |artifact_thread_id| artifact_thread_id == thread_id)
+        });
+        if !exact_version || scope.is_none() {
+            return Err(anyhow::Error::new(
+                TurnMessageMutationFailure::InvalidTarget,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct NewUserThreadCreation {
     creator: PersistedActorRef,
@@ -1645,12 +1912,27 @@ async fn insert_new_user_thread_for_initial_turn(
     events: &[TurnEventPayload],
     creation: &NewUserThreadCreation,
 ) -> Result<()> {
-    let [
-        TurnEventPayload::TurnStarted(started),
-        TurnEventPayload::TurnPermissionAudit(audit),
-    ] = events
-    else {
-        bail!("new user thread materialization requires one turn/started and one permission audit");
+    let (started, audit) = match events {
+        [
+            TurnEventPayload::TurnStarted(started),
+            TurnEventPayload::TurnPermissionAudit(audit),
+        ] => (started, audit),
+        [
+            TurnEventPayload::TurnStarted(started),
+            TurnEventPayload::TurnCompleted(completed),
+            TurnEventPayload::TurnPermissionAudit(audit),
+        ] if completed.thread_id == started.thread.id
+            && completed.turn.id == started.turn.id
+            && completed.workspace_id == started.thread.workspace_id
+            && completed.turn.status == TurnStatus::Completed =>
+        {
+            (started, audit)
+        }
+        _ => {
+            bail!(
+                "new user thread materialization requires turn/started, optional immediate turn/completed, and one permission audit"
+            );
+        }
     };
     if started.actor.as_ref() != Some(&creation.creator) {
         bail!("new user thread creator differs from first-turn actor");
@@ -1683,6 +1965,41 @@ async fn insert_new_user_thread_for_initial_turn(
         }
     }
 
+    // SQLite writes for one CrudStore already pass through the shared write
+    // coordinator. A concurrent first Message can therefore arrive here only
+    // after another first Message has committed the same runtime draft. Reuse
+    // that exact, already-authorized thread instead of manufacturing a second
+    // coordination layer around turn/start.
+    if let Some(existing) =
+        repositories::thread::find_thread_by_id(transaction, started.thread.id.as_str()).await?
+    {
+        let existing_creator = actor_ref_from_db(
+            existing.created_by_actor_kind.as_deref(),
+            existing.created_by_actor_id.as_deref(),
+        )?;
+        let existing_access_class =
+            persisted_thread_access_class_from_db(existing.access_class.as_str())?;
+        let existing_origin = thread_origin_kind_from_db(existing.origin_kind.as_str());
+        let existing_sidebar_visibility =
+            thread_sidebar_visibility_from_db(existing.sidebar_visibility.as_str());
+        if existing.workspace_id != started.thread.workspace_id
+            || existing_creator.as_ref() != Some(&creation.creator)
+            || existing_access_class != creation.access_class
+            || existing_origin != Some(started.thread.origin_kind)
+            || existing_sidebar_visibility != Some(started.thread.sidebar_visibility)
+        {
+            bail!("runtime draft collides with a different durable user thread");
+        }
+        if let Some((_, principal_id)) = creation.member.as_ref()
+            && find_thread_membership(transaction, started.thread.id.as_str(), principal_id)
+                .await?
+                .is_none()
+        {
+            bail!("durable Member runtime draft is missing its creator membership");
+        }
+        return Ok(());
+    }
+
     let thread_created_at = unix_to_datetime(started.thread.created_at);
     let thread_updated_at = unix_to_datetime(started.thread.updated_at);
     thread::insert_user_thread_with_creator(
@@ -1710,6 +2027,57 @@ async fn insert_new_user_thread_for_initial_turn(
         .await?;
     }
     Ok(())
+}
+
+pub struct CompletedMessageTurnWrite<'a> {
+    pub thread: &'a Thread,
+    pub sandbox_mode: SandboxMode,
+    pub started_turn: &'a Turn,
+    pub input: &'a [UserInput],
+    pub actor: PersistedActorRef,
+    pub completed: pioneer_protocol::TurnCompletedNotification,
+    pub audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+}
+
+fn completed_message_turn_events(
+    write: CompletedMessageTurnWrite<'_>,
+) -> Result<Vec<TurnEventPayload>> {
+    if write.started_turn.mode != pioneer_protocol::ThreadMode::Message
+        || write.started_turn.status != TurnStatus::InProgress
+    {
+        bail!("instant Message batch requires an in-progress Message start snapshot");
+    }
+    if write.completed.workspace_id != write.thread.workspace_id
+        || write.completed.thread_id != write.thread.id
+        || write.completed.turn.id != write.started_turn.id
+        || write.completed.turn.mode != pioneer_protocol::ThreadMode::Message
+        || write.completed.turn.status != TurnStatus::Completed
+        || write.completed.turn.author != write.started_turn.author
+        || write.completed.turn.reply_to_turn_id != write.started_turn.reply_to_turn_id
+        || write.completed.turn.mentions != write.started_turn.mentions
+        || write.completed.turn.message_revision != write.started_turn.message_revision
+        || write.completed.turn.message_deleted != write.started_turn.message_deleted
+    {
+        bail!("instant Message completion differs from its start snapshot");
+    }
+    if write.audit_event.workspace_id != write.thread.workspace_id
+        || write.audit_event.thread_id != write.thread.id
+        || write.audit_event.turn_id != write.started_turn.id
+    {
+        bail!("instant Message permission audit scope differs from Turn scope");
+    }
+    Ok(vec![
+        TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: write.thread.clone(),
+            sandbox_mode: write.sandbox_mode,
+            turn: write.started_turn.clone(),
+            input: write.input.to_vec(),
+            actor: Some(write.actor),
+            reasoning_effort: None,
+        }),
+        TurnEventPayload::TurnCompleted(write.completed),
+        TurnEventPayload::TurnPermissionAudit(write.audit_event),
+    ])
 }
 
 async fn authorize_private_participant_scope(
@@ -4612,6 +4980,17 @@ impl CrudStore {
     ) -> Result<ArtifactSummary> {
         artifact_repository::ArtifactRepository::new()
             .get_artifact_summary(&self.connection, workspace_id, artifact_id, version_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_exact_artifact_refs(
+        &self,
+        workspace_id: &str,
+        requested: &[(String, String)],
+    ) -> Result<HashMap<(String, String), pioneer_protocol::ArtifactRef>> {
+        artifact_repository::ArtifactRepository::new()
+            .list_exact_artifact_refs(&self.connection, workspace_id, requested)
             .await
             .map_err(Into::into)
     }
@@ -7994,6 +8373,66 @@ impl CrudStore {
         .await
     }
 
+    /// Persists an ordinary Message as one Started + immediately Completed
+    /// canonical Turn batch. Both projections become visible in one commit.
+    pub async fn materialize_completed_message_turn_with_permission_audit(
+        &self,
+        write: CompletedMessageTurnWrite<'_>,
+    ) -> Result<()> {
+        let updated_at = write.thread.updated_at;
+        let events = completed_message_turn_events(write)?;
+        self.materialize_turn_events_atomically(events, updated_at)
+            .await
+    }
+
+    /// Atomically creates a Member runtime draft and its immediately
+    /// completed first Message Turn.
+    pub async fn materialize_new_member_completed_message_turn_with_permission_audit(
+        &self,
+        write: CompletedMessageTurnWrite<'_>,
+        gateway_id: &GatewayId,
+        principal_id: &PrincipalId,
+    ) -> Result<()> {
+        let updated_at = write.thread.updated_at;
+        let actor = write.actor.clone();
+        let events = completed_message_turn_events(write)?;
+        self.materialize_turn_events_atomically_with_creation(
+            events,
+            updated_at,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class: PersistedThreadAccessClass::Private,
+                member: Some((gateway_id.clone(), principal_id.clone())),
+            },
+        )
+        .await
+    }
+
+    /// Atomically creates a Superuser runtime draft and its immediately
+    /// completed first Message Turn.
+    pub async fn materialize_new_superuser_completed_message_turn_with_permission_audit(
+        &self,
+        write: CompletedMessageTurnWrite<'_>,
+        access_class: PersistedThreadAccessClass,
+    ) -> Result<()> {
+        if access_class == PersistedThreadAccessClass::Internal {
+            bail!("new user Message thread cannot use internal access class");
+        }
+        let updated_at = write.thread.updated_at;
+        let actor = write.actor.clone();
+        let events = completed_message_turn_events(write)?;
+        self.materialize_turn_events_atomically_with_creation(
+            events,
+            updated_at,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class,
+                member: None,
+            },
+        )
+        .await
+    }
+
     /// Atomically creates a Member-owned private thread, its creator
     /// membership, the first turn, and the permission audit. No empty thread
     /// row is visible if first-turn materialization fails.
@@ -10101,6 +10540,497 @@ impl CrudStore {
             .collect())
     }
 
+    pub async fn mark_thread_read(
+        &self,
+        request: MarkThreadReadRequest,
+    ) -> Result<ThreadReadResponse> {
+        self.run_serialized_write(|| {
+            let request = request.clone();
+            async move { self.mark_thread_read_once(request).await }
+        })
+        .await
+    }
+
+    pub async fn unread_counts_for_threads(
+        &self,
+        principal_id: &PrincipalId,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, u64>> {
+        count_unread_user_message_blocks_for_threads(
+            &self.connection,
+            thread_ids,
+            principal_id.to_string().as_str(),
+        )
+        .await
+    }
+
+    async fn mark_thread_read_once(
+        &self,
+        request: MarkThreadReadRequest,
+    ) -> Result<ThreadReadResponse> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin thread read transaction")?;
+
+        let outcome = async {
+            if principal_current_thread_access_kind(
+                &transaction,
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                &request.principal_id,
+            )
+            .await?
+            .is_none()
+            {
+                return Err(anyhow::Error::new(ThreadReadFailure::InvalidTarget));
+            }
+            let thread_model = thread::find_thread_by_id(&transaction, request.thread_id.as_str())
+                .await?
+                .filter(|thread| thread.workspace_id == request.workspace_id)
+                .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
+            let block = find_user_message_block_by_turn_id(
+                &transaction,
+                request.thread_id.as_str(),
+                request.through_turn_id.as_str(),
+            )
+            .await?
+            .filter(|block| block.workspace_id == request.workspace_id)
+            .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
+            let turn_model = turn::find_turn_by_thread_and_id(
+                &transaction,
+                request.thread_id.as_str(),
+                request.through_turn_id.as_str(),
+            )
+            .await?
+            .filter(|turn| {
+                turn.turn_kind == "conversation"
+                    && turn.origin == "user"
+                    && turn.initiated_by_actor_kind.as_deref() == Some("principal")
+                    && turn.initiated_by_actor_id.is_some()
+            })
+            .ok_or_else(|| anyhow::Error::new(ThreadReadFailure::InvalidTarget))?;
+
+            if block.turn_id.as_deref() != Some(turn_model.id.as_str()) {
+                return Err(anyhow::Error::new(ThreadReadFailure::InvalidTarget));
+            }
+
+            advance_thread_read_cursor(
+                &transaction,
+                &request.principal_id,
+                request.thread_id.as_str(),
+                block.sort_key.as_str(),
+                turn_model.id.as_str(),
+                unix_to_datetime(request.read_at_unix),
+            )
+            .await?;
+            let cursor_model = find_thread_read_cursor(
+                &transaction,
+                &request.principal_id,
+                request.thread_id.as_str(),
+            )
+            .await?
+            .context("thread read cursor is missing after monotonic upsert")?;
+            let cursor = thread_read_cursor_from_model(&cursor_model);
+            let principal_id = request.principal_id.to_string();
+            let unread_count = count_unread_user_message_blocks(
+                &transaction,
+                request.thread_id.as_str(),
+                principal_id.as_str(),
+                cursor.sort_key.as_str(),
+            )
+            .await?;
+
+            Ok(ThreadReadResponse {
+                workspace_id: thread_model.workspace_id,
+                thread_id: request.thread_id,
+                cursor,
+                unread_count,
+            })
+        }
+        .await;
+
+        match outcome {
+            Ok(response) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread read transaction")?;
+                Ok(response)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn edit_turn_message(
+        &self,
+        request: EditTurnMessageRequest,
+    ) -> Result<TurnMessageEditedEvent> {
+        self.run_serialized_write(|| {
+            let request = request.clone();
+            async move { self.edit_turn_message_once(request).await }
+        })
+        .await
+    }
+
+    async fn edit_turn_message_once(
+        &self,
+        request: EditTurnMessageRequest,
+    ) -> Result<TurnMessageEditedEvent> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Turn message edit transaction")?;
+        let changed_at = unix_to_datetime(request.changed_at_unix);
+
+        let outcome = async {
+            let thread_model = thread::find_thread_by_id(&transaction, request.thread_id.as_str())
+                .await?
+                .filter(|thread| thread.workspace_id == request.workspace_id)
+                .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let (turn_model, collaboration) = turn::find_turn_collaboration(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+
+            if !collaboration.mode.message_mutation_eligible
+                || turn_model.turn_kind != "conversation"
+                || turn_model.origin != "user"
+                || turn_model.status != "completed"
+            {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::ImmutableMessage,
+                ));
+            }
+            let original_author =
+                turn::find_turn_initiator(&transaction, request.turn_id.as_str()).await?;
+            if !matches!(&original_author, Some(PersistedActorRef::Principal(_))) {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::ImmutableMessage,
+                ));
+            }
+            let current_actor_kind = message_mutation_actor_current_thread_write_kind(
+                &transaction,
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                &request.changed_by,
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let author_edit = original_author.as_ref() == Some(&request.changed_by);
+            let moderated =
+                !author_edit && current_actor_kind == pioneer_protocol::PrincipalKind::Superuser;
+            if !author_edit && !moderated {
+                return Err(anyhow::Error::new(TurnMessageMutationFailure::Forbidden));
+            }
+            revalidate_turn_message_edit_targets(
+                &transaction,
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                &request.changed_by,
+                request.input.as_slice(),
+                request.mentions.as_slice(),
+            )
+            .await?;
+            if collaboration.message_deleted {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::DeletedMessage,
+                ));
+            }
+            if collaboration.message_revision != request.expected_revision {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::RevisionConflict,
+                ));
+            }
+
+            let previous_input = turn::find_turn_inputs(&transaction, request.turn_id.as_str())
+                .await?
+                .into_iter()
+                .map(decode_turn_input_model)
+                .collect::<Result<Vec<_>>>()?;
+            turn::insert_turn_message_revision(
+                &transaction,
+                turn::NewTurnMessageRevision {
+                    turn_id: request.turn_id.as_str(),
+                    revision: collaboration.message_revision,
+                    input: previous_input.as_slice(),
+                    mentions: collaboration.mentions.as_slice(),
+                    changed_by: &request.changed_by,
+                    change_kind: TurnMessageRevisionChangeKind::Edit,
+                    created_at: changed_at,
+                },
+            )
+            .await?;
+
+            if !turn::compare_and_set_message_turn_mutation(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+                request.expected_revision,
+                request.mentions.as_slice(),
+                None,
+                changed_at,
+            )
+            .await?
+            {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::RevisionConflict,
+                ));
+            }
+            turn::replace_turn_input(
+                &transaction,
+                request.turn_id.as_str(),
+                request.input.as_slice(),
+                changed_at,
+            )
+            .await?;
+
+            let updated_model = turn::find_turn_by_thread_and_id(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let updated_turn = thread_snapshot_turn_from_db_model(updated_model)?
+                .context("edited Message no longer maps to a Turn")?;
+            let event = TurnMessageEditedEvent {
+                workspace_id: thread_model.workspace_id,
+                thread_id: request.thread_id.clone(),
+                turn: updated_turn,
+                input: request.input.clone(),
+                changed_by: request.changed_by.clone(),
+                changed_at: request.changed_at_unix,
+            };
+
+            // This canonical, append-only mutation event is also the durable moderation record:
+            // its server-owned actor differs from the immutable original author for a
+            // Superuser action. Reusing it keeps Epic 6 DDL-only and avoids a second audit path.
+            self.append_and_project_turn_event_in_transaction(
+                &transaction,
+                TurnEventPayload::TurnMessageEdited(event.clone()),
+                changed_at,
+                unix_to_datetime(
+                    request
+                        .changed_at_unix
+                        .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                ),
+            )
+            .await?;
+            Ok(event)
+        }
+        .await;
+
+        match outcome {
+            Ok(event) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Turn message edit transaction")?;
+                Ok(event)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn delete_turn_message(
+        &self,
+        request: DeleteTurnMessageRequest,
+    ) -> Result<DeleteTurnMessageResult> {
+        self.run_serialized_write(|| {
+            let request = request.clone();
+            async move { self.delete_turn_message_once(request).await }
+        })
+        .await
+    }
+
+    async fn delete_turn_message_once(
+        &self,
+        request: DeleteTurnMessageRequest,
+    ) -> Result<DeleteTurnMessageResult> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Turn message delete transaction")?;
+        let changed_at = unix_to_datetime(request.changed_at_unix);
+
+        let outcome = async {
+            let thread_model = thread::find_thread_by_id(&transaction, request.thread_id.as_str())
+                .await?
+                .filter(|thread| thread.workspace_id == request.workspace_id)
+                .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let (turn_model, collaboration) = turn::find_turn_collaboration(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+
+            if !collaboration.mode.message_mutation_eligible
+                || turn_model.turn_kind != "conversation"
+                || turn_model.origin != "user"
+                || turn_model.status != "completed"
+            {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::ImmutableMessage,
+                ));
+            }
+            let original_author =
+                turn::find_turn_initiator(&transaction, request.turn_id.as_str()).await?;
+            if !matches!(&original_author, Some(PersistedActorRef::Principal(_))) {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::ImmutableMessage,
+                ));
+            }
+            let current_actor_kind = message_mutation_actor_current_thread_write_kind(
+                &transaction,
+                request.workspace_id.as_str(),
+                request.thread_id.as_str(),
+                &request.changed_by,
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let author_delete = original_author.as_ref() == Some(&request.changed_by);
+            let moderated =
+                !author_delete && current_actor_kind == pioneer_protocol::PrincipalKind::Superuser;
+            if !author_delete && !moderated {
+                return Err(anyhow::Error::new(TurnMessageMutationFailure::Forbidden));
+            }
+
+            if collaboration.message_deleted {
+                let duplicate = request.expected_revision == collaboration.message_revision
+                    || request.expected_revision.checked_add(1)
+                        == Some(collaboration.message_revision);
+                if !duplicate {
+                    return Err(anyhow::Error::new(
+                        TurnMessageMutationFailure::RevisionConflict,
+                    ));
+                }
+                let turn = thread_snapshot_turn_from_db_model(turn_model)?
+                    .context("deleted Message no longer maps to a Turn")?;
+                return Ok(DeleteTurnMessageResult { turn, event: None });
+            }
+            if collaboration.message_revision != request.expected_revision {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::RevisionConflict,
+                ));
+            }
+
+            let previous_input = turn::find_turn_inputs(&transaction, request.turn_id.as_str())
+                .await?
+                .into_iter()
+                .map(decode_turn_input_model)
+                .collect::<Result<Vec<_>>>()?;
+            turn::insert_turn_message_revision(
+                &transaction,
+                turn::NewTurnMessageRevision {
+                    turn_id: request.turn_id.as_str(),
+                    revision: collaboration.message_revision,
+                    input: previous_input.as_slice(),
+                    mentions: collaboration.mentions.as_slice(),
+                    changed_by: &request.changed_by,
+                    change_kind: TurnMessageRevisionChangeKind::Delete,
+                    created_at: changed_at,
+                },
+            )
+            .await?;
+
+            if !turn::compare_and_set_message_turn_mutation(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+                request.expected_revision,
+                &[],
+                Some(&request.changed_by),
+                changed_at,
+            )
+            .await?
+            {
+                return Err(anyhow::Error::new(
+                    TurnMessageMutationFailure::RevisionConflict,
+                ));
+            }
+            turn::replace_turn_input(&transaction, request.turn_id.as_str(), &[], changed_at)
+                .await?;
+
+            let updated_model = turn::find_turn_by_thread_and_id(
+                &transaction,
+                request.thread_id.as_str(),
+                request.turn_id.as_str(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::NotFound))?;
+            let updated_turn = thread_snapshot_turn_from_db_model(updated_model)?
+                .context("deleted Message no longer maps to a Turn")?;
+            let event = TurnMessageDeletedEvent {
+                workspace_id: thread_model.workspace_id,
+                thread_id: request.thread_id.clone(),
+                turn: updated_turn.clone(),
+                deleted_by: request.changed_by.clone(),
+                deleted_at: request.changed_at_unix,
+            };
+
+            // The canonical delete event preserves the authenticated moderator together with
+            // the stable Turn identity; no parallel administration-audit schema is required.
+            self.append_and_project_turn_event_in_transaction(
+                &transaction,
+                TurnEventPayload::TurnMessageDeleted(event.clone()),
+                changed_at,
+                unix_to_datetime(
+                    request
+                        .changed_at_unix
+                        .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                ),
+            )
+            .await?;
+            Ok(DeleteTurnMessageResult {
+                turn: updated_turn,
+                event: Some(event),
+            })
+        }
+        .await;
+
+        match outcome {
+            Ok(result) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Turn message delete transaction")?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn get_turn_message_revisions(
+        &self,
+        turn_id: &str,
+        before_revision: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<TurnMessageRevision>> {
+        turn::list_turn_message_revisions(&self.connection, turn_id, before_revision, limit)
+            .await?
+            .into_iter()
+            .map(turn::turn_message_revision_from_model)
+            .collect()
+    }
+
     pub async fn get_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<(String, Turn)>> {
         let Some(thread_model) = thread::find_thread_by_id(&self.connection, thread_id).await?
         else {
@@ -10119,6 +11049,7 @@ impl CrudStore {
 
         let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
         let permission_profile = parse_turn_permission_profile(&turn_model)?;
+        let collaboration = turn::collaboration_from_model(&turn_model)?;
 
         Ok(Some((
             thread_model.workspace_id,
@@ -10127,11 +11058,33 @@ impl CrudStore {
                 status,
                 turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
                 origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                mode: collaboration.mode.effective_mode,
+                author: collaboration.author,
+                reply_to_turn_id: collaboration.reply_to_turn_id,
+                mentions: collaboration.mentions,
+                message_revision: collaboration.message_revision,
+                message_deleted: collaboration.message_deleted,
                 error: turn_model.error,
                 prompt_manifest,
                 permission_profile,
             },
         )))
+    }
+
+    pub async fn get_turns_by_thread_and_ids(
+        &self,
+        thread_id: &str,
+        turn_ids: &[String],
+    ) -> Result<HashMap<String, Turn>> {
+        let rows =
+            turn::find_turns_by_thread_and_ids(&self.connection, thread_id, turn_ids).await?;
+        rows.into_iter()
+            .filter_map(|row| match thread_snapshot_turn_from_db_model(row) {
+                Ok(Some(turn)) => Some(Ok((turn.id.clone(), turn))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     pub async fn complete_in_progress_turns_after_final_agent_message(
@@ -10167,6 +11120,7 @@ impl CrudStore {
 
             let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
             let permission_profile = parse_turn_permission_profile(&turn_model)?;
+            let collaboration = turn::collaboration_from_model(&turn_model)?;
             self.materialize_turn_completed(
                 pioneer_protocol::TurnCompletedNotification {
                     workspace_id: thread_model.workspace_id,
@@ -10177,6 +11131,12 @@ impl CrudStore {
                         turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str())
                             .unwrap_or_default(),
                         origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                        mode: collaboration.mode.effective_mode,
+                        author: collaboration.author,
+                        reply_to_turn_id: collaboration.reply_to_turn_id,
+                        mentions: collaboration.mentions,
+                        message_revision: collaboration.message_revision,
+                        message_deleted: collaboration.message_deleted,
                         error: None,
                         prompt_manifest,
                         permission_profile,
@@ -10251,27 +11211,30 @@ impl CrudStore {
         let mut inputs = Vec::with_capacity(rows.len());
 
         for row in rows {
-            match serde_json::from_str::<UserInput>(row.payload.as_str()) {
-                Ok(input) => inputs.push(input),
-                Err(error) if row.input_type == "text" => {
-                    if let Some(text) = row.text {
-                        inputs.push(UserInput::Text {
-                            text,
-                            text_elements: Vec::new(),
-                        });
-                    } else {
-                        return Err(error)
-                            .with_context(|| format!("failed to decode turn input `{}`", row.id));
-                    }
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to decode turn input `{}`", row.id));
-                }
-            }
+            inputs.push(decode_turn_input_model(row)?);
         }
 
         Ok(inputs)
+    }
+
+    pub async fn get_turn_inputs_for_turns(
+        &self,
+        turn_ids: &[String],
+    ) -> Result<HashMap<String, Vec<UserInput>>> {
+        let rows = turn::find_turn_inputs_for_turns(&self.connection, turn_ids).await?;
+        let mut inputs_by_turn = turn_ids
+            .iter()
+            .cloned()
+            .map(|turn_id| (turn_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        for row in rows {
+            let turn_id = row.turn_id.clone();
+            inputs_by_turn
+                .entry(turn_id)
+                .or_default()
+                .push(decode_turn_input_model(row)?);
+        }
+        Ok(inputs_by_turn)
     }
 
     pub async fn update_turn_prompt_manifest(
@@ -10489,6 +11452,32 @@ impl CrudStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn list_turn_items_by_type_for_turns(
+        &self,
+        turn_ids: &[String],
+        item_type: &str,
+    ) -> Result<HashMap<String, Vec<TurnItem>>> {
+        let rows =
+            turn::list_turn_items_by_type_for_turns(&self.connection, turn_ids, item_type).await?;
+        let mut items_by_turn = turn_ids
+            .iter()
+            .cloned()
+            .map(|turn_id| (turn_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        for model in rows {
+            let turn_id = model.turn_id.clone();
+            let item =
+                serde_json::from_str::<TurnItem>(model.payload.as_str()).with_context(|| {
+                    format!(
+                        "failed to decode turn item payload for turn `{turn_id}` item `{}`",
+                        model.item_id
+                    )
+                })?;
+            items_by_turn.entry(turn_id).or_default().push(item);
+        }
+        Ok(items_by_turn)
     }
 
     pub async fn list_completed_agent_messages(&self, turn_id: &str) -> Result<Vec<TurnItem>> {
@@ -10730,6 +11719,8 @@ impl CrudStore {
                     TurnItemEventPayload::TurnPermissionAudit(event)
                 }
                 TurnEventPayload::TurnStarted(_)
+                | TurnEventPayload::TurnMessageEdited(_)
+                | TurnEventPayload::TurnMessageDeleted(_)
                 | TurnEventPayload::TurnCompleted(_)
                 | TurnEventPayload::TurnFailed(_)
                 | TurnEventPayload::TurnBlocked(_) => continue,
@@ -11195,7 +12186,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             BTreeMap::new()
         };
 
-        self.build_ordered_conversation_entries(&turns, &artifact_refs)
+        self.build_ordered_conversation_entries(&turns, &artifact_refs, workspace_id)
             .await
     }
 
@@ -11384,11 +12375,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         &self,
         turns: &[pioneer_entity::turn::Model],
         artifact_refs: &BTreeMap<String, ConversationTurnArtifactRefs>,
+        workspace_id: Option<&str>,
     ) -> Result<Vec<ConversationEntry>> {
         let mut ordered_entries = Vec::with_capacity(turns.len());
 
         for turn_model in turns {
-            let inputs = turn::find_turn_inputs(&self.connection, &turn_model.id).await?;
+            let collaboration = turn::collaboration_from_model(turn_model)?;
+            let is_message = collaboration.mode.message_mutation_eligible;
+            let inputs = if is_message && collaboration.message_deleted {
+                Vec::new()
+            } else {
+                turn::find_turn_inputs(&self.connection, &turn_model.id).await?
+            };
             let user_text: String = inputs
                 .iter()
                 .filter(|i| i.input_type == "text")
@@ -11408,10 +12406,61 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            let refs = artifact_refs
+            let mut refs = artifact_refs
                 .get(&turn_model.id)
                 .cloned()
                 .unwrap_or_default();
+            if is_message {
+                // Message is the only mutable send mode. Its context must use
+                // the exact refs in the current turn_input projection rather
+                // than immutable upload/execution bindings from initial send.
+                refs.assistant.clear();
+                refs.user.clear();
+                if !collaboration.message_deleted
+                    && let Some(workspace_id) = workspace_id
+                {
+                    let requested = inputs
+                        .iter()
+                        .filter_map(|input| {
+                            serde_json::from_str::<UserInput>(input.payload.as_str()).ok()
+                        })
+                        .filter_map(|input| match input {
+                            UserInput::Artifact {
+                                artifact_id,
+                                version_id: Some(version_id),
+                            } => Some((artifact_id, version_id)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let exact = self
+                        .list_exact_artifact_refs(workspace_id, requested.as_slice())
+                        .await?;
+                    for (index, key) in requested.iter().enumerate() {
+                        let Some(artifact) = exact.get(key) else {
+                            continue;
+                        };
+                        if artifact.status != ArtifactStatus::Ready {
+                            continue;
+                        }
+                        refs.user.push(ConversationArtifactRef {
+                            artifact_id: artifact.artifact_id.clone(),
+                            version_id: artifact.version_id.clone(),
+                            display_name: artifact.display_name.clone(),
+                            kind: artifact.kind,
+                            mime_type: artifact.mime_type.clone(),
+                            size_bytes: artifact.size_bytes,
+                            sha256: artifact.sha256.clone(),
+                            binding_kind: ArtifactBindingKind::UserInput,
+                            direction: ArtifactBindingDirection::Input,
+                            role: Some(ArtifactRole::User),
+                            turn_id: Some(turn_model.id.clone()),
+                            message_id: None,
+                            turn_item_id: None,
+                            item_index: i64::try_from(index).ok(),
+                        });
+                    }
+                }
+            }
 
             let has_user_message = !user_text.is_empty() || !refs.user.is_empty();
             let has_assistant_message = !assistant_text.is_empty() || !refs.assistant.is_empty();
@@ -14750,7 +15799,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
         let turns = turn::find_completed_turns_for_thread(&self.connection, thread_id).await?;
         let entries = self
-            .build_ordered_conversation_entries(&turns, &BTreeMap::new())
+            .build_ordered_conversation_entries(&turns, &BTreeMap::new(), None)
             .await?;
         let entries = self
             .project_causally_closed_conversation_entries(thread_id, entries)
@@ -14775,18 +15824,71 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let event_rows =
             turn_event::list_events_for_thread(&self.connection, thread_id, limit_events).await?;
 
-        let mut events = Vec::with_capacity(event_rows.len());
+        // Message lifecycle events remain append-only, but their original
+        // TurnStarted payload is not a public revision reader. Project the
+        // current Message body/tombstone and collaboration metadata into this
+        // existing history DTO so an edit or delete cannot be bypassed by
+        // replaying the immutable start event.
+        let mut decoded_rows = Vec::with_capacity(event_rows.len());
+        let mut message_turn_ids = HashSet::new();
         for row in event_rows {
             let payload = serde_json::from_str::<TurnEventPayload>(row.payload.as_str())
                 .with_context(|| format!("failed to decode turn_event payload `{}`", row.id))?;
+            match &payload {
+                TurnEventPayload::TurnStarted(started)
+                    if started.turn.mode == ThreadMode::Message =>
+                {
+                    message_turn_ids.insert(row.turn_id.clone());
+                }
+                TurnEventPayload::TurnCompleted(completed)
+                    if completed.turn.mode == ThreadMode::Message =>
+                {
+                    message_turn_ids.insert(row.turn_id.clone());
+                }
+                _ => {}
+            }
+            decoded_rows.push((row, payload));
+        }
+        let message_turn_ids = message_turn_ids.into_iter().collect::<Vec<_>>();
+        let current_message_turns = self
+            .get_turns_by_thread_and_ids(thread_id, message_turn_ids.as_slice())
+            .await?;
+        let current_message_inputs = self
+            .get_turn_inputs_for_turns(message_turn_ids.as_slice())
+            .await?;
 
+        let mut events = Vec::with_capacity(decoded_rows.len());
+        for (row, payload) in decoded_rows {
             let mapped_payload = match payload {
-                TurnEventPayload::TurnStarted(payload) => ThreadHistoryEventPayload::TurnStarted {
-                    workspace_id: payload.thread.workspace_id.clone(),
-                    thread_id: payload.thread.id.clone(),
-                    turn: payload.turn,
-                    input: payload.input,
-                },
+                TurnEventPayload::TurnStarted(payload) => {
+                    let (turn, input) = if payload.turn.mode == ThreadMode::Message {
+                        let current = current_message_turns
+                            .get(row.turn_id.as_str())
+                            .context("current Message history projection is unavailable")?;
+                        if current.mode != ThreadMode::Message {
+                            anyhow::bail!("current Message history projection changed mode");
+                        }
+                        let mut projected = current.clone();
+                        projected.status = payload.turn.status;
+                        let input = if current.message_deleted {
+                            Vec::new()
+                        } else {
+                            current_message_inputs
+                                .get(row.turn_id.as_str())
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        (projected, input)
+                    } else {
+                        (payload.turn, payload.input)
+                    };
+                    ThreadHistoryEventPayload::TurnStarted {
+                        workspace_id: payload.thread.workspace_id.clone(),
+                        thread_id: payload.thread.id.clone(),
+                        turn,
+                        input,
+                    }
+                }
                 TurnEventPayload::ItemStarted(notification) => {
                     ThreadHistoryEventPayload::ItemStarted {
                         workspace_id: notification.workspace_id,
@@ -14979,7 +16081,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 TurnEventPayload::TurnPermissionAudit(event) => {
                     ThreadHistoryEventPayload::TurnPermissionAudit(event)
                 }
-                TurnEventPayload::TurnCompleted(notification) => {
+                TurnEventPayload::TurnMessageEdited(_)
+                | TurnEventPayload::TurnMessageDeleted(_) => continue,
+                TurnEventPayload::TurnCompleted(mut notification) => {
+                    if notification.turn.mode == ThreadMode::Message {
+                        notification.turn = current_message_turns
+                            .get(row.turn_id.as_str())
+                            .filter(|turn| turn.mode == ThreadMode::Message)
+                            .cloned()
+                            .context(
+                                "current completed Message history projection is unavailable",
+                            )?;
+                    }
                     ThreadHistoryEventPayload::TurnCompleted {
                         workspace_id: notification.workspace_id,
                         thread_id: notification.thread_id,
@@ -16349,118 +17462,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         }
 
         for event in events {
-            if let Err(error) = validate_turn_event_for_permanent_storage(&event).await {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-
-            let projection_context = TurnEventProjectionContext::default();
-            let claim_token = generate_id(DB_ID_LEN);
-            let appended_event =
-                match turn_event::append_event(&transaction, &event, created_at).await {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
-                    }
-                };
-
-            let projection_context_json = match serialize_turn_event_projection_context(
-                &projection_context,
-                appended_event.id.as_str(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-            if let Err(error) = turn_event_projection_state::insert_claimed(
-                &transaction,
-                turn_event_projection_state::NewTurnEventProjectionState {
-                    event_id: appended_event.id.clone(),
-                    thread_id: appended_event.thread_id.clone(),
-                    turn_id: appended_event.turn_id.clone(),
-                    sequence: appended_event.sequence,
-                    projection_context_json,
-                    claim_token: claim_token.clone(),
-                    claim_expires_at,
-                    created_at,
-                },
-            )
-            .await
-            {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-
-            let has_unprojected_predecessor =
-                match turn_event_projection_state::has_unprojected_predecessor(
-                    &transaction,
-                    appended_event.turn_id.as_str(),
-                    appended_event.sequence,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
-                    }
-                };
-            if has_unprojected_predecessor {
-                let _ = transaction.rollback().await;
-                anyhow::bail!(
-                    "turn event projection `{}` is waiting for an earlier event in turn `{}`",
-                    appended_event.id,
-                    appended_event.turn_id
-                );
-            }
-
             if let Err(error) = self
-                .projector
-                .project(&transaction, &appended_event)
-                .await
-                .context("failed to project turn event to read models")
-            {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-
-            if let Err(error) =
-                crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
+                .append_and_project_turn_event_in_transaction(
                     &transaction,
-                    &appended_event,
+                    event,
+                    created_at,
+                    claim_expires_at,
                 )
                 .await
-                .context("failed to project turn event to semantic timeline")
             {
                 let _ = transaction.rollback().await;
                 return Err(error);
-            }
-
-            let projected = match turn_event_projection_state::mark_projected_claimed(
-                &transaction,
-                appended_event.id.as_str(),
-                claim_token.as_str(),
-                created_at,
-            )
-            .await
-            {
-                Ok(projected) => projected,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-            if !projected {
-                let _ = transaction.rollback().await;
-                anyhow::bail!(
-                    "turn event projection `{}` is no longer claimed by this worker",
-                    appended_event.id
-                );
             }
         }
 
@@ -16468,6 +17480,79 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .commit()
             .await
             .context("failed to commit turn event batch materialization transaction")?;
+
+        Ok(())
+    }
+
+    async fn append_and_project_turn_event_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        event: TurnEventPayload,
+        created_at: DateTimeWithTimeZone,
+        claim_expires_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        validate_turn_event_for_permanent_storage(&event).await?;
+
+        let projection_context = TurnEventProjectionContext::default();
+        let claim_token = generate_id(DB_ID_LEN);
+        let appended_event = turn_event::append_event(transaction, &event, created_at).await?;
+        let projection_context_json = serialize_turn_event_projection_context(
+            &projection_context,
+            appended_event.id.as_str(),
+        )?;
+        turn_event_projection_state::insert_claimed(
+            transaction,
+            turn_event_projection_state::NewTurnEventProjectionState {
+                event_id: appended_event.id.clone(),
+                thread_id: appended_event.thread_id.clone(),
+                turn_id: appended_event.turn_id.clone(),
+                sequence: appended_event.sequence,
+                projection_context_json,
+                claim_token: claim_token.clone(),
+                claim_expires_at,
+                created_at,
+            },
+        )
+        .await?;
+
+        if turn_event_projection_state::has_unprojected_predecessor(
+            transaction,
+            appended_event.turn_id.as_str(),
+            appended_event.sequence,
+        )
+        .await?
+        {
+            anyhow::bail!(
+                "turn event projection `{}` is waiting for an earlier event in turn `{}`",
+                appended_event.id,
+                appended_event.turn_id
+            );
+        }
+
+        self.projector
+            .project(transaction, &appended_event)
+            .await
+            .context("failed to project turn event to read models")?;
+        crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
+            transaction,
+            &appended_event,
+        )
+        .await
+        .context("failed to project turn event to semantic timeline")?;
+
+        if !turn_event_projection_state::mark_projected_claimed(
+            transaction,
+            appended_event.id.as_str(),
+            claim_token.as_str(),
+            created_at,
+        )
+        .await?
+        {
+            anyhow::bail!(
+                "turn event projection `{}` is no longer claimed by this worker",
+                appended_event.id
+            );
+        }
 
         Ok(())
     }
@@ -18197,16 +19282,36 @@ fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Res
         return Ok(None);
     };
     let permission_profile = parse_turn_permission_profile(&model)?;
+    let collaboration = turn::collaboration_from_model(&model)?;
 
     Ok(Some(Turn {
         id: model.id,
         status,
         turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
         origin: turn_origin_from_db(model.origin.as_str()).unwrap_or_default(),
+        mode: collaboration.mode.effective_mode,
+        author: collaboration.author,
+        reply_to_turn_id: collaboration.reply_to_turn_id,
+        mentions: collaboration.mentions,
+        message_revision: collaboration.message_revision,
+        message_deleted: collaboration.message_deleted,
         error: model.error,
         prompt_manifest: None,
         permission_profile,
     }))
+}
+
+fn decode_turn_input_model(model: pioneer_entity::turn_input::Model) -> Result<UserInput> {
+    match serde_json::from_str::<UserInput>(model.payload.as_str()) {
+        Ok(input) => Ok(input),
+        Err(_) if model.input_type == "text" && model.text.is_some() => Ok(UserInput::Text {
+            text: model.text.unwrap_or_default(),
+            text_elements: Vec::new(),
+        }),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to decode turn input `{}`", model.id))
+        }
+    }
 }
 
 fn thread_folder_from_db_model(model: pioneer_entity::thread_folder::Model) -> ThreadFolder {
@@ -18366,16 +19471,17 @@ mod tests {
         CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
         CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
         CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
-        CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits, CrudStore,
-        IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
-        McpServerInstallationRecord, NewArtifactBlobRecord, NewCliRuntimeInstructionProjection,
-        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-        NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
+        CliRuntimeTurnMcpMetadata, CompletedMessageTurnWrite, ConversationArtifactRefLimits,
+        CrudStore, DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
+        McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
+        NewArtifactBlobRecord, NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent,
+        NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+        NewMemberPrincipalRow, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-        PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
-        ProjectionPageAnchor, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
-        SkillDependencySnapshotRecord, SkillInstallationPatch, SkillInstallationRecord,
-        SkillPackChildDiff, SkillPackInstallationRecord,
+        NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
+        PreparedClaudeProviderSessionMode, ProjectionPageAnchor, ResolveCliRuntimePendingRequest,
+        SkillAuditEventRecord, SkillDependencySnapshotRecord, SkillInstallationPatch,
+        SkillInstallationRecord, SkillPackChildDiff, SkillPackInstallationRecord,
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
@@ -18386,8 +19492,13 @@ mod tests {
         ThreadTimelineBlockRecord, TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
         TurnExecutionWindowUsageAggregateRecord, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
         TurnMcpProjectionPersistenceError, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
-        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord, upsert_thread_timeline_block,
+        TurnMessageMutationFailure, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
+        create_gateway_singleton, create_member_principal, create_superuser,
+        delete_workspace_membership, insert_workspace_membership,
+        message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
+        upsert_thread_timeline_block,
     };
+    use crate::repositories::{thread, turn};
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
@@ -18418,13 +19529,14 @@ mod tests {
         ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
         TurnCompletedNotification, TurnExecutionSecuritySnapshot, TurnFilesystemAccess,
         TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
-        TurnItemType, TurnKind, TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
-        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
-        TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
+        TurnItemType, TurnKind, TurnMention, TurnOrigin, TurnPermissionAuditEventKind,
+        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+        TurnSandboxMode, TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
+        generate_id,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
-        QueryOrder, Set, Statement,
+        QueryOrder, Set, Statement, TransactionTrait,
     };
     use std::collections::BTreeMap;
 
@@ -18493,6 +19605,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -18514,6 +19632,84 @@ mod tests {
             .expect("turn should persist");
 
         (store, thread, turn)
+    }
+
+    async fn insert_unread_test_turn(
+        store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        sort_key: &str,
+        send_mode: &str,
+        actor_id: Option<&str>,
+        deleted: bool,
+    ) {
+        let created_at = unix_to_datetime(1_700_000_100);
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set(turn_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            status: Set("completed".to_owned()),
+            error: Set(None),
+            prompt_manifest_json: Set("{}".to_owned()),
+            prompt_compiler_version: Set(None),
+            prompt_profile: Set(None),
+            prompt_fingerprint_stable: Set(None),
+            prompt_fingerprint_dynamic: Set(None),
+            prompt_fingerprint_full: Set(None),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("user".to_owned()),
+            reasoning_effort: Set(None),
+            permission_profile_mode: Set(None),
+            permission_profile_source: Set(None),
+            permission_profile_snapshot_json: Set(None),
+            execution_security_snapshot_version: Set(None),
+            execution_security_snapshot_json: Set(None),
+            initiated_by_actor_id: Set(actor_id.map(str::to_owned)),
+            initiated_by_actor_kind: Set(Some(
+                if actor_id.is_some() {
+                    "principal"
+                } else {
+                    "system"
+                }
+                .to_owned(),
+            )),
+            execution_authorization_context_json: Set(None),
+            send_mode: Set(Some(send_mode.to_owned())),
+            author_display_name_snapshot: Set(Some("Author".to_owned())),
+            author_nickname_snapshot: Set(Some("author".to_owned())),
+            author_avatar_revision_snapshot: Set(None),
+            reply_to_turn_id: Set(None),
+            mentions_json: Set("[]".to_owned()),
+            message_revision: Set(0),
+            message_deleted_at: Set(deleted.then_some(created_at)),
+            message_deleted_by_actor_id: Set(None),
+            message_deleted_by_actor_kind: Set(None),
+        })
+        .exec(&store.connection)
+        .await
+        .expect("unread test Turn should persist");
+        upsert_thread_timeline_block(
+            &store.connection,
+            ThreadTimelineBlockRecord {
+                block_id: format!("user:{turn_id}"),
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: Some(turn_id.to_owned()),
+                block_kind: BLOCK_KIND_USER_MESSAGE.to_owned(),
+                sort_key: sort_key.to_owned(),
+                source_kind: Some("turn".to_owned()),
+                source_key: Some(turn_id.to_owned()),
+                started_at: Some(created_at),
+                completed_at: Some(created_at),
+                metadata_json: "{}".to_owned(),
+                created_at,
+                updated_at: created_at,
+            },
+        )
+        .await
+        .expect("unread test timeline block should persist");
     }
 
     fn test_turn_mcp_projection(
@@ -20211,6 +21407,12 @@ mod tests {
                         status: TurnStatus::InProgress,
                         turn_kind: Default::default(),
                         origin: Default::default(),
+                        mode: Default::default(),
+                        author: None,
+                        reply_to_turn_id: None,
+                        mentions: Vec::new(),
+                        message_revision: 0,
+                        message_deleted: false,
                         error: None,
                         prompt_manifest: None,
                         permission_profile:
@@ -21692,6 +22894,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -22187,6 +23395,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -22363,6 +23577,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -22482,6 +23702,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -22834,6 +24060,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -24065,6 +25297,12 @@ mod tests {
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
                         origin: Default::default(),
+                        mode: Default::default(),
+                        author: None,
+                        reply_to_turn_id: None,
+                        mentions: Vec::new(),
+                        message_revision: 0,
+                        message_deleted: false,
                         error: None,
                         prompt_manifest: None,
                         permission_profile:
@@ -24997,6 +26235,12 @@ mod tests {
                 status: TurnStatus::InProgress,
                 turn_kind: Default::default(),
                 origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
                 error: None,
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -25023,6 +26267,12 @@ mod tests {
                         status: TurnStatus::Completed,
                         turn_kind: Default::default(),
                         origin: Default::default(),
+                        mode: Default::default(),
+                        author: None,
+                        reply_to_turn_id: None,
+                        mentions: Vec::new(),
+                        message_revision: 0,
+                        message_deleted: false,
                         error: None,
                         prompt_manifest: None,
                         permission_profile:
@@ -25203,6 +26453,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -25457,6 +26713,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -27416,6 +28678,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -27610,6 +28878,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -27998,6 +29272,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: permission_profile.clone(),
@@ -28183,6 +29463,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: permission_profile.clone(),
@@ -28258,6 +29544,798 @@ mod tests {
             TurnItemEventPayload::TurnPermissionAudit(audit)
                 if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
         )));
+    }
+
+    #[tokio::test]
+    async fn completed_message_materializes_started_and_completed_in_one_batch() {
+        let store = test_store_with_workspace("ws_atomic_message").await;
+        let connection = store.database_connection();
+        let timestamp = 1_700_000_000;
+        let author = PrincipalId::new("P00000000000000000001").expect("principal id");
+        let gateway_id = GatewayId::new("G00000000000000000001").expect("gateway id");
+        let now = unix_to_datetime(timestamp);
+        create_gateway_singleton(&connection, &gateway_id, 0, now)
+            .await
+            .expect("gateway identity should persist");
+        create_superuser(
+            &connection,
+            &author,
+            &gateway_id,
+            "Author",
+            "author",
+            "author",
+            now,
+        )
+        .await
+        .expect("author principal should persist");
+        let authoritative_thread = Thread {
+            workspace_id: "ws_atomic_message".to_owned(),
+            id: "thr_atomic_message".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(
+                &authoritative_thread,
+                PersistedActorRef::Principal(author.clone()),
+            )
+            .await
+            .expect("authoritative thread should persist before Message projection");
+        let mut thread = authoritative_thread.clone();
+        // Simulate a Message prepared before a concurrent thread-management
+        // update. The event envelope is intentionally stale and must not
+        // replace the current thread metadata when its Turn is projected.
+        thread.name = Some("stale name".to_owned());
+        thread.preview = "hello".to_owned();
+        thread.mode = ThreadMode::Message;
+        thread.model = "stale-model".to_owned();
+        thread.model_provider = "stale-provider".to_owned();
+        thread.updated_at = timestamp + 1;
+        let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
+        let started = Turn {
+            id: "turn_atomic_message".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: ThreadMode::Message,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: permission_profile.clone(),
+        };
+        thread.turns.push(started.clone());
+        let mut completed = started.clone();
+        completed.status = TurnStatus::Completed;
+        let completed_notification = pioneer_protocol::TurnCompletedNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn: completed,
+        };
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: started.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: permission_profile.mode,
+            profile_source: permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+        let input = vec![UserInput::Text {
+            text: "hello".to_owned(),
+            text_elements: Vec::new(),
+        }];
+
+        store
+            .materialize_completed_message_turn_with_permission_audit(CompletedMessageTurnWrite {
+                thread: &thread,
+                sandbox_mode: SandboxMode::FullAccess,
+                started_turn: &started,
+                input: &input,
+                actor: PersistedActorRef::Principal(author.clone()),
+                completed: completed_notification,
+                audit_event: audit,
+            })
+            .await
+            .expect("Message batch should commit");
+
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(started.id.clone()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&connection)
+            .await
+            .expect("must query turn events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].event_type,
+            pioneer_protocol::constants::events::TURN_STARTED
+        );
+        assert_eq!(
+            events[1].event_type,
+            pioneer_protocol::constants::events::TURN_COMPLETED
+        );
+        assert_eq!(
+            events[2].event_type,
+            pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT
+        );
+        let (_, persisted) = store
+            .get_turn(thread.id.as_str(), started.id.as_str())
+            .await
+            .expect("turn read should succeed")
+            .expect("turn should exist");
+        assert_eq!(persisted.status, TurnStatus::Completed);
+        assert_eq!(persisted.mode, ThreadMode::Message);
+        assert_eq!(
+            store.get_turn_inputs(started.id.as_str()).await.unwrap(),
+            input
+        );
+        assert!(
+            store
+                .list_self_improvement_source_turns_after(thread.workspace_id.as_str(), 0, 0, 10,)
+                .await
+                .expect("Message source projection should query")
+                .is_empty(),
+            "ordinary Message completion must not schedule self-improvement work"
+        );
+        let persisted_thread = store
+            .get_thread_model(thread.id.as_str())
+            .await
+            .expect("thread read should succeed")
+            .expect("thread should remain persisted");
+        assert_eq!(persisted_thread.name, authoritative_thread.name);
+        assert_eq!(persisted_thread.mode, authoritative_thread.mode);
+        assert_eq!(persisted_thread.model, authoritative_thread.model);
+        assert_eq!(
+            persisted_thread.model_provider,
+            authoritative_thread.model_provider
+        );
+        assert_eq!(persisted_thread.preview, "hello");
+        assert_eq!(persisted_thread.updated_at, timestamp + 1);
+        assert_eq!(
+            store
+                .get_thread_sandbox_mode(thread.id.as_str())
+                .await
+                .expect("Message thread policy should load"),
+            Some(SandboxMode::FullAccess)
+        );
+
+        let invalid_input = store
+            .edit_turn_message(EditTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 0,
+                input: vec![UserInput::Text {
+                    text: "   ".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                mentions: Vec::new(),
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 1,
+            })
+            .await
+            .expect_err("invalid replacement input must be rejected transactionally");
+        assert_eq!(
+            invalid_input.downcast_ref::<TurnMessageMutationFailure>(),
+            Some(&TurnMessageMutationFailure::InvalidInput)
+        );
+
+        let missing_mention = store
+            .edit_turn_message(EditTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 0,
+                input: input.clone(),
+                mentions: vec![TurnMention {
+                    principal_id: PrincipalId::new("P00000000000000000009")
+                        .expect("missing principal id"),
+                    nickname: "Missing".to_owned(),
+                }],
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 1,
+            })
+            .await
+            .expect_err("missing mention target must be rejected transactionally");
+        assert_eq!(
+            missing_mention.downcast_ref::<TurnMessageMutationFailure>(),
+            Some(&TurnMessageMutationFailure::InvalidTarget)
+        );
+
+        let missing_artifact = store
+            .edit_turn_message(EditTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 0,
+                input: vec![UserInput::Artifact {
+                    artifact_id: "missing_artifact".to_owned(),
+                    version_id: Some("missing_version".to_owned()),
+                }],
+                mentions: Vec::new(),
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 1,
+            })
+            .await
+            .expect_err("missing artifact target must be rejected transactionally");
+        assert_eq!(
+            missing_artifact.downcast_ref::<TurnMessageMutationFailure>(),
+            Some(&TurnMessageMutationFailure::InvalidTarget)
+        );
+        assert!(
+            turn::list_turn_message_revisions(&connection, started.id.as_str(), None, 10)
+                .await
+                .expect("failed replacements must leave revision history readable")
+                .is_empty(),
+            "failed replacement validation must not append a revision"
+        );
+        assert_eq!(
+            store.get_turn_inputs(started.id.as_str()).await.unwrap(),
+            input,
+            "failed replacement validation must preserve current content"
+        );
+
+        let edited_input = vec![UserInput::Text {
+            text: "edited".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let edited = store
+            .edit_turn_message(EditTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 0,
+                input: edited_input.clone(),
+                mentions: Vec::new(),
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 1,
+            })
+            .await
+            .expect("Message edit should commit atomically");
+        assert_eq!(edited.turn.status, TurnStatus::Completed);
+        assert_eq!(edited.turn.mode, ThreadMode::Message);
+        assert_eq!(edited.turn.message_revision, 1);
+        assert_eq!(edited.input, edited_input);
+        assert_eq!(
+            store.get_turn_inputs(started.id.as_str()).await.unwrap(),
+            edited_input
+        );
+        assert_eq!(
+            thread::find_thread_by_id(&connection, thread.id.as_str())
+                .await
+                .unwrap()
+                .expect("edited Message thread should remain")
+                .preview,
+            "edited"
+        );
+        let edited_context = store
+            .get_thread_conversation_history(thread.id.as_str(), 10)
+            .await
+            .expect("edited Message context should load");
+        let edited_entry = edited_context
+            .iter()
+            .find(|entry| entry.turn_id == started.id)
+            .expect("edited Message should remain in conversation context");
+        assert_eq!(edited_entry.user_text.as_deref(), Some("edited"));
+        assert_ne!(edited_entry.user_text.as_deref(), Some("hello"));
+        let edited_history = store
+            .get_thread_history(thread.id.as_str(), None)
+            .await
+            .expect("edited Message history should load")
+            .expect("edited Message thread should exist");
+        assert!(edited_history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::TurnStarted { turn, input, .. }
+                if turn.id == started.id
+                    && turn.message_revision == 1
+                    && input == &edited_input
+        )));
+        assert!(!edited_history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::TurnStarted {
+                input: projected_input,
+                ..
+            } if projected_input == &input
+        )));
+        let revisions =
+            turn::list_turn_message_revisions(&connection, started.id.as_str(), None, 10)
+                .await
+                .expect("revision history should load");
+        assert_eq!(revisions.len(), 1);
+        let prior = turn::turn_message_revision_from_model(revisions[0].clone())
+            .expect("prior revision should decode");
+        assert_eq!(prior.revision, 0);
+        assert_eq!(prior.input, Some(input.clone()));
+
+        let stale = store
+            .edit_turn_message(EditTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 0,
+                input: vec![UserInput::Text {
+                    text: "stale".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                mentions: Vec::new(),
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 2,
+            })
+            .await
+            .expect_err("stale edit must conflict");
+        assert_eq!(
+            stale.downcast_ref::<TurnMessageMutationFailure>(),
+            Some(&TurnMessageMutationFailure::RevisionConflict)
+        );
+        assert_eq!(
+            turn::list_turn_message_revisions(&connection, started.id.as_str(), None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "failed edit must not append a second prior revision"
+        );
+        assert_eq!(
+            store.get_turn_inputs(started.id.as_str()).await.unwrap(),
+            edited_input,
+            "failed edit must not replace current content"
+        );
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(started.id.clone()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&connection)
+            .await
+            .expect("must query post-edit events");
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events.last().map(|event| event.event_type.as_str()),
+            Some(pioneer_protocol::constants::events::TURN_MESSAGE_EDITED)
+        );
+
+        let deleted = store
+            .delete_turn_message(DeleteTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 1,
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 3,
+            })
+            .await
+            .expect("Message delete should commit atomically");
+        assert!(deleted.event.is_some());
+        assert!(deleted.turn.message_deleted);
+        assert_eq!(deleted.turn.message_revision, 2);
+        assert_eq!(deleted.turn.status, TurnStatus::Completed);
+        assert!(
+            store
+                .get_turn_inputs(started.id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            thread::find_thread_by_id(&connection, thread.id.as_str())
+                .await
+                .unwrap()
+                .expect("deleted Message thread should remain")
+                .preview,
+            ""
+        );
+        let deleted_context = store
+            .get_thread_conversation_history(thread.id.as_str(), 10)
+            .await
+            .expect("deleted Message context should load");
+        let deleted_entry = deleted_context
+            .iter()
+            .find(|entry| entry.turn_id == started.id)
+            .expect("deleted Message keeps its stable Turn position");
+        assert_eq!(deleted_entry.user_text, None);
+        assert!(deleted_entry.user_artifacts.is_empty());
+        assert_ne!(deleted_entry.user_text.as_deref(), Some("edited"));
+        assert_ne!(deleted_entry.user_text.as_deref(), Some("hello"));
+        let deleted_history = store
+            .get_thread_history(thread.id.as_str(), None)
+            .await
+            .expect("deleted Message history should load")
+            .expect("deleted Message thread should exist");
+        assert!(deleted_history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::TurnStarted { turn, input, .. }
+                if turn.id == started.id
+                    && turn.message_deleted
+                    && turn.message_revision == 2
+                    && input.is_empty()
+        )));
+        assert!(deleted_history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::TurnCompleted { turn, .. }
+                if turn.id == started.id
+                    && turn.message_deleted
+                    && turn.message_revision == 2
+        )));
+        assert!(!deleted_history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::TurnStarted {
+                input: projected_input,
+                ..
+            } if projected_input == &edited_input || projected_input == &input
+        )));
+        let revisions = store
+            .get_turn_message_revisions(started.id.as_str(), None, 10)
+            .await
+            .expect("edit and delete revisions should load");
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].revision, 1);
+        assert_eq!(revisions[0].input, Some(edited_input.clone()));
+        assert_eq!(revisions[1].revision, 0);
+        assert_eq!(revisions[1].input, Some(input.clone()));
+
+        let duplicate = store
+            .delete_turn_message(DeleteTurnMessageRequest {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: started.id.clone(),
+                expected_revision: 1,
+                changed_by: PersistedActorRef::Principal(author.clone()),
+                changed_at_unix: timestamp + 4,
+            })
+            .await
+            .expect("same delete retry should return the existing tombstone");
+        assert!(duplicate.event.is_none());
+        assert_eq!(duplicate.turn, deleted.turn);
+        assert_eq!(
+            store
+                .get_turn_message_revisions(started.id.as_str(), None, 10)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "duplicate delete must not append another revision"
+        );
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(started.id.clone()))
+            .all(&connection)
+            .await
+            .expect("must query post-delete events");
+        assert_eq!(events.len(), 5, "duplicate delete must not append an event");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == pioneer_protocol::constants::events::TURN_MESSAGE_DELETED
+                })
+                .count(),
+            1
+        );
+
+        let delete_event = events
+            .into_iter()
+            .find(|event| {
+                event.event_type == pioneer_protocol::constants::events::TURN_MESSAGE_DELETED
+            })
+            .map(crate::repositories::turn_event::appended_event_from_model)
+            .transpose()
+            .expect("delete event should decode")
+            .expect("delete event should exist");
+        connection
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE turn SET message_deleted_at=NULL, message_deleted_by_actor_kind=NULL, message_deleted_by_actor_id=NULL WHERE id=?",
+                [started.id.clone().into()],
+            ))
+            .await
+            .expect("test should corrupt tombstone projection");
+        connection
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET preview=? WHERE id=?",
+                ["edited".into(), thread.id.clone().into()],
+            ))
+            .await
+            .expect("test should restore the deleted Message preview");
+        turn::replace_turn_input(
+            &connection,
+            started.id.as_str(),
+            edited_input.as_slice(),
+            unix_to_datetime(timestamp + 5),
+        )
+        .await
+        .expect("test should corrupt current input projection");
+
+        store
+            .projector
+            .project(&connection, &delete_event)
+            .await
+            .expect("delete replay should repair the current projection");
+        store
+            .projector
+            .project(&connection, &delete_event)
+            .await
+            .expect("repeated delete replay should be idempotent");
+        let (_, repaired) = store
+            .get_turn(thread.id.as_str(), started.id.as_str())
+            .await
+            .unwrap()
+            .expect("repaired Turn should exist");
+        assert_eq!(repaired.status, TurnStatus::Completed);
+        assert_eq!(repaired.message_revision, 2);
+        assert!(repaired.message_deleted);
+        assert_eq!(
+            thread::find_thread_by_id(&connection, thread.id.as_str())
+                .await
+                .unwrap()
+                .expect("replayed Message thread should remain")
+                .preview,
+            "",
+            "delete replay must remove the deleted Message preview"
+        );
+        assert!(
+            store
+                .get_turn_inputs(started.id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_turn_message_revisions(started.id.as_str(), None, 10)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "replay must not duplicate immutable revisions"
+        );
+
+        for (fixture_update, label) in [
+            (
+                "message_deleted_at=NULL, turn_kind='task_run', origin='user', status='completed'",
+                "task Turn",
+            ),
+            (
+                "message_deleted_at=NULL, turn_kind='conversation', origin='system', status='completed'",
+                "system Turn",
+            ),
+            (
+                "message_deleted_at=NULL, turn_kind='conversation', origin='user', status='in_progress'",
+                "non-terminal Turn",
+            ),
+            (
+                "message_deleted_at=NULL, turn_kind='conversation', origin='user', status='completed', initiated_by_actor_kind='system', initiated_by_actor_id=NULL",
+                "system-authored Turn",
+            ),
+        ] {
+            let update_sql = format!("UPDATE turn SET {fixture_update} WHERE id='{}'", started.id);
+            connection
+                .execute_unprepared(update_sql.as_str())
+                .await
+                .unwrap_or_else(|error| panic!("prepare {label} fixture: {error}"));
+            let error = store
+                .edit_turn_message(EditTurnMessageRequest {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: started.id.clone(),
+                    expected_revision: 2,
+                    input: vec![UserInput::Text {
+                        text: "must remain immutable".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    mentions: Vec::new(),
+                    changed_by: PersistedActorRef::Principal(author.clone()),
+                    changed_at_unix: timestamp + 6,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<TurnMessageMutationFailure>(),
+                Some(&TurnMessageMutationFailure::ImmutableMessage),
+                "{label} must remain immutable even if its mode column says Message"
+            );
+            let error = store
+                .delete_turn_message(DeleteTurnMessageRequest {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: started.id.clone(),
+                    expected_revision: 2,
+                    changed_by: PersistedActorRef::Principal(author.clone()),
+                    changed_at_unix: timestamp + 7,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<TurnMessageMutationFailure>(),
+                Some(&TurnMessageMutationFailure::ImmutableMessage),
+                "{label} must not accept a Message tombstone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn message_mutation_rechecks_current_member_thread_access() {
+        let workspace_id = "W00000000000000000006";
+        let thread_id = "T00000000000000000006";
+        let store = test_store_with_workspace(workspace_id).await;
+        let connection = store.database_connection();
+        let gateway_id = GatewayId::new("G00000000000000000001").expect("gateway id");
+        let superuser_id = PrincipalId::new("P00000000000000000001").expect("principal id");
+        let member_id = PrincipalId::new("P00000000000000000002").expect("principal id");
+        let now = unix_to_datetime(1_700_000_000);
+        create_gateway_singleton(&connection, &gateway_id, 0, now)
+            .await
+            .expect("gateway identity should persist");
+        create_superuser(
+            &connection,
+            &superuser_id,
+            &gateway_id,
+            "Superuser",
+            "superuser",
+            "superuser",
+            now,
+        )
+        .await
+        .expect("superuser should persist");
+        create_member_principal(
+            &connection,
+            NewMemberPrincipalRow {
+                id: member_id.clone(),
+                gateway_id: gateway_id.clone(),
+                display_name: "Member".to_owned(),
+                nickname: "member".to_owned(),
+                nickname_key: "member".to_owned(),
+                now,
+            },
+        )
+        .await
+        .expect("member should persist");
+        let transaction = connection.begin().await.expect("membership transaction");
+        insert_workspace_membership(
+            &transaction,
+            &NewWorkspaceMembership {
+                gateway_id: gateway_id.clone(),
+                principal_id: member_id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                granted_by: PersistedActorRef::Principal(superuser_id.clone()),
+                now,
+            },
+        )
+        .await
+        .expect("workspace membership should persist");
+        transaction.commit().await.expect("membership commit");
+
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Message,
+            model: String::new(),
+            model_provider: String::new(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::Collaborative,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: Some(pioneer_protocol::ThreadVisibility::Workspace),
+            turns: Vec::new(),
+        };
+        crate::repositories::thread::insert_user_thread_with_creator(
+            &connection,
+            &thread,
+            &PersistedActorRef::Principal(superuser_id.clone()),
+            super::PersistedThreadAccessClass::Workspace,
+            now,
+            now,
+        )
+        .await
+        .expect("workspace thread should persist");
+        let read_anchor_turn_id = "R00000000000000000001";
+        insert_unread_test_turn(
+            &store,
+            workspace_id,
+            thread_id,
+            read_anchor_turn_id,
+            "001",
+            "message",
+            Some(superuser_id.as_ref()),
+            false,
+        )
+        .await;
+
+        let transaction = connection.begin().await.expect("authorization transaction");
+        assert_eq!(
+            principal_current_thread_access_kind(
+                &transaction,
+                workspace_id,
+                thread_id,
+                &superuser_id,
+            )
+            .await
+            .expect("current Superuser ACL should resolve"),
+            Some(pioneer_protocol::PrincipalKind::Superuser)
+        );
+        assert!(
+            message_mutation_actor_current_thread_write_kind(
+                &transaction,
+                workspace_id,
+                thread_id,
+                &PersistedActorRef::Principal(member_id.clone()),
+            )
+            .await
+            .expect("current ACL should resolve")
+                == Some(pioneer_protocol::PrincipalKind::User)
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("authorization rollback");
+
+        let transaction = connection.begin().await.expect("revocation transaction");
+        delete_workspace_membership(&transaction, &gateway_id, &member_id, workspace_id)
+            .await
+            .expect("workspace membership should revoke");
+        transaction.commit().await.expect("revocation commit");
+
+        let transaction = connection.begin().await.expect("authorization transaction");
+        assert!(
+            message_mutation_actor_current_thread_write_kind(
+                &transaction,
+                workspace_id,
+                thread_id,
+                &PersistedActorRef::Principal(member_id.clone()),
+            )
+            .await
+            .expect("revoked ACL should resolve")
+            .is_none()
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("authorization rollback");
+
+        let error = store
+            .mark_thread_read(super::MarkThreadReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: member_id,
+                through_turn_id: read_anchor_turn_id.to_owned(),
+                read_at_unix: 1_700_000_001,
+            })
+            .await
+            .expect_err("revoked Member must not mutate or disclose a read cursor");
+        assert_eq!(
+            error.downcast_ref::<super::ThreadReadFailure>(),
+            Some(&super::ThreadReadFailure::InvalidTarget)
+        );
     }
 
     #[tokio::test]
@@ -28526,6 +30604,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -28667,6 +30751,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -28727,6 +30817,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
             origin: TurnOrigin::ScheduledTask,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -28781,6 +30877,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -28948,6 +31050,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -28975,6 +31083,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -29000,6 +31114,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
             origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -29051,6 +31171,12 @@ mod tests {
             status: TurnStatus::Completed,
             turn_kind: TurnKind::Conversation,
             origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -29076,6 +31202,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::TaskRun,
             origin: TurnOrigin::DetachedTask,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -29141,6 +31273,12 @@ mod tests {
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
@@ -29209,5 +31347,187 @@ mod tests {
             .expect("turn/get should succeed")
             .expect("turn should exist");
         assert_eq!(roundtrip_turn.prompt_manifest, Some(manifest));
+    }
+
+    #[tokio::test]
+    async fn thread_read_cursor_is_monotonic_and_unread_is_authoritative() {
+        let workspace_id = "ws_unread_authoritative";
+        let thread_id = "T00000000000000000001";
+        let gateway_id = GatewayId::new("G00000000000000000001").expect("gateway id");
+        let reader_id = PrincipalId::new("P00000000000000000001").expect("principal id");
+        let other_id = PrincipalId::new("P00000000000000000002").expect("principal id");
+        let store = test_store_with_workspace(workspace_id).await;
+        let now = unix_to_datetime(1_700_000_000);
+        super::create_gateway_singleton(&store.connection, &gateway_id, 0, now)
+            .await
+            .expect("gateway identity should persist");
+        super::create_superuser(
+            &store.connection,
+            &reader_id,
+            &gateway_id,
+            "Reader",
+            "reader",
+            "reader",
+            now,
+        )
+        .await
+        .expect("reader principal should persist");
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Message,
+            model: String::new(),
+            model_provider: String::new(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::Collaborative,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: Some(pioneer_protocol::ThreadVisibility::Workspace),
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::Principal(reader_id.clone()))
+            .await
+            .expect("thread should persist");
+
+        let own_turn_id = "O00000000000000000001";
+        let message_turn_id = "M00000000000000000001";
+        let chat_turn_id = "C00000000000000000001";
+        let agent_turn_id = "A00000000000000000001";
+        let system_turn_id = "S00000000000000000001";
+        let deleted_turn_id = "D00000000000000000001";
+        for (turn_id, sort_key, mode, actor_id, deleted) in [
+            (
+                own_turn_id,
+                "001",
+                "message",
+                Some(reader_id.as_ref()),
+                false,
+            ),
+            (
+                message_turn_id,
+                "002",
+                "message",
+                Some(other_id.as_ref()),
+                false,
+            ),
+            (chat_turn_id, "003", "chat", Some(other_id.as_ref()), false),
+            (
+                agent_turn_id,
+                "004",
+                "agent",
+                Some(other_id.as_ref()),
+                false,
+            ),
+            (system_turn_id, "005", "message", None, false),
+            (
+                deleted_turn_id,
+                "006",
+                "message",
+                Some(other_id.as_ref()),
+                true,
+            ),
+        ] {
+            insert_unread_test_turn(
+                &store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                sort_key,
+                mode,
+                actor_id,
+                deleted,
+            )
+            .await;
+        }
+
+        let counts = store
+            .unread_counts_for_threads(&reader_id, &[thread_id.to_owned()])
+            .await
+            .expect("unread batch should succeed");
+        assert_eq!(counts.get(thread_id), Some(&3));
+
+        let read_chat = store
+            .mark_thread_read(super::MarkThreadReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: reader_id.clone(),
+                through_turn_id: chat_turn_id.to_owned(),
+                read_at_unix: 1_700_000_200,
+            })
+            .await
+            .expect("chat cursor target should succeed");
+        assert_eq!(read_chat.cursor.sort_key, "003");
+        assert_eq!(read_chat.unread_count, 1);
+
+        let stale = store
+            .mark_thread_read(super::MarkThreadReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: reader_id.clone(),
+                through_turn_id: message_turn_id.to_owned(),
+                read_at_unix: 1_700_000_201,
+            })
+            .await
+            .expect("stale cursor target should be idempotent");
+        assert_eq!(stale.cursor.sort_key, "003");
+        assert_eq!(stale.unread_count, 1);
+
+        let older = store.mark_thread_read(super::MarkThreadReadRequest {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            principal_id: reader_id.clone(),
+            through_turn_id: message_turn_id.to_owned(),
+            read_at_unix: 1_700_000_202,
+        });
+        let newer = store.mark_thread_read(super::MarkThreadReadRequest {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            principal_id: reader_id.clone(),
+            through_turn_id: agent_turn_id.to_owned(),
+            read_at_unix: 1_700_000_203,
+        });
+        let (older, newer) = tokio::join!(older, newer);
+        older.expect("concurrent stale cursor should succeed");
+        newer.expect("concurrent newer cursor should succeed");
+        let cursor = super::find_thread_read_cursor(&store.connection, &reader_id, thread_id)
+            .await
+            .expect("cursor query should succeed")
+            .expect("cursor should exist");
+        assert_eq!(cursor.last_read_sort_key, "004");
+
+        let deleted = store
+            .mark_thread_read(super::MarkThreadReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: reader_id.clone(),
+                through_turn_id: deleted_turn_id.to_owned(),
+                read_at_unix: 1_700_000_204,
+            })
+            .await
+            .expect("an accessible tombstone remains a valid cursor position");
+        assert_eq!(deleted.cursor.sort_key, "006");
+        assert_eq!(deleted.unread_count, 0);
+
+        let error = store
+            .mark_thread_read(super::MarkThreadReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                principal_id: reader_id,
+                through_turn_id: system_turn_id.to_owned(),
+                read_at_unix: 1_700_000_205,
+            })
+            .await
+            .expect_err("system target must fail closed");
+        assert_eq!(
+            error.downcast_ref::<super::ThreadReadFailure>(),
+            Some(&super::ThreadReadFailure::InvalidTarget)
+        );
     }
 }

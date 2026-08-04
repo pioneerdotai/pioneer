@@ -76,9 +76,9 @@ pub(crate) fn load_registry_for_runtime(
                     "errors.registry.unsupported_version",
                     version = version,
                     path = path_display.as_str(),
-                        current_registry_version = CURRENT_GATEWAY_REGISTRY_VERSION
-                    )
-                );
+                    current_registry_version = CURRENT_GATEWAY_REGISTRY_VERSION
+                )
+            );
         }
     } else {
         default_registry(config)?

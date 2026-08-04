@@ -2916,6 +2916,8 @@ mod tests {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: Some(crate::ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
             execution_backend: Some(crate::AgentExecutionBackend::ApiProvider {
                 provider: "openai".to_owned(),
             }),

@@ -94,16 +94,16 @@ use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
     ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
     InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberDeviceCreate,
-    MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend,
-    MemoryRead, MemoryWrite, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn,
-    SkillManage, SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
+    MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryRead, MemoryWrite,
+    ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillManage, SkillUse,
+    TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
     ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate, WorkspaceList,
     WorkspaceManage, WorkspaceMemberAdd, WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
 };
 use ResourceResolverKind::{
     Artifact, Capability, Gateway, Invitation, InvitationCollection, InvitationGrantSet,
-    MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn,
-    Workspace, WorkspaceCollection,
+    MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn, Workspace,
+    WorkspaceCollection,
 };
 
 pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
@@ -324,8 +324,18 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(THREAD_READ, ThreadRead, Thread, NotFound, Mutation),
     method_entry(THREAD_UNSUBSCRIBE, ThreadRead, Thread, NotFound, Mutation),
     method_entry(TURN_START, ThreadWrite, Thread, NotFound, Execution),
+    method_entry(TURN_MESSAGE_EDIT, ThreadWrite, Turn, NotFound, Mutation),
+    method_entry(TURN_MESSAGE_DELETE, ThreadWrite, Turn, NotFound, Mutation),
+    method_entry(
+        TURN_MESSAGE_REVISIONS_PAGE,
+        ThreadRead,
+        Turn,
+        NotFound,
+        Read,
+    ),
     method_entry(TURN_CANCEL, ThreadWrite, Turn, NotFound, Mutation),
     method_entry(TURN_RESUME, ThreadWrite, Turn, NotFound, Execution),
     method_entry(TURN_GET, ThreadRead, Turn, NotFound, Read),
@@ -915,13 +925,40 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 134);
+        assert_eq!(registry.len(), 138);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());
             assert!(!entry.resolver.safe_name().is_empty());
             assert!(!entry.disclosure.safe_name().is_empty());
             assert!(!entry.audit.safe_name().is_empty());
+        }
+    }
+
+    #[test]
+    fn turn_message_operations_use_the_existing_turn_resolver() {
+        for (method, action, audit) in [
+            (
+                methods::TURN_MESSAGE_EDIT,
+                ResourceAction::ThreadWrite,
+                AuthorizationAuditClass::Mutation,
+            ),
+            (
+                methods::TURN_MESSAGE_DELETE,
+                ResourceAction::ThreadWrite,
+                AuthorizationAuditClass::Mutation,
+            ),
+            (
+                methods::TURN_MESSAGE_REVISIONS_PAGE,
+                ResourceAction::ThreadRead,
+                AuthorizationAuditClass::Read,
+            ),
+        ] {
+            let entry = normal_method_entry(method).expect("registered Turn message method");
+            assert_eq!(entry.action, action);
+            assert_eq!(entry.resolver, ResourceResolverKind::Turn);
+            assert_eq!(entry.disclosure, DisclosurePolicy::NotFound);
+            assert_eq!(entry.audit, audit);
         }
     }
 
@@ -1032,7 +1069,11 @@ mod tests {
         assert_eq!(registry, public);
         assert_eq!(
             BinaryIngressKind::ALL.map(BinaryIngressKind::safe_name),
-            ["artifact/upload/chunk", "skills/upload/chunk", "voice/chunk"],
+            [
+                "artifact/upload/chunk",
+                "skills/upload/chunk",
+                "voice/chunk"
+            ],
         );
         for kind in BinaryIngressKind::ALL {
             let entry = binary_ingress_entry(kind).expect("registered binary ingress");

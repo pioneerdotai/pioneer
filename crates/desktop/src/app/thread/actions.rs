@@ -439,6 +439,7 @@ impl PioneerDesktop {
                             if let Some(thread) = coordinator.thread_mut() {
                                 turn_start::apply_prepared_turn_to_thread_snapshot(
                                     thread,
+                                    selected_mode,
                                     reduction.thread_snapshot_update.selected_model.as_deref(),
                                     reduction
                                         .thread_snapshot_update

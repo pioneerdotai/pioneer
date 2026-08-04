@@ -309,20 +309,15 @@ impl Default for GatewayArtifactsConfig {
             readable_copy_ttl_secs: default_gateway_artifacts_readable_copy_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
             http_streams_global: default_gateway_artifacts_http_streams_global(),
-            http_streams_per_principal:
-                default_gateway_artifacts_http_streams_per_principal(),
+            http_streams_per_principal: default_gateway_artifacts_http_streams_per_principal(),
             http_streams_per_session: default_gateway_artifacts_http_streams_per_session(),
             http_open_handles: default_gateway_artifacts_http_open_handles(),
-            http_max_single_range_bytes:
-                default_gateway_artifacts_http_max_single_range_bytes(),
+            http_max_single_range_bytes: default_gateway_artifacts_http_max_single_range_bytes(),
             http_tiny_range_bytes: default_gateway_artifacts_http_tiny_range_bytes(),
-            http_tiny_range_window_secs:
-                default_gateway_artifacts_http_tiny_range_window_secs(),
-            http_tiny_range_max_requests:
-                default_gateway_artifacts_http_tiny_range_max_requests(),
+            http_tiny_range_window_secs: default_gateway_artifacts_http_tiny_range_window_secs(),
+            http_tiny_range_max_requests: default_gateway_artifacts_http_tiny_range_max_requests(),
             http_open_timeout_secs: default_gateway_artifacts_http_open_timeout_secs(),
-            http_body_idle_timeout_secs:
-                default_gateway_artifacts_http_body_idle_timeout_secs(),
+            http_body_idle_timeout_secs: default_gateway_artifacts_http_body_idle_timeout_secs(),
             view_grant_ttl_secs: default_gateway_artifacts_view_grant_ttl_secs(),
             view_grants_global: default_gateway_artifacts_view_grants_global(),
             view_grants_per_session: default_gateway_artifacts_view_grants_per_session(),

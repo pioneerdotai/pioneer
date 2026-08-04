@@ -7,7 +7,9 @@ use pioneer_client::{
     },
     transport::ws::command_sender as ws_commands,
 };
-use pioneer_protocol::{Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement};
+use pioneer_protocol::{
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, ThreadUnreadSummary,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +36,7 @@ pub struct ThreadTreeRefreshRequest {
 pub struct ClientThreadTreeSnapshot {
     pub workspace_id: String,
     pub threads_by_id: HashMap<String, Thread>,
+    pub unread: Vec<ThreadUnreadSummary>,
     pub folders_by_id: HashMap<String, ThreadFolder>,
     pub placements_by_thread_id: HashMap<String, ThreadPlacement>,
     pub child_folder_ids_by_parent_id: HashMap<String, Vec<String>>,
@@ -112,6 +115,7 @@ pub fn client_thread_tree_snapshot_from_reduction(
     let folders = reduction.folders;
     let placements = reduction.placements;
     let agents_docs = reduction.agents_docs;
+    let unread = reduction.unread;
     let mut threads = reduction
         .threads
         .into_iter()
@@ -126,12 +130,20 @@ pub fn client_thread_tree_snapshot_from_reduction(
             .then_with(|| lhs.id.cmp(&rhs.id))
     });
 
-    client_thread_tree_snapshot_from_parts(workspace_id, threads, folders, placements, agents_docs)
+    client_thread_tree_snapshot_from_parts(
+        workspace_id,
+        threads,
+        unread,
+        folders,
+        placements,
+        agents_docs,
+    )
 }
 
 pub fn client_thread_tree_snapshot_from_parts(
     workspace_id: String,
     threads: Vec<Thread>,
+    mut unread: Vec<ThreadUnreadSummary>,
     folders: Vec<ThreadFolder>,
     placements: Vec<ThreadPlacement>,
     agents_docs: Vec<ThreadAgentsDocSummary>,
@@ -178,6 +190,8 @@ pub fn client_thread_tree_snapshot_from_parts(
         .filter(|thread| thread.workspace_id == workspace_id)
         .map(|thread| (thread.id.clone(), thread))
         .collect::<HashMap<_, _>>();
+    unread.retain(|summary| threads_by_id.contains_key(summary.thread_id.as_str()));
+    unread.sort_by(|lhs, rhs| lhs.thread_id.cmp(&rhs.thread_id));
 
     let mut sorted_thread_ids = threads_by_id.keys().cloned().collect::<Vec<_>>();
     sorted_thread_ids.sort_by(|lhs, rhs| {
@@ -220,6 +234,7 @@ pub fn client_thread_tree_snapshot_from_parts(
     ClientThreadTreeSnapshot {
         workspace_id,
         threads_by_id,
+        unread,
         folders_by_id,
         placements_by_thread_id,
         child_folder_ids_by_parent_id,
@@ -351,6 +366,7 @@ mod tests {
                 thread("thread_visible", "workspace_a", 10),
                 thread("thread_draft", "workspace_a", 20),
             ],
+            unread: Vec::new(),
             folders: Vec::new(),
             placements: Vec::new(),
             agents_docs: Vec::new(),
@@ -382,6 +398,62 @@ mod tests {
                 .map(|thread| thread.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["thread_visible"]
+        );
+    }
+
+    #[test]
+    fn thread_tree_snapshot_keeps_unread_only_for_visible_authoritative_threads() {
+        let reduction = ThreadTreeRefreshSuccessReduction {
+            workspace_id: "workspace_a".to_owned(),
+            threads: vec![
+                thread("thread_b", "workspace_a", 20),
+                thread("thread_a", "workspace_a", 10),
+                thread("thread_draft", "workspace_a", 30),
+            ],
+            unread: vec![
+                ThreadUnreadSummary {
+                    thread_id: "thread_b".to_owned(),
+                    unread_count: 2,
+                },
+                ThreadUnreadSummary {
+                    thread_id: "thread_missing".to_owned(),
+                    unread_count: 7,
+                },
+                ThreadUnreadSummary {
+                    thread_id: "thread_a".to_owned(),
+                    unread_count: 1,
+                },
+                ThreadUnreadSummary {
+                    thread_id: "thread_draft".to_owned(),
+                    unread_count: 9,
+                },
+            ],
+            folders: Vec::new(),
+            placements: Vec::new(),
+            agents_docs: Vec::new(),
+            set_active_thread_id: None,
+            set_preferred_workspace_id: None,
+            ensure_thread_subscription: None,
+            ensure_thread_timeline_loaded: None,
+            request_thread_start_if_needed: false,
+            drive_thread_start_queue: false,
+            sync_composer_model_selection: false,
+        };
+
+        let snapshot = client_thread_tree_snapshot_from_reduction(reduction, Some("thread_draft"));
+
+        assert_eq!(
+            snapshot.unread,
+            vec![
+                ThreadUnreadSummary {
+                    thread_id: "thread_a".to_owned(),
+                    unread_count: 1,
+                },
+                ThreadUnreadSummary {
+                    thread_id: "thread_b".to_owned(),
+                    unread_count: 2,
+                },
+            ]
         );
     }
 }
