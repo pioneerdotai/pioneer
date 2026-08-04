@@ -2205,6 +2205,22 @@ impl MessageProcessor {
         input: &[pioneer_protocol::UserInput],
     ) -> anyhow::Result<()> {
         let database = self.crud_store.database_connection();
+        if !input
+            .iter()
+            .any(|value| matches!(value, pioneer_protocol::UserInput::Artifact { .. }))
+        {
+            return Ok(());
+        }
+        let target_authorization_root = pioneer_crud::resolve_artifact_binding_authorization_root(
+            &database,
+            workspace_id,
+            Some(thread_id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("artifact reference is unavailable"))?;
 
         for value in input {
             let pioneer_protocol::UserInput::Artifact {
@@ -2250,7 +2266,9 @@ impl MessageProcessor {
                 scope
                     .thread_id
                     .as_deref()
-                    .map_or(true, |artifact_thread_id| artifact_thread_id == thread_id)
+                    .map_or(true, |artifact_root_thread_id| {
+                        target_authorization_root.as_deref() == Some(artifact_root_thread_id)
+                    })
             });
             // Planned-turn uploads can refer to the not-yet-created Turn, so
             // the generic resolver may not materialize that binding yet. Its

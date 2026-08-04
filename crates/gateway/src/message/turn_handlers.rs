@@ -2459,10 +2459,19 @@ impl MessageProcessor {
                     return;
                 }
             };
+            // Detached Task execution prepares its hidden child before that
+            // child is materialized in the durable thread table. Validate
+            // user artifacts against the already-authorized context root in
+            // that narrow preparation window; ordinary CLI turns validate
+            // against their own thread. Once materialized, internal child
+            // threads resolve to the same authorization root through durable
+            // lineage.
+            let artifact_authorization_thread_id =
+                success_response.context_thread_id(thread.id.as_str());
             if let Err(error) = self
                 .validate_turn_artifact_user_inputs(
                     thread.workspace_id.as_str(),
-                    thread.id.as_str(),
+                    artifact_authorization_thread_id,
                     params.input.as_slice(),
                 )
                 .await

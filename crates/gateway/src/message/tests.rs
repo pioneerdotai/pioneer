@@ -18578,13 +18578,29 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         let turn_id = format!("turn_dynamic_native_{runtime_id}");
         let request_id = generate_test_request_id("dynamic", runtime_id);
         let input_marker = format!("dynamic Composer request for {runtime_id}");
+        let artifact = ingest_bound_test_artifact(
+            processor.as_ref(),
+            workspace_id.as_str(),
+            parent_thread_id.as_str(),
+            turn_id.as_str(),
+            format!("user_{turn_id}").as_str(),
+            format!("{runtime_id}-attachment.txt").as_str(),
+            format!("{runtime_id} attachment body").into_bytes(),
+        )
+        .await;
         let launch = pioneer_protocol::TurnStartParams {
             thread_id: parent_thread_id.clone(),
             turn_id: turn_id.clone(),
-            input: vec![UserInput::Text {
-                text: input_marker.clone(),
-                text_elements: Vec::new(),
-            }],
+            input: vec![
+                UserInput::Text {
+                    text: input_marker.clone(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Artifact {
+                    artifact_id: artifact.artifact_id.clone(),
+                    version_id: artifact.version_id.clone(),
+                },
+            ],
             capabilities: vec![TurnCapability {
                 id: "mcp-tool:workspace:resend:send".to_owned(),
                 kind: TurnCapabilityKind::McpTool {
@@ -18826,7 +18842,30 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             "projection rebuild must recover the source sort base from the durable Task row"
         );
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
-        assert_eq!(starts.len(), 1);
+        let child_turn_after_dispatch = crud_store
+            .get_turn(
+                lineage.child_thread_id.as_str(),
+                lineage.child_turn_id.as_str(),
+            )
+            .await
+            .expect("hidden child dispatch state should load");
+        let task_run_after_dispatch = crud_store
+            .get_task_run(run.id.as_str())
+            .await
+            .expect("Task run dispatch state should load");
+        assert_eq!(
+            starts.len(),
+            1,
+            "{runtime_id} hidden CLI child did not start: child={child_turn_after_dispatch:?} run={task_run_after_dispatch:?}"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn_inputs(lineage.child_turn_id.as_str())
+                .await
+                .expect("hidden child artifact inputs should load"),
+            launch.input,
+            "the hidden CLI child must accept the exact parent-scoped artifact version"
+        );
         assert_eq!(starts[0].model.as_deref(), Some(model));
         assert_eq!(starts[0].effort, None);
         assert!(
@@ -26443,6 +26482,23 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
         "e6artifacttimeline001",
     )
     .await;
+    let exact_turn_artifact_count = page
+        .blocks
+        .iter()
+        .filter(|block| block.turn_id.as_deref() == Some("trnE6ArtifactExact001"))
+        .filter_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::UserMessage { attachments, .. } => {
+                Some(attachments)
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter(|attachment| matches!(attachment, UserMessageAttachment::Artifact { .. }))
+        .count();
+    assert_eq!(
+        exact_turn_artifact_count, 1,
+        "the persisted snapshot and exact-version refresh must render one artifact chip"
+    );
     let attachment = page
         .blocks
         .iter()

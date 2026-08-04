@@ -1960,7 +1960,33 @@ fn merge_user_message_attachments(
     secondary: Vec<UserMessageAttachment>,
 ) -> Vec<UserMessageAttachment> {
     for attachment in secondary {
-        if !primary.contains(&attachment) {
+        if let UserMessageAttachment::Artifact { artifact: incoming } = attachment {
+            if let Some(UserMessageAttachment::Artifact { artifact: existing }) =
+                primary.iter_mut().find(|candidate| {
+                    matches!(
+                        candidate,
+                        UserMessageAttachment::Artifact { artifact }
+                            if artifact.artifact_id == incoming.artifact_id
+                                && artifact.version_id == incoming.version_id
+                    )
+                })
+            {
+                // The persisted user-message snapshot can carry a generated
+                // preview while the fresh exact-version lookup deliberately
+                // omits it. Artifact identity is the immutable
+                // (artifact_id, version_id) pair, not the entire mutable
+                // presentation snapshot. Refresh canonical metadata without
+                // turning the two snapshots into duplicate chips.
+                let preview = incoming
+                    .preview
+                    .clone()
+                    .or_else(|| existing.preview.clone());
+                *existing = incoming;
+                existing.preview = preview;
+            } else {
+                primary.push(UserMessageAttachment::Artifact { artifact: incoming });
+            }
+        } else if !primary.contains(&attachment) {
             primary.push(attachment);
         }
     }
@@ -2167,6 +2193,25 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
 mod timeline_handler_unit_tests {
     use super::*;
 
+    fn artifact_attachment(
+        status: pioneer_protocol::ArtifactStatus,
+        preview: Option<pioneer_protocol::ArtifactPreviewRef>,
+    ) -> UserMessageAttachment {
+        UserMessageAttachment::Artifact {
+            artifact: pioneer_protocol::ArtifactRef {
+                artifact_id: "artifact".to_owned(),
+                version_id: Some("version".to_owned()),
+                display_name: "attachment.png".to_owned(),
+                kind: pioneer_protocol::ArtifactKind::Image,
+                mime_type: Some("image/png".to_owned()),
+                size_bytes: Some(42),
+                sha256: Some("sha256".to_owned()),
+                status,
+                preview,
+            },
+        }
+    }
+
     fn pending_request_for(principal_id: &str, session_id: &str) -> CliRuntimePendingRequestRecord {
         let now = chrono::Utc::now().fixed_offset();
         CliRuntimePendingRequestRecord {
@@ -2241,5 +2286,37 @@ mod timeline_handler_unit_tests {
                 message: Some("stopped by user".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn attachment_merge_deduplicates_artifact_snapshots_by_exact_version() {
+        let preview = pioneer_protocol::ArtifactPreviewRef {
+            projection_kind: pioneer_protocol::ArtifactProjectionKind::Thumbnail,
+            status: pioneer_protocol::ArtifactProjectionStatus::Ready,
+            artifact_id: "artifact".to_owned(),
+            version_id: "version".to_owned(),
+            blob_id: Some("preview-blob".to_owned()),
+            mime_type: Some("image/png".to_owned()),
+            size_bytes: Some(12),
+            sha256: Some("preview-sha256".to_owned()),
+        };
+        let merged = merge_user_message_attachments(
+            vec![artifact_attachment(
+                pioneer_protocol::ArtifactStatus::Pending,
+                Some(preview.clone()),
+            )],
+            vec![artifact_attachment(
+                pioneer_protocol::ArtifactStatus::Ready,
+                None,
+            )],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(
+            merged.as_slice(),
+            [UserMessageAttachment::Artifact { artifact }]
+                if artifact.status == pioneer_protocol::ArtifactStatus::Ready
+                    && artifact.preview.as_ref() == Some(&preview)
+        ));
     }
 }
