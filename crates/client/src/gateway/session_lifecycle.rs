@@ -316,10 +316,21 @@ impl SessionLifecycle {
                 self.begin_refresh(metadata.clone(), Some(*connection_generation))
             }
             SessionLifecycleEvent::RefreshTransportLost { intent_id } => {
-                if !self.matches_intent(intent_id) {
+                let SessionLifecycleState::Refreshing {
+                    metadata,
+                    intent_id: active_intent,
+                    ..
+                } = &self.state
+                else {
+                    return SessionLifecycleEffect::None;
+                };
+                if *active_intent != intent_id {
                     return SessionLifecycleEffect::None;
                 }
-                self.enter_terminal(SessionTerminalReason::RefreshOutcomeUnknown)
+                SessionLifecycleEffect::BeginRefresh {
+                    session_id: metadata.session_id.clone(),
+                    intent_id,
+                }
             }
             SessionLifecycleEvent::AuthFailed { reason } => self.enter_terminal(reason),
         }
@@ -538,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn response_loss_and_terminal_auth_stop_retry() {
+    fn response_loss_retries_the_same_intent_while_terminal_auth_stops() {
         let mut lifecycle = SessionLifecycle::default();
         let SessionLifecycleEffect::BeginRefresh { intent_id, .. } =
             lifecycle.reduce(SessionLifecycleEvent::StoredSessionLoaded(metadata(0)))
@@ -547,16 +558,25 @@ mod tests {
         };
         assert_eq!(
             lifecycle.reduce(SessionLifecycleEvent::RefreshTransportLost { intent_id }),
-            SessionLifecycleEffect::Stop {
-                reason: SessionTerminalReason::RefreshOutcomeUnknown,
+            SessionLifecycleEffect::BeginRefresh {
+                session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
+                intent_id,
             }
         );
+        assert!(matches!(
+            lifecycle.state(),
+            SessionLifecycleState::Refreshing {
+                intent_id: active,
+                ..
+            } if *active == intent_id
+        ));
         assert_eq!(
-            lifecycle.reduce(SessionLifecycleEvent::ClockAdvanced {
-                now_unix: 1,
-                refresh_leeway_seconds: 1,
+            lifecycle.reduce(SessionLifecycleEvent::AuthFailed {
+                reason: SessionTerminalReason::SessionCompromised,
             }),
-            SessionLifecycleEffect::None
+            SessionLifecycleEffect::Stop {
+                reason: SessionTerminalReason::SessionCompromised,
+            }
         );
     }
 

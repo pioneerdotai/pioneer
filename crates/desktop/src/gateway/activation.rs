@@ -253,6 +253,7 @@ fn session_from_grant(
         refresh_generation: grant.refresh_generation,
         refresh_expires_at_unix: grant.refresh_expires_at_unix,
         refresh_token: grant.refresh_token,
+        pending_refresh_request_id: None,
     };
     session.validate()?;
     Ok((

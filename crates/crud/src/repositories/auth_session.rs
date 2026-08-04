@@ -10,7 +10,7 @@ use pioneer_protocol::{
     BoundedServerGeneratedMetadata, ClientInstallationDescriptor, ClientKind,
     DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
     INVITATION_MAX_WORKSPACE_GRANTS, INVITATION_MIN_WORKSPACE_GRANTS, INVITATION_TTL_SECONDS,
-    InvitationId, PrincipalId, RefreshCredentialId, RoleKey, TokenFamilyId, WorkspaceId,
+    InvitationId, PrincipalId, RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, WorkspaceId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -383,6 +383,7 @@ pub async fn insert_refresh_credential<C: ConnectionTrait>(
         token_hash: Set(row.token_hash.to_vec()),
         issued_at: Set(row.issued_at),
         expires_at: Set(row.expires_at),
+        exchange_request_id: Set(None),
     }
     .insert(db)
     .await
@@ -860,6 +861,7 @@ pub async fn replace_current_refresh<C: ConnectionTrait>(
     expected_hash: &[u8; 32],
     next_generation: u64,
     next_hash: &[u8; 32],
+    exchange_request_id: &RequestId,
     issued_at: DateTimeWithTimeZone,
     expires_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
@@ -881,6 +883,10 @@ pub async fn replace_current_refresh<C: ConnectionTrait>(
         .col_expr(
             auth_refresh_credential::Column::ExpiresAt,
             Expr::value(expires_at),
+        )
+        .col_expr(
+            auth_refresh_credential::Column::ExchangeRequestId,
+            Expr::value(Some(exchange_request_id.to_string())),
         )
         .filter(auth_refresh_credential::Column::Id.eq(current_id.to_string()))
         .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
@@ -1607,6 +1613,7 @@ async fn scan_auth_schema_invariants<C: ConnectionTrait>(db: &C) -> Result<Vec<S
                 "ck_auth_refresh_generation",
                 "ck_auth_refresh_hash",
                 "ck_auth_refresh_expiry",
+                "ck_auth_refresh_exchange_request_id",
             ],
         ),
     ];

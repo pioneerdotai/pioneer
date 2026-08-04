@@ -188,6 +188,7 @@ impl GatewayRuntime {
         F: FnOnce(
             &GatewayBaseUrl,
             &str,
+            &str,
             Duration,
         ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
     {
@@ -374,6 +375,7 @@ impl GatewayRuntime {
         F: FnOnce(
             &GatewayBaseUrl,
             &str,
+            &str,
             Duration,
         ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
         C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
@@ -450,13 +452,14 @@ impl GatewayRuntime {
         endpoint_id: &str,
         endpoint: pioneer_client::gateway::types::GatewayEndpoint,
         session_ref: String,
-        stored: DesktopGatewaySessionSecret,
+        mut stored: DesktopGatewaySessionSecret,
         refresh: F,
         mut cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
         F: FnOnce(
             &GatewayBaseUrl,
+            &str,
             &str,
             Duration,
         ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
@@ -468,17 +471,48 @@ impl GatewayRuntime {
         ) else {
             bail!("shared session lifecycle did not request cold-start refresh");
         };
+        let refresh_request_id = stored
+            .pending_refresh_request_id
+            .clone()
+            .unwrap_or_else(|| generate_id(pioneer_protocol::REQUEST_ID_LEN));
+        if stored.pending_refresh_request_id.is_none() {
+            stored.pending_refresh_request_id = Some(refresh_request_id.clone());
+            if let Err(error) = self.secrets.put_gateway_session(
+                session_ref.as_str(),
+                &stored,
+                Some(format!("{} session", endpoint.name)),
+            ) {
+                let effect =
+                    lifecycle.reduce(SessionLifecycleEvent::SecureStorageFailed { intent_id });
+                let SessionLifecycleEffect::Stop { reason } = effect else {
+                    return Err(error);
+                };
+                return Ok(self.enter_terminal(endpoint_id, Some(metadata(&stored)), reason));
+            }
+        }
         let refresh = match refresh(
             &endpoint.gateway_base_url,
             stored.refresh_token.expose_secret(),
+            refresh_request_id.as_str(),
             self.timings.startup_timeout,
         ) {
             Ok(refresh) => refresh,
             Err(error) => {
                 let Some(reason) = terminal_reason_for_refresh_error(&error) else {
-                    // The restricted transport proves that the refresh RPC
-                    // was never dispatched. Keep the durable predecessor and
-                    // let the normal connection recovery retry it later.
+                    // The predecessor and request id are both durable. A
+                    // retry can recover either a pre-dispatch failure or an
+                    // exchange whose response was lost after server commit.
+                    let effect =
+                        lifecycle.reduce(SessionLifecycleEvent::RefreshTransportLost { intent_id });
+                    if !matches!(
+                        effect,
+                        SessionLifecycleEffect::BeginRefresh {
+                            intent_id: retry_intent,
+                            ..
+                        } if retry_intent == intent_id
+                    ) {
+                        bail!("shared session lifecycle rejected retryable refresh failure");
+                    }
                     return Err(anyhow::Error::new(error));
                 };
                 let event = match reason {
@@ -660,6 +694,7 @@ impl GatewayRuntime {
 fn exchange_refresh(
     gateway_base_url: &GatewayBaseUrl,
     credential: &str,
+    refresh_request_id: &str,
     timeout: Duration,
 ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -674,7 +709,7 @@ fn exchange_refresh(
         gateway_base_url,
         credential,
         AuthRefreshParams {
-            refresh_request_id: generate_id(pioneer_protocol::REQUEST_ID_LEN),
+            refresh_request_id: refresh_request_id.to_owned(),
             client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         },
     ))
@@ -721,6 +756,7 @@ fn rotated_session(
             refresh_generation: grant.refresh_generation,
             refresh_expires_at_unix: grant.refresh_expires_at_unix,
             refresh_token: grant.refresh_token,
+            pending_refresh_request_id: None,
         },
         DesktopSessionAccessGrant {
             access_token: grant.access_token,
@@ -776,10 +812,10 @@ fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> Option<Sessio
         return Some(reason);
     }
     match error.kind {
-        AuthExchangeErrorKind::TransportBeforeRequest => None,
-        AuthExchangeErrorKind::Timeout
+        AuthExchangeErrorKind::TransportBeforeRequest
+        | AuthExchangeErrorKind::Timeout
         | AuthExchangeErrorKind::Transport
-        | AuthExchangeErrorKind::Protocol => Some(SessionTerminalReason::RefreshOutcomeUnknown),
+        | AuthExchangeErrorKind::Protocol => None,
         AuthExchangeErrorKind::InvalidEndpoint => {
             Some(SessionTerminalReason::GatewayIdentityMismatch)
         }
@@ -928,6 +964,7 @@ mod tests {
             refresh_generation: generation,
             refresh_expires_at_unix: 4_102_444_800,
             refresh_token: pioneer_protocol::AuthSecretString::new(refresh_token(generation)),
+            pending_refresh_request_id: None,
         }
     }
 
@@ -1026,7 +1063,7 @@ mod tests {
     fn cold_start_refresh_persists_rotation_before_returning_ephemeral_access() {
         let (mut runtime, _, endpoint_id) = fixture();
         let prepared = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
                 assert_eq!(raw, refresh_token(0));
                 Ok(refresh_grant(1))
             })
@@ -1056,7 +1093,7 @@ mod tests {
         endpoint.server_gateway_id = None;
 
         let prepared = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 panic!("unbound endpoint must not attempt refresh")
             })
             .expect("terminal preparation");
@@ -1079,7 +1116,7 @@ mod tests {
             .expect("delete session fixture");
 
         let prepared = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 panic!("missing session must not attempt refresh")
             })
             .expect("terminal preparation");
@@ -1109,13 +1146,13 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let first_calls = calls.clone();
         first
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), move |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), move |_, _, _, _| {
                 first_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(refresh_grant(1))
             })
             .unwrap();
         second
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
                 assert_eq!(raw, refresh_token(1));
                 Ok(refresh_grant(2))
             })
@@ -1140,7 +1177,7 @@ mod tests {
             .expect("begin mutation");
 
         let error = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 panic!("refresh must not start during a destructive session mutation")
             })
             .expect_err("mutation must exclude refresh");
@@ -1151,7 +1188,7 @@ mod tests {
 
         drop(mutation);
         runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 Ok(refresh_grant(1))
             })
             .expect("refresh after mutation");
@@ -1183,7 +1220,7 @@ mod tests {
     fn pre_dispatch_refresh_failure_keeps_the_durable_credential_retryable() {
         let (mut runtime, _, endpoint_id) = fixture();
         let first = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
                 assert_eq!(raw, refresh_token(0));
                 Err(AuthExchangeError {
                     kind: AuthExchangeErrorKind::TransportBeforeRequest,
@@ -1195,7 +1232,7 @@ mod tests {
         assert!(format!("{first:#}").contains("before request dispatch"));
 
         let second = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
                 assert_eq!(raw, refresh_token(0));
                 Ok(refresh_grant(1))
             })
@@ -1204,61 +1241,121 @@ mod tests {
     }
 
     #[test]
-    fn refresh_response_loss_is_terminal_and_never_retried() {
+    fn refresh_response_loss_retries_with_the_durable_request_id() {
         let (mut runtime, _, endpoint_id) = fixture();
-        let calls = Arc::new(AtomicU64::new(0));
-        let first_calls = calls.clone();
         let first = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), move |_, _, _| {
-                first_calls.fetch_add(1, Ordering::SeqCst);
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 Err(AuthExchangeError {
                     kind: AuthExchangeErrorKind::Timeout,
                     code: None,
                     message: "response outcome unknown".to_owned(),
                 })
             })
-            .unwrap();
-        assert!(matches!(
-            first,
-            DesktopSessionPreparation::Terminal(DesktopSessionTerminal {
-                reason: SessionTerminalReason::RefreshOutcomeUnknown,
-                ..
-            })
-        ));
+            .expect_err("lost response remains retryable");
+        assert!(format!("{first:#}").contains("outcome unknown"));
+        let pending_request_id = runtime
+            .secrets
+            .get_gateway_session(endpoint_id.as_str())
+            .unwrap()
+            .unwrap()
+            .pending_refresh_request_id
+            .expect("refresh intent must be durable before dispatch");
         let second = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
-                panic!("terminal session must not retry")
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, request_id, _| {
+                assert_eq!(raw, refresh_token(0));
+                assert_eq!(request_id, pending_request_id);
+                Ok(refresh_grant(1))
             })
-            .unwrap();
-        assert!(matches!(second, DesktopSessionPreparation::Terminal(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+            .expect("same exchange request recovers the committed successor");
+        assert!(matches!(second, DesktopSessionPreparation::Ready(_)));
+        assert!(
+            runtime
+                .secrets
+                .get_gateway_session(endpoint_id.as_str())
+                .unwrap()
+                .unwrap()
+                .pending_refresh_request_id
+                .is_none()
+        );
     }
 
     #[test]
-    fn malformed_refresh_response_is_outcome_unknown_and_never_retried() {
+    fn refresh_response_loss_recovers_after_desktop_restart() {
+        let (mut first, store, endpoint_id) = fixture();
+        first
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
+                Err(AuthExchangeError {
+                    kind: AuthExchangeErrorKind::Timeout,
+                    code: None,
+                    message: "response outcome unknown".to_owned(),
+                })
+            })
+            .expect_err("lost response remains retryable");
+        let pending_request_id = first
+            .secrets
+            .get_gateway_session(endpoint_id.as_str())
+            .unwrap()
+            .unwrap()
+            .pending_refresh_request_id
+            .expect("refresh intent persisted before process restart");
+        let mut restarted = GatewayRuntime {
+            config: first.config.clone(),
+            timings: first.timings,
+            ws_timings: first.ws_timings,
+            registry_path: first.registry_path.clone(),
+            registry: first.registry.clone(),
+            secrets: DesktopSecrets::new(store),
+            terminal_sessions: HashMap::new(),
+            access_expiries: HashMap::new(),
+        };
+
+        let prepared = restarted
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, request_id, _| {
+                assert_eq!(raw, refresh_token(0));
+                assert_eq!(request_id, pending_request_id);
+                Ok(refresh_grant(1))
+            })
+            .expect("restart must retry the durable refresh exchange");
+
+        assert!(matches!(prepared, DesktopSessionPreparation::Ready(_)));
+        assert!(
+            restarted
+                .secrets
+                .get_gateway_session(endpoint_id.as_str())
+                .unwrap()
+                .unwrap()
+                .pending_refresh_request_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_refresh_response_preserves_the_recoverable_exchange() {
         let (mut runtime, _, endpoint_id) = fixture();
         let first = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 Err(AuthExchangeError {
                     kind: AuthExchangeErrorKind::Protocol,
                     code: None,
                     message: "malformed response after refresh request".to_owned(),
                 })
             })
+            .expect_err("malformed response remains retryable with the same exchange id");
+        assert!(format!("{first:#}").contains("malformed response"));
+        let pending_request_id = runtime
+            .secrets
+            .get_gateway_session(endpoint_id.as_str())
+            .unwrap()
+            .unwrap()
+            .pending_refresh_request_id
             .unwrap();
-        assert!(matches!(
-            first,
-            DesktopSessionPreparation::Terminal(DesktopSessionTerminal {
-                reason: SessionTerminalReason::RefreshOutcomeUnknown,
-                ..
-            })
-        ));
         let second = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
-                panic!("terminal outcome-unknown session must not retry")
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, request_id, _| {
+                assert_eq!(request_id, pending_request_id);
+                Ok(refresh_grant(1))
             })
-            .unwrap();
-        assert!(matches!(second, DesktopSessionPreparation::Terminal(_)));
+            .expect("protocol retry recovers through server idempotency");
+        assert!(matches!(second, DesktopSessionPreparation::Ready(_)));
     }
 
     #[test]
@@ -1290,7 +1387,7 @@ mod tests {
         let (mut runtime, _, endpoint_id) = fixture();
         runtime.registry.installation_id = Some("different-installation".to_owned());
         let prepared = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 panic!("installation mismatch must fail before presenting refresh")
             })
             .unwrap();
@@ -1308,7 +1405,7 @@ mod tests {
     fn restart_reloads_rotated_envelope_and_refreshes_next_generation() {
         let (mut first, store, endpoint_id) = fixture();
         first
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 Ok(refresh_grant(1))
             })
             .unwrap();
@@ -1323,7 +1420,7 @@ mod tests {
             access_expiries: HashMap::new(),
         };
         restarted
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
                 assert_eq!(raw, refresh_token(1));
                 Ok(refresh_grant(2))
             })
@@ -1343,7 +1440,7 @@ mod tests {
     fn server_terminal_code_stops_reconnect_path() {
         let (mut runtime, _, endpoint_id) = fixture();
         let prepared = runtime
-            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _| {
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
                 Err(AuthExchangeError {
                     kind: AuthExchangeErrorKind::Server,
                     code: Some("session_revoked".to_owned()),

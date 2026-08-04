@@ -619,6 +619,7 @@ mod tests {
                         pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
                         "r".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
                     )),
+                    pending_refresh_request_id: None,
                 },
                 Some("Remote Gateway session".to_owned()),
             )

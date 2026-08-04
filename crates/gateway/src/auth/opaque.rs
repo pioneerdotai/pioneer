@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthSessionId, DEVICE_ACTIVATION_ALPHABET, InvitationCredential,
-    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, TokenFamilyId,
+    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, RequestId, TokenFamilyId,
     device_activation_locator, encode_device_activation_entropy, normalize_device_activation_code,
 };
 use sha2::Sha256;
@@ -18,6 +18,7 @@ const REFRESH_PAYLOAD_BYTES: usize =
     1 + AUTH_DOMAIN_ID_LEN + AUTH_DOMAIN_ID_LEN + 8 + 8 + REFRESH_NONCE_BYTES;
 const REFRESH_ENVELOPE_BYTES: usize = REFRESH_PAYLOAD_BYTES + REFRESH_MAC_BYTES;
 const REFRESH_MAC_DOMAIN: &[u8] = b"refresh_envelope_v2\0";
+const REFRESH_EXCHANGE_NONCE_DOMAIN: &[u8] = b"refresh_exchange_nonce_v1\0";
 const INVITATION_FINGERPRINT_DOMAIN: &[u8] = b"pioneer.invitation.v1\0";
 const INVITATION_CURSOR_DOMAIN: &[u8] = b"pioneer.invitation.cursor.v1\0";
 const MEMBER_CURSOR_DOMAIN: &[u8] = b"pioneer.member.cursor.v1\0";
@@ -103,6 +104,39 @@ impl OpaqueCredentialFactory {
     ) -> OpaqueCredential {
         let mut nonce = [0u8; REFRESH_NONCE_BYTES];
         rand::fill(&mut nonce);
+        let credential = self.build_refresh(
+            session_id,
+            token_family_id,
+            generation,
+            expires_at_unix,
+            &nonce,
+        );
+        nonce.zeroize();
+        credential
+    }
+
+    pub(crate) fn generate_refresh_for_request(
+        &self,
+        session_id: &AuthSessionId,
+        token_family_id: &TokenFamilyId,
+        generation: u64,
+        expires_at_unix: u64,
+        request_id: &RequestId,
+    ) -> OpaqueCredential {
+        let mut seed = Vec::with_capacity(
+            AUTH_DOMAIN_ID_LEN * 2 + std::mem::size_of::<u64>() * 2 + request_id.as_str().len(),
+        );
+        seed.extend_from_slice(session_id.as_str().as_bytes());
+        seed.extend_from_slice(token_family_id.as_str().as_bytes());
+        seed.extend_from_slice(&generation.to_be_bytes());
+        seed.extend_from_slice(&expires_at_unix.to_be_bytes());
+        seed.extend_from_slice(request_id.as_str().as_bytes());
+        let mut nonce = fingerprint(
+            self.hmac_key.as_slice(),
+            REFRESH_EXCHANGE_NONCE_DOMAIN,
+            seed.as_slice(),
+        );
+        seed.zeroize();
         let credential = self.build_refresh(
             session_id,
             token_family_id,
@@ -470,6 +504,40 @@ mod tests {
         );
         assert_ne!(locator_hash, factory.fingerprint(&activation));
         assert!(!format!("{refresh:?} {refresh}").contains(refresh.expose_for_exchange()));
+    }
+
+    #[test]
+    fn refresh_successor_is_stable_only_for_the_same_exchange_request() {
+        let factory = OpaqueCredentialFactory::new(&[7; 64]).unwrap();
+        let session_id = AuthSessionId::new("S00000000000000000001").unwrap();
+        let token_family_id = TokenFamilyId::new("F00000000000000000001").unwrap();
+        let request_a = RequestId::new("Q00000000000000000001").unwrap();
+        let request_b = RequestId::new("Q00000000000000000002").unwrap();
+
+        let first = factory.generate_refresh_for_request(
+            &session_id,
+            &token_family_id,
+            8,
+            12_345,
+            &request_a,
+        );
+        let retry = factory.generate_refresh_for_request(
+            &session_id,
+            &token_family_id,
+            8,
+            12_345,
+            &request_a,
+        );
+        let distinct = factory.generate_refresh_for_request(
+            &session_id,
+            &token_family_id,
+            8,
+            12_345,
+            &request_b,
+        );
+
+        assert_eq!(first.expose_for_exchange(), retry.expose_for_exchange());
+        assert_ne!(first.expose_for_exchange(), distinct.expose_for_exchange());
     }
 
     #[test]

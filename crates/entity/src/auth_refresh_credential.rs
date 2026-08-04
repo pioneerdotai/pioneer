@@ -18,6 +18,7 @@ pub struct Model {
     pub token_hash: Vec<u8>,
     pub issued_at: DateTimeWithTimeZone,
     pub expires_at: DateTimeWithTimeZone,
+    pub exchange_request_id: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "session_id",

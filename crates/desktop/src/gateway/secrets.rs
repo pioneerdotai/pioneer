@@ -33,6 +33,8 @@ pub(crate) struct DesktopGatewaySessionSecret {
     pub refresh_generation: u64,
     pub refresh_expires_at_unix: u64,
     pub refresh_token: AuthSecretString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_refresh_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +60,16 @@ impl DesktopGatewaySessionSecret {
         }
         if self.refresh_expires_at_unix == 0 {
             bail!("invalid desktop Gateway refresh expiry");
+        }
+        if self
+            .pending_refresh_request_id
+            .as_ref()
+            .is_some_and(|request_id| {
+                pioneer_protocol::RequestId::new(request_id.clone()).is_err()
+                    || !request_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            bail!("invalid desktop Gateway pending refresh request id");
         }
         Ok(())
     }
@@ -217,26 +229,31 @@ mod tests {
     use super::*;
     use pioneer_keystore::MemorySecretStore;
 
-    #[test]
-    fn retired_session_envelope_is_deleted_and_treated_as_missing() {
-        let store = Arc::new(MemorySecretStore::new());
+    fn session_json(schema_version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": schema_version,
+            "gateway_id": "G00000000000000000001",
+            "principal_id": "P00000000000000000001",
+            "device_id": "D00000000000000000001",
+            "session_id": "S00000000000000000001",
+            "token_family_id": "F00000000000000000001",
+            "installation_id": "installation-desktop-1",
+            "refresh_generation": 3,
+            "refresh_expires_at_unix": 1_900_000_000_u64,
+            "refresh_token": format!(
+                "{}{}",
+                REFRESH_CREDENTIAL_PREFIX,
+                "r".repeat(REFRESH_CREDENTIAL_BODY_LEN)
+            ),
+        })
+    }
+
+    fn put_raw_session(store: &MemorySecretStore, value: serde_json::Value) {
         let id = SecretId::desktop_gateway_session("remote-1").unwrap();
         store
             .put_string(
                 &id,
-                &serde_json::json!({
-                    "schema_version": 1,
-                    "gateway_id": "G00000000000000000001",
-                    "principal_id": "P00000000000000000001",
-                    "device_id": "D00000000000000000001",
-                    "session_id": "S00000000000000000001",
-                    "token_family_id": "F00000000000000000001",
-                    "installation_id": "installation-desktop-1",
-                    "refresh_generation": 3,
-                    "refresh_expires_at_unix": 1_900_000_000_u64,
-                    "refresh_token": format!("prf_{}", "r".repeat(43)),
-                })
-                .to_string(),
+                &value.to_string(),
                 SecretMeta {
                     kind: SecretKind::DesktopGatewaySession,
                     label: Some("Remote".to_owned()),
@@ -245,9 +262,48 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn retired_session_envelope_is_deleted_and_treated_as_missing() {
+        let store = Arc::new(MemorySecretStore::new());
+        let id = SecretId::desktop_gateway_session("remote-1").unwrap();
+        put_raw_session(store.as_ref(), session_json(1));
         let secrets = DesktopSecrets::new(store.clone());
 
         assert!(secrets.get_gateway_session("remote-1").unwrap().is_none());
         assert!(!store.exists(&id).unwrap());
+    }
+
+    #[test]
+    fn existing_v2_session_without_pending_refresh_intent_remains_readable() {
+        let store = Arc::new(MemorySecretStore::new());
+        put_raw_session(store.as_ref(), session_json(2));
+        let secrets = DesktopSecrets::new(store);
+
+        let session = secrets
+            .get_gateway_session("remote-1")
+            .unwrap()
+            .expect("existing session");
+
+        assert_eq!(session.refresh_generation, 3);
+        assert!(session.pending_refresh_request_id.is_none());
+    }
+
+    #[test]
+    fn malformed_pending_refresh_request_id_is_rejected() {
+        let store = Arc::new(MemorySecretStore::new());
+        let mut raw = session_json(2);
+        raw["pending_refresh_request_id"] = serde_json::json!("!!!!!!!!!!!!!!!!!!!!!");
+        put_raw_session(store.as_ref(), raw);
+        let secrets = DesktopSecrets::new(store);
+
+        let error = secrets
+            .get_gateway_session("remote-1")
+            .expect_err("malformed pending request id must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("invalid desktop Gateway pending refresh request id")
+        );
     }
 }
