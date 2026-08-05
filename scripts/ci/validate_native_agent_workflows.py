@@ -81,53 +81,57 @@ def cargo_test(package: str, *extra: str) -> tuple[str, ...]:
     return ("cargo", "test", "--locked", "-p", package, *extra)
 
 
+DEFAULT_WORKSPACE_COMMAND = ("cargo", "test", "--locked", "--workspace")
+COMPUTER_USE_COMMAND = cargo_test("pioneer-tools", "--features", "computer-use")
+DEFAULT_WORKSPACE_CATEGORIES = (
+    "normal-final",
+    "parallel-tools",
+    "local-tool-rejection",
+    "provider-failure",
+    "provider-conformance",
+    "cancellation",
+    "restart-recovery",
+    "blocked-resume",
+    "durable-events",
+    "scheduled-parent-child",
+    "migration-restart",
+    "path-attachments",
+    "process-cancellation",
+    "long-running-progress",
+    "long-running-no-progress",
+)
+COMPUTER_USE_CATEGORIES = (
+    "normal-final",
+    "local-tool-rejection",
+    "path-attachments",
+)
+
+
+def expected_profile_cases() -> dict[str, dict[str, tuple[str, ...]]]:
+    return {
+        "default-workspace": {
+            "command": DEFAULT_WORKSPACE_COMMAND,
+            "categories": DEFAULT_WORKSPACE_CATEGORIES,
+        },
+        "computer-use": {
+            "command": COMPUTER_USE_COMMAND,
+            "categories": COMPUTER_USE_CATEGORIES,
+        },
+    }
+
+
 EXPECTED_SUITES = {
     "linux-native-lifecycle": {
         "platforms": ("linux",),
-        "cases": {
-            "agent": cargo_test("pioneer-agent"),
-            "provider": cargo_test("pioneer-provider"),
-            "tools": cargo_test("pioneer-tools"),
-            "tools-computer-use": cargo_test(
-                "pioneer-tools", "--features", "computer-use"
-            ),
-            "runtime-events": cargo_test("pioneer-runtime-events"),
-            "crud": cargo_test("pioneer-crud"),
-            "gateway": cargo_test("pioneer-gateway"),
-            "tasks": cargo_test("pioneer-tasks"),
-            "skills": cargo_test("pioneer-skills"),
-            "hooks": cargo_test("pioneer-hooks"),
-            "memory": cargo_test("pioneer-memory"),
-            "protocol": cargo_test("pioneer-protocol"),
-            "migration": cargo_test("pioneer-migration"),
-            "sqlite": cargo_test("pioneer-sqlite"),
-        },
+        "cases": expected_profile_cases(),
     },
     "macos-native-runtime": {
         "platforms": ("macos",),
-        "cases": {
-            "agent": cargo_test("pioneer-agent"),
-            "provider": cargo_test("pioneer-provider"),
-            "tools": cargo_test("pioneer-tools"),
-            "tools-computer-use": cargo_test(
-                "pioneer-tools", "--features", "computer-use"
-            ),
-            "runtime-events": cargo_test("pioneer-runtime-events"),
-            "gateway": cargo_test("pioneer-gateway"),
-        },
+        "cases": expected_profile_cases(),
     },
     "windows-native-runtime": {
         "platforms": ("windows",),
-        "cases": {
-            "agent": cargo_test("pioneer-agent"),
-            "provider": cargo_test("pioneer-provider"),
-            "tools": cargo_test("pioneer-tools"),
-            "tools-computer-use": cargo_test(
-                "pioneer-tools", "--features", "computer-use"
-            ),
-            "runtime-events": cargo_test("pioneer-runtime-events"),
-            "gateway": cargo_test("pioneer-gateway"),
-        },
+        "cases": expected_profile_cases(),
     },
 }
 
@@ -410,9 +414,11 @@ def validate_manifest_alignment() -> None:
         expected_cases = expected["cases"]
         if set(cases) != set(expected_cases):
             raise ContractError(f"manifest case set changed for {suite_id}")
-        for case_id, expected_command in expected_cases.items():
-            if tuple(cases[case_id].get("command", ())) != expected_command:
+        for case_id, expected_case in expected_cases.items():
+            if tuple(cases[case_id].get("command", ())) != expected_case["command"]:
                 raise ContractError(f"manifest command changed for {suite_id}/{case_id}")
+            if tuple(cases[case_id].get("categories", ())) != expected_case["categories"]:
+                raise ContractError(f"manifest categories changed for {suite_id}/{case_id}")
 
 
 def main() -> int:

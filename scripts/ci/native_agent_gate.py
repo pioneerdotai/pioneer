@@ -9,6 +9,7 @@ uses a shell to execute manifest commands.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import datetime as dt
 import hashlib
 import json
@@ -140,8 +141,14 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 raise GateError(f"case {suite_id}/{case_id} is not locked")
             if "--" in command or "--no-run" in command:
                 raise GateError(f"case {suite_id}/{case_id} may not filter or skip test execution")
-            if command.count("-p") != 1:
-                raise GateError(f"case {suite_id}/{case_id} must select exactly one package")
+            package_selections = command.count("-p")
+            workspace_selections = command.count("--workspace")
+            if package_selections + workspace_selections != 1:
+                raise GateError(
+                    f"case {suite_id}/{case_id} must select exactly one package or the workspace"
+                )
+            if package_selections == 1 and command.index("-p") + 1 >= len(command):
+                raise GateError(f"case {suite_id}/{case_id} has no package after -p")
             command_features(command)
             categories = case.get("categories")
             if (
@@ -234,6 +241,33 @@ def command_features(command: list[str]) -> list[str]:
     if not features or len(set(features)) != len(features):
         raise GateError("cargo test --features must name unique non-empty features")
     return sorted(features)
+
+
+def ambiguous_pinned_test_identities(
+    tests: list[str], ignored_tests: list[str], pinned: set[str]
+) -> list[str]:
+    """Return required or ignored identities that are ambiguous in one case."""
+
+    enumerated_counts = Counter(tests)
+    ignored_counts = Counter(ignored_tests)
+    return sorted(
+        name
+        for name in pinned
+        if enumerated_counts[name] > 1 or ignored_counts[name] > 1
+    )
+
+
+def executed_test_identities(tests: list[str], ignored_tests: list[str]) -> list[str]:
+    """Subtract ignored occurrences without collapsing unrelated duplicate names."""
+
+    remaining_ignored = Counter(ignored_tests)
+    executed: list[str] = []
+    for name in tests:
+        if remaining_ignored[name] > 0:
+            remaining_ignored[name] -= 1
+        else:
+            executed.append(name)
+    return executed
 
 
 def deterministic_numeric_seed(seed: str) -> str:
@@ -359,11 +393,20 @@ def run_suite(args: argparse.Namespace) -> int:
         tests = enumeration.pop("listed_tests")
         ignored_tests = ignored_run.pop("listed_tests")
         allowance = allowed_ignored(manifest, args.suite, case_id)
+        required_for_case = {
+            name
+            for category in case["categories"]
+            for name in manifest["category_required_tests"][category]
+        }
+        ambiguous_tests = ambiguous_pinned_test_identities(
+            tests,
+            ignored_tests,
+            required_for_case | set(allowance),
+        )
         unexpected_ignored = [name for name in ignored_tests if name not in allowance]
         stale_allowances = [name for name in allowance if name not in ignored_tests]
         ignored_not_enumerated = [name for name in ignored_tests if name not in tests]
-        ignored_names = set(ignored_tests)
-        executed_tests = [name for name in tests if name not in ignored_names]
+        executed_tests = executed_test_identities(tests, ignored_tests)
 
         case_report: dict[str, Any] = {
             "id": case_id,
@@ -379,6 +422,7 @@ def run_suite(args: argparse.Namespace) -> int:
             "unexpected_ignored": unexpected_ignored,
             "stale_ignored_allowances": stale_allowances,
             "ignored_not_enumerated": ignored_not_enumerated,
+            "ambiguous_pinned_test_identities": ambiguous_tests,
             "outcome": "pending",
         }
 
@@ -389,6 +433,7 @@ def run_suite(args: argparse.Namespace) -> int:
             and not unexpected_ignored
             and not stale_allowances
             and not ignored_not_enumerated
+            and not ambiguous_tests
         )
         if preflight_ok:
             print(f"::group::{args.suite}/{case_id} execute")
@@ -537,12 +582,30 @@ def validate_reports(args: argparse.Namespace) -> int:
                 raise GateError(
                     f"report {suite_id}/{case_id} ignored-test evidence does not match manifest"
                 )
-            ignored_names = set(actual_ignored)
-            if not ignored_names.issubset(tests):
+            required_for_case = {
+                name
+                for category in definition["categories"]
+                for name in manifest["category_required_tests"][category]
+            }
+            expected_ambiguous = ambiguous_pinned_test_identities(
+                tests,
+                [item["name"] for item in ignored_tests],
+                required_for_case | set(expected_ignored),
+            )
+            if (
+                case.get("ambiguous_pinned_test_identities") != expected_ambiguous
+                or expected_ambiguous
+            ):
+                raise GateError(
+                    f"report {suite_id}/{case.get('id')} has ambiguous pinned test identities"
+                )
+            if not set(actual_ignored).issubset(tests):
                 raise GateError(
                     f"report {suite_id}/{case_id} ignored tests were not enumerated"
                 )
-            expected_executed_tests = [name for name in tests if name not in ignored_names]
+            expected_executed_tests = executed_test_identities(
+                tests, [item["name"] for item in ignored_tests]
+            )
             executed_tests = case.get("executed_tests")
             if executed_tests != expected_executed_tests or not expected_executed_tests:
                 raise GateError(

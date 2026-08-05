@@ -251,7 +251,7 @@ jobs:
         manifest["suites"][0]["cases"] = [
             case
             for case in manifest["suites"][0]["cases"]
-            if case["id"] != "tools-computer-use"
+            if case["id"] != "computer-use"
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -260,6 +260,26 @@ jobs:
             path.write_text(json.dumps(manifest), encoding="utf-8")
             with mock.patch.object(workflows, "ROOT", root):
                 with self.assertRaisesRegex(workflows.ContractError, "case set changed"):
+                    workflows.validate_manifest_alignment()
+
+    def test_manifest_cannot_fragment_default_workspace_case(self) -> None:
+        manifest = json.loads(
+            (workflows.ROOT / "ci/native-agent-gate.json").read_text(encoding="utf-8")
+        )
+        manifest["suites"][0]["cases"][0]["command"] = [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "pioneer-agent",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ci/native-agent-gate.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with mock.patch.object(workflows, "ROOT", root):
+                with self.assertRaisesRegex(workflows.ContractError, "command changed"):
                     workflows.validate_manifest_alignment()
 
     def test_manifest_cannot_replace_required_regression_identity(self) -> None:

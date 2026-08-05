@@ -25,12 +25,15 @@ renames, removes, or materially changes any of the following:
 
 For a relevant change:
 
-1. Update the manifest when package cases, feature profiles, required
+1. Update the manifest when workspace coverage, feature profiles, required
    categories, exact Rust test identities, platforms, or justified ignores
-   change. New critical behavior needs an exact required test identity; broad
-   substring coverage is not acceptable.
+   change. Keep one default-workspace case and one explicit production
+   `computer-use` case per supported OS. New critical behavior needs an exact
+   required test identity; broad substring coverage is not acceptable.
 2. Keep enumerated and actually executed tests distinct. An ignored test must
-   never satisfy required coverage or executed-test counts.
+   never satisfy required coverage or executed-test counts. Duplicate required
+   or ignored identities inside a workspace case are ambiguous and must fail
+   closed.
 3. Prefer deterministic automated coverage. If an external/manual smoke must be
    ignored, allowlist its exact suite/case/test identity with a concrete reason
    and retain deterministic coverage for the same contract. Remove stale

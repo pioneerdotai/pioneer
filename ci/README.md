@@ -6,11 +6,12 @@ produces a JSON report containing the exact commit, clean-tree state, platform,
 fault seed, commands, feature profile, discovered and actually executed test
 names, ignored-test decisions, durations, outcomes and output digests.
 
-The reusable workflow `.github/workflows/native-agent-gate.yml` runs the full
-Linux lifecycle set plus macOS and Windows runtime subsets. Its final job merges
-the reports and emits an exact-SHA attestation. CI, Gateway release and Desktop
-release call that workflow directly; release build jobs cannot start unless the
-attestation job succeeds.
+The reusable workflow `.github/workflows/native-agent-gate.yml` runs the same
+two-profile contract on Linux, macOS and Windows: one locked default-workspace
+test command plus one locked `pioneer-tools` command with the production
+`computer-use` feature. Its final job merges the reports and emits an exact-SHA
+attestation. CI, Gateway release and Desktop release call that workflow
+directly; release build jobs cannot start unless the attestation job succeeds.
 
 Tag-triggered Gateway and Desktop releases also wait for the ordinary `CI`
 workflow to complete successfully for the exact tag commit before starting the
@@ -37,10 +38,17 @@ They are fail-closed: a necessary ignore must be added to
 reason. A stale allowance also fails, preventing an obsolete exception from
 silently remaining in the gate.
 
-The case/package matrix is independently pinned by
-`validate_native_agent_workflows.py`, including the `computer-use` production
-feature profile on Linux, macOS and Windows. Removing a crate, platform,
-feature case, required category or exact regression identity fails the contract
+Required and allowlisted-ignored identities must each be unique inside a
+default-workspace enumeration. Other packages may legitimately contain the same
+non-critical test name; the runner preserves those occurrences. A duplicate
+pinned identity is ambiguous once package-specific commands are collapsed, so
+the runner fails before execution instead of allowing one package's test to
+stand in for another package's required regression.
+
+The two-case profile matrix is independently pinned by
+`validate_native_agent_workflows.py` on Linux, macOS and Windows. Replacing the
+default workspace with a package fragment, removing the `computer-use` profile,
+platform, required category or exact regression identity fails the contract
 tests even if the manifest is edited at the same time. Release publisher jobs
 are also checked to depend on their gated build/package jobs using active YAML
 lines; commented-out wiring cannot satisfy the validator.

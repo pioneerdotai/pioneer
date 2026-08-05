@@ -80,6 +80,7 @@ def passing_report(sha: str = "a" * 40) -> dict:
                 "unexpected_ignored": [],
                 "stale_ignored_allowances": [],
                 "ignored_not_enumerated": [],
+                "ambiguous_pinned_test_identities": [],
                 "outcome": "passed",
             }
         ],
@@ -89,6 +90,16 @@ def passing_report(sha: str = "a" * 40) -> dict:
 class ManifestTests(unittest.TestCase):
     def test_minimal_manifest_is_valid(self) -> None:
         gate.validate_manifest(minimal_manifest())
+
+    def test_locked_workspace_command_is_valid(self) -> None:
+        manifest = minimal_manifest()
+        manifest["suites"][0]["cases"][0]["command"] = [
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+        ]
+        gate.validate_manifest(manifest)
 
     def test_missing_required_category_is_rejected(self) -> None:
         manifest = minimal_manifest()
@@ -112,6 +123,16 @@ class ManifestTests(unittest.TestCase):
         manifest = minimal_manifest()
         manifest["suites"][0]["cases"][0]["command"].remove("--locked")
         with self.assertRaisesRegex(gate.GateError, "is not locked"):
+            gate.validate_manifest(manifest)
+
+    def test_unscoped_test_command_is_rejected(self) -> None:
+        manifest = minimal_manifest()
+        manifest["suites"][0]["cases"][0]["command"] = [
+            "cargo",
+            "test",
+            "--locked",
+        ]
+        with self.assertRaisesRegex(gate.GateError, "package or the workspace"):
             gate.validate_manifest(manifest)
 
     def test_filtered_test_command_is_rejected(self) -> None:
@@ -208,6 +229,17 @@ class ReportTests(unittest.TestCase):
         report["clean"] = False
         report["dirty_paths"] = [" M crates/agent/src/lib.rs"]
         with self.assertRaisesRegex(gate.GateError, "dirty checkout"):
+            self.validate(report)
+
+    def test_duplicate_pinned_workspace_identity_blocks_attestation(self) -> None:
+        report = passing_report()
+        duplicate = "tests::normal_final: test"
+        report["cases"][0]["enumerated_tests"] = [duplicate, duplicate]
+        report["cases"][0]["executed_tests"] = [duplicate, duplicate]
+        report["cases"][0]["ambiguous_pinned_test_identities"] = [duplicate]
+        report["enumerated_test_count"] = 2
+        report["test_count"] = 2
+        with self.assertRaisesRegex(gate.GateError, "ambiguous pinned"):
             self.validate(report)
 
     def test_unexpected_ignored_test_blocks_attestation(self) -> None:
