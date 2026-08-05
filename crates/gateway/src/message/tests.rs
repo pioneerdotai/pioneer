@@ -10083,6 +10083,114 @@ async fn first_voice_turn_materializes_runtime_draft() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_turn_start_replay_does_not_dispatch_provider_again() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider = Arc::new(CaptureSummaryProvider::new("voice replay answer"));
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request"));
+    let thread_id = "thr_voice_admission_replay";
+    let turn_id = "turn_voice_admission_replay";
+    let started = thread_manager
+        .thread_start_seeded(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: None,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::TaskRun),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await;
+    let started = started.expect("voice replay TaskRun thread should start");
+    crud_store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("persist voice replay authorization target");
+
+    let first = submit_test_voice_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    assert_eq!(first.outcome, VoiceSessionOutcome::TurnStarted);
+    let first_status = wait_for_turn_status(
+        crud_store.clone(),
+        thread_id,
+        turn_id,
+        TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(
+        first_status,
+        TurnStatus::Completed,
+        "voice Turn did not finish: provider_calls={}, finalization_intent={:?}",
+        provider.call_count(),
+        crud_store.has_turn_finalization_intent(turn_id).await
+    );
+    let provider_calls_after_first_turn = provider.call_count();
+    assert!(provider_calls_after_first_turn > 0);
+
+    let replay = submit_test_voice_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    assert_eq!(replay.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(replay.turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        provider.call_count(),
+        provider_calls_after_first_turn,
+        "an exact voice admission replay must not start a second provider execution"
+    );
+
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("voice replay Turn lookup should succeed")
+        .expect("voice replay Turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_voice_composer_admits_detached_task() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
@@ -10444,16 +10552,48 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     assert_eq!(turn_started_payload.turn.id, "turn_voice_success_0001");
 
     let mut user_message = None;
-    for _ in 0..10 {
-        let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
-        let completed_payload: pioneer_protocol::ItemCompletedNotification =
-            serde_json::from_value(completed.params.expect("item/completed params"))
-                .expect("item/completed decode");
-        if let TurnItem::UserMessage {
-            text, attachments, ..
-        } = completed_payload.item
-        {
-            user_message = Some((text, attachments));
+    let mut result_payload = None;
+    let mut turn_completed = false;
+    for _ in 0..40 {
+        let payload = recv_text_timeout_context(
+            &mut rx,
+            Duration::from_secs(10),
+            "voice turn lifecycle notification",
+        )
+        .await;
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("voice lifecycle payload should decode");
+        let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match method {
+            events::ITEM_COMPLETED => {
+                let notification: JsonRpcNotification = serde_json::from_value(value)
+                    .expect("item/completed notification should decode");
+                let completed: pioneer_protocol::ItemCompletedNotification =
+                    serde_json::from_value(notification.params.expect("item/completed params"))
+                        .expect("item/completed decode");
+                if let TurnItem::UserMessage {
+                    text, attachments, ..
+                } = completed.item
+                {
+                    user_message = Some((text, attachments));
+                }
+            }
+            events::VOICE_SESSION_RESULT => {
+                let notification: JsonRpcNotification = serde_json::from_value(value)
+                    .expect("voice/session/result notification should decode");
+                result_payload = Some(
+                    serde_json::from_value(
+                        notification.params.expect("voice/session/result params"),
+                    )
+                    .expect("voice/session/result decode"),
+                );
+            }
+            events::TURN_COMPLETED => turn_completed = true,
+            _ => {}
+        }
+        if user_message.is_some() && result_payload.is_some() && turn_completed {
             break;
         }
     }
@@ -10496,14 +10636,8 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         "voice turn must preserve selected MCP tool capability"
     );
 
-    let result_notification =
-        recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
-    let result_payload: VoiceSessionResultNotification = serde_json::from_value(
-        result_notification
-            .params
-            .expect("voice/session/result params"),
-    )
-    .expect("voice/session/result decode");
+    let result_payload: VoiceSessionResultNotification =
+        result_payload.expect("voice turn must emit voice/session/result");
     assert_eq!(result_payload.session_id, start_payload.session_id);
     assert_eq!(result_payload.outcome, VoiceSessionOutcome::TurnStarted);
     assert_eq!(
@@ -10512,7 +10646,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     );
     assert!(result_payload.error.is_none());
 
-    let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    assert!(turn_completed, "voice turn must emit turn/completed");
     assert_eq!(capture_provider.call_count(), 1);
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -24802,6 +24936,53 @@ async fn terminal_turn_completion_closes_running_execution_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
+    let thread_id = "thr_native_finalization_reconcile";
+    let turn_id = "turn_native_finalization_reconcile";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    crud_store
+        .prepare_turn_finalization(
+            &ItemCompletedNotification {
+                workspace_id,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "final_reconcile_1".to_owned(),
+                    text: "accepted before listener loss".to_owned(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+            1_700_000_100,
+        )
+        .await
+        .expect("finalization intent should prepare");
+
+    assert_eq!(
+        processor
+            .reconcile_prepared_native_turn_finalizations(1_700_000_101, 10)
+            .await
+            .expect("periodic finalization should reconcile"),
+        1
+    );
+    let (_, in_memory) = processor
+        .thread_manager
+        .turn_get(thread_id, turn_id)
+        .await
+        .expect("loaded turn should remain available");
+    assert_eq!(in_memory.status, TurnStatus::Completed);
+    let (_, persisted) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("persisted turn lookup should succeed")
+        .expect("persisted turn should exist");
+    assert_eq!(persisted.status, TurnStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
     let thread_id = "thr_window_terminal_fail";
     let turn_id = "turn_window_terminal_fail";
@@ -28022,6 +28203,126 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
     assert_eq!(
         cwd_entry.resolved_path.as_deref(),
         Some(persisted.snapshot.sandbox.cwd.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_native_admission_replay";
+    let turn_id = "turn_native_admission_replay";
+    thread_manager
+        .thread_start_seeded(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id,
+                name: Some("Native admission replay".to_owned()),
+                model: Some("o4-mini".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("thread should seed");
+    let actor = pioneer_protocol::PersistedActorRef::System;
+    let params = pioneer_protocol::TurnStartParams {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        input: vec![UserInput::Text {
+            text: "execute exactly once".to_owned(),
+            text_elements: Vec::new(),
+        }],
+        capabilities: Vec::new(),
+        model: None,
+        model_provider: None,
+        sandbox_policy: None,
+        mode: None,
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
+        execution_backend: None,
+        reasoning: None,
+        permission_profile: None,
+        cli_runtime_options: None,
+    };
+
+    let first = processor
+        .prepare_api_provider_turn_start(
+            connection_id,
+            actor.clone(),
+            None,
+            params.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("first request should prepare");
+    assert!(matches!(
+        first,
+        super::turn_handlers::ApiProviderTurnAdmission::New(_)
+    ));
+
+    let replay = processor
+        .prepare_api_provider_turn_start(
+            connection_id,
+            actor.clone(),
+            None,
+            params.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("same request should replay");
+    let super::turn_handlers::ApiProviderTurnAdmission::Replay(response) = replay else {
+        panic!("same durable request must not prepare a second execution");
+    };
+    assert_eq!(response.turn.id, turn_id);
+    assert_eq!(response.turn.status, TurnStatus::InProgress);
+
+    let mut conflicting = params;
+    conflicting.input = vec![UserInput::Text {
+        text: "different payload".to_owned(),
+        text_elements: Vec::new(),
+    }];
+    let error = match processor
+        .prepare_api_provider_turn_start(connection_id, actor, None, conflicting, None, None)
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("same Turn identity with another payload must conflict"),
+    };
+    assert!(error.contains("conflicting durable admission request"));
+    assert_eq!(
+        pioneer_entity::turn_admission::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .expect("admission rows should list")
+            .len(),
+        1
     );
 }
 

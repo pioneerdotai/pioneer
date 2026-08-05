@@ -862,16 +862,49 @@ use crate::repositories::{
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
     agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding, hook_run,
     mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
-    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_pack_installation,
-    skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
-    task_delivery, task_dependency, task_event, task_result_candidate, task_result_review_event,
-    task_run, task_run_conversation_snapshot, task_run_execution, task_run_thread_binding,
-    task_run_turn, task_trigger, task_write_lock, thread, thread_agents_doc,
-    thread_episodic as thread_episodic_repository, thread_lineage, thread_tree, turn,
-    turn_cli_runtime_instruction, turn_event, turn_event_delivery, turn_event_projection_state,
-    turn_execution_window, turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding,
-    turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
+    recovery_terminalization_outbox, skill_audit_event, skill_dependency_snapshot,
+    skill_installation, skill_pack_installation, skill_upload_session, skill_workspace_policy,
+    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
+    task_result_candidate, task_result_review_event, task_run, task_run_conversation_snapshot,
+    task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
+    thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
+    thread_tree, turn, turn_admission, turn_cli_runtime_instruction, turn_event,
+    turn_event_delivery, turn_event_projection_state, turn_execution_window, turn_finalization,
+    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
+    turn_runtime_snapshot, turn_skill_binding,
 };
+
+pub use crate::repositories::turn_admission::NewTurnAdmission;
+pub use crate::repositories::turn_finalization::PrepareTurnFinalizationOutcome;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedTurnFinalization {
+    pub final_item: pioneer_protocol::ItemCompletedNotification,
+    pub turn_completed: pioneer_protocol::TurnCompletedNotification,
+    pub already_committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedRecoveryTerminalizationRecord {
+    pub recovery_job_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+    pub recovery_status: RecoveryJobStatus,
+    pub attempt_number: u32,
+    pub error_message: String,
+    pub attempt_count: u32,
+    pub claim_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedRecoveryTerminalization {
+    pub recovery_job_id: String,
+    pub thread_id: String,
+    pub final_item: Option<pioneer_protocol::ItemCompletedNotification>,
+    pub turn: Turn,
+    pub already_terminal: bool,
+}
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
 pub use crate::timeline_projection::{
@@ -9092,6 +9125,54 @@ impl CrudStore {
         actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     ) -> Result<()> {
+        self.materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor,
+            audit_event,
+            None,
+        )
+        .await
+    }
+
+    pub async fn materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        admission: NewTurnAdmission,
+    ) -> Result<()> {
+        self.materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor,
+            audit_event,
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        admission: Option<NewTurnAdmission>,
+    ) -> Result<()> {
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
@@ -9102,9 +9183,11 @@ impl CrudStore {
         });
         let audit_event = TurnEventPayload::TurnPermissionAudit(audit_event);
 
-        self.materialize_turn_events_atomically(
+        self.materialize_turn_events_atomically_with_optional_admission(
             vec![started_event, audit_event],
             thread_model.updated_at,
+            None,
+            admission,
         )
         .await
     }
@@ -9144,6 +9227,37 @@ impl CrudStore {
         .await
     }
 
+    pub async fn materialize_new_member_native_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        gateway_id: &GatewayId,
+        principal_id: &PrincipalId,
+        admission: NewTurnAdmission,
+    ) -> Result<()> {
+        self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor.clone(),
+            audit_event,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class: PersistedThreadAccessClass::Private,
+                member: Some((gateway_id.clone(), principal_id.clone())),
+            },
+            Some(admission),
+        )
+        .await
+    }
+
     /// Atomically creates a Superuser runtime draft and its immediately
     /// completed first Message Turn.
     pub async fn materialize_new_superuser_completed_message_turn_with_permission_audit(
@@ -9165,6 +9279,39 @@ impl CrudStore {
                 access_class,
                 member: None,
             },
+        )
+        .await
+    }
+
+    pub async fn materialize_new_superuser_native_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        access_class: PersistedThreadAccessClass,
+        admission: NewTurnAdmission,
+    ) -> Result<()> {
+        if access_class == PersistedThreadAccessClass::Internal {
+            bail!("new user native thread cannot use internal access class");
+        }
+        self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            reasoning_effort,
+            actor.clone(),
+            audit_event,
+            NewUserThreadCreation {
+                creator: actor,
+                access_class,
+                member: None,
+            },
+            Some(admission),
         )
         .await
     }
@@ -9197,6 +9344,7 @@ impl CrudStore {
                 access_class: PersistedThreadAccessClass::Private,
                 member: Some((gateway_id.clone(), principal_id.clone())),
             },
+            None,
         )
         .await
     }
@@ -9227,6 +9375,7 @@ impl CrudStore {
                 access_class,
                 member: None,
             },
+            None,
         )
         .await
     }
@@ -9241,6 +9390,7 @@ impl CrudStore {
         actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
         creation: NewUserThreadCreation,
+        admission: Option<NewTurnAdmission>,
     ) -> Result<()> {
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
@@ -9250,15 +9400,23 @@ impl CrudStore {
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
         });
-        self.materialize_turn_events_atomically_with_creation(
+        self.materialize_turn_events_atomically_with_optional_admission(
             vec![
                 started_event,
                 TurnEventPayload::TurnPermissionAudit(audit_event),
             ],
             thread_model.updated_at,
-            creation,
+            Some(creation),
+            admission,
         )
         .await
+    }
+
+    pub async fn get_turn_admission(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_entity::turn_admission::Model>> {
+        turn_admission::find(&self.connection, turn_id).await
     }
 
     pub async fn materialize_item_started(
@@ -9297,6 +9455,284 @@ impl CrudStore {
             TurnEventPayload::ItemCompleted(notification),
             event_timestamp_secs,
         )
+        .await
+    }
+
+    /// Captures one accepted final provider response before the execution owner
+    /// may report success. Exact replay is idempotent; a different response for
+    /// the same Turn/generation is rejected.
+    pub async fn prepare_turn_finalization(
+        &self,
+        notification: &pioneer_protocol::ItemCompletedNotification,
+        generation: i64,
+        event_timestamp_secs: i64,
+    ) -> Result<PrepareTurnFinalizationOutcome> {
+        let notification = notification.clone();
+        self.run_serialized_write(|| async {
+            let turn = turn::find_turn_by_thread_and_id(
+                &self.connection,
+                notification.thread_id.as_str(),
+                notification.turn_id.as_str(),
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "turn `{}` does not exist for finalization",
+                    notification.turn_id
+                )
+            })?;
+            let status = turn_status_from_db(turn.status.as_str())
+                .context("turn finalization target has an unknown status")?;
+            if !matches!(status, TurnStatus::InProgress | TurnStatus::Completed) {
+                anyhow::bail!(
+                    "turn `{}` cannot prepare finalization from status `{:?}`",
+                    notification.turn_id,
+                    status
+                );
+            }
+            if status == TurnStatus::Completed
+                && turn_finalization::find_by_turn_id(
+                    &self.connection,
+                    notification.turn_id.as_str(),
+                )
+                .await?
+                .is_none()
+            {
+                anyhow::bail!(
+                    "completed turn `{}` has no existing finalization intent",
+                    notification.turn_id
+                );
+            }
+            let thread =
+                thread::find_thread_by_id(&self.connection, notification.thread_id.as_str())
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "thread `{}` does not exist for finalization",
+                            notification.thread_id
+                        )
+                    })?;
+            if thread.workspace_id != notification.workspace_id {
+                anyhow::bail!("turn finalization workspace does not match authoritative thread");
+            }
+            turn_finalization::prepare(
+                &self.connection,
+                &notification,
+                generation,
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn list_prepared_turn_finalization_ids(&self, limit: u64) -> Result<Vec<String>> {
+        self.run_serialized_write(|| async {
+            Ok(turn_finalization::list_prepared(&self.connection, limit)
+                .await?
+                .into_iter()
+                .map(|row| row.turn_id)
+                .collect())
+        })
+        .await
+    }
+
+    /// Returns whether this Turn participates in the atomic native-provider
+    /// finalization protocol. Turns emitted by an older native worker or by a
+    /// CLI runtime have no intent and retain the legacy terminal event path
+    /// during expand/migrate/contract rollout.
+    pub async fn has_turn_finalization_intent(&self, turn_id: &str) -> Result<bool> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            Ok(
+                turn_finalization::find_by_turn_id(&self.connection, turn_id.as_str())
+                    .await?
+                    .is_some(),
+            )
+        })
+        .await
+    }
+
+    pub async fn reconcile_prepared_turn_finalizations(
+        &self,
+        limit: u64,
+        event_timestamp_secs: i64,
+    ) -> Result<u64> {
+        let turn_ids = self.list_prepared_turn_finalization_ids(limit).await?;
+        let mut committed = 0_u64;
+        for turn_id in turn_ids {
+            self.commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp_secs)
+                .await
+                .with_context(|| {
+                    format!("failed to reconcile finalization for turn `{turn_id}`")
+                })?;
+            committed = committed.saturating_add(1);
+        }
+        Ok(committed)
+    }
+
+    /// Atomically publishes the prepared final AgentMessage and immutable
+    /// Completed Turn state. This is the sole successful native finalization
+    /// commit boundary.
+    pub async fn commit_prepared_turn_finalization(
+        &self,
+        turn_id: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<CommittedTurnFinalization> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin turn finalization transaction")?;
+            let result = async {
+                let intent = turn_finalization::find_by_turn_id(&transaction, turn_id.as_str())
+                    .await?
+                    .with_context(|| format!("turn `{turn_id}` has no finalization intent"))?;
+                let final_item = turn_finalization::notification_from_model(&intent)?;
+                let turn_model = turn::find_turn_by_thread_and_id(
+                    &transaction,
+                    intent.thread_id.as_str(),
+                    turn_id.as_str(),
+                )
+                .await?
+                .with_context(|| format!("turn `{turn_id}` disappeared during finalization"))?;
+                let authoritative_status = turn_status_from_db(turn_model.status.as_str())
+                    .context("turn finalization target has an unknown status")?;
+                let thread_model =
+                    thread::find_thread_by_id(&transaction, intent.thread_id.as_str())
+                        .await?
+                        .with_context(|| {
+                            format!(
+                                "thread `{}` disappeared during finalization",
+                                intent.thread_id
+                            )
+                        })?;
+                if thread_model.workspace_id != intent.workspace_id {
+                    anyhow::bail!("turn finalization workspace identity changed");
+                }
+
+                let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
+                let permission_profile = parse_turn_permission_profile(&turn_model)?;
+                let collaboration = turn::collaboration_from_model(&turn_model)?;
+                let completed_turn = Turn {
+                    id: turn_model.id.clone(),
+                    status: TurnStatus::Completed,
+                    turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
+                    origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                    mode: collaboration.mode.effective_mode,
+                    author: collaboration.author,
+                    reply_to_turn_id: collaboration.reply_to_turn_id,
+                    mentions: collaboration.mentions,
+                    message_revision: collaboration.message_revision,
+                    message_deleted: collaboration.message_deleted,
+                    error: None,
+                    prompt_manifest,
+                    permission_profile,
+                };
+                let turn_completed = pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: intent.workspace_id.clone(),
+                    thread_id: intent.thread_id.clone(),
+                    turn: completed_turn,
+                };
+
+                let already_committed = authoritative_status == TurnStatus::Completed;
+                if already_committed {
+                    if intent.status != turn_finalization::STATUS_COMMITTED {
+                        let existing_item = turn::find_turn_item(
+                            &transaction,
+                            turn_id.as_str(),
+                            intent.item_id.as_str(),
+                        )
+                        .await?
+                        .context("completed Turn is missing its final AgentMessage")?;
+                        if existing_item.payload != intent.item_json {
+                            anyhow::bail!(
+                                "completed Turn final item conflicts with its finalization intent"
+                            );
+                        }
+                        if !turn_finalization::mark_committed(
+                            &transaction,
+                            turn_id.as_str(),
+                            intent.generation,
+                            unix_to_datetime(event_timestamp_secs),
+                        )
+                        .await?
+                        {
+                            anyhow::bail!("failed to reconcile committed finalization intent");
+                        }
+                    }
+                    return Ok(CommittedTurnFinalization {
+                        final_item,
+                        turn_completed,
+                        already_committed: true,
+                    });
+                }
+                if authoritative_status != TurnStatus::InProgress {
+                    anyhow::bail!(
+                        "turn `{turn_id}` has conflicting terminal status `{:?}`",
+                        authoritative_status
+                    );
+                }
+                if intent.status != turn_finalization::STATUS_PREPARED {
+                    anyhow::bail!(
+                        "in-progress Turn `{turn_id}` has non-prepared finalization state `{}`",
+                        intent.status
+                    );
+                }
+
+                let created_at = unix_to_datetime(event_timestamp_secs);
+                let claim_expires_at = unix_to_datetime(
+                    event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                );
+                self.append_and_project_turn_event_in_transaction(
+                    &transaction,
+                    TurnEventPayload::ItemCompleted(final_item.clone()),
+                    created_at,
+                    claim_expires_at,
+                    true,
+                )
+                .await?;
+                self.append_and_project_turn_event_in_transaction(
+                    &transaction,
+                    TurnEventPayload::TurnCompleted(turn_completed.clone()),
+                    created_at,
+                    claim_expires_at,
+                    true,
+                )
+                .await?;
+                if !turn_finalization::mark_committed(
+                    &transaction,
+                    turn_id.as_str(),
+                    intent.generation,
+                    created_at,
+                )
+                .await?
+                {
+                    anyhow::bail!("turn finalization compare-and-set was lost");
+                }
+                Ok(CommittedTurnFinalization {
+                    final_item,
+                    turn_completed,
+                    already_committed: false,
+                })
+            }
+            .await;
+            match result {
+                Ok(committed) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit turn finalization transaction")?;
+                    Ok(committed)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        })
         .await
     }
 
@@ -17787,6 +18223,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     return Err(error);
                 }
             };
+            if affected
+                && let Err(error) = enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    job_id,
+                    unix_to_datetime(now_unix),
+                )
+                .await
+            {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
             tx.commit()
                 .await
                 .context("failed to commit due pending recovery terminal transaction")?;
@@ -17805,15 +18252,32 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<bool> {
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
-            recovery_job::mark_claimed_job_terminal(
-                &self.connection,
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin claimed recovery terminal transaction")?;
+            let affected = recovery_job::mark_claimed_job_terminal(
+                &tx,
                 job_id,
                 claim_token,
                 status,
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
-            .await
+            .await?;
+            if affected {
+                enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    job_id,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("failed to commit claimed recovery terminal transaction")?;
+            Ok(affected)
         })
         .await
     }
@@ -17827,14 +18291,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<bool> {
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
-            recovery_job::mark_job_terminal(
-                &self.connection,
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery terminal transaction")?;
+            let affected = recovery_job::mark_job_terminal(
+                &tx,
                 job_id,
                 status,
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
-            .await
+            .await?;
+            if affected {
+                enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    job_id,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("failed to commit recovery terminal transaction")?;
+            Ok(affected)
         })
         .await
     }
@@ -17848,14 +18329,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<bool> {
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
-            recovery_job::mark_active_without_attempt_terminal(
-                &self.connection,
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin malformed recovery terminal transaction")?;
+            let affected = recovery_job::mark_active_without_attempt_terminal(
+                &tx,
                 job_id,
                 status,
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
-            .await
+            .await?;
+            if affected {
+                enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    job_id,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("failed to commit malformed recovery terminal transaction")?;
+            Ok(affected)
         })
         .await
     }
@@ -17870,15 +18368,385 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<bool> {
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
-            recovery_job::mark_job_terminal_after_attempt(
-                &self.connection,
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery-after-attempt terminal transaction")?;
+            let affected = recovery_job::mark_job_terminal_after_attempt(
+                &tx,
                 job_id,
                 active_attempt_id,
                 status,
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
+            .await?;
+            if affected {
+                enqueue_recovery_terminalization_if_required(
+                    &tx,
+                    job_id,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("failed to commit recovery-after-attempt terminal transaction")?;
+            Ok(affected)
+        })
+        .await
+    }
+
+    pub async fn claim_due_recovery_terminalizations(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        limit: u64,
+    ) -> Result<Vec<ClaimedRecoveryTerminalizationRecord>> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            let claim_expires_at = unix_to_datetime(
+                now_unix.saturating_add(i64::try_from(claim_lease_secs).unwrap_or(i64::MAX)),
+            );
+            recovery_terminalization_outbox::claim_due(
+                &self.connection,
+                now,
+                claim_expires_at,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(|claimed| {
+                let row = claimed.row;
+                Ok(ClaimedRecoveryTerminalizationRecord {
+                    recovery_job_id: row.recovery_job_id,
+                    turn_id: row.turn_id,
+                    item_id: row.item_id,
+                    item_type: turn_item_type_from_db(row.item_type.as_str())
+                        .context("recovery terminalization has an unknown item type")?,
+                    recovery_status: recovery_job_status_from_db(row.recovery_status.as_str())
+                        .context("recovery terminalization has an unknown recovery status")?,
+                    attempt_number: u32::try_from(row.attempt_number)
+                        .context("recovery terminalization attempt number is invalid")?,
+                    error_message: row.error_message,
+                    attempt_count: u32::try_from(row.attempt_count).unwrap_or(u32::MAX),
+                    claim_token: claimed.claim_token,
+                })
+            })
+            .collect()
+        })
+        .await
+    }
+
+    /// Backfills terminal recovery outcomes committed by an older Gateway or
+    /// by a process that crashed before the outbox migration became active.
+    /// Selection and insertion are serialized and each row remains protected
+    /// by the outbox primary key.
+    pub async fn enqueue_missing_recovery_terminalizations(
+        &self,
+        limit: u64,
+        now_unix: i64,
+    ) -> Result<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        self.run_serialized_write(|| async {
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery terminalization audit transaction")?;
+            let result = async {
+                let rows = tx
+                    .query_all_raw(Statement::from_sql_and_values(
+                        tx.get_database_backend(),
+                        "SELECT r.id FROM recovery_job r \
+                         LEFT JOIN recovery_terminalization_outbox o \
+                           ON o.recovery_job_id = r.id \
+                         WHERE r.status IN ('failed', 'exhausted', 'blocked') \
+                           AND o.recovery_job_id IS NULL \
+                         ORDER BY r.updated_at ASC, r.id ASC LIMIT ?"
+                            .to_owned(),
+                        [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+                    ))
+                    .await
+                    .context("failed to scan terminal recovery jobs missing outbox")?;
+                let mut enqueued = 0_u64;
+                for row in rows {
+                    let job_id: String = row.try_get("", "id")?;
+                    enqueue_recovery_terminalization_if_required(
+                        &tx,
+                        job_id.as_str(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                    enqueued = enqueued.saturating_add(1);
+                }
+                Ok(enqueued)
+            }
+            .await;
+            match result {
+                Ok(enqueued) => {
+                    tx.commit()
+                        .await
+                        .context("failed to commit recovery terminalization audit")?;
+                    Ok(enqueued)
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn fail_recovery_terminalization_claim(
+        &self,
+        record: &ClaimedRecoveryTerminalizationRecord,
+        error: String,
+        retry_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            recovery_terminalization_outbox::mark_failed(
+                &self.connection,
+                record.recovery_job_id.as_str(),
+                record.claim_token.as_str(),
+                error.clone(),
+                unix_to_datetime(retry_at_unix),
+                unix_to_datetime(now_unix),
+            )
             .await
+        })
+        .await
+    }
+
+    /// Applies item and Turn terminal state and consumes the recovery outbox
+    /// claim in the same transaction. A stale/resumed job cannot close a Turn.
+    pub async fn apply_claimed_recovery_terminalization(
+        &self,
+        record: &ClaimedRecoveryTerminalizationRecord,
+        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        event_timestamp_secs: i64,
+    ) -> Result<AppliedRecoveryTerminalization> {
+        let record = record.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery terminalization transaction")?;
+            let result = async {
+                let outbox = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
+                    record.recovery_job_id.clone(),
+                )
+                .one(&transaction)
+                .await?
+                .context("recovery terminalization outbox row disappeared")?;
+                if outbox.status != recovery_terminalization_outbox::STATUS_DELIVERING
+                    || outbox.claim_token.as_deref() != Some(record.claim_token.as_str())
+                {
+                    anyhow::bail!("recovery terminalization claim is no longer owned");
+                }
+                let job =
+                    recovery_job::find_job_by_id(&transaction, record.recovery_job_id.as_str())
+                        .await?
+                        .context("recovery terminalization job disappeared")?;
+                let job_status = recovery_job_status_from_db(job.status.as_str())
+                    .context("recovery terminalization job has an unknown status")?;
+                let job_item_type = turn_item_type_from_db(job.item_type.as_str())
+                    .context("recovery terminalization job has an unknown item type")?;
+                let job_attempt_number = u32::try_from(job.run_count.max(1))
+                    .context("recovery terminalization job has an invalid attempt number")?;
+                let job_error_message = job
+                    .last_error
+                    .clone()
+                    .or_else(|| job.reason.clone())
+                    .unwrap_or_else(|| "recovery reached a terminal outcome".to_owned());
+                if job.turn_id != record.turn_id
+                    || job.item_id != record.item_id
+                    || job_item_type != record.item_type
+                    || job_status != record.recovery_status
+                    || job_attempt_number != record.attempt_number
+                    || job_error_message != record.error_message
+                {
+                    anyhow::bail!("recovery terminalization is stale: job identity/status changed");
+                }
+                if !matches!(
+                    job_status,
+                    RecoveryJobStatus::Blocked
+                        | RecoveryJobStatus::Failed
+                        | RecoveryJobStatus::Exhausted
+                ) {
+                    anyhow::bail!("recovery terminalization job is no longer terminalizable");
+                }
+                let turn_model = turn::find_turn_by_id(&transaction, record.turn_id.as_str())
+                    .await?
+                    .context("recovery terminalization Turn is missing")?;
+                let thread_model =
+                    thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str())
+                        .await?
+                        .context("recovery terminalization Thread is missing")?;
+                let current_status = turn_status_from_db(turn_model.status.as_str())
+                    .context("recovery terminalization Turn has an unknown status")?;
+                let desired_status = if job_status == RecoveryJobStatus::Blocked {
+                    TurnStatus::Blocked
+                } else {
+                    TurnStatus::Failed
+                };
+                if current_status != TurnStatus::InProgress && current_status != desired_status {
+                    anyhow::bail!(
+                        "stale recovery job cannot replace terminal Turn status `{:?}`",
+                        current_status
+                    );
+                }
+
+                let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
+                let permission_profile = parse_turn_permission_profile(&turn_model)?;
+                let collaboration = turn::collaboration_from_model(&turn_model)?;
+                let terminal_error = if job_status == RecoveryJobStatus::Blocked {
+                    let resume = resume.as_ref().context(
+                        "blocked recovery terminalization is missing durable resume metadata",
+                    )?;
+                    format!(
+                        "{} (recovery job {})",
+                        resume.human_message, record.recovery_job_id
+                    )
+                } else {
+                    let status_label = match job_status {
+                        RecoveryJobStatus::Exhausted => "exhausted",
+                        RecoveryJobStatus::Failed => "failed",
+                        RecoveryJobStatus::Blocked => unreachable!("handled above"),
+                        RecoveryJobStatus::Pending
+                        | RecoveryJobStatus::Active
+                        | RecoveryJobStatus::Succeeded
+                        | RecoveryJobStatus::Cancelled => unreachable!(
+                            "non-terminal recovery status was rejected before terminalization"
+                        ),
+                    };
+                    format!(
+                        "recovery {status_label} for item `{}`: {}",
+                        record.item_id, record.error_message
+                    )
+                };
+                let terminal_turn = Turn {
+                    id: turn_model.id.clone(),
+                    status: desired_status,
+                    turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
+                    origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                    mode: collaboration.mode.effective_mode,
+                    author: collaboration.author,
+                    reply_to_turn_id: collaboration.reply_to_turn_id,
+                    mentions: collaboration.mentions,
+                    message_revision: collaboration.message_revision,
+                    message_deleted: collaboration.message_deleted,
+                    error: Some(terminal_error),
+                    prompt_manifest,
+                    permission_profile,
+                };
+                let already_terminal = current_status == desired_status;
+                let mut final_item = None;
+                let created_at = unix_to_datetime(event_timestamp_secs);
+                let claim_expires_at = unix_to_datetime(
+                    event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                );
+                // Compatibility workers from an older Gateway may have
+                // committed the Turn failure while losing the synthetic item
+                // completion. Repair that half-state even when the desired
+                // Turn status is already present, then consume the outbox in
+                // the same transaction.
+                if desired_status == TurnStatus::Failed
+                    && let Some(item_model) = turn::find_turn_item(
+                        &transaction,
+                        record.turn_id.as_str(),
+                        record.item_id.as_str(),
+                    )
+                    .await?
+                {
+                    let mut item: TurnItem = serde_json::from_str(item_model.payload.as_str())
+                        .context("failed to decode recovery terminalization item")?;
+                    if tool_call_status(&item) == Some(ToolCallStatus::InProgress) {
+                        terminalize_turn_item_payload(
+                            &mut item,
+                            TurnItemTerminalState::Failed {
+                                reason: Some(record.error_message.clone()),
+                            },
+                        );
+                        let notification = pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: thread_model.workspace_id.clone(),
+                            thread_id: turn_model.thread_id.clone(),
+                            turn_id: record.turn_id.clone(),
+                            item,
+                        };
+                        self.append_and_project_turn_event_in_transaction(
+                            &transaction,
+                            TurnEventPayload::ItemCompleted(notification.clone()),
+                            created_at,
+                            claim_expires_at,
+                            true,
+                        )
+                        .await?;
+                        final_item = Some(notification);
+                    }
+                }
+                if !already_terminal {
+                    let terminal_event = if desired_status == TurnStatus::Blocked {
+                        TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
+                            workspace_id: thread_model.workspace_id.clone(),
+                            thread_id: turn_model.thread_id.clone(),
+                            turn: terminal_turn.clone(),
+                            resume: resume.clone(),
+                        })
+                    } else {
+                        TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
+                            workspace_id: thread_model.workspace_id.clone(),
+                            thread_id: turn_model.thread_id.clone(),
+                            turn: terminal_turn.clone(),
+                        })
+                    };
+                    self.append_and_project_turn_event_in_transaction(
+                        &transaction,
+                        terminal_event,
+                        created_at,
+                        claim_expires_at,
+                        true,
+                    )
+                    .await?;
+                }
+                if !recovery_terminalization_outbox::mark_delivered(
+                    &transaction,
+                    record.recovery_job_id.as_str(),
+                    record.claim_token.as_str(),
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await?
+                {
+                    anyhow::bail!("recovery terminalization claim was lost before commit");
+                }
+                Ok(AppliedRecoveryTerminalization {
+                    recovery_job_id: record.recovery_job_id.clone(),
+                    thread_id: turn_model.thread_id,
+                    final_item,
+                    turn: terminal_turn,
+                    already_terminal,
+                })
+            }
+            .await;
+            match result {
+                Ok(applied) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit recovery terminalization transaction")?;
+                    Ok(applied)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
         })
         .await
     }
@@ -17970,6 +18838,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .context("failed to rollback stale blocked recovery resume transaction")?;
                 return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
             }
+
+            recovery_terminalization_outbox::cancel_undelivered_for_job(
+                &tx,
+                job.id.as_str(),
+                "superseded by explicit blocked Turn resume",
+                now,
+            )
+            .await?;
 
             let updated = turn::update_turn_status(
                 &tx,
@@ -18274,6 +19150,22 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         events: Vec<TurnEventPayload>,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            event_timestamp_secs,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn materialize_turn_events_atomically_with_optional_admission(
+        &self,
+        events: Vec<TurnEventPayload>,
+        event_timestamp_secs: i64,
+        creation: Option<NewUserThreadCreation>,
+        admission: Option<NewTurnAdmission>,
+    ) -> Result<()> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
@@ -18283,7 +19175,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 events.clone(),
                 created_at,
                 claim_expires_at,
-                None,
+                creation.clone(),
+                admission.clone(),
             )
         })
         .await
@@ -18295,18 +19188,12 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         event_timestamp_secs: i64,
         creation: NewUserThreadCreation,
     ) -> Result<()> {
-        let created_at = unix_to_datetime(event_timestamp_secs);
-        let claim_expires_at =
-            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-
-        self.run_serialized_write(|| {
-            self.materialize_turn_events_atomically_once(
-                events.clone(),
-                created_at,
-                claim_expires_at,
-                Some(creation.clone()),
-            )
-        })
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            event_timestamp_secs,
+            Some(creation),
+            None,
+        )
         .await
     }
 
@@ -18316,6 +19203,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         created_at: DateTimeWithTimeZone,
         claim_expires_at: DateTimeWithTimeZone,
         creation: Option<NewUserThreadCreation>,
+        admission: Option<NewTurnAdmission>,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -18345,6 +19233,13 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 let _ = transaction.rollback().await;
                 return Err(error);
             }
+        }
+
+        if let Some(admission) = admission
+            && let Err(error) = turn_admission::insert(&transaction, admission, created_at).await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
         }
 
         transaction
@@ -20386,6 +21281,25 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
     }
 }
 
+async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    let job = recovery_job::find_job_by_id(db, job_id)
+        .await?
+        .with_context(|| format!("terminal recovery job `{job_id}` disappeared"))?;
+    let status = recovery_job_status_from_db(job.status.as_str())
+        .context("terminal recovery job has an unknown status")?;
+    if matches!(
+        status,
+        RecoveryJobStatus::Failed | RecoveryJobStatus::Exhausted | RecoveryJobStatus::Blocked
+    ) {
+        recovery_terminalization_outbox::enqueue_for_terminal_job(db, &job, now).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -20405,10 +21319,10 @@ mod tests {
         NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
-        PreparedClaudeProviderSessionMode, ProjectionPageAnchor, ResolveCliRuntimePendingRequest,
-        SkillAuditEventRecord, SkillDependencySnapshotRecord, SkillInstallationPatch,
-        SkillInstallationRecord, SkillPackChildDiff, SkillPackInstallationRecord,
-        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
+        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillDependencySnapshotRecord,
+        SkillInstallationPatch, SkillInstallationRecord, SkillPackChildDiff,
+        SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
@@ -20423,7 +21337,7 @@ mod tests {
         create_gateway_singleton, create_member_principal, create_superuser,
         delete_workspace_membership, insert_workspace_membership,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
-        upsert_thread_timeline_block,
+        tool_call_status, upsert_thread_timeline_block,
     };
     use crate::repositories::{thread, turn};
     use crate::util::unix_to_datetime;
@@ -20454,7 +21368,7 @@ mod tests {
         ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
         ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
         ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-        TurnCompletedNotification, TurnExecutionSecuritySnapshot,
+        TurnBlockedResumeMetadata, TurnCompletedNotification, TurnExecutionSecuritySnapshot,
         TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
         TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
         TurnFilesystemAccess, TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload,
@@ -20469,6 +21383,29 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    struct PreNativeDeliveryMigrator;
+
+    impl MigratorTrait for PreNativeDeliveryMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            let mut migrations = Migrator::migrations();
+            migrations.pop();
+            migrations.pop();
+            migrations
+        }
+    }
+
+    struct PreAtomicTerminalizationMigrator;
+
+    impl MigratorTrait for PreAtomicTerminalizationMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            let mut migrations = Migrator::migrations();
+            migrations.pop();
+            migrations
+        }
+    }
+
+    // Legacy migration tests use an all-but-latest migrator so the newest
+    // additive migration can be exercised independently.
     struct ReversibleMigrator;
 
     impl MigratorTrait for ReversibleMigrator {
@@ -20644,7 +21581,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        ReversibleMigrator::up(&connection, None)
+        PreNativeDeliveryMigrator::up(&connection, None)
             .await
             .expect("baseline migrations must succeed");
         Migrator::up(&connection, None)
@@ -20679,7 +21616,7 @@ mod tests {
                 .is_some()
         );
 
-        Migrator::down(&connection, Some(1))
+        Migrator::down(&connection, Some(2))
             .await
             .expect("native delivery rollback must succeed");
         assert!(
@@ -20693,6 +21630,62 @@ mod tests {
                 .expect("outbox table lookup after rollback should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_terminalization_migration_expands_and_rolls_back_cleanly() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        PreAtomicTerminalizationMigrator::up(&connection, None)
+            .await
+            .expect("baseline migrations must succeed");
+        Migrator::up(&connection, None)
+            .await
+            .expect("atomic terminalization expansion must succeed");
+
+        for table_name in [
+            "turn_admission",
+            "turn_finalization",
+            "recovery_terminalization_outbox",
+        ] {
+            assert!(
+                connection
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Sqlite,
+                        format!(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}'"
+                        ),
+                    ))
+                    .await
+                    .expect("terminalization table lookup should succeed")
+                    .is_some(),
+                "{table_name} should be created"
+            );
+        }
+
+        Migrator::down(&connection, Some(1))
+            .await
+            .expect("atomic terminalization rollback must succeed");
+        for table_name in [
+            "turn_admission",
+            "turn_finalization",
+            "recovery_terminalization_outbox",
+        ] {
+            assert!(
+                connection
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Sqlite,
+                        format!(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}'"
+                        ),
+                    ))
+                    .await
+                    .expect("terminalization table lookup after rollback should succeed")
+                    .is_none(),
+                "{table_name} should be removed by rollback"
+            );
+        }
     }
 
     #[tokio::test]
@@ -20843,6 +21836,545 @@ mod tests {
             .expect("successor lookup should succeed");
         assert_eq!(successor.len(), 1);
         assert!(successor[0].event.sequence > retried[0].event.sequence);
+    }
+
+    #[tokio::test]
+    async fn prepared_native_finalization_survives_restart_and_commits_exactly_once() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_finalization",
+            "thr_native_finalization",
+            "turn_native_finalize",
+        )
+        .await;
+        let final_notification = ItemCompletedNotification {
+            workspace_id: "ws_native_finalization".to_owned(),
+            thread_id: "thr_native_finalization".to_owned(),
+            turn_id: "turn_native_finalize".to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_native_message_1".to_owned(),
+                text: "the one durable final answer".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+
+        assert_eq!(
+            store
+                .prepare_turn_finalization(&final_notification, 1, 1_700_000_100)
+                .await
+                .expect("finalization intent should prepare"),
+            PrepareTurnFinalizationOutcome::Prepared
+        );
+        assert_eq!(
+            store
+                .prepare_turn_finalization(&final_notification, 1, 1_700_000_100)
+                .await
+                .expect("exact intent replay should be idempotent"),
+            PrepareTurnFinalizationOutcome::AlreadyPrepared
+        );
+        let mut rerendered = final_notification.clone();
+        if let TurnItem::AgentMessage {
+            markdown_version, ..
+        } = &mut rerendered.item
+        {
+            *markdown_version = Some(99);
+        }
+        assert_eq!(
+            store
+                .prepare_turn_finalization(&rerendered, 1, 1_700_000_100)
+                .await
+                .expect("derived renderer metadata must not change provider identity"),
+            PrepareTurnFinalizationOutcome::AlreadyPrepared
+        );
+        let before = store
+            .get_turn("thr_native_finalization", "turn_native_finalize")
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist")
+            .1;
+        assert_eq!(before.status, TurnStatus::InProgress);
+        assert!(
+            turn::find_turn_item(
+                &store.connection,
+                "turn_native_finalize",
+                "final_native_message_1"
+            )
+            .await
+            .expect("item lookup should succeed")
+            .is_none(),
+            "prepare alone must not publish a half-terminal final item"
+        );
+
+        // A fresh store models a process restart after the provider response
+        // was acknowledged but before TurnCompleted was emitted.
+        let restarted = CrudStore::new(store.database_connection());
+        assert_eq!(
+            restarted
+                .reconcile_prepared_turn_finalizations(10, 1_700_000_101)
+                .await
+                .expect("startup reconciliation should finish the commit"),
+            1
+        );
+        let committed = restarted
+            .commit_prepared_turn_finalization("turn_native_finalize", 1_700_000_102)
+            .await
+            .expect("duplicate terminal acknowledgement should reconcile");
+        assert!(committed.already_committed);
+        assert_eq!(committed.final_item, final_notification);
+
+        let (_, terminal) = restarted
+            .get_turn("thr_native_finalization", "turn_native_finalize")
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(terminal.status, TurnStatus::Completed);
+        let items = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq("turn_native_finalize".to_owned()))
+            .filter(
+                pioneer_entity::turn_item::Column::ItemId.eq("final_native_message_1".to_owned()),
+            )
+            .all(&restarted.connection)
+            .await
+            .expect("final items should list");
+        assert_eq!(items.len(), 1);
+
+        let mut conflicting = final_notification;
+        if let TurnItem::AgentMessage { text, .. } = &mut conflicting.item {
+            *text = "a conflicting second provider answer".to_owned();
+        }
+        assert!(
+            restarted
+                .prepare_turn_finalization(&conflicting, 1, 1_700_000_103)
+                .await
+                .is_err(),
+            "a finalization generation cannot alias different provider output"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_native_finalization_cannot_attach_to_an_unrelated_completed_turn() {
+        let (store, _, mut turn) = test_store_with_started_turn(
+            "ws_native_finalization_late",
+            "thr_native_finalization_late",
+            "turn_native_finalization_late",
+        )
+        .await;
+        turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: "ws_native_finalization_late".to_owned(),
+                    thread_id: "thr_native_finalization_late".to_owned(),
+                    turn,
+                },
+                1_700_000_100,
+            )
+            .await
+            .expect("legacy terminal turn should commit");
+
+        let late = ItemCompletedNotification {
+            workspace_id: "ws_native_finalization_late".to_owned(),
+            thread_id: "thr_native_finalization_late".to_owned(),
+            turn_id: "turn_native_finalization_late".to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_native_late_1".to_owned(),
+                text: "late provider response".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        let error = store
+            .prepare_turn_finalization(&late, 1, 1_700_000_101)
+            .await
+            .expect_err("late finalization must not claim another terminal outcome");
+        assert!(
+            format!("{error:#}").contains("has no existing finalization intent"),
+            "unexpected late-finalization error: {error:#}"
+        );
+        assert!(
+            pioneer_entity::turn_finalization::Entity::find_by_id(
+                "turn_native_finalization_late".to_owned()
+            )
+            .one(&store.connection)
+            .await
+            .expect("finalization lookup should succeed")
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_finalization_transaction_rolls_back_and_reconciles_after_injected_crash() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_finalize_fault",
+            "thr_native_finalize_fault",
+            "turn_native_fault",
+        )
+        .await;
+        let notification = ItemCompletedNotification {
+            workspace_id: "ws_native_finalize_fault".to_owned(),
+            thread_id: "thr_native_finalize_fault".to_owned(),
+            turn_id: "turn_native_fault".to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_native_fault_1".to_owned(),
+                text: "durable answer before injected crash".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        store
+            .prepare_turn_finalization(&notification, 1, 1_700_000_100)
+            .await
+            .expect("finalization intent should prepare");
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_native_terminal_commit \
+                 BEFORE UPDATE OF status ON turn \
+                 WHEN NEW.id = 'turn_native_fault' AND NEW.status = 'completed' \
+                 BEGIN SELECT RAISE(ABORT, 'injected terminal commit crash'); END;",
+            )
+            .await
+            .expect("fault trigger should install");
+        assert!(
+            store
+                .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
+                .await
+                .is_err()
+        );
+        assert!(
+            turn::find_turn_item(
+                &store.connection,
+                "turn_native_fault",
+                "final_native_fault_1"
+            )
+            .await
+            .expect("item lookup should succeed")
+            .is_none(),
+            "failed terminal commit must roll back the final item"
+        );
+        let (_, still_running) = store
+            .get_turn("thr_native_finalize_fault", "turn_native_fault")
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(still_running.status, TurnStatus::InProgress);
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_native_terminal_commit")
+            .await
+            .expect("fault trigger should uninstall");
+        assert_eq!(
+            store
+                .reconcile_prepared_turn_finalizations(10, 1_700_000_102)
+                .await
+                .expect("prepared intent should reconcile"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_restart() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_recovery_terminal_outbox",
+            "thr_recovery_terminal_outbox",
+            "turn_recovery_outbox",
+        )
+        .await;
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_recovery_terminal_outbox".to_owned(),
+                    thread_id: "thr_recovery_terminal_outbox".to_owned(),
+                    turn_id: "turn_recovery_outbox".to_owned(),
+                    item: safe_web_fetch_item("tool_recovery_outbox"),
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("tool item should start");
+        let job = store
+            .enqueue_recovery_job(
+                "turn_recovery_outbox".to_owned(),
+                "tool_recovery_outbox".to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::RetryWithBackoff,
+                Some("tool timed out".to_owned()),
+                None,
+                None,
+                None,
+                1,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_002,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Exhausted,
+                    Some("recovery budget exhausted".to_owned()),
+                    1_700_000_003,
+                )
+                .await
+                .expect("terminal job and outbox should commit")
+        );
+
+        // Model a terminal job written by a pre-outbox Gateway during a
+        // rolling upgrade. The startup/periodic auditor must reconstruct the
+        // missing durable handoff without replaying the tool.
+        pioneer_entity::recovery_terminalization_outbox::Entity::delete_by_id(job.id.clone())
+            .exec(&store.connection)
+            .await
+            .expect("test should remove the outbox row");
+        assert_eq!(
+            store
+                .enqueue_missing_recovery_terminalizations(10, 1_700_000_004)
+                .await
+                .expect("terminalization auditor should backfill the row"),
+            1
+        );
+
+        let restarted = CrudStore::new(store.database_connection());
+        let claimed = restarted
+            .claim_due_recovery_terminalizations(1_700_000_004, 45, 10)
+            .await
+            .expect("terminalization should survive restart");
+        assert_eq!(claimed.len(), 1);
+        let applied = restarted
+            .apply_claimed_recovery_terminalization(&claimed[0], None, 1_700_000_004)
+            .await
+            .expect("item and Turn should commit atomically");
+        assert!(!applied.already_terminal);
+        assert_eq!(applied.turn.status, TurnStatus::Failed);
+        assert!(applied.final_item.is_some());
+        let (_, terminal) = restarted
+            .get_turn("thr_recovery_terminal_outbox", "turn_recovery_outbox")
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(terminal.status, TurnStatus::Failed);
+        let item = turn::find_turn_item(
+            &restarted.connection,
+            "turn_recovery_outbox",
+            "tool_recovery_outbox",
+        )
+        .await
+        .expect("tool item lookup should succeed")
+        .expect("tool item should exist");
+        let item: TurnItem = serde_json::from_str(item.payload.as_str())
+            .expect("terminal item payload should decode");
+        assert_eq!(tool_call_status(&item), Some(ToolCallStatus::Failed));
+        assert!(
+            restarted
+                .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
+                .await
+                .expect("delivered outbox lookup should succeed")
+                .is_empty(),
+            "delivered terminalization must not execute twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_recovery_outbox_preserves_the_durable_resume_reason_after_event_loss() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_recovery_blocked_outbox",
+            "thr_recovery_blocked_outbox",
+            "turn_recovery_blocked_outbox",
+        )
+        .await;
+        let root_reason = "provider credentials must be refreshed";
+        let fallback_reason =
+            "cannot restore recovery because durable turn runtime snapshot is missing";
+        let job = store
+            .enqueue_recovery_job(
+                "turn_recovery_blocked_outbox".to_owned(),
+                "reasoning_recovery_blocked_outbox".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RestartTurn,
+                Some(root_reason.to_owned()),
+                None,
+                None,
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_001,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Blocked,
+                    Some(fallback_reason.to_owned()),
+                    1_700_000_002,
+                )
+                .await
+                .expect("blocked job and outbox should commit")
+        );
+
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_003, 45, 10)
+            .await
+            .expect("blocked terminalization should claim");
+        assert_eq!(claimed.len(), 1);
+        let resume = TurnBlockedResumeMetadata {
+            reason_class: "auth_or_config".to_owned(),
+            human_message: root_reason.to_owned(),
+            resume_requirements: vec!["Refresh provider credentials.".to_owned()],
+            resume_command: "turn.resume:turn_recovery_blocked_outbox".to_owned(),
+            blocked_recovery_job_id: Some(job.id.clone()),
+            latest_checkpoint_id: None,
+            can_resume_same_turn: true,
+        };
+        store
+            .apply_claimed_recovery_terminalization(&claimed[0], Some(resume), 1_700_000_003)
+            .await
+            .expect("outbox-only blocked terminalization should commit");
+
+        let (_, blocked) = store
+            .get_turn(
+                "thr_recovery_blocked_outbox",
+                "turn_recovery_blocked_outbox",
+            )
+            .await
+            .expect("blocked turn lookup should succeed")
+            .expect("blocked turn should exist");
+        assert_eq!(blocked.status, TurnStatus::Blocked);
+        let error = blocked.error.as_deref().unwrap_or_default();
+        assert!(error.contains(root_reason), "root reason was lost: {error}");
+        assert!(
+            error.contains(job.id.as_str()),
+            "recovery fence was lost: {error}"
+        );
+        assert!(
+            !error.contains(fallback_reason),
+            "secondary recovery failure replaced the root reason: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_terminalization_rolls_back_both_item_and_turn_then_reclaims_expired_lease() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_recovery_terminal_fault",
+            "thr_recovery_terminal_fault",
+            "turn_recovery_fault",
+        )
+        .await;
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_recovery_terminal_fault".to_owned(),
+                    thread_id: "thr_recovery_terminal_fault".to_owned(),
+                    turn_id: "turn_recovery_fault".to_owned(),
+                    item: safe_web_fetch_item("tool_recovery_fault"),
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("tool item should start");
+        let job = store
+            .enqueue_recovery_job(
+                "turn_recovery_fault".to_owned(),
+                "tool_recovery_fault".to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::MarkFailed,
+                Some("terminal recovery fault".to_owned()),
+                None,
+                None,
+                None,
+                1,
+                1,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_002,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some("terminal recovery fault".to_owned()),
+                    1_700_000_003,
+                )
+                .await
+                .expect("terminal job should commit with outbox")
+        );
+        let first_claim = store
+            .claim_due_recovery_terminalizations(1_700_000_004, 5, 10)
+            .await
+            .expect("terminalization should claim");
+        assert_eq!(first_claim.len(), 1);
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_recovery_turn_failure \
+                 BEFORE UPDATE OF status ON turn \
+                 WHEN NEW.id = 'turn_recovery_fault' AND NEW.status = 'failed' \
+                 BEGIN SELECT RAISE(ABORT, 'injected recovery terminal crash'); END;",
+            )
+            .await
+            .expect("fault trigger should install");
+        assert!(
+            store
+                .apply_claimed_recovery_terminalization(&first_claim[0], None, 1_700_000_004)
+                .await
+                .is_err()
+        );
+        let (_, running) = store
+            .get_turn("thr_recovery_terminal_fault", "turn_recovery_fault")
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(running.status, TurnStatus::InProgress);
+        let running_item = turn::find_turn_item(
+            &store.connection,
+            "turn_recovery_fault",
+            "tool_recovery_fault",
+        )
+        .await
+        .expect("tool item lookup should succeed")
+        .expect("tool item should exist");
+        let running_item: TurnItem = serde_json::from_str(running_item.payload.as_str())
+            .expect("running item should decode");
+        assert_eq!(
+            tool_call_status(&running_item),
+            Some(ToolCallStatus::InProgress),
+            "item completion must roll back with Turn terminalization"
+        );
+
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_recovery_turn_failure")
+            .await
+            .expect("fault trigger should uninstall");
+        let restarted = CrudStore::new(store.database_connection());
+        let reclaimed = restarted
+            .claim_due_recovery_terminalizations(1_700_000_010, 5, 10)
+            .await
+            .expect("expired claim should be recovered after restart");
+        assert_eq!(reclaimed.len(), 1);
+        assert_ne!(reclaimed[0].claim_token, first_claim[0].claim_token);
+        restarted
+            .apply_claimed_recovery_terminalization(&reclaimed[0], None, 1_700_000_010)
+            .await
+            .expect("reclaimed terminalization should converge");
     }
 
     #[tokio::test]
@@ -27052,6 +28584,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_turn_projection_rejects_late_turn_started_without_regression() {
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_terminal_start_fence";
+        let store = test_store_with_workspace(workspace_id).await;
+        let thread_id = "thr_terminal_start_fence";
+        let turn_id = "turn_terminal_start_fence";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let original_input = vec![UserInput::Text {
+            text: "original input".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let turn = sample_turn(turn_id);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                original_input.as_slice(),
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("initial start should persist");
+        let mut completed = turn.clone();
+        completed.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: completed,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal state should persist");
+
+        let conflicting_input = vec![UserInput::Text {
+            text: "must never replace the original".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let error = store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                conflicting_input.as_slice(),
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect_err("late start must be fenced by terminal monotonicity");
+        assert!(format!("{error:#}").contains("identity reuse"));
+
+        let (_, persisted) = store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(persisted.status, TurnStatus::Completed);
+        let persisted_input = store
+            .get_turn_inputs(turn_id)
+            .await
+            .expect("turn input lookup should succeed");
+        assert_eq!(persisted_input, original_input);
+    }
+
+    #[tokio::test]
     async fn read_model_invariant_verifier_detects_and_repairs_terminal_tool_payload() {
         let connection = Database::connect("sqlite::memory:")
             .await
@@ -31361,6 +32959,114 @@ mod tests {
             TurnItemEventPayload::TurnPermissionAudit(audit)
                 if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
         )));
+    }
+
+    #[tokio::test]
+    async fn native_turn_admission_failure_rolls_back_started_event_and_projection() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_native_turn_admission BEFORE INSERT ON turn_admission \
+                 BEGIN SELECT RAISE(FAIL, 'injected admission failure'); END",
+            )
+            .await
+            .expect("fault trigger should install");
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_atomic_admission_fault".to_owned(),
+            id: "thr_atomic_admission_fault".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: "turn_atomic_admission_fault".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: turn.permission_profile.mode,
+            profile_source: turn.permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+
+        store
+            .materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                None,
+                pioneer_protocol::PersistedActorRef::System,
+                audit,
+                crate::NewTurnAdmission {
+                    turn_id: turn.id.clone(),
+                    thread_id: thread.id.clone(),
+                    workspace_id: thread.workspace_id.clone(),
+                    request_digest: "a".repeat(64),
+                },
+            )
+            .await
+            .expect_err("injected admission failure must abort the whole batch");
+
+        assert!(
+            pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                .one(&connection)
+                .await
+                .expect("turn lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id))
+                .all(&connection)
+                .await
+                .expect("event lookup should succeed")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

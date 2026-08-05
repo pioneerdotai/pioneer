@@ -3460,6 +3460,9 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         AgentDurableEvent::ItemCompleted { notification } => {
             Some(AgentEvent::ItemCompleted(notification))
         }
+        AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+            Some(AgentEvent::ItemCompleted(notification))
+        }
         AgentDurableEvent::ItemToolRetryScheduled { notification } => {
             Some(AgentEvent::ItemToolRetryScheduled(notification))
         }

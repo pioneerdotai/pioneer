@@ -92,6 +92,9 @@ async fn migration_fresh_schema_is_idempotent_across_database_restart() {
     assert!(table_exists(&restarted, "turn").await);
     assert!(table_exists(&restarted, "task_run").await);
     assert!(table_exists(&restarted, "turn_execution_checkpoint").await);
+    assert!(table_exists(&restarted, "turn_finalization").await);
+    assert!(table_exists(&restarted, "turn_admission").await);
+    assert!(table_exists(&restarted, "recovery_terminalization_outbox").await);
     restarted
         .close()
         .await
@@ -122,6 +125,9 @@ async fn migration_previous_release_upgrades_after_database_restart() {
         .expect("upgrade previous release after restart");
     assert_eq!(applied_migration_count(&upgraded).await, expected_after);
     assert!(column_exists(&upgraded, "auth_refresh_credential", "exchange_request_id").await);
+    assert!(table_exists(&upgraded, "turn_admission").await);
+    assert!(table_exists(&upgraded, "turn_finalization").await);
+    assert!(table_exists(&upgraded, "recovery_terminalization_outbox").await);
     upgraded
         .close()
         .await

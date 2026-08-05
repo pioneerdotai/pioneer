@@ -12,6 +12,10 @@ use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
 pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
     let created_default_workspace = ensure_default_workspace_exists(connection).await?;
+    let reconciled_prepared_turn_finalizations =
+        reconcile_prepared_turn_finalizations(connection).await?;
+    let reconciled_recovery_terminalizations =
+        reconcile_recovery_terminalization_outbox(connection).await?;
     let repaired_completed_turn_rows =
         repair_turns_completed_after_final_agent_message(connection).await?;
     let repaired_thread_foreground_status_rows =
@@ -24,6 +28,8 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
 
     info!(
         created_default_workspace,
+        reconciled_prepared_turn_finalizations,
+        reconciled_recovery_terminalizations,
         repaired_completed_turn_rows,
         repaired_thread_foreground_status_rows,
         repaired_terminal_execution_window_rows,
@@ -33,6 +39,25 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
         "gateway bootstrap completed"
     );
     Ok(())
+}
+
+async fn reconcile_recovery_terminalization_outbox(connection: &DatabaseConnection) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection.clone());
+    store
+        .enqueue_missing_recovery_terminalizations(
+            4096,
+            chrono::Utc::now().fixed_offset().timestamp(),
+        )
+        .await
+        .context("failed to reconcile terminal recovery jobs during bootstrap")
+}
+
+async fn reconcile_prepared_turn_finalizations(connection: &DatabaseConnection) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection.clone());
+    store
+        .reconcile_prepared_turn_finalizations(4096, chrono::Utc::now().fixed_offset().timestamp())
+        .await
+        .context("failed to reconcile prepared native Turn finalizations during bootstrap")
 }
 
 async fn repair_thread_foreground_statuses(connection: &DatabaseConnection) -> Result<u64> {

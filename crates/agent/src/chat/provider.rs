@@ -441,7 +441,7 @@ pub(super) async fn stream_provider_response(
 
     super::emit_durable_event(
         event_tx,
-        AgentDurableEvent::ItemCompleted {
+        AgentDurableEvent::TurnFinalizationPrepared {
             notification: ItemCompletedNotification {
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
@@ -454,6 +454,7 @@ pub(super) async fn stream_provider_response(
                     markdown_version: None,
                 },
             },
+            generation: super::TURN_FINALIZATION_GENERATION,
         },
     )
     .await?;
@@ -550,7 +551,7 @@ pub(super) async fn non_stream_provider_response(
 
     super::emit_durable_event(
         event_tx,
-        AgentDurableEvent::ItemCompleted {
+        AgentDurableEvent::TurnFinalizationPrepared {
             notification: ItemCompletedNotification {
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
@@ -563,6 +564,7 @@ pub(super) async fn non_stream_provider_response(
                     markdown_version: None,
                 },
             },
+            generation: super::TURN_FINALIZATION_GENERATION,
         },
     )
     .await?;

@@ -1571,6 +1571,37 @@ impl MessageProcessor {
                     continue;
                 }
 
+                if let Err(error) = retry_transient_storage_access(|| {
+                    this.crud_store
+                        .enqueue_missing_recovery_terminalizations(64, now)
+                })
+                .await
+                {
+                    record_resilience_worker_poll_error(
+                        "recovery terminalization auditor",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                if let Err(error) = retry_transient_storage_access(|| {
+                    this.process_due_recovery_terminalizations(now, 64)
+                })
+                .await
+                {
+                    record_resilience_worker_poll_error(
+                        "recovery terminalization outbox",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
                 match retry_transient_storage_access(|| {
                     this.recovery_coordinator.run_ready_jobs(now, 64)
                 })
@@ -1588,6 +1619,26 @@ impl MessageProcessor {
                             &mut transient_storage_poll_failed,
                         );
                     }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                match retry_transient_storage_access(|| {
+                    this.reconcile_prepared_native_turn_finalizations(now, 64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => {
+                        info!(reconciled, "reconciled prepared native Turn finalizations");
+                        this.kick_native_turn_event_deliveries();
+                    }
+                    Ok(_) => {}
+                    Err(error) => record_resilience_worker_poll_error(
+                        "native Turn finalization reconciler",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    ),
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;

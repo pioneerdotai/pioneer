@@ -65,7 +65,7 @@ impl TurnProjector {
         }
         let future: ProjectFuture<'_> = match &event.payload {
             TurnEventPayload::TurnStarted(payload) => {
-                project_future(self.project_turn_started(db, payload))
+                project_future(self.project_turn_started(db, payload, event.sequence))
             }
             TurnEventPayload::ItemStarted(payload) => project_future(async move {
                 turn::upsert_turn_item(
@@ -389,13 +389,17 @@ impl TurnProjector {
         &self,
         db: &C,
         payload: &TurnStartedEventPayload,
+        event_sequence: i64,
     ) -> Result<()> {
         match payload.actor.as_ref() {
             Some(actor) => {
-                self.project_attributed_turn_started(db, payload, actor)
+                self.project_attributed_turn_started(db, payload, actor, event_sequence)
                     .await
             }
-            None => self.project_legacy_turn_started(db, payload).await,
+            None => {
+                self.project_legacy_turn_started(db, payload, event_sequence)
+                    .await
+            }
         }
     }
 
@@ -404,8 +408,9 @@ impl TurnProjector {
         db: &C,
         payload: &TurnStartedEventPayload,
         actor: &PersistedActorRef,
+        event_sequence: i64,
     ) -> Result<()> {
-        self.project_turn_started_inner(db, payload, Some(actor))
+        self.project_turn_started_inner(db, payload, Some(actor), event_sequence)
             .await
     }
 
@@ -415,8 +420,10 @@ impl TurnProjector {
         &self,
         db: &C,
         payload: &TurnStartedEventPayload,
+        event_sequence: i64,
     ) -> Result<()> {
-        self.project_turn_started_inner(db, payload, None).await?;
+        self.project_turn_started_inner(db, payload, None, event_sequence)
+            .await?;
         if let Some(superuser_id) = legacy_backfill_superuser_id(db).await? {
             identity::backfill_legacy_actor_references(db, &superuser_id).await?;
         }
@@ -428,7 +435,24 @@ impl TurnProjector {
         db: &C,
         payload: &TurnStartedEventPayload,
         actor: Option<&PersistedActorRef>,
+        event_sequence: i64,
     ) -> Result<()> {
+        // Sequence 1 may legitimately be replayed after projection-state loss,
+        // and the explicit legacy seam may revisit an actorless in-progress
+        // row to perform its idempotent actor backfill. A second TurnStarted is
+        // necessarily later in the same canonical stream. Fence that identity
+        // reuse before touching Thread/input projections. A terminal read model
+        // is also monotonic even when imported legacy history has no event row.
+        if let Some(existing) = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?
+            && (event_sequence != 1 || existing.status != "in_progress")
+        {
+            anyhow::bail!(
+                "turn `{}` already exists with status `{}`; TurnStarted identity reuse is forbidden",
+                payload.turn.id,
+                existing.status
+            );
+        }
+
         let thread_created_at = unix_to_datetime(payload.thread.created_at);
         let thread_updated_at = unix_to_datetime(payload.thread.updated_at);
         let is_task_run_occurrence = payload.turn.turn_kind == TurnKind::TaskRun;
@@ -534,8 +558,6 @@ impl TurnProjector {
             .await?;
         }
 
-        let existing_turn = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?;
-        let turn_status = turn_status_to_db(payload.turn.status).to_owned();
         let turn_error = payload.turn.error.clone();
 
         match actor {
@@ -576,9 +598,7 @@ impl TurnProjector {
         )
         .await?;
 
-        let should_append_status = existing_turn
-            .map(|existing| (existing.status, existing.error))
-            .is_none_or(|existing| existing != (turn_status.clone(), turn_error.clone()));
+        let should_append_status = true;
 
         if should_append_status {
             turn::append_turn_status_history(

@@ -179,7 +179,10 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
-        AgentDurableEvent::ItemCompleted { notification } => Some(notification.thread_id.as_str()),
+        AgentDurableEvent::ItemCompleted { notification }
+        | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+            Some(notification.thread_id.as_str())
+        }
         AgentDurableEvent::ItemToolRetryScheduled { notification } => {
             Some(notification.thread_id.as_str())
         }
@@ -1498,7 +1501,7 @@ impl MessageProcessor {
     /// drains a bounded number of batches; the durable retry schedule remains
     /// authoritative for failures and the periodic worker remains the restart
     /// safety net.
-    fn kick_native_turn_event_deliveries(&self) {
+    pub(super) fn kick_native_turn_event_deliveries(&self) {
         if self
             .native_turn_event_delivery_kick_running
             .swap(true, Ordering::AcqRel)
@@ -2317,6 +2320,29 @@ impl MessageProcessor {
                     .await;
                 true
             }),
+            AgentDurableEvent::TurnFinalizationPrepared {
+                notification,
+                generation,
+            } => message_future(async move {
+                let mut notification = notification;
+                self.enrich_item_completed_markdown(&mut notification).await;
+                let thread_id = notification.thread_id.clone();
+                let turn_id = notification.turn_id.clone();
+                if let Err(error) = self
+                    .crud_store
+                    .prepare_turn_finalization(&notification, generation, now_timestamp_secs())
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id,
+                        turn_id,
+                        format!("failed to persist turn finalization intent: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                true
+            }),
             AgentDurableEvent::ItemToolRetryScheduled { notification } => {
                 message_future(async move {
                     let thread_id = notification.thread_id.clone();
@@ -2680,7 +2706,7 @@ impl MessageProcessor {
                 turn_id,
                 recovery,
             } => message_future(async move {
-                if !message_future(self.complete_turn(thread_id, turn_id, recovery)).await {
+                if !message_future(self.complete_native_turn(thread_id, turn_id, recovery)).await {
                     return false;
                 }
                 true
@@ -3774,6 +3800,125 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn process_due_recovery_terminalizations(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        const CLAIM_LEASE_SECS: u64 = 45;
+        let records = self
+            .crud_store
+            .claim_due_recovery_terminalizations(now_unix, CLAIM_LEASE_SECS, limit)
+            .await?;
+        let count = records.len() as u64;
+        for record in records {
+            let resume = async {
+                if record.recovery_status != pioneer_protocol::RecoveryJobStatus::Blocked {
+                    return Ok(None);
+                }
+                let display_reason = self
+                    .recovery_blocked_display_reason(
+                        record.turn_id.as_str(),
+                        record.recovery_job_id.as_str(),
+                        record.error_message.as_str(),
+                    )
+                    .await?;
+                self.build_recovery_blocked_resume_metadata(
+                    record.turn_id.as_str(),
+                    record.recovery_job_id.as_str(),
+                    display_reason.as_str(),
+                )
+                .await
+                .map(Some)
+            }
+            .await;
+            let applied = match resume {
+                Ok(resume) => {
+                    self.crud_store
+                        .apply_claimed_recovery_terminalization(&record, resume, now_unix)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match applied {
+                Ok(applied) => {
+                    if !applied.already_terminal {
+                        if let Err(error) = self
+                            .thread_manager
+                            .commit_terminal_turn(applied.thread_id.as_str(), &applied.turn)
+                            .await
+                        {
+                            warn!(
+                                recovery_job_id = record.recovery_job_id,
+                                turn_id = record.turn_id,
+                                error = %format!("{error:#}"),
+                                "authoritative recovery terminalization committed but in-memory projection could not be synchronized"
+                            );
+                        }
+                    }
+                    self.kick_native_turn_event_deliveries();
+                }
+                Err(error) => {
+                    let exponent = record.attempt_count.min(8);
+                    let delay = 1_i64.checked_shl(exponent).unwrap_or(256).min(300);
+                    let retry_at = now_unix.saturating_add(delay);
+                    if let Err(mark_error) = self
+                        .crud_store
+                        .fail_recovery_terminalization_claim(
+                            &record,
+                            format!("{error:#}"),
+                            retry_at,
+                            now_unix,
+                        )
+                        .await
+                    {
+                        warn!(
+                            recovery_job_id = record.recovery_job_id,
+                            turn_id = record.turn_id,
+                            error = %format!("{error:#}"),
+                            mark_error = %format!("{mark_error:#}"),
+                            "failed recovery terminalization and could not persist retry state"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Completes prepared provider outcomes and synchronizes any loaded
+    /// in-memory Turn from the authoritative transaction. Bootstrap performs
+    /// the same database repair before threads are loaded; this path covers a
+    /// listener/agent task loss while the Gateway process keeps running.
+    pub(super) async fn reconcile_prepared_native_turn_finalizations(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        let turn_ids = self
+            .crud_store
+            .list_prepared_turn_finalization_ids(limit)
+            .await?;
+        let mut reconciled = 0_u64;
+        for turn_id in turn_ids {
+            let committed = self
+                .crud_store
+                .commit_prepared_turn_finalization(turn_id.as_str(), now_unix)
+                .await?;
+            self.thread_manager
+                .commit_terminal_turn(
+                    committed.turn_completed.thread_id.as_str(),
+                    &committed.turn_completed.turn,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to synchronize reconciled native Turn `{turn_id}` in memory")
+                })?;
+            reconciled = reconciled.saturating_add(1);
+        }
+        Ok(reconciled)
+    }
+
     pub(super) fn handle_recovery_event<'a>(
         &'a self,
         event: crate::resilience::RecoveryCoordinatorEvent,
@@ -4169,13 +4314,37 @@ impl MessageProcessor {
         let display_reason = self
             .recovery_blocked_display_reason(turn_id.as_str(), job_id.as_str(), reason.as_str())
             .await;
-        let resume = self
+        let display_reason = match display_reason {
+            Ok(display_reason) => display_reason,
+            Err(error) => {
+                warn!(
+                    recovery_job_id = %job_id,
+                    turn_id = %turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve blocked recovery reason; durable outbox will retry"
+                );
+                return false;
+            }
+        };
+        let resume = match self
             .build_recovery_blocked_resume_metadata(
                 turn_id.as_str(),
                 job_id.as_str(),
                 display_reason.as_str(),
             )
-            .await;
+            .await
+        {
+            Ok(resume) => resume,
+            Err(error) => {
+                warn!(
+                    recovery_job_id = %job_id,
+                    turn_id = %turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve blocked recovery resume metadata; durable outbox will retry"
+                );
+                return false;
+            }
+        };
         if !self
             .mark_turn_blocked_with_resume_metadata(
                 thread_id,
@@ -4201,33 +4370,30 @@ impl MessageProcessor {
         turn_id: &str,
         recovery_job_id: &str,
         fallback_reason: &str,
-    ) -> String {
+    ) -> Result<String> {
         if !fallback_reason
             .to_ascii_lowercase()
             .contains("durable turn runtime snapshot is missing")
         {
-            return fallback_reason.to_owned();
+            return Ok(fallback_reason.to_owned());
         }
 
         let is_cli_runtime_turn = self
             .crud_store
             .get_cli_runtime_turn_binding(turn_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .is_some();
         if !is_cli_runtime_turn {
-            return fallback_reason.to_owned();
+            return Ok(fallback_reason.to_owned());
         }
 
-        self.crud_store
+        Ok(self
+            .crud_store
             .get_recovery_job(recovery_job_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .and_then(|job| job.reason)
             .filter(|reason| !reason.trim().is_empty())
-            .unwrap_or_else(|| fallback_reason.to_owned())
+            .unwrap_or_else(|| fallback_reason.to_owned()))
     }
 
     async fn handle_recovery_exhausted_event(
@@ -4824,6 +4990,97 @@ impl MessageProcessor {
         true
     }
 
+    /// Native provider success is acknowledged only after the previously
+    /// prepared final response, final AgentMessage and Completed Turn commit in
+    /// one authoritative transaction. Legacy execution-free callers retain
+    /// `complete_turn`, which has no provider final response to bind.
+    pub(super) async fn complete_native_turn(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    ) -> bool {
+        if let Some(recovery) = recovery.as_ref() {
+            match self
+                .recovery_coordinator
+                .is_active_recovery_attempt(turn_id.as_str(), recovery)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        recovery_job_id = %recovery.job_id,
+                        recovery_attempt_id = %recovery.attempt_id,
+                        error = %format!("{error:#}"),
+                        "failed to verify native finalization recovery context"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // TurnCompleted is shared by native API providers, CLI runtimes and
+        // older native workers. Only the new provider protocol emits the
+        // preceding durable finalization intent. Preserve the existing
+        // terminal lifecycle for intent-less producers during the rolling
+        // expand/migrate/contract window; a prepared native response always
+        // takes the atomic path below.
+        match self
+            .crud_store
+            .has_turn_finalization_intent(turn_id.as_str())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return self.complete_turn(thread_id, turn_id, recovery).await,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve native Turn finalization protocol"
+                );
+                return false;
+            }
+        }
+
+        let committed = match self
+            .crud_store
+            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+            .await
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to atomically commit native Turn finalization"
+                );
+                return false;
+            }
+        };
+        if committed.turn_completed.thread_id != thread_id {
+            error!(
+                requested_thread_id = thread_id,
+                committed_thread_id = committed.turn_completed.thread_id,
+                turn_id,
+                "native finalization committed for a different thread"
+            );
+            return false;
+        }
+        self.record_final_assistant_text_for_item(&committed.final_item)
+            .await;
+        self.kick_native_turn_event_deliveries();
+
+        // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
+        // TurnCompleted write is now an exact idempotent replay of the already
+        // committed terminal half of the finalization transaction.
+        self.complete_turn(thread_id, turn_id, recovery).await
+    }
+
     pub(super) async fn mark_turn_blocked(
         &self,
         thread_id: String,
@@ -4839,26 +5096,17 @@ impl MessageProcessor {
         turn_id: &str,
         recovery_job_id: &str,
         reason: &str,
-    ) -> pioneer_protocol::TurnBlockedResumeMetadata {
+    ) -> Result<pioneer_protocol::TurnBlockedResumeMetadata> {
         let latest_checkpoint_id = self
             .crud_store
             .latest_turn_execution_checkpoint_for_turn(turn_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .map(|checkpoint| checkpoint.id);
-        let recovery_job = self
-            .crud_store
-            .get_recovery_job(recovery_job_id)
-            .await
-            .ok()
-            .flatten();
+        let recovery_job = self.crud_store.get_recovery_job(recovery_job_id).await?;
         let has_runtime_snapshot = self
             .crud_store
             .get_turn_runtime_snapshot(turn_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .is_some();
         let can_resume_same_turn = recovery_job
             .as_ref()
@@ -4923,7 +5171,7 @@ impl MessageProcessor {
             }
         }
 
-        pioneer_protocol::TurnBlockedResumeMetadata {
+        Ok(pioneer_protocol::TurnBlockedResumeMetadata {
             reason_class: reason_class.to_owned(),
             human_message: reason.to_owned(),
             resume_requirements,
@@ -4931,7 +5179,7 @@ impl MessageProcessor {
             blocked_recovery_job_id: Some(recovery_job_id.to_owned()),
             latest_checkpoint_id,
             can_resume_same_turn,
-        }
+        })
     }
 
     pub(super) async fn mark_turn_blocked_with_recovery(

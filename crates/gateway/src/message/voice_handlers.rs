@@ -557,7 +557,7 @@ impl MessageProcessor {
 
                 let requested_reasoning_effort =
                     super::turn_handlers::requested_reasoning_effort(&turn_params);
-                let prepared = match self
+                let admission = match self
                     .prepare_api_provider_turn_start(
                         connection_id,
                         request_actor,
@@ -585,6 +585,23 @@ impl MessageProcessor {
                                 outcome: VoiceSessionOutcome::Failed,
                                 turn_id: Some(session.turn_id.clone()),
                                 error: Some(error),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let prepared = match admission {
+                    super::turn_handlers::ApiProviderTurnAdmission::New(prepared) => prepared,
+                    super::turn_handlers::ApiProviderTurnAdmission::Replay(_) => {
+                        self.send_voice_session_result_notification(
+                            connection_id,
+                            session.thread_id.as_str(),
+                            VoiceSessionResultNotification {
+                                session_id: session.session_id.clone(),
+                                outcome: VoiceSessionOutcome::TurnStarted,
+                                turn_id: Some(session.turn_id.clone()),
+                                error: None,
                             },
                         )
                         .await;

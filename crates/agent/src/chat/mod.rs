@@ -103,6 +103,7 @@ use pioneer_tools::{
     build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,6 +114,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 const TURN_ITEM_ID_LEN: usize = 21;
+pub(super) const TURN_FINALIZATION_GENERATION: i64 = 1;
+
+fn deterministic_final_message_item_id(turn_id: &str) -> String {
+    let digest = Sha256::digest(
+        format!("native-turn-finalization:{turn_id}:{TURN_FINALIZATION_GENERATION}").as_bytes(),
+    );
+    hex::encode(digest)[..TURN_ITEM_ID_LEN].to_owned()
+}
 const MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS: usize = 20;
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
 const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
@@ -2387,7 +2396,7 @@ pub(super) async fn execute_chat_turn_flow(
     }
 
     let thinking_item_id = generate_id(TURN_ITEM_ID_LEN);
-    let message_item_id = generate_id(TURN_ITEM_ID_LEN);
+    let message_item_id = deterministic_final_message_item_id(&turn_id);
 
     emit_durable_event(
         event_tx.as_ref(),
@@ -4381,7 +4390,7 @@ async fn execute_agent_provider_response(
                 .map_err(|error| (error, current_thinking_id.clone()))?;
                 emit_durable_event(
                     event_tx.as_ref(),
-                    AgentDurableEvent::ItemCompleted {
+                    AgentDurableEvent::TurnFinalizationPrepared {
                         notification: ItemCompletedNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
@@ -4394,6 +4403,7 @@ async fn execute_agent_provider_response(
                                 markdown_version: None,
                             },
                         },
+                        generation: TURN_FINALIZATION_GENERATION,
                     },
                 )
                 .await
@@ -4879,7 +4889,7 @@ async fn execute_agent_provider_response(
 
                 emit_durable_event(
                     event_tx.as_ref(),
-                    AgentDurableEvent::ItemCompleted {
+                    AgentDurableEvent::TurnFinalizationPrepared {
                         notification: ItemCompletedNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
@@ -4892,6 +4902,7 @@ async fn execute_agent_provider_response(
                                 markdown_version: None,
                             },
                         },
+                        generation: TURN_FINALIZATION_GENERATION,
                     },
                 )
                 .await
@@ -6022,13 +6033,14 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatExecutionWindowStats, ExecutedToolResult, TaskMutationFinalizationGuard,
-        agent_skill_cards_have_read_path, append_recovered_provider_history,
-        apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
-        apply_review_required_tools_to_visible_tools, build_execution_window_continuation,
-        build_user_message, compile_agent_instruction_delivery_plan_with_prompt_root,
-        compiled_prompt_payload_from_delivery_plan, materialize_mcp_tooling,
-        normalize_turn_capabilities, readable_agent_skill_overlay,
+        ChatExecutionWindowStats, ExecutedToolResult, TURN_ITEM_ID_LEN,
+        TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,
+        append_recovered_provider_history, apply_request_tools_results_to_visible_tools,
+        apply_request_tools_visibility_expansion, apply_review_required_tools_to_visible_tools,
+        build_execution_window_continuation, build_user_message,
+        compile_agent_instruction_delivery_plan_with_prompt_root,
+        compiled_prompt_payload_from_delivery_plan, deterministic_final_message_item_id,
+        materialize_mcp_tooling, normalize_turn_capabilities, readable_agent_skill_overlay,
         resolve_skill_capability_summary, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
         review_required_observation_payload, review_required_observation_signature,
@@ -6047,6 +6059,16 @@ mod tests {
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
+
+    #[test]
+    fn native_final_message_identity_is_stable_per_turn_and_generation() {
+        let first = deterministic_final_message_item_id("turn_stable_final_identity");
+        let replay = deterministic_final_message_item_id("turn_stable_final_identity");
+        let other = deterministic_final_message_item_id("turn_other_final_identity");
+        assert_eq!(first, replay);
+        assert_eq!(first.len(), TURN_ITEM_ID_LEN);
+        assert_ne!(first, other);
+    }
     use pioneer_protocol::{
         ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
         ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointToolNoProgressExactVariant,

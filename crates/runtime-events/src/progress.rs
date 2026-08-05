@@ -309,7 +309,8 @@ impl ProgressCoalescer {
 
     pub async fn flush_for_durable(&self, event: &AgentDurableEvent) {
         match event {
-            AgentDurableEvent::ItemCompleted { notification } => {
+            AgentDurableEvent::ItemCompleted { notification }
+            | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
                 self.flush_item(
                     notification.workspace_id.as_str(),
                     notification.thread_id.as_str(),

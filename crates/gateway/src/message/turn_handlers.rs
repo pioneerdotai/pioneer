@@ -29,6 +29,22 @@ pub(super) struct PreparedApiProviderTurnStart {
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
 
+pub(super) enum ApiProviderTurnAdmission {
+    New(PreparedApiProviderTurnStart),
+    Replay(pioneer_protocol::TurnStartResponse),
+}
+
+fn native_turn_admission_digest(
+    actor: &pioneer_protocol::PersistedActorRef,
+    params: &TurnStartParams,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::to_vec(&(actor, params))
+        .map_err(|error| format!("failed to encode native Turn admission identity: {error}"))?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
 async fn persist_admitted_turn_start(
     crud_store: &pioneer_crud::CrudStore,
     materialization: &crate::thread::TurnStartMaterialization,
@@ -36,12 +52,72 @@ async fn persist_admitted_turn_start(
     actor: pioneer_protocol::PersistedActorRef,
     audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     runtime_draft: Option<&RuntimeDraftMaterialization>,
+    request_digest: Option<String>,
 ) -> anyhow::Result<()> {
-    match runtime_draft.map(RuntimeDraftMaterialization::creator) {
-        Some(RuntimeDraftCreator::Member {
-            gateway_id,
-            principal_id,
-        }) => {
+    let admission = request_digest.map(|request_digest| pioneer_crud::NewTurnAdmission {
+        turn_id: materialization.turn.id.clone(),
+        thread_id: materialization.thread.id.clone(),
+        workspace_id: materialization.thread.workspace_id.clone(),
+        request_digest,
+    });
+    match (
+        runtime_draft.map(RuntimeDraftMaterialization::creator),
+        admission,
+    ) {
+        (
+            Some(RuntimeDraftCreator::Member {
+                gateway_id,
+                principal_id,
+            }),
+            Some(admission),
+        ) => crud_store
+            .materialize_new_member_native_turn_start_with_reasoning_effort_and_permission_audit(
+                &materialization.thread,
+                materialization.sandbox_mode,
+                &materialization.turn,
+                &materialization.input,
+                reasoning_effort,
+                actor,
+                audit_event,
+                gateway_id,
+                principal_id,
+                admission,
+            )
+            .await,
+        (Some(RuntimeDraftCreator::Superuser { access_class }), Some(admission)) => crud_store
+            .materialize_new_superuser_native_turn_start_with_reasoning_effort_and_permission_audit(
+                &materialization.thread,
+                materialization.sandbox_mode,
+                &materialization.turn,
+                &materialization.input,
+                reasoning_effort,
+                actor,
+                audit_event,
+                *access_class,
+                admission,
+            )
+            .await,
+        (None, Some(admission)) => {
+            crud_store
+                .materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialization.thread,
+                    materialization.sandbox_mode,
+                    &materialization.turn,
+                    &materialization.input,
+                    reasoning_effort,
+                    actor,
+                    audit_event,
+                    admission,
+                )
+                .await
+        }
+        (
+            Some(RuntimeDraftCreator::Member {
+                gateway_id,
+                principal_id,
+            }),
+            None,
+        ) => {
             crud_store
                 .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
                     &materialization.thread,
@@ -56,7 +132,7 @@ async fn persist_admitted_turn_start(
                 )
                 .await
         }
-        Some(RuntimeDraftCreator::Superuser { access_class }) => {
+        (Some(RuntimeDraftCreator::Superuser { access_class }), None) => {
             crud_store
                 .materialize_new_superuser_turn_start_with_reasoning_effort_and_permission_audit(
                     &materialization.thread,
@@ -70,7 +146,7 @@ async fn persist_admitted_turn_start(
                 )
                 .await
         }
-        None => {
+        (None, None) => {
             crud_store
                 .materialize_turn_start_with_reasoning_effort_and_permission_audit(
                     &materialization.thread,
@@ -754,7 +830,7 @@ impl MessageProcessor {
                 }
             }
 
-            let prepared = match self
+            let admission = match self
                 .prepare_api_provider_turn_start(
                     connection_id,
                     request_actor,
@@ -772,6 +848,39 @@ impl MessageProcessor {
                         JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                     )
                     .await;
+                    return;
+                }
+            };
+            let prepared = match admission {
+                ApiProviderTurnAdmission::New(prepared) => prepared,
+                ApiProviderTurnAdmission::Replay(response) => {
+                    self.session_manager
+                        .set_connection_workspace(connection_id, Some(thread.workspace_id.clone()))
+                        .await;
+                    match JsonRpcResponse::from_result(request_id, &response) {
+                        Ok(response) => {
+                            if let Err(error) = self.send_json(connection_id, &response).await {
+                                warn!(
+                                    connection_id,
+                                    error = %format!("{error:#}"),
+                                    "failed to send idempotent turn/start replay response"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    None,
+                                    INVALID_REQUEST_CODE,
+                                    format!(
+                                        "failed to encode idempotent turn/start response: {error}"
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
                     return;
                 }
             };
@@ -1060,6 +1169,7 @@ impl MessageProcessor {
             execution_admission
                 .as_ref()
                 .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+            None,
         )
         .await
         {
@@ -1294,7 +1404,7 @@ impl MessageProcessor {
         mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
         execution_admission: Option<ExecutionAuthorizationAdmission>,
-    ) -> Result<PreparedApiProviderTurnStart, String> {
+    ) -> Result<ApiProviderTurnAdmission, String> {
         let allow_agent_skill_overlay =
             execution_backend_allows_agent_skill_overlay(params.execution_backend.as_ref());
         let thread = self
@@ -1321,6 +1431,51 @@ impl MessageProcessor {
         params.capabilities = normalized_capabilities.execution.clone();
         super::message_turn::normalize_turn_collaboration_params(&mut params)
             .map_err(|error| format!("invalid Turn collaboration metadata: {error}"))?;
+        let request_digest = native_turn_admission_digest(&request_actor, &params)?;
+        let existing_admission = self
+            .crud_store
+            .get_turn_admission(params.turn_id.trim())
+            .await
+            .map_err(|error| format!("failed to verify Turn admission request: {error:#}"))?;
+        let existing_turn = self
+            .crud_store
+            .get_turn(params.thread_id.trim(), params.turn_id.trim())
+            .await
+            .map_err(|error| format!("failed to verify Turn admission identity: {error:#}"))?;
+        if let Some(admission) = existing_admission {
+            if admission.workspace_id != thread.workspace_id
+                || admission.thread_id != params.thread_id.trim()
+                || admission.request_digest != request_digest
+            {
+                return Err(format!(
+                    "turn `{}` already has a conflicting durable admission request",
+                    params.turn_id.trim()
+                ));
+            }
+            let Some((workspace_id, existing)) = existing_turn else {
+                return Err(format!(
+                    "turn `{}` has durable admission state but no authoritative Turn",
+                    params.turn_id.trim()
+                ));
+            };
+            if workspace_id != thread.workspace_id {
+                return Err(format!(
+                    "turn `{}` admission workspace differs from its authoritative Turn",
+                    params.turn_id.trim()
+                ));
+            }
+            return Ok(ApiProviderTurnAdmission::Replay(
+                pioneer_protocol::TurnStartResponse { turn: existing },
+            ));
+        }
+        if let Some((_workspace_id, existing)) = existing_turn {
+            return Err(format!(
+                "turn `{}` already exists in thread `{}` with status `{:?}` but has no durable native admission identity",
+                params.turn_id.trim(),
+                params.thread_id.trim(),
+                existing.status
+            ));
+        }
         self.validate_turn_artifact_user_inputs(
             thread.workspace_id.as_str(),
             thread.id.as_str(),
@@ -1456,6 +1611,7 @@ impl MessageProcessor {
             execution_admission
                 .as_ref()
                 .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+            Some(request_digest),
         ))
         .await
         {
@@ -1661,19 +1817,21 @@ impl MessageProcessor {
                 }
             };
 
-        Ok(PreparedApiProviderTurnStart {
-            outcome,
-            user_message_capability_attachments,
-            workspace_skill_policies,
-            skill_catalog,
-            agent_skill_overlay,
-            resolved_artifacts,
-            runtime_environment,
-            history,
-            effective_reasoning_effort,
-            permission_profile,
-            execution_security_snapshot,
-        })
+        Ok(ApiProviderTurnAdmission::New(
+            PreparedApiProviderTurnStart {
+                outcome,
+                user_message_capability_attachments,
+                workspace_skill_policies,
+                skill_catalog,
+                agent_skill_overlay,
+                resolved_artifacts,
+                runtime_environment,
+                history,
+                effective_reasoning_effort,
+                permission_profile,
+                execution_security_snapshot,
+            },
+        ))
     }
 
     pub(super) async fn finish_api_provider_turn_start_without_response(
@@ -2779,6 +2937,7 @@ impl MessageProcessor {
                         request_actor,
                         profile_selected_audit,
                         runtime_draft.as_ref(),
+                        None,
                     )
                     .await
                 });

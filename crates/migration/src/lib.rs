@@ -44,6 +44,7 @@ mod m20260802_000001_task_event_fanout_cursor;
 mod m20260804_000001_shared_messages_authorship;
 mod m20260804_000002_refresh_exchange_recovery;
 mod m20260805_000001_native_durable_delivery;
+mod m20260806_000001_atomic_turn_terminalization;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -89,6 +90,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000001_shared_messages_authorship::Migration),
             Box::new(m20260804_000002_refresh_exchange_recovery::Migration),
             Box::new(m20260805_000001_native_durable_delivery::Migration),
+            Box::new(m20260806_000001_atomic_turn_terminalization::Migration),
         ]
     }
 }

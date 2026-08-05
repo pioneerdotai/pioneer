@@ -911,6 +911,13 @@ impl ThreadManager {
             bail!("connection `{connection_id}` is not subscribed to thread `{thread_id}`");
         }
 
+        if let Some(existing) = entry.thread.turns.iter().find(|turn| turn.id == turn_id) {
+            bail!(
+                "turn `{turn_id}` already exists in thread `{thread_id}` with status `{:?}`",
+                existing.status
+            );
+        }
+
         let has_running_turn = entry.thread.turns.iter().any(turn_owns_foreground);
 
         if has_running_turn {
@@ -1246,6 +1253,49 @@ impl ThreadManager {
         turn.error = context.previous_turn_error;
         entry.thread.status = context.previous_thread_status;
         entry.thread.updated_at = context.previous_thread_updated_at;
+    }
+
+    /// Applies an authoritative terminal Turn only after its database
+    /// transaction committed. Missing unloaded state is harmless; a different
+    /// terminal outcome or duplicate in-memory identity is rejected.
+    pub async fn commit_terminal_turn(&self, thread_id: &str, terminal: &Turn) -> Result<bool> {
+        let now = unix_timestamp_secs()? as i64;
+        let mut state = self.state.write().await;
+        let Some(entry) = state.threads.get_mut(thread_id) else {
+            return Ok(false);
+        };
+        let matching = entry
+            .thread
+            .turns
+            .iter_mut()
+            .filter(|turn| turn.id == terminal.id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            bail!(
+                "thread `{thread_id}` has {} in-memory Turns with identity `{}`",
+                matching.len(),
+                terminal.id
+            );
+        }
+        let current = matching.into_iter().next().expect("one matching Turn");
+        if current.status != TurnStatus::InProgress {
+            if current == terminal {
+                return Ok(true);
+            }
+            bail!(
+                "turn `{}` already has conflicting terminal status `{:?}`",
+                terminal.id,
+                current.status
+            );
+        }
+        *current = terminal.clone();
+        entry.thread.status = if entry.thread.turns.iter().any(turn_owns_foreground) {
+            ThreadStatus::Active
+        } else {
+            ThreadStatus::Idle
+        };
+        entry.thread.updated_at = entry.thread.updated_at.max(now);
+        Ok(true)
     }
 
     pub async fn subscribed_connection_ids(&self, thread_id: &str) -> Vec<ConnectionId> {
@@ -1791,6 +1841,170 @@ mod tests {
         assert!(synchronized.turns[1].message_deleted);
         assert_eq!(synchronized.turns[1].message_revision, 1);
         assert!(synchronized.preview.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_native_turn_identity_cannot_be_admitted_again() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_native_duplicate_terminal";
+        manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread should start");
+        let params = TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: "turn_native_duplicate_terminal".to_owned(),
+            input: vec![UserInput::Text {
+                text: "execute once".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+        };
+        manager
+            .turn_start(10, params.clone())
+            .await
+            .expect("first admission should succeed");
+        manager
+            .turn_finish(
+                thread_id,
+                params.turn_id.as_str(),
+                TurnStatus::Completed,
+                None,
+            )
+            .await
+            .expect("first turn should finish");
+
+        let error = manager
+            .turn_start(10, params)
+            .await
+            .expect_err("terminal turn identity must not be admitted twice");
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "duplicate admission must return a deterministic identity conflict: {error:#}"
+        );
+        let loaded = manager.thread_get(thread_id).await.expect("thread");
+        let matches = loaded
+            .turns
+            .iter()
+            .filter(|turn| turn.id == "turn_native_duplicate_terminal")
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_native_turn_identity_admission_has_exactly_one_winner() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_native_duplicate_concurrent";
+        manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread should start");
+        let params = TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: "turn_native_duplicate_concurrent".to_owned(),
+            input: vec![UserInput::Text {
+                text: "execute one admission".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: Some(ThreadMode::Agent),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+        };
+        let (first, second) = tokio::join!(
+            manager.turn_start(10, params.clone()),
+            manager.turn_start(10, params)
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let rejected = first.err().or_else(|| second.err()).expect("one rejection");
+        assert!(format!("{rejected:#}").contains("already exists"));
+        let loaded = manager.thread_get(thread_id).await.expect("thread");
+        assert_eq!(
+            loaded
+                .turns
+                .iter()
+                .filter(|turn| turn.id == "turn_native_duplicate_concurrent")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn every_native_terminal_status_fences_sequential_identity_reuse() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_native_terminal_identity_matrix";
+        manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread should start");
+        for (suffix, status) in [
+            ("completed", TurnStatus::Completed),
+            ("failed", TurnStatus::Failed),
+            ("blocked", TurnStatus::Blocked),
+            ("interrupted", TurnStatus::Interrupted),
+        ] {
+            let params = TurnStartParams {
+                thread_id: thread_id.to_owned(),
+                turn_id: format!("turn_terminal_{suffix}"),
+                input: vec![UserInput::Text {
+                    text: suffix.to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            };
+            manager
+                .turn_start(10, params.clone())
+                .await
+                .expect("first admission should succeed");
+            manager
+                .turn_finish(thread_id, params.turn_id.as_str(), status, None)
+                .await
+                .expect("turn should become terminal");
+            assert!(
+                manager.turn_start(10, params).await.is_err(),
+                "{status:?} identity must not admit another execution"
+            );
+        }
     }
 
     #[tokio::test]

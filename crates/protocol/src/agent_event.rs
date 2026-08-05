@@ -83,6 +83,13 @@ pub enum AgentDurableEvent {
     ItemCompleted {
         notification: ItemCompletedNotification,
     },
+    /// Complete accepted provider response captured before terminal Turn
+    /// publication. Gateway persists this intent and later commits the item
+    /// together with TurnCompleted in one transaction.
+    TurnFinalizationPrepared {
+        notification: ItemCompletedNotification,
+        generation: i64,
+    },
     ItemToolRetryScheduled {
         notification: ItemToolRetryScheduledNotification,
     },
@@ -348,9 +355,12 @@ impl AgentDurableEvent {
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
-            Self::ItemCompleted { notification } => DurableEventCausalityKey::Turn {
-                turn_id: notification.turn_id.clone(),
-            },
+            Self::ItemCompleted { notification }
+            | Self::TurnFinalizationPrepared { notification, .. } => {
+                DurableEventCausalityKey::Turn {
+                    turn_id: notification.turn_id.clone(),
+                }
+            }
             Self::ItemToolRetryScheduled { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
@@ -394,6 +404,7 @@ impl AgentDurableEvent {
             | Self::TurnBlocked { .. }
             | Self::TurnInterrupted { .. }
             | Self::ItemCompleted { .. }
+            | Self::TurnFinalizationPrepared { .. }
             | Self::ItemToolRetryExhausted { .. } => true,
             Self::TaskEvent { event } => event.is_terminal(),
             Self::PromptManifestCompiled { .. }
