@@ -5037,16 +5037,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_window_policy_allows_healthy_turns_past_the_former_limit() {
-        let (crud_store, coordinator) = setup_coordinator().await;
-        let timestamp = chrono::Utc::now().fixed_offset();
-        let turn_id = "turn_unbounded_healthy_windows";
-        for window_index in 1..=44 {
+    async fn virtual_week_with_causal_progress_survives_windows_and_coordinator_restart() {
+        let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("fixed virtual-week timestamp should be valid")
+            .fixed_offset();
+        let turn_id = "turn_virtual_week_progress";
+        let virtual_week_windows = 7 * 24;
+        for window_index in 1..=virtual_week_windows {
+            let window_started_at = timestamp + chrono::Duration::hours(i64::from(window_index));
             crud_store
                 .create_turn_execution_window(
                     NewTurnExecutionWindowRecord {
-                        workspace_id: "ws_unbounded_healthy_windows".to_owned(),
-                        thread_id: "thr_unbounded_healthy_windows".to_owned(),
+                        workspace_id: "ws_virtual_week_progress".to_owned(),
+                        thread_id: "thr_virtual_week_progress".to_owned(),
                         turn_id: turn_id.to_owned(),
                         window_index,
                         status: ExecutionWindowStatus::Checkpointed,
@@ -5059,27 +5063,42 @@ mod tests {
                         metadata_json: serde_json::json!({
                             "runtimeWindowId": format!("{turn_id}:window:{window_index}"),
                         }),
-                        started_at: timestamp,
+                        started_at: window_started_at,
                     },
-                    timestamp,
-                    timestamp,
+                    window_started_at,
+                    window_started_at,
                 )
                 .await
                 .expect("healthy execution window should persist");
         }
 
+        drop(coordinator);
+        let restarted = RecoveryCoordinator::new(
+            crud_store.clone(),
+            agent_manager,
+            Arc::new(ProviderRegistry::with_provider(
+                "echo",
+                Arc::new(EchoProvider::new()),
+            )),
+            RecoveryPolicyRegistry::default(),
+            test_tool_loop_config().normalized(),
+        );
+
         assert_eq!(
-            coordinator
+            restarted
                 .execution_window_continuation_admission_for_turn(turn_id, None)
                 .await
-                .expect("healthy long-running turn should be admitted"),
-            super::ExecutionWindowContinuationAdmission::Open { window_index: 45 }
+                .expect("a virtual week of durable causal progress should survive restart"),
+            super::ExecutionWindowContinuationAdmission::Open {
+                window_index: virtual_week_windows + 1,
+            }
         );
     }
 
     #[tokio::test]
-    async fn persisted_no_progress_windows_trip_recovery_circuit_breaker() {
-        let (crud_store, coordinator) = setup_coordinator().await;
+    async fn persisted_no_progress_windows_trip_recovery_circuit_breaker_after_coordinator_restart()
+    {
+        let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let timestamp = chrono::Utc::now().fixed_offset();
         let turn_id = "turn_recovery_no_progress";
         for window_index in 1..=3 {
@@ -5110,7 +5129,19 @@ mod tests {
                 .expect("no-progress execution window should persist");
         }
 
-        let admission = coordinator
+        drop(coordinator);
+        let restarted = RecoveryCoordinator::new(
+            crud_store.clone(),
+            agent_manager,
+            Arc::new(ProviderRegistry::with_provider(
+                "echo",
+                Arc::new(EchoProvider::new()),
+            )),
+            RecoveryPolicyRegistry::default(),
+            test_tool_loop_config().normalized(),
+        );
+
+        let admission = restarted
             .execution_window_continuation_admission_for_turn(turn_id, None)
             .await
             .expect("no-progress admission should be evaluated");

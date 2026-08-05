@@ -6,6 +6,10 @@ config/local.toml
 
 # Builds
 target
+.target
+native-agent-results
+__pycache__
+*.pyc
 
 # Environment
 .env

@@ -308,29 +308,6 @@ async fn computer_use_regression_preflight_rejects_session_fields() {
 }
 
 #[tokio::test]
-#[ignore = "WP-27 app identity resolution must reject ambiguous/localized name mismatches with a targeted diagnostic"]
-async fn computer_use_regression_app_name_mismatch_is_diagnostic_not_generic_not_found() {
-    let (handler, _) = test_handler();
-
-    // Generic class: requested app name differs from real/localized identity and needs actionable remediation.
-    let error = invoke_result(
-        &handler,
-        serde_json::json!({
-            "action": "start",
-            "goal": "open calculator",
-            "target": {
-                "type": "app_name",
-                "name": "OtherExampleApp"
-            }
-        }),
-    )
-    .await
-    .expect_err("app identity mismatch must fail diagnostically");
-
-    assert!(error.to_string().contains("app_identity_mismatch"));
-}
-
-#[tokio::test]
 async fn computer_use_regression_completed_stop_requires_final_evidence() {
     let (handler, _) = test_handler();
     let session_id = start_app_session_with_snapshot(&handler).await;

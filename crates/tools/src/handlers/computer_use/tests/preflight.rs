@@ -115,7 +115,6 @@ async fn computer_use_preflight_blocked_returns_blocking_issue_without_recovery(
 }
 
 #[test]
-#[ignore = "compile-only xa11y API reconciliation reference; do not run against a real desktop"]
 fn xa11y_api_compile_reference() {
     use std::time::Duration;
     use xa11y::{
@@ -147,6 +146,7 @@ fn xa11y_api_compile_reference() {
             Error::Timeout { .. } => "timeout",
             Error::InvalidSelector { .. } => "invalid_selector",
             Error::InvalidActionData { .. } => "invalid_action_data",
+            Error::InvalidConfig { .. } => "invalid_config",
             Error::NoElementBounds => "no_element_bounds",
             Error::Unsupported { .. } => "unsupported",
             Error::Platform { .. } => "platform",

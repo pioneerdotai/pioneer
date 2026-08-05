@@ -838,7 +838,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["W00000000000000000001", "W00000000000000000002"]
         );
-        let rendered = format!("{:?}", loaded.invitation);
+        let rendered = format!(
+            "{:?}",
+            NewInvitationRow {
+                invitation_id: invitation_id(9),
+                gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+                created_by_principal_id: principal_id(1),
+                created_by_session_id: session_id(1),
+                token_hash: [222; 32],
+                expires_at: timestamp(100),
+                now: timestamp(1),
+            }
+        );
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("222"));
 

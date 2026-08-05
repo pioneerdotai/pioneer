@@ -8566,9 +8566,12 @@ name = "pioneer-migration"
 version = "0.38.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "pioneer-entity",
  "pioneer-sqlite",
+ "sea-orm",
  "sea-orm-migration",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -43846,7 +43846,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
-        thread_manager,
+        thread_manager.clone(),
         test_provider(),
         session_manager,
         workspace_manager,
@@ -43869,6 +43869,19 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
         turn_id,
     )
     .await;
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("materialized CLI test thread should load")
+        .expect("materialized CLI test thread should exist");
+    let sandbox_mode = crud_store
+        .get_thread_sandbox_mode(thread_id)
+        .await
+        .expect("materialized CLI test sandbox should load");
+    thread_manager
+        .system_thread_restore_persisted(persisted, sandbox_mode)
+        .await
+        .expect("materialized CLI test thread should be available to terminal lifecycle");
     persist_test_cli_execution_authorization_context(
         crud_store.as_ref(),
         workspace_id.as_str(),

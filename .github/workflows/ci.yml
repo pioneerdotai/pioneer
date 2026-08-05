@@ -2,11 +2,22 @@ name: CI
 
 on:
   workflow_dispatch:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
+  native-agent-gate:
+    name: native-agent-gate
+    uses: ./.github/workflows/native-agent-gate.yml
+    with:
+      expected_sha: ${{ github.sha }}
+
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
     runs-on: ${{ matrix.os }}

@@ -9,8 +9,15 @@ permissions:
   contents: write
 
 jobs:
+  native-agent-gate:
+    name: native-agent-gate
+    uses: ./.github/workflows/native-agent-gate.yml
+    with:
+      expected_sha: ${{ github.sha }}
+
   build-gateway:
     name: build-${{ matrix.target }}
+    needs: native-agent-gate
     runs-on: ${{ matrix.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -84,6 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
 
       - name: setup-rust
@@ -242,6 +250,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
 
       - name: download-artifacts

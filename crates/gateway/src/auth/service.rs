@@ -1756,9 +1756,19 @@ impl GatewayAuthService {
         let exact_pending_match = exact_session
             .as_ref()
             .is_some_and(|session| session.status == "pending");
-        let terminal_exact_match = exact_session
-            .as_ref()
-            .is_some_and(|session| session.status != "pending");
+        let terminal_exact_match = exact_session.as_ref().is_some_and(|session| {
+            session.status != "pending"
+                && bool::from(
+                    session
+                        .activation_locator_hash
+                        .as_slice()
+                        .ct_eq(activation_locator_hash.as_slice()),
+                )
+        });
+        if terminal_exact_match {
+            let _ = transaction.rollback().await;
+            return Err(AuthError::new(AuthErrorCode::DeviceActivationConsumed));
+        }
         let pending_session = match exact_session {
             Some(session) if session.status == "pending" => session,
             _ => match load_pending_session_by_activation_locator_hash(
@@ -1772,11 +1782,7 @@ impl GatewayAuthService {
                 Some(session) => session,
                 None => {
                     let _ = transaction.rollback().await;
-                    return Err(AuthError::new(if terminal_exact_match {
-                        AuthErrorCode::DeviceActivationConsumed
-                    } else {
-                        AuthErrorCode::InvalidCredential
-                    }));
+                    return Err(AuthError::new(AuthErrorCode::InvalidCredential));
                 }
             },
         };
@@ -4976,6 +4982,29 @@ mod tests {
                 .unwrap_err()
                 .code(),
             AuthErrorCode::DeviceActivationConsumed
+        );
+        assert_eq!(
+            scalar_i64(
+                &service.database,
+                &format!(
+                    "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
+                    second.session_id
+                ),
+            )
+            .await,
+            0,
+            "an exact consumed credential must not count against a newer request sharing its locator"
+        );
+        assert_eq!(
+            scalar_text(
+                &service.database,
+                &format!(
+                    "SELECT status AS value FROM auth_session WHERE id = '{}'",
+                    second.session_id
+                ),
+            )
+            .await,
+            "pending"
         );
         let revoked = service
             .revoke_owned_session(

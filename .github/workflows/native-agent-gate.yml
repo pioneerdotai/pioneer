@@ -1,0 +1,198 @@
+name: Native Agent Lifecycle Gate
+
+on:
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Exact commit that the gate must attest
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact commit that the gate must attest (defaults to the dispatched SHA)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NATIVE_AGENT_GATE_SHA: ${{ inputs.expected_sha || github.sha }}
+  PIONEER_FAULT_SEED: ${{ inputs.expected_sha || github.sha }}
+
+jobs:
+  validate-contract:
+    name: validate-native-agent-gate-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.NATIVE_AGENT_GATE_SHA }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: verify-exact-sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$NATIVE_AGENT_GATE_SHA"
+          test -z "$(git status --porcelain)"
+
+      - name: validate-suite-manifest
+        run: >-
+          python scripts/ci/native_agent_gate.py validate-manifest
+          --manifest ci/native-agent-gate.json
+
+      - name: test-gate-fail-closed-contract
+        run: python -m unittest discover -s scripts/ci/tests -p 'test_*.py' -v
+
+      - name: validate-workflow-wiring
+        run: python scripts/ci/validate_native_agent_workflows.py
+
+  linux-native-lifecycle:
+    name: linux-native-lifecycle
+    needs: validate-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.NATIVE_AGENT_GATE_SHA }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install-linux-build-dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libegl1-mesa-dev \
+            libgbm-dev \
+            libssl-dev \
+            libpipewire-0.3-dev \
+            libwayland-dev \
+            libxkbcommon-dev
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "$GITHUB_ENV"
+
+      - name: run-linux-native-lifecycle
+        run: >-
+          python scripts/ci/native_agent_gate.py run
+          --manifest ci/native-agent-gate.json
+          --suite linux-native-lifecycle
+          --expected-sha "$NATIVE_AGENT_GATE_SHA"
+          --seed "$PIONEER_FAULT_SEED"
+          --output native-agent-results/linux-native-lifecycle.json
+
+      - name: upload-linux-native-lifecycle-report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-agent-gate-linux-native-lifecycle
+          path: native-agent-results/linux-native-lifecycle.json
+          if-no-files-found: warn
+
+  platform-native-runtime:
+    name: ${{ matrix.suite }}
+    needs: validate-contract
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            suite: macos-native-runtime
+          - os: windows-latest
+            suite: windows-native-runtime
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.NATIVE_AGENT_GATE_SHA }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: configure-windows-bindgen
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-msvc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: run-platform-native-runtime
+        shell: bash
+        run: >-
+          python scripts/ci/native_agent_gate.py run
+          --manifest ci/native-agent-gate.json
+          --suite "${{ matrix.suite }}"
+          --expected-sha "$NATIVE_AGENT_GATE_SHA"
+          --seed "$PIONEER_FAULT_SEED"
+          --output "native-agent-results/${{ matrix.suite }}.json"
+
+      - name: upload-platform-native-runtime-report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-agent-gate-${{ matrix.suite }}
+          path: native-agent-results/${{ matrix.suite }}.json
+          if-no-files-found: warn
+
+  attest-native-agent-gate:
+    name: attest-native-agent-gate
+    if: always()
+    needs:
+      - validate-contract
+      - linux-native-lifecycle
+      - platform-native-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.NATIVE_AGENT_GATE_SHA }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: download-suite-reports
+        uses: actions/download-artifact@v7
+        with:
+          pattern: native-agent-gate-*
+          path: native-agent-results
+          merge-multiple: true
+
+      - name: attest-exact-sha-and-complete-matrix
+        run: >-
+          python scripts/ci/native_agent_gate.py validate-reports
+          --manifest ci/native-agent-gate.json
+          --reports-dir native-agent-results
+          --expected-sha "$NATIVE_AGENT_GATE_SHA"
+          --output native-agent-results/native-agent-gate-attestation.json
+
+      - name: publish-native-agent-gate-attestation
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-agent-gate-attestation-${{ env.NATIVE_AGENT_GATE_SHA }}
+          path: native-agent-results/native-agent-gate-attestation.json
+          if-no-files-found: error
+          retention-days: 90
