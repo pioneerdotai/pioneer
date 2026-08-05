@@ -1299,13 +1299,18 @@ impl AgentManager {
         thread_id: &str,
         workspace_id: &str,
     ) -> Result<(), AgentStartError> {
-        if let Some(existing_workspace_id) = self
+        if let Some((existing_workspace_id, loop_finished)) = self
             .state
             .read()
             .await
             .threads
             .get(thread_id)
-            .map(|thread| thread.workspace_id.clone())
+            .map(|thread| {
+                (
+                    thread.workspace_id.clone(),
+                    thread.loop_handle.is_finished(),
+                )
+            })
         {
             if existing_workspace_id != workspace_id {
                 return Err(AgentStartError::ThreadWorkspaceMismatch {
@@ -1313,7 +1318,13 @@ impl AgentManager {
                     actual_workspace_id: workspace_id.to_owned(),
                 });
             }
-            return Ok(());
+            if !loop_finished {
+                return Ok(());
+            }
+            // A failed loop must not leave a permanently poisoned handle. The
+            // durable event receiver remains in its hub, and uncommitted work
+            // is recovered from storage by the Gateway coordinator.
+            self.remove_thread(thread_id).await;
         }
 
         let thread_id_owned = thread_id.to_owned();
@@ -2006,6 +2017,26 @@ impl AgentManager {
         thread.loop_handle.abort();
     }
 
+    /// Retire a terminal thread without aborting the loop that is currently
+    /// waiting for its durable terminal-event ACK.
+    ///
+    /// Once the ACK is delivered the loop must still run its post-commit
+    /// actions (notably deferred post-turn hook dispatch) before consuming the
+    /// queued shutdown command. Explicit teardown continues to use
+    /// `remove_thread`, which retains immediate abort semantics.
+    pub async fn retire_thread_after_terminal_commit(&self, thread_id: &str) {
+        let thread = self.state.write().await.threads.remove(thread_id);
+        let Some(thread) = thread else {
+            return;
+        };
+
+        let _ = thread.command_tx.send(AgentCommand::Shutdown).await;
+        // Dropping a JoinHandle detaches the task. The queued shutdown is
+        // bounded and is consumed immediately after the terminal ACK unblocks
+        // the loop; aborting here would erase required post-commit work.
+        drop(thread.loop_handle);
+    }
+
     pub async fn has_thread(&self, thread_id: &str) -> bool {
         self.state.read().await.threads.contains_key(thread_id)
     }
@@ -2098,7 +2129,7 @@ mod event_class_tests {
     }
 
     #[tokio::test]
-    async fn closed_durable_lane_is_reported_to_publisher() {
+    async fn dropped_durable_listener_can_be_replaced_without_losing_the_lane() {
         let hub = AgentEventHub::with_capacity(1, 1);
         let durable_rx = hub
             .take_durable_receiver()
@@ -2106,12 +2137,18 @@ mod event_class_tests {
             .expect("durable receiver should be available once");
         drop(durable_rx);
 
-        let error = hub
-            .publish_durable(durable_turn_completed("turn_1"))
+        hub.publish_durable(durable_turn_completed("turn_1"))
             .await
-            .expect_err("closed durable lane must fail publishing");
+            .expect("hub must retain queued events while no listener owns the receiver");
 
-        assert_eq!(error, AgentEventHubError::DurableLaneClosed);
+        let mut replacement = hub
+            .take_durable_receiver()
+            .await
+            .expect("replacement listener should lease the retained receiver");
+        assert!(matches!(
+            replacement.recv().await,
+            Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_1"
+        ));
     }
 
     #[tokio::test]

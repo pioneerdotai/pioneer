@@ -71,7 +71,7 @@ pub(super) async fn forward_tool_event_to_agent(
 
             if should_emit_started {
                 event_tx
-                    .publish_durable(AgentDurableEvent::ItemStarted {
+                    .publish_durable_and_wait(AgentDurableEvent::ItemStarted {
                         notification: ItemStartedNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
@@ -91,65 +91,26 @@ pub(super) async fn forward_tool_event_to_agent(
         }
         ToolEventPayload::PermissionAudit(audit_event) => {
             event_tx
-                .publish_durable(AgentDurableEvent::TurnPermissionAudit { event: audit_event })
+                .publish_durable_and_wait(AgentDurableEvent::TurnPermissionAudit {
+                    event: audit_event,
+                })
                 .await?;
         }
         ToolEventPayload::OutputDelta(delta_event) => {
-            let (
-                tool_name,
-                arguments,
-                recovery_policy,
-                output_policy,
-                should_emit_started,
-                latest_observation,
-            ) = {
+            let should_forward = {
                 let mut pending = pending_tool_ui.lock().await;
-                let state = pending.entry(event.call_id.clone()).or_default();
-                if state.tool_name.is_empty() {
-                    state.tool_name = event.tool_name.clone();
-                }
+                let Some(state) = pending.get_mut(event.call_id.as_str()) else {
+                    // Progress is deliberately lossy. It must never synthesize
+                    // durable lifecycle state when CallStarted has not yet
+                    // crossed the acknowledged lane or when CallCompleted has
+                    // already removed that state.
+                    return Ok(());
+                };
                 state.latest_observation = observation.clone();
-                let should_emit_started = if state.started_sent {
-                    false
-                } else {
-                    state.started_sent = true;
-                    true
-                };
-                let arguments = if state.arguments.is_empty() {
-                    "{}".to_owned()
-                } else {
-                    state.arguments.clone()
-                };
-                (
-                    state.tool_name.clone(),
-                    parse_arguments_json(arguments.as_str()),
-                    state.recovery_policy.clone(),
-                    state.output_policy.clone().unwrap_or_else(|| {
-                        ToolOutputPolicySnapshot::for_tool_name(state.tool_name.as_str())
-                    }),
-                    should_emit_started,
-                    state.latest_observation.clone(),
-                )
+                state.started_sent
             };
-
-            if should_emit_started {
-                event_tx
-                    .publish_durable(AgentDurableEvent::ItemStarted {
-                        notification: ItemStartedNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item: build_tool_turn_item(ProjectedToolItemInput::started(
-                                event.call_id.clone(),
-                                tool_name,
-                                arguments,
-                                recovery_policy,
-                                output_policy,
-                                latest_observation,
-                            )),
-                        },
-                    })
-                    .await?;
+            if !should_forward {
+                return Ok(());
             }
 
             if let Some((delta, stream, payload)) =
@@ -196,7 +157,7 @@ pub(super) async fn forward_tool_event_to_agent(
 
             if should_emit_started {
                 event_tx
-                    .publish_durable(AgentDurableEvent::ItemStarted {
+                    .publish_durable_and_wait(AgentDurableEvent::ItemStarted {
                         notification: ItemStartedNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
@@ -217,7 +178,7 @@ pub(super) async fn forward_tool_event_to_agent(
             let outcome = protocol_outcome_from_tool_outcome(&completed.outcome);
 
             event_tx
-                .publish_durable(AgentDurableEvent::ItemCompleted {
+                .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
                     notification: ItemCompletedNotification {
                         workspace_id: workspace_id.to_owned(),
                         thread_id: thread_id.to_owned(),
@@ -265,7 +226,7 @@ pub(super) async fn forward_tool_event_to_agent(
 
             if should_emit_started {
                 event_tx
-                    .publish_durable(AgentDurableEvent::ItemStarted {
+                    .publish_durable_and_wait(AgentDurableEvent::ItemStarted {
                         notification: ItemStartedNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
@@ -286,7 +247,7 @@ pub(super) async fn forward_tool_event_to_agent(
             let outcome = protocol_outcome_from_tool_outcome(&failed.outcome);
 
             event_tx
-                .publish_durable(AgentDurableEvent::ItemCompleted {
+                .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
                     notification: ItemCompletedNotification {
                         workspace_id: workspace_id.to_owned(),
                         thread_id: thread_id.to_owned(),
@@ -1335,6 +1296,58 @@ mod tests {
         ObservationContext, ToolCallCompletedEvent, ToolEventPayload, ToolResultView,
     };
     use std::sync::Arc;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn lossy_delta_cannot_synthesize_missing_durable_tool_start() {
+        let event_tx = AgentEventHub::with_capacity(8, 8);
+        let mut durable_rx = event_tx
+            .take_durable_receiver()
+            .await
+            .expect("durable receiver should be available");
+        let pending_tool_ui = Arc::new(Mutex::new(HashMap::new()));
+        let event = ToolEvent {
+            schema_version: 1,
+            call_id: "call_late_delta".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            ts_unix_ms: 1,
+            observation: ObservationContext {
+                trace_id: "trace_late_delta".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                tool_call_id: "call_late_delta".to_owned(),
+                attempt_id: 1,
+                pipeline_stage: "runtime.call.delta".to_owned(),
+                ts_unix_ms: 1,
+                mono_ns: 1,
+                event_seq: 2,
+            },
+            payload: ToolEventPayload::OutputDelta(pioneer_tools::ToolOutputDeltaEvent {
+                delta: ToolDeltaPayload::OutputChunk {
+                    stream: ItemDeltaStream::Stdout,
+                    text: "late".to_owned(),
+                    truncated: false,
+                },
+            }),
+        };
+
+        forward_tool_event_to_agent(
+            event,
+            &event_tx,
+            pending_tool_ui,
+            "workspace_1",
+            "thread_1",
+            "turn_1",
+        )
+        .await
+        .expect("lossy delta should be safely ignored");
+
+        assert!(
+            timeout(Duration::from_millis(20), durable_rx.recv())
+                .await
+                .is_err(),
+            "a progress delta must not invent an ItemStarted durable event"
+        );
+    }
 
     #[test]
     fn tool_item_type_maps_write_file_to_file_change() {
@@ -1386,7 +1399,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_tool_event_keeps_llm_context_out_of_async_event_forwarder() {
-        let event_tx = AgentEventHub::with_capacity(8, 8);
+        let event_tx = Arc::new(AgentEventHub::with_capacity(8, 8));
         let mut durable_rx = event_tx
             .take_durable_receiver()
             .await
@@ -1439,24 +1452,26 @@ mod tests {
             }),
         };
 
-        forward_tool_event_to_agent(
-            event,
-            &event_tx,
-            pending_tool_ui,
-            "workspace_1",
-            "thread_1",
-            "turn_1",
-        )
-        .await
-        .expect("tool event should publish");
+        let forward_event_tx = event_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            forward_tool_event_to_agent(
+                event,
+                forward_event_tx.as_ref(),
+                pending_tool_ui,
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+            )
+            .await
+        });
 
         let mut saw_completed = false;
         for _ in 0..2 {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), durable_rx.recv())
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), durable_rx.recv())
                 .await
                 .expect("agent event should be emitted before timeout")
-                .expect("durable lane should stay open")
-            {
+                .expect("durable lane should stay open");
+            match event {
                 AgentDurableEvent::TurnLlmContextAppended { .. } => {
                     panic!("async tool forwarding must not race provider-history persistence");
                 }
@@ -1468,8 +1483,13 @@ mod tests {
                 }
                 _ => {}
             }
+            durable_rx.acknowledge_last(Ok(()));
         }
 
+        forwarder
+            .await
+            .expect("tool forwarder should not panic")
+            .expect("tool event should publish after commit acknowledgements");
         assert!(saw_completed);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), durable_rx.recv())

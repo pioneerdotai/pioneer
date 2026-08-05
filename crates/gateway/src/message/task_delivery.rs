@@ -312,15 +312,39 @@ impl MessageProcessor {
         )
         .await;
 
-        self.persist_delivery_item(
-            delivery.workspace_id.as_str(),
-            thread_id,
-            turn_id.as_str(),
-            delivery_summary_item(delivery),
-        )
-        .await?;
-        self.complete_turn(thread_id.to_owned(), turn_id.clone(), None)
-            .await;
+        if let Err(error) = self
+            .persist_delivery_item(
+                delivery.workspace_id.as_str(),
+                thread_id,
+                turn_id.as_str(),
+                delivery_summary_item(delivery),
+            )
+            .await
+        {
+            let reason = format!("failed to persist task delivery item: {error:#}");
+            if !self
+                .mark_turn_blocked(thread_id.to_owned(), turn_id.clone(), reason.clone())
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to durably close task delivery turn after item persistence failure"
+                );
+            }
+            return Err(error);
+        }
+        if !self
+            .complete_turn(thread_id.to_owned(), turn_id.clone(), None)
+            .await
+        {
+            let reason = "failed to durably complete task delivery turn".to_owned();
+            let _ = self
+                .mark_turn_blocked(thread_id.to_owned(), turn_id.clone(), reason.clone())
+                .await;
+            bail!(reason);
+        }
         Ok(turn_id)
     }
 

@@ -12,7 +12,7 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
-pub use events::{CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+pub use events::{AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
     insert_administrative_audit_event,
@@ -132,6 +132,7 @@ use sea_orm::{
     DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
     TransactionTrait,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
@@ -848,6 +849,10 @@ pub use crate::repositories::thread_timeline_projection::{
     update_projection_meta_status, upsert_projection_meta, upsert_projection_meta_with_config,
     upsert_thread_timeline_block, upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
+pub use crate::repositories::turn_event_delivery::{
+    CONSUMER_LIVE_NOTIFICATION as NATIVE_TURN_EVENT_LIVE_CONSUMER,
+    CONSUMER_THREAD_EPISODIC as NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+};
 pub use crate::repositories::turn_mcp_projection::{
     TurnMcpProjectionPersistenceError, TurnMcpProjectionReplaceOutcome,
     TurnMcpProjectionReplacement,
@@ -863,9 +868,9 @@ use crate::repositories::{
     task_run, task_run_conversation_snapshot, task_run_execution, task_run_thread_binding,
     task_run_turn, task_trigger, task_write_lock, thread, thread_agents_doc,
     thread_episodic as thread_episodic_repository, thread_lineage, thread_tree, turn,
-    turn_cli_runtime_instruction, turn_event, turn_event_projection_state, turn_execution_window,
-    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
-    turn_runtime_snapshot, turn_skill_binding,
+    turn_cli_runtime_instruction, turn_event, turn_event_delivery, turn_event_projection_state,
+    turn_execution_window, turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding,
+    turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -915,7 +920,110 @@ pub use crate::repositories::turn_execution_window::{
     TurnExecutionWindowStatsRecord, TurnExecutionWindowTerminalItemCountsRecord,
     TurnExecutionWindowUsageAggregateRecord,
 };
-pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
+pub use crate::repositories::turn_llm_context::{
+    NewTurnLlmContextEntry, TurnLlmContextAppendOutcome, TurnLlmContextEntry,
+};
+
+#[derive(Debug, Clone)]
+pub struct ClaimedTurnEventDeliveryRecord {
+    pub id: String,
+    pub consumer: String,
+    pub attempt_count: i64,
+    pub claim_token: String,
+    pub event: AppendedTurnEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteNativeTurnAdmissionRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum NativeExecutionWindowTransition {
+    Started {
+        notification: pioneer_protocol::TurnExecutionWindowStartedNotification,
+        window: NewTurnExecutionWindowRecord,
+        created_at: DateTimeWithTimeZone,
+        updated_at: DateTimeWithTimeZone,
+    },
+    Exhausted {
+        notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification,
+        stats: TurnExecutionWindowStatsRecord,
+    },
+    Checkpointed {
+        notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification,
+        checkpoint: NewTurnExecutionCheckpointRecord,
+    },
+    Continued {
+        notification: pioneer_protocol::TurnExecutionWindowContinuedNotification,
+        updated_at: DateTimeWithTimeZone,
+    },
+    Blocked {
+        notification: pioneer_protocol::TurnExecutionWindowBlockedNotification,
+        stats: TurnExecutionWindowStatsRecord,
+    },
+}
+
+impl NativeExecutionWindowTransition {
+    fn event_payload(&self) -> TurnEventPayload {
+        match self {
+            Self::Started { notification, .. } => {
+                TurnEventPayload::TurnExecutionWindowStarted(notification.clone())
+            }
+            Self::Exhausted { notification, .. } => {
+                TurnEventPayload::TurnExecutionWindowExhausted(notification.clone())
+            }
+            Self::Checkpointed { notification, .. } => {
+                TurnEventPayload::TurnExecutionWindowCheckpointed(notification.clone())
+            }
+            Self::Continued { notification, .. } => {
+                TurnEventPayload::TurnExecutionWindowContinued(notification.clone())
+            }
+            Self::Blocked { notification, .. } => {
+                TurnEventPayload::TurnExecutionWindowBlocked(notification.clone())
+            }
+        }
+    }
+}
+
+fn db_timestamp_from_unix_millis(value: i64) -> sea_orm::entity::prelude::DateTimeWithTimeZone {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+        .map(|timestamp| timestamp.fixed_offset())
+        .unwrap_or_else(|| chrono::Utc::now().fixed_offset())
+}
+
+async fn require_native_execution_window<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    window_index: u32,
+    runtime_window_id: &str,
+) -> Result<TurnExecutionWindowRecord> {
+    let window = turn_execution_window::latest_turn_execution_window(db, turn_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "execution-window event for turn `{turn_id}` index {window_index} has no predecessor"
+            )
+        })?;
+    if window.window_index != window_index {
+        anyhow::bail!(
+            "execution-window event for turn `{turn_id}` expected latest index {window_index}, found {}",
+            window.window_index
+        );
+    }
+    let stored_runtime_id = window
+        .metadata_json
+        .get("runtimeWindowId")
+        .and_then(serde_json::Value::as_str);
+    if stored_runtime_id != Some(runtime_window_id) {
+        anyhow::bail!(
+            "execution-window event runtime id `{runtime_window_id}` does not match stored id {:?}",
+            stored_runtime_id
+        );
+    }
+    Ok(window)
+}
 pub use crate::repositories::turn_runtime_snapshot::{
     NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord,
 };
@@ -1130,6 +1238,8 @@ pub struct TurnProjectionReplayExhaustedRecord {
 struct TurnEventProjectionContext {
     #[serde(default)]
     item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+    #[serde(default)]
+    enqueue_optional_deliveries: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1197,6 +1307,7 @@ pub struct RecoveryJobRecord {
     pub run_count: i64,
     pub max_attempts: i64,
     pub scheduled_at_unix: i64,
+    pub next_run_at_unix: i64,
     pub updated_at_unix: i64,
     pub claim_token: Option<String>,
     pub active_attempt_id: Option<String>,
@@ -1449,7 +1560,7 @@ fn workspace_skill_policy_record_from_model(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SkillAuditEventRecord {
     pub turn_id: Option<String>,
     pub skill_id: SkillId,
@@ -1463,7 +1574,7 @@ pub struct SkillAuditEventRecord {
     pub created_at_unix: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SkillDependencySnapshotRecord {
     pub turn_id: Option<String>,
     pub skill_id: SkillId,
@@ -1472,6 +1583,18 @@ pub struct SkillDependencySnapshotRecord {
     pub source_kind: String,
     pub diagnostics_json: String,
     pub created_at_unix: i64,
+}
+
+fn native_skill_delivery_id<T: serde::Serialize>(
+    record_kind: &str,
+    turn_id: &str,
+    index: usize,
+    record: &T,
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&(record_kind, turn_id, index, record))
+        .context("failed to encode native skill delivery identity")?;
+    let digest = hex::encode(Sha256::digest(encoded));
+    Ok(format!("N{}", &digest[..20]))
 }
 
 fn turn_skill_binding_record_from_model(
@@ -3006,6 +3129,42 @@ impl CrudStore {
         turn_llm_context::insert_turn_llm_context(&self.connection, entry).await
     }
 
+    pub async fn append_turn_llm_context(
+        &self,
+        entry: NewTurnLlmContextEntry,
+        delivery_key: &str,
+    ) -> Result<TurnLlmContextAppendOutcome> {
+        let delivery_key = delivery_key.to_owned();
+        self.run_serialized_write(|| {
+            let entry = entry.clone();
+            let delivery_key = delivery_key.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin turn_llm_context append transaction")?;
+                let outcome =
+                    turn_llm_context::append_turn_llm_context(&transaction, entry, &delivery_key)
+                        .await;
+                match outcome {
+                    Ok(outcome) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit turn_llm_context append transaction")?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn list_turn_llm_context(&self, turn_id: &str) -> Result<Vec<TurnLlmContextEntry>> {
         turn_llm_context::list_turn_llm_context(&self.connection, turn_id).await
     }
@@ -3016,6 +3175,140 @@ impl CrudStore {
 
     pub async fn delete_expired_turn_llm_context(&self) -> Result<u64> {
         turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
+    }
+
+    /// Lists native API-provider turns whose durable start committed but whose
+    /// mandatory runtime snapshot did not. This is intentionally a startup
+    /// admission repair primitive, not the general active-turn orphan scanner:
+    /// a complete snapshot belongs to ownership/recovery reconciliation.
+    pub async fn list_incomplete_native_turn_admissions(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<IncompleteNativeTurnAdmissionRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
+                 WHERE t.status = 'in_progress' \
+                   AND NOT EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
+                   AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
+                 ORDER BY t.created_at ASC, t.id ASC LIMIT ?"
+                    .to_owned(),
+                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+            ))
+            .await
+            .context("failed to list in-progress turns for native admission repair")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(IncompleteNativeTurnAdmissionRecord {
+                    thread_id: row.try_get("", "thread_id")?,
+                    turn_id: row.try_get("", "turn_id")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn claim_due_turn_event_deliveries(
+        &self,
+        consumer: &str,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<ClaimedTurnEventDeliveryRecord>> {
+        let consumer = consumer.to_owned();
+        self.run_serialized_write(|| {
+            let consumer = consumer.clone();
+            async move {
+                let now = unix_to_datetime(now_unix);
+                let claim_expires_at = unix_to_datetime(now_unix.saturating_add(120));
+                let claimed = turn_event_delivery::claim_due(
+                    &self.connection,
+                    consumer.as_str(),
+                    now,
+                    claim_expires_at,
+                    limit,
+                )
+                .await?;
+                let mut records = Vec::with_capacity(claimed.len());
+                for claim in claimed {
+                    let event =
+                        turn_event::find_event_by_id(&self.connection, claim.row.event_id.as_str())
+                            .await?
+                            .with_context(|| {
+                                format!(
+                                    "turn event `{}` is missing for delivery `{}`",
+                                    claim.row.event_id, claim.row.id
+                                )
+                            })?;
+                    records.push(ClaimedTurnEventDeliveryRecord {
+                        id: claim.row.id,
+                        consumer: claim.row.consumer,
+                        attempt_count: claim.row.attempt_count,
+                        claim_token: claim.claim_token,
+                        event,
+                    });
+                }
+                Ok(records)
+            }
+        })
+        .await
+    }
+
+    pub async fn complete_turn_event_delivery(
+        &self,
+        id: &str,
+        claim_token: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let id = id.to_owned();
+        let claim_token = claim_token.to_owned();
+        self.run_serialized_write(|| async {
+            turn_event_delivery::mark_delivered(
+                &self.connection,
+                id.as_str(),
+                claim_token.as_str(),
+                unix_to_datetime(now_unix),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn fail_turn_event_delivery(
+        &self,
+        id: &str,
+        claim_token: &str,
+        attempt_count: i64,
+        error: String,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let id = id.to_owned();
+        let claim_token = claim_token.to_owned();
+        self.run_serialized_write(|| {
+            let error = error.clone();
+            let id = id.clone();
+            let claim_token = claim_token.clone();
+            async move {
+                const MAX_ATTEMPTS: i64 = 10;
+                let exhausted = attempt_count.saturating_add(1) >= MAX_ATTEMPTS;
+                let exponent = u32::try_from(attempt_count.clamp(0, 8)).unwrap_or(8);
+                let delay = 2_i64.saturating_pow(exponent).min(300);
+                turn_event_delivery::mark_failed(
+                    &self.connection,
+                    id.as_str(),
+                    claim_token.as_str(),
+                    error,
+                    unix_to_datetime(now_unix.saturating_add(delay)),
+                    unix_to_datetime(now_unix),
+                    exhausted,
+                )
+                .await
+            }
+        })
+        .await
     }
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
@@ -4564,6 +4857,449 @@ impl CrudStore {
                             .await
                             .context("failed to commit turn_item_attempt payload compaction")?;
                         Ok(summary)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn materialize_native_execution_window_transition(
+        &self,
+        transition: NativeExecutionWindowTransition,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        let created_at = unix_to_datetime(event_timestamp_secs);
+        let claim_expires_at =
+            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+        self.run_serialized_write(|| {
+            let transition = transition.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin native execution-window transition")?;
+                let result: Result<()> = async {
+                    // Exact delivery replay is successful regardless of how far a
+                    // later valid transition has advanced the window. The event
+                    // and authoritative mutation were committed by this same
+                    // transaction, so existence of the stable event identity is
+                    // the durable acknowledgement fence.
+                    let replay_event = transition.event_payload();
+                    let replay_key = replay_event
+                        .idempotency_key()
+                        .context("failed to identify execution-window transition")?;
+                    if let Some(existing) = turn_event::find_event_by_idempotency_key(
+                        &transaction,
+                        replay_event.turn_id(),
+                        replay_key.as_str(),
+                    )
+                    .await?
+                    {
+                        if existing.payload != replay_event {
+                            anyhow::bail!(
+                                "execution-window event idempotency key collision for turn `{}`",
+                                existing.turn_id
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    match transition {
+                        NativeExecutionWindowTransition::Started {
+                            notification,
+                            window,
+                            created_at: window_created_at,
+                            updated_at,
+                        } => {
+                            if notification.status != pioneer_protocol::ExecutionWindowStatus::Running
+                            {
+                                anyhow::bail!(
+                                    "execution-window started event has non-running status {:?}",
+                                    notification.status
+                                );
+                            }
+                            let latest = turn_execution_window::latest_turn_execution_window(
+                                &transaction,
+                                notification.turn_id.as_str(),
+                            )
+                            .await?;
+                            if window.workspace_id != notification.workspace_id
+                                || window.thread_id != notification.thread_id
+                                || window.turn_id != notification.turn_id
+                                || window.window_index != notification.window_index
+                            {
+                                anyhow::bail!(
+                                    "execution-window started record does not match its notification"
+                                );
+                            }
+                            if window.status
+                                != pioneer_protocol::ExecutionWindowStatus::Running
+                                || window.exhaustion_reason.is_some()
+                                || window
+                                    .metadata_json
+                                    .get("runtimeWindowId")
+                                    .and_then(serde_json::Value::as_str)
+                                    != Some(notification.window_id.as_str())
+                            {
+                                anyhow::bail!(
+                                    "execution-window started record is not an exact running runtime window"
+                                );
+                            }
+                            match latest.as_ref() {
+                                None if notification.window_index == 1 => {}
+                                Some(existing)
+                                    if existing.window_index == notification.window_index
+                                        && existing.status
+                                            == pioneer_protocol::ExecutionWindowStatus::Running
+                                        && existing.workspace_id == notification.workspace_id
+                                        && existing.thread_id == notification.thread_id
+                                        && existing.turn_id == notification.turn_id
+                                        && existing
+                                            .metadata_json
+                                            .get("runtimeWindowId")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(notification.window_id.as_str())
+                                        && existing
+                                            .metadata_json
+                                            .get("createdByContinuationCheckpointId")
+                                            .and_then(serde_json::Value::as_str)
+                                            .is_some() =>
+                                {
+                                    self.append_and_project_turn_event_in_transaction(
+                                        &transaction,
+                                        TurnEventPayload::TurnExecutionWindowStarted(notification),
+                                        created_at,
+                                        claim_expires_at,
+                                        true,
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                _ => anyhow::bail!(
+                                    "execution-window started event is out of order or lacks a committed continuation for turn `{}` at index {}",
+                                    notification.turn_id,
+                                    notification.window_index
+                                ),
+                            }
+                            self.append_and_project_turn_event_in_transaction(
+                                &transaction,
+                                TurnEventPayload::TurnExecutionWindowStarted(notification),
+                                created_at,
+                                claim_expires_at,
+                                true,
+                            )
+                            .await?;
+                            turn_execution_window::create_turn_execution_window(
+                                &transaction,
+                                window,
+                                window_created_at,
+                                updated_at,
+                            )
+                            .await?;
+                        }
+                        NativeExecutionWindowTransition::Exhausted {
+                            notification,
+                            stats,
+                        } => {
+                            if notification.status
+                                != pioneer_protocol::ExecutionWindowStatus::Exhausted
+                            {
+                                anyhow::bail!(
+                                    "execution-window exhausted event has invalid status {:?}",
+                                    notification.status
+                                );
+                            }
+                            let window = require_native_execution_window(
+                                &transaction,
+                                notification.turn_id.as_str(),
+                                notification.window_index,
+                                notification.window_id.as_str(),
+                            )
+                            .await?;
+                            if stats.agent_round_count != notification.agent_round_count
+                                || stats.tool_call_count != notification.tool_call_count
+                                || stats.provider_token_count
+                                    != notification.provider_token_count.unwrap_or_default()
+                            {
+                                anyhow::bail!(
+                                    "execution-window exhausted statistics do not match notification"
+                                );
+                            }
+                            self.append_and_project_turn_event_in_transaction(
+                                &transaction,
+                                TurnEventPayload::TurnExecutionWindowExhausted(notification.clone()),
+                                created_at,
+                                claim_expires_at,
+                                true,
+                            )
+                            .await?;
+                            turn_execution_window::transition_window_with_stats(
+                                &transaction,
+                                window.id.as_str(),
+                                pioneer_protocol::ExecutionWindowStatus::Running,
+                                pioneer_protocol::ExecutionWindowStatus::Exhausted,
+                                Some(notification.exhaustion_reason),
+                                stats,
+                            )
+                            .await?;
+                        }
+                        NativeExecutionWindowTransition::Checkpointed {
+                            notification,
+                            mut checkpoint,
+                        } => {
+                            if notification.status
+                                != pioneer_protocol::ExecutionWindowStatus::Checkpointed
+                            {
+                                anyhow::bail!(
+                                    "execution-window checkpoint event has invalid status {:?}",
+                                    notification.status
+                                );
+                            }
+                            let window = require_native_execution_window(
+                                &transaction,
+                                notification.turn_id.as_str(),
+                                notification.window_index,
+                                notification.window_id.as_str(),
+                            )
+                            .await?;
+                            checkpoint.window_id = window.id.clone();
+                            if checkpoint.id.as_deref()
+                                != Some(notification.checkpoint_id.as_str())
+                                || checkpoint.workspace_id != notification.workspace_id
+                                || checkpoint.thread_id != notification.thread_id
+                                || checkpoint.turn_id != notification.turn_id
+                            {
+                                anyhow::bail!(
+                                    "execution-window checkpoint record does not match its notification"
+                                );
+                            }
+                            let expected_kind = match checkpoint.checkpoint_kind {
+                                TurnExecutionCheckpointKind::WindowExhausted => "window_exhausted",
+                                TurnExecutionCheckpointKind::TurnBlocked => "turn_blocked",
+                                TurnExecutionCheckpointKind::StartupRecovery => "startup_recovery",
+                            };
+                            let payload_bytes = turn_execution_window::serialize_checkpoint_payload(
+                                &checkpoint.payload_json,
+                            )?
+                            .len();
+                            if notification.checkpoint_kind != expected_kind
+                                || u64::try_from(payload_bytes).ok()
+                                    != Some(notification.payload_bytes)
+                            {
+                                anyhow::bail!(
+                                    "execution-window checkpoint wire metadata does not match its durable payload"
+                                );
+                            }
+                            if window.status
+                                != pioneer_protocol::ExecutionWindowStatus::Exhausted
+                            {
+                                anyhow::bail!(
+                                    "execution window `{}` cannot be checkpointed from {:?}",
+                                    window.id,
+                                    window.status
+                                );
+                            }
+                            self.append_and_project_turn_event_in_transaction(
+                                &transaction,
+                                TurnEventPayload::TurnExecutionWindowCheckpointed(
+                                    notification.clone(),
+                                ),
+                                created_at,
+                                claim_expires_at,
+                                true,
+                            )
+                            .await?;
+                            let existing = turn_execution_window::get_turn_execution_checkpoint(
+                                &transaction,
+                                notification.checkpoint_id.as_str(),
+                            )
+                            .await?;
+                            if let Some(existing) = existing {
+                                if existing.window_id != window.id
+                                    || existing.workspace_id != checkpoint.workspace_id
+                                    || existing.thread_id != checkpoint.thread_id
+                                    || existing.turn_id != checkpoint.turn_id
+                                    || existing.checkpoint_kind != checkpoint.checkpoint_kind
+                                    || existing.payload_json != checkpoint.payload_json
+                                {
+                                    anyhow::bail!(
+                                        "checkpoint id `{}` conflicts with an existing durable checkpoint",
+                                        notification.checkpoint_id
+                                    );
+                                }
+                            } else {
+                                turn_execution_window::save_turn_execution_checkpoint(
+                                    &transaction,
+                                    checkpoint,
+                                )
+                                .await?;
+                            }
+                            turn_execution_window::transition_window_status_only(
+                                &transaction,
+                                window.id.as_str(),
+                                pioneer_protocol::ExecutionWindowStatus::Exhausted,
+                                pioneer_protocol::ExecutionWindowStatus::Checkpointed,
+                                db_timestamp_from_unix_millis(notification.created_at_unix_ms),
+                            )
+                            .await?;
+                        }
+                        NativeExecutionWindowTransition::Continued {
+                            notification,
+                            updated_at,
+                        } => {
+                            if notification.status
+                                != pioneer_protocol::ExecutionWindowStatus::Continued
+                            {
+                                anyhow::bail!(
+                                    "execution-window continued event has invalid status {:?}",
+                                    notification.status
+                                );
+                            }
+                            let previous = require_native_execution_window(
+                                &transaction,
+                                notification.turn_id.as_str(),
+                                notification.previous_window_index,
+                                notification.previous_window_id.as_str(),
+                            )
+                            .await?;
+                            if notification.window_index
+                                != notification.previous_window_index.saturating_add(1)
+                            {
+                                anyhow::bail!(
+                                    "execution-window continuation skips from {} to {}",
+                                    notification.previous_window_index,
+                                    notification.window_index
+                                );
+                            }
+                            let checkpoint = turn_execution_window::get_turn_execution_checkpoint(
+                                &transaction,
+                                notification.checkpoint_id.as_str(),
+                            )
+                            .await?;
+                            if checkpoint
+                                .as_ref()
+                                .is_none_or(|checkpoint| checkpoint.window_id != previous.id)
+                            {
+                                anyhow::bail!(
+                                    "execution window `{}` cannot continue without exact checkpoint `{}`",
+                                    previous.id,
+                                    notification.checkpoint_id
+                                );
+                            }
+                            self.append_and_project_turn_event_in_transaction(
+                                &transaction,
+                                TurnEventPayload::TurnExecutionWindowContinued(
+                                    notification.clone(),
+                                ),
+                                created_at,
+                                claim_expires_at,
+                                true,
+                            )
+                            .await?;
+                            turn_execution_window::transition_window_status_only(
+                                &transaction,
+                                previous.id.as_str(),
+                                pioneer_protocol::ExecutionWindowStatus::Checkpointed,
+                                pioneer_protocol::ExecutionWindowStatus::Continued,
+                                updated_at,
+                            )
+                            .await?;
+                            turn_execution_window::create_turn_execution_window(
+                                &transaction,
+                                NewTurnExecutionWindowRecord {
+                                    workspace_id: notification.workspace_id,
+                                    thread_id: notification.thread_id,
+                                    turn_id: notification.turn_id,
+                                    window_index: notification.window_index,
+                                    status: pioneer_protocol::ExecutionWindowStatus::Running,
+                                    exhaustion_reason: None,
+                                    agent_round_count: 0,
+                                    tool_call_count: 0,
+                                    provider_token_count: 0,
+                                    metadata_json: serde_json::json!({
+                                        "runtimeWindowId": notification.window_id,
+                                        "createdByContinuationCheckpointId": notification.checkpoint_id,
+                                    }),
+                                    started_at: db_timestamp_from_unix_millis(
+                                        notification.continued_at_unix_ms,
+                                    ),
+                                },
+                                db_timestamp_from_unix_millis(
+                                    notification.continued_at_unix_ms,
+                                ),
+                                updated_at,
+                            )
+                            .await?;
+                        }
+                        NativeExecutionWindowTransition::Blocked {
+                            notification,
+                            stats,
+                        } => {
+                            if notification.status
+                                != pioneer_protocol::ExecutionWindowStatus::Blocked
+                            {
+                                anyhow::bail!(
+                                    "execution-window blocked event has invalid status {:?}",
+                                    notification.status
+                                );
+                            }
+                            let window = require_native_execution_window(
+                                &transaction,
+                                notification.turn_id.as_str(),
+                                notification.window_index,
+                                notification.window_id.as_str(),
+                            )
+                            .await?;
+                            let expected = match window.status {
+                                pioneer_protocol::ExecutionWindowStatus::Running
+                                | pioneer_protocol::ExecutionWindowStatus::Exhausted
+                                | pioneer_protocol::ExecutionWindowStatus::Checkpointed => {
+                                    window.status
+                                }
+                                pioneer_protocol::ExecutionWindowStatus::Blocked => {
+                                    pioneer_protocol::ExecutionWindowStatus::Running
+                                }
+                                status => anyhow::bail!(
+                                    "execution window `{}` cannot be blocked from {:?}",
+                                    window.id,
+                                    status
+                                ),
+                            };
+                            self.append_and_project_turn_event_in_transaction(
+                                &transaction,
+                                TurnEventPayload::TurnExecutionWindowBlocked(notification.clone()),
+                                created_at,
+                                claim_expires_at,
+                                true,
+                            )
+                            .await?;
+                            turn_execution_window::transition_window_with_stats(
+                                &transaction,
+                                window.id.as_str(),
+                                expected,
+                                pioneer_protocol::ExecutionWindowStatus::Blocked,
+                                notification.exhaustion_reason,
+                                stats,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit native execution-window transition")?;
+                        Ok(())
                     }
                     Err(error) => {
                         let _ = transaction.rollback().await;
@@ -10823,6 +11559,7 @@ impl CrudStore {
                         .changed_at_unix
                         .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
                 ),
+                false,
             )
             .await?;
             Ok(event)
@@ -10994,6 +11731,7 @@ impl CrudStore {
                         .changed_at_unix
                         .saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
                 ),
+                false,
             )
             .await?;
             Ok(DeleteTurnMessageResult {
@@ -14712,6 +15450,90 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await
     }
 
+    pub async fn persist_native_skill_audit_bundle(
+        &self,
+        turn_id: &str,
+        records: &[SkillAuditEventRecord],
+        dependency_snapshots: &[SkillDependencySnapshotRecord],
+    ) -> Result<()> {
+        for record in records {
+            if record
+                .turn_id
+                .as_deref()
+                .is_some_and(|value| value != turn_id)
+            {
+                bail!("native skill audit record belongs to a different turn");
+            }
+        }
+        for snapshot in dependency_snapshots {
+            if snapshot
+                .turn_id
+                .as_deref()
+                .is_some_and(|value| value != turn_id)
+            {
+                bail!("native skill dependency snapshot belongs to a different turn");
+            }
+        }
+
+        let audit_deliveries = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                Ok((
+                    native_skill_delivery_id("audit", turn_id, index, record)?,
+                    record.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let dependency_deliveries = dependency_snapshots
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                Ok((
+                    native_skill_delivery_id("dependency", turn_id, index, record)?,
+                    record.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let turn_id = turn_id.to_owned();
+
+        self.run_serialized_write(|| {
+            let audit_deliveries = audit_deliveries.clone();
+            let dependency_deliveries = dependency_deliveries.clone();
+            let turn_id = turn_id.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin native skill audit transaction")?;
+                for (id, record) in &audit_deliveries {
+                    skill_audit_event::insert_skill_audit_event_idempotent(
+                        &transaction,
+                        id,
+                        turn_id.as_str(),
+                        record,
+                    )
+                    .await?;
+                }
+                for (id, record) in &dependency_deliveries {
+                    skill_dependency_snapshot::insert_skill_dependency_snapshot_idempotent(
+                        &transaction,
+                        id,
+                        turn_id.as_str(),
+                        record,
+                    )
+                    .await?;
+                }
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit native skill audit transaction")
+            }
+        })
+        .await
+    }
+
     pub async fn list_turn_skill_audit_event_records(
         &self,
         turn_id: &str,
@@ -17255,7 +18077,43 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<()> {
         let projection_context = TurnEventProjectionContext {
             item_started_deadlines,
+            enqueue_optional_deliveries: false,
         };
+        self.materialize_turn_event_with_projection_context(
+            event,
+            event_timestamp_secs,
+            projection_context,
+        )
+        .await
+    }
+
+    /// Materialize a native-agent causal event and atomically enqueue its
+    /// optional live/episodic consumers. Other runtimes retain their existing
+    /// delivery path and cannot accidentally receive duplicate fan-out.
+    pub async fn materialize_native_agent_turn_event(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+    ) -> Result<()> {
+        let projection_context = TurnEventProjectionContext {
+            item_started_deadlines,
+            enqueue_optional_deliveries: true,
+        };
+        self.materialize_turn_event_with_projection_context(
+            event,
+            event_timestamp_secs,
+            projection_context,
+        )
+        .await
+    }
+
+    async fn materialize_turn_event_with_projection_context(
+        &self,
+        event: TurnEventPayload,
+        event_timestamp_secs: i64,
+        projection_context: TurnEventProjectionContext,
+    ) -> Result<()> {
         let claim_token = generate_id(DB_ID_LEN);
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
@@ -17292,6 +18150,10 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 claim_expires_at,
             )
             .await?;
+
+        if !appended_event.was_inserted {
+            return Ok(());
+        }
 
         let projection = retry_with_backoff(
             || {
@@ -17344,6 +18206,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         "failed to release deferred turn event projection claim; lease expiry will retry it"
                     ),
                 }
+                return Err(TurnEventProjectionAfterAppendError::new(
+                    appended_event.id,
+                    appended_event.turn_id,
+                    appended_event.sequence,
+                    "authoritative projection is waiting for an earlier turn event".to_owned(),
+                    None,
+                )
+                .into());
             }
             Err(error) => {
                 let error_message = format!("{error:#}");
@@ -17468,6 +18338,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     event,
                     created_at,
                     claim_expires_at,
+                    false,
                 )
                 .await
             {
@@ -17490,12 +18361,29 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         event: TurnEventPayload,
         created_at: DateTimeWithTimeZone,
         claim_expires_at: DateTimeWithTimeZone,
+        enqueue_optional_deliveries: bool,
     ) -> Result<()> {
         validate_turn_event_for_permanent_storage(&event).await?;
 
         let projection_context = TurnEventProjectionContext::default();
         let claim_token = generate_id(DB_ID_LEN);
         let appended_event = turn_event::append_event(transaction, &event, created_at).await?;
+        if !appended_event.was_inserted {
+            let state = turn_event_projection_state::find_by_event_id(
+                transaction,
+                appended_event.id.as_str(),
+            )
+            .await?;
+            if state.as_ref().is_some_and(|state| {
+                state.status == turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+            }) {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "idempotent turn event `{}` exists but its authoritative projection is incomplete",
+                appended_event.id
+            );
+        }
         let projection_context_json = serialize_turn_event_projection_context(
             &projection_context,
             appended_event.id.as_str(),
@@ -17514,7 +18402,10 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             },
         )
         .await?;
-
+        if enqueue_optional_deliveries {
+            turn_event_delivery::insert_pending_for_event(transaction, &appended_event, created_at)
+                .await?;
+        }
         if turn_event_projection_state::has_unprojected_predecessor(
             transaction,
             appended_event.turn_id.as_str(),
@@ -17582,6 +18473,28 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             }
         };
 
+        if !appended_event.was_inserted {
+            let state = turn_event_projection_state::find_by_event_id(
+                &transaction,
+                appended_event.id.as_str(),
+            )
+            .await?;
+            let projected = state.as_ref().is_some_and(|state| {
+                state.status == turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+            });
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback idempotent turn event lookup")?;
+            if projected {
+                return Ok(appended_event);
+            }
+            anyhow::bail!(
+                "idempotent turn event `{}` exists but its authoritative projection is incomplete",
+                appended_event.id
+            );
+        }
+
         let projection_context_json = match serialize_turn_event_projection_context(
             &projection_context,
             appended_event.id.as_str(),
@@ -17611,7 +18524,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             let _ = transaction.rollback().await;
             return Err(error);
         }
-
+        if projection_context.enqueue_optional_deliveries
+            && let Err(error) = turn_event_delivery::insert_pending_for_event(
+                &transaction,
+                &appended_event,
+                created_at,
+            )
+            .await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
         transaction
             .commit()
             .await
@@ -19453,6 +20376,7 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
         run_count: model.run_count,
         max_attempts: model.max_attempts,
         scheduled_at_unix: model.scheduled_at.timestamp(),
+        next_run_at_unix: model.next_run_at.timestamp(),
         updated_at_unix: model.updated_at.timestamp(),
         claim_token: model.claim_token,
         active_attempt_id: model.active_attempt_id,
@@ -19466,24 +20390,27 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 mod tests {
     use super::{
         ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BLOCK_KIND_APPROVAL,
-        BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
-        CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter,
-        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
-        CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
-        CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
-        CliRuntimeTurnMcpMetadata, CompletedMessageTurnWrite, ConversationArtifactRefLimits,
-        CrudStore, DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
-        McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
-        NewArtifactBlobRecord, NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent,
-        NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-        NewMemberPrincipalRow, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
+        BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome, CanonicalTurnEventPayload,
+        ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
+        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
+        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
+        CliRuntimeRequestAuthorizationBinding, CliRuntimeThreadMcpMetadata,
+        CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata,
+        CompletedMessageTurnWrite, ConversationArtifactRefLimits, CrudStore,
+        DeleteTurnMessageRequest, EditTurnMessageRequest, IncompleteNativeTurnAdmissionRecord,
+        IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
+        McpServerInstallationRecord, NativeExecutionWindowTransition, NewArtifactBlobRecord,
+        NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
+        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewMemberPrincipalRow,
+        NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PreparedClaudeProviderSessionMode, ProjectionPageAnchor, ResolveCliRuntimePendingRequest,
         SkillAuditEventRecord, SkillDependencySnapshotRecord, SkillInstallationPatch,
         SkillInstallationRecord, SkillPackChildDiff, SkillPackInstallationRecord,
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-        THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
+        THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
+        TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
         ThreadEpisodicCapsuleWriteState, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
@@ -19527,12 +20454,14 @@ mod tests {
         ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
         ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
         ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-        TurnCompletedNotification, TurnExecutionSecuritySnapshot, TurnFilesystemAccess,
-        TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
-        TurnItemType, TurnKind, TurnMention, TurnOrigin, TurnPermissionAuditEventKind,
-        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
-        TurnSandboxMode, TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
-        generate_id,
+        TurnCompletedNotification, TurnExecutionSecuritySnapshot,
+        TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+        TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+        TurnFilesystemAccess, TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload,
+        TurnItemTimeoutReason, TurnItemType, TurnKind, TurnMention, TurnOrigin,
+        TurnPermissionAuditEventKind, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
+        TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
@@ -19632,6 +20561,777 @@ mod tests {
             .expect("turn should persist");
 
         (store, thread, turn)
+    }
+
+    #[tokio::test]
+    async fn native_transcript_sequence_and_delivery_identity_survive_store_restart() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_transcript",
+            "thr_native_transcript",
+            "turn_native_transcript",
+        )
+        .await;
+        let created_at = unix_to_datetime(1_700_000_100);
+        let entry = NewTurnLlmContextEntry {
+            turn_id: "turn_native_transcript".to_owned(),
+            item_id: Some("assistant_round_1".to_owned()),
+            attempt_id: None,
+            sequence: 0,
+            source: "assistant_round".to_owned(),
+            tool_name: None,
+            payload: "{\"round\":1}".to_owned(),
+            output_policy_snapshot: "{}".to_owned(),
+            created_at,
+            expires_at: None,
+        };
+
+        let first = store
+            .append_turn_llm_context(entry.clone(), "delivery_round_1")
+            .await
+            .expect("first transcript delivery should commit");
+        assert_eq!(first.entry.sequence, 1);
+        assert!(!first.already_committed);
+
+        let restarted = CrudStore::new(store.database_connection());
+        let duplicate = restarted
+            .append_turn_llm_context(entry.clone(), "delivery_round_1")
+            .await
+            .expect("ack retry should find its durable delivery");
+        assert_eq!(duplicate.entry.id, first.entry.id);
+        assert!(duplicate.already_committed);
+
+        let second = restarted
+            .append_turn_llm_context(
+                NewTurnLlmContextEntry {
+                    item_id: Some("tool_result_1".to_owned()),
+                    source: "tool_result".to_owned(),
+                    payload: "{\"result\":true}".to_owned(),
+                    ..entry.clone()
+                },
+                "delivery_tool_1",
+            )
+            .await
+            .expect("post-restart transcript delivery should append");
+        assert_eq!(second.entry.sequence, 2);
+        assert_eq!(
+            restarted
+                .list_turn_llm_context("turn_native_transcript")
+                .await
+                .expect("transcript should list")
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let collision = restarted
+            .append_turn_llm_context(
+                NewTurnLlmContextEntry {
+                    payload: "{\"round\":999}".to_owned(),
+                    ..entry
+                },
+                "delivery_round_1",
+            )
+            .await;
+        assert!(
+            collision.is_err(),
+            "a delivery key cannot alias different content"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_durable_delivery_migration_expands_and_rolls_back_cleanly() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        ReversibleMigrator::up(&connection, None)
+            .await
+            .expect("baseline migrations must succeed");
+        Migrator::up(&connection, None)
+            .await
+            .expect("native delivery expansion must succeed");
+
+        for (table_name, column_name) in [
+            ("turn_event", "idempotency_key"),
+            ("turn_llm_context", "delivery_key"),
+        ] {
+            let columns = connection
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    format!("PRAGMA table_info('{table_name}')"),
+                ))
+                .await
+                .expect("column lookup should succeed")
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "name").expect("column name"))
+                .collect::<Vec<_>>();
+            assert!(columns.iter().any(|column| column == column_name));
+        }
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_event_delivery'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("outbox table lookup should succeed")
+                .is_some()
+        );
+
+        Migrator::down(&connection, Some(1))
+            .await
+            .expect("native delivery rollback must succeed");
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_event_delivery'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("outbox table lookup after rollback should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_event_commit_atomically_enqueues_idempotent_optional_deliveries() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_outbox",
+            "thr_native_outbox",
+            "turn_native_outbox",
+        )
+        .await;
+        let event = CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
+            workspace_id: "ws_native_outbox".to_owned(),
+            thread_id: "thr_native_outbox".to_owned(),
+            turn_id: "turn_native_outbox".to_owned(),
+            item: TurnItem::SystemEvent {
+                id: "native_outbox_item".to_owned(),
+                level: SystemEventLevel::Info,
+                message: "committed".to_owned(),
+                code: Some("native.outbox.test".to_owned()),
+                details: None,
+            },
+        });
+
+        store
+            .materialize_native_agent_turn_event(event.clone(), 1_700_000_100, None)
+            .await
+            .expect("native event should commit");
+        store
+            .materialize_native_agent_turn_event(event, 1_700_000_100, None)
+            .await
+            .expect("exact native event replay should be idempotent");
+
+        let rows = pioneer_entity::turn_event_delivery::Entity::find()
+            .filter(
+                pioneer_entity::turn_event_delivery::Column::TurnId
+                    .eq("turn_native_outbox".to_owned()),
+            )
+            .all(&store.connection)
+            .await
+            .expect("outbox rows should list");
+        assert_eq!(
+            rows.len(),
+            2,
+            "live and episodic consumers enqueue once each"
+        );
+        assert!(rows.iter().all(|row| row.status == "pending"));
+
+        let live = store
+            .claim_due_turn_event_deliveries("live_notification", 1_700_000_100, 10)
+            .await
+            .expect("live delivery should claim");
+        assert_eq!(live.len(), 1);
+        assert!(
+            store
+                .complete_turn_event_delivery(
+                    live[0].id.as_str(),
+                    live[0].claim_token.as_str(),
+                    1_700_000_101,
+                )
+                .await
+                .expect("delivery completion should persist")
+        );
+        assert!(
+            store
+                .claim_due_turn_event_deliveries("live_notification", 1_700_000_102, 10)
+                .await
+                .expect("delivered rows should not reclaim")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_optional_delivery_retries_without_reordering_a_turn() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_outbox_order",
+            "thr_native_outbox_order",
+            "turn_native_outbox_order",
+        )
+        .await;
+        for index in 1..=2 {
+            store
+                .materialize_native_agent_turn_event(
+                    CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
+                        workspace_id: "ws_native_outbox_order".to_owned(),
+                        thread_id: "thr_native_outbox_order".to_owned(),
+                        turn_id: "turn_native_outbox_order".to_owned(),
+                        item: TurnItem::SystemEvent {
+                            id: format!("native_outbox_order_{index}"),
+                            level: SystemEventLevel::Info,
+                            message: format!("committed {index}"),
+                            code: Some("native.outbox.order".to_owned()),
+                            details: None,
+                        },
+                    }),
+                    1_700_000_100 + index,
+                    None,
+                )
+                .await
+                .expect("native event should commit with outbox");
+        }
+
+        let first = store
+            .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
+            .await
+            .expect("first delivery should claim");
+        assert_eq!(first.len(), 1, "only the causal predecessor may be claimed");
+        assert!(
+            store
+                .fail_turn_event_delivery(
+                    first[0].id.as_str(),
+                    first[0].claim_token.as_str(),
+                    first[0].attempt_count,
+                    "injected live failure".to_owned(),
+                    1_700_000_110,
+                )
+                .await
+                .expect("failure should persist")
+        );
+        assert!(
+            store
+                .claim_due_turn_event_deliveries("live_notification", 1_700_000_110, 10)
+                .await
+                .expect("backoff lookup should succeed")
+                .is_empty(),
+            "a later event cannot overtake a failed predecessor during backoff"
+        );
+
+        let retried = store
+            .claim_due_turn_event_deliveries("live_notification", 1_700_000_111, 10)
+            .await
+            .expect("failed predecessor should become due");
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].id, first[0].id);
+        assert!(
+            store
+                .complete_turn_event_delivery(
+                    retried[0].id.as_str(),
+                    retried[0].claim_token.as_str(),
+                    1_700_000_111,
+                )
+                .await
+                .expect("retry completion should persist")
+        );
+
+        let successor = store
+            .claim_due_turn_event_deliveries("live_notification", 1_700_000_112, 10)
+            .await
+            .expect("successor lookup should succeed");
+        assert_eq!(successor.len(), 1);
+        assert!(successor[0].event.sequence > retried[0].event.sequence);
+    }
+
+    #[tokio::test]
+    async fn incomplete_native_admission_disappears_only_after_runtime_snapshot_commit() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_admission",
+            "thr_native_admission",
+            "turn_native_admission",
+        )
+        .await;
+        let incomplete = store
+            .list_incomplete_native_turn_admissions(10)
+            .await
+            .expect("incomplete admission scan should succeed");
+        assert_eq!(
+            incomplete,
+            vec![IncompleteNativeTurnAdmissionRecord {
+                thread_id: "thr_native_admission".to_owned(),
+                turn_id: "turn_native_admission".to_owned(),
+            }]
+        );
+
+        let timestamp = unix_to_datetime(1_700_000_100);
+        store
+            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
+                turn_id: "turn_native_admission".to_owned(),
+                thread_id: "thr_native_admission".to_owned(),
+                workspace_id: "ws_native_admission".to_owned(),
+                mode_json: r#""Agent""#.to_owned(),
+                model: "test-model".to_owned(),
+                provider_name: "test-provider".to_owned(),
+                reasoning_effort: None,
+                agent_skill_versions_json: None,
+                hook_runtime_context_json: "{}".to_owned(),
+                workspace_skill_policies_json: "[]".to_owned(),
+                input_json: "[]".to_owned(),
+                capabilities_json: "[]".to_owned(),
+                resolved_artifacts_json: "[]".to_owned(),
+                runtime_environment_json: "{}".to_owned(),
+                history_json: "[]".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("runtime snapshot should commit");
+        assert!(
+            store
+                .list_incomplete_native_turn_admissions(10)
+                .await
+                .expect("completed admission scan should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_execution_window_transition_rejects_gaps_and_rolls_back_invalid_checkpoint() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_window",
+            "thr_native_window",
+            "turn_native_window",
+        )
+        .await;
+        let timestamp = unix_to_datetime(1_700_000_100);
+        let started = TurnExecutionWindowStartedNotification {
+            workspace_id: "ws_native_window".to_owned(),
+            thread_id: "thr_native_window".to_owned(),
+            turn_id: "turn_native_window".to_owned(),
+            window_id: "runtime_window_1".to_owned(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Running,
+            started_at_unix_ms: 1_700_000_100_000,
+        };
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Started {
+                    notification: started.clone(),
+                    window: NewTurnExecutionWindowRecord {
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_1"}),
+                        started_at: timestamp,
+                    },
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                },
+                1_700_000_100,
+            )
+            .await
+            .expect("first execution window should commit atomically");
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Started {
+                    notification: started.clone(),
+                    window: NewTurnExecutionWindowRecord {
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_1"}),
+                        started_at: timestamp,
+                    },
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                },
+                1_700_000_100,
+            )
+            .await
+            .expect("exact start replay should be idempotent");
+
+        let uncontinued_started = TurnExecutionWindowStartedNotification {
+            window_id: "runtime_window_2_without_continuation".to_owned(),
+            window_index: 2,
+            started_at_unix_ms: 1_700_000_101_000,
+            ..started.clone()
+        };
+        let uncontinued = store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Started {
+                    notification: uncontinued_started.clone(),
+                    window: NewTurnExecutionWindowRecord {
+                        workspace_id: uncontinued_started.workspace_id.clone(),
+                        thread_id: uncontinued_started.thread_id.clone(),
+                        turn_id: uncontinued_started.turn_id.clone(),
+                        window_index: uncontinued_started.window_index,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({
+                            "runtimeWindowId": uncontinued_started.window_id,
+                        }),
+                        started_at: timestamp + chrono::Duration::seconds(1),
+                    },
+                    created_at: timestamp + chrono::Duration::seconds(1),
+                    updated_at: timestamp + chrono::Duration::seconds(1),
+                },
+                1_700_000_101,
+            )
+            .await;
+        assert!(
+            uncontinued.is_err(),
+            "a later window must be created by a committed continuation"
+        );
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_native_window")
+                .await
+                .expect("window should reload")
+                .expect("first window should remain")
+                .window_index,
+            1
+        );
+
+        let exhausted = TurnExecutionWindowExhaustedNotification {
+            workspace_id: started.workspace_id.clone(),
+            thread_id: started.thread_id.clone(),
+            turn_id: started.turn_id.clone(),
+            window_id: started.window_id.clone(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Exhausted,
+            exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+            limit: 4,
+            observed: 4,
+            agent_round_count: 2,
+            tool_call_count: 4,
+            provider_token_count: Some(100),
+            started_at_unix_ms: started.started_at_unix_ms,
+            exhausted_at_unix_ms: 1_700_000_110_000,
+            reason: "max_tool_calls".to_owned(),
+        };
+        let stats = TurnExecutionWindowStatsRecord {
+            agent_round_count: 2,
+            tool_call_count: 4,
+            provider_token_count: 100,
+            metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_1"}),
+            completed_at: timestamp + chrono::Duration::seconds(10),
+            updated_at: timestamp + chrono::Duration::seconds(10),
+        };
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Exhausted {
+                    notification: exhausted,
+                    stats,
+                },
+                1_700_000_110,
+            )
+            .await
+            .expect("exhaustion should commit");
+        let window = store
+            .latest_turn_execution_window("turn_native_window")
+            .await
+            .expect("window should load")
+            .expect("window should exist");
+        assert_eq!(window.status, ExecutionWindowStatus::Exhausted);
+
+        let oversized_payload = serde_json::json!({
+            "payload": "x".repeat(TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1)
+        });
+        let checkpoint_notification = TurnExecutionWindowCheckpointedNotification {
+            workspace_id: started.workspace_id.clone(),
+            thread_id: started.thread_id.clone(),
+            turn_id: started.turn_id.clone(),
+            window_id: started.window_id.clone(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Checkpointed,
+            checkpoint_id: "native_checkpoint_1".to_owned(),
+            checkpoint_kind: "window_exhausted".to_owned(),
+            payload_bytes: u64::MAX,
+            created_at_unix_ms: 1_700_000_111_000,
+        };
+        let oversized = store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Checkpointed {
+                    notification: checkpoint_notification.clone(),
+                    checkpoint: NewTurnExecutionCheckpointRecord {
+                        id: Some("native_checkpoint_1".to_owned()),
+                        window_id: String::new(),
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                        payload_json: oversized_payload,
+                        created_at: timestamp + chrono::Duration::seconds(11),
+                    },
+                },
+                1_700_000_111,
+            )
+            .await;
+        assert!(oversized.is_err());
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_native_window")
+                .await
+                .expect("window should reload")
+                .expect("window should remain")
+                .status,
+            ExecutionWindowStatus::Exhausted,
+            "failed checkpoint transaction must not advance authoritative status"
+        );
+
+        let payload = serde_json::json!({"window": 1, "state": "durable"});
+        let mut valid_checkpoint_notification = checkpoint_notification;
+        valid_checkpoint_notification.payload_bytes = u64::try_from(
+            serde_json::to_vec(&payload)
+                .expect("checkpoint payload should encode")
+                .len(),
+        )
+        .expect("checkpoint payload length should fit u64");
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Checkpointed {
+                    notification: valid_checkpoint_notification.clone(),
+                    checkpoint: NewTurnExecutionCheckpointRecord {
+                        id: Some("native_checkpoint_1".to_owned()),
+                        window_id: String::new(),
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                        payload_json: payload,
+                        created_at: timestamp + chrono::Duration::seconds(11),
+                    },
+                },
+                1_700_000_111,
+            )
+            .await
+            .expect("valid checkpoint should commit");
+
+        let same_identity_conflicting_payload =
+            serde_json::json!({"window": 1, "state": "same-id-conflict"});
+        let same_identity_conflicting_notification = TurnExecutionWindowCheckpointedNotification {
+            payload_bytes: u64::try_from(
+                serde_json::to_vec(&same_identity_conflicting_payload)
+                    .expect("same-identity conflicting payload should encode")
+                    .len(),
+            )
+            .expect("checkpoint payload length should fit u64"),
+            ..valid_checkpoint_notification.clone()
+        };
+        let same_identity_conflict = store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Checkpointed {
+                    notification: same_identity_conflicting_notification,
+                    checkpoint: NewTurnExecutionCheckpointRecord {
+                        id: Some("native_checkpoint_1".to_owned()),
+                        window_id: String::new(),
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                        payload_json: same_identity_conflicting_payload,
+                        created_at: timestamp + chrono::Duration::seconds(11),
+                    },
+                },
+                1_700_000_111,
+            )
+            .await;
+        assert!(
+            same_identity_conflict.is_err(),
+            "an idempotency-key replay must match the exact committed payload"
+        );
+
+        let conflicting_payload = serde_json::json!({"window": 1, "state": "conflict"});
+        let conflicting_checkpoint_notification = TurnExecutionWindowCheckpointedNotification {
+            checkpoint_id: "native_checkpoint_2".to_owned(),
+            payload_bytes: u64::try_from(
+                serde_json::to_vec(&conflicting_payload)
+                    .expect("conflicting checkpoint payload should encode")
+                    .len(),
+            )
+            .expect("checkpoint payload length should fit u64"),
+            created_at_unix_ms: 1_700_000_111_500,
+            ..valid_checkpoint_notification
+        };
+        let conflicting_checkpoint = store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Checkpointed {
+                    notification: conflicting_checkpoint_notification,
+                    checkpoint: NewTurnExecutionCheckpointRecord {
+                        id: Some("native_checkpoint_2".to_owned()),
+                        window_id: String::new(),
+                        workspace_id: started.workspace_id.clone(),
+                        thread_id: started.thread_id.clone(),
+                        turn_id: started.turn_id.clone(),
+                        checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                        payload_json: conflicting_payload,
+                        created_at: timestamp + chrono::Duration::milliseconds(11_500),
+                    },
+                },
+                1_700_000_111,
+            )
+            .await;
+        assert!(
+            conflicting_checkpoint.is_err(),
+            "a checkpointed window must reject a second checkpoint identity"
+        );
+        let checkpointed_window = store
+            .latest_turn_execution_window("turn_native_window")
+            .await
+            .expect("window should reload")
+            .expect("window should exist");
+        assert_eq!(
+            store
+                .list_turn_execution_checkpoints_for_window(checkpointed_window.id.as_str())
+                .await
+                .expect("checkpoints should list")
+                .len(),
+            1
+        );
+        let continued = TurnExecutionWindowContinuedNotification {
+            workspace_id: started.workspace_id,
+            thread_id: started.thread_id,
+            turn_id: started.turn_id,
+            window_id: "runtime_window_2".to_owned(),
+            window_index: 2,
+            status: ExecutionWindowStatus::Continued,
+            previous_window_id: started.window_id,
+            previous_window_index: 1,
+            checkpoint_id: "native_checkpoint_1".to_owned(),
+            continued_at_unix_ms: 1_700_000_112_000,
+        };
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Continued {
+                    notification: continued.clone(),
+                    updated_at: timestamp + chrono::Duration::seconds(12),
+                },
+                1_700_000_112,
+            )
+            .await
+            .expect("continuation with exact checkpoint should commit");
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Continued {
+                    notification: continued.clone(),
+                    updated_at: timestamp + chrono::Duration::seconds(12),
+                },
+                1_700_000_112,
+            )
+            .await
+            .expect("exact continuation replay should be idempotent");
+        let next_window = store
+            .latest_turn_execution_window("turn_native_window")
+            .await
+            .expect("window should load")
+            .expect("window should exist");
+        assert_eq!(next_window.window_index, 2);
+        assert_eq!(next_window.status, ExecutionWindowStatus::Running);
+        assert_eq!(
+            next_window
+                .metadata_json
+                .get("createdByContinuationCheckpointId")
+                .and_then(serde_json::Value::as_str),
+            Some("native_checkpoint_1")
+        );
+
+        let second_started = TurnExecutionWindowStartedNotification {
+            workspace_id: continued.workspace_id.clone(),
+            thread_id: continued.thread_id.clone(),
+            turn_id: continued.turn_id.clone(),
+            window_id: continued.window_id.clone(),
+            window_index: continued.window_index,
+            status: ExecutionWindowStatus::Running,
+            started_at_unix_ms: continued.continued_at_unix_ms,
+        };
+        store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Started {
+                    notification: second_started.clone(),
+                    window: NewTurnExecutionWindowRecord {
+                        workspace_id: second_started.workspace_id.clone(),
+                        thread_id: second_started.thread_id.clone(),
+                        turn_id: second_started.turn_id.clone(),
+                        window_index: second_started.window_index,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({
+                            "runtimeWindowId": second_started.window_id.clone(),
+                        }),
+                        started_at: timestamp + chrono::Duration::seconds(12),
+                    },
+                    created_at: timestamp + chrono::Duration::seconds(12),
+                    updated_at: timestamp + chrono::Duration::seconds(12),
+                },
+                1_700_000_112,
+            )
+            .await
+            .expect("started event should attach to the atomically-created continuation window");
+
+        let future_started = TurnExecutionWindowStartedNotification {
+            window_id: "runtime_window_4".to_owned(),
+            window_index: 4,
+            started_at_unix_ms: 1_700_000_114_000,
+            ..second_started
+        };
+        let gap = store
+            .materialize_native_execution_window_transition(
+                NativeExecutionWindowTransition::Started {
+                    notification: future_started.clone(),
+                    window: NewTurnExecutionWindowRecord {
+                        workspace_id: future_started.workspace_id.clone(),
+                        thread_id: future_started.thread_id.clone(),
+                        turn_id: future_started.turn_id.clone(),
+                        window_index: future_started.window_index,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({
+                            "runtimeWindowId": future_started.window_id,
+                        }),
+                        started_at: timestamp + chrono::Duration::seconds(14),
+                    },
+                    created_at: timestamp + chrono::Duration::seconds(14),
+                    updated_at: timestamp + chrono::Duration::seconds(14),
+                },
+                1_700_000_114,
+            )
+            .await;
+        assert!(
+            gap.is_err(),
+            "future window gaps must be negatively acknowledged"
+        );
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_native_window")
+                .await
+                .expect("window should reload")
+                .expect("latest window should remain")
+                .window_index,
+            2
+        );
     }
 
     async fn insert_unread_test_turn(
@@ -24475,19 +26175,23 @@ mod tests {
             hard_deadline_at_unix: Some(timestamp + 301),
         };
 
-        store
-            .materialize_item_started_with_attempt_deadlines(
-                ItemStartedNotification {
+        let deferred_error = store
+            .materialize_native_agent_turn_event(
+                CanonicalTurnEventPayload::ItemStarted(ItemStartedNotification {
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     item: safe_web_fetch_item(item_id),
-                },
+                }),
                 timestamp + 1,
-                deadlines,
+                Some(deadlines),
             )
             .await
-            .expect("durably appended item should be accepted for ordered projection replay");
+            .expect_err("an unapplied authoritative projection must reject its commit ACK");
+        assert!(
+            super::turn_event_was_appended_before_error(&deferred_error),
+            "the rejected ACK must retain the raw event for ordered replay"
+        );
 
         let events = pioneer_entity::turn_event::Entity::find()
             .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
@@ -24499,6 +26203,16 @@ mod tests {
             events.len(),
             2,
             "failed projection must not roll back raw event"
+        );
+        let optional_deliveries = pioneer_entity::turn_event_delivery::Entity::find()
+            .filter(pioneer_entity::turn_event_delivery::Column::EventId.eq(events[1].id.clone()))
+            .all(&store.connection)
+            .await
+            .expect("optional delivery lookup should succeed");
+        assert_eq!(
+            optional_deliveries.len(),
+            1,
+            "native live delivery must commit atomically with the raw event before projection"
         );
 
         let item_state =
@@ -25509,6 +27223,9 @@ mod tests {
         ReversibleMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
+        Migrator::up(&connection, None)
+            .await
+            .expect("latest additive migrations must succeed");
 
         let table = connection
             .query_one_raw(Statement::from_string(
@@ -25540,6 +27257,7 @@ mod tests {
             "tool_name",
             "payload",
             "output_policy_snapshot",
+            "delivery_key",
             "created_at",
             "expires_at",
         ] {
@@ -25570,6 +27288,7 @@ mod tests {
             "uq_turn_llm_context_turn_id_sequence",
             "idx_turn_llm_context_turn_item",
             "idx_turn_llm_context_expires_at",
+            "uq_turn_llm_context_turn_id_delivery_key",
         ] {
             assert!(
                 indexes.iter().any(|(name, _)| name == expected),
@@ -25589,6 +27308,9 @@ mod tests {
             .expect("turn_llm_context entity should match migration columns");
         assert!(rows.is_empty());
 
+        Migrator::down(&connection, Some(1))
+            .await
+            .expect("latest additive migration down should succeed");
         ReversibleMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
@@ -25854,6 +27576,7 @@ mod tests {
 
         let checkpoint = store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: None,
                 window_id: first_window.id.clone(),
                 workspace_id: first_window.workspace_id.clone(),
                 thread_id: first_window.thread_id.clone(),
@@ -25896,6 +27619,7 @@ mod tests {
         });
         let oversized_result = store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: None,
                 window_id: first_window.id.clone(),
                 workspace_id: first_window.workspace_id.clone(),
                 thread_id: first_window.thread_id.clone(),
@@ -28390,6 +30114,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_skill_audit_bundle_is_atomic_and_idempotent() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let turn_id = "turn_native_skill_audit";
+        let skill_id = SkillId::new("N".repeat(21)).expect("valid skill id");
+        let audit = SkillAuditEventRecord {
+            turn_id: Some(turn_id.to_owned()),
+            skill_id: skill_id.clone(),
+            skill_owner: Some("pioneer".to_owned()),
+            skill_slug: "durable-skill".to_owned(),
+            source_kind: "registry".to_owned(),
+            action: "resolve".to_owned(),
+            decision: "accepted".to_owned(),
+            reason_code: None,
+            details_json: r#"{"dependency_diagnostics":[{"name":"tool"}]}"#.to_owned(),
+            created_at_unix: 1_700_000_200,
+        };
+        let dependency = SkillDependencySnapshotRecord {
+            turn_id: Some(turn_id.to_owned()),
+            skill_id,
+            skill_owner: audit.skill_owner.clone(),
+            skill_slug: audit.skill_slug.clone(),
+            source_kind: audit.source_kind.clone(),
+            diagnostics_json: r#"[{"name":"tool"}]"#.to_owned(),
+            created_at_unix: audit.created_at_unix,
+        };
+
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_native_skill_dependency BEFORE INSERT ON skill_dependency_snapshot BEGIN SELECT RAISE(ABORT, 'fault injection'); END",
+            )
+            .await
+            .expect("fault trigger should install");
+        assert!(
+            store
+                .persist_native_skill_audit_bundle(
+                    turn_id,
+                    std::slice::from_ref(&audit),
+                    std::slice::from_ref(&dependency),
+                )
+                .await
+                .is_err(),
+            "dependency failure must reject the whole durable delivery"
+        );
+        assert!(
+            store
+                .list_turn_skill_audit_event_records(turn_id)
+                .await
+                .expect("audit rows should list after rollback")
+                .is_empty(),
+            "audit rows must roll back with the dependency snapshot"
+        );
+
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_native_skill_dependency")
+            .await
+            .expect("fault trigger should drop");
+        for _ in 0..2 {
+            store
+                .persist_native_skill_audit_bundle(
+                    turn_id,
+                    std::slice::from_ref(&audit),
+                    std::slice::from_ref(&dependency),
+                )
+                .await
+                .expect("native skill delivery should commit idempotently");
+        }
+        assert_eq!(
+            store
+                .list_turn_skill_audit_event_records(turn_id)
+                .await
+                .expect("audit rows should list"),
+            vec![audit]
+        );
+        assert_eq!(
+            store
+                .list_turn_skill_dependency_snapshot_records(turn_id)
+                .await
+                .expect("dependency snapshots should list"),
+            vec![dependency]
+        );
+    }
+
+    #[tokio::test]
     async fn skill_history_survives_exact_installation_delete() {
         let connection = Database::connect("sqlite::memory:")
             .await
@@ -28903,6 +30718,8 @@ mod tests {
             turn_id: turn.id.clone(),
             sequence: 1,
             payload,
+            idempotency_key: None,
+            was_inserted: true,
             created_at: unix_to_datetime(timestamp),
         };
 

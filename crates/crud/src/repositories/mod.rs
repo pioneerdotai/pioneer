@@ -57,6 +57,7 @@ pub mod thread_tree;
 pub mod turn;
 pub mod turn_cli_runtime_instruction;
 pub mod turn_event;
+pub mod turn_event_delivery;
 pub mod turn_event_projection_state;
 pub mod turn_execution_window;
 pub mod turn_item_attempt;

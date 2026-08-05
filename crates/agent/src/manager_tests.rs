@@ -4323,7 +4323,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         "empty-no-tool-round",
         provider,
     ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
     let workspace_id = "provider_failure_window_workspace";
     let thread_id = "provider_failure_window_thread";
     let turn_id = "provider_failure_window_turn";
@@ -4412,28 +4412,30 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
     }
     assert!(saw_provider_failure, "provider failure should be emitted");
 
-    manager
-        .start_recovery_attempt(
-            thread_id,
-            RecoveryAttemptRequest {
-                recovery_job_id: "provider_failure_window_job".to_owned(),
-                recovery_attempt_id: "provider_failure_window_attempt".to_owned(),
-                turn_id: turn_id.to_owned(),
-                item_id: "provider_failure_window_reasoning".to_owned(),
-                item_type: TurnItemType::Reasoning,
-                force_non_stream: false,
-                disable_tool_calling: false,
-                disable_image_input: false,
-                refresh_provider_auth: false,
-                compact_history: false,
-                continue_generation: true,
-                model_override: None,
-                retained_provider_history: Vec::new(),
-                execution_checkpoint_context: checkpoint_context,
-            },
-        )
-        .await
-        .expect("provider recovery should start from the checkpoint");
+    let recovery_manager = manager.clone();
+    let recovery_handle = tokio::spawn(async move {
+        recovery_manager
+            .start_recovery_attempt(
+                thread_id,
+                RecoveryAttemptRequest {
+                    recovery_job_id: "provider_failure_window_job".to_owned(),
+                    recovery_attempt_id: "provider_failure_window_attempt".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item_id: "provider_failure_window_reasoning".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    force_non_stream: false,
+                    disable_tool_calling: false,
+                    disable_image_input: false,
+                    refresh_provider_auth: false,
+                    compact_history: false,
+                    continue_generation: true,
+                    model_override: None,
+                    retained_provider_history: Vec::new(),
+                    execution_checkpoint_context: checkpoint_context,
+                },
+            )
+            .await
+    });
 
     let mut saw_continued = false;
     for _ in 0..40 {
@@ -4455,6 +4457,10 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     saw_continued,
                     "recovery must mark the previous window continued before starting the next one"
                 );
+                recovery_handle
+                    .await
+                    .expect("provider recovery task should not panic")
+                    .expect("provider recovery should start from the checkpoint");
                 return;
             }
             _ => {}
@@ -10761,6 +10767,13 @@ async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_
         "provider tools after tools-disabled must not fail the turn"
     );
 
+    timeout(Duration::from_secs(2), async {
+        while provider.snapshot_requests().len() < 4 {
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("continuation should causally schedule the next provider round");
     let requests = provider.snapshot_requests();
     assert!(
         requests.len() >= 4,
@@ -11449,6 +11462,7 @@ async fn start_turn_initializes_first_execution_window_index() {
             Ok(None) => panic!("durable receiver should stay open"),
             Err(_) => continue,
         };
+        durable_events.acknowledge_last(Ok(()));
         if let AgentDurableEvent::TurnExecutionWindowStarted { notification } = event {
             assert_eq!(notification.workspace_id, workspace_id);
             assert_eq!(notification.thread_id, thread_id);
@@ -11561,16 +11575,13 @@ async fn cancel_turn_emits_interrupted_durable_event() {
     advance(Duration::from_millis(800)).await;
     yield_now().await;
 
-    cancel_handle
-        .await
-        .expect("cancel task should not panic")
-        .expect("turn cancellation should succeed");
-
+    let mut saw_interrupted = false;
     for _ in 0..16 {
         let event = timeout(Duration::from_secs(1), durable_events.recv())
             .await
             .expect("durable event should be emitted")
             .expect("durable receiver should stay open");
+        durable_events.acknowledge_last(Ok(()));
         if let AgentDurableEvent::TurnInterrupted {
             thread_id: event_thread_id,
             turn_id: event_turn_id,
@@ -11582,11 +11593,19 @@ async fn cancel_turn_emits_interrupted_durable_event() {
             assert_eq!(event_turn_id, turn_id);
             assert_eq!(reason, "user clicked stop");
             assert!(recovery.is_none());
-            return;
+            saw_interrupted = true;
+            break;
         }
     }
 
-    panic!("turn cancellation should emit TurnInterrupted");
+    assert!(
+        saw_interrupted,
+        "turn cancellation should emit TurnInterrupted"
+    );
+    cancel_handle
+        .await
+        .expect("cancel task should not panic")
+        .expect("turn cancellation should succeed");
 }
 
 #[tokio::test(start_paused = true)]

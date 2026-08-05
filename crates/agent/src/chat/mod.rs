@@ -94,7 +94,7 @@ use pioneer_skills::{
 };
 use pioneer_tools::{
     FinalToolVisibility, PermissionApprovalBroker, PermissionEvaluationContext, PreflightToolIndex,
-    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass,
+    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolEventPayload,
     ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
     ToolLoopRoundAction, ToolNoProgressGuard, ToolNoProgressGuardConfig,
     ToolNoProgressPreflightDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
@@ -108,7 +108,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -120,7 +120,6 @@ const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
 const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
-const TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS: u64 = 250;
 
 fn readable_agent_skill_overlay(
     agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
@@ -140,27 +139,15 @@ fn agent_skill_cards_have_read_path(
     agent_skill_overlay.is_empty() || read_skill_materialized
 }
 
-async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
-    match timeout(
-        Duration::from_millis(TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS),
-        &mut forwarder,
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            if !error.is_cancelled() {
-                error!(error = %error, "tool event forwarder failed during turn shutdown");
-            }
-        }
-        Err(_) => {
-            forwarder.abort();
-            if let Err(error) = forwarder.await
-                && !error.is_cancelled()
-            {
-                error!(error = %error, "tool event forwarder failed after abort");
-            }
-        }
+async fn finish_tool_event_forwarder(
+    forwarder: JoinHandle<Result<(), AgentEventHubError>>,
+) -> Result<(), ChatTurnError> {
+    match forwarder.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(agent_event_error(error)),
+        Err(error) => Err(ChatTurnError::Terminal(format!(
+            "tool event forwarder failed before its durable lifecycle queue drained: {error}"
+        ))),
     }
 }
 
@@ -220,10 +207,8 @@ struct ExecutedToolResult {
 
 struct SpawnedToolTask {
     item_id: String,
-    item_type: TurnItemType,
     tool_name: String,
-    arguments: String,
-    handle: AbortOnDropJoinHandle<ExecutedToolResult>,
+    handle: AbortOnDropJoinHandle<Result<ExecutedToolResult, ChatTurnError>>,
 }
 
 struct AbortOnDropJoinHandle<T> {
@@ -250,32 +235,6 @@ impl<T> Drop for AbortOnDropJoinHandle<T> {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
-    }
-}
-
-fn joined_tool_task_failure_result(
-    item_id: String,
-    item_type: TurnItemType,
-    tool_name: String,
-    arguments: String,
-    error: tokio::task::JoinError,
-) -> ExecutedToolResult {
-    let error_text = format!("tool task join failed: {error}");
-    let tool_error = pioneer_tools::ToolError::internal(error_text.clone());
-    let outcome = classify_tool_error(tool_name.as_str(), &tool_error);
-    ExecutedToolResult {
-        item_id: item_id.clone(),
-        item_type,
-        attempt_number: 1,
-        tool_name: tool_name.clone(),
-        arguments,
-        model_visible_text: error_text.clone(),
-        success: false,
-        outcome: outcome.clone(),
-        recovery_view: None,
-        retained_llm_context: None,
-        request_tools_result: None,
-        message: tooling::build_tool_error_message(item_id, tool_name, error_text, outcome),
     }
 }
 
@@ -992,7 +951,7 @@ async fn emit_durable_event(
     event: AgentDurableEvent,
 ) -> Result<(), ChatTurnError> {
     event_tx
-        .publish_durable(event)
+        .publish_durable_and_wait(event)
         .await
         .map_err(agent_event_error)
 }
@@ -3929,7 +3888,11 @@ async fn execute_agent_provider_response(
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
-    let mut tool_event_rx = tools.event_bus.subscribe();
+    let mut tool_event_rx = tools
+        .event_bus
+        .take_durable_receiver()
+        .expect("native chat owns the tool lifecycle durable receiver");
+    let mut tool_progress_rx = tools.event_bus.subscribe();
 
     let event_tx_for_tools = event_tx.clone();
     let tool_ui_for_events = pending_tool_ui.clone();
@@ -3938,30 +3901,53 @@ async fn execute_agent_provider_response(
     let turn_id_for_tools = turn_id.to_owned();
 
     let tool_event_forwarder = tokio::spawn(async move {
-        loop {
-            match tool_event_rx.recv().await {
-                Ok(event) => {
-                    if let Err(error) = tooling::forward_tool_event_to_agent(
-                        event,
-                        &event_tx_for_tools,
-                        tool_ui_for_events.clone(),
-                        workspace_id_for_tools.as_str(),
-                        thread_id_for_tools.as_str(),
-                        turn_id_for_tools.as_str(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            error = %error,
-                            "failed to publish forwarded tool event"
-                        );
-                        break;
+        let mut durable_open = true;
+        while durable_open {
+            tokio::select! {
+                biased;
+                event = tool_event_rx.recv(), if durable_open => {
+                    match event {
+                        Some(envelope) => {
+                            let result = tooling::forward_tool_event_to_agent(
+                                envelope.event.clone(),
+                                &event_tx_for_tools,
+                                tool_ui_for_events.clone(),
+                                workspace_id_for_tools.as_str(),
+                                thread_id_for_tools.as_str(),
+                                turn_id_for_tools.as_str(),
+                            )
+                            .await;
+                            envelope.acknowledge(
+                                result
+                                    .as_ref()
+                                    .map(|()| ())
+                                    .map_err(ToString::to_string),
+                            );
+                            result?;
+                        }
+                        None => durable_open = false,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                event = tool_progress_rx.recv() => {
+                    match event {
+                        Ok(event) if matches!(&event.payload, ToolEventPayload::OutputDelta(_)) => {
+                            tooling::forward_tool_event_to_agent(
+                                event,
+                                &event_tx_for_tools,
+                                tool_ui_for_events.clone(),
+                                workspace_id_for_tools.as_str(),
+                                thread_id_for_tools.as_str(),
+                                turn_id_for_tools.as_str(),
+                            )
+                            .await?;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    }
+                }
             }
         }
+        Ok::<(), AgentEventHubError>(())
     });
 
     let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
@@ -4977,10 +4963,6 @@ async fn execute_agent_provider_response(
                     let turn_id = turn_id.to_owned();
                     let task_item_id = model_tool_call.id.clone();
                     let task_tool_name = model_tool_call.name.clone();
-                    let task_arguments = model_tool_call.arguments.clone();
-                    let task_item_type =
-                        tooling::tool_item_type_from_name(task_tool_name.as_str());
-
                     // Tool handlers can execute nested tools. Running each model tool call in its
                     // own task keeps nested dispatch from being polled under the full chat-loop
                     // future, whose execution-window state is intentionally large.
@@ -5030,8 +5012,9 @@ async fn execute_agent_provider_response(
                                 let mut pending = pending_tool_ui.lock().await;
                                 pending.remove(item_id.as_str());
                             }
-                            let _ = event_tx
-                                .publish_durable(AgentDurableEvent::ItemStarted {
+                            emit_durable_event(
+                                event_tx.as_ref(),
+                                AgentDurableEvent::ItemStarted {
                                     notification: ItemStartedNotification {
                                         workspace_id: workspace_id.clone(),
                                         thread_id: thread_id.clone(),
@@ -5045,10 +5028,12 @@ async fn execute_agent_provider_response(
                                             None,
                                         ),
                                     },
-                                })
-                                .await;
-                            let _ = event_tx
-                                .publish_durable(AgentDurableEvent::ItemCompleted {
+                                },
+                            )
+                            .await?;
+                            emit_durable_event(
+                                event_tx.as_ref(),
+                                AgentDurableEvent::ItemCompleted {
                                     notification: ItemCompletedNotification {
                                         workspace_id: workspace_id.clone(),
                                         thread_id: thread_id.clone(),
@@ -5064,9 +5049,10 @@ async fn execute_agent_provider_response(
                                             None,
                                         ),
                                     },
-                                })
-                                .await;
-                            return ExecutedToolResult {
+                                },
+                            )
+                            .await?;
+                            return Ok(ExecutedToolResult {
                                 item_id: item_id.clone(),
                                 item_type,
                                 attempt_number,
@@ -5084,7 +5070,7 @@ async fn execute_agent_provider_response(
                                     message,
                                     outcome,
                                 ),
-                            };
+                            });
                         }
 
                         if let Some(descriptor) = runtime_tool_index.get(tool_name.as_str()) {
@@ -5146,8 +5132,9 @@ async fn execute_agent_provider_response(
                                     &pioneer_tools::ToolError::Rejected(error_text.clone()),
                                 );
 
-                                let _ = event_tx
-                                    .publish_durable(AgentDurableEvent::ItemStarted {
+                                emit_durable_event(
+                                    event_tx.as_ref(),
+                                    AgentDurableEvent::ItemStarted {
                                         notification: ItemStartedNotification {
                                             workspace_id: workspace_id.clone(),
                                             thread_id: thread_id.clone(),
@@ -5161,11 +5148,13 @@ async fn execute_agent_provider_response(
                                                 None,
                                             ),
                                         },
-                                    })
-                                    .await;
+                                    },
+                                )
+                                .await?;
 
-                                let _ = event_tx
-                                    .publish_durable(AgentDurableEvent::ItemCompleted {
+                                emit_durable_event(
+                                    event_tx.as_ref(),
+                                    AgentDurableEvent::ItemCompleted {
                                         notification: ItemCompletedNotification {
                                             workspace_id: workspace_id.clone(),
                                             thread_id: thread_id.clone(),
@@ -5181,11 +5170,13 @@ async fn execute_agent_provider_response(
                                                 None,
                                             ),
                                         },
-                                    })
-                                    .await;
+                                    },
+                                )
+                                .await?;
 
-                                let _ = event_tx
-                                    .publish_durable(AgentDurableEvent::SkillAuditEvents {
+                                emit_durable_event(
+                                    event_tx.as_ref(),
+                                    AgentDurableEvent::SkillAuditEvents {
                                         thread_id: thread_id.clone(),
                                         turn_id: turn_id.clone(),
                                         events: vec![protocol_skill_audit_event(
@@ -5212,10 +5203,11 @@ async fn execute_agent_provider_response(
                                                 },
                                             ),
                                         )],
-                                    })
-                                    .await;
+                                    },
+                                )
+                                .await?;
 
-                                return ExecutedToolResult {
+                                return Ok(ExecutedToolResult {
                                     item_id: item_id.clone(),
                                     item_type,
                                     attempt_number,
@@ -5233,7 +5225,7 @@ async fn execute_agent_provider_response(
                                         error_text,
                                         outcome,
                                     ),
-                                };
+                                });
                             }
                         }
 
@@ -5257,8 +5249,9 @@ async fn execute_agent_provider_response(
                                     .map(|configured| configured.output_policy.clone());
                                 let outcome = classify_tool_error(tool_name.as_str(), &error);
                                 if !suppress_partial_unknown_tool_ui {
-                                    let _ = event_tx
-                                        .publish_durable(AgentDurableEvent::ItemStarted {
+                                    emit_durable_event(
+                                        event_tx.as_ref(),
+                                        AgentDurableEvent::ItemStarted {
                                             notification: ItemStartedNotification {
                                                 workspace_id: workspace_id.clone(),
                                                 thread_id: thread_id.clone(),
@@ -5272,10 +5265,12 @@ async fn execute_agent_provider_response(
                                                     None,
                                                 ),
                                             },
-                                        })
-                                        .await;
-                                    let _ = event_tx
-                                        .publish_durable(AgentDurableEvent::ItemCompleted {
+                                        },
+                                    )
+                                    .await?;
+                                    emit_durable_event(
+                                        event_tx.as_ref(),
+                                        AgentDurableEvent::ItemCompleted {
                                             notification: ItemCompletedNotification {
                                                 workspace_id,
                                                 thread_id,
@@ -5291,10 +5286,11 @@ async fn execute_agent_provider_response(
                                                     None,
                                                 ),
                                             },
-                                        })
-                                        .await;
+                                        },
+                                    )
+                                    .await?;
                                 }
-                                return ExecutedToolResult {
+                                return Ok(ExecutedToolResult {
                                     item_id: item_id.clone(),
                                     item_type,
                                     attempt_number,
@@ -5312,7 +5308,7 @@ async fn execute_agent_provider_response(
                                         error_text,
                                         outcome,
                                     ),
-                                };
+                                });
                             }
                         };
 
@@ -5408,7 +5404,7 @@ async fn execute_agent_provider_response(
                                 }
                             };
 
-                        ExecutedToolResult {
+                        Ok(ExecutedToolResult {
                             item_id: item_id.clone(),
                             item_type,
                             attempt_number,
@@ -5421,14 +5417,12 @@ async fn execute_agent_provider_response(
                             retained_llm_context,
                             request_tools_result,
                             message,
-                        }
+                        })
                     });
 
                     SpawnedToolTask {
                         item_id: task_item_id,
-                        item_type: task_item_type,
                         tool_name: task_tool_name,
-                        arguments: task_arguments,
                         handle: AbortOnDropJoinHandle::new(handle),
                     }
                 })
@@ -5443,16 +5437,16 @@ async fn execute_agent_provider_response(
                     async move {
                     let SpawnedToolTask {
                         item_id,
-                        item_type,
                         tool_name,
-                        arguments,
                         handle,
                     } = task;
                     let result = match handle.join().await {
-                        Ok(result) => result,
-                        Err(error) => joined_tool_task_failure_result(
-                            item_id, item_type, tool_name, arguments, error,
-                        ),
+                        Ok(result) => result?,
+                        Err(error) => {
+                            return Err(ChatTurnError::Terminal(format!(
+                                "tool task `{tool_name}` (`{item_id}`) failed before durable completion: {error}"
+                            )));
+                        }
                     };
                     persist_retained_tool_result(
                         event_tx.as_ref(),
@@ -5470,6 +5464,15 @@ async fn execute_agent_provider_response(
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+            if tool_event_forwarder.is_finished() {
+                return Err((
+                    ChatTurnError::Terminal(
+                        "tool event forwarder stopped before the durable lifecycle queue drained"
+                            .to_owned(),
+                    ),
+                    current_thinking_id.clone(),
+                ));
+            }
             window_stats.record_executed_tools(&executed_results);
 
             apply_request_tools_results_to_visible_tools(
@@ -5638,11 +5641,12 @@ async fn execute_agent_provider_response(
     skill_tool_materialization
         .clear_function_proxy_runtime()
         .await;
+    tools.event_bus.close_durable_lane();
     drop(runtime);
     drop(router);
     drop(tools);
 
-    finish_tool_event_forwarder(tool_event_forwarder).await;
+    finish_tool_event_forwarder(tool_event_forwarder).await?;
 
     match turn_result {
         Ok(AgentProviderLoopOutcome::Completed) => {
@@ -6308,6 +6312,7 @@ mod tests {
                 warning_emitted: true,
                 exhausted: true,
             }],
+            truncated: false,
         };
         let continuation = build_execution_window_continuation(
             "workspace",

@@ -87,6 +87,7 @@ pub mod turn_cli_runtime_binding;
 pub mod turn_cli_runtime_execution_segment;
 pub mod turn_cli_runtime_instruction;
 pub mod turn_event;
+pub mod turn_event_delivery;
 pub mod turn_event_projection_state;
 pub mod turn_execution_checkpoint;
 pub mod turn_execution_window;

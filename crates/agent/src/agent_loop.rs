@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error};
 
 const TURN_CANCEL_GRACE_MS: u64 = 750;
@@ -217,6 +217,18 @@ pub(super) async fn run_agent_loop(
     let mut last_turn_observation: Option<(String, super::ExecutionTurnObservation)> = None;
     let mut next_turn_run_id: u64 = 1;
 
+    macro_rules! commit_or_stop {
+        ($event:expr $(,)?) => {
+            if !publish_loop_durable_event(event_hub.as_ref(), $event).await {
+                error!(
+                    thread_id = %thread_id,
+                    "stopping agent loop after durable event commit was exhausted"
+                );
+                return;
+            }
+        };
+    }
+
     while let Some(command) = command_rx.recv().await {
         match command {
             AgentCommand::StartTurn {
@@ -344,7 +356,6 @@ pub(super) async fn run_agent_loop(
                 active_turn_task = None;
                 active_turn_control = None;
                 active_turn_run_id = None;
-                active_recovery = None;
 
                 let TurnTaskCompletion {
                     result,
@@ -360,17 +371,14 @@ pub(super) async fn run_agent_loop(
                                 message: None,
                             },
                         ));
+                        commit_or_stop!(AgentDurableEvent::TurnCompleted {
+                            thread_id: thread_id.clone(),
+                            turn_id,
+                            recovery,
+                        },);
                         active_turn_id = None;
                         active_turn_request = None;
-                        publish_loop_durable_event(
-                            event_hub.as_ref(),
-                            AgentDurableEvent::TurnCompleted {
-                                thread_id: thread_id.clone(),
-                                turn_id,
-                                recovery,
-                            },
-                        )
-                        .await;
+                        active_recovery = None;
                         maybe_dispatch_post_turn_hook(
                             hook_runtime.clone(),
                             post_turn_hook_dispatch_policy,
@@ -398,50 +406,42 @@ pub(super) async fn run_agent_loop(
                                     message: Some(blocked_reason.clone()),
                                 },
                             ));
+                            commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
+                                notification: TurnExecutionWindowBlockedNotification {
+                                    workspace_id: workspace_id.clone(),
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    window_id: continuation.exhausted_window_id.clone(),
+                                    window_index: continuation
+                                        .checkpoint_payload
+                                        .window
+                                        .window_index,
+                                    status: ExecutionWindowStatus::Blocked,
+                                    exhaustion_reason: Some(continuation.reason),
+                                    checkpoint_id: Some(continuation.checkpoint_id.clone()),
+                                    total_windows: continuation
+                                        .checkpoint_payload
+                                        .window
+                                        .window_index,
+                                    total_tool_calls: continuation
+                                        .checkpoint_payload
+                                        .tools
+                                        .total_count,
+                                    reason: blocked_reason.clone(),
+                                    blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
+                                },
+                            },);
+                            commit_or_stop!(AgentDurableEvent::TurnBlocked {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                reason: blocked_reason,
+                                recovery,
+                            },);
                             active_turn_id = None;
                             active_turn_run_id = None;
                             active_turn_control = None;
                             active_turn_request = None;
                             active_recovery = None;
-                            publish_loop_durable_event(
-                                event_hub.as_ref(),
-                                AgentDurableEvent::TurnExecutionWindowBlocked {
-                                    notification: TurnExecutionWindowBlockedNotification {
-                                        workspace_id: workspace_id.clone(),
-                                        thread_id: thread_id.clone(),
-                                        turn_id: turn_id.clone(),
-                                        window_id: continuation.exhausted_window_id.clone(),
-                                        window_index: continuation
-                                            .checkpoint_payload
-                                            .window
-                                            .window_index,
-                                        status: ExecutionWindowStatus::Blocked,
-                                        exhaustion_reason: Some(continuation.reason),
-                                        checkpoint_id: Some(continuation.checkpoint_id.clone()),
-                                        total_windows: continuation
-                                            .checkpoint_payload
-                                            .window
-                                            .window_index,
-                                        total_tool_calls: continuation
-                                            .checkpoint_payload
-                                            .tools
-                                            .total_count,
-                                        reason: blocked_reason.clone(),
-                                        blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
-                                    },
-                                },
-                            )
-                            .await;
-                            publish_loop_durable_event(
-                                event_hub.as_ref(),
-                                AgentDurableEvent::TurnBlocked {
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    reason: blocked_reason,
-                                    recovery,
-                                },
-                            )
-                            .await;
                             continue;
                         };
                         let total_budget = tool_loop_config.execution_windows.total.normalized();
@@ -464,50 +464,41 @@ pub(super) async fn run_agent_loop(
                                         message: Some(blocked_reason.clone()),
                                     },
                                 ));
+                                commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
+                                    notification: TurnExecutionWindowBlockedNotification {
+                                        workspace_id: workspace_id.clone(),
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        window_id: continuation.exhausted_window_id.clone(),
+                                        window_index: continuation
+                                            .checkpoint_payload
+                                            .window
+                                            .window_index,
+                                        status: ExecutionWindowStatus::Blocked,
+                                        exhaustion_reason: Some(
+                                            total_budget_block_exhaustion_reason(
+                                                block.kind,
+                                                continuation.reason,
+                                            ),
+                                        ),
+                                        checkpoint_id: Some(continuation.checkpoint_id.clone()),
+                                        total_windows: block.total_windows,
+                                        total_tool_calls: block.total_tool_calls,
+                                        reason: block.reason,
+                                        blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
+                                    },
+                                },);
+                                commit_or_stop!(AgentDurableEvent::TurnBlocked {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    reason: blocked_reason,
+                                    recovery,
+                                },);
                                 active_turn_id = None;
                                 active_turn_run_id = None;
                                 active_turn_control = None;
                                 active_turn_request = None;
                                 active_recovery = None;
-                                publish_loop_durable_event(
-                                    event_hub.as_ref(),
-                                    AgentDurableEvent::TurnExecutionWindowBlocked {
-                                        notification: TurnExecutionWindowBlockedNotification {
-                                            workspace_id: workspace_id.clone(),
-                                            thread_id: thread_id.clone(),
-                                            turn_id: turn_id.clone(),
-                                            window_id: continuation.exhausted_window_id.clone(),
-                                            window_index: continuation
-                                                .checkpoint_payload
-                                                .window
-                                                .window_index,
-                                            status: ExecutionWindowStatus::Blocked,
-                                            exhaustion_reason: Some(
-                                                total_budget_block_exhaustion_reason(
-                                                    block.kind,
-                                                    continuation.reason,
-                                                ),
-                                            ),
-                                            checkpoint_id: Some(continuation.checkpoint_id.clone()),
-                                            total_windows: block.total_windows,
-                                            total_tool_calls: block.total_tool_calls,
-                                            reason: block.reason,
-                                            blocked_at_unix_ms: chrono::Local::now()
-                                                .timestamp_millis(),
-                                        },
-                                    },
-                                )
-                                .await;
-                                publish_loop_durable_event(
-                                    event_hub.as_ref(),
-                                    AgentDurableEvent::TurnBlocked {
-                                        thread_id: thread_id.clone(),
-                                        turn_id: turn_id.clone(),
-                                        reason: blocked_reason,
-                                        recovery,
-                                    },
-                                )
-                                .await;
                                 continue;
                             }
                         };
@@ -542,18 +533,15 @@ pub(super) async fn run_agent_loop(
                                         message: Some(failure_message.clone()),
                                     },
                                 ));
+                                commit_or_stop!(AgentDurableEvent::TurnFailed {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    error: failure_message,
+                                    recovery,
+                                },);
                                 active_turn_id = None;
                                 active_turn_request = None;
-                                publish_loop_durable_event(
-                                    event_hub.as_ref(),
-                                    AgentDurableEvent::TurnFailed {
-                                        thread_id: thread_id.clone(),
-                                        turn_id: turn_id.clone(),
-                                        error: failure_message,
-                                        recovery,
-                                    },
-                                )
-                                .await;
+                                active_recovery = None;
                                 continue;
                             }
                         };
@@ -563,27 +551,23 @@ pub(super) async fn run_agent_loop(
                         let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                         let next_window_id = format!("{turn_id}:window:{next_window_index}");
 
-                        publish_loop_durable_event(
-                            event_hub.as_ref(),
-                            AgentDurableEvent::TurnExecutionWindowContinued {
-                                notification: TurnExecutionWindowContinuedNotification {
-                                    workspace_id: workspace_id.clone(),
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    window_id: next_window_id,
-                                    window_index: next_window_index,
-                                    status: ExecutionWindowStatus::Continued,
-                                    previous_window_id: continuation.exhausted_window_id.clone(),
-                                    previous_window_index: continuation
-                                        .checkpoint_payload
-                                        .window
-                                        .window_index,
-                                    checkpoint_id: continuation.checkpoint_id.clone(),
-                                    continued_at_unix_ms: chrono::Local::now().timestamp_millis(),
-                                },
+                        commit_or_stop!(AgentDurableEvent::TurnExecutionWindowContinued {
+                            notification: TurnExecutionWindowContinuedNotification {
+                                workspace_id: workspace_id.clone(),
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                window_id: next_window_id,
+                                window_index: next_window_index,
+                                status: ExecutionWindowStatus::Continued,
+                                previous_window_id: continuation.exhausted_window_id.clone(),
+                                previous_window_index: continuation
+                                    .checkpoint_payload
+                                    .window
+                                    .window_index,
+                                checkpoint_id: continuation.checkpoint_id.clone(),
+                                continued_at_unix_ms: chrono::Local::now().timestamp_millis(),
                             },
-                        )
-                        .await;
+                        },);
 
                         active_turn_id = Some(turn_id.clone());
                         active_turn_run_id = Some(run_id);
@@ -621,25 +605,22 @@ pub(super) async fn run_agent_loop(
                                 message: Some(error.clone()),
                             },
                         ));
+                        let error_for_dispatch = error.clone();
+                        commit_or_stop!(AgentDurableEvent::TurnFailed {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            error,
+                            recovery,
+                        },);
                         active_turn_id = None;
                         active_turn_request = None;
+                        active_recovery = None;
                         cleanup_attached_tasks(
                             task_tool_provider.as_ref(),
                             workspace_id.as_str(),
                             thread_id.as_str(),
                             turn_id.as_str(),
-                            format!("parent turn failed: {error}"),
-                        )
-                        .await;
-                        let error_for_dispatch = error.clone();
-                        publish_loop_durable_event(
-                            event_hub.as_ref(),
-                            AgentDurableEvent::TurnFailed {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                error,
-                                recovery,
-                            },
+                            format!("parent turn failed: {error_for_dispatch}"),
                         )
                         .await;
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
@@ -668,19 +649,16 @@ pub(super) async fn run_agent_loop(
                                 message: Some(reason.clone()),
                             },
                         ));
+                        let reason_for_dispatch = reason.clone();
+                        commit_or_stop!(AgentDurableEvent::TurnBlocked {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            reason,
+                            recovery,
+                        },);
                         active_turn_id = None;
                         active_turn_request = None;
-                        let reason_for_dispatch = reason.clone();
-                        publish_loop_durable_event(
-                            event_hub.as_ref(),
-                            AgentDurableEvent::TurnBlocked {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                reason,
-                                recovery,
-                            },
-                        )
-                        .await;
+                        active_recovery = None;
                         let blocked_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
                                 workspace_id.as_str(),
@@ -705,26 +683,23 @@ pub(super) async fn run_agent_loop(
                         failure,
                     }) => {
                         last_turn_request = turn_request_snapshot.clone();
-                        active_turn_id = None;
-                        active_turn_request = None;
                         let failure_message = failure.message.clone().unwrap_or_else(|| {
                             format!(
                                 "provider failure: {:?} during {:?}",
                                 failure.class, failure.stage
                             )
                         });
-                        publish_loop_durable_event(
-                            event_hub.as_ref(),
-                            AgentDurableEvent::ProviderFailureDetected {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                item_id,
-                                item_type,
-                                failure,
-                                recovery,
-                            },
-                        )
-                        .await;
+                        commit_or_stop!(AgentDurableEvent::ProviderFailureDetected {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id,
+                            item_type,
+                            failure,
+                            recovery,
+                        },);
+                        active_turn_id = None;
+                        active_turn_request = None;
+                        active_recovery = None;
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
                                 workspace_id.as_str(),
@@ -760,16 +735,12 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
+                commit_or_stop!(AgentDurableEvent::RecoveryAttemptSucceeded {
+                    thread_id: thread_id.clone(),
+                    turn_id,
+                    recovery,
+                },);
                 active_recovery = None;
-                publish_loop_durable_event(
-                    event_hub.as_ref(),
-                    AgentDurableEvent::RecoveryAttemptSucceeded {
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        recovery,
-                    },
-                )
-                .await;
             }
             AgentCommand::CancelAttempt {
                 turn_id,
@@ -834,7 +805,7 @@ pub(super) async fn run_agent_loop(
                     }
                 }
                 let turn_request_snapshot = active_turn_request.clone();
-                let recovery = active_recovery.take();
+                let recovery = active_recovery.clone();
                 last_turn_observation = Some((
                     turn_id.clone(),
                     super::ExecutionTurnObservation {
@@ -842,31 +813,27 @@ pub(super) async fn run_agent_loop(
                         message: Some(reason.clone()),
                     },
                 ));
+                let reason_for_dispatch = reason.clone();
+                commit_or_stop!(AgentDurableEvent::TurnInterrupted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    reason,
+                    recovery,
+                },);
                 active_turn_id = None;
                 active_turn_control = None;
                 active_turn_request = None;
                 active_turn_run_id = None;
-
-                let _ = ack.send(Ok(()));
+                active_recovery = None;
                 cleanup_attached_tasks(
                     task_tool_provider.as_ref(),
                     workspace_id.as_str(),
                     thread_id.as_str(),
                     turn_id.as_str(),
-                    format!("parent turn cancelled: {reason}"),
+                    format!("parent turn cancelled: {reason_for_dispatch}"),
                 )
                 .await;
-                let reason_for_dispatch = reason.clone();
-                publish_loop_durable_event(
-                    event_hub.as_ref(),
-                    AgentDurableEvent::TurnInterrupted {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        reason,
-                        recovery,
-                    },
-                )
-                .await;
+                let _ = ack.send(Ok(()));
                 let interrupted_dispatch = synthesize_post_turn_failure_dispatch(
                     workspace_id.as_str(),
                     thread_id.as_str(),
@@ -1447,9 +1414,39 @@ async fn execute_turn_flow(
     }
 }
 
-async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurableEvent) {
-    if let Err(error) = event_hub.publish_durable(event).await {
-        error!(error = %error, "failed to publish durable agent loop event");
+async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurableEvent) -> bool {
+    const COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let result = timeout(
+            COMMIT_ATTEMPT_TIMEOUT,
+            event_hub.publish_durable_and_wait(event.clone()),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => return true,
+            Ok(Err(error)) => error!(
+                attempt,
+                error = %error,
+                "durable agent-loop event remains pending after rejected commit"
+            ),
+            Err(_) => error!(
+                attempt,
+                timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
+                "durable agent-loop event remains pending after commit attempt timed out"
+            ),
+        }
+
+        // A terminal/checkpoint boundary cannot be abandoned or converted to
+        // process-local success. Retry indefinitely across transient listener
+        // and database outages, but cap the cadence so an unavailable sink does
+        // not create a hot no-progress loop. Each retry has stable event
+        // identity and is safe after an unknown commit result.
+        let delay_ms = 100_u64
+            .saturating_mul(1_u64 << attempt.saturating_sub(1).min(8))
+            .min(30_000);
+        sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -1467,7 +1464,7 @@ async fn publish_recovery_execution_window_continued(
         .max(context.next_window_index());
 
     event_hub
-        .publish_durable(AgentDurableEvent::TurnExecutionWindowContinued {
+        .publish_durable_and_wait(AgentDurableEvent::TurnExecutionWindowContinued {
             notification: TurnExecutionWindowContinuedNotification {
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),

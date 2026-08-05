@@ -352,6 +352,22 @@ impl ThreadEpisodicIngestor for RecordingThreadEpisodicIngestor {
     }
 }
 
+async fn wait_for_episodic_ingestor_calls(
+    ingestor: &RecordingThreadEpisodicIngestor,
+    expected: usize,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if ingestor.calls.lock().await.len() >= expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("optional episodic outbox delivery should complete");
+}
+
 #[derive(Default)]
 struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
@@ -16601,27 +16617,25 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .await
         .expect("execution query should succeed")
         .expect("task run execution should exist");
-    initial_processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
-            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                window_id: "task_recovery_window_1".to_owned(),
-                window_index: 1,
-                status: ExecutionWindowStatus::Running,
-                started_at_unix_ms: 1_000,
-            },
-        })
+    let running_window = crud_store
+        .latest_turn_execution_window(lineage.child_turn_id.as_str())
         .await;
+    let running_window = running_window
+        .expect("running child window should load")
+        .expect("hanging child should have an active execution window");
+    let runtime_window_id = running_window.metadata_json["runtimeWindowId"]
+        .as_str()
+        .expect("active child window should preserve its runtime id")
+        .to_owned();
+    let runtime_window_index = running_window.window_index;
     initial_processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
             notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
                 workspace_id: workspace_id.clone(),
                 thread_id: lineage.child_thread_id.clone(),
                 turn_id: lineage.child_turn_id.clone(),
-                window_id: "task_recovery_window_1".to_owned(),
-                window_index: 1,
+                window_id: runtime_window_id.clone(),
+                window_index: runtime_window_index,
                 status: ExecutionWindowStatus::Exhausted,
                 exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
                 limit: 3,
@@ -16647,8 +16661,8 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             attachment_kinds: Vec::new(),
         },
         pioneer_protocol::ExecutionCheckpointWindowSummary {
-            window_id: Some("task_recovery_window_1".to_owned()),
-            window_index: 1,
+            window_id: Some(runtime_window_id.clone()),
+            window_index: runtime_window_index,
             started_at_unix_ms: Some(1_000),
             completed_at_unix_ms: Some(2_000),
             agent_round_count: 2,
@@ -16681,18 +16695,21 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         },
         Vec::new(),
     );
+    let checkpoint_payload_bytes = serde_json::to_vec(&checkpoint_payload)
+        .expect("checkpoint payload should serialize")
+        .len() as u64;
     initial_processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
             notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
                 workspace_id: workspace_id.clone(),
                 thread_id: lineage.child_thread_id.clone(),
                 turn_id: lineage.child_turn_id.clone(),
-                window_id: "task_recovery_window_1".to_owned(),
-                window_index: 1,
+                window_id: runtime_window_id,
+                window_index: runtime_window_index,
                 status: ExecutionWindowStatus::Checkpointed,
                 checkpoint_id: "task_recovery_checkpoint_1".to_owned(),
                 checkpoint_kind: "window_exhausted".to_owned(),
-                payload_bytes: 512,
+                payload_bytes: checkpoint_payload_bytes,
                 created_at_unix_ms: 2_050,
             },
             payload: checkpoint_payload,
@@ -16960,6 +16977,15 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
         provider.child_main_call_count() > 0,
         "child provider should be hanging before synthetic window block"
     );
+    let running_window = crud_store
+        .latest_turn_execution_window(lineage.child_turn_id.as_str())
+        .await
+        .expect("running child window should load")
+        .expect("hanging child should have an active execution window");
+    let runtime_window_id = running_window.metadata_json["runtimeWindowId"]
+        .as_str()
+        .expect("active child window should preserve its runtime id")
+        .to_owned();
 
     processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowBlocked {
@@ -16967,12 +16993,12 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
                 workspace_id: workspace_id.clone(),
                 thread_id: lineage.child_thread_id.clone(),
                 turn_id: lineage.child_turn_id.clone(),
-                window_id: "task_blocked_window_1".to_owned(),
-                window_index: 1,
+                window_id: runtime_window_id,
+                window_index: running_window.window_index,
                 status: ExecutionWindowStatus::Blocked,
                 exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
                 checkpoint_id: Some("task_blocked_checkpoint_1".to_owned()),
-                total_windows: 1,
+                total_windows: running_window.window_index,
                 total_tool_calls: 16,
                 reason: "total budget exhausted".to_owned(),
                 blocked_at_unix_ms: 2_000,
@@ -23031,34 +23057,64 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
             arguments: "{}".to_owned(),
         }],
     );
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnProviderHistoryAppended {
-            thread_id: "thread_llm_ctx".to_owned(),
-            turn_id: "turn_llm_ctx".to_owned(),
-            item_id: "reasoning_llm_ctx".to_owned(),
-            sequence: 0,
-            payload: serde_json::to_value(assistant_round).unwrap(),
-        })
-        .await;
+    let assistant_round_payload = serde_json::to_value(&assistant_round).unwrap();
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::TurnProviderHistoryAppended {
+                thread_id: "thread_llm_ctx".to_owned(),
+                turn_id: "turn_llm_ctx".to_owned(),
+                item_id: "reasoning_llm_ctx".to_owned(),
+                sequence: 0,
+                payload: assistant_round_payload.clone(),
+            })
+            .await
+    );
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::TurnProviderHistoryAppended {
+                thread_id: "thread_llm_ctx".to_owned(),
+                turn_id: "turn_llm_ctx".to_owned(),
+                item_id: "reasoning_llm_ctx".to_owned(),
+                sequence: 0,
+                payload: assistant_round_payload,
+            })
+            .await,
+        "an exact provider-history replay must be idempotent"
+    );
 
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnLlmContextAppended {
-            thread_id: "thread_llm_ctx".to_owned(),
-            turn_id: "turn_llm_ctx".to_owned(),
-            item_id: "item_llm_ctx".to_owned(),
-            attempt_id: Some("1".to_owned()),
-            sequence: 7,
-            source: "tool_result".to_owned(),
-            tool_name: "read_file".to_owned(),
-            payload: ToolResultView::Json {
-                value: json!({
-                    "output": "SECRET_LLM_CONTEXT_SENTINEL"
-                }),
-                truncated: false,
-            },
-            output_policy_snapshot: ToolOutputPolicySnapshot::for_tool_name("read_file"),
-        })
-        .await;
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::TurnLlmContextAppended {
+                thread_id: "thread_llm_ctx".to_owned(),
+                turn_id: "turn_llm_ctx".to_owned(),
+                item_id: "item_llm_ctx".to_owned(),
+                attempt_id: Some("1".to_owned()),
+                sequence: 7,
+                source: "tool_result".to_owned(),
+                tool_name: "read_file".to_owned(),
+                payload: ToolResultView::Json {
+                    value: json!({
+                        "output": "SECRET_LLM_CONTEXT_SENTINEL"
+                    }),
+                    truncated: false,
+                },
+                output_policy_snapshot: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+            })
+            .await
+    );
+
+    assert!(
+        !processor
+            .handle_durable_agent_event(AgentDurableEvent::TurnProviderHistoryAppended {
+                thread_id: "thread_llm_ctx".to_owned(),
+                turn_id: "turn_llm_ctx".to_owned(),
+                item_id: "reasoning_llm_ctx".to_owned(),
+                sequence: 0,
+                payload: serde_json::json!({"conflicting": true}),
+            })
+            .await,
+        "the same provider-history identity must reject conflicting content"
+    );
 
     let rows = crud_store
         .list_turn_llm_context("turn_llm_ctx")
@@ -23338,6 +23394,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
         "committed durable event must already be persisted in the read model"
     );
 
+    wait_for_episodic_ingestor_calls(ingestor.as_ref(), 1).await;
     let calls = ingestor.calls.lock().await;
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
@@ -23427,7 +23484,8 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
             }],
             &[],
         )
-        .await;
+        .await
+        .expect("user message lifecycle should persist");
 
     let item_events = crud_store
         .get_turn_item_events(thread_id, turn_id)
@@ -23445,6 +23503,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
         "user message must be committed before thread episodic ingestion is observed"
     );
 
+    wait_for_episodic_ingestor_calls(ingestor.as_ref(), 1).await;
     let calls = ingestor.calls.lock().await;
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
@@ -23603,7 +23662,8 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
             }],
             &[],
         )
-        .await;
+        .await
+        .expect("user message lifecycle should persist");
 
     let item_events = crud_store
         .get_turn_item_events(thread_id, turn_id)
@@ -23621,6 +23681,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
         "user message must still be committed after profile audit event"
     );
 
+    wait_for_episodic_ingestor_calls(ingestor.as_ref(), 1).await;
     let calls = ingestor.calls.lock().await;
     assert_eq!(calls.len(), 1);
 }
@@ -23767,6 +23828,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
         )),
         "ingestion failure must not roll back durable item persistence"
     );
+    wait_for_episodic_ingestor_calls(ingestor.as_ref(), 1).await;
     assert_eq!(ingestor.calls.lock().await.len(), 1);
 }
 
@@ -24223,6 +24285,9 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
         },
         Vec::new(),
     );
+    let checkpoint_payload_bytes = serde_json::to_vec(&checkpoint_payload)
+        .expect("checkpoint payload should serialize")
+        .len() as u64;
 
     processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
@@ -24235,7 +24300,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 status: ExecutionWindowStatus::Checkpointed,
                 checkpoint_id: "checkpoint_1".to_owned(),
                 checkpoint_kind: "window_exhausted".to_owned(),
-                payload_bytes: 512,
+                payload_bytes: checkpoint_payload_bytes,
                 created_at_unix_ms: 2_050,
             },
             payload: checkpoint_payload.clone(),
@@ -24311,29 +24376,11 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             payload: oversized_payload,
         })
         .await;
-    let oversized_checkpointed_live_payload = recv_text_timeout_context(
-        &mut rx,
-        Duration::from_secs(2),
-        "oversized turn/execution_window/checkpointed live notification",
-    )
-    .await;
-    let oversized_checkpointed_live_rpc: JsonRpcNotification =
-        serde_json::from_str(&oversized_checkpointed_live_payload)
-            .expect("oversized checkpointed notification should decode");
-    assert_eq!(
-        oversized_checkpointed_live_rpc.method,
-        events::TURN_EXECUTION_WINDOW_CHECKPOINTED
-    );
-    let oversized_checkpointed_live_params = oversized_checkpointed_live_rpc
-        .params
-        .expect("oversized checkpointed notification should include params");
-    assert_eq!(
-        oversized_checkpointed_live_params["checkpoint_id"],
-        "checkpoint_oversized"
-    );
     assert!(
-        oversized_checkpointed_live_params.get("payload").is_none(),
-        "oversized checkpoint payload must not be forwarded in live notification"
+        tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .is_err(),
+        "an oversized rejected checkpoint must not be published as committed"
     );
     assert_eq!(
         crud_store
@@ -24380,12 +24427,17 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
     assert_eq!(continued_live_params["turn_id"], turn_id);
     assert_eq!(continued_live_params["window_id"], "runtime_win_2");
     assert_eq!(continued_live_params["window_index"], 2);
-    let continued = crud_store
-        .latest_turn_execution_window(turn_id)
+    let continued_windows = crud_store
+        .list_turn_execution_windows(turn_id)
         .await
-        .expect("latest continued window should load")
-        .expect("continued window should exist");
-    assert_eq!(continued.status, ExecutionWindowStatus::Continued);
+        .expect("continued windows should load");
+    assert_eq!(continued_windows.len(), 2);
+    assert_eq!(
+        continued_windows[0].status,
+        ExecutionWindowStatus::Continued
+    );
+    assert_eq!(continued_windows[1].window_index, 2);
+    assert_eq!(continued_windows[1].status, ExecutionWindowStatus::Running);
 
     processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowBlocked {
@@ -24393,27 +24445,30 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                window_id: "runtime_win_1".to_owned(),
-                window_index: 1,
+                window_id: "runtime_win_2".to_owned(),
+                window_index: 2,
                 status: ExecutionWindowStatus::Blocked,
                 exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
                 checkpoint_id: Some("checkpoint_1".to_owned()),
-                total_windows: 1,
+                total_windows: 2,
                 total_tool_calls: 3,
                 reason: "total budget exhausted".to_owned(),
                 blocked_at_unix_ms: 2_200,
             },
         })
         .await;
-    let turn_blocked_live_payload = recv_text_timeout_context(
-        &mut rx,
-        Duration::from_secs(2),
-        "turn/blocked live notification",
-    )
-    .await;
-    let turn_blocked_live_rpc: JsonRpcNotification =
-        serde_json::from_str(&turn_blocked_live_payload)
-            .expect("turn blocked notification should decode");
+    let blocked_live_rpc =
+        recv_notification_by_method(&mut rx, events::TURN_EXECUTION_WINDOW_BLOCKED).await;
+    let blocked_live_params = blocked_live_rpc
+        .params
+        .expect("blocked notification should include params");
+    assert_eq!(blocked_live_params["workspace_id"], workspace_id);
+    assert_eq!(blocked_live_params["thread_id"], thread_id);
+    assert_eq!(blocked_live_params["turn_id"], turn_id);
+    assert_eq!(blocked_live_params["window_id"], "runtime_win_2");
+    assert_eq!(blocked_live_params["window_index"], 2);
+
+    let turn_blocked_live_rpc = recv_notification_by_method(&mut rx, events::TURN_BLOCKED).await;
     assert_eq!(turn_blocked_live_rpc.method, events::TURN_BLOCKED);
     let turn_blocked_live_params = turn_blocked_live_rpc
         .params
@@ -24427,16 +24482,6 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
         "total budget exhausted"
     );
 
-    let blocked_live_rpc =
-        recv_notification_by_method(&mut rx, events::TURN_EXECUTION_WINDOW_BLOCKED).await;
-    let blocked_live_params = blocked_live_rpc
-        .params
-        .expect("blocked notification should include params");
-    assert_eq!(blocked_live_params["workspace_id"], workspace_id);
-    assert_eq!(blocked_live_params["thread_id"], thread_id);
-    assert_eq!(blocked_live_params["turn_id"], turn_id);
-    assert_eq!(blocked_live_params["window_id"], "runtime_win_1");
-    assert_eq!(blocked_live_params["window_index"], 1);
     let blocked = crud_store
         .latest_turn_execution_window(turn_id)
         .await
@@ -25051,6 +25096,83 @@ async fn direct_durable_item_completed_does_not_commit_when_persistence_fails() 
             .await
             .is_err(),
         "failed durable persistence must not publish a committed notification"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_recovery_events_reject_ack_without_canonical_persistence() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager,
+        agent_manager,
+        session_manager,
+        workspace_manager,
+        crud_store,
+    );
+
+    let provider_failure_committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::ProviderFailureDetected {
+            thread_id: "thr_missing_provider_failure".to_owned(),
+            turn_id: "turn_missing_provider_failure".to_owned(),
+            item_id: "item_missing_provider_failure".to_owned(),
+            item_type: TurnItemType::AgentMessage,
+            failure: ProviderFailureDetails {
+                provider: "openai".to_owned(),
+                model: "o4-mini".to_owned(),
+                transport: ProviderTransportKind::Stream,
+                class: ProviderFailureClass::NetworkTransient,
+                stage: ProviderFailureStage::MidStream,
+                http_status: None,
+                provider_code: None,
+                retry_after_ms: None,
+                is_recoverable_hint: true,
+                message: Some("injected provider failure".to_owned()),
+            },
+            recovery: None,
+        })
+        .await;
+    assert!(
+        !provider_failure_committed,
+        "a provider failure without a durable turn/recovery record must reject ACK"
+    );
+
+    let recovery_success_committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::RecoveryAttemptSucceeded {
+            thread_id: "thr_missing_recovery_success".to_owned(),
+            turn_id: "turn_missing_recovery_success".to_owned(),
+            recovery: pioneer_protocol::RecoveryAttemptContext {
+                job_id: "job_missing_recovery_success".to_owned(),
+                attempt_id: "attempt_missing_recovery_success".to_owned(),
+            },
+        })
+        .await;
+    assert!(
+        !recovery_success_committed,
+        "a recovery success without its canonical durable job must reject ACK"
+    );
+
+    let prompt_manifest_committed = processor
+        .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
+            thread_id: "thr_missing_prompt_manifest".to_owned(),
+            turn_id: "turn_missing_prompt_manifest".to_owned(),
+            manifest: PromptManifest {
+                compiler_version: "test".to_owned(),
+                profile: PromptManifestProfile::AssistantFull,
+                section_ids: Vec::new(),
+                fingerprint_stable: "stable".to_owned(),
+                fingerprint_dynamic: "dynamic".to_owned(),
+                fingerprint_full: "full".to_owned(),
+                diagnostics: Vec::new(),
+                hook_sources: Vec::new(),
+            },
+        })
+        .await;
+    assert!(
+        !prompt_manifest_committed,
+        "a prompt manifest without its canonical durable turn must reject ACK"
     );
 }
 
@@ -31194,11 +31316,11 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let db = crud_store.database_connection();
     let predecessor = turn_event_projection_state::Entity::find()
         .filter(turn_event_projection_state::Column::TurnId.eq(turn_id))
-        .order_by_desc(turn_event_projection_state::Column::Sequence)
+        .filter(turn_event_projection_state::Column::Sequence.eq(1))
         .one(&db)
         .await
-        .expect("predecessor projection state should load")
-        .expect("predecessor projection state should exist");
+        .expect("turn/start projection state should load")
+        .expect("turn/start projection state should exist");
     turn_event_projection_state::Entity::update_many()
         .col_expr(
             turn_event_projection_state::Column::Status,
@@ -31285,7 +31407,10 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 64)
         .await
         .expect("ordered projection replay should succeed");
-    assert!(replay.projected >= 2);
+    assert!(
+        replay.projected >= 2,
+        "ordered replay should project the repaired predecessor and its dependent event: {replay:#?}"
+    );
     assert_eq!(replay.failed, 0);
     assert!(
         crud_store
@@ -32177,7 +32302,7 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         .await
         .expect("poisoned hub should expose receiver");
     drop(receiver);
-    assert!(poisoned.durable_lane_is_closed());
+    assert!(!poisoned.durable_receiver_is_claimed());
     processor
         .cli_runtime_event_hubs
         .lock()
@@ -42812,10 +42937,17 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
     let processor = with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager,
-            test_provider(),
+            provider_registry,
             session_manager,
             workspace_manager,
             crud_store.clone(),

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use futures_util::future::BoxFuture;
 use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
     RestoredRecoveryTurnRequest, RetainedProviderHistoryMessage, ToolLoopConfig,
@@ -24,6 +25,7 @@ use pioneer_provider::{ChatMessage, ModelInputItem, ProviderRegistry, Role};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::timeout::{
@@ -37,6 +39,9 @@ const RECOVERY_ATTEMPT_ID_LEN: usize = 21;
 const STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT: u32 = 2;
 pub const TURN_RECOVERY_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 3 * 60;
+
+type RecoveryListenerStarter =
+    Arc<dyn Fn(String) -> BoxFuture<'static, std::result::Result<(), String>> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryPolicy {
@@ -476,6 +481,7 @@ pub struct RecoveryCoordinator {
     policy_registry: RecoveryPolicyRegistry,
     tool_loop_config: ToolLoopConfig,
     authorization_invalidation_hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
+    listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -682,7 +688,23 @@ impl RecoveryCoordinator {
             authorization_invalidation_hub: Arc::new(
                 crate::authorization::AuthorizationInvalidationHub::default(),
             ),
+            listener_starter: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) async fn set_listener_starter(&self, starter: RecoveryListenerStarter) {
+        *self.listener_starter.write().await = Some(starter);
+    }
+
+    async fn ensure_recovery_listener(&self, thread_id: &str) -> Result<(), AgentControlError> {
+        let starter = self.listener_starter.read().await.clone().ok_or_else(|| {
+            AgentControlError::Internal(
+                "native recovery durable listener is not configured".to_owned(),
+            )
+        })?;
+        starter(thread_id.to_owned())
+            .await
+            .map_err(AgentControlError::Internal)
     }
 
     pub(crate) fn with_authorization_invalidation_hub(
@@ -2089,6 +2111,21 @@ impl RecoveryCoordinator {
             execution_checkpoint_context,
         };
 
+        if self.agent_manager.has_thread(thread_id.as_str()).await
+            && let Err(error) = self.ensure_recovery_listener(thread_id.as_str()).await
+        {
+            return self
+                .handle_recovery_start_error(
+                    job,
+                    active_attempt_id,
+                    error,
+                    policy,
+                    attempt_number,
+                    now_unix,
+                )
+                .await;
+        }
+
         match self
             .agent_manager
             .start_recovery_attempt(thread_id.as_str(), request.clone())
@@ -2125,6 +2162,36 @@ impl RecoveryCoordinator {
                                 .await?;
                             request.continue_generation = request.continue_generation
                                 || request.execution_checkpoint_context.is_some();
+                            if let Err(error) = self
+                                .agent_manager
+                                .ensure_thread(thread_id.as_str(), workspace_id.as_str())
+                                .await
+                            {
+                                return self
+                                    .handle_recovery_start_error(
+                                        job,
+                                        active_attempt_id,
+                                        AgentControlError::Internal(error.to_string()),
+                                        policy,
+                                        attempt_number,
+                                        now_unix,
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                self.ensure_recovery_listener(thread_id.as_str()).await
+                            {
+                                return self
+                                    .handle_recovery_start_error(
+                                        job,
+                                        active_attempt_id,
+                                        error,
+                                        policy,
+                                        attempt_number,
+                                        now_unix,
+                                    )
+                                    .await;
+                            }
                             match self
                                 .agent_manager
                                 .start_restored_recovery_turn(
@@ -2852,6 +2919,7 @@ impl RecoveryCoordinator {
         if !checkpoint_exists {
             self.crud_store
                 .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                    id: None,
                     window_id: window.id.clone(),
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
@@ -4141,6 +4209,28 @@ mod tests {
             RecoveryPolicyRegistry::default(),
             tool_loop_config.normalized(),
         );
+        let listener_manager = agent_manager.clone();
+        coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let listener_manager = listener_manager.clone();
+                Box::pin(async move {
+                    let Some(mut receiver) = listener_manager
+                        .take_durable_receiver(thread_id.as_str())
+                        .await
+                    else {
+                        // A prior recovery attempt already owns the single
+                        // durable receiver for this test thread.
+                        return Ok(());
+                    };
+                    tokio::spawn(async move {
+                        while receiver.recv().await.is_some() {
+                            receiver.acknowledge_last(Ok(()));
+                        }
+                    });
+                    Ok(())
+                })
+            }))
+            .await;
         (crud_store, agent_manager, coordinator)
     }
 
@@ -4212,6 +4302,7 @@ mod tests {
             run_count: 0,
             max_attempts: 2,
             scheduled_at_unix: 1_700_000_000,
+            next_run_at_unix: 1_700_000_000,
             updated_at_unix: 1_700_000_000,
             claim_token: None,
             active_attempt_id: None,
@@ -6218,6 +6309,7 @@ mod tests {
         );
         let checkpoint = crud_store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: None,
                 window_id: first_window.id.clone(),
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
@@ -6407,6 +6499,7 @@ mod tests {
         );
         crud_store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: None,
                 window_id: window.id.clone(),
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),

@@ -172,7 +172,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -436,7 +436,6 @@ pub struct MessageProcessor {
     cli_runtime_session_turn_leases:
         Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
-    turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
     turn_final_assistant_texts: Arc<Mutex<HashMap<String, String>>>,
@@ -447,6 +446,7 @@ pub struct MessageProcessor {
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
+    native_turn_event_delivery_kick_running: Arc<AtomicBool>,
     resilience_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     hook_recovery_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -761,7 +761,6 @@ impl MessageProcessor {
             cli_runtime_session_turn_mutexes: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_session_turn_leases: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_command_heartbeats,
-            turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
@@ -771,6 +770,7 @@ impl MessageProcessor {
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
             recovery_coordinator,
+            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
@@ -1454,6 +1454,21 @@ impl MessageProcessor {
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
         self.bind_agent_tool_bridges().await;
+        let processor = Arc::downgrade(self);
+        self.recovery_coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let processor = processor.clone();
+                Box::pin(async move {
+                    let processor = processor.upgrade().ok_or_else(|| {
+                        "message processor stopped before recovery listener startup".to_owned()
+                    })?;
+                    processor
+                        .ensure_agent_listener_task(thread_id.as_str())
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+            }))
+            .await;
         match self
             .crud_store
             .repair_deterministic_read_model_violations()
@@ -1501,6 +1516,17 @@ impl MessageProcessor {
                     "failed to backfill missing running item deadlines during startup"
                 );
             }
+        }
+        match self.reconcile_incomplete_native_turn_admissions(1024).await {
+            Ok(reconciled) if reconciled > 0 => warn!(
+                reconciled,
+                "reconciled native turns interrupted during durable admission"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                error = %format!("{error:#}"),
+                "failed to reconcile incomplete native turn admissions at startup"
+            ),
         }
         if let Err(error) = self.task_runtime.start().await {
             error!(error = %format!("{error:#}"), "failed to start task runtime");
@@ -1616,6 +1642,21 @@ impl MessageProcessor {
                             &mut transient_storage_poll_failed,
                         );
                     }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                if let Err(error) = retry_transient_storage_access(|| {
+                    this.process_due_native_turn_event_deliveries(now, 64)
+                })
+                .await
+                {
+                    record_resilience_worker_poll_error(
+                        "native turn-event optional delivery worker",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
@@ -2921,7 +2962,6 @@ impl MessageProcessor {
                     .cli_runtime_command_heartbeat
                     .interval_secs,
             ),
-            turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
@@ -2931,6 +2971,7 @@ impl MessageProcessor {
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
             recovery_coordinator,
+            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),

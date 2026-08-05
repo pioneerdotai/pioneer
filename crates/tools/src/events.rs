@@ -1,4 +1,5 @@
 use crate::context::ToolOutcome;
+use crate::error::ToolError;
 use crate::output_policy::{
     ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryView, ToolResultEnvelope,
     ToolResultView, ToolStoragePayload,
@@ -11,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,9 +159,26 @@ impl ToolEvent {
     }
 }
 
+#[derive(Debug)]
+pub struct DurableToolEventEnvelope {
+    pub event: ToolEvent,
+    committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+impl DurableToolEventEnvelope {
+    pub fn acknowledge(mut self, result: Result<(), String>) {
+        if let Some(committed_tx) = self.committed_tx.take() {
+            let _ = committed_tx.send(result);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolEventBus {
     tx: broadcast::Sender<ToolEvent>,
+    durable_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<DurableToolEventEnvelope>>>>,
+    durable_installed: Arc<AtomicBool>,
+    durable_capacity: usize,
     trace_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
 }
 
@@ -230,32 +248,40 @@ impl ToolEventTrace {
         );
     }
 
-    pub fn emit_permission_audit(&self, attempt_id: u32, event: TurnPermissionAuditEvent) {
-        self.event_bus.emit_internal(
-            self,
-            attempt_id,
-            "permission.audit",
-            ToolEventPayload::PermissionAudit(event),
-        );
+    pub async fn emit_permission_audit(
+        &self,
+        attempt_id: u32,
+        event: TurnPermissionAuditEvent,
+    ) -> Result<(), ToolError> {
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "permission.audit",
+                ToolEventPayload::PermissionAudit(event),
+            )
+            .await
     }
 
-    pub fn emit_started(
+    pub async fn emit_started(
         &self,
         attempt_id: u32,
         arguments: Option<JsonValue>,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
         output_policy: ToolOutputPolicySnapshot,
-    ) {
-        self.event_bus.emit_internal(
-            self,
-            attempt_id,
-            "runtime.call.started",
-            ToolEventPayload::CallStarted(ToolCallStartedEvent {
-                arguments,
-                recovery_policy,
-                output_policy,
-            }),
-        );
+    ) -> Result<(), ToolError> {
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "runtime.call.started",
+                ToolEventPayload::CallStarted(ToolCallStartedEvent {
+                    arguments,
+                    recovery_policy,
+                    output_policy,
+                }),
+            )
+            .await
     }
 
     pub fn emit_delta(&self, attempt_id: u32, text: String) {
@@ -269,7 +295,7 @@ impl ToolEventTrace {
         text: String,
         truncated: bool,
     ) {
-        self.event_bus.emit_internal(
+        self.event_bus.emit_progress(
             self,
             attempt_id,
             "runtime.call.delta",
@@ -289,7 +315,7 @@ impl ToolEventTrace {
         stage: impl Into<String>,
         metadata: Option<JsonValue>,
     ) {
-        self.event_bus.emit_internal(
+        self.event_bus.emit_progress(
             self,
             attempt_id,
             "runtime.call.delta",
@@ -304,30 +330,36 @@ impl ToolEventTrace {
         );
     }
 
-    pub fn emit_completed(&self, attempt_id: u32, envelope: &ToolResultEnvelope) {
-        self.event_bus.emit_internal(
-            self,
-            attempt_id,
-            "runtime.call.completed",
-            ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
-                success: envelope.success,
-                outcome: envelope.outcome.clone(),
-                llm_view: envelope.llm_view.clone(),
-                display: envelope.display.clone(),
-                storage: envelope.storage.clone(),
-                recovery: envelope.recovery.clone(),
-                output_policy: envelope.output_policy.clone(),
-            }),
-        );
+    pub async fn emit_completed(
+        &self,
+        attempt_id: u32,
+        envelope: &ToolResultEnvelope,
+    ) -> Result<(), ToolError> {
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "runtime.call.completed",
+                ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                    success: envelope.success,
+                    outcome: envelope.outcome.clone(),
+                    llm_view: envelope.llm_view.clone(),
+                    display: envelope.display.clone(),
+                    storage: envelope.storage.clone(),
+                    recovery: envelope.recovery.clone(),
+                    output_policy: envelope.output_policy.clone(),
+                }),
+            )
+            .await
     }
 
-    pub fn emit_failed_with_outcome(
+    pub async fn emit_failed_with_outcome(
         &self,
         attempt_id: u32,
         error: &str,
         outcome: &ToolOutcome,
         output_policy: ToolOutputPolicySnapshot,
-    ) {
+    ) -> Result<(), ToolError> {
         let summary = ToolOutputSummary {
             title: "Tool execution failed".to_owned(),
             lines: vec![error.to_owned()],
@@ -349,20 +381,22 @@ impl ToolEventTrace {
             was_truncated: outcome.incomplete,
             continuation: None,
         };
-        self.event_bus.emit_internal(
-            self,
-            attempt_id,
-            "runtime.call.failed",
-            ToolEventPayload::CallFailed(ToolCallFailedEvent {
-                error: error.to_owned(),
-                outcome: outcome.clone(),
-                llm_view: None,
-                display,
-                storage,
-                recovery: Some(recovery),
-                output_policy,
-            }),
-        );
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "runtime.call.failed",
+                ToolEventPayload::CallFailed(ToolCallFailedEvent {
+                    error: error.to_owned(),
+                    outcome: outcome.clone(),
+                    llm_view: None,
+                    display,
+                    storage,
+                    recovery: Some(recovery),
+                    output_policy,
+                }),
+            )
+            .await
     }
 }
 
@@ -400,12 +434,43 @@ impl ToolEventBus {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
+            durable_tx: Arc::new(Mutex::new(None)),
+            durable_installed: Arc::new(AtomicBool::new(false)),
+            durable_capacity: capacity.max(1),
             trace_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ToolEvent> {
         self.tx.subscribe()
+    }
+
+    /// Installs the single lossless lifecycle consumer used by the native
+    /// agent. Live observers remain on the lossy broadcast lane; start/audit/
+    /// terminal tool events cannot be skipped by a lagging Gateway forwarder.
+    pub fn take_durable_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<DurableToolEventEnvelope>> {
+        let mut durable_tx = self.durable_tx.lock().ok()?;
+        if durable_tx.is_some() {
+            return None;
+        }
+        if self.durable_installed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(self.durable_capacity);
+        *durable_tx = Some(tx);
+        self.durable_installed.store(true, Ordering::SeqCst);
+        Some(rx)
+    }
+
+    /// Publishes the producer watermark for a native tool lifecycle lane.
+    /// Traces may remain referenced by diagnostics after execution, so drain
+    /// completion must not depend on every trace clone being dropped.
+    pub fn close_durable_lane(&self) {
+        if let Ok(mut durable_tx) = self.durable_tx.lock() {
+            durable_tx.take();
+        }
     }
 
     pub fn trace_with_id(
@@ -451,22 +516,91 @@ impl ToolEventBus {
         format!("tr_{}_{}", now_unix_ms(), index)
     }
 
-    fn emit_internal(
+    fn build_event(
         &self,
         trace: &ToolEventTrace,
         attempt_id: u32,
         pipeline_stage: &str,
         payload: ToolEventPayload,
-    ) {
+    ) -> ToolEvent {
         let observation = trace.next_context(pipeline_stage, attempt_id);
-        let _ = self.tx.send(ToolEvent {
+        ToolEvent {
             schema_version: 1,
             call_id: trace.tool_call_id.clone(),
             tool_name: trace.tool_name.clone(),
             ts_unix_ms: observation.ts_unix_ms,
             observation,
             payload,
-        });
+        }
+    }
+
+    fn emit_progress(
+        &self,
+        trace: &ToolEventTrace,
+        attempt_id: u32,
+        pipeline_stage: &str,
+        payload: ToolEventPayload,
+    ) {
+        debug_assert_eq!(payload.event_class(), ProtocolEventClass::Progress);
+        let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
+        let _ = self.tx.send(event);
+    }
+
+    async fn emit_durable(
+        &self,
+        trace: &ToolEventTrace,
+        attempt_id: u32,
+        pipeline_stage: &str,
+        payload: ToolEventPayload,
+    ) -> Result<(), ToolError> {
+        debug_assert_eq!(payload.event_class(), ProtocolEventClass::Durable);
+        let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
+        let durable_tx = self
+            .durable_tx
+            .lock()
+            .map_err(|_| ToolError::execution_failed("tool durable event lane lock poisoned"))?
+            .clone();
+        match (self.durable_installed.load(Ordering::SeqCst), durable_tx) {
+            (true, Some(durable_tx)) => {
+                let (committed_tx, committed_rx) = oneshot::channel();
+                durable_tx
+                    .send(DurableToolEventEnvelope {
+                        event: event.clone(),
+                        committed_tx: Some(committed_tx),
+                    })
+                    .await
+                    .map_err(|_| {
+                        ToolError::execution_failed(
+                            "tool durable event lane closed before lifecycle event commit",
+                        )
+                    })?;
+                committed_rx
+                    .await
+                    .map_err(|_| {
+                        ToolError::execution_failed(
+                            "tool durable event commit acknowledgement was dropped",
+                        )
+                    })?
+                    .map_err(|reason| {
+                        ToolError::execution_failed(format!(
+                            "tool durable event commit was rejected: {reason}"
+                        ))
+                    })?;
+            }
+            (true, None) => {
+                return Err(ToolError::execution_failed(
+                    "tool durable event emitted after the producer watermark",
+                ));
+            }
+            (false, None) => {}
+            (false, Some(_)) => {
+                return Err(ToolError::execution_failed(
+                    "tool durable event lane entered an invalid installation state",
+                ));
+            }
+        }
+        let _ = self.tx.send(event);
+        Ok(())
     }
 
     pub fn finish_trace(&self, trace_id: &str) {
@@ -550,6 +684,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_durable_receiver_preserves_terminal_event_when_live_lane_lags() {
+        let bus = ToolEventBus::new(1);
+        let mut live = bus.subscribe();
+        let mut durable = bus
+            .take_durable_receiver()
+            .expect("single durable receiver");
+        let trace = bus.start_trace("turn_1", "call_1", "test_tool");
+        let outcome = ToolOutcome::ok();
+        let output_policy = ToolOutputPolicySnapshot::for_tool_name("test_tool");
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_1",
+            tool_name: "test_tool",
+            arguments: &serde_json::json!({}),
+            raw_output_text: "ok",
+            raw_output_json: &serde_json::json!({"ok": true}),
+            success: true,
+            outcome: &outcome,
+            output_policy: &output_policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let started_trace = trace.clone();
+        let started = tokio::spawn(async move {
+            started_trace
+                .emit_started(1, None, None, output_policy)
+                .await
+        });
+        tokio::pin!(started);
+        assert!(
+            timeout(Duration::from_millis(20), &mut started)
+                .await
+                .is_err(),
+            "durable producer must wait for the canonical commit acknowledgement"
+        );
+        for index in 0..32 {
+            trace.emit_delta(1, format!("chunk-{index}"));
+        }
+        let completion_trace = trace.clone();
+        let completion =
+            tokio::spawn(async move { completion_trace.emit_completed(1, &envelope).await });
+        tokio::pin!(completion);
+        assert!(
+            timeout(Duration::from_millis(20), &mut completion)
+                .await
+                .is_err(),
+            "a full durable lane must apply backpressure instead of dropping terminal state"
+        );
+
+        let started_envelope = durable
+            .recv()
+            .await
+            .expect("started event should remain queued");
+        assert_eq!(started_envelope.event.kind(), ToolEventKind::CallStarted);
+        started_envelope.acknowledge(Ok(()));
+        started
+            .await
+            .expect("started publisher should not panic")
+            .expect("started publisher should resume after commit ACK");
+        let completed_envelope = durable
+            .recv()
+            .await
+            .expect("completed event should remain queued");
+        assert_eq!(
+            completed_envelope.event.kind(),
+            ToolEventKind::CallCompleted
+        );
+        completed_envelope.acknowledge(Ok(()));
+        completion
+            .await
+            .expect("completion publisher should not panic")
+            .expect("completion should resume after durable commit ACK");
+        assert!(
+            timeout(Duration::from_millis(20), durable.recv())
+                .await
+                .is_err(),
+            "lossy output deltas must not consume durable queue capacity"
+        );
+        bus.close_durable_lane();
+        assert!(
+            durable.recv().await.is_none(),
+            "producer watermark must close drain even while a trace clone remains alive"
+        );
+        assert!(
+            trace
+                .emit_started(
+                    2,
+                    None,
+                    None,
+                    ToolOutputPolicySnapshot::for_tool_name("test_tool"),
+                )
+                .await
+                .is_err(),
+            "late durable lifecycle events must fail closed after the watermark"
+        );
+        assert!(matches!(
+            live.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn write_file_completed_event_carries_file_change_metadata() {
         let raw_output_json = serde_json::json!({
             "ok": true,
@@ -589,7 +824,10 @@ mod tests {
         let mut events = bus.subscribe();
         let trace = bus.start_trace("turn_1", "call_write", "write_file");
 
-        trace.emit_completed(1, &envelope);
+        trace
+            .emit_completed(1, &envelope)
+            .await
+            .expect("completed event should publish");
 
         let event = timeout(Duration::from_millis(100), events.recv())
             .await
@@ -675,7 +913,10 @@ mod tests {
         let mut events = bus.subscribe();
         let trace = bus.start_trace("turn_1", "call_edit", "edit_file");
 
-        trace.emit_completed(1, &envelope);
+        trace
+            .emit_completed(1, &envelope)
+            .await
+            .expect("completed event should publish");
 
         let event = timeout(Duration::from_millis(100), events.recv())
             .await

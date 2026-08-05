@@ -775,13 +775,22 @@ impl MessageProcessor {
                     return;
                 }
             };
-            message_future(self.finish_turn_start_success(
+            if !message_future(self.finish_turn_start_success(
                 connection_id,
                 request_id,
                 &prepared.outcome,
                 prepared.user_message_capability_attachments.as_slice(),
             ))
-            .await;
+            .await
+            {
+                self.mark_turn_blocked(
+                    prepared.outcome.started_notification.thread_id.clone(),
+                    prepared.outcome.started_notification.turn.id.clone(),
+                    "failed to commit native turn start lifecycle".to_owned(),
+                )
+                .await;
+                return;
+            }
             self.dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
         })
@@ -1082,6 +1091,8 @@ impl MessageProcessor {
         {
             Ok(snapshot) => snapshot,
             Err(message) => {
+                self.mark_turn_blocked(thread.id.clone(), launch.turn_id.clone(), message.clone())
+                    .await;
                 self.send_turn_start_failure(
                     connection_id,
                     request_id.clone(),
@@ -1122,10 +1133,9 @@ impl MessageProcessor {
         let frozen_history_json = match serde_json::to_string(&frozen_history) {
             Ok(history_json) => history_json,
             Err(error) => {
-                self.report_turn_failure(
+                self.mark_turn_blocked(
                     thread.id.clone(),
                     launch.turn_id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to freeze Composer task history: {error:#}"),
                 )
                 .await;
@@ -1215,10 +1225,9 @@ impl MessageProcessor {
             .create_task(create_context, task_params)
             .await
         {
-            self.report_turn_failure(
+            self.mark_turn_blocked(
                 thread.id.clone(),
                 launch.turn_id.clone(),
-                TurnFailureRecoveryKind::TurnStart,
                 format!("failed to create detached Composer task: {error:#}"),
             )
             .await;
@@ -1256,9 +1265,25 @@ impl MessageProcessor {
             TurnStartSuccessResponse::Task { .. } => false,
         };
         if !success_sent {
+            self.mark_turn_blocked(
+                thread.id.clone(),
+                launch.turn_id.clone(),
+                "failed to commit Composer turn start lifecycle".to_owned(),
+            )
+            .await;
             return;
         }
-        let _ = self.complete_turn(thread.id, launch.turn_id, None).await;
+        if !self
+            .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
+            .await
+        {
+            self.mark_turn_blocked(
+                thread.id,
+                launch.turn_id,
+                "failed to durably complete Composer turn after task creation".to_owned(),
+            )
+            .await;
+        }
     }
 
     pub(super) async fn prepare_api_provider_turn_start(
@@ -1456,9 +1481,12 @@ impl MessageProcessor {
         {
             Ok(snapshot) => snapshot,
             Err(message) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
                 return Err(message);
             }
         };
@@ -1472,18 +1500,28 @@ impl MessageProcessor {
             )
             .await
         {
-            self.report_turn_failure(
+            self.mark_turn_blocked(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnStart,
                 format!("failed to prepare agent thread runtime: {error}"),
             )
             .await;
             return Err(format!("failed to prepare agent thread runtime: {error}"));
         }
 
-        self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
+        if let Err(error) = self
+            .ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
+            .await
+        {
+            let message = format!("failed to activate native durable listener: {error:#}");
+            self.mark_turn_blocked(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                message.clone(),
+            )
             .await;
+            return Err(message);
+        }
         let history = self
             .load_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
@@ -1514,14 +1552,18 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to load authoritative workspace skill policies"
                 );
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(if member_principal_id.is_some() {
+                let message = if member_principal_id.is_some() {
                     "Member skill projection is unavailable".to_owned()
                 } else {
                     format!("failed to load workspace skill policies: {error:#}")
-                });
+                };
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
+                return Err(message);
             }
         };
         let resolved_artifacts = match self
@@ -1533,10 +1575,9 @@ impl MessageProcessor {
         {
             Ok(resolved_artifacts) => resolved_artifacts,
             Err(error) => {
-                self.report_turn_failure(
+                self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to resolve artifact input for provider: {error:#}"),
                 )
                 .await;
@@ -1555,10 +1596,9 @@ impl MessageProcessor {
         {
             Ok(runtime_environment) => runtime_environment.into_iter().collect::<HashMap<_, _>>(),
             Err(error) => {
-                self.report_turn_failure(
+                self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to prepare artifact output directory: {error:#}"),
                 )
                 .await;
@@ -1595,10 +1635,9 @@ impl MessageProcessor {
             )
             .await;
         if let Err(error) = snapshot_result {
-            self.report_turn_failure(
+            self.mark_turn_blocked(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnStart,
                 format!("failed to persist turn runtime snapshot: {error:#}"),
             )
             .await;
@@ -1610,10 +1649,9 @@ impl MessageProcessor {
             match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
                 Ok(permission_profile) => permission_profile,
                 Err(error) => {
-                    self.report_turn_failure(
+                    self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
-                        TurnFailureRecoveryKind::TurnStart,
                         format!("failed to resolve turn permission profile: {error:#}"),
                     )
                     .await;
@@ -1642,7 +1680,7 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         prepared: &PreparedApiProviderTurnStart,
-    ) {
+    ) -> bool {
         self.session_manager
             .set_connection_workspace(
                 connection_id,
@@ -1653,7 +1691,20 @@ impl MessageProcessor {
             &prepared.outcome,
             prepared.user_message_capability_attachments.as_slice(),
         ))
-        .await;
+        .await
+    }
+
+    pub(super) async fn block_prepared_api_provider_turn_start(
+        &self,
+        prepared: &PreparedApiProviderTurnStart,
+        reason: String,
+    ) -> bool {
+        self.mark_turn_blocked(
+            prepared.outcome.started_notification.thread_id.clone(),
+            prepared.outcome.started_notification.turn.id.clone(),
+            reason,
+        )
+        .await
     }
 
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
@@ -1683,13 +1734,23 @@ impl MessageProcessor {
             )
             .await
         {
-            self.report_turn_failure(
+            let reason = format!("failed to dispatch turn to agent runtime: {error}");
+            if !self
+                .report_turn_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 TurnFailureRecoveryKind::TurnDispatch,
-                format!("failed to dispatch turn to agent runtime: {error}"),
+                reason.clone(),
             )
-            .await;
+            .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    reason,
+                )
+                .await;
+            }
         }
     }
 
@@ -1799,13 +1860,19 @@ impl MessageProcessor {
         {
             self.release_cli_runtime_session_turn_lease(turn_id.as_str())
                 .await;
-            self.report_turn_failure(
-                prepared.outcome.started_notification.thread_id.clone(),
-                turn_id,
-                TurnFailureRecoveryKind::TaskDispatch,
-                "failed to publish task CLI runtime turn start".to_owned(),
-            )
-            .await;
+            let thread_id = prepared.outcome.started_notification.thread_id.clone();
+            let reason = "failed to publish task CLI runtime turn start".to_owned();
+            if !self
+                .report_turn_failure(
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    TurnFailureRecoveryKind::TaskDispatch,
+                    reason.clone(),
+                )
+                .await
+            {
+                self.mark_turn_blocked(thread_id, turn_id, reason).await;
+            }
             anyhow::bail!("failed to publish task CLI runtime turn start");
         }
         self.spawn_prepared_cli_runtime_native_turn(prepared);
@@ -1815,11 +1882,21 @@ impl MessageProcessor {
     pub(super) async fn abort_prepared_task_cli_runtime_turn(
         &self,
         prepared: PreparedCliRuntimeNativeTurnStart,
+        reason: String,
     ) {
+        let thread_id = prepared.outcome.started_notification.thread_id.clone();
         let turn_id = prepared.outcome.started_notification.turn.id.clone();
-        self.thread_manager
-            .rollback_turn_start(prepared.outcome.rollback_context)
-            .await;
+        if !self
+            .mark_turn_blocked(thread_id.clone(), turn_id.clone(), reason.clone())
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                reason,
+                "failed to durably close an aborted prepared task CLI runtime turn"
+            );
+        }
         self.release_cli_runtime_session_turn_lease(turn_id.as_str())
             .await;
     }
@@ -2737,9 +2814,12 @@ impl MessageProcessor {
             {
                 Ok(snapshot) => snapshot,
                 Err(message) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        message.clone(),
+                    )
+                    .await;
                     send_turn_start_failure!(message);
                     return;
                 }
@@ -2987,12 +3067,16 @@ impl MessageProcessor {
                     match pioneer_crud::serialize_cli_runtime_json(sandbox_policy) {
                         Ok(sandbox_json) => Some(sandbox_json),
                         Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
-                            send_turn_start_failure!(format!(
+                            let message = format!(
                                 "failed to serialize CLI runtime sandbox policy: {error:#}"
-                            ));
+                            );
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                message.clone(),
+                            )
+                            .await;
+                            send_turn_start_failure!(message);
                             return;
                         }
                     }
@@ -3416,6 +3500,21 @@ impl MessageProcessor {
                 TurnStartSuccessResponse::Task { .. } => true,
             };
             if !success_sent {
+                self.mark_turn_blocked(
+                    native_turn_start
+                        .outcome
+                        .started_notification
+                        .thread_id
+                        .clone(),
+                    native_turn_start
+                        .outcome
+                        .started_notification
+                        .turn
+                        .id
+                        .clone(),
+                    "failed to commit CLI runtime turn start lifecycle".to_owned(),
+                )
+                .await;
                 success_response.complete_task(Err(anyhow::anyhow!(
                     "failed to publish task CLI runtime turn start"
                 )));
@@ -4920,6 +5019,22 @@ impl MessageProcessor {
                 Some(outcome.started_notification.workspace_id.clone()),
             )
             .await;
+        if !message_future(
+            self.publish_turn_start_success(outcome, user_message_capability_attachments),
+        )
+        .await
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    "failed to commit native turn start lifecycle".to_owned(),
+                ),
+            )
+            .await;
+            return false;
+        }
         let response = match JsonRpcResponse::from_result(request_id, &outcome.response) {
             Ok(response) => response,
             Err(error) => {
@@ -4932,7 +5047,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
-                return false;
+                return true;
             }
         };
         if let Err(error) = self.send_json(connection_id, &response).await {
@@ -4941,12 +5056,9 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to send turn/start response"
             );
-            return false;
+            return true;
         }
-        message_future(
-            self.publish_turn_start_success(outcome, user_message_capability_attachments),
-        )
-        .await
+        true
     }
 
     async fn finish_voice_session_finalize_accepted_turn_start_success(
@@ -5002,20 +5114,29 @@ impl MessageProcessor {
         outcome: &crate::thread::TurnStartOutcome,
         user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
-        self.send_notification_to_authorized_thread_connections(
-            outcome.started_notification.thread_id.as_str(),
-            events::TURN_STARTED,
-            &outcome.started_notification,
-            outcome.started_notification_connection_ids.clone(),
-        )
-        .await;
-        message_future(self.emit_user_message_item_lifecycle(
+        if let Err(error) = message_future(self.emit_user_message_item_lifecycle(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.input.as_slice(),
             user_message_capability_attachments,
         ))
+        .await
+        {
+            warn!(
+                thread_id = outcome.started_notification.thread_id,
+                turn_id = outcome.started_notification.turn.id,
+                error = %format!("{error:#}"),
+                "failed to commit native turn start item lifecycle"
+            );
+            return false;
+        }
+        self.send_notification_to_authorized_thread_connections(
+            outcome.started_notification.thread_id.as_str(),
+            events::TURN_STARTED,
+            &outcome.started_notification,
+            outcome.started_notification_connection_ids.clone(),
+        )
         .await;
         self.notify_thread_tree_changed(outcome.started_notification.workspace_id.clone())
             .await;

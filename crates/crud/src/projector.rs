@@ -844,6 +844,8 @@ mod epic6_tests {
             turn_id: "turn-message".to_owned(),
             sequence: 9,
             payload,
+            idempotency_key: None,
+            was_inserted: true,
             created_at: unix_to_datetime(1_700_000_000),
         }
     }

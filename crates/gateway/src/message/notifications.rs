@@ -1387,7 +1387,7 @@ impl MessageProcessor {
         for target_connection_id in connection_ids {
             if let Err(error) = self
                 .session_manager
-                .send_text(target_connection_id, serialized.to_owned())
+                .try_send_notification_text(target_connection_id, serialized.to_owned())
                 .await
             {
                 crate::epic5_observability::record_outcome(

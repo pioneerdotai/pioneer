@@ -85,6 +85,7 @@ pub use super::turn_cli_runtime_binding::Entity as TurnCliRuntimeBinding;
 pub use super::turn_cli_runtime_execution_segment::Entity as TurnCliRuntimeExecutionSegment;
 pub use super::turn_cli_runtime_instruction::Entity as TurnCliRuntimeInstruction;
 pub use super::turn_event::Entity as TurnEvent;
+pub use super::turn_event_delivery::Entity as TurnEventDelivery;
 pub use super::turn_event_projection_state::Entity as TurnEventProjectionState;
 pub use super::turn_execution_checkpoint::Entity as TurnExecutionCheckpoint;
 pub use super::turn_execution_window::Entity as TurnExecutionWindow;

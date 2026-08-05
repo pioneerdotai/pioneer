@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::{Context, Result, bail};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
+use sha2::{Digest, Sha256};
 use std::panic::AssertUnwindSafe;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
@@ -61,6 +62,15 @@ fn db_timestamp_from_unix_ms(value: i64) -> sea_orm::entity::prelude::DateTimeWi
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
         .map(|timestamp| timestamp.fixed_offset())
         .unwrap_or_else(now_db_timestamp)
+}
+
+fn turn_llm_context_delivery_key(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn execution_window_started_metadata(runtime_window_id: &str) -> serde_json::Value {
@@ -140,16 +150,6 @@ fn execution_window_is_active_for_terminal_close(
         pioneer_protocol::ExecutionWindowStatus::Running
             | pioneer_protocol::ExecutionWindowStatus::Checkpointed
     )
-}
-
-fn execution_window_can_create_after(
-    latest: Option<&pioneer_crud::TurnExecutionWindowRecord>,
-    window_index: u32,
-) -> bool {
-    match latest {
-        None => window_index == 1,
-        Some(window) => window.window_index.saturating_add(1) == window_index,
-    }
 }
 
 fn execution_checkpoint_kind_from_wire(
@@ -240,7 +240,6 @@ fn normalized_titles_equal(left: &str, right: &str) -> bool {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TurnFailureRecoveryKind {
-    TurnStart,
     TurnDispatch,
     ExecutionWindowContinuation,
     ArtifactFinalization,
@@ -251,7 +250,6 @@ pub(super) enum TurnFailureRecoveryKind {
 impl TurnFailureRecoveryKind {
     const fn trigger(self) -> pioneer_protocol::RecoveryTrigger {
         match self {
-            Self::TurnStart => pioneer_protocol::RecoveryTrigger::TurnStart,
             Self::TurnDispatch => pioneer_protocol::RecoveryTrigger::TurnDispatch,
             Self::ExecutionWindowContinuation => {
                 pioneer_protocol::RecoveryTrigger::ExecutionWindowContinuation
@@ -267,8 +265,7 @@ impl TurnFailureRecoveryKind {
             Self::ArtifactFinalization => {
                 pioneer_protocol::RecoveryAction::RepairArtifactFinalization
             }
-            Self::TurnStart
-            | Self::TurnDispatch
+            Self::TurnDispatch
             | Self::ExecutionWindowContinuation
             | Self::TaskDispatch
             | Self::RuntimeFailure => pioneer_protocol::RecoveryAction::RestartTurn,
@@ -277,7 +274,6 @@ impl TurnFailureRecoveryKind {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::TurnStart => "turn_start",
             Self::TurnDispatch => "turn_dispatch",
             Self::ExecutionWindowContinuation => "execution_window_continuation",
             Self::ArtifactFinalization => "artifact_finalization",
@@ -458,19 +454,23 @@ impl MessageProcessor {
         None
     }
 
-    pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) {
-        if self
-            .agent_listener_tasks
-            .lock()
-            .await
-            .contains_key(thread_id)
+    pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) -> Result<()> {
+        // Keep reservation, receiver lease, and handle publication under one
+        // lock. Concurrent start/recovery/supervisor callers must observe the
+        // same listener rather than letting the loser mistake an already leased
+        // healthy receiver for a fatal closed lane.
+        let mut listeners = self.agent_listener_tasks.lock().await;
+        if listeners
+            .get(thread_id)
+            .is_some_and(|handle| !handle.is_finished())
         {
-            return;
+            return Ok(());
         }
+        listeners.remove(thread_id);
 
         let Some(mut durable_receiver) = self.agent_manager.take_durable_receiver(thread_id).await
         else {
-            return;
+            bail!("native durable listener receiver is already leased for thread `{thread_id}`");
         };
 
         let mut live_receiver = self.agent_manager.subscribe_progress(thread_id).await;
@@ -481,6 +481,31 @@ impl MessageProcessor {
             loop {
                 tokio::select! {
                     biased;
+                    durable = durable_receiver.recv() => {
+                        let Some(event) = durable else {
+                            break;
+                        };
+                        let committed = match AssertUnwindSafe(
+                            this.handle_durable_agent_event(event),
+                        )
+                        .catch_unwind()
+                        .await
+                        {
+                            Ok(committed) => committed,
+                            Err(_) => {
+                                warn!(
+                                    thread_id = %thread_id_owned,
+                                    "contained panic while projecting durable agent event"
+                                );
+                                false
+                            }
+                        };
+                        durable_receiver.acknowledge_last(if committed {
+                            Ok(())
+                        } else {
+                            Err("gateway failed to commit durable agent event".to_owned())
+                        });
+                    }
                     live = async {
                         match live_receiver.as_mut() {
                             Some(receiver) => Some(receiver.recv().await),
@@ -512,31 +537,6 @@ impl MessageProcessor {
                             }
                         }
                     }
-                    durable = durable_receiver.recv() => {
-                        let Some(event) = durable else {
-                            break;
-                        };
-                        let committed = match AssertUnwindSafe(
-                            this.handle_durable_agent_event(event),
-                        )
-                        .catch_unwind()
-                        .await
-                        {
-                            Ok(committed) => committed,
-                            Err(_) => {
-                                warn!(
-                                    thread_id = %thread_id_owned,
-                                    "contained panic while projecting durable agent event"
-                                );
-                                false
-                            }
-                        };
-                        durable_receiver.acknowledge_last(if committed {
-                            Ok(())
-                        } else {
-                            Err("gateway failed to commit durable agent event".to_owned())
-                        });
-                    }
                 }
             }
             this.agent_listener_tasks
@@ -545,10 +545,8 @@ impl MessageProcessor {
                 .remove(thread_id_owned.as_str());
         });
 
-        self.agent_listener_tasks
-            .lock()
-            .await
-            .insert(thread_id.to_owned(), handle);
+        listeners.insert(thread_id.to_owned(), handle);
+        Ok(())
     }
 
     pub(super) fn enrich_turn_item_events_markdown(events: &mut [TurnItemEvent]) {
@@ -749,18 +747,6 @@ impl MessageProcessor {
             .retain(|key, _| !key.starts_with(prefix.as_str()));
     }
 
-    async fn next_turn_llm_context_sequence(&self, turn_id: &str, observed_sequence: i64) -> i64 {
-        let mut sequences = self.turn_llm_context_sequences.lock().await;
-        let current = sequences.get(turn_id).copied().unwrap_or_default();
-        let next = current.max(observed_sequence).saturating_add(1);
-        sequences.insert(turn_id.to_owned(), next);
-        next
-    }
-
-    async fn clear_turn_llm_context_state(&self, turn_id: &str) {
-        self.turn_llm_context_sequences.lock().await.remove(turn_id);
-    }
-
     async fn delete_turn_runtime_snapshot_for_closed_turn(
         &self,
         thread_id: &str,
@@ -792,9 +778,7 @@ impl MessageProcessor {
                 let thread_id = durable_event_thread_id(&event).map(str::to_owned);
                 let committed = self.persist_durable_agent_event(event.clone()).await;
                 if committed {
-                    if let AgentDurableEvent::ItemCompleted { notification } = &event {
-                        self.ingest_committed_thread_item(notification).await;
-                    }
+                    self.kick_native_turn_event_deliveries();
                     if let Some(thread_id) = thread_id {
                         self.agent_manager
                             .publish_committed(thread_id.as_str(), event)
@@ -1408,6 +1392,21 @@ impl MessageProcessor {
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) {
+        if let Err(error) = self
+            .ingest_committed_thread_item_with_result(notification)
+            .await
+        {
+            warn!(
+                error = %format!("{error:#}"),
+                "thread episodic ingestion failed after committed item persistence"
+            );
+        }
+    }
+
+    async fn ingest_committed_thread_item_with_result(
+        &self,
+        notification: &pioneer_protocol::ItemCompletedNotification,
+    ) -> Result<()> {
         let Some(input) = crate::thread_episodic::committed_item_ingestion_input(notification)
         else {
             debug!(
@@ -1417,7 +1416,7 @@ impl MessageProcessor {
                 item_id = notification.item.item_id(),
                 "skipping thread episodic ingestion for committed item with missing required ids"
             );
-            return;
+            return Ok(());
         };
 
         let wake_indexer = thread_episodic_index_wakeup_after_commit(&notification.item);
@@ -1443,13 +1442,510 @@ impl MessageProcessor {
                     "thread episodic ingestion skipped committed item"
                 );
             }
-            Err(error) => {
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    pub(super) async fn process_due_native_turn_event_deliveries(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        let mut processed = 0_u64;
+        for consumer in [
+            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+        ] {
+            let deliveries = self
+                .crud_store
+                .claim_due_turn_event_deliveries(consumer, now_unix, limit)
+                .await?;
+            let mut by_turn = std::collections::BTreeMap::<
+                String,
+                Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
+            >::new();
+            for delivery in deliveries {
+                by_turn
+                    .entry(delivery.event.turn_id.clone())
+                    .or_default()
+                    .push(delivery);
+            }
+            processed = processed.saturating_add(
+                by_turn
+                    .values()
+                    .map(|deliveries| deliveries.len() as u64)
+                    .sum::<u64>(),
+            );
+            futures_util::stream::iter(by_turn.into_values())
+                .for_each_concurrent(Some(16), |deliveries| async move {
+                    for delivery in deliveries {
+                        self.process_claimed_native_turn_event_delivery(delivery)
+                            .await;
+                    }
+                })
+                .await;
+        }
+        Ok(processed)
+    }
+
+    /// Wake the optional outbox after the canonical transaction commits.
+    ///
+    /// The durable commit ACK never waits for websocket, artifact, or episodic
+    /// side effects. At the same time, delivery cannot depend solely on the
+    /// process-wide resilience worker: restored/test-owned processors and a
+    /// freshly admitted turn may not have reached that worker yet. Each kick
+    /// drains a bounded number of batches; the durable retry schedule remains
+    /// authoritative for failures and the periodic worker remains the restart
+    /// safety net.
+    fn kick_native_turn_event_deliveries(&self) {
+        if self
+            .native_turn_event_delivery_kick_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            struct KickGuard(Arc<AtomicBool>);
+
+            impl Drop for KickGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+
+            let _guard = KickGuard(this.native_turn_event_delivery_kick_running.clone());
+            for _ in 0..128 {
+                match this
+                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
+                    .await
+                {
+                    Ok(0) => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "post-commit native turn-event delivery kick failed"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn materialize_native_agent_turn_event(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
+    ) -> Result<()> {
+        let result = self
+            .crud_store
+            .materialize_native_agent_turn_event(
+                event,
+                event_timestamp_secs,
+                item_started_deadlines,
+            )
+            .await;
+        match result {
+            Ok(()) => {
+                self.kick_native_turn_event_deliveries();
+                Ok(())
+            }
+            Err(error) if pioneer_crud::turn_event_was_appended_before_error(&error) => {
+                // The canonical event is the authoritative commit. A read-model
+                // predecessor backlog is recoverable projection work and must
+                // neither reject the producer ACK nor start a second execution.
+                self.kick_native_turn_event_deliveries();
                 warn!(
                     error = %format!("{error:#}"),
-                    "thread episodic ingestion failed after committed item persistence"
+                    "native event committed while its ordered projection remains pending"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) async fn reconcile_incomplete_native_turn_admissions(
+        &self,
+        limit: u64,
+    ) -> Result<u64> {
+        let candidates = self
+            .crud_store
+            .list_incomplete_native_turn_admissions(limit)
+            .await?;
+        let mut reconciled = 0_u64;
+        for candidate in candidates {
+            let reason = "native turn admission was interrupted before its durable runtime snapshot; resume or retry from the preserved user message"
+                .to_owned();
+            if self
+                .mark_turn_blocked(
+                    candidate.thread_id.clone(),
+                    candidate.turn_id.clone(),
+                    reason,
+                )
+                .await
+            {
+                reconciled = reconciled.saturating_add(1);
+            } else {
+                warn!(
+                    thread_id = candidate.thread_id,
+                    turn_id = candidate.turn_id,
+                    "incomplete native turn admission could not be reconciled"
                 );
             }
         }
+        Ok(reconciled)
+    }
+
+    async fn process_claimed_native_turn_event_delivery(
+        &self,
+        delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
+    ) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.deliver_native_turn_event(&delivery),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
+        .and_then(|result| result);
+        let completed_at = now_timestamp_secs();
+        match result {
+            Ok(()) => {
+                if let Err(error) = self
+                    .crud_store
+                    .complete_turn_event_delivery(
+                        delivery.id.as_str(),
+                        delivery.claim_token.as_str(),
+                        completed_at,
+                    )
+                    .await
+                {
+                    warn!(
+                        delivery_id = delivery.id,
+                        consumer = delivery.consumer,
+                        error = %format!("{error:#}"),
+                        "failed to acknowledge optional turn-event delivery"
+                    );
+                }
+            }
+            Err(error) => {
+                if let Err(mark_error) = self
+                    .crud_store
+                    .fail_turn_event_delivery(
+                        delivery.id.as_str(),
+                        delivery.claim_token.as_str(),
+                        delivery.attempt_count,
+                        format!("{error:#}"),
+                        completed_at,
+                    )
+                    .await
+                {
+                    warn!(
+                        delivery_id = delivery.id,
+                        consumer = delivery.consumer,
+                        error = %format!("{mark_error:#}"),
+                        "failed to record optional turn-event delivery failure"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn deliver_native_turn_event(
+        &self,
+        delivery: &pioneer_crud::ClaimedTurnEventDeliveryRecord,
+    ) -> Result<()> {
+        match delivery.consumer.as_str() {
+            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER => {
+                self.deliver_native_turn_event_live(&delivery.event.payload)
+                    .await
+            }
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER => {
+                let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) =
+                    &delivery.event.payload
+                else {
+                    bail!(
+                        "episodic delivery `{}` references non-completed event",
+                        delivery.id
+                    );
+                };
+                self.ingest_committed_thread_item_with_result(notification)
+                    .await
+            }
+            consumer => bail!("unknown native turn-event delivery consumer `{consumer}`"),
+        }
+    }
+
+    async fn deliver_native_turn_event_live(
+        &self,
+        payload: &pioneer_crud::CanonicalTurnEventPayload,
+    ) -> Result<()> {
+        use pioneer_crud::CanonicalTurnEventPayload as Event;
+
+        match payload {
+            Event::ItemStarted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_STARTED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    Some("in_progress"),
+                )
+                .await;
+            }
+            Event::ItemCompleted(notification) => {
+                self.register_artifacts_for_completed_item(notification)
+                    .await;
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_COMPLETED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    None,
+                )
+                .await;
+            }
+            Event::ItemUpdated(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_UPDATED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    None,
+                )
+                .await;
+            }
+            Event::ItemToolRetryScheduled(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_TOOL_RETRY_SCHEDULED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
+            }
+            Event::ItemToolRetryResolved(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_TOOL_RETRY_RESOLVED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
+            }
+            Event::ItemToolRetryExhausted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_TOOL_RETRY_EXHAUSTED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
+            }
+            Event::TurnToolLoopBudgetExceeded(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_TOOL_LOOP_BUDGET_EXCEEDED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnExecutionWindowStarted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_STARTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnExecutionWindowExhausted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_EXHAUSTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnExecutionWindowCheckpointed(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnExecutionWindowContinued(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_CONTINUED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnExecutionWindowBlocked(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_BLOCKED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemTimeoutDetected(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_TIMEOUT_DETECTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRecoveryOpened(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RECOVERY_OPENED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRecoveryAttached(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RECOVERY_ATTACHED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRetryScheduled(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RETRY_SCHEDULED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRetryAttemptStarted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RETRY_ATTEMPT_STARTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRecoverySucceeded(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RECOVERY_SUCCEEDED,
+                    notification,
+                )
+                .await;
+            }
+            Event::ItemRecoveryExhausted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_RECOVERY_EXHAUSTED,
+                    notification,
+                )
+                .await;
+            }
+            Event::TurnCompleted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_COMPLETED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
+                )
+                .await;
+            }
+            Event::TurnFailed(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_FAILED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
+                )
+                .await;
+            }
+            Event::TurnBlocked(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_BLOCKED,
+                    notification,
+                )
+                .await;
+                self.notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
+                )
+                .await;
+            }
+            Event::TurnStarted(_)
+            | Event::TurnPermissionAudit(_)
+            | Event::TurnMessageEdited(_)
+            | Event::TurnMessageDeleted(_) => {
+                bail!(
+                    "event type `{}` is not a native live-delivery event",
+                    payload.event_type()
+                );
+            }
+        }
+
+        self.notify_parent_timeline_changed_for_child_turn(
+            payload.thread_id(),
+            payload.turn_id(),
+            Some(payload.workspace_id()),
+        )
+        .await;
+        Ok(())
     }
 
     fn spawn_thread_episodic_index_run(&self) {
@@ -1501,14 +1997,16 @@ impl MessageProcessor {
                             thread_id,
                             turn_id, "turn was not found while persisting prompt manifest"
                         );
+                        return false;
                     }
                     Err(error) => {
                         warn!(
                             thread_id,
                             turn_id,
                             error = %format!("{error:#}"),
-                            "failed to persist prompt manifest metadata; continuing"
+                            "failed to persist prompt manifest metadata"
                         );
+                        return false;
                     }
                 }
                 true
@@ -1532,6 +2030,7 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to persist durable turn skill projection"
                     );
+                    return false;
                 }
                 true
             }),
@@ -1613,30 +2112,20 @@ impl MessageProcessor {
 
                 if let Err(error) = self
                     .crud_store
-                    .append_skill_audit_event_records(turn_id.as_str(), records.as_slice())
+                    .persist_native_skill_audit_bundle(
+                        turn_id.as_str(),
+                        records.as_slice(),
+                        dependency_snapshots.as_slice(),
+                    )
                     .await
                 {
                     warn!(
                         thread_id,
                         turn_id,
                         error = %format!("{error:#}"),
-                        "failed to persist skill audit events; continuing"
+                        "failed to persist skill audit events"
                     );
-                }
-
-                for snapshot in dependency_snapshots {
-                    if let Err(error) = self
-                        .crud_store
-                        .insert_skill_dependency_snapshot_record(&snapshot)
-                        .await
-                    {
-                        warn!(
-                            thread_id,
-                            turn_id,
-                            error = %format!("{error:#}"),
-                            "failed to persist skill dependency snapshot; continuing"
-                        );
-                    }
+                    return false;
                 }
                 true
             }),
@@ -1668,10 +2157,27 @@ impl MessageProcessor {
                 payload,
                 output_policy_snapshot,
             } => message_future(async move {
-                let sequence = self
-                    .next_turn_llm_context_sequence(turn_id.as_str(), sequence)
-                    .await;
                 let created_at = now_db_timestamp();
+                let payload = match serde_json::to_string(&tool_result_view_from_protocol(payload))
+                {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(turn_id = %turn_id, error = %error, "rejecting unserializable retained tool result");
+                        return false;
+                    }
+                };
+                let output_policy_snapshot = match serde_json::to_string(&output_policy_snapshot) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        warn!(turn_id = %turn_id, error = %error, "rejecting unserializable retained tool output policy");
+                        return false;
+                    }
+                };
+                let delivery_key = turn_llm_context_delivery_key(&[
+                    "tool_result",
+                    item_id.as_str(),
+                    attempt_id.as_deref().unwrap_or(""),
+                ]);
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
@@ -1679,14 +2185,16 @@ impl MessageProcessor {
                     sequence,
                     source,
                     tool_name: Some(tool_name),
-                    payload: serde_json::to_string(&tool_result_view_from_protocol(payload))
-                        .unwrap_or_else(|_| serde_json::json!({}).to_string()),
-                    output_policy_snapshot: serde_json::to_string(&output_policy_snapshot)
-                        .unwrap_or_else(|_| serde_json::json!({}).to_string()),
+                    payload,
+                    output_policy_snapshot,
                     created_at,
                     expires_at: None,
                 };
-                if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
+                if let Err(error) = self
+                    .crud_store
+                    .append_turn_llm_context(entry, delivery_key.as_str())
+                    .await
+                {
                     self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
@@ -1704,9 +2212,6 @@ impl MessageProcessor {
                 sequence,
                 payload,
             } => message_future(async move {
-                let sequence = self
-                    .next_turn_llm_context_sequence(turn_id.as_str(), sequence)
-                    .await;
                 let created_at = now_db_timestamp();
                 let payload = match serde_json::to_string(&payload) {
                     Ok(payload) => payload,
@@ -1720,6 +2225,8 @@ impl MessageProcessor {
                         return false;
                     }
                 };
+                let delivery_key =
+                    turn_llm_context_delivery_key(&["assistant_round", item_id.as_str()]);
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
@@ -1732,7 +2239,11 @@ impl MessageProcessor {
                     created_at,
                     expires_at: None,
                 };
-                if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
+                if let Err(error) = self
+                    .crud_store
+                    .append_turn_llm_context(entry, delivery_key.as_str())
+                    .await
+                {
                     self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
@@ -1753,14 +2264,11 @@ impl MessageProcessor {
                 let deadlines = self
                     .timeout_supervisor
                     .deadlines_for_item(&notification.item, event_timestamp);
-                if let Err(error) = message_future(
-                    self.crud_store
-                        .materialize_item_started_with_attempt_deadlines(
-                            notification.clone(),
-                            event_timestamp,
-                            deadlines,
-                        ),
-                )
+                if let Err(error) = message_future(self.materialize_native_agent_turn_event(
+                    pioneer_crud::CanonicalTurnEventPayload::ItemStarted(notification.clone()),
+                    event_timestamp,
+                    Some(deadlines),
+                ))
                 .await
                 {
                     self.report_legacy_turn_failure(
@@ -1771,26 +2279,6 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_STARTED,
-                    &notification,
-                )
-                .await;
-                self.notify_semantic_timeline_item_changed(
-                    notification.workspace_id.as_str(),
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    &notification.item,
-                    Some("in_progress"),
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
                 debug!(
                     thread_id = notification.thread_id,
                     turn_id = notification.turn_id,
@@ -1803,15 +2291,14 @@ impl MessageProcessor {
             AgentDurableEvent::ItemCompleted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
-                self.record_final_assistant_text_for_item(&notification)
-                    .await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
-                if let Err(error) = message_future(
-                    self.crud_store
-                        .materialize_item_completed(notification.clone(), event_timestamp),
-                )
+                if let Err(error) = message_future(self.materialize_native_agent_turn_event(
+                    pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone()),
+                    event_timestamp,
+                    None,
+                ))
                 .await
                 {
                     self.report_legacy_turn_failure(
@@ -1822,28 +2309,12 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-                self.register_artifacts_for_completed_item(&notification)
+                // This tiny in-process projection participates in the
+                // completion guard and therefore must be visible before the
+                // agent receives the canonical commit ACK. Network, artifact,
+                // and episodic work remains on the optional outbox.
+                self.record_final_assistant_text_for_item(&notification)
                     .await;
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_COMPLETED,
-                    &notification,
-                )
-                .await;
-                self.notify_semantic_timeline_item_changed(
-                    notification.workspace_id.as_str(),
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    &notification.item,
-                    None,
-                )
-                .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
                 true
             }),
             AgentDurableEvent::ItemToolRetryScheduled { notification } => {
@@ -1852,10 +2323,12 @@ impl MessageProcessor {
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
                     if let Err(error) = self
-                        .crud_store
-                        .materialize_item_tool_retry_scheduled(
-                            notification.clone(),
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemToolRetryScheduled(
+                                notification.clone(),
+                            ),
                             event_timestamp,
+                            None,
                         )
                         .await
                     {
@@ -1867,25 +2340,6 @@ impl MessageProcessor {
                         .await;
                         return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::ITEM_TOOL_RETRY_SCHEDULED,
-                        &notification,
-                    )
-                    .await;
-                    self.notify_semantic_timeline_work_item_id_changed(
-                        notification.workspace_id.as_str(),
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        notification.item_id.as_str(),
-                    )
-                    .await;
-                    self.notify_parent_timeline_changed_for_child_turn(
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        Some(notification.workspace_id.as_str()),
-                    )
-                    .await;
                     true
                 })
             }
@@ -1895,8 +2349,13 @@ impl MessageProcessor {
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
                     if let Err(error) = self
-                        .crud_store
-                        .materialize_item_tool_retry_resolved(notification.clone(), event_timestamp)
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemToolRetryResolved(
+                                notification.clone(),
+                            ),
+                            event_timestamp,
+                            None,
+                        )
                         .await
                     {
                         self.report_legacy_turn_failure(
@@ -1907,25 +2366,6 @@ impl MessageProcessor {
                         .await;
                         return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::ITEM_TOOL_RETRY_RESOLVED,
-                        &notification,
-                    )
-                    .await;
-                    self.notify_semantic_timeline_work_item_id_changed(
-                        notification.workspace_id.as_str(),
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        notification.item_id.as_str(),
-                    )
-                    .await;
-                    self.notify_parent_timeline_changed_for_child_turn(
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        Some(notification.workspace_id.as_str()),
-                    )
-                    .await;
                     true
                 })
             }
@@ -1935,10 +2375,12 @@ impl MessageProcessor {
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
                     if let Err(error) = self
-                        .crud_store
-                        .materialize_item_tool_retry_exhausted(
-                            notification.clone(),
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemToolRetryExhausted(
+                                notification.clone(),
+                            ),
                             event_timestamp,
+                            None,
                         )
                         .await
                     {
@@ -1950,25 +2392,6 @@ impl MessageProcessor {
                         .await;
                         return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::ITEM_TOOL_RETRY_EXHAUSTED,
-                        &notification,
-                    )
-                    .await;
-                    self.notify_semantic_timeline_work_item_id_changed(
-                        notification.workspace_id.as_str(),
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        notification.item_id.as_str(),
-                    )
-                    .await;
-                    self.notify_parent_timeline_changed_for_child_turn(
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        Some(notification.workspace_id.as_str()),
-                    )
-                    .await;
                     true
                 })
             }
@@ -1978,10 +2401,12 @@ impl MessageProcessor {
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
                     if let Err(error) = self
-                        .crud_store
-                        .materialize_turn_tool_loop_budget_exceeded(
-                            notification.clone(),
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::TurnToolLoopBudgetExceeded(
+                                notification.clone(),
+                            ),
                             event_timestamp,
+                            None,
                         )
                         .await
                     {
@@ -1993,18 +2418,6 @@ impl MessageProcessor {
                         .await;
                         return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_TOOL_LOOP_BUDGET_EXCEEDED,
-                        &notification,
-                    )
-                    .await;
-                    self.notify_parent_timeline_changed_for_child_turn(
-                        notification.thread_id.as_str(),
-                        notification.turn_id.as_str(),
-                        Some(notification.workspace_id.as_str()),
-                    )
-                    .await;
                     true
                 })
             }
@@ -2013,44 +2426,13 @@ impl MessageProcessor {
                     let thread_id = notification.thread_id.clone();
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
+                    let event_time =
+                        db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000));
                     if let Err(error) = self
                         .crud_store
-                        .materialize_turn_execution_window_started(
-                            notification.clone(),
-                            event_timestamp,
-                        )
-                        .await
-                    {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to persist turn/execution_window/started: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                    let latest = match self
-                        .crud_store
-                        .latest_turn_execution_window(notification.turn_id.as_str())
-                        .await
-                    {
-                        Ok(latest) => latest,
-                        Err(error) => {
-                            self.report_legacy_turn_failure(
-                                thread_id.clone(),
-                                turn_id.clone(),
-                                format!("failed to load latest execution window: {error:#}"),
-                            )
-                            .await;
-                            return false;
-                        }
-                    };
-                    if execution_window_can_create_after(latest.as_ref(), notification.window_index)
-                    {
-                        if let Err(error) = self
-                            .crud_store
-                            .create_turn_execution_window(
-                                pioneer_crud::NewTurnExecutionWindowRecord {
+                        .materialize_native_execution_window_transition(
+                            pioneer_crud::NativeExecutionWindowTransition::Started {
+                                window: pioneer_crud::NewTurnExecutionWindowRecord {
                                     workspace_id: notification.workspace_id.clone(),
                                     thread_id: notification.thread_id.clone(),
                                     turn_id: notification.turn_id.clone(),
@@ -2067,36 +2449,22 @@ impl MessageProcessor {
                                         notification.started_at_unix_ms,
                                     ),
                                 },
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            )
-                            .await
-                        {
-                            self.report_legacy_turn_failure(
-                                thread_id.clone(),
-                                turn_id.clone(),
-                                format!("failed to create execution window: {error:#}"),
-                            )
-                            .await;
-                            return false;
-                        }
-                    } else if latest
-                        .as_ref()
-                        .is_some_and(|window| window.window_index < notification.window_index)
+                                notification,
+                                created_at: event_time,
+                                updated_at: event_time,
+                            },
+                            event_timestamp,
+                        )
+                        .await
                     {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            latest_window_index = latest.as_ref().map(|window| window.window_index),
-                            event_window_index = notification.window_index,
-                            "skipping out-of-order execution window started event"
-                        );
+                        self.report_legacy_turn_failure(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to persist turn/execution_window/started: {error:#}"),
+                        )
+                        .await;
+                        return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_EXECUTION_WINDOW_STARTED,
-                        &notification,
-                    )
-                    .await;
                     true
                 })
             }
@@ -2105,10 +2473,26 @@ impl MessageProcessor {
                     let thread_id = notification.thread_id.clone();
                     let turn_id = notification.turn_id.clone();
                     let event_timestamp = now_timestamp_secs();
+                    let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
+                        agent_round_count: notification.agent_round_count,
+                        tool_call_count: notification.tool_call_count,
+                        provider_token_count: notification.provider_token_count.unwrap_or(0),
+                        metadata_json: execution_window_exhausted_metadata(
+                            notification.window_id.as_str(),
+                            notification.limit,
+                            notification.observed,
+                            notification.reason.as_str(),
+                        ),
+                        completed_at: db_timestamp_from_unix_ms(notification.exhausted_at_unix_ms),
+                        updated_at: now_db_timestamp(),
+                    };
                     if let Err(error) = self
                         .crud_store
-                        .materialize_turn_execution_window_exhausted(
-                            notification.clone(),
+                        .materialize_native_execution_window_transition(
+                            pioneer_crud::NativeExecutionWindowTransition::Exhausted {
+                                notification,
+                                stats,
+                            },
                             event_timestamp,
                         )
                         .await
@@ -2121,120 +2505,6 @@ impl MessageProcessor {
                         .await;
                         return false;
                     }
-                    let latest = match self
-                        .crud_store
-                        .latest_turn_execution_window(notification.turn_id.as_str())
-                        .await
-                    {
-                        Ok(latest) => latest,
-                        Err(error) => {
-                            self.report_legacy_turn_failure(
-                                thread_id.clone(),
-                                turn_id.clone(),
-                                format!(
-                                    "failed to load execution window for exhaustion: {error:#}"
-                                ),
-                            )
-                            .await;
-                            return false;
-                        }
-                    };
-                    let window = if latest
-                        .as_ref()
-                        .is_some_and(|window| window.window_index == notification.window_index)
-                    {
-                        latest
-                    } else if execution_window_can_create_after(
-                        latest.as_ref(),
-                        notification.window_index,
-                    ) {
-                        match self
-                            .crud_store
-                            .create_turn_execution_window(
-                                pioneer_crud::NewTurnExecutionWindowRecord {
-                                    workspace_id: notification.workspace_id.clone(),
-                                    thread_id: notification.thread_id.clone(),
-                                    turn_id: notification.turn_id.clone(),
-                                    window_index: notification.window_index,
-                                    status: pioneer_protocol::ExecutionWindowStatus::Running,
-                                    exhaustion_reason: None,
-                                    agent_round_count: 0,
-                                    tool_call_count: 0,
-                                    provider_token_count: 0,
-                                    metadata_json: execution_window_started_metadata(
-                                        notification.window_id.as_str(),
-                                    ),
-                                    started_at: db_timestamp_from_unix_ms(
-                                        notification.started_at_unix_ms,
-                                    ),
-                                },
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            )
-                            .await
-                        {
-                            Ok(window) => Some(window),
-                            Err(error) => {
-                                self.report_legacy_turn_failure(
-                                thread_id.clone(),
-                                turn_id.clone(),
-                                format!(
-                                    "failed to create execution window for exhaustion: {error:#}"
-                                ),
-                            )
-                            .await;
-                                return false;
-                            }
-                        }
-                    } else {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            latest_window_index = latest.as_ref().map(|window| window.window_index),
-                            event_window_index = notification.window_index,
-                            "skipping out-of-order execution window exhausted event"
-                        );
-                        None
-                    };
-                    if let Some(window) = window
-                        && let Err(error) = self
-                            .crud_store
-                            .mark_turn_execution_window_exhausted(
-                                window.id.as_str(),
-                                notification.exhaustion_reason,
-                                pioneer_crud::TurnExecutionWindowStatsRecord {
-                                    agent_round_count: notification.agent_round_count,
-                                    tool_call_count: notification.tool_call_count,
-                                    provider_token_count: notification
-                                        .provider_token_count
-                                        .unwrap_or(0),
-                                    metadata_json: execution_window_exhausted_metadata(
-                                        notification.window_id.as_str(),
-                                        notification.limit,
-                                        notification.observed,
-                                        notification.reason.as_str(),
-                                    ),
-                                    completed_at: db_timestamp_from_unix_ms(
-                                        notification.exhausted_at_unix_ms,
-                                    ),
-                                    updated_at: now_db_timestamp(),
-                                },
-                            )
-                            .await
-                    {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to mark execution window exhausted: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_EXECUTION_WINDOW_EXHAUSTED,
-                        &notification,
-                    )
-                    .await;
                     true
                 })
             }
@@ -2245,98 +2515,57 @@ impl MessageProcessor {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_turn_execution_window_checkpointed(
-                        notification.clone(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    self.report_legacy_turn_failure(
-                        thread_id.clone(),
-                        turn_id.clone(),
-                        format!("failed to persist turn/execution_window/checkpointed: {error:#}"),
-                    )
-                    .await;
+                let Some(checkpoint_kind) =
+                    execution_checkpoint_kind_from_wire(notification.checkpoint_kind.as_str())
+                else {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        checkpoint_kind = %notification.checkpoint_kind,
+                        "rejecting execution window checkpoint with unknown kind"
+                    );
                     return false;
-                }
-                let latest = match self
-                    .crud_store
-                    .latest_turn_execution_window(notification.turn_id.as_str())
-                    .await
-                {
-                    Ok(latest) => latest,
+                };
+                let payload_json = match serde_json::to_value(&payload) {
+                    Ok(payload_json) => payload_json,
                     Err(error) => {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to load execution window for checkpoint: {error:#}"),
-                        )
-                        .await;
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            error = %format!("{error:#}"),
+                            "rejecting execution window checkpoint with unserializable payload"
+                        );
                         return false;
                     }
                 };
-                if let Some(window) =
-                    latest.filter(|window| window.window_index == notification.window_index)
-                {
-                    let Some(checkpoint_kind) =
-                        execution_checkpoint_kind_from_wire(notification.checkpoint_kind.as_str())
-                    else {
+                let payload_size = match serde_json::to_vec(&payload_json) {
+                    Ok(bytes) => bytes.len(),
+                    Err(error) => {
                         warn!(
                             turn_id = %notification.turn_id,
-                            checkpoint_kind = %notification.checkpoint_kind,
-                            "skipping execution window checkpoint with unknown kind"
+                            error = %format!("{error:#}"),
+                            "rejecting execution window checkpoint whose size cannot be measured"
                         );
-                        self.send_notification_to_thread_subscribers(
-                            notification.thread_id.as_str(),
-                            events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
-                            &notification,
-                        )
-                        .await;
-                        return true;
-                    };
-                    let payload_json = match serde_json::to_value(&payload) {
-                        Ok(payload_json) => payload_json,
-                        Err(error) => {
-                            warn!(
-                                turn_id = %notification.turn_id,
-                                error = %format!("{error:#}"),
-                                "skipping execution window checkpoint with unserializable payload"
-                            );
-                            self.send_notification_to_thread_subscribers(
-                                notification.thread_id.as_str(),
-                                events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
-                                &notification,
-                            )
-                            .await;
-                            return true;
-                        }
-                    };
-                    let payload_size = serde_json::to_vec(&payload_json)
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(usize::MAX);
-                    if payload_size > pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            payload_size,
-                            max_payload_size =
-                                pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
-                            "skipping oversized execution window checkpoint payload"
-                        );
-                        self.send_notification_to_thread_subscribers(
-                            notification.thread_id.as_str(),
-                            events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
-                            &notification,
-                        )
-                        .await;
-                        return true;
+                        return false;
                     }
-                    if let Err(error) = self
-                        .crud_store
-                        .save_turn_execution_checkpoint(
-                            pioneer_crud::NewTurnExecutionCheckpointRecord {
-                                window_id: window.id.clone(),
+                };
+                if payload_size > pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES
+                    || u64::try_from(payload_size).ok() != Some(notification.payload_bytes)
+                {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        payload_size,
+                        declared_payload_size = notification.payload_bytes,
+                        max_payload_size = pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+                        "rejecting invalid execution window checkpoint payload size"
+                    );
+                    return false;
+                }
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_native_execution_window_transition(
+                        pioneer_crud::NativeExecutionWindowTransition::Checkpointed {
+                            checkpoint: pioneer_crud::NewTurnExecutionCheckpointRecord {
+                                id: Some(notification.checkpoint_id.clone()),
+                                window_id: String::new(),
                                 workspace_id: notification.workspace_id.clone(),
                                 thread_id: notification.thread_id.clone(),
                                 turn_id: notification.turn_id.clone(),
@@ -2346,283 +2575,103 @@ impl MessageProcessor {
                                     notification.created_at_unix_ms,
                                 ),
                             },
-                        )
-                        .await
-                    {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to save execution window checkpoint: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                    if let Err(error) = self
-                        .crud_store
-                        .mark_turn_execution_window_checkpointed(
-                            window.id.as_str(),
-                            db_timestamp_from_unix_ms(notification.created_at_unix_ms),
-                        )
-                        .await
-                    {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to mark execution window checkpointed: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                } else {
-                    warn!(
-                        turn_id = %notification.turn_id,
-                        event_window_index = notification.window_index,
-                        "skipping execution window checkpoint without matching stored window"
-                    );
+                            notification,
+                        },
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id,
+                        turn_id,
+                        format!("failed to persist execution-window checkpoint: {error:#}"),
+                    )
+                    .await;
+                    return false;
                 }
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
-                    &notification,
-                )
-                .await;
                 true
             }),
             AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
                 message_future(async move {
                     let event_timestamp = now_timestamp_secs();
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let updated_at = db_timestamp_from_unix_ms(notification.continued_at_unix_ms);
                     if let Err(error) = self
                         .crud_store
-                        .materialize_turn_execution_window_continued(
-                            notification.clone(),
+                        .materialize_native_execution_window_transition(
+                            pioneer_crud::NativeExecutionWindowTransition::Continued {
+                                notification,
+                                updated_at,
+                            },
                             event_timestamp,
                         )
                         .await
                     {
                         self.report_legacy_turn_failure(
-                            notification.thread_id.clone(),
-                            notification.turn_id.clone(),
+                            thread_id,
+                            turn_id,
                             format!("failed to persist turn/execution_window/continued: {error:#}"),
                         )
                         .await;
                         return false;
                     }
-                    match self
-                        .crud_store
-                        .latest_turn_execution_window(notification.turn_id.as_str())
-                        .await
-                    {
-                        Ok(Some(window))
-                            if window.window_index == notification.previous_window_index =>
-                        {
-                            if let Err(error) = self
-                                .crud_store
-                                .mark_turn_execution_window_continued(
-                                    window.id.as_str(),
-                                    db_timestamp_from_unix_ms(notification.continued_at_unix_ms),
-                                )
-                                .await
-                            {
-                                self.report_legacy_turn_failure(
-                                    notification.thread_id.clone(),
-                                    notification.turn_id.clone(),
-                                    format!("failed to mark execution window continued: {error:#}"),
-                                )
-                                .await;
-                                return false;
-                            }
-                        }
-                        Ok(Some(window)) => {
-                            warn!(
-                                turn_id = %notification.turn_id,
-                                latest_window_index = window.window_index,
-                                previous_window_index = notification.previous_window_index,
-                                "skipping out-of-order execution window continued state update"
-                            );
-                        }
-                        Ok(None) => {
-                            warn!(
-                                turn_id = %notification.turn_id,
-                                previous_window_index = notification.previous_window_index,
-                                "skipping execution window continued state update without stored window"
-                            );
-                        }
-                        Err(error) => {
-                            self.report_legacy_turn_failure(
-                                notification.thread_id.clone(),
-                                notification.turn_id.clone(),
-                                format!(
-                                    "failed to load execution window for continuation: {error:#}"
-                                ),
-                            )
-                            .await;
-                            return false;
-                        }
-                    }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_EXECUTION_WINDOW_CONTINUED,
-                        &notification,
-                    )
-                    .await;
                     true
                 })
             }
             AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
                 message_future(async move {
                     let event_timestamp = now_timestamp_secs();
+                    let thread_id = notification.thread_id.clone();
+                    let turn_id = notification.turn_id.clone();
+                    let reason = notification.reason.clone();
+                    let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
+                        agent_round_count: 0,
+                        tool_call_count: notification.total_tool_calls,
+                        provider_token_count: 0,
+                        metadata_json: execution_window_blocked_metadata(
+                            notification.window_id.as_str(),
+                            notification.total_windows,
+                            notification.total_tool_calls,
+                            notification.reason.as_str(),
+                        ),
+                        completed_at: db_timestamp_from_unix_ms(notification.blocked_at_unix_ms),
+                        updated_at: now_db_timestamp(),
+                    };
                     if let Err(error) = self
                         .crud_store
-                        .materialize_turn_execution_window_blocked(
-                            notification.clone(),
+                        .materialize_native_execution_window_transition(
+                            pioneer_crud::NativeExecutionWindowTransition::Blocked {
+                                notification,
+                                stats,
+                            },
                             event_timestamp,
                         )
                         .await
                     {
                         self.report_legacy_turn_failure(
-                            notification.thread_id.clone(),
-                            notification.turn_id.clone(),
+                            thread_id.clone(),
+                            turn_id.clone(),
                             format!("failed to persist turn/execution_window/blocked: {error:#}"),
                         )
                         .await;
                         return false;
                     }
-                    let latest =
-                        match self
-                            .crud_store
-                            .latest_turn_execution_window(notification.turn_id.as_str())
-                            .await
-                        {
-                            Ok(latest) => latest,
-                            Err(error) => {
-                                self.report_legacy_turn_failure(
-                            notification.thread_id.clone(),
-                            notification.turn_id.clone(),
-                            format!("failed to load execution window for blocked state: {error:#}"),
-                        )
-                        .await;
-                                return false;
-                            }
-                        };
-                    let window = if latest
-                        .as_ref()
-                        .is_some_and(|window| window.window_index == notification.window_index)
-                    {
-                        latest
-                    } else if execution_window_can_create_after(
-                        latest.as_ref(),
-                        notification.window_index,
-                    ) {
-                        match self
-                            .crud_store
-                            .create_turn_execution_window(
-                                pioneer_crud::NewTurnExecutionWindowRecord {
-                                    workspace_id: notification.workspace_id.clone(),
-                                    thread_id: notification.thread_id.clone(),
-                                    turn_id: notification.turn_id.clone(),
-                                    window_index: notification.window_index,
-                                    status: pioneer_protocol::ExecutionWindowStatus::Running,
-                                    exhaustion_reason: None,
-                                    agent_round_count: 0,
-                                    tool_call_count: 0,
-                                    provider_token_count: 0,
-                                    metadata_json: execution_window_started_metadata(
-                                        notification.window_id.as_str(),
-                                    ),
-                                    started_at: db_timestamp_from_unix_ms(
-                                        notification.blocked_at_unix_ms,
-                                    ),
-                                },
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                                db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
-                            )
-                            .await
-                        {
-                            Ok(window) => Some(window),
-                            Err(error) => {
-                                self.report_legacy_turn_failure(
-                                notification.thread_id.clone(),
-                                notification.turn_id.clone(),
-                                format!(
-                                    "failed to create execution window for blocked state: {error:#}"
-                                ),
-                            )
-                            .await;
-                                return false;
-                            }
-                        }
-                    } else {
-                        warn!(
-                            turn_id = %notification.turn_id,
-                            latest_window_index = latest.as_ref().map(|window| window.window_index),
-                            event_window_index = notification.window_index,
-                            "skipping out-of-order execution window blocked state update"
-                        );
-                        None
-                    };
-                    if let Some(window) = window
-                        && let Err(error) = self
-                            .crud_store
-                            .mark_turn_execution_window_blocked(
-                                window.id.as_str(),
-                                notification.exhaustion_reason,
-                                pioneer_crud::TurnExecutionWindowStatsRecord {
-                                    agent_round_count: 0,
-                                    tool_call_count: notification.total_tool_calls,
-                                    provider_token_count: 0,
-                                    metadata_json: execution_window_blocked_metadata(
-                                        notification.window_id.as_str(),
-                                        notification.total_windows,
-                                        notification.total_tool_calls,
-                                        notification.reason.as_str(),
-                                    ),
-                                    completed_at: db_timestamp_from_unix_ms(
-                                        notification.blocked_at_unix_ms,
-                                    ),
-                                    updated_at: now_db_timestamp(),
-                                },
-                            )
-                            .await
-                    {
-                        self.report_legacy_turn_failure(
-                            notification.thread_id.clone(),
-                            notification.turn_id.clone(),
-                            format!("failed to mark execution window blocked: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                    if notification
-                        .reason
-                        .contains("execution window continuation could not resume")
-                    {
+                    if reason.contains("execution window continuation could not resume") {
                         if !self
                             .report_turn_failure(
-                                notification.thread_id.clone(),
-                                notification.turn_id.clone(),
+                                thread_id,
+                                turn_id,
                                 TurnFailureRecoveryKind::ExecutionWindowContinuation,
-                                notification.reason.clone(),
+                                reason,
                             )
                             .await
                         {
                             return false;
                         }
-                    } else if !self
-                        .mark_turn_blocked(
-                            notification.thread_id.clone(),
-                            notification.turn_id.clone(),
-                            notification.reason.clone(),
-                        )
-                        .await
-                    {
+                    } else if !self.mark_turn_blocked(thread_id, turn_id, reason).await {
                         return false;
                     }
-                    self.send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_EXECUTION_WINDOW_BLOCKED,
-                        &notification,
-                    )
-                    .await;
                     true
                 })
             }
@@ -2647,19 +2696,15 @@ impl MessageProcessor {
                 message_future(self.handle_provider_failure_detected(
                     thread_id, turn_id, item_id, item_type, failure, recovery,
                 ))
-                .await;
-                true
+                .await
             }),
             AgentDurableEvent::RecoveryAttemptSucceeded {
                 thread_id,
                 turn_id,
                 recovery,
             } => message_future(async move {
-                message_future(
-                    self.handle_recovery_attempt_succeeded(thread_id, turn_id, recovery),
-                )
-                .await;
-                true
+                message_future(self.handle_recovery_attempt_succeeded(thread_id, turn_id, recovery))
+                    .await
             }),
             AgentDurableEvent::TurnFailed {
                 thread_id,
@@ -2852,7 +2897,7 @@ impl MessageProcessor {
         thread_id: String,
         turn_id: String,
         recovery: pioneer_protocol::RecoveryAttemptContext,
-    ) {
+    ) -> bool {
         let now_unix = now_timestamp_secs();
         match self
             .recovery_coordinator
@@ -2860,9 +2905,52 @@ impl MessageProcessor {
             .await
         {
             Ok(events) => {
-                for event in events {
-                    self.handle_recovery_event(event, now_unix).await;
+                if events.is_empty() {
+                    let job = match self
+                        .crud_store
+                        .get_recovery_job(recovery.job_id.as_str())
+                        .await
+                    {
+                        Ok(Some(job))
+                            if job.turn_id == turn_id
+                                && job.status == pioneer_protocol::RecoveryJobStatus::Succeeded =>
+                        {
+                            job
+                        }
+                        Ok(_) => return false,
+                        Err(error) => {
+                            warn!(
+                                thread_id,
+                                turn_id,
+                                recovery_job_id = recovery.job_id,
+                                error = %format!("{error:#}"),
+                                "failed to confirm idempotent recovery success"
+                            );
+                            return false;
+                        }
+                    };
+                    let attempt_number =
+                        if job.trigger == pioneer_protocol::RecoveryTrigger::ProviderError {
+                            u32::try_from(job.provider_attempt_number.max(0)).unwrap_or(u32::MAX)
+                        } else {
+                            u32::try_from(job.run_count.max(0)).unwrap_or(u32::MAX)
+                        };
+                    return self
+                        .handle_recovery_succeeded_event(
+                            job.id,
+                            job.turn_id,
+                            job.item_id,
+                            job.item_type,
+                            attempt_number,
+                            now_unix,
+                        )
+                        .await;
                 }
+                let mut committed = true;
+                for event in events {
+                    committed &= self.handle_recovery_event(event, now_unix).await;
+                }
+                committed
             }
             Err(error) => {
                 self.report_legacy_turn_failure(
@@ -2871,6 +2959,7 @@ impl MessageProcessor {
                     format!("failed to mark recovery attempt succeeded: {error:#}"),
                 )
                 .await;
+                false
             }
         }
     }
@@ -3010,8 +3099,7 @@ impl MessageProcessor {
                 next_attempt_number,
             }
         };
-        self.handle_recovery_event(event, now_unix).await;
-        true
+        self.handle_recovery_event(event, now_unix).await
     }
 
     pub(super) async fn handle_provider_failure_detected(
@@ -3022,11 +3110,11 @@ impl MessageProcessor {
         item_type: TurnItemType,
         failure: pioneer_protocol::ProviderFailureDetails,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
-    ) {
+    ) -> bool {
         let now_unix = now_timestamp_secs();
 
         if let Some(recovery) = recovery {
-            match self
+            return match self
                 .recovery_coordinator
                 .record_recovery_provider_failure(
                     recovery.job_id.as_str(),
@@ -3037,9 +3125,20 @@ impl MessageProcessor {
                 .await
             {
                 Ok(events) => {
-                    for event in events {
-                        self.handle_recovery_event(event, now_unix).await;
+                    if events.is_empty() {
+                        return self
+                            .replay_applied_recovery_provider_failure(
+                                turn_id.as_str(),
+                                &recovery,
+                                now_unix,
+                            )
+                            .await;
                     }
+                    let mut committed = true;
+                    for event in events {
+                        committed &= self.handle_recovery_event(event, now_unix).await;
+                    }
+                    committed
                 }
                 Err(error) => {
                     self.report_legacy_turn_failure(
@@ -3048,9 +3147,9 @@ impl MessageProcessor {
                         format!("failed to update provider recovery: {error:#}"),
                     )
                     .await;
+                    false
                 }
-            }
-            return;
+            };
         }
 
         let candidate = crate::resilience::ProviderFailureCandidate {
@@ -3070,15 +3169,32 @@ impl MessageProcessor {
                 let next_attempt_number = outcome.next_attempt_number();
                 let job = outcome.into_job();
                 let should_terminalize = job.action == pioneer_protocol::RecoveryAction::MarkFailed;
-                if let Some((_, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    if is_created {
-                        let opened = pioneer_protocol::ItemRecoveryOpenedNotification {
+                let workspace_id = match self.crud_store.get_turn_location(turn_id.as_str()).await {
+                    Ok(Some((stored_thread_id, workspace_id))) if stored_thread_id == thread_id => {
+                        workspace_id
+                    }
+                    Ok(_) => return false,
+                    Err(error) => {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to resolve provider recovery turn location"
+                        );
+                        return false;
+                    }
+                };
+
+                // Retrying an unknown commit result reuses the same provider
+                // recovery job. Keep the opened-event identity stable instead
+                // of changing it to an attached event on the retry.
+                let owns_provider_failure = job.trigger
+                    == pioneer_protocol::RecoveryTrigger::ProviderError
+                    && job.item_id == item_id
+                    && job.item_type == item_type;
+                let recovery_event_committed = if is_created || owns_provider_failure {
+                    self.persist_and_send_item_recovery_opened(
+                        pioneer_protocol::ItemRecoveryOpenedNotification {
                             workspace_id,
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
@@ -3088,11 +3204,13 @@ impl MessageProcessor {
                             trigger: job.trigger,
                             action: job.action,
                             attempt_number: next_attempt_number,
-                        };
-                        self.persist_and_send_item_recovery_opened(opened, now_unix)
-                            .await;
-                    } else {
-                        let attached = pioneer_protocol::ItemRecoveryAttachedNotification {
+                        },
+                        now_unix,
+                    )
+                    .await
+                } else {
+                    self.persist_and_send_item_recovery_attached(
+                        pioneer_protocol::ItemRecoveryAttachedNotification {
                             workspace_id,
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
@@ -3105,22 +3223,27 @@ impl MessageProcessor {
                             action: job.action,
                             existing_status: job.status,
                             next_attempt_number,
-                        };
-                        self.persist_and_send_item_recovery_attached(attached, now_unix)
-                            .await;
-                    }
+                        },
+                        now_unix,
+                    )
+                    .await
+                };
+                if !recovery_event_committed {
+                    return false;
                 }
 
                 if should_terminalize {
-                    match self
+                    return match self
                         .recovery_coordinator
                         .terminalize_pending_mark_failed_job(job, now_unix)
                         .await
                     {
                         Ok(events) => {
+                            let mut committed = !events.is_empty();
                             for event in events {
-                                self.handle_recovery_event(event, now_unix).await;
+                                committed &= self.handle_recovery_event(event, now_unix).await;
                             }
+                            committed
                         }
                         Err(error) => {
                             self.report_legacy_turn_failure(
@@ -3129,9 +3252,11 @@ impl MessageProcessor {
                                 format!("failed to apply terminal provider recovery: {error:#}"),
                             )
                             .await;
+                            false
                         }
-                    }
+                    };
                 }
+                true
             }
             Err(error) => {
                 self.report_legacy_turn_failure(
@@ -3140,8 +3265,89 @@ impl MessageProcessor {
                     format!("failed to schedule provider recovery: {error:#}"),
                 )
                 .await;
+                false
             }
         }
+    }
+
+    async fn replay_applied_recovery_provider_failure(
+        &self,
+        turn_id: &str,
+        recovery: &pioneer_protocol::RecoveryAttemptContext,
+        event_timestamp: i64,
+    ) -> bool {
+        let job = match self
+            .crud_store
+            .get_recovery_job(recovery.job_id.as_str())
+            .await
+        {
+            Ok(Some(job)) if job.turn_id == turn_id => job,
+            Ok(_) => return false,
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    recovery_job_id = recovery.job_id,
+                    error = %format!("{error:#}"),
+                    "failed to reload applied provider recovery failure"
+                );
+                return false;
+            }
+        };
+
+        let event = match job.status {
+            pioneer_protocol::RecoveryJobStatus::Pending => {
+                let current_attempt =
+                    if job.trigger == pioneer_protocol::RecoveryTrigger::ProviderError {
+                        u32::try_from(job.provider_attempt_number.max(0)).unwrap_or(u32::MAX)
+                    } else {
+                        u32::try_from(job.run_count.max(0)).unwrap_or(u32::MAX)
+                    };
+                crate::resilience::RecoveryCoordinatorEvent::RetryScheduled {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    item_id: job.item_id,
+                    item_type: job.item_type,
+                    attempt_number: current_attempt.saturating_add(1),
+                    next_run_at_unix: job.next_run_at_unix,
+                    reason: job.last_error,
+                }
+            }
+            pioneer_protocol::RecoveryJobStatus::Failed
+            | pioneer_protocol::RecoveryJobStatus::Exhausted => {
+                let status = job.status;
+                let attempt_number =
+                    if job.trigger == pioneer_protocol::RecoveryTrigger::ProviderError {
+                        u32::try_from(job.provider_attempt_number.max(0)).unwrap_or(u32::MAX)
+                    } else {
+                        u32::try_from(job.run_count.max(0)).unwrap_or(u32::MAX)
+                    };
+                let persisted_error = job
+                    .last_error
+                    .unwrap_or_else(|| "provider recovery failed".to_owned());
+                let error_message = [
+                    "recovery wall-clock budget exhausted",
+                    "recovery attempts exhausted",
+                    "recovery no-progress guardrail exhausted",
+                ]
+                .into_iter()
+                .find(|summary| persisted_error.starts_with(summary))
+                .map(str::to_owned)
+                .unwrap_or(persisted_error);
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(
+                    crate::resilience::RecoveryTerminalOutcome {
+                        job_id: job.id,
+                        turn_id: job.turn_id,
+                        item_id: job.item_id,
+                        item_type: job.item_type,
+                        attempt_number,
+                        status,
+                        error_message,
+                    },
+                )
+            }
+            _ => return false,
+        };
+        self.handle_recovery_event(event, event_timestamp).await
     }
 
     pub(super) async fn handle_timeout_candidate(
@@ -3403,7 +3609,6 @@ impl MessageProcessor {
         else {
             return Ok(false);
         };
-        self.ensure_agent_listener_task(thread_id.as_str()).await;
         let Some(observation) = self
             .agent_manager
             .observe_turn(thread_id.as_str(), turn_id)
@@ -3411,6 +3616,7 @@ impl MessageProcessor {
         else {
             return Ok(false);
         };
+        self.ensure_agent_listener_task(thread_id.as_str()).await?;
         if observation.status != pioneer_agent::ExecutionTurnStatus::InProgress {
             debug!(
                 thread_id,
@@ -3572,7 +3778,7 @@ impl MessageProcessor {
         &'a self,
         event: crate::resilience::RecoveryCoordinatorEvent,
         event_timestamp: i64,
-    ) -> MessageFuture<'a, ()> {
+    ) -> MessageFuture<'a, bool> {
         message_future(async move {
             match event {
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryOpened {
@@ -3594,7 +3800,7 @@ impl MessageProcessor {
                         attempt_number,
                         event_timestamp,
                     ))
-                    .await;
+                    .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryAttached {
                     job_id,
@@ -3621,7 +3827,7 @@ impl MessageProcessor {
                         next_attempt_number,
                         event_timestamp,
                     ))
-                    .await;
+                    .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RetryScheduled {
                     job_id,
@@ -3642,7 +3848,7 @@ impl MessageProcessor {
                         reason,
                         event_timestamp,
                     ))
-                    .await;
+                    .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
                     job_id,
@@ -3659,7 +3865,7 @@ impl MessageProcessor {
                         attempt_number,
                         event_timestamp,
                     ))
-                    .await;
+                    .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::CliRuntimeRetryAttemptRequested(
                     request,
@@ -3671,6 +3877,7 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    true
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
                     job_id,
@@ -3687,7 +3894,7 @@ impl MessageProcessor {
                         attempt_number,
                         event_timestamp,
                     ))
-                    .await;
+                    .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
                     job_id,
@@ -3695,11 +3902,11 @@ impl MessageProcessor {
                     reason,
                 } => {
                     message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason))
-                        .await;
+                        .await
                 }
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
                     message_future(self.handle_recovery_exhausted_event(outcome, event_timestamp))
-                        .await;
+                        .await
                 }
             }
         })
@@ -3781,7 +3988,7 @@ impl MessageProcessor {
         action: pioneer_protocol::RecoveryAction,
         attempt_number: u32,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3789,7 +3996,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRecoveryOpenedNotification {
             workspace_id,
@@ -3803,7 +4010,7 @@ impl MessageProcessor {
             attempt_number,
         };
         self.persist_and_send_item_recovery_opened(notification, event_timestamp)
-            .await;
+            .await
     }
 
     async fn handle_recovery_attached_event(
@@ -3819,7 +4026,7 @@ impl MessageProcessor {
         existing_status: pioneer_protocol::RecoveryJobStatus,
         next_attempt_number: u32,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3827,7 +4034,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRecoveryAttachedNotification {
             workspace_id,
@@ -3844,7 +4051,7 @@ impl MessageProcessor {
             next_attempt_number,
         };
         self.persist_and_send_item_recovery_attached(notification, event_timestamp)
-            .await;
+            .await
     }
 
     async fn handle_retry_scheduled_event(
@@ -3857,7 +4064,7 @@ impl MessageProcessor {
         next_run_at_unix: i64,
         reason: Option<String>,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3865,7 +4072,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRetryScheduledNotification {
             workspace_id,
@@ -3879,7 +4086,7 @@ impl MessageProcessor {
             reason,
         };
         self.persist_and_send_item_retry_scheduled(notification, event_timestamp)
-            .await;
+            .await
     }
 
     async fn handle_retry_attempt_started_event(
@@ -3890,7 +4097,7 @@ impl MessageProcessor {
         item_type: pioneer_protocol::TurnItemType,
         attempt_number: u32,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3898,7 +4105,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRetryAttemptStartedNotification {
             workspace_id,
@@ -3910,7 +4117,7 @@ impl MessageProcessor {
             attempt_number,
         };
         self.persist_and_send_item_retry_attempt_started(notification, event_timestamp)
-            .await;
+            .await
     }
 
     async fn handle_recovery_succeeded_event(
@@ -3921,7 +4128,7 @@ impl MessageProcessor {
         item_type: pioneer_protocol::TurnItemType,
         attempt_number: u32,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3929,7 +4136,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRecoverySucceededNotification {
             workspace_id,
@@ -3941,10 +4148,15 @@ impl MessageProcessor {
             attempt_number,
         };
         self.persist_and_send_item_recovery_succeeded(notification, event_timestamp)
-            .await;
+            .await
     }
 
-    async fn handle_recovery_blocked_event(&self, job_id: String, turn_id: String, reason: String) {
+    async fn handle_recovery_blocked_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        reason: String,
+    ) -> bool {
         let Some((thread_id, _workspace_id)) = self
             .crud_store
             .get_turn_location(turn_id.as_str())
@@ -3952,7 +4164,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let display_reason = self
             .recovery_blocked_display_reason(turn_id.as_str(), job_id.as_str(), reason.as_str())
@@ -3979,7 +4191,9 @@ impl MessageProcessor {
                 error = %display_reason,
                 "failed to mark turn blocked for blocked recovery job"
             );
+            return false;
         }
+        true
     }
 
     async fn recovery_blocked_display_reason(
@@ -4020,16 +4234,19 @@ impl MessageProcessor {
         &self,
         outcome: RecoveryTerminalOutcome,
         event_timestamp: i64,
-    ) {
-        message_future(self.send_recovery_exhausted_notification(&outcome, event_timestamp)).await;
+    ) -> bool {
+        let committed =
+            message_future(self.send_recovery_exhausted_notification(&outcome, event_timestamp))
+                .await;
         message_future(self.handle_recovery_terminal_outcome(outcome, event_timestamp)).await;
+        committed
     }
 
     pub(super) async fn send_recovery_exhausted_notification(
         &self,
         outcome: &RecoveryTerminalOutcome,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(outcome.turn_id.as_str())
@@ -4037,7 +4254,7 @@ impl MessageProcessor {
             .ok()
             .flatten()
         else {
-            return;
+            return false;
         };
         let notification = pioneer_protocol::ItemRecoveryExhaustedNotification {
             workspace_id,
@@ -4051,7 +4268,7 @@ impl MessageProcessor {
             error_message: outcome.error_message.clone(),
         };
         self.persist_and_send_item_recovery_exhausted(notification, event_timestamp)
-            .await;
+            .await
     }
 
     async fn persist_and_send_item_timeout_detected(
@@ -4093,10 +4310,13 @@ impl MessageProcessor {
         &self,
         notification: pioneer_protocol::ItemRecoveryOpenedNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_recovery_opened(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRecoveryOpened(notification.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4105,34 +4325,24 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item recovery opened timeline event; skipping live notification"
+                "failed to persist item recovery opened timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RECOVERY_OPENED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     async fn persist_and_send_item_recovery_attached(
         &self,
         notification: pioneer_protocol::ItemRecoveryAttachedNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_recovery_attached(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRecoveryAttached(notification.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4141,34 +4351,24 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item recovery attached timeline event; skipping live notification"
+                "failed to persist item recovery attached timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RECOVERY_ATTACHED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     async fn persist_and_send_item_retry_scheduled(
         &self,
         notification: pioneer_protocol::ItemRetryScheduledNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_retry_scheduled(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRetryScheduled(notification.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4177,34 +4377,26 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item retry scheduled timeline event; skipping live notification"
+                "failed to persist item retry scheduled timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RETRY_SCHEDULED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     async fn persist_and_send_item_retry_attempt_started(
         &self,
         notification: pioneer_protocol::ItemRetryAttemptStartedNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_retry_attempt_started(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRetryAttemptStarted(
+                    notification.clone(),
+                ),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4213,34 +4405,26 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item retry attempt started timeline event; skipping live notification"
+                "failed to persist item retry attempt started timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RETRY_ATTEMPT_STARTED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     async fn persist_and_send_item_recovery_succeeded(
         &self,
         notification: pioneer_protocol::ItemRecoverySucceededNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_recovery_succeeded(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRecoverySucceeded(
+                    notification.clone(),
+                ),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4249,34 +4433,26 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item recovery succeeded timeline event; skipping live notification"
+                "failed to persist item recovery succeeded timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RECOVERY_SUCCEEDED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     async fn persist_and_send_item_recovery_exhausted(
         &self,
         notification: pioneer_protocol::ItemRecoveryExhaustedNotification,
         event_timestamp: i64,
-    ) {
+    ) -> bool {
         if let Err(error) = self
-            .crud_store
-            .materialize_item_recovery_exhausted(notification.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemRecoveryExhausted(
+                    notification.clone(),
+                ),
+                event_timestamp,
+                None,
+            )
             .await
         {
             warn!(
@@ -4285,24 +4461,11 @@ impl MessageProcessor {
                 item_id = notification.item_id.as_str(),
                 recovery_job_id = notification.recovery_job_id.as_str(),
                 error = %format!("{error:#}"),
-                "failed to persist item recovery exhausted timeline event; skipping live notification"
+                "failed to persist item recovery exhausted timeline event"
             );
-            return;
+            return false;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_RECOVERY_EXHAUSTED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_work_item_id_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            notification.item_id.as_str(),
-        )
-        .await;
+        true
     }
 
     pub(super) fn item_markdown_buffer_key(thread_id: &str, item_id: &str) -> String {
@@ -4459,6 +4622,40 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        if let Some((workspace_id, current_turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            if current_turn.status == TurnStatus::Completed {
+                let notification = TurnCompletedNotification {
+                    workspace_id,
+                    thread_id: thread_id.clone(),
+                    turn: current_turn,
+                };
+                return self
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(notification),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                    .map(|()| true)
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to confirm idempotent completed Turn commit"
+                        );
+                        false
+                    });
+            }
+            if current_turn.status != TurnStatus::InProgress {
+                return false;
+            }
+        }
+
         if let Some(recovery) = recovery.as_ref() {
             match self
                 .recovery_coordinator
@@ -4518,8 +4715,11 @@ impl MessageProcessor {
 
         let event_timestamp = now_timestamp_secs();
         if let Err(error) = self
-            .crud_store
-            .materialize_turn_completed(turn_completed.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(turn_completed.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             let rolled_back = self
@@ -4589,7 +4789,6 @@ impl MessageProcessor {
             "completed",
         )
         .await;
-        self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -4613,32 +4812,14 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_authorized_thread_connections(
-            turn_completed.thread_id.as_str(),
-            events::TURN_COMPLETED,
-            &turn_completed,
-            finish_outcome.connection_ids,
-        )
-        .await;
-        self.notify_semantic_timeline_turn_state_changed(
-            turn_completed.workspace_id.as_str(),
-            turn_completed.thread_id.as_str(),
-            turn_completed.turn.id.as_str(),
-        )
-        .await;
-        self.notify_parent_timeline_changed_for_child_turn(
-            turn_completed.thread_id.as_str(),
-            turn_completed.turn.id.as_str(),
-            Some(turn_completed.workspace_id.as_str()),
-        )
-        .await;
-
         if self
             .thread_manager
             .unload_orphaned_thread_if_idle(thread_id.as_str())
             .await
         {
-            self.agent_manager.remove_thread(thread_id.as_str()).await;
+            self.agent_manager
+                .retire_thread_after_terminal_commit(thread_id.as_str())
+                .await;
         }
         true
     }
@@ -4782,6 +4963,28 @@ impl MessageProcessor {
                     .error
                     .as_deref()
                     .unwrap_or_else(|| reason.as_str());
+                let notification = TurnBlockedNotification {
+                    workspace_id: _workspace_id,
+                    thread_id: thread_id.clone(),
+                    turn: current_turn.clone(),
+                    resume: resume.clone(),
+                };
+                if let Err(error) = self
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(notification),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to confirm idempotent blocked Turn commit"
+                    );
+                    return false;
+                }
                 self.ensure_blocked_turn_terminal_cleanup(
                     thread_id.as_str(),
                     turn_id.as_str(),
@@ -4880,11 +5083,15 @@ impl MessageProcessor {
 
         let event_timestamp = now_timestamp_secs();
         let materialize_blocked_result = {
-            let crud_store = self.crud_store.clone();
+            let processor = self.clone();
             let turn_blocked = turn_blocked.clone();
             message_fresh_task(async move {
-                crud_store
-                    .materialize_turn_blocked(turn_blocked, event_timestamp)
+                processor
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(turn_blocked),
+                        event_timestamp,
+                        None,
+                    )
                     .await
             })
             .await
@@ -4958,32 +5165,14 @@ impl MessageProcessor {
             );
         }
 
-        self.send_notification_to_authorized_thread_connections(
-            turn_blocked.thread_id.as_str(),
-            events::TURN_BLOCKED,
-            &turn_blocked,
-            finish_outcome.connection_ids,
-        )
-        .await;
-        self.notify_semantic_timeline_turn_state_changed(
-            turn_blocked.workspace_id.as_str(),
-            turn_blocked.thread_id.as_str(),
-            turn_blocked.turn.id.as_str(),
-        )
-        .await;
-        self.notify_parent_timeline_changed_for_child_turn(
-            turn_blocked.thread_id.as_str(),
-            turn_blocked.turn.id.as_str(),
-            Some(turn_blocked.workspace_id.as_str()),
-        )
-        .await;
-
         if self
             .thread_manager
             .unload_orphaned_thread_if_idle(thread_id.as_str())
             .await
         {
-            self.agent_manager.remove_thread(thread_id.as_str()).await;
+            self.agent_manager
+                .retire_thread_after_terminal_commit(thread_id.as_str())
+                .await;
         }
 
         true
@@ -5067,11 +5256,15 @@ impl MessageProcessor {
         };
         let event_timestamp = now_timestamp_secs();
         let materialize_blocked_result = {
-            let crud_store = self.crud_store.clone();
+            let processor = self.clone();
             let turn_blocked = turn_blocked.clone();
             message_fresh_task(async move {
-                crud_store
-                    .materialize_turn_blocked(turn_blocked, event_timestamp)
+                processor
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(turn_blocked),
+                        event_timestamp,
+                        None,
+                    )
                     .await
             })
             .await
@@ -5199,7 +5392,6 @@ impl MessageProcessor {
                 "failed to delete turn_llm_context rows after turn block"
             );
         }
-        self.clear_turn_llm_context_state(turn_id).await;
         self.clear_artifact_finalization_state(turn_id).await;
         self.ensure_cli_runtime_turn_blocked_cleanup(thread_id, turn_id, reason)
             .await;
@@ -5287,12 +5479,33 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         user_cancellation: bool,
     ) -> bool {
-        if let Some((_workspace_id, current_turn)) = self
+        if let Some((workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
             .await
         {
             if current_turn.status == TurnStatus::Interrupted {
+                let notification = TurnFailedNotification {
+                    workspace_id,
+                    thread_id: thread_id.clone(),
+                    turn: current_turn,
+                };
+                if let Err(error) = self
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to confirm idempotent interrupted Turn commit"
+                    );
+                    return false;
+                }
                 if user_cancellation
                     && let Err(error) = self
                         .task_agent_executor
@@ -5377,8 +5590,11 @@ impl MessageProcessor {
 
         let event_timestamp = now_timestamp_secs();
         if let Err(error) = self
-            .crud_store
-            .materialize_turn_failed(turn_failed.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnFailed(turn_failed.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             let rolled_back = self
@@ -5470,7 +5686,6 @@ impl MessageProcessor {
             "interrupted",
         )
         .await;
-        self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -5508,32 +5723,14 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_authorized_thread_connections(
-            turn_failed.thread_id.as_str(),
-            events::TURN_FAILED,
-            &turn_failed,
-            finish_outcome.connection_ids,
-        )
-        .await;
-        self.notify_semantic_timeline_turn_state_changed(
-            turn_failed.workspace_id.as_str(),
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-        )
-        .await;
-        self.notify_parent_timeline_changed_for_child_turn(
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-            Some(turn_failed.workspace_id.as_str()),
-        )
-        .await;
-
         if self
             .thread_manager
             .unload_orphaned_thread_if_idle(thread_id.as_str())
             .await
         {
-            self.agent_manager.remove_thread(thread_id.as_str()).await;
+            self.agent_manager
+                .retire_thread_after_terminal_commit(thread_id.as_str())
+                .await;
         }
         true
     }
@@ -5545,6 +5742,40 @@ impl MessageProcessor {
         error_message: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        if let Some((workspace_id, current_turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            if current_turn.status == TurnStatus::Failed {
+                let notification = TurnFailedNotification {
+                    workspace_id,
+                    thread_id: thread_id.clone(),
+                    turn: current_turn,
+                };
+                return self
+                    .materialize_native_agent_turn_event(
+                        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
+                        now_timestamp_secs(),
+                        None,
+                    )
+                    .await
+                    .map(|()| true)
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to confirm idempotent failed Turn commit"
+                        );
+                        false
+                    });
+            }
+            if current_turn.status != TurnStatus::InProgress {
+                return false;
+            }
+        }
+
         if let Some(recovery) = recovery.as_ref() {
             match self
                 .recovery_coordinator
@@ -5597,8 +5828,11 @@ impl MessageProcessor {
 
         let event_timestamp = now_timestamp_secs();
         if let Err(error) = self
-            .crud_store
-            .materialize_turn_failed(turn_failed.clone(), event_timestamp)
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnFailed(turn_failed.clone()),
+                event_timestamp,
+                None,
+            )
             .await
         {
             let rolled_back = self
@@ -5672,7 +5906,6 @@ impl MessageProcessor {
             "failed",
         )
         .await;
-        self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -5706,32 +5939,14 @@ impl MessageProcessor {
             }
         }
 
-        self.send_notification_to_authorized_thread_connections(
-            turn_failed.thread_id.as_str(),
-            events::TURN_FAILED,
-            &turn_failed,
-            finish_outcome.connection_ids,
-        )
-        .await;
-        self.notify_semantic_timeline_turn_state_changed(
-            turn_failed.workspace_id.as_str(),
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-        )
-        .await;
-        self.notify_parent_timeline_changed_for_child_turn(
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-            Some(turn_failed.workspace_id.as_str()),
-        )
-        .await;
-
         if self
             .thread_manager
             .unload_orphaned_thread_if_idle(thread_id.as_str())
             .await
         {
-            self.agent_manager.remove_thread(thread_id.as_str()).await;
+            self.agent_manager
+                .retire_thread_after_terminal_commit(thread_id.as_str())
+                .await;
         }
         true
     }
@@ -5743,9 +5958,9 @@ impl MessageProcessor {
         turn_id: &str,
         input: &[pioneer_protocol::UserInput],
         capability_attachments: &[pioneer_protocol::UserMessageAttachment],
-    ) {
+    ) -> Result<()> {
         let item_id = user_message_item_id(turn_id);
-        let payload = match self
+        let payload = self
             .user_message_payload_from_input_resolved(
                 workspace_id,
                 thread_id,
@@ -5754,24 +5969,12 @@ impl MessageProcessor {
                 input,
             )
             .await
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to materialize artifact-aware user message payload"
-                );
-                return;
-            }
-        };
+            .context("failed to materialize artifact-aware user message payload")?;
         let (text, mut attachments) = payload.unwrap_or_default();
         attachments.extend_from_slice(capability_attachments);
 
         if text.is_empty() && attachments.is_empty() {
-            return;
+            return Ok(());
         }
 
         let item = TurnItem::UserMessage {
@@ -5787,42 +5990,13 @@ impl MessageProcessor {
             item: item.clone(),
         };
 
-        let started_timestamp = now_timestamp_secs();
-        let started_result = {
-            let crud_store = self.crud_store.clone();
-            let started = started.clone();
-            message_fresh_task(async move {
-                crud_store
-                    .materialize_item_started(started, started_timestamp)
-                    .await
-            })
-            .await
-        };
-        let started_result = match started_result {
-            Ok(result) => result,
-            Err(error) => Err(anyhow::anyhow!(
-                "user message item/started materialization task failed: {error}"
-            )),
-        };
-        if let Err(error) = started_result {
-            warn!(
-                thread_id = thread_id,
-                turn_id = turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist user message item/started"
-            );
-        } else {
-            self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
-                .await;
-            self.notify_semantic_timeline_item_changed(
-                started.workspace_id.as_str(),
-                started.thread_id.as_str(),
-                started.turn_id.as_str(),
-                &started.item,
-                Some("in_progress"),
-            )
-            .await;
-        }
+        self.materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started),
+            now_timestamp_secs(),
+            None,
+        )
+        .await
+        .context("failed to persist user message item/started")?;
 
         let completed = pioneer_protocol::ItemCompletedNotification {
             workspace_id: workspace_id.to_owned(),
@@ -5831,44 +6005,14 @@ impl MessageProcessor {
             item,
         };
 
-        let completed_timestamp = now_timestamp_secs();
-        let completed_result = {
-            let crud_store = self.crud_store.clone();
-            let completed = completed.clone();
-            message_fresh_task(async move {
-                crud_store
-                    .materialize_item_completed(completed, completed_timestamp)
-                    .await
-            })
-            .await
-        };
-        let completed_result = match completed_result {
-            Ok(result) => result,
-            Err(error) => Err(anyhow::anyhow!(
-                "user message item/completed materialization task failed: {error}"
-            )),
-        };
-        if let Err(error) = completed_result {
-            warn!(
-                thread_id = thread_id,
-                turn_id = turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist user message item/completed"
-            );
-            return;
-        }
-
-        self.ingest_committed_thread_item(&completed).await;
-        self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
-            .await;
-        self.notify_semantic_timeline_item_changed(
-            completed.workspace_id.as_str(),
-            completed.thread_id.as_str(),
-            completed.turn_id.as_str(),
-            &completed.item,
+        self.materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed),
+            now_timestamp_secs(),
             None,
         )
-        .await;
+        .await
+        .context("failed to persist user message item/completed")?;
+        Ok(())
     }
 
     pub(super) fn spawn_initial_thread_title_task(

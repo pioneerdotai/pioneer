@@ -155,7 +155,7 @@ pub(super) async fn emit_tool_loop_budget_exceeded(
     event_tx: &AgentEventHub,
 ) -> Result<(), AgentEventHubError> {
     event_tx
-        .publish_durable(AgentDurableEvent::TurnToolLoopBudgetExceeded {
+        .publish_durable_and_wait(AgentDurableEvent::TurnToolLoopBudgetExceeded {
             notification: TurnToolLoopBudgetExceededNotification {
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
@@ -184,7 +184,7 @@ pub(super) async fn emit_tool_retry_drafts(
                 let episode_id = lifecycle.episode_id_for_scheduled(turn_id);
                 for entry in entries {
                     event_tx
-                        .publish_durable(AgentDurableEvent::ItemToolRetryScheduled {
+                        .publish_durable_and_wait(AgentDurableEvent::ItemToolRetryScheduled {
                             notification: ItemToolRetryScheduledNotification {
                                 workspace_id: workspace_id.to_owned(),
                                 thread_id: thread_id.to_owned(),
@@ -216,7 +216,7 @@ pub(super) async fn emit_tool_retry_drafts(
                 };
                 for entry in entries {
                     event_tx
-                        .publish_durable(AgentDurableEvent::ItemToolRetryResolved {
+                        .publish_durable_and_wait(AgentDurableEvent::ItemToolRetryResolved {
                             notification: ItemToolRetryResolvedNotification {
                                 workspace_id: workspace_id.to_owned(),
                                 thread_id: thread_id.to_owned(),
@@ -243,7 +243,7 @@ pub(super) async fn emit_tool_retry_drafts(
                 let episode_id = lifecycle.episode_id_for_scheduled(turn_id);
                 for entry in entries {
                     event_tx
-                        .publish_durable(AgentDurableEvent::ItemToolRetryExhausted {
+                        .publish_durable_and_wait(AgentDurableEvent::ItemToolRetryExhausted {
                             notification: ItemToolRetryExhaustedNotification {
                                 workspace_id: workspace_id.to_owned(),
                                 thread_id: thread_id.to_owned(),

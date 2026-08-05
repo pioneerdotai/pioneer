@@ -164,18 +164,54 @@ async fn commit_rejection_is_reported_to_publisher() {
 }
 
 #[tokio::test]
-async fn durable_lane_reports_when_its_consumer_is_gone() {
+async fn durable_lane_receiver_drop_releases_lease_without_closing_or_losing_queue() {
     let hub = ExecutionEventHub::with_capacity(8, 8);
+    assert!(!hub.durable_receiver_is_claimed());
     let receiver = hub.take_durable_receiver().await.expect("receiver");
+    assert!(hub.durable_receiver_is_claimed());
     assert!(!hub.durable_lane_is_closed());
 
     drop(receiver);
 
-    assert!(hub.durable_lane_is_closed());
-    assert_eq!(
-        hub.publish_durable(completed("turn_closed")).await,
-        Err(ExecutionEventHubError::DurableLaneClosed)
-    );
+    assert!(!hub.durable_receiver_is_claimed());
+    assert!(!hub.durable_lane_is_closed());
+    hub.publish_durable(completed("turn_recovered"))
+        .await
+        .expect("queue remains writable");
+    let mut replacement = hub
+        .take_durable_receiver()
+        .await
+        .expect("replacement receiver");
+    assert!(hub.durable_receiver_is_claimed());
+    assert!(matches!(
+        replacement.recv().await,
+        Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_recovered"
+    ));
+}
+
+#[tokio::test]
+async fn dropping_receiver_rejects_pending_ack_but_preserves_following_event_for_replacement() {
+    let hub = Arc::new(ExecutionEventHub::with_capacity(8, 8));
+    let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+    let first = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.publish_durable_and_wait(completed("turn_1")).await })
+    };
+    assert!(receiver.recv().await.is_some());
+    drop(receiver);
+    assert!(matches!(
+        first.await.expect("publisher"),
+        Err(ExecutionEventHubError::CommitRejected(message)) if message.contains("dropped")
+    ));
+
+    hub.publish_durable(completed("turn_2"))
+        .await
+        .expect("enqueue after listener failure");
+    let mut replacement = hub.take_durable_receiver().await.expect("replacement");
+    assert!(matches!(
+        replacement.recv().await,
+        Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_2"
+    ));
 }
 
 #[tokio::test]

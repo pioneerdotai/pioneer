@@ -14,6 +14,7 @@ use pioneer_protocol::{
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalTurnStartedEventPayload {
@@ -59,6 +60,18 @@ pub enum CanonicalTurnEventPayload {
 }
 
 impl CanonicalTurnEventPayload {
+    /// Stable identity for retrying the same logical native delivery after an
+    /// unknown commit result. It is deliberately derived from the canonical
+    /// structured payload, not from process-local sequence or wall clock.
+    pub fn idempotency_key(&self) -> Result<String, serde_json::Error> {
+        let payload = serde_json::to_vec(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(self.event_type().as_bytes());
+        hasher.update([0]);
+        hasher.update(payload);
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::TurnStarted(_) => events::TURN_STARTED,
@@ -194,6 +207,8 @@ pub struct AppendedTurnEvent {
     pub turn_id: String,
     pub sequence: i64,
     pub payload: TurnEventPayload,
+    pub idempotency_key: Option<String>,
+    pub was_inserted: bool,
     pub created_at: DateTimeWithTimeZone,
 }
 

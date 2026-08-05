@@ -17,6 +17,7 @@ pub struct Model {
     pub event_type: String,
     #[sea_orm(column_type = "Text")]
     pub payload: String,
+    pub idempotency_key: Option<String>,
     pub created_at: DateTimeWithTimeZone,
 }
 

@@ -109,6 +109,10 @@ pub struct TurnExecutionDataCleanupRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTurnExecutionCheckpointRecord {
+    /// Stable wire/checkpoint identity. Native execution-window transitions
+    /// provide it so a continuation fence survives acknowledgement retries;
+    /// legacy callers may leave it empty and receive a generated id.
+    pub id: Option<String>,
     pub window_id: String,
     pub workspace_id: String,
     pub thread_id: String,
@@ -226,7 +230,7 @@ pub fn checkpoint_active_model(
 ) -> Result<turn_execution_checkpoint::ActiveModel> {
     let payload_json = serialize_checkpoint_payload(&record.payload_json)?;
     Ok(turn_execution_checkpoint::ActiveModel {
-        id: Set(generate_id(DB_ID_LEN)),
+        id: Set(record.id.unwrap_or_else(|| generate_id(DB_ID_LEN))),
         window_id: Set(record.window_id),
         workspace_id: Set(record.workspace_id),
         thread_id: Set(record.thread_id),
@@ -436,6 +440,128 @@ pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     stats: TurnExecutionWindowStatsRecord,
 ) -> Result<TurnExecutionWindowRecord> {
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Blocked, reason, stats).await
+}
+
+/// Apply a monotonic execution-window transition with a database compare-and-
+/// set. Exact replay of the already committed target is idempotent; every
+/// other stale, skipped, or regressive transition is rejected.
+pub async fn transition_window_with_stats<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    expected_status: ExecutionWindowStatus,
+    target_status: ExecutionWindowStatus,
+    reason: Option<ExecutionWindowExhaustionReason>,
+    stats: TurnExecutionWindowStatsRecord,
+) -> Result<TurnExecutionWindowRecord> {
+    let metadata_json = serde_json::to_string(&stats.metadata_json)
+        .context("failed to serialize execution-window metadata_json")?;
+    let affected = turn_execution_window::Entity::update_many()
+        .col_expr(
+            turn_execution_window::Column::Status,
+            sea_orm::sea_query::Expr::value(execution_window_status_to_db(target_status)),
+        )
+        .col_expr(
+            turn_execution_window::Column::ExhaustionReason,
+            sea_orm::sea_query::Expr::value(reason.map(execution_window_exhaustion_reason_to_db)),
+        )
+        .col_expr(
+            turn_execution_window::Column::AgentRoundCount,
+            sea_orm::sea_query::Expr::value(i64::from(stats.agent_round_count)),
+        )
+        .col_expr(
+            turn_execution_window::Column::ToolCallCount,
+            sea_orm::sea_query::Expr::value(i64::from(stats.tool_call_count)),
+        )
+        .col_expr(
+            turn_execution_window::Column::ProviderTokenCount,
+            sea_orm::sea_query::Expr::value(
+                i64::try_from(stats.provider_token_count)
+                    .context("provider_token_count exceeds i64")?,
+            ),
+        )
+        .col_expr(
+            turn_execution_window::Column::MetadataJson,
+            sea_orm::sea_query::Expr::value(metadata_json),
+        )
+        .col_expr(
+            turn_execution_window::Column::CompletedAt,
+            sea_orm::sea_query::Expr::value(Some(stats.completed_at.clone())),
+        )
+        .col_expr(
+            turn_execution_window::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(stats.updated_at.clone()),
+        )
+        .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
+        .filter(
+            turn_execution_window::Column::Status
+                .eq(execution_window_status_to_db(expected_status)),
+        )
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to transition execution window `{window_id}`"))?
+        .rows_affected;
+
+    let current = get_turn_execution_window(db, window_id)
+        .await?
+        .with_context(|| format!("execution window `{window_id}` is missing"))?;
+    if affected == 1 {
+        return Ok(current);
+    }
+    if current.status == target_status
+        && current.exhaustion_reason == reason
+        && current.agent_round_count == stats.agent_round_count
+        && current.tool_call_count == stats.tool_call_count
+        && current.provider_token_count == stats.provider_token_count
+        && current.metadata_json == stats.metadata_json
+        && current.completed_at.as_ref() == Some(&stats.completed_at)
+    {
+        return Ok(current);
+    }
+    anyhow::bail!(
+        "execution window `{window_id}` cannot transition from {:?} to {:?}; expected {:?}",
+        current.status,
+        target_status,
+        expected_status
+    )
+}
+
+pub async fn transition_window_status_only<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    expected_status: ExecutionWindowStatus,
+    target_status: ExecutionWindowStatus,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<TurnExecutionWindowRecord> {
+    let affected = turn_execution_window::Entity::update_many()
+        .col_expr(
+            turn_execution_window::Column::Status,
+            sea_orm::sea_query::Expr::value(execution_window_status_to_db(target_status)),
+        )
+        .col_expr(
+            turn_execution_window::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(updated_at.clone()),
+        )
+        .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
+        .filter(
+            turn_execution_window::Column::Status
+                .eq(execution_window_status_to_db(expected_status)),
+        )
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to transition execution window `{window_id}` status"))?
+        .rows_affected;
+    let current = get_turn_execution_window(db, window_id)
+        .await?
+        .with_context(|| format!("execution window `{window_id}` is missing"))?;
+    if affected == 1 || current.status == target_status {
+        return Ok(current);
+    }
+    anyhow::bail!(
+        "execution window `{window_id}` cannot transition from {:?} to {:?}; expected {:?}",
+        current.status,
+        target_status,
+        expected_status
+    )
 }
 
 pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrait>(
@@ -772,7 +898,7 @@ fn enum_from_snake_string<T: DeserializeOwned>(value: &str, type_name: &str) -> 
         .map_err(|err| anyhow::anyhow!("unknown {type_name} `{value}`: {err}"))
 }
 
-fn serialize_checkpoint_payload(payload: &serde_json::Value) -> Result<String> {
+pub(crate) fn serialize_checkpoint_payload(payload: &serde_json::Value) -> Result<String> {
     let encoded = serde_json::to_string(payload)
         .context("failed to serialize execution-checkpoint payload_json")?;
     if encoded.len() > TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES {

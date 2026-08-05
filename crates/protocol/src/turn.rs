@@ -2169,6 +2169,10 @@ pub const EXECUTION_CHECKPOINT_METADATA_MAX_CHARS: usize = 256;
 pub const EXECUTION_CHECKPOINT_METADATA_MAX_FIELDS: usize = 16;
 pub const EXECUTION_CHECKPOINT_METADATA_MAX_ARRAY_ITEMS: usize = 8;
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCheckpointPayload {
     pub schema_version: u32,
@@ -2195,11 +2199,15 @@ pub struct ExecutionCheckpointPayload {
 pub struct ExecutionCheckpointToolNoProgressState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strategies: Vec<ExecutionCheckpointToolNoProgressStrategy>,
+    /// True when older no-progress evidence was deterministically compacted to keep the
+    /// execution checkpoint within its durable wire budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 impl ExecutionCheckpointToolNoProgressState {
     pub fn is_empty(&self) -> bool {
-        self.strategies.is_empty()
+        self.strategies.is_empty() && !self.truncated
     }
 }
 

@@ -592,8 +592,32 @@ impl MessageProcessor {
                     }
                 };
 
-                self.finish_api_provider_turn_start_without_response(connection_id, &prepared)
+                if !self
+                    .finish_api_provider_turn_start_without_response(connection_id, &prepared)
+                    .await
+                {
+                    self.block_prepared_api_provider_turn_start(
+                        &prepared,
+                        "failed to commit native voice turn start lifecycle".to_owned(),
+                    )
                     .await;
+                    self.send_voice_session_result_notification(
+                        connection_id,
+                        session.thread_id.as_str(),
+                        VoiceSessionResultNotification {
+                            session_id: session.session_id.clone(),
+                            outcome: VoiceSessionOutcome::Failed,
+                            turn_id: Some(session.turn_id.clone()),
+                            error: Some(VoiceError {
+                                kind: VoiceErrorKind::Unknown,
+                                message: "failed to commit native voice turn start lifecycle"
+                                    .to_owned(),
+                            }),
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 self.send_voice_session_result_notification(
                     connection_id,
                     session.thread_id.as_str(),

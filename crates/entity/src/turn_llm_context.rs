@@ -21,6 +21,7 @@ pub struct Model {
     pub payload: String,
     #[sea_orm(column_type = "Text")]
     pub output_policy_snapshot: String,
+    pub delivery_key: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub expires_at: Option<DateTimeWithTimeZone>,
 }

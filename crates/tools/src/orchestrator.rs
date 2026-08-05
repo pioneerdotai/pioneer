@@ -433,7 +433,8 @@ impl ToolOrchestrator {
                         permission_grant.request_key.as_ref(),
                         Some(PermissionDecisionReason::SandboxDenied),
                         false,
-                    );
+                    )
+                    .await?;
                 }
                 trace.emit_stage(
                     1,
@@ -456,7 +457,7 @@ impl ToolOrchestrator {
         self.post_policy.classify_error(invocation, error)
     }
 
-    fn emit_permission_audit(
+    async fn emit_permission_audit(
         &self,
         trace: &ToolEventTrace,
         invocation: &ToolInvocation,
@@ -467,7 +468,7 @@ impl ToolOrchestrator {
         request_key: Option<&crate::PermissionRequestKey>,
         reason: Option<PermissionDecisionReason>,
         cached: bool,
-    ) {
+    ) -> Result<(), ToolError> {
         let turn_id = permission_context
             .turn_id
             .clone()
@@ -476,32 +477,34 @@ impl ToolOrchestrator {
             turn_id.as_str(),
             invocation.execution_security_snapshot.as_ref(),
         );
-        trace.emit_permission_audit(
-            invocation.attempt_id,
-            TurnPermissionAuditEvent {
-                workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
-                thread_id: permission_context.thread_id.clone().unwrap_or_default(),
-                turn_id,
-                event_kind,
-                profile_mode: permission_context.permission_profile.mode,
-                profile_source: permission_context.permission_profile.source,
-                security_snapshot_id,
-                security_snapshot_version,
-                security_reason_code: None,
-                security_capability: None,
-                item_id: Some(invocation.call_id.clone()),
-                tool_call_id: Some(invocation.call_id.clone()),
-                tool_name: Some(invocation.tool_name.clone()),
-                action_kind: Some(intent.action),
-                request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
-                    action_kind: key.action,
-                    scope_hash: key.normalized_scope_hash.clone(),
-                }),
-                decision,
-                reason,
-                cached,
-            },
-        );
+        trace
+            .emit_permission_audit(
+                invocation.attempt_id,
+                TurnPermissionAuditEvent {
+                    workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
+                    thread_id: permission_context.thread_id.clone().unwrap_or_default(),
+                    turn_id,
+                    event_kind,
+                    profile_mode: permission_context.permission_profile.mode,
+                    profile_source: permission_context.permission_profile.source,
+                    security_snapshot_id,
+                    security_snapshot_version,
+                    security_reason_code: None,
+                    security_capability: None,
+                    item_id: Some(invocation.call_id.clone()),
+                    tool_call_id: Some(invocation.call_id.clone()),
+                    tool_name: Some(invocation.tool_name.clone()),
+                    action_kind: Some(intent.action),
+                    request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
+                        action_kind: key.action,
+                        scope_hash: key.normalized_scope_hash.clone(),
+                    }),
+                    decision,
+                    reason,
+                    cached,
+                },
+            )
+            .await
     }
 
     async fn evaluate_permission(
@@ -557,7 +560,8 @@ impl ToolOrchestrator {
                     None,
                     Some(reason),
                     false,
-                );
+                )
+                .await?;
                 Ok(PermissionEvaluationGrant {
                     intent,
                     request_key: None,
@@ -575,7 +579,8 @@ impl ToolOrchestrator {
                     None,
                     Some(reason),
                     false,
-                );
+                )
+                .await?;
                 trace.emit_stage(
                     invocation.attempt_id,
                     "permission.evaluate.failed",
@@ -610,7 +615,8 @@ impl ToolOrchestrator {
                         Some(&key),
                         Some(PermissionDecisionReason::CachedApproval),
                         true,
-                    );
+                    )
+                    .await?;
                     return Ok(PermissionEvaluationGrant {
                         intent,
                         request_key: Some(key),
@@ -628,7 +634,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(reason),
                     false,
-                );
+                )
+                .await?;
 
                 let resolution = self
                     .request_approval_or_cancel(
@@ -651,7 +658,8 @@ impl ToolOrchestrator {
                             Some(&key),
                             Some(PermissionDecisionReason::UserApproved),
                             false,
-                        );
+                        )
+                        .await?;
                         Ok(PermissionEvaluationGrant {
                             intent,
                             request_key: Some(key),
@@ -669,7 +677,8 @@ impl ToolOrchestrator {
                             Some(&key),
                             Some(PermissionDecisionReason::UserApproved),
                             false,
-                        );
+                        )
+                        .await?;
                         if let Ok(mut cache) = self.approval_cache.lock() {
                             cache.insert(key.clone());
                         }
@@ -690,7 +699,8 @@ impl ToolOrchestrator {
                             Some(&key),
                             Some(PermissionDecisionReason::UserDenied),
                             false,
-                        );
+                        )
+                        .await?;
                         trace.emit_stage(
                             invocation.attempt_id,
                             "permission.evaluate.failed",
@@ -710,7 +720,8 @@ impl ToolOrchestrator {
                             Some(&key),
                             Some(PermissionDecisionReason::Cancelled),
                             false,
-                        );
+                        )
+                        .await?;
                         Err(ToolError::cancelled("permission approval cancelled"))
                     }
                     PermissionApprovalResolution::Expired => {
@@ -724,7 +735,8 @@ impl ToolOrchestrator {
                             Some(&key),
                             Some(PermissionDecisionReason::Expired),
                             false,
-                        );
+                        )
+                        .await?;
                         Err(ToolError::Rejected(
                             "permission approval expired".to_owned(),
                         ))
@@ -781,7 +793,8 @@ impl ToolOrchestrator {
             Some(&key),
             Some(PermissionDecisionReason::SandboxDenied),
             false,
-        );
+        )
+        .await?;
 
         let resolution = self
             .request_approval_or_cancel(
@@ -805,7 +818,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserApproved),
                     false,
-                );
+                )
+                .await?;
                 self.apply_filesystem_grants(
                     invocation,
                     permission_context,
@@ -827,7 +841,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserApproved),
                     false,
-                );
+                )
+                .await?;
                 self.apply_filesystem_grants(
                     invocation,
                     permission_context,
@@ -849,7 +864,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserDenied),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::Rejected(message))
             }
             PermissionApprovalResolution::Cancelled => {
@@ -863,7 +879,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::Cancelled),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::cancelled("filesystem access approval cancelled"))
             }
             PermissionApprovalResolution::Expired => {
@@ -877,7 +894,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::Expired),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::Rejected(
                     "filesystem access approval expired".to_owned(),
                 ))
@@ -932,7 +950,8 @@ impl ToolOrchestrator {
             Some(&key),
             Some(PermissionDecisionReason::SandboxDenied),
             false,
-        );
+        )
+        .await?;
 
         let resolution = self
             .request_approval_or_cancel(
@@ -956,7 +975,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserApproved),
                     false,
-                );
+                )
+                .await?;
                 self.apply_network_grants(
                     invocation,
                     permission_context,
@@ -978,7 +998,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserApproved),
                     false,
-                );
+                )
+                .await?;
                 self.apply_network_grants(
                     invocation,
                     permission_context,
@@ -1000,7 +1021,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::UserDenied),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::Rejected(message))
             }
             PermissionApprovalResolution::Cancelled => {
@@ -1014,7 +1036,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::Cancelled),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::cancelled("network access approval cancelled"))
             }
             PermissionApprovalResolution::Expired => {
@@ -1028,7 +1051,8 @@ impl ToolOrchestrator {
                     Some(&key),
                     Some(PermissionDecisionReason::Expired),
                     false,
-                );
+                )
+                .await?;
                 Err(ToolError::Rejected(
                     "network access approval expired".to_owned(),
                 ))

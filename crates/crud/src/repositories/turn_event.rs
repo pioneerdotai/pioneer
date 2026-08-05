@@ -22,6 +22,24 @@ pub async fn append_event<C: ConnectionTrait>(
     let payload_json =
         serde_json::to_string(payload).context("failed to serialize turn event payload")?;
 
+    let idempotency_key = payload
+        .idempotency_key()
+        .context("failed to derive turn event idempotency key")?;
+    if let Some(existing) = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.clone()))
+        .filter(turn_event::Column::IdempotencyKey.eq(idempotency_key.clone()))
+        .one(db)
+        .await
+        .context("failed to query idempotent turn event")?
+    {
+        let mut existing = appended_event_from_model(existing)?;
+        if existing.payload != *payload {
+            anyhow::bail!("turn event idempotency key collision for turn `{turn_id}`");
+        }
+        existing.was_inserted = false;
+        return Ok(existing);
+    }
+
     let sequence = next_sequence_for_turn(db, turn_id.as_str()).await?;
 
     let id = generate_id(DB_ID_LEN);
@@ -37,6 +55,7 @@ pub async fn append_event<C: ConnectionTrait>(
             Alias::new("sequence"),
             Alias::new("event_type"),
             Alias::new("payload"),
+            Alias::new("idempotency_key"),
             Alias::new("created_at"),
         ])
         .values_panic([
@@ -46,6 +65,7 @@ pub async fn append_event<C: ConnectionTrait>(
             sequence.into(),
             event_type.clone().into(),
             payload_json.into(),
+            idempotency_key.clone().into(),
             created_at.into(),
         ]);
 
@@ -59,6 +79,8 @@ pub async fn append_event<C: ConnectionTrait>(
         turn_id,
         sequence,
         payload: payload.clone(),
+        idempotency_key: Some(idempotency_key),
+        was_inserted: true,
         created_at,
     })
 }
@@ -73,6 +95,8 @@ pub fn appended_event_from_model(model: turn_event::Model) -> Result<AppendedTur
         turn_id: model.turn_id,
         sequence: model.sequence,
         payload,
+        idempotency_key: model.idempotency_key,
+        was_inserted: false,
         created_at: model.created_at,
     })
 }
@@ -85,6 +109,21 @@ pub async fn find_event_by_id<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn_event by id")?
+        .map(appended_event_from_model)
+        .transpose()
+}
+
+pub async fn find_event_by_idempotency_key<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<AppendedTurnEvent>> {
+    turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event::Column::IdempotencyKey.eq(idempotency_key.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query turn_event by idempotency key")?
         .map(appended_event_from_model)
         .transpose()
 }

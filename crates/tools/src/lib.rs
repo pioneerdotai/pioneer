@@ -47,9 +47,9 @@ pub use domain::{
 };
 pub use error::ToolError;
 pub use events::{
-    ObservationContext, ToolCallCompletedEvent, ToolCallFailedEvent, ToolCallStartedEvent,
-    ToolDeltaPayload, ToolEvent, ToolEventBus, ToolEventKind, ToolEventPayload, ToolEventTrace,
-    ToolOutputDeltaEvent,
+    DurableToolEventEnvelope, ObservationContext, ToolCallCompletedEvent, ToolCallFailedEvent,
+    ToolCallStartedEvent, ToolDeltaPayload, ToolEvent, ToolEventBus, ToolEventKind,
+    ToolEventPayload, ToolEventTrace, ToolOutputDeltaEvent,
 };
 pub use file_policy::{
     FilePolicyChecker, FilePolicyDecision, FilePolicyDeny, FilePolicyDenyReason, FilePolicyGrant,

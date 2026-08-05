@@ -80,7 +80,6 @@ pub struct TurnFinishOutcome {
     pub thread_id: String,
     pub workspace_id: String,
     pub turn: pioneer_protocol::Turn,
-    pub connection_ids: Vec<ConnectionId>,
     pub rollback_context: TurnFinishRollbackContext,
 }
 
@@ -1217,7 +1216,6 @@ impl ThreadManager {
             thread_id: thread_id.to_owned(),
             workspace_id: entry.thread.workspace_id.clone(),
             turn: turn.clone(),
-            connection_ids: entry.subscribers.keys().copied().collect(),
             rollback_context: TurnFinishRollbackContext {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),

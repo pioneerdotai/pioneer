@@ -144,12 +144,14 @@ impl ToolCallRuntime {
             call.call_id.clone(),
             call.tool_name.clone(),
         );
-        trace.emit_started(
-            1,
-            Some(payload_arguments_json(&call.payload)),
-            None,
-            call.output_policy.clone(),
-        );
+        trace
+            .emit_started(
+                1,
+                Some(payload_arguments_json(&call.payload)),
+                None,
+                call.output_policy.clone(),
+            )
+            .await?;
 
         let result = match call.execution_class {
             ExecutionClass::Shared => {
@@ -317,7 +319,7 @@ impl ToolCallRuntime {
                     })),
                 );
                 if let Some(projection) = output.projection() {
-                    trace.emit_completed(1, projection);
+                    trace.emit_completed(1, projection).await?;
                 }
                 self.event_bus.finish_trace(trace.trace_id());
                 Ok(output)
@@ -325,12 +327,14 @@ impl ToolCallRuntime {
             Err(error) => {
                 let outcome = classify_call_error(&call, &error, source, &workdir);
                 trace.emit_stage(1, "runtime.failed", Some(error.to_string()), None);
-                trace.emit_failed_with_outcome(
-                    1,
-                    error.to_string().as_str(),
-                    &outcome,
-                    call.output_policy,
-                );
+                trace
+                    .emit_failed_with_outcome(
+                        1,
+                        error.to_string().as_str(),
+                        &outcome,
+                        call.output_policy,
+                    )
+                    .await?;
                 self.event_bus.finish_trace(trace.trace_id());
                 Err(error)
             }

@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pioneer_protocol::{AgentDurableEvent, AgentProgressEvent, TurnItemType};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -45,7 +47,7 @@ struct DurableEventEnvelope {
 /// be acknowledged explicitly after their durable projection succeeds.
 #[derive(Debug)]
 pub struct DurableEventReceiver {
-    inner: mpsc::Receiver<DurableEventEnvelope>,
+    lane: Arc<DurableLane>,
     pending_commit: Option<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -55,7 +57,7 @@ impl DurableEventReceiver {
             "durable event consumer requested the next event without acknowledging the previous commit"
                 .to_owned(),
         ));
-        let envelope = self.inner.recv().await?;
+        let envelope = self.lane.receiver.lock().await.recv().await?;
         self.pending_commit = envelope.committed_tx;
         Some(*envelope.event)
     }
@@ -67,10 +69,29 @@ impl DurableEventReceiver {
     }
 }
 
+impl Drop for DurableEventReceiver {
+    fn drop(&mut self) {
+        self.acknowledge_last(Err(
+            "durable event consumer was dropped before acknowledging the commit".to_owned(),
+        ));
+        self.lane.receiver_claimed.store(false, Ordering::Release);
+    }
+}
+
+/// The raw receiver stays owned by the hub for the whole hub lifetime. A
+/// gateway listener only leases access to it. Dropping or panicking a listener
+/// therefore releases the lease without closing the channel or discarding the
+/// queued envelopes; a replacement listener resumes from the same queue.
+#[derive(Debug)]
+struct DurableLane {
+    receiver: Mutex<mpsc::Receiver<DurableEventEnvelope>>,
+    receiver_claimed: AtomicBool,
+}
+
 #[derive(Debug)]
 pub struct ExecutionEventHub {
     durable_tx: mpsc::Sender<DurableEventEnvelope>,
-    durable_rx: Mutex<Option<DurableEventReceiver>>,
+    durable_lane: Arc<DurableLane>,
     progress: ProgressCoalescer,
     snapshot: SnapshotCoalescer,
     snapshot_rx: Mutex<Option<SnapshotEventReceiver>>,
@@ -101,12 +122,13 @@ impl ExecutionEventHub {
         let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
         let (committed_tx, _) = broadcast::channel(live_capacity.max(1));
         let snapshot = SnapshotCoalescer::new();
+        let durable_lane = Arc::new(DurableLane {
+            receiver: Mutex::new(durable_rx),
+            receiver_claimed: AtomicBool::new(false),
+        });
         Self {
             durable_tx,
-            durable_rx: Mutex::new(Some(DurableEventReceiver {
-                inner: durable_rx,
-                pending_commit: None,
-            })),
+            durable_lane,
             progress: ProgressCoalescer::new(live_capacity, progress_config),
             snapshot_rx: Mutex::new(Some(snapshot.receiver())),
             snapshot,
@@ -229,7 +251,14 @@ impl ExecutionEventHub {
     }
 
     pub async fn take_durable_receiver(&self) -> Option<DurableEventReceiver> {
-        self.durable_rx.lock().await.take()
+        self.durable_lane
+            .receiver_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(DurableEventReceiver {
+            lane: self.durable_lane.clone(),
+            pending_commit: None,
+        })
     }
 
     /// Returns true once the durable consumer has gone away. Callers that
@@ -237,6 +266,13 @@ impl ExecutionEventHub {
     /// handing every later event to a permanently closed channel.
     pub fn durable_lane_is_closed(&self) -> bool {
         self.durable_tx.is_closed()
+    }
+
+    /// Reports whether a consumer currently owns the durable receiver lease.
+    /// Dropping a receiver releases this lease without closing the hub so a
+    /// supervisor can replace or restart the listener without losing backlog.
+    pub fn durable_receiver_is_claimed(&self) -> bool {
+        self.durable_lane.receiver_claimed.load(Ordering::Acquire)
     }
 }
 

@@ -949,6 +949,7 @@ mod tests {
                 }
             })
             .to_string()),
+            idempotency_key: Set(None),
             created_at: Set(now),
         })
         .exec(&connection)
@@ -975,6 +976,7 @@ mod tests {
                 }
             })
             .to_string()),
+            idempotency_key: Set(None),
             created_at: Set(now),
         })
         .exec(&connection)

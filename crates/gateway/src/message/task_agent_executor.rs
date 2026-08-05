@@ -34,6 +34,53 @@ use tokio::time::{Duration, sleep};
 
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
+async fn close_admitted_task_turn_on_error<T>(
+    processor: &Arc<MessageProcessor>,
+    thread_id: &str,
+    turn_id: &str,
+    result: Result<T>,
+) -> Result<T> {
+    let Err(error) = result else {
+        return result;
+    };
+    let reason = format!("task turn admission failed after durable start: {error:#}");
+    if !processor
+        .mark_turn_blocked(thread_id.to_owned(), turn_id.to_owned(), reason.clone())
+        .await
+    {
+        warn!(
+            thread_id,
+            turn_id,
+            error = %format!("{error:#}"),
+            "failed to durably close task turn after admission failure"
+        );
+    }
+    Err(error)
+}
+
+async fn report_or_block_task_turn_failure(
+    processor: &Arc<MessageProcessor>,
+    thread_id: String,
+    turn_id: String,
+    kind: TurnFailureRecoveryKind,
+    reason: String,
+) {
+    if !processor
+        .report_turn_failure(thread_id.clone(), turn_id.clone(), kind, reason.clone())
+        .await
+        && !processor
+            .mark_turn_blocked(thread_id.clone(), turn_id.clone(), reason.clone())
+            .await
+    {
+        warn!(
+            thread_id,
+            turn_id,
+            error = %reason,
+            "failed to report or durably block task turn after runtime failure"
+        );
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TaskAgentExecutor {
     processor: StdRwLock<Option<Weak<MessageProcessor>>>,
@@ -526,7 +573,11 @@ impl TaskAgentExecutor {
                 .is_none_or(|current| current.status.is_terminal())
             {
                 processor
-                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .abort_prepared_task_cli_runtime_turn(
+                        prepared,
+                        "task run became terminal before its CLI runtime turn was activated"
+                            .to_owned(),
+                    )
                     .await;
                 record_task_run_turn_failure(
                     &handle,
@@ -547,8 +598,10 @@ impl TaskAgentExecutor {
 
             let started_at = now_timestamp_secs();
             if let Err(error) = handle.mark_started(started_at).await {
+                let abort_reason =
+                    format!("failed to mark task CLI runtime run started: {error:#}");
                 processor
-                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                     .await;
                 return Err(error).context("failed to mark task CLI runtime run started");
             }
@@ -561,8 +614,10 @@ impl TaskAgentExecutor {
                 )
                 .await
             {
+                let abort_reason =
+                    format!("failed to mark task CLI runtime execution running: {error:#}");
                 processor
-                    .abort_prepared_task_cli_runtime_turn(prepared)
+                    .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                     .await;
                 return Err(error).context("failed to mark task CLI runtime execution running");
             }
@@ -696,111 +751,186 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden task turn");
         }
-        if let Err(error) = persist_resolved_task_child_execution_envelope(
+        close_admitted_task_turn_on_error(
             processor,
+            child_thread_id.as_str(),
             child_turn_id.as_str(),
-            &child_security_snapshot,
-            child_authorization_context.as_ref(),
-        )
-        .await
-        {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
-            return Err(error).context("failed to persist hidden task execution security");
-        }
-        handle
-            .link_child_thread_with_runtime(
-                child_runtime.lineage.clone(),
-                binding,
-                child_runtime.task_run_turn.clone(),
-                now,
+            persist_resolved_task_child_execution_envelope(
+                processor,
+                child_turn_id.as_str(),
+                &child_security_snapshot,
+                child_authorization_context.as_ref(),
             )
-            .await?;
+            .await
+            .context("failed to persist hidden task execution security"),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            handle
+                .link_child_thread_with_runtime(
+                    child_runtime.lineage.clone(),
+                    binding,
+                    child_runtime.task_run_turn.clone(),
+                    now,
+                )
+                .await
+                .context("failed to link hidden task runtime"),
+        )
+        .await?;
 
         processor.ensure_hook_runtime_with_run_store().await;
-        processor
-            .agent_manager
-            .ensure_thread(child_thread_id.as_str(), context.workspace_id.as_str())
-            .await
-            .map_err(|error| anyhow!("failed to prepare child agent runtime: {error}"))?;
-        processor
-            .ensure_agent_listener_task(child_thread_id.as_str())
-            .await;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .agent_manager
+                .ensure_thread(child_thread_id.as_str(), context.workspace_id.as_str())
+                .await
+                .map_err(|error| anyhow!("failed to prepare child agent runtime: {error}")),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .ensure_agent_listener_task(child_thread_id.as_str())
+                .await,
+        )
+        .await?;
 
         let started_at = now_timestamp_secs();
-        handle.mark_started(started_at).await?;
-        processor
-            .crud_store
-            .mark_execution_running(
-                execution.id.as_str(),
-                started_at,
-                Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
-            )
-            .await
-            .context("failed to mark task run execution running")?;
-        let workspace_skill_policies =
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            handle
+                .mark_started(started_at)
+                .await
+                .context("failed to mark hidden task run started"),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .crud_store
+                .mark_execution_running(
+                    execution.id.as_str(),
+                    started_at,
+                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await
+                .context("failed to mark task run execution running"),
+        )
+        .await?;
+        let workspace_skill_policies = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
             load_workspace_skill_policies(processor, task.workspace_id.as_str())
                 .await
-                .context("failed to load hidden task workspace skill policies")?;
-        let skill_catalog = processor
-            .validate_turn_skill_capabilities(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-            .map_err(|message| anyhow!(message))
-            .context("failed to validate hidden task skill capabilities")?;
+                .context("failed to load hidden task workspace skill policies"),
+        )
+        .await?;
+        let skill_catalog = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .validate_turn_skill_capabilities(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+                .map_err(|message| anyhow!(message))
+                .context("failed to validate hidden task skill capabilities"),
+        )
+        .await?;
         if let Some(normalized) = normalized_composer_capabilities.as_ref() {
-            let capability_attachments =
+            let capability_attachments = close_admitted_task_turn_on_error(
+                processor,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
                 super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
                     normalized.presentation.as_slice(),
                     &skill_catalog,
                     &normalized.pack_names,
                 )
-                .context("failed to snapshot composer work capability presentation")?;
+                .context("failed to snapshot composer work capability presentation"),
+            )
+            .await?;
+            close_admitted_task_turn_on_error(
+                processor,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                processor
+                    .emit_user_message_item_lifecycle(
+                        task.workspace_id.as_str(),
+                        child_thread_id.as_str(),
+                        child_turn_id.as_str(),
+                        turn_outcome.materialization.input.as_slice(),
+                        capability_attachments.as_slice(),
+                    )
+                    .await
+                    .context("failed to persist hidden task user message lifecycle"),
+            )
+            .await?;
+        }
+        let resolved_artifacts = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
             processor
-                .emit_user_message_item_lifecycle(
+                .resolve_provider_artifact_inputs(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.input.as_slice(),
+                )
+                .await
+                .context("failed to resolve hidden task artifact input for provider"),
+        )
+        .await?;
+        let runtime_environment = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .create_artifact_output_environment(
                     task.workspace_id.as_str(),
                     child_thread_id.as_str(),
                     child_turn_id.as_str(),
-                    turn_outcome.materialization.input.as_slice(),
-                    capability_attachments.as_slice(),
                 )
-                .await;
-        }
-        let resolved_artifacts = processor
-            .resolve_provider_artifact_inputs(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.input.as_slice(),
-            )
-            .await
-            .context("failed to resolve hidden task artifact input for provider")?;
-        let runtime_environment = processor
-            .create_artifact_output_environment(
-                task.workspace_id.as_str(),
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-            )
-            .await
-            .context("failed to prepare hidden task artifact output directory")?
-            .into_iter()
-            .collect();
-        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+                .await
+                .context("failed to prepare hidden task artifact output directory"),
+        )
+        .await?
+        .into_iter()
+        .collect();
+        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
             processor,
-            task,
-            run,
-            parent,
-            child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
-            thread_outcome.started_notification.thread.model.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
+            load_task_execution_conversation_scope(
+                processor,
+                task,
+                run,
+                parent,
+                child_runtime.task_run_turn.kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
+            )
+            .await,
         )
         .await?;
         let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
@@ -811,7 +941,13 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await?
+            close_admitted_task_turn_on_error(
+                processor,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -835,14 +971,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    child_thread_id,
-                    child_turn_id,
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to persist child task turn runtime snapshot: {error:#}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id,
+                child_turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to persist child task turn runtime snapshot: {error:#}"),
+            )
+            .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
         let runtime_permission_profile = turn_permission_profile;
@@ -869,14 +1005,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    child_thread_id,
-                    child_turn_id,
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to dispatch child task turn: {error}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id,
+                child_turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to dispatch child task turn: {error}"),
+            )
+            .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
         spawn_execution_heartbeat(
@@ -1032,7 +1168,7 @@ impl TaskAgentExecutor {
                         .context("failed to mark revision task run execution running")?;
                     processor
                         .ensure_agent_listener_task(child_thread_id.as_str())
-                        .await;
+                        .await?;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id.clone(),
@@ -1169,7 +1305,7 @@ impl TaskAgentExecutor {
                     .context("failed to mark revision task run execution running")?;
                 processor
                     .ensure_agent_listener_task(child_thread_id.as_str())
-                    .await;
+                    .await?;
                 spawn_execution_heartbeat(
                     processor,
                     execution.id.clone(),
@@ -1360,17 +1496,29 @@ impl TaskAgentExecutor {
         )
         .await
         {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
+            let reason = format!("failed to persist revision task execution security: {error:#}");
+            if !processor
+                .mark_turn_blocked(
+                    child_thread_id.clone(),
+                    child_turn_id.clone(),
+                    reason.clone(),
+                )
+                .await
+            {
+                warn!(
+                    thread_id = child_thread_id,
+                    turn_id = child_turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to durably close revision task turn after admission failure"
+                );
+            }
             self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
                 handle,
                 task_error(
                     "revision_execution_security_persist_failed",
-                    format!("failed to persist revision task execution security: {error:#}"),
+                    reason,
                     TaskErrorClass::Internal,
                     Some(run.id.clone()),
                 ),
@@ -1379,70 +1527,124 @@ impl TaskAgentExecutor {
             return Ok(());
         }
         processor.ensure_hook_runtime_with_run_store().await;
-        processor
-            .agent_manager
-            .ensure_thread(child_thread_id.as_str(), task.workspace_id.as_str())
-            .await
-            .map_err(|error| anyhow!("failed to prepare revision child agent runtime: {error}"))?;
-        processor
-            .ensure_agent_listener_task(child_thread_id.as_str())
-            .await;
-
-        let started_at = now_timestamp_secs();
-        processor
-            .crud_store
-            .mark_execution_running(
-                execution.id.as_str(),
-                started_at,
-                Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
-            )
-            .await
-            .context("failed to mark revision task run execution running")?;
-        let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str())
-                .await
-                .context("failed to load revision task workspace skill policies")?;
-        let skill_catalog = processor
-            .validate_turn_skill_capabilities(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-            .map_err(|message| anyhow!(message))
-            .context("failed to validate revision task skill capabilities")?;
-        let resolved_artifacts = processor
-            .resolve_provider_artifact_inputs(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.input.as_slice(),
-            )
-            .await
-            .context("failed to resolve revision task artifact input for provider")?;
-        let runtime_environment = processor
-            .create_artifact_output_environment(
-                task.workspace_id.as_str(),
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-            )
-            .await
-            .context("failed to prepare revision task artifact output directory")?
-            .into_iter()
-            .collect();
-        let execution_checkpoint_context =
-            load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await?;
-        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+        close_admitted_task_turn_on_error(
             processor,
-            task,
-            run,
-            &parent,
-            child_runtime.task_run_turn.kind,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
-            thread_outcome.started_notification.thread.model.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
+            processor
+                .agent_manager
+                .ensure_thread(child_thread_id.as_str(), task.workspace_id.as_str())
+                .await
+                .map_err(|error| {
+                    anyhow!("failed to prepare revision child agent runtime: {error}")
+                }),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .ensure_agent_listener_task(child_thread_id.as_str())
+                .await,
+        )
+        .await?;
+
+        let started_at = now_timestamp_secs();
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .crud_store
+                .mark_execution_running(
+                    execution.id.as_str(),
+                    started_at,
+                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await
+                .context("failed to mark revision task run execution running"),
+        )
+        .await?;
+        let workspace_skill_policies = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load revision task workspace skill policies"),
+        )
+        .await?;
+        let skill_catalog = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .validate_turn_skill_capabilities(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+                .map_err(|message| anyhow!(message))
+                .context("failed to validate revision task skill capabilities"),
+        )
+        .await?;
+        let resolved_artifacts = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .resolve_provider_artifact_inputs(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.input.as_slice(),
+                )
+                .await
+                .context("failed to resolve revision task artifact input for provider"),
+        )
+        .await?;
+        let runtime_environment = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            processor
+                .create_artifact_output_environment(
+                    task.workspace_id.as_str(),
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
+                )
+                .await
+                .context("failed to prepare revision task artifact output directory"),
+        )
+        .await?
+        .into_iter()
+        .collect();
+        let execution_checkpoint_context = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await,
+        )
+        .await?;
+        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            load_task_execution_conversation_scope(
+                processor,
+                task,
+                run,
+                &parent,
+                child_runtime.task_run_turn.kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
+            )
+            .await,
         )
         .await?;
         let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
@@ -1453,7 +1655,13 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await?
+            close_admitted_task_turn_on_error(
+                processor,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -1477,14 +1685,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    child_thread_id.clone(),
-                    child_turn_id.clone(),
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to persist revision task turn runtime snapshot: {error:#}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id.clone(),
+                child_turn_id.clone(),
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to persist revision task turn runtime snapshot: {error:#}"),
+            )
+            .await;
             self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
@@ -1523,14 +1731,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    child_thread_id.clone(),
-                    child_turn_id.clone(),
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to dispatch revision task turn: {error}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id.clone(),
+                child_turn_id.clone(),
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to dispatch revision task turn: {error}"),
+            )
+            .await;
             self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
@@ -1628,14 +1836,14 @@ impl TaskAgentExecutor {
                         .await?
                     else {
                         let message = "native CLI runtime binding is missing during task recovery";
-                        processor
-                            .report_turn_failure(
-                                child_runtime.task_run_turn.thread_id.clone(),
-                                child_runtime.task_run_turn.turn_id.clone(),
-                                TurnFailureRecoveryKind::TaskDispatch,
-                                message.to_owned(),
-                            )
-                            .await;
+                        report_or_block_task_turn_failure(
+                            processor,
+                            child_runtime.task_run_turn.thread_id.clone(),
+                            child_runtime.task_run_turn.turn_id.clone(),
+                            TurnFailureRecoveryKind::TaskDispatch,
+                            message.to_owned(),
+                        )
+                        .await;
                         self.fail_child_turn(
                             child_runtime,
                             message,
@@ -1651,14 +1859,14 @@ impl TaskAgentExecutor {
                     {
                         let message =
                             "native CLI runtime binding ownership is invalid during task recovery";
-                        processor
-                            .report_turn_failure(
-                                child_runtime.task_run_turn.thread_id.clone(),
-                                child_runtime.task_run_turn.turn_id.clone(),
-                                TurnFailureRecoveryKind::TaskDispatch,
-                                message.to_owned(),
-                            )
-                            .await;
+                        report_or_block_task_turn_failure(
+                            processor,
+                            child_runtime.task_run_turn.thread_id.clone(),
+                            child_runtime.task_run_turn.turn_id.clone(),
+                            TurnFailureRecoveryKind::TaskDispatch,
+                            message.to_owned(),
+                        )
+                        .await;
                         self.fail_child_turn(
                             child_runtime,
                             message,
@@ -1828,7 +2036,9 @@ impl TaskAgentExecutor {
             Err(error) if format!("{error:#}").contains("already has a running turn") => {
                 load_required_task_child_execution_security_snapshot(processor, child_turn_id)
                     .await?;
-                processor.ensure_agent_listener_task(child_thread_id).await;
+                processor
+                    .ensure_agent_listener_task(child_thread_id)
+                    .await?;
                 spawn_execution_heartbeat(
                     processor,
                     execution.id.clone(),
@@ -1861,7 +2071,9 @@ impl TaskAgentExecutor {
             .ensure_thread(child_thread_id, task.workspace_id.as_str())
             .await
             .map_err(|error| anyhow!("failed to restore child agent runtime: {error}"))?;
-        processor.ensure_agent_listener_task(child_thread_id).await;
+        processor
+            .ensure_agent_listener_task(child_thread_id)
+            .await?;
 
         if run.status != TaskRunStatus::Running
             || execution.status != TaskRunExecutionStatus::Running
@@ -2715,62 +2927,118 @@ impl TaskAgentExecutor {
         )
         .await
         {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
+            let reason = format!("failed to persist hidden reviewer execution security: {error:#}");
+            if !processor
+                .mark_turn_blocked(
+                    task_run_turn.thread_id.clone(),
+                    task_run_turn.turn_id.clone(),
+                    reason,
+                )
+                .await
+            {
+                warn!(
+                    thread_id = task_run_turn.thread_id,
+                    turn_id = task_run_turn.turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to durably close reviewer turn after admission failure"
+                );
+            }
             return Err(error).context("failed to persist hidden reviewer execution security");
         }
 
         processor.ensure_hook_runtime_with_run_store().await;
-        processor
-            .agent_manager
-            .ensure_thread(task_run_turn.thread_id.as_str(), task.workspace_id.as_str())
-            .await
-            .map_err(|error| anyhow!("failed to prepare reviewer agent runtime: {error}"))?;
-        let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str())
-                .await
-                .context("failed to load reviewer task workspace skill policies")?;
-        let skill_catalog = processor
-            .validate_turn_skill_capabilities(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-            .map_err(|message| anyhow!(message))
-            .context("failed to validate reviewer task skill capabilities")?;
-        let resolved_artifacts = processor
-            .resolve_provider_artifact_inputs(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.input.as_slice(),
-            )
-            .await
-            .context("failed to resolve reviewer artifact input for provider")?;
-        let runtime_environment = processor
-            .create_artifact_output_environment(
-                task.workspace_id.as_str(),
-                task_run_turn.thread_id.as_str(),
-                task_run_turn.turn_id.as_str(),
-            )
-            .await
-            .context("failed to prepare reviewer artifact output directory")?
-            .into_iter()
-            .collect();
-        let (hook_runtime_context, history) = load_task_execution_conversation_scope(
+        close_admitted_task_turn_on_error(
             processor,
-            task,
-            &run,
-            &parent,
-            task_run_turn.kind,
             task_run_turn.thread_id.as_str(),
             task_run_turn.turn_id.as_str(),
-            thread_outcome.started_notification.thread.model.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
+            processor
+                .agent_manager
+                .ensure_thread(task_run_turn.thread_id.as_str(), task.workspace_id.as_str())
+                .await
+                .map_err(|error| anyhow!("failed to prepare reviewer agent runtime: {error}")),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            processor
+                .ensure_agent_listener_task(task_run_turn.thread_id.as_str())
+                .await,
+        )
+        .await?;
+        let workspace_skill_policies = close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            load_workspace_skill_policies(processor, task.workspace_id.as_str())
+                .await
+                .context("failed to load reviewer task workspace skill policies"),
+        )
+        .await?;
+        let skill_catalog = close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            processor
+                .validate_turn_skill_capabilities(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+                .map_err(|message| anyhow!(message))
+                .context("failed to validate reviewer task skill capabilities"),
+        )
+        .await?;
+        let resolved_artifacts = close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            processor
+                .resolve_provider_artifact_inputs(
+                    task.workspace_id.as_str(),
+                    turn_outcome.materialization.input.as_slice(),
+                )
+                .await
+                .context("failed to resolve reviewer artifact input for provider"),
+        )
+        .await?;
+        let runtime_environment = close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            processor
+                .create_artifact_output_environment(
+                    task.workspace_id.as_str(),
+                    task_run_turn.thread_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
+                )
+                .await
+                .context("failed to prepare reviewer artifact output directory"),
+        )
+        .await?
+        .into_iter()
+        .collect();
+        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            load_task_execution_conversation_scope(
+                processor,
+                task,
+                &run,
+                &parent,
+                task_run_turn.kind,
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
+            )
+            .await,
         )
         .await?;
         let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
@@ -2781,7 +3049,14 @@ impl TaskAgentExecutor {
                 .model_provider
                 .as_str(),
         ) {
-            load_task_agent_skill_overlay(processor, task, task_run_turn.turn_id.as_str()).await?
+            close_admitted_task_turn_on_error(
+                processor,
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                load_task_agent_skill_overlay(processor, task, task_run_turn.turn_id.as_str())
+                    .await,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -2805,14 +3080,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    task_run_turn.thread_id,
-                    task_run_turn.turn_id,
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to persist reviewer task turn runtime snapshot: {error:#}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                task_run_turn.thread_id,
+                task_run_turn.turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to persist reviewer task turn runtime snapshot: {error:#}"),
+            )
+            .await;
             return Ok(());
         }
         let runtime_permission_profile = turn_permission_profile;
@@ -2838,14 +3113,14 @@ impl TaskAgentExecutor {
             )
             .await
         {
-            processor
-                .report_turn_failure(
-                    task_run_turn.thread_id,
-                    task_run_turn.turn_id,
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    format!("failed to dispatch reviewer task turn: {error}"),
-                )
-                .await;
+            report_or_block_task_turn_failure(
+                processor,
+                task_run_turn.thread_id,
+                task_run_turn.turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to dispatch reviewer task turn: {error}"),
+            )
+            .await;
         }
         Ok(())
     }
@@ -3695,19 +3970,31 @@ async fn ensure_task_run_occurrence_turn(
                 run.id, task.id
             )
         })?;
-    persist_resolved_task_child_execution_envelope(
+    if let Err(error) = persist_resolved_task_child_execution_envelope(
         processor,
         run.id.as_str(),
         execution_security_snapshot,
         authorization_context,
     )
     .await
-    .with_context(|| {
-        format!(
-            "failed to persist task run occurrence execution security snapshot `{}` for task `{}`",
+    {
+        let reason = format!(
+            "failed to persist task run occurrence execution security snapshot `{}` for task `{}`: {error:#}",
             run.id, task.id
-        )
-    })?;
+        );
+        if !processor
+            .mark_turn_blocked(parent_thread_id.to_owned(), run.id.clone(), reason.clone())
+            .await
+        {
+            warn!(
+                thread_id = parent_thread_id,
+                turn_id = run.id,
+                error = %format!("{error:#}"),
+                "failed to durably close task run occurrence after admission failure"
+            );
+        }
+        return Err(error).context(reason);
+    }
     processor
         .send_notification_to_thread_subscribers(
             parent_thread_id,

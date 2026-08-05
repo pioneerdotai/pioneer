@@ -9,6 +9,15 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 const CONTROL_ARGUMENT_KEYS: &[&str] = &["timeout_ms", "yield_time_ms", "max_output_tokens"];
+// Keep this optional checkpoint section well below the 128 KiB authoritative payload ceiling.
+// The remaining budget is reserved for the request, provider and tool summaries.
+const CHECKPOINT_STATE_MAX_BYTES: usize = 48 * 1024;
+const CHECKPOINT_MAX_STRATEGIES: usize = 16;
+const CHECKPOINT_MAX_EXACT_VARIANTS_PER_STRATEGY: usize = 8;
+const CHECKPOINT_MAX_FEATURES_PER_STRATEGY: usize = 32;
+const CHECKPOINT_MAX_TOOL_NAME_CHARS: usize = 128;
+const CHECKPOINT_MAX_EXECUTABLE_CHARS: usize = 256;
+const CHECKPOINT_MAX_HASH_CHARS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolNoProgressGuardConfig {
@@ -32,9 +41,9 @@ impl Default for ToolNoProgressGuardConfig {
             structural_timeout_limit: 3,
             warning_timeout_count: 2,
             structural_similarity_millis: 720,
-            max_strategies: 32,
-            max_exact_variants_per_strategy: 8,
-            max_features_per_strategy: 128,
+            max_strategies: CHECKPOINT_MAX_STRATEGIES,
+            max_exact_variants_per_strategy: CHECKPOINT_MAX_EXACT_VARIANTS_PER_STRATEGY,
+            max_features_per_strategy: CHECKPOINT_MAX_FEATURES_PER_STRATEGY,
         }
     }
 }
@@ -46,9 +55,13 @@ impl ToolNoProgressGuardConfig {
             structural_timeout_limit: self.structural_timeout_limit.max(2),
             warning_timeout_count: self.warning_timeout_count.max(1),
             structural_similarity_millis: self.structural_similarity_millis.clamp(1, 1_000),
-            max_strategies: self.max_strategies.max(1),
-            max_exact_variants_per_strategy: self.max_exact_variants_per_strategy.max(1),
-            max_features_per_strategy: self.max_features_per_strategy.max(8),
+            max_strategies: self.max_strategies.clamp(1, CHECKPOINT_MAX_STRATEGIES),
+            max_exact_variants_per_strategy: self
+                .max_exact_variants_per_strategy
+                .clamp(1, CHECKPOINT_MAX_EXACT_VARIANTS_PER_STRATEGY),
+            max_features_per_strategy: self
+                .max_features_per_strategy
+                .clamp(8, CHECKPOINT_MAX_FEATURES_PER_STRATEGY),
         }
     }
 }
@@ -207,6 +220,7 @@ impl ToolNoProgressGuard {
                     if strategy.exact_variants.len() >= self.config.max_exact_variants_per_strategy
                     {
                         strategy.exact_variants.remove(0);
+                        self.state.truncated = true;
                     }
                     strategy
                         .exact_variants
@@ -253,6 +267,7 @@ impl ToolNoProgressGuard {
     fn insert_strategy(&mut self, fingerprint: &StrategyFingerprint) -> usize {
         if self.state.strategies.len() >= self.config.max_strategies {
             self.state.strategies.remove(0);
+            self.state.truncated = true;
         }
         let index = self.state.strategies.len();
         self.state
@@ -312,20 +327,65 @@ impl ToolNoProgressGuard {
                 .len()
                 .saturating_sub(self.config.max_strategies);
             self.state.strategies.drain(0..remove);
+            self.state.truncated = true;
         }
         for strategy in &mut self.state.strategies {
-            strategy
-                .structural_features
-                .truncate(self.config.max_features_per_strategy);
+            self.state.truncated |=
+                truncate_chars(&mut strategy.strategy_id, CHECKPOINT_MAX_HASH_CHARS);
+            self.state.truncated |=
+                truncate_chars(&mut strategy.tool_name, CHECKPOINT_MAX_TOOL_NAME_CHARS);
+            if let Some(executable) = &mut strategy.executable {
+                self.state.truncated |= truncate_chars(executable, CHECKPOINT_MAX_EXECUTABLE_CHARS);
+            }
+            self.state.truncated |= truncate_chars(
+                &mut strategy.structural_fingerprint,
+                CHECKPOINT_MAX_HASH_CHARS,
+            );
+            for feature in &mut strategy.structural_features {
+                self.state.truncated |= truncate_chars(feature, CHECKPOINT_MAX_HASH_CHARS);
+            }
+            for variant in &mut strategy.exact_variants {
+                self.state.truncated |= truncate_chars(
+                    &mut variant.arguments_fingerprint,
+                    CHECKPOINT_MAX_HASH_CHARS,
+                );
+            }
+            if strategy.structural_features.len() > self.config.max_features_per_strategy {
+                strategy
+                    .structural_features
+                    .truncate(self.config.max_features_per_strategy);
+                self.state.truncated = true;
+            }
             if strategy.exact_variants.len() > self.config.max_exact_variants_per_strategy {
                 let remove = strategy
                     .exact_variants
                     .len()
                     .saturating_sub(self.config.max_exact_variants_per_strategy);
                 strategy.exact_variants.drain(0..remove);
+                self.state.truncated = true;
             }
         }
+        while serialized_checkpoint_state_len(&self.state) > CHECKPOINT_STATE_MAX_BYTES
+            && !self.state.strategies.is_empty()
+        {
+            self.state.strategies.remove(0);
+            self.state.truncated = true;
+        }
     }
+}
+
+fn truncate_chars(value: &mut String, max_chars: usize) -> bool {
+    let Some((byte_index, _)) = value.char_indices().nth(max_chars) else {
+        return false;
+    };
+    value.truncate(byte_index);
+    true
+}
+
+fn serialized_checkpoint_state_len(state: &ExecutionCheckpointToolNoProgressState) -> usize {
+    serde_json::to_vec(state)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -343,9 +403,11 @@ impl StrategyFingerprint {
             .unwrap_or_else(|_| JsonValue::String(arguments.to_owned()));
         let normalized = normalized_exact_arguments(&parsed);
         let exact = hash_value(&normalized);
+        let mut bounded_tool_name = tool_name.to_owned();
+        truncate_chars(&mut bounded_tool_name, CHECKPOINT_MAX_TOOL_NAME_CHARS);
         let executable = executable_identity(tool_name, &parsed);
         let mut raw_features = BTreeSet::new();
-        raw_features.insert(format!("tool:{tool_name}"));
+        raw_features.insert(format!("tool:{bounded_tool_name}"));
         if let Some(executable) = executable.as_deref() {
             raw_features.insert(format!("executable:{executable}"));
         }
@@ -357,7 +419,7 @@ impl StrategyFingerprint {
             .collect::<Vec<_>>();
         let structural = short_hash(features.join("|").as_bytes());
         Self {
-            tool_name: tool_name.to_owned(),
+            tool_name: bounded_tool_name,
             executable,
             exact,
             structural,
@@ -397,11 +459,13 @@ fn executable_identity(tool_name: &str, arguments: &JsonValue) -> Option<String>
         .and_then(|command| command.first())
         .and_then(JsonValue::as_str)
         .map(|value| {
-            Path::new(value)
+            let mut executable = Path::new(value)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or(value)
-                .to_lowercase()
+                .to_lowercase();
+            truncate_chars(&mut executable, CHECKPOINT_MAX_EXECUTABLE_CHARS);
+            executable
         })
 }
 
@@ -796,5 +860,58 @@ mod tests {
             ),
             ToolNoProgressPreflightDecision::Block { .. }
         ));
+    }
+
+    #[test]
+    fn maximum_checkpoint_state_is_deterministically_compacted_below_its_wire_budget() {
+        let oversized = ExecutionCheckpointToolNoProgressState {
+            strategies: (0..64)
+                .map(|index| ExecutionCheckpointToolNoProgressStrategy {
+                    strategy_id: format!("strategy-{index}-{}", "s".repeat(512)),
+                    tool_name: format!("tool-{index}-{}", "t".repeat(512)),
+                    executable: Some(format!("runner-{index}-{}", "e".repeat(1_024))),
+                    structural_fingerprint: "f".repeat(512),
+                    structural_features: (0..256)
+                        .map(|feature| format!("feature-{feature}-{}", "x".repeat(256)))
+                        .collect(),
+                    exact_variants: (0..32)
+                        .map(|variant| ExecutionCheckpointToolNoProgressExactVariant {
+                            arguments_fingerprint: format!("variant-{variant}-{}", "v".repeat(256)),
+                            timeout_count: u32::MAX,
+                        })
+                        .collect(),
+                    timeout_count: u32::MAX,
+                    cumulative_timeout_ms: u64::MAX,
+                    warning_emitted: true,
+                    exhausted: true,
+                })
+                .collect(),
+            truncated: false,
+        };
+        let guard = ToolNoProgressGuard::from_checkpoint(
+            ToolNoProgressGuardConfig {
+                max_strategies: usize::MAX,
+                max_exact_variants_per_strategy: usize::MAX,
+                max_features_per_strategy: usize::MAX,
+                ..ToolNoProgressGuardConfig::default()
+            },
+            oversized,
+        );
+        let compacted = guard.checkpoint_state();
+
+        assert!(compacted.truncated);
+        assert!(compacted.strategies.len() <= CHECKPOINT_MAX_STRATEGIES);
+        assert!(compacted.strategies.iter().all(|strategy| {
+            strategy.structural_features.len() <= CHECKPOINT_MAX_FEATURES_PER_STRATEGY
+                && strategy.exact_variants.len() <= CHECKPOINT_MAX_EXACT_VARIANTS_PER_STRATEGY
+        }));
+        assert!(serialized_checkpoint_state_len(&compacted) <= CHECKPOINT_STATE_MAX_BYTES);
+        assert!(
+            compacted
+                .strategies
+                .last()
+                .is_some_and(|strategy| strategy.tool_name.starts_with("tool-63-")),
+            "compaction must retain the newest evidence"
+        );
     }
 }

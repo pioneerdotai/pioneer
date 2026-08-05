@@ -2557,7 +2557,7 @@ impl MessageProcessor {
     ) -> Arc<ExecutionEventHub> {
         let mut hubs = self.cli_runtime_event_hubs.lock().await;
         if let Some(hub) = hubs.get(instance) {
-            if !hub.durable_lane_is_closed() {
+            if hub.durable_receiver_is_claimed() {
                 return hub.clone();
             }
 
@@ -2566,7 +2566,7 @@ impl MessageProcessor {
                 runtime_id = instance.key().runtime_id.as_str(),
                 thread_id = instance.key().thread_id.as_str(),
                 session_generation = instance.generation(),
-                "replacing CLI runtime execution event hub after durable listener closed"
+                "replacing CLI runtime execution event hub after durable listener lease was released"
             );
         }
         let poisoned_hub = hubs.remove(instance);

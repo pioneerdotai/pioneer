@@ -263,6 +263,39 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Best-effort notification delivery. Unlike request/response writes this
+    /// never waits for outbound capacity: a lagging socket is fenced so it
+    /// cannot apply backpressure to lifecycle persistence or other clients.
+    pub async fn try_send_notification_text(
+        &self,
+        connection_id: ConnectionId,
+        payload: String,
+    ) -> Result<()> {
+        let sender = {
+            self.connections
+                .read()
+                .await
+                .get(&connection_id)
+                .map(|connection| connection.sender.clone())
+                .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
+        };
+
+        match sender.try_send(Message::Text(payload.into())) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                record_outbound_queue_saturation("notification_connection_evicted");
+                self.unregister_connection(connection_id).await;
+                Err(anyhow!(
+                    "connection `{connection_id}` outbound notification queue is full"
+                ))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.unregister_connection(connection_id).await;
+                Err(anyhow!("connection `{connection_id}` channel is closed"))
+            }
+        }
+    }
+
     pub async fn connection_ids_for_session(
         &self,
         session_id: &AuthSessionId,
@@ -403,6 +436,25 @@ mod tests {
             .expect("send_text should succeed");
 
         assert_eq!(rx.recv().await, Some(Message::Text("ping".into())));
+    }
+
+    #[tokio::test]
+    async fn notification_send_never_waits_for_a_full_connection_queue() {
+        let manager = SessionManager::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let connection_id = register_authenticated_test_connection(&manager, sender).await;
+
+        manager
+            .send_text(connection_id, "occupy-notification-queue".to_owned())
+            .await
+            .expect("first message should occupy the queue");
+        let error = manager
+            .try_send_notification_text(connection_id, "must-not-wait".to_owned())
+            .await
+            .expect_err("full notification queue should evict the lagging connection");
+
+        assert!(error.to_string().contains("queue is full"));
+        assert!(manager.connection_principal(connection_id).await.is_err());
     }
 
     #[tokio::test]
