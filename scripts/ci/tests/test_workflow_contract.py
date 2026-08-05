@@ -30,6 +30,9 @@ class WorkflowContractTests(unittest.TestCase):
             publish_job="publish-release",
             publish_dependency="build-gateway",
         )
+        workflows.validate_release_ci_wait(
+            ".github/workflows/release-gateway.yml", allow_non_tag_runs=False
+        )
         workflows.validate_calling_workflow(
             ".github/workflows/release-app.yml",
             gated_job="package-desktop",
@@ -37,7 +40,101 @@ class WorkflowContractTests(unittest.TestCase):
             publish_job="publish-desktop-release",
             publish_dependency="package-desktop",
         )
+        workflows.validate_release_ci_wait(
+            ".github/workflows/release-app.yml", allow_non_tag_runs=True
+        )
         workflows.validate_manifest_alignment()
+
+    def valid_tag_release_wait_fixture(self) -> str:
+        return """name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  wait-for-ci:
+    name: wait-for-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: wait-for-successful-exact-sha-ci
+        env:
+          CI_WAIT_REPOSITORY: ${{ github.repository }}
+          CI_WAIT_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/wait_for_ci.py
+          --repository "$CI_WAIT_REPOSITORY"
+          --workflow ci.yml
+          --sha "$CI_WAIT_SHA"
+          --branch main
+          --event push
+          --timeout-seconds 9000
+          --poll-seconds 30
+  native-agent-gate:
+    name: native-agent-gate
+    needs: wait-for-ci
+    uses: ./.github/workflows/native-agent-gate.yml
+    with:
+      expected_sha: ${{ github.sha }}
+"""
+
+    def validate_tag_release_wait_fixture(self, contents: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".github/workflows/release.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text(contents, encoding="utf-8")
+            with mock.patch.object(workflows, "ROOT", root):
+                workflows.validate_release_ci_wait(
+                    ".github/workflows/release.yml", allow_non_tag_runs=False
+                )
+
+    def test_exact_sha_release_ci_wait_fixture_is_accepted(self) -> None:
+        self.validate_tag_release_wait_fixture(self.valid_tag_release_wait_fixture())
+
+    def test_release_gate_without_ci_wait_dependency_is_rejected(self) -> None:
+        broken = self.valid_tag_release_wait_fixture().replace(
+            "    needs: wait-for-ci\n", ""
+        )
+        with self.assertRaisesRegex(workflows.ContractError, "needs: wait-for-ci"):
+            self.validate_tag_release_wait_fixture(broken)
+
+    def test_commented_exact_sha_wait_command_is_rejected(self) -> None:
+        broken = self.valid_tag_release_wait_fixture().replace(
+            "          --sha \"$CI_WAIT_SHA\"\n",
+            "          # --sha \"$CI_WAIT_SHA\"\n",
+        )
+        with self.assertRaisesRegex(workflows.ContractError, "required active line"):
+            self.validate_tag_release_wait_fixture(broken)
+
+    def test_conditional_tag_only_wait_is_rejected(self) -> None:
+        broken = self.valid_tag_release_wait_fixture().replace(
+            "      - name: wait-for-successful-exact-sha-ci\n",
+            "      - name: wait-for-successful-exact-sha-ci\n"
+            "        if: ${{ false }}\n",
+        )
+        with self.assertRaisesRegex(workflows.ContractError, "may not be conditional"):
+            self.validate_tag_release_wait_fixture(broken)
+
+    def test_tolerated_ci_wait_failure_is_rejected(self) -> None:
+        broken = self.valid_tag_release_wait_fixture().replace(
+            "      - name: wait-for-successful-exact-sha-ci\n",
+            "      - name: wait-for-successful-exact-sha-ci\n"
+            "        continue-on-error: true\n",
+        )
+        with self.assertRaisesRegex(workflows.ContractError, "may not be skipped or tolerated"):
+            self.validate_tag_release_wait_fixture(broken)
 
     def test_pre_fix_manual_only_ci_fixture_is_rejected(self) -> None:
         baseline = """name: CI

@@ -12,6 +12,15 @@ the reports and emits an exact-SHA attestation. CI, Gateway release and Desktop
 release call that workflow directly; release build jobs cannot start unless the
 attestation job succeeds.
 
+Tag-triggered Gateway and Desktop releases also wait for the ordinary `CI`
+workflow to complete successfully for the exact tag commit before starting the
+release gate. `scripts/ci/wait_for_ci.py` queries only `ci.yml` runs from a
+`push` to `main`, filters again by the full commit SHA, and fails closed on a
+failed, cancelled, missing, malformed, or timed-out result. It must never be
+changed to accept a branch name, the latest successful run, or a CI result from
+another commit. Non-tag Desktop validation runs skip only this cross-workflow
+wait; they still execute the native-agent gate.
+
 The attestation records exact source SHA and cleanliness, deterministic fault
 and property-test seeds, enumerated versus executed counts, the feature matrix,
 explicitly allowlisted ignored tests, per-category test counts, case outcomes,

@@ -147,6 +147,13 @@ def require_line(text: str, line: str, source: str) -> None:
         raise ContractError(f"{source} is missing required active line: {line!r}")
 
 
+def require_fragment(text: str, fragment: str, source: str) -> None:
+    """Require an exact active YAML fragment whose ordering is security-relevant."""
+
+    if fragment not in text:
+        raise ContractError(f"{source} is missing required active workflow fragment")
+
+
 def job_block(text: str, job: str, source: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
@@ -190,6 +197,109 @@ def validate_calling_workflow(
         for trigger in ("  pull_request:", "  merge_group:", "  push:"):
             require_line(text, trigger, relative)
         require_line(text, "      - main", relative)
+
+
+def validate_release_ci_wait(relative: str, *, allow_non_tag_runs: bool) -> None:
+    """Require releases to wait for successful main CI on their exact tag SHA."""
+
+    text = read(relative)
+    require_fragment(
+        text,
+        "permissions:\n  actions: read\n  contents: write",
+        relative,
+    )
+    for trigger_line in ("  push:", "    tags:", '      - "v*"'):
+        require_line(text, trigger_line, relative)
+
+    wait_job = job_block(text, "wait-for-ci", relative)
+    for line in (
+        "    name: wait-for-ci",
+        "    runs-on: ubuntu-latest",
+        "    timeout-minutes: 155",
+        "          CI_WAIT_REPOSITORY: ${{ github.repository }}",
+        "          CI_WAIT_SHA: ${{ github.sha }}",
+        "          GITHUB_TOKEN: ${{ github.token }}",
+        "          python3 scripts/ci/wait_for_ci.py",
+        '          --repository "$CI_WAIT_REPOSITORY"',
+        "          --workflow ci.yml",
+        '          --sha "$CI_WAIT_SHA"',
+        "          --branch main",
+        "          --event push",
+        "          --timeout-seconds 9000",
+        "          --poll-seconds 30",
+    ):
+        require_line(wait_job, line, relative)
+
+    if any(
+        line.startswith("    if:") or line.lstrip().startswith("continue-on-error:")
+        for line in wait_job.splitlines()
+    ):
+        raise ContractError(f"{relative} wait-for-ci job may not be skipped or tolerated")
+
+    release_condition = (
+        "        if: ${{ github.event_name == 'push' && "
+        "startsWith(github.ref, 'refs/tags/v') }}"
+    )
+    if allow_non_tag_runs:
+        expected_step_conditions = [
+            "        if: ${{ github.event_name != 'push' || "
+            "!startsWith(github.ref, 'refs/tags/v') }}",
+            release_condition,
+            release_condition,
+        ]
+        actual_step_conditions = [
+            line for line in wait_job.splitlines() if line.startswith("        if:")
+        ]
+        if actual_step_conditions != expected_step_conditions:
+            raise ContractError(f"{relative} has an unsafe non-tag CI-wait condition")
+        require_fragment(
+            wait_job,
+            "      - name: skip-ci-wait-for-non-tag-run\n"
+            "        if: ${{ github.event_name != 'push' || "
+            "!startsWith(github.ref, 'refs/tags/v') }}\n"
+            '        run: echo "Exact-SHA CI wait is required only for v* tag releases."',
+            relative,
+        )
+        require_fragment(
+            wait_job,
+            "      - uses: actions/checkout@v5\n"
+            f"{release_condition}\n"
+            "        with:\n"
+            "          ref: ${{ github.sha }}\n"
+            "          persist-credentials: false",
+            relative,
+        )
+        require_fragment(
+            wait_job,
+            "      - name: wait-for-successful-exact-sha-ci\n"
+            f"{release_condition}\n"
+            "        env:",
+            relative,
+        )
+    else:
+        if any(line.startswith("        if:") for line in wait_job.splitlines()):
+            raise ContractError(f"{relative} tag-only CI wait may not be conditional")
+        require_fragment(
+            wait_job,
+            "      - uses: actions/checkout@v5\n"
+            "        with:\n"
+            "          ref: ${{ github.sha }}\n"
+            "          persist-credentials: false",
+            relative,
+        )
+        require_fragment(
+            wait_job,
+            "      - name: wait-for-successful-exact-sha-ci\n        env:",
+            relative,
+        )
+
+    gate = job_block(text, "native-agent-gate", relative)
+    require_line(gate, "    needs: wait-for-ci", relative)
+    if any(
+        line.startswith("    if:") or line.lstrip().startswith("continue-on-error:")
+        for line in gate.splitlines()
+    ):
+        raise ContractError(f"{relative} native-agent gate may not bypass failed CI wait")
 
 
 def validate_reusable_gate() -> None:
@@ -321,12 +431,18 @@ def main() -> int:
             publish_job="publish-release",
             publish_dependency="build-gateway",
         )
+        validate_release_ci_wait(
+            ".github/workflows/release-gateway.yml", allow_non_tag_runs=False
+        )
         validate_calling_workflow(
             ".github/workflows/release-app.yml",
             gated_job="package-desktop",
             require_exact_checkout=True,
             publish_job="publish-desktop-release",
             publish_dependency="package-desktop",
+        )
+        validate_release_ci_wait(
+            ".github/workflows/release-app.yml", allow_non_tag_runs=True
         )
         validate_manifest_alignment()
     except (ContractError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
