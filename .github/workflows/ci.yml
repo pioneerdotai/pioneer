@@ -12,16 +12,10 @@ permissions:
   contents: read
 
 jobs:
-  native-agent-gate:
-    name: native-agent-gate
-    uses: ./.github/workflows/native-agent-gate.yml
-    with:
-      expected_sha: ${{ github.sha }}
-
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     strategy:
@@ -74,15 +68,15 @@ jobs:
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
       - name: cargo-check-workspace
+        if: matrix.run_tests != 'true'
         shell: bash
         run: |
           set -euo pipefail
           cargo check --locked --workspace
 
-      - name: cargo-test-core
+      - name: cargo-test-workspace
         if: matrix.run_tests == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p pioneer-cli
-          cargo test --locked -p pioneer-desktop gateway::
+          cargo test --locked

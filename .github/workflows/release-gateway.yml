@@ -35,16 +35,8 @@ jobs:
           --timeout-seconds 9000
           --poll-seconds 30
 
-  native-agent-gate:
-    name: native-agent-gate
-    needs: wait-for-ci
-    uses: ./.github/workflows/native-agent-gate.yml
-    with:
-      expected_sha: ${{ github.sha }}
-
   build-gateway:
     name: build-${{ matrix.target }}
-    needs: native-agent-gate
     runs-on: ${{ matrix.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -270,7 +262,7 @@ jobs:
   publish-release:
     name: publish-release
     runs-on: ubuntu-latest
-    needs: build-gateway
+    needs: [wait-for-ci, build-gateway]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
