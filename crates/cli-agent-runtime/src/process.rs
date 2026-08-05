@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -269,6 +270,7 @@ pub struct CLIAgentProcess {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: StderrRing,
+    stderr_reader: Option<JoinHandle<()>>,
 }
 
 impl CLIAgentProcess {
@@ -298,14 +300,18 @@ impl CLIAgentProcess {
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus> {
-        self.child
+        let status = self
+            .child
             .wait()
             .await
-            .context("failed to wait for CLI process")
+            .context("failed to wait for CLI process")?;
+        self.wait_for_stderr().await?;
+        Ok(status)
     }
 
     pub async fn terminate_with_grace(&mut self, grace: Duration) -> Result<ExitStatus> {
         if let Some(status) = self.try_wait()? {
+            self.wait_for_stderr().await?;
             return Ok(status);
         }
 
@@ -318,7 +324,7 @@ impl CLIAgentProcess {
             let _ = self.child.start_kill();
         }
 
-        match timeout(grace, self.child.wait()).await {
+        let status = match timeout(grace, self.child.wait()).await {
             Ok(status) => status.context("failed to wait for gracefully terminated CLI process"),
             Err(_) => {
                 Box::into_pin(self.child.kill())
@@ -329,7 +335,16 @@ impl CLIAgentProcess {
                     .await
                     .context("failed to wait for force-killed CLI process")
             }
+        }?;
+        self.wait_for_stderr().await?;
+        Ok(status)
+    }
+
+    async fn wait_for_stderr(&mut self) -> Result<()> {
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.await.context("failed to drain CLI process stderr")?;
         }
+        Ok(())
     }
 }
 
@@ -376,7 +391,14 @@ impl StderrRing {
         }
     }
 
-    pub fn spawn_reader<R>(&self, mut reader: R)
+    pub fn spawn_reader<R>(&self, reader: R)
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        drop(self.spawn_reader_tracked(reader));
+    }
+
+    fn spawn_reader_tracked<R>(&self, mut reader: R) -> JoinHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
@@ -400,7 +422,7 @@ impl StderrRing {
                 ring.push_line(normalize_stderr_line(pending.as_str()))
                     .await;
             }
-        });
+        })
     }
 
     pub async fn lines(&self) -> Vec<String> {
@@ -468,15 +490,17 @@ pub fn spawn_prepared_cli_agent_process(
         prepared.stderr_redactions.clone(),
         prepared.process_generation,
     );
-    if let Some(stderr_pipe) = child.stderr().take() {
-        stderr.spawn_reader(stderr_pipe);
-    }
+    let stderr_reader = child
+        .stderr()
+        .take()
+        .map(|stderr_pipe| stderr.spawn_reader_tracked(stderr_pipe));
 
     Ok(CLIAgentProcess {
         child,
         stdin,
         stdout,
         stderr,
+        stderr_reader,
     })
 }
 
