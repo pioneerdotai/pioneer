@@ -972,6 +972,16 @@ pub struct IncompleteNativeTurnAdmissionRecord {
     pub turn_id: String,
 }
 
+/// Persisted native turns that still claim `in_progress` after a process
+/// restart.  CLI-backed turns are excluded by their durable binding; the
+/// recovery coordinator uses this list to reconcile turns that never produced
+/// a running item attempt or recovery job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InProgressNativeTurnRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum NativeExecutionWindowTransition {
     Started {
@@ -1294,6 +1304,8 @@ pub struct RunningTurnItemAttempt {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub started_at_unix: i64,
+    pub last_heartbeat_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3238,6 +3250,36 @@ impl CrudStore {
         rows.into_iter()
             .map(|row| {
                 Ok(IncompleteNativeTurnAdmissionRecord {
+                    thread_id: row.try_get("", "thread_id")?,
+                    turn_id: row.try_get("", "turn_id")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_in_progress_native_turns(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<InProgressNativeTurnRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
+                 WHERE t.status = 'in_progress' \
+                   AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
+                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
+                    .to_owned(),
+                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+            ))
+            .await
+            .context("failed to list in-progress native turns for orphan reconciliation")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(InProgressNativeTurnRecord {
                     thread_id: row.try_get("", "thread_id")?,
                     turn_id: row.try_get("", "turn_id")?,
                 })
@@ -17605,6 +17647,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 turn_id: row.turn_id,
                 item_id: row.item_id,
                 item_type: row.item_type,
+                started_at_unix: row.started_at.timestamp(),
+                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
             })
             .collect())
     }

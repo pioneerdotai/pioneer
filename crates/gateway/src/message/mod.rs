@@ -203,6 +203,22 @@ use crate::voice::session_store::GatewayVoiceSessionStore;
 use crate::voice::supervisor::VoiceInputSupervisor;
 use crate::workspace::{WorkspaceError, WorkspaceManager};
 
+#[cfg(test)]
+static TEST_EPISODIC_STORAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn isolated_test_thread_episodic_storage_root(runtime_home: &std::path::Path) -> PathBuf {
+    let sequence = TEST_EPISODIC_STORAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    runtime_home.join("memory").join(format!(
+        "capsules-{}-{now_nanos}-{sequence}",
+        std::process::id()
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthenticatedTransferOwner {
     pub(crate) principal_id: pioneer_protocol::PrincipalId,
@@ -578,7 +594,8 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
-        let thread_episodic_storage_root = runtime_home.join("memory").join("capsules");
+        let thread_episodic_storage_root =
+            isolated_test_thread_episodic_storage_root(&runtime_home);
         Self::new_with_memory_runtime_and_task_config(
             thread_manager,
             provider_registry,
@@ -2929,7 +2946,8 @@ impl MessageProcessor {
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
             Arc::new(MemvidThreadEpisodicBackend::new());
-        let thread_episodic_storage_root = artifact_runtime_home.join("memory").join("capsules");
+        let thread_episodic_storage_root =
+            isolated_test_thread_episodic_storage_root(&artifact_runtime_home);
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),

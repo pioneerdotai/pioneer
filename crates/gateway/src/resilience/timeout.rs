@@ -374,15 +374,60 @@ impl TimeoutSupervisor {
         turn_id: &str,
         now_unix: i64,
     ) -> Result<usize> {
+        self.renew_running_attempt_deadlines_inner(turn_id, now_unix, false)
+            .await
+    }
+
+    /// Renews an active attempt after an externally observed runtime event.
+    ///
+    /// Process-local observation is deliberately not accepted by the normal
+    /// renewal path.  A CLI runtime observation or a user response is a
+    /// causal event received at the gateway boundary, so it is first recorded
+    /// durably and then may renew the lease/idle deadline.  The immutable hard
+    /// deadline is still never extended.
+    pub async fn renew_running_attempt_deadlines_after_runtime_activity(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        activity_kind: &str,
+    ) -> Result<usize> {
         self.crud_store
-            .observe_turn_runtime_activity(turn_id, "runtime/observed_in_progress", now_unix)
+            .observe_turn_runtime_activity(turn_id, activity_kind, now_unix)
             .await?;
+        self.renew_running_attempt_deadlines_inner(turn_id, now_unix, true)
+            .await
+    }
+
+    async fn renew_running_attempt_deadlines_inner(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        allow_runtime_activity: bool,
+    ) -> Result<usize> {
         let attempts = self
             .crud_store
             .list_running_turn_item_attempts_for_turn(turn_id)
             .await?;
+        let Some(liveness) = self.crud_store.get_turn_liveness(turn_id).await? else {
+            // Process-local `active_turn_id` is not causal progress.  Without
+            // a durable event frontier there is nothing safe to renew.
+            return Ok(0);
+        };
         let mut renewed = 0usize;
         for attempt in attempts {
+            // The supervisor's own observation heartbeat is deliberately not
+            // accepted as evidence.  Only a new durable item/provider/tool
+            // activity frontier can renew an idle lease.
+            if !allow_runtime_activity
+                && (liveness.last_activity_kind.starts_with("runtime/")
+                    || liveness.last_activity_at_unix
+                        <= attempt
+                            .last_heartbeat_at_unix
+                            .unwrap_or(attempt.started_at_unix))
+            {
+                continue;
+            }
+
             let deadlines = self
                 .deadlines_for_stored_item(
                     attempt.turn_id.as_str(),
@@ -391,15 +436,18 @@ impl TimeoutSupervisor {
                     now_unix,
                 )
                 .await?;
+            // heartbeat_turn_item_attempt updates only lease/idle fields.  The
+            // hard deadline remains the immutable deadline assigned at attempt
+            // creation and therefore cannot be extended by a stuck actor.
             if self
                 .crud_store
-                .configure_turn_item_attempt_deadlines(
+                .heartbeat_turn_item_attempt(
                     attempt.turn_id.as_str(),
                     attempt.item_id.as_str(),
+                    attempt.item_type,
                     now_unix,
                     deadlines.lease_expires_at_unix,
                     deadlines.idle_deadline_at_unix,
-                    deadlines.hard_deadline_at_unix,
                 )
                 .await?
             {

@@ -918,6 +918,10 @@ fn build_command(args: &ExecCommandArgs, cwd: &Path) -> Result<(Vec<String>, Com
         cmd.args(&command[1..]);
         cmd.current_dir(cwd);
         configure_process_group(&mut cmd)?;
+        // The async owner is the cancellation fence for one-shot commands.
+        // If that owner is dropped while cleanup is being unwound, Tokio must
+        // still terminate the child instead of detaching it.
+        cmd.kill_on_drop(true);
         return Ok((command, cmd));
     }
 

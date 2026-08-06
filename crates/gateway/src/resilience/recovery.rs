@@ -37,8 +37,12 @@ const RECOVERY_JOB_CLAIM_LEASE_SECS: u64 = 45;
 const ACTIVE_RECOVERY_RECHECK_SECS: i64 = 2;
 const RECOVERY_ATTEMPT_ID_LEN: usize = 21;
 const STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT: u32 = 2;
+const RECOVERY_PROGRESS_STALE_SECS: i64 = 2 * RECOVERY_JOB_CLAIM_LEASE_SECS as i64;
 pub const TURN_RECOVERY_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
-const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 3 * 60;
+// This is an episode safety budget, not a universal three-minute lifetime for
+// a healthy provider stream.  A fresh durable progress frontier keeps the
+// attempt alive; an unchanged episode still gets bounded and re-planned.
+const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 
 type RecoveryListenerStarter =
     Arc<dyn Fn(String) -> BoxFuture<'static, std::result::Result<(), String>> + Send + Sync>;
@@ -1443,6 +1447,17 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
         let mut phase_errors = Vec::new();
 
+        match self.reconcile_orphan_native_turns(now_unix, limit).await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "recovery coordinator orphan-native-turn phase failed"
+                );
+                phase_errors.push(format!("orphan native turns: {error:#}"));
+            }
+        }
+
         match self.backfill_timeout_jobs(now_unix, limit).await {
             Ok(mut phase_events) => events.append(&mut phase_events),
             Err(error) => {
@@ -1515,6 +1530,77 @@ impl RecoveryCoordinator {
         }
 
         Ok(events)
+    }
+
+    /// Reconcile persisted native Turns that survived a process restart without
+    /// an item timeout or provider-failure job.  The local AgentManager map is
+    /// intentionally not consulted: it is process-local and cannot prove
+    /// ownership after restart.  A recent durable activity frontier is the
+    /// only reason to defer reconciliation.
+    async fn reconcile_orphan_native_turns(&self, now_unix: i64, limit: u64) -> Result<()> {
+        for turn in self.crud_store.list_in_progress_native_turns(limit).await? {
+            if self
+                .open_recovery_for_turn(turn.turn_id.as_str())
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            if self
+                .crud_store
+                .get_turn_liveness(turn.turn_id.as_str())
+                .await?
+                .is_some_and(|liveness| {
+                    !liveness.last_activity_kind.starts_with("runtime/")
+                        && now_unix.saturating_sub(liveness.last_activity_at_unix)
+                            <= RECOVERY_PROGRESS_STALE_SECS
+                })
+            {
+                continue;
+            }
+
+            let has_snapshot = self
+                .crud_store
+                .get_turn_runtime_snapshot(turn.turn_id.as_str())
+                .await?
+                .is_some();
+            let policy = self
+                .policy_registry
+                .policy_for_item_type(TurnItemType::Reasoning);
+            let action = if has_snapshot {
+                RecoveryAction::RestartTurn
+            } else {
+                RecoveryAction::BlockResumable
+            };
+            let reason = if has_snapshot {
+                "native Turn was orphaned by a restart; resuming from its durable runtime snapshot"
+                    .to_owned()
+            } else {
+                "native Turn was orphaned by a restart without a durable runtime snapshot; preserving it as resumable blocked work"
+                    .to_owned()
+            };
+            let orphan_turn_id = turn.turn_id.clone();
+            let _ = self
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: orphan_turn_id.clone(),
+                        item_id: format!("orphan:{orphan_turn_id}"),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action,
+                        reason,
+                        base_backoff_secs: policy.base_backoff_secs,
+                        max_attempts: if has_snapshot { policy.max_attempts } else { 0 },
+                        max_wall_clock_secs: policy.max_wall_clock_secs,
+                        no_progress_limit: policy.no_progress_limit,
+                        metadata: ToolMetadata::empty(),
+                    },
+                    now_unix,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn resume_blocked_turn(
@@ -1644,8 +1730,27 @@ impl RecoveryCoordinator {
                     .min(RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS),
             )
             .unwrap_or(i64::MAX);
-            let job_budget_exceeded = wall_clock_elapsed > max_wall_clock_secs;
-            let attempt_budget_exceeded = active_elapsed > attempt_wall_clock_secs;
+            let progress_frontier = self
+                .crud_store
+                .get_turn_liveness(job.turn_id.as_str())
+                .await?;
+            let progress_since_attempt = progress_frontier.as_ref().is_some_and(|liveness| {
+                !liveness.last_activity_kind.starts_with("runtime/")
+                    && now_unix.saturating_sub(liveness.last_activity_at_unix)
+                        <= RECOVERY_PROGRESS_STALE_SECS
+                    && liveness.last_activity_at_unix
+                        > job
+                            .active_attempt_started_at_unix
+                            .unwrap_or(job.updated_at_unix)
+            });
+            // Wall-clock expiry is only a no-progress episode guard.  A
+            // provider stream that is durably emitting causal progress must
+            // not be failed merely because recovery mode crossed the old
+            // hidden 180-second ceiling.
+            let job_budget_exceeded =
+                wall_clock_elapsed > max_wall_clock_secs && !progress_since_attempt;
+            let attempt_budget_exceeded =
+                active_elapsed > attempt_wall_clock_secs && !progress_since_attempt;
             if !job_budget_exceeded && !attempt_budget_exceeded {
                 continue;
             }
@@ -3248,8 +3353,24 @@ impl RecoveryCoordinator {
         };
 
         if let Some(snapshot) = item.recovery_policy() {
+            let mut policy = policy_from_tool_snapshot(snapshot);
+            // The recovery metadata is descriptive; it is not an operation
+            // ledger.  Until a tool is explicitly backed by a durable
+            // idempotency record, replaying a partially completed
+            // RequiresKey/SessionBound side effect is unsafe.  Preserve the
+            // checkpoint and let the resumable path await reconciliation rather
+            // than silently issuing the side effect twice.
+            if matches!(
+                snapshot.idempotency_mode,
+                ToolRecoveryIdempotencyMode::RequiresKey
+                    | ToolRecoveryIdempotencyMode::SessionBound
+            ) {
+                policy.action = RecoveryAction::BlockResumable;
+                policy.max_attempts = 0;
+                policy.base_backoff_secs = 0;
+            }
             return Ok(TimeoutRecoveryPolicyDecision {
-                policy: policy_from_tool_snapshot(snapshot),
+                policy,
                 policy_source: TimeoutRecoveryPolicySource::ToolItemSnapshot,
                 tool_snapshot: Some(snapshot.clone()),
             });
@@ -7732,7 +7853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_recovery_watchdog_retries_stale_attempt_before_job_budget_expires() {
+    async fn active_recovery_watchdog_does_not_use_hidden_three_minute_ceiling() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_active_recovery_watchdog";
         let job = coordinator
@@ -7750,38 +7871,26 @@ mod tests {
             .into_job();
         let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
 
+        // The provider-failure policy allows a 15-minute recovery episode.
+        // Crossing the historical three-minute implementation detail must not
+        // retry or terminalize a still-owned attempt by itself.
         let events = coordinator
             .run_ready_jobs(1_700_000_182, 64)
             .await
-            .expect("active watchdog should expire the stale attempt");
+            .expect("active watchdog should inspect the still-live attempt");
 
-        assert!(matches!(
-            events.as_slice(),
-            [RecoveryCoordinatorEvent::RetryScheduled { job_id, attempt_number: 2, .. }]
-                if job_id == &job.id
-        ));
+        assert!(events.is_empty());
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
-        assert_eq!(reloaded.run_count, 1);
-        assert!(reloaded.active_attempt_id.is_none());
-
-        let late_events = coordinator
-            .record_recovery_provider_failure(
-                job.id.as_str(),
-                active_attempt_id.as_str(),
-                provider_failure(
-                    ProviderFailureClass::NetworkTransient,
-                    "late provider failure after watchdog",
-                ),
-                1_700_000_182,
-            )
-            .await
-            .expect("late stale provider failure should not error");
-        assert!(late_events.is_empty());
+        assert_eq!(reloaded.status, RecoveryJobStatus::Active);
+        assert_eq!(reloaded.run_count, 0);
+        assert_eq!(
+            reloaded.active_attempt_id.as_deref(),
+            Some(active_attempt_id.as_str())
+        );
     }
 
     #[tokio::test]

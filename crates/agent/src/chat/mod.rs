@@ -279,10 +279,18 @@ impl<T> AbortOnDropJoinHandle<T> {
     }
 
     async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        self.handle
-            .take()
+        // Keep ownership of the JoinHandle while awaiting it.  Taking it out
+        // before the await makes Drop unable to abort a task when the join
+        // future is cancelled (for example when the parent Turn is fenced).
+        // Tokio then detaches the child and any external side effect can outlive
+        // the Turn owner.
+        let result = self
+            .handle
+            .as_mut()
             .expect("join handle should be present")
-            .await
+            .await;
+        self.handle.take();
+        result
     }
 }
 
@@ -2547,12 +2555,6 @@ pub(super) async fn execute_chat_turn_flow(
             )
             .await;
 
-            if result.is_ok() {
-                turn_control
-                    .succeed_recovery_attempt(turn_id.as_str(), recovery)
-                    .await;
-            }
-
             if result.is_err() {
                 emit_durable_event(
                     event_tx.as_ref(),
@@ -3582,9 +3584,6 @@ async fn execute_agent_provider_response(
 
         match result {
             Ok(assistant_text) => {
-                turn_control
-                    .succeed_recovery_attempt(turn_id, recovery.take())
-                    .await;
                 let summary = AgentTurnPostTurnSummary::succeeded_with_model(
                     Some(post_turn_model.clone()),
                     Some(post_turn_model_provider.clone()),
@@ -4398,10 +4397,6 @@ async fn execute_agent_provider_response(
             if !round.text.trim().is_empty() {
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
             }
-
-            turn_control
-                .succeed_recovery_attempt(turn_id, recovery.take())
-                .await;
 
             window_stats.record_provider_round(round.tool_calls.len(), round.provider_token_count);
 
@@ -5653,6 +5648,15 @@ async fn execute_agent_provider_response(
                     ),
                     current_thinking_id.clone(),
                 ));
+            }
+            // The recovery attempt is closed only after the complete provider
+            // round and every tool result have crossed the durable event lane.
+            // A provider response alone is not enough: a later tool-result
+            // persistence failure must keep the recovery context attached.
+            if recovery.is_some() {
+                turn_control
+                    .succeed_recovery_attempt(turn_id, recovery.take())
+                    .await;
             }
             window_stats.record_executed_tools(&executed_results);
 

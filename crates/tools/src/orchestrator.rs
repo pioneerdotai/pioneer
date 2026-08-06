@@ -386,6 +386,7 @@ impl ToolOrchestrator {
             }
             Err(error)
                 if self.policy.retry_with_escalated_sandbox
+                    && self.can_retry_invocation(&invocation)
                     && self.should_retry_with_escalated_sandbox(&error) =>
             {
                 trace.emit_stage(
@@ -1311,10 +1312,16 @@ impl ToolOrchestrator {
 
     fn enforce_idempotency_contract(&self, invocation: &ToolInvocation) -> Result<(), ToolError> {
         match invocation.recovery.idempotency_mode {
-            ToolIdempotencyMode::None => Ok(()),
-            ToolIdempotencyMode::Safe
-            | ToolIdempotencyMode::RequiresKey
-            | ToolIdempotencyMode::SessionBound => {
+            ToolIdempotencyMode::None | ToolIdempotencyMode::Safe => Ok(()),
+            ToolIdempotencyMode::RequiresKey | ToolIdempotencyMode::SessionBound => {
+                // The first delivery is allowed to establish the operation.
+                // A key by itself is only correlation metadata until a
+                // verified operation ledger/backend is present, so automatic
+                // retries for these modes are rejected below instead of
+                // replaying an ambiguous side effect.
+                if invocation.attempt_id <= 1 {
+                    return Ok(());
+                }
                 let has_key = invocation
                     .idempotency_key
                     .as_ref()
@@ -1330,6 +1337,13 @@ impl ToolOrchestrator {
                 }
             }
         }
+    }
+
+    fn can_retry_invocation(&self, invocation: &ToolInvocation) -> bool {
+        matches!(
+            invocation.recovery.idempotency_mode,
+            ToolIdempotencyMode::None | ToolIdempotencyMode::Safe
+        )
     }
 }
 

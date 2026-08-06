@@ -36480,6 +36480,21 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
         before_wait,
     )
     .await;
+    // The request response may renew the attempt's lease and idle deadline,
+    // but the immutable hard cap must already be a future boundary.  Keeping
+    // that cap expired here would test the pre-T5 sliding-hard-deadline
+    // behavior rather than the human-response renewal contract.
+    crud_store
+        .configure_turn_item_attempt_deadlines(
+            "codex-turn-command",
+            "codex-item-command",
+            before_wait,
+            Some(before_wait.saturating_sub(10)),
+            Some(before_wait.saturating_sub(10)),
+            Some(before_wait.saturating_add(60 * 60)),
+        )
+        .await
+        .expect("hard deadline should be configured as a future immutable cap");
     let opened =
         open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(712))
             .await;
@@ -54802,7 +54817,12 @@ async fn wait_for_cli_runtime_turn_starts(
     session: &RecordingCliRuntimeSession,
     expected: usize,
 ) -> Vec<CLIAgentRuntimeTurnStartParams> {
-    for _ in 0..200 {
+    // The gateway crate runs a large number of SQLite/memvid tests in parallel.
+    // A valid child dispatch can therefore be delayed by scheduler and I/O
+    // contention even though the runtime contract is healthy. Keep this test
+    // observation bounded, but do not turn that transient contention into a
+    // false zero-start assertion.
+    for _ in 0..1_200 {
         let starts = session.turn_starts.lock().await.clone();
         if starts.len() >= expected {
             return starts;

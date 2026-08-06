@@ -2166,7 +2166,11 @@ impl MessageProcessor {
         if let Some(turn_id) = resolved.turn_id.as_deref()
             && let Err(error) = self
                 .timeout_supervisor
-                .renew_running_attempt_deadlines_for_turn(turn_id, now_timestamp_secs())
+                .renew_running_attempt_deadlines_after_runtime_activity(
+                    turn_id,
+                    now_timestamp_secs(),
+                    "runtime/request_responded",
+                )
                 .await
         {
             warn!(
@@ -5312,9 +5316,10 @@ impl MessageProcessor {
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
             let renewed = self
                 .timeout_supervisor
-                .renew_running_attempt_deadlines_for_turn(
+                .renew_running_attempt_deadlines_after_runtime_activity(
                     binding.turn_id.as_str(),
                     now_unix_ms.saturating_div(1_000),
+                    "runtime/observed_in_progress",
                 )
                 .await?;
             debug!(

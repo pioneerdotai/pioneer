@@ -508,11 +508,13 @@ impl ToolRouter {
 
         match idempotency_mode {
             ToolIdempotencyMode::None => None,
-            ToolIdempotencyMode::Safe | ToolIdempotencyMode::RequiresKey => {
-                Some(format!("{tool_name}:{call_id}"))
-            }
-            ToolIdempotencyMode::SessionBound => Self::derive_session_scope_key(tool_name, payload)
-                .or_else(|| Some(format!("{tool_name}:{call_id}"))),
+            ToolIdempotencyMode::Safe => Some(format!("{tool_name}:{call_id}")),
+            // A provider call id is not a durable operation key: a replay can
+            // receive a different call id while targeting the same side effect.
+            // RequiresKey and SessionBound tools must supply a stable key or a
+            // typed session identity; otherwise the orchestrator fails closed.
+            ToolIdempotencyMode::RequiresKey => None,
+            ToolIdempotencyMode::SessionBound => Self::derive_session_scope_key(tool_name, payload),
         }
     }
 }

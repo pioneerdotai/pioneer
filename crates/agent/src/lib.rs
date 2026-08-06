@@ -1046,14 +1046,12 @@ impl TurnExecutionControl {
     }
 
     async fn complete_attempt(&self, turn_id: &str, item_id: &str) {
-        let recovery = self
-            .attempt_controls
-            .lock()
-            .await
-            .remove(item_id)
-            .and_then(|control| control.recovery);
-
-        self.succeed_recovery_attempt(turn_id, recovery).await;
+        // Completing a tool attempt is not the recovery commit point.  The
+        // surrounding provider round may still need to persist its assistant
+        // envelope, subsequent results, checkpoint, or terminal outcome.  The
+        // actor owns recovery success after that durable boundary.
+        let _ = turn_id;
+        self.attempt_controls.lock().await.remove(item_id);
     }
 
     async fn succeed_recovery_attempt(
@@ -1135,6 +1133,10 @@ struct AgentManagerState {
 
 pub struct AgentManager {
     state: RwLock<AgentManagerState>,
+    // Serializes stale-thread replacement.  Without this gate two concurrent
+    // callers can both observe a finished actor, both spawn a replacement, and
+    // the later registry write silently strands the first owner.
+    thread_creation_lock: tokio::sync::Mutex<()>,
     provider_registry: Arc<ProviderRegistry>,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -1175,6 +1177,7 @@ impl AgentManager {
     ) -> Self {
         Self {
             state: RwLock::new(AgentManagerState::default()),
+            thread_creation_lock: tokio::sync::Mutex::new(()),
             provider_registry,
             tool_loop_config: tool_loop_config.normalized(),
             mcp_tool_provider,
@@ -1299,6 +1302,7 @@ impl AgentManager {
         thread_id: &str,
         workspace_id: &str,
     ) -> Result<(), AgentStartError> {
+        let _creation_guard = self.thread_creation_lock.lock().await;
         if let Some((existing_workspace_id, loop_finished)) = self
             .state
             .read()
@@ -2014,7 +2018,17 @@ impl AgentManager {
         };
 
         let _ = thread.command_tx.send(AgentCommand::Shutdown).await;
-        thread.loop_handle.abort();
+        let mut loop_handle = thread.loop_handle;
+        if tokio::time::timeout(tokio::time::Duration::from_millis(2_500), &mut loop_handle)
+            .await
+            .is_err()
+        {
+            // The actor has had a cooperative cancellation window.  Fence it
+            // only after that window, so tool cleanup is not dropped at the
+            // same instant as the registry entry.
+            loop_handle.abort();
+            let _ = loop_handle.await;
+        }
     }
 
     /// Retire a terminal thread without aborting the loop that is currently

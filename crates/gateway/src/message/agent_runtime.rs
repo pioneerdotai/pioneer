@@ -3663,7 +3663,11 @@ impl MessageProcessor {
             renewed,
             "renewed item deadlines from authoritative active native runtime turn"
         );
-        Ok(true)
+        // An in-process actor is not itself proof of liveness.  Return true
+        // only when a causal durable frontier actually renewed an item lease;
+        // otherwise the normal timeout/recovery path remains active for a hung
+        // native Turn.
+        Ok(renewed > 0)
     }
 
     pub(super) async fn handle_recovery_terminal_outcome(
@@ -5628,18 +5632,11 @@ impl MessageProcessor {
             );
         }
 
-        if let Err(error) = self
-            .crud_store
-            .delete_turn_llm_context_for_turn(turn_id)
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to delete turn_llm_context rows after turn block"
-            );
-        }
+        // A blocked recovery is resumable by contract.  Provider rounds and
+        // tool results are the resume capsule; deleting them here makes the
+        // advertised `turn.resume:<id>` path reconstruct an empty transcript.
+        // Terminal completion/failure cleanup still removes the context, while
+        // blocked data is reclaimed only by an explicit abandon/retention path.
         self.clear_artifact_finalization_state(turn_id).await;
         self.ensure_cli_runtime_turn_blocked_cleanup(thread_id, turn_id, reason)
             .await;

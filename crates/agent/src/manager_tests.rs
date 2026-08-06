@@ -1,5 +1,5 @@
 use super::{
-    AgentCommand, AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
+    AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
     AgentMcpMaterializationError, AgentMcpMaterializationRequest, AgentMcpPersistedProjection,
     AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
     AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider, AgentMemoryProvider,
@@ -11601,7 +11601,9 @@ async fn cancel_turn_emits_interrupted_durable_event() {
     });
 
     yield_now().await;
-    advance(Duration::from_millis(800)).await;
+    // The tool runtime has a one-second cleanup grace; the parent Turn waits
+    // longer before its hard fence so external subprocess cleanup can finish.
+    advance(Duration::from_millis(2_100)).await;
     yield_now().await;
 
     let mut saw_interrupted = false;
@@ -12348,7 +12350,7 @@ fn write_skill(
 }
 
 #[tokio::test]
-async fn turn_execution_control_emits_recovery_success_on_attempt_completion() {
+async fn turn_execution_control_does_not_close_recovery_before_round_commit() {
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(4);
     let control = TurnExecutionControl::new(command_tx, 7);
     let recovery = RecoveryAttemptContext {
@@ -12366,23 +12368,12 @@ async fn turn_execution_control_emits_recovery_success_on_attempt_completion() {
         .complete_attempt("turn_control_recovery", "tool_item_1")
         .await;
 
-    let command = timeout(Duration::from_secs(1), command_rx.recv())
-        .await
-        .expect("recovery success command should be emitted")
-        .expect("command channel should remain open");
-
-    match command {
-        AgentCommand::RecoveryAttemptSucceeded {
-            turn_id,
-            run_id,
-            recovery: emitted,
-        } => {
-            assert_eq!(turn_id, "turn_control_recovery");
-            assert_eq!(run_id, 7);
-            assert_eq!(emitted, recovery);
-        }
-        other => panic!("unexpected command: {other:?}"),
-    }
+    assert!(
+        timeout(Duration::from_millis(100), command_rx.recv())
+            .await
+            .is_err(),
+        "tool completion must not close recovery before the durable provider round commit"
+    );
 }
 
 #[tokio::test]

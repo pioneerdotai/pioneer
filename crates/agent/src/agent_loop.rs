@@ -28,7 +28,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error};
 
-const TURN_CANCEL_GRACE_MS: u64 = 750;
+// Tool dispatch uses a one-second cleanup grace.  The parent Turn must wait
+// longer than that before resorting to a hard abort, otherwise dropping the
+// tool future can detach external work before its process-group cleanup runs.
+const TURN_CANCEL_GRACE_MS: u64 = 2_000;
 
 type TurnFlowFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -395,9 +398,20 @@ pub(super) async fn run_agent_loop(
                         ));
                         commit_or_stop!(AgentDurableEvent::TurnCompleted {
                             thread_id: thread_id.clone(),
-                            turn_id,
-                            recovery,
+                            turn_id: turn_id.clone(),
+                            recovery: recovery.clone(),
                         },);
+                        // Recovery success is a post-commit fact.  The provider
+                        // response may already have arrived, but only this
+                        // durable terminal event proves that the recovered Turn
+                        // reached an observable terminal state.
+                        if let Some(recovery) = recovery.clone() {
+                            commit_or_stop!(AgentDurableEvent::RecoveryAttemptSucceeded {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                recovery,
+                            },);
+                        }
                         active_turn_id = None;
                         active_turn_request = None;
                         active_recovery = None;
@@ -591,12 +605,25 @@ pub(super) async fn run_agent_loop(
                             },
                         },);
 
+                        // A committed continuation checkpoint is the durable
+                        // target of a recovery attempt.  It is safe to close
+                        // that attempt before starting the next execution
+                        // window; the next window no longer inherits a stale
+                        // recovery-success race.
+                        if let Some(recovery) = recovery.clone() {
+                            commit_or_stop!(AgentDurableEvent::RecoveryAttemptSucceeded {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                recovery,
+                            },);
+                        }
+
                         active_turn_id = Some(turn_id.clone());
                         active_turn_run_id = Some(run_id);
                         active_turn_control = Some(turn_control.clone());
                         active_turn_request = Some(next_turn_request.clone());
                         last_turn_request = Some(next_turn_request.clone());
-                        active_recovery = recovery.clone();
+                        active_recovery = None;
 
                         active_turn_task = Some(spawn_turn_task(
                             command_tx.clone(),
@@ -615,7 +642,7 @@ pub(super) async fn run_agent_loop(
                             provider,
                             next_turn_request,
                             turn_control,
-                            recovery,
+                            None,
                             run_id,
                         ));
                     }
@@ -810,21 +837,7 @@ pub(super) async fn run_agent_loop(
                 }
 
                 if let Some(task) = active_turn_task.take() {
-                    sleep(Duration::from_millis(TURN_CANCEL_GRACE_MS)).await;
-                    if task.is_finished() {
-                        if let Err(error) = task.await
-                            && !error.is_cancelled()
-                        {
-                            error!(error = %error, "active turn task failed during cancellation");
-                        }
-                    } else {
-                        task.abort();
-                        if let Err(error) = task.await
-                            && !error.is_cancelled()
-                        {
-                            error!(error = %error, "active turn task failed after abort");
-                        }
-                    }
+                    wait_for_turn_task_shutdown(task).await;
                 }
                 let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.clone();
@@ -1015,10 +1028,6 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
-                if let Some(task) = active_turn_task.take() {
-                    task.abort();
-                }
-
                 if request.refresh_provider_auth {
                     provider_registry.invalidate(turn_request.provider_name.as_str());
                 }
@@ -1036,6 +1045,17 @@ pub(super) async fn run_agent_loop(
                         continue;
                     }
                 };
+
+                // Prepare the replacement provider before touching the current
+                // owner.  A provider/auth failure must leave the old executor
+                // alive rather than creating a process-local ghost Turn.
+                if let Some(control) = active_turn_control.as_ref() {
+                    control.cancel_all_attempts().await;
+                }
+                if let Some(task) = active_turn_task.take() {
+                    wait_for_turn_task_shutdown(task).await;
+                }
+
                 if let Err(error) = publish_recovery_execution_window_continued(
                     event_hub.as_ref(),
                     workspace_id.as_str(),
@@ -1044,6 +1064,15 @@ pub(super) async fn run_agent_loop(
                 )
                 .await
                 {
+                    let recovery = active_recovery.clone();
+                    commit_or_stop!(AgentDurableEvent::TurnFailed {
+                        thread_id: thread_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        error: format!(
+                            "failed to persist recovery execution-window handoff: {error}"
+                        ),
+                        recovery,
+                    },);
                     active_turn_id = None;
                     active_turn_run_id = None;
                     active_turn_control = None;
@@ -1199,8 +1228,11 @@ pub(super) async fn run_agent_loop(
                 let _ = ack.send(Ok(()));
             }
             AgentCommand::Shutdown => {
+                if let Some(control) = active_turn_control.as_ref() {
+                    control.cancel_all_attempts().await;
+                }
                 if let Some(task) = active_turn_task.take() {
-                    task.abort();
+                    wait_for_turn_task_shutdown(task).await;
                 }
                 break;
             }
@@ -1294,6 +1326,25 @@ fn spawn_turn_task(
             })
             .await;
     }))
+}
+
+async fn wait_for_turn_task_shutdown(mut task: JoinHandle<()>) {
+    if task.is_finished() {
+        let _ = task.await;
+        return;
+    }
+
+    if timeout(Duration::from_millis(TURN_CANCEL_GRACE_MS), &mut task)
+        .await
+        .is_err()
+    {
+        // Cooperative cancellation had its full grace period.  A task that
+        // still does not quiesce is fenced as a last resort; the shell child
+        // itself is protected by kill_on_drop and the handler process-group
+        // cleanup.
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
