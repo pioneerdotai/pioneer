@@ -2417,9 +2417,26 @@ impl RecoveryCoordinator {
         else {
             return Ok(None);
         };
+        // Continuation notifications carry the runtime window identity.  The
+        // checkpoint's window_id is a database foreign key and must not be
+        // leaked into the provider/runtime event contract.
+        let runtime_window_id = window
+            .metadata_json
+            .get("runtimeWindowId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                payload
+                    .window
+                    .window_id
+                    .as_ref()
+                    .filter(|id| id.as_str() != window.id.as_str())
+                    .cloned()
+            })
+            .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index));
 
         Ok(Some(ExecutionCheckpointContext {
-            window_id: window.id,
+            window_id: runtime_window_id,
             window_index: window.window_index,
             checkpoint_id: checkpoint.id,
             checkpoint_kind: checkpoint_kind_label(checkpoint.checkpoint_kind),
@@ -2860,13 +2877,24 @@ impl RecoveryCoordinator {
         );
         let provider_token_count =
             (window.provider_token_count > 0).then_some(window.provider_token_count);
+        // The provider-facing checkpoint payload carries the logical runtime
+        // window identity. `window.id` is only the database row key used by
+        // the checkpoint foreign key and must never cross the recovery
+        // protocol boundary. Legacy rows without metadata get the same
+        // deterministic identity used when a missing window is materialized.
+        let runtime_window_id = window
+            .metadata_json
+            .get("runtimeWindowId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index));
         let payload = build_execution_checkpoint_payload(
             workspace_id,
             thread_id,
             turn_id,
             build_execution_checkpoint_original_request_summary(input),
             ExecutionCheckpointWindowSummary {
-                window_id: Some(window.id.clone()),
+                window_id: Some(runtime_window_id),
                 window_index: window.window_index,
                 started_at_unix_ms: Some(window.started_at.timestamp_millis()),
                 completed_at_unix_ms: Some(completed_at.timestamp_millis()),
@@ -3511,6 +3539,35 @@ fn assemble_retained_provider_history(
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     rows.sort_by_key(|row| row.sequence);
 
+    let canonical_start = rows.iter().position(|row| {
+        row.source == "tool_result_v2"
+            || (row.source == "assistant_round"
+                && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                    row.payload.as_str(),
+                )
+                .is_ok())
+    });
+    let Some(canonical_start) = canonical_start else {
+        return assemble_legacy_provider_history(turn_id, rows);
+    };
+
+    let canonical_rows = rows.split_off(canonical_start);
+    let mut retained = assemble_legacy_provider_history(turn_id, rows)?;
+    retained.extend(assemble_canonical_provider_history(
+        turn_id,
+        canonical_rows,
+    )?);
+    Ok(retained)
+}
+
+fn assemble_legacy_provider_history(
+    turn_id: &str,
+    rows: Vec<RetainedProviderHistoryRow>,
+) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut retained = Vec::with_capacity(rows.len());
     let mut pending_tool_calls = HashSet::<String>::new();
     let mut answered_tool_calls = HashSet::<String>::new();
@@ -3609,6 +3666,191 @@ fn assemble_retained_provider_history(
         );
     }
 
+    Ok(retained)
+}
+
+fn assemble_canonical_provider_history(
+    turn_id: &str,
+    rows: Vec<RetainedProviderHistoryRow>,
+) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
+
+    struct PendingRound {
+        sequence: i64,
+        envelope: CanonicalProviderRoundEnvelope,
+        results: HashMap<String, ChatMessage>,
+    }
+
+    fn flush_round(
+        turn_id: &str,
+        pending: PendingRound,
+        retained: &mut Vec<RetainedProviderHistoryMessage>,
+    ) -> Result<()> {
+        if pending.envelope.version != 1 {
+            bail!(
+                "retained provider round `{}` for turn `{turn_id}` has unsupported version {}",
+                pending.envelope.round_id,
+                pending.envelope.version
+            );
+        }
+        if pending.envelope.round_id.trim().is_empty() {
+            bail!("retained provider round for turn `{turn_id}` has an empty round identity");
+        }
+        if pending.envelope.message.role != Role::Assistant {
+            bail!(
+                "retained provider round `{}` for turn `{turn_id}` is not an assistant message",
+                pending.envelope.round_id
+            );
+        }
+        if pending.envelope.termination != ProviderTermination::ToolCalls {
+            bail!(
+                "retained provider round `{}` for turn `{turn_id}` has non-tool terminal semantics",
+                pending.envelope.round_id
+            );
+        }
+
+        let calls = pending
+            .envelope
+            .message
+            .tool_calls
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "retained provider round `{}` for turn `{turn_id}` has no tool calls",
+                    pending.envelope.round_id
+                )
+            })?;
+        if calls.len() != pending.envelope.calls.len() || calls.is_empty() {
+            bail!(
+                "retained provider round `{}` for turn `{turn_id}` has inconsistent call identity metadata",
+                pending.envelope.round_id
+            );
+        }
+
+        let mut identities = pending.envelope.calls.clone();
+        identities.sort_by_key(|identity| identity.ordinal);
+        let mut provider_ids = HashSet::new();
+        let mut item_ids = HashSet::new();
+        for (expected_ordinal, identity) in identities.iter().enumerate() {
+            let expected_ordinal = u32::try_from(expected_ordinal).unwrap_or(u32::MAX);
+            if identity.ordinal != expected_ordinal
+                || identity.provider_call_id.trim().is_empty()
+                || identity.turn_item_id.trim().is_empty()
+                || !provider_ids.insert(identity.provider_call_id.clone())
+                || !item_ids.insert(identity.turn_item_id.clone())
+                || calls.get(expected_ordinal as usize).is_none_or(|call| {
+                    call.id != identity.provider_call_id
+                        || call.name.trim().is_empty()
+                        || serde_json::from_str::<serde_json::Value>(call.arguments.as_str())
+                            .is_err()
+                })
+            {
+                bail!(
+                    "retained provider round `{}` for turn `{turn_id}` has invalid or duplicate call identities",
+                    pending.envelope.round_id
+                );
+            }
+        }
+
+        let missing = identities
+            .iter()
+            .filter(|identity| !pending.results.contains_key(identity.turn_item_id.as_str()))
+            .map(|identity| identity.turn_item_id.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "retained provider round `{}` for turn `{turn_id}` requires side-effect reconciliation; missing durable results for Turn items: {}",
+                pending.envelope.round_id,
+                missing.join(", ")
+            );
+        }
+
+        retained.push(RetainedProviderHistoryMessage {
+            sequence: pending.sequence,
+            message: pending.envelope.message,
+        });
+        for (offset, identity) in identities.into_iter().enumerate() {
+            let message = pending
+                .results
+                .get(identity.turn_item_id.as_str())
+                .expect("missing results were checked")
+                .clone();
+            if message.role != Role::Tool
+                || message.tool_call_id.as_deref() != Some(identity.provider_call_id.as_str())
+            {
+                bail!(
+                    "retained result `{}` for provider round `{}` has mismatched provider identity",
+                    identity.turn_item_id,
+                    pending.envelope.round_id
+                );
+            }
+            retained.push(RetainedProviderHistoryMessage {
+                sequence: pending.sequence.saturating_add(offset as i64 + 1),
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    let mut retained = Vec::new();
+    let mut pending: Option<PendingRound> = None;
+    for row in rows {
+        match row.source.as_str() {
+            "assistant_round" => {
+                if let Some(previous) = pending.take() {
+                    flush_round(turn_id, previous, &mut retained)?;
+                }
+                let envelope =
+                    serde_json::from_str::<CanonicalProviderRoundEnvelope>(row.payload.as_str())
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "invalid canonical provider round for turn `{turn_id}`: {error}"
+                            )
+                        })?;
+                pending = Some(PendingRound {
+                    sequence: row.sequence,
+                    envelope,
+                    results: HashMap::new(),
+                });
+            }
+            "tool_result_v2" => {
+                let pending = pending.as_mut().ok_or_else(|| anyhow::anyhow!(
+                    "exact provider result for turn `{turn_id}` has no preceding canonical round"
+                ))?;
+                let item_id = row.item_id.ok_or_else(|| anyhow::anyhow!(
+                    "exact provider result for turn `{turn_id}` is missing its Turn item identity"
+                ))?;
+                let view =
+                    serde_json::from_str::<pioneer_tools::ToolResultView>(row.payload.as_str())?;
+                let pioneer_tools::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = view
+                else {
+                    bail!(
+                        "exact provider result `{item_id}` for turn `{turn_id}` is not an untruncated canonical message"
+                    );
+                };
+                let message = serde_json::from_value::<ChatMessage>(value).map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid exact provider result `{item_id}` for turn `{turn_id}`: {error}"
+                    )
+                })?;
+                if pending.results.insert(item_id.clone(), message).is_some() {
+                    bail!(
+                        "canonical provider round `{}` for turn `{turn_id}` has duplicate result for Turn item `{item_id}`",
+                        pending.envelope.round_id
+                    );
+                }
+            }
+            source => bail!(
+                "canonical provider history for turn `{turn_id}` contains incompatible source `{source}`"
+            ),
+        }
+    }
+    if let Some(pending) = pending {
+        flush_round(turn_id, pending, &mut retained)?;
+    }
     Ok(retained)
 }
 
@@ -3915,7 +4157,8 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
-        ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, ProviderReplayState,
+        CanonicalProviderRoundEnvelope, ChatMessage, InputContentType, MessageAttachment,
+        ProviderCallIdentity, ProviderRegistry, ProviderReplayState, ProviderTermination,
         ProviderToolCall, providers::EchoProvider,
     };
     use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
@@ -4067,6 +4310,169 @@ mod tests {
         let error = assemble_retained_provider_history("turn_incomplete", rows).unwrap_err();
 
         assert!(error.to_string().contains("is incomplete"));
+    }
+
+    fn canonical_round_row(
+        sequence: i64,
+        round_id: &str,
+        provider_call_id: &str,
+        item_id: &str,
+    ) -> RetainedProviderHistoryRow {
+        let message = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: provider_call_id.to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        );
+        retained_history_row(
+            sequence,
+            "assistant_round",
+            Some(round_id),
+            None,
+            serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: round_id.to_owned(),
+                termination: ProviderTermination::ToolCalls,
+                message,
+                calls: vec![ProviderCallIdentity {
+                    provider_call_id: provider_call_id.to_owned(),
+                    turn_item_id: item_id.to_owned(),
+                    ordinal: 0,
+                }],
+            })
+            .unwrap(),
+        )
+    }
+
+    fn exact_result_row(
+        sequence: i64,
+        item_id: &str,
+        provider_call_id: &str,
+        text: &str,
+    ) -> RetainedProviderHistoryRow {
+        let message = ChatMessage::tool_result(provider_call_id, "read_file", text);
+        retained_history_row(
+            sequence,
+            "tool_result_v2",
+            Some(item_id),
+            Some("read_file"),
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(message).unwrap(),
+                truncated: false,
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn canonical_provider_history_replays_exact_result_by_provider_identity() {
+        let retained = assemble_retained_provider_history(
+            "turn_v2",
+            vec![
+                canonical_round_row(1, "round_1", "provider_call", "turn_item_1"),
+                exact_result_row(2, "turn_item_1", "provider_call", "exact output"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].message.role, pioneer_provider::Role::Assistant);
+        assert_eq!(retained[1].message.role, pioneer_provider::Role::Tool);
+        assert_eq!(
+            retained[1].message.tool_call_id.as_deref(),
+            Some("provider_call")
+        );
+        assert_eq!(retained[1].message.content, "exact output");
+    }
+
+    #[test]
+    fn canonical_provider_history_reports_reconciliation_for_partial_round() {
+        let error = assemble_retained_provider_history(
+            "turn_partial",
+            vec![canonical_round_row(
+                1,
+                "round_partial",
+                "provider_call",
+                "turn_item_missing",
+            )],
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("requires side-effect reconciliation"));
+        assert!(message.contains("turn_item_missing"));
+    }
+
+    #[test]
+    fn repeated_provider_call_ids_across_rounds_keep_distinct_turn_items() {
+        let retained = assemble_retained_provider_history(
+            "turn_reused_provider_id",
+            vec![
+                canonical_round_row(1, "round_1", "call_1", "turn_item_1"),
+                exact_result_row(2, "turn_item_1", "call_1", "first"),
+                canonical_round_row(3, "round_2", "call_1", "turn_item_2"),
+                exact_result_row(4, "turn_item_2", "call_1", "second"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 4);
+        assert_eq!(retained[1].message.content, "first");
+        assert_eq!(retained[3].message.content, "second");
+        assert_eq!(retained[1].message.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(retained[3].message.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn completed_legacy_prefix_can_continue_with_canonical_rounds_after_upgrade() {
+        let legacy_assistant = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "legacy_call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        );
+        let retained = assemble_retained_provider_history(
+            "turn_upgraded",
+            vec![
+                retained_history_row(
+                    1,
+                    "assistant_round",
+                    Some("legacy_round"),
+                    None,
+                    serde_json::to_string(&legacy_assistant).unwrap(),
+                ),
+                retained_history_row(
+                    2,
+                    "tool_result",
+                    Some("legacy_call"),
+                    Some("read_file"),
+                    serde_json::to_string(&pioneer_tools::ToolResultView::Text {
+                        text: "legacy result".to_owned(),
+                        truncated: false,
+                    })
+                    .unwrap(),
+                ),
+                canonical_round_row(3, "round_v2", "provider_call", "turn_item_v2"),
+                exact_result_row(4, "turn_item_v2", "provider_call", "canonical result"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 4);
+        let legacy_payload =
+            serde_json::from_str::<serde_json::Value>(&retained[1].message.content).unwrap();
+        assert_eq!(legacy_payload["output"], "legacy result");
+        assert_eq!(legacy_payload["truncated"], false);
+        assert_eq!(legacy_payload["recovered_from_turn_llm_context"], true);
+        assert_eq!(
+            retained[1].message.tool_call_id.as_deref(),
+            Some("legacy_call")
+        );
+        assert_eq!(retained[3].message.content, "canonical result");
     }
 
     #[test]
@@ -5750,7 +6156,7 @@ mod tests {
             .await
             .expect("runtime checkpoint preparation should succeed")
             .expect("runtime recovery should receive a checkpoint");
-        assert_eq!(context.window_id, window.id);
+        assert_eq!(context.window_id, "runtime_window_1");
         assert_eq!(context.window_index, 1);
         assert_eq!(context.next_window_index(), 2);
         assert_eq!(context.checkpoint_kind, "window_exhausted");
@@ -5813,7 +6219,7 @@ mod tests {
             .await
             .expect("second runtime checkpoint preparation should succeed")
             .expect("second runtime recovery should receive the current checkpoint");
-        assert_eq!(second_context.window_id, second_window.id);
+        assert_eq!(second_context.window_id, "runtime_window_2");
         assert_eq!(second_context.window_index, 2);
         assert_eq!(second_context.next_window_index(), 3);
         assert_eq!(
@@ -6333,7 +6739,7 @@ mod tests {
             .await
             .expect("checkpoint context lookup should succeed")
             .expect("checkpoint context should exist");
-        assert_eq!(context.window_id, first_window.id);
+        assert_eq!(context.window_id, "runtime_window_1");
         assert_eq!(context.window_index, 1);
         assert_eq!(context.next_window_index(), 2);
         assert_eq!(context.checkpoint_id, checkpoint.id);

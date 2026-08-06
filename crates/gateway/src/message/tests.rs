@@ -2817,6 +2817,7 @@ impl Provider for DelayedProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -2828,7 +2829,9 @@ impl Provider for DelayedProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -2874,6 +2877,7 @@ impl Provider for RevisionProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -2885,7 +2889,9 @@ impl Provider for RevisionProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -2950,6 +2956,7 @@ impl Provider for RevisionHangingProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -2961,7 +2968,9 @@ impl Provider for RevisionHangingProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3020,6 +3029,7 @@ impl Provider for CountingDelayedProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -3031,7 +3041,9 @@ impl Provider for CountingDelayedProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3168,6 +3180,7 @@ impl Provider for CaptureSummaryProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -3179,7 +3192,9 @@ impl Provider for CaptureSummaryProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3221,7 +3236,9 @@ impl Provider for PreflightCaptureProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3273,7 +3290,9 @@ impl Provider for PromptParityCaptureProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3351,7 +3370,9 @@ impl Provider for HangingChildProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3410,7 +3431,9 @@ impl Provider for ConcurrentComposerHistoryProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3444,6 +3467,7 @@ impl Provider for FlakyTitleProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -3455,7 +3479,9 @@ impl Provider for FlakyTitleProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3503,6 +3529,7 @@ impl Provider for GuardAwareProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             });
         }
@@ -3518,6 +3545,7 @@ impl Provider for GuardAwareProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_guard_create".to_owned(),
                     name: "task_create".to_owned(),
@@ -3533,6 +3561,7 @@ impl Provider for GuardAwareProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             },
             2 => {
@@ -3543,6 +3572,7 @@ impl Provider for GuardAwareProvider {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
                     tool_calls: vec![ProviderToolCall {
                         id: "call_guard_detach".to_owned(),
                         name: "task_detach".to_owned(),
@@ -3555,6 +3585,7 @@ impl Provider for GuardAwareProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             },
         };
@@ -3568,7 +3599,9 @@ impl Provider for GuardAwareProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -3618,6 +3651,7 @@ impl Provider for CreateThenHangProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             });
         }
@@ -3629,6 +3663,7 @@ impl Provider for CreateThenHangProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_cancel_create".to_owned(),
                     name: "task_create".to_owned(),
@@ -3646,6 +3681,7 @@ impl Provider for CreateThenHangProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -3657,7 +3693,9 @@ impl Provider for CreateThenHangProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -4404,6 +4442,7 @@ impl Provider for VerticalSelfImprovementProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -4502,7 +4541,9 @@ impl Provider for VerticalUnfinishedSiblingProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -4540,6 +4581,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: format!("vertical_source_tool_{}", round / 2),
                     name: "request_tools".to_owned(),
@@ -4569,6 +4611,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -4585,7 +4628,9 @@ impl Provider for VerticalCollaborativeSourceProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(
+            pioneer_provider::ProviderTermination::Complete,
+        )));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -4643,6 +4688,7 @@ impl Provider for VerticalReadSkillProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
                 tool_calls: vec![ProviderToolCall {
                     id: "vertical_read_agent_skill".to_owned(),
                     name: "read_skill".to_owned(),
@@ -4659,6 +4705,7 @@ impl Provider for VerticalReadSkillProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -4675,7 +4722,9 @@ impl Provider for VerticalReadSkillProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(
+            pioneer_provider::ProviderTermination::Complete,
+        )));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -4734,6 +4783,7 @@ impl Provider for MemoryAgentE2eProvider {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             });
         }
@@ -4758,7 +4808,9 @@ impl Provider for MemoryAgentE2eProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(
+            pioneer_provider::ProviderTermination::Complete,
+        )));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -4998,6 +5050,7 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
         usage: None,
         reasoning_content: None,
         provider_replay_state: None,
+        termination: pioneer_provider::ProviderTermination::Complete,
         tool_calls: Vec::new(),
     }
 }
@@ -5128,11 +5181,17 @@ impl Provider for SequencedToolProvider {
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         if index == 0 {
+            let termination = if self.first_tool_calls.is_empty() {
+                pioneer_provider::ProviderTermination::Complete
+            } else {
+                pioneer_provider::ProviderTermination::ToolCalls
+            };
             return Ok(ChatResponse {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination,
                 tool_calls: self.first_tool_calls.clone(),
             });
         }
@@ -5142,6 +5201,7 @@ impl Provider for SequencedToolProvider {
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
         })
     }
@@ -5153,7 +5213,9 @@ impl Provider for SequencedToolProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
         ])
         .boxed())
     }
@@ -8957,8 +9019,12 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .process_request_for_connection(connection_id, &request.to_string())
         .await;
 
-    let _response = recv_response_by_id(&mut rx, request_id.as_str()).await;
-    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_response, _turn_started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let mut user_message = None;
     for _ in 0..10 {
         let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
@@ -9685,8 +9751,12 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         .process_request_for_connection(connection_id, &request.to_string())
         .await;
 
-    let _response = recv_response_by_id(&mut rx, request_id.as_str()).await;
-    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_response, _turn_started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let mut user_message = None;
     for _ in 0..10 {
         let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
@@ -12800,8 +12870,12 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             .to_string(),
         )
         .await;
-    let _ = recv_response_by_id(&mut allowed_rx, materialize_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut allowed_rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut allowed_rx,
+        materialize_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let _ = recv_notification_by_method(&mut allowed_rx, events::TURN_COMPLETED).await;
     assert!(
         pioneer_crud::find_thread_membership(
@@ -16862,6 +16936,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
         .await
         .expect("execution lease should be made stale for startup recovery");
+    // Model an actual process restart. Leaving the original hanging agent loop
+    // alive would create two in-memory owners for the same durable Turn and
+    // turn this recovery test into an unsupported split-brain race.
+    initial_processor
+        .agent_manager
+        .remove_thread(lineage.child_thread_id.as_str())
+        .await;
     let recovery_provider = Arc::new(PreflightCaptureProvider::new(
         "recovered hidden child completed",
     ));
@@ -16887,12 +16968,45 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .await
         .expect("startup recovery should run");
 
-    wait_for_task_status(
-        crud_store.clone(),
-        response.task.id.as_str(),
+    let mut recovered_task_status = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("initial recovered task query should succeed")
+        .expect("initial recovered task should exist")
+        .task
+        .status;
+    for _ in 0..400 {
+        recovered_task_status = crud_store
+            .get_task(response.task.id.as_str())
+            .await
+            .expect("recovered task query should succeed")
+            .expect("recovered task should exist")
+            .task
+            .status;
+        if recovered_task_status == pioneer_protocol::TaskStatus::Completed {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let diagnostic_child_turn = crud_store
+        .get_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("diagnostic child turn lookup should succeed");
+    let diagnostic_execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("diagnostic execution lookup should succeed");
+    assert_eq!(
+        recovered_task_status,
         pioneer_protocol::TaskStatus::Completed,
-    )
-    .await;
+        "recovered hidden child should complete; provider requests: {:?}; child turn: {:?}; execution: {:?}",
+        recovery_provider.snapshot_requests(),
+        diagnostic_child_turn,
+        diagnostic_execution,
+    );
     let (_, child_turn) = crud_store
         .get_turn(
             lineage.child_thread_id.as_str(),
@@ -25410,9 +25524,13 @@ async fn connection_closed_keeps_active_turn_running_without_subscribers() {
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let _turn_start_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _turn_started_notification =
-        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_turn_start_response, _turn_started_notification) =
+        recv_response_and_notification_by_id_method(
+            &mut rx,
+            "bbbbbbbbbbbbbbbbbbbbb",
+            events::TURN_STARTED,
+        )
+        .await;
 
     processor.connection_closed(connection_id).await;
 
@@ -26184,8 +26302,12 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (turn_rpc_response, started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "bbbbbbbbbbbbbbbbbbbbb",
+        events::TURN_STARTED,
+    )
+    .await;
     let completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
     let _timeline_changed =
         recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
@@ -26482,8 +26604,12 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
             .to_string(),
         )
         .await;
-    let _ = recv_response_by_id(&mut rx, "epic6replytarget00001").await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "epic6replytarget00001",
+        events::TURN_STARTED,
+    )
+    .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
     let _ = recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
 
@@ -26759,8 +26885,12 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
             .to_string(),
         )
         .await;
-    let response = recv_response_by_id(&mut rx, success_request_id.as_str()).await;
-    let started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (response, started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        success_request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
     let timeline =
         recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
@@ -27169,8 +27299,12 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
             .to_string(),
         )
         .await;
-    let _ = recv_response_by_id(&mut superuser_rx, "e6mutationseedmsg0001").await;
-    let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut superuser_rx,
+        "e6mutationseedmsg0001",
+        events::TURN_STARTED,
+    )
+    .await;
     let _ = recv_notification_by_method(&mut superuser_rx, events::TURN_COMPLETED).await;
     let _ = recv_notification_by_method(&mut superuser_rx, events::THREAD_TIMELINE_BLOCKS_CHANGED)
         .await;
@@ -28046,8 +28180,12 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
             .to_string(),
         )
         .await;
-    let _turn_response = recv_response_by_id(&mut rx, "turnstartapioldturn01").await;
-    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_turn_response, _turn_started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "turnstartapioldturn01",
+        events::TURN_STARTED,
+    )
+    .await;
 
     for _ in 0..20 {
         if capture_provider.snapshot_requests().iter().any(|request| {
@@ -28446,9 +28584,12 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
     assert!(audit.request_key.is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch() {
-    turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl().await;
+#[test]
+fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch() {
+    run_large_stack_message_test(
+        "CLI-disabled turn/start regression",
+        turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl(),
+    );
 }
 
 async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl() {
@@ -30680,8 +30821,12 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
             .to_string(),
         )
         .await;
-    let _ = recv_response_by_id(&mut rx, source_turn_request_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut rx,
+        source_turn_request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
 
     let now = chrono::Utc::now().fixed_offset();
@@ -30805,8 +30950,8 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     .to_string();
     message_future(processor.process_request_for_connection(connection_id, &turn_start_payload))
         .await;
-    let _turn_response = recv_response_by_id(rx, turn_start_id).await;
-    let _turn_started = recv_notification_by_method(rx, events::TURN_STARTED).await;
+    let _ =
+        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33135,7 +33280,19 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         "recovery must bind the durable Codex thread before process allocation"
     );
     let starts = cli_session.turn_starts.lock().await.clone();
-    assert_eq!(starts.len(), 1);
+    let diagnostic_attempt = crud_store
+        .latest_cli_runtime_turn_attempt(turn_id)
+        .await
+        .expect("diagnostic CLI recovery attempt should load");
+    let diagnostic_window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("diagnostic CLI execution window should load");
+    assert_eq!(
+        starts.len(),
+        1,
+        "CLI recovery did not submit its native turn; latest attempt: {diagnostic_attempt:?}; latest execution window: {diagnostic_window:?}"
+    );
     assert_eq!(starts[0].native_thread_id, native_thread_id);
     assert_eq!(
         cli_session.goal_resets.lock().await.as_slice(),
@@ -37030,9 +37187,13 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _turn_started_notification =
-        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (turn_rpc_response, _turn_started_notification) =
+        recv_response_and_notification_by_id_method(
+            &mut rx,
+            "bbbbbbbbbbbbbbbbbbbbb",
+            events::TURN_STARTED,
+        )
+        .await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
     assert_eq!(turn_result.turn.status, TurnStatus::InProgress);
@@ -37914,8 +38075,12 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         processor
             .process_request_for_connection(connection_id, &turn_start_request.to_string())
             .await;
-        let _ = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-        let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+        let _ = recv_response_and_notification_by_id_method(
+            &mut rx,
+            "bbbbbbbbbbbbbbbbbbbbb",
+            events::TURN_STARTED,
+        )
+        .await;
 
         let manifest = PromptManifest {
             compiler_version: "0.1.0-test".to_owned(),
@@ -38087,9 +38252,13 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _turn_started_notification =
-        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (turn_rpc_response, _turn_started_notification) =
+        recv_response_and_notification_by_id_method(
+            &mut rx,
+            "bbbbbbbbbbbbbbbbbbbbb",
+            events::TURN_STARTED,
+        )
+        .await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
 
@@ -38241,8 +38410,12 @@ async fn turn_get_returns_turn_snapshot() {
     processor
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "bbbbbbbbbbbbbbbbbbbbb",
+        events::TURN_STARTED,
+    )
+    .await;
 
     let turn_get_request = json!({
         "jsonrpc": "2.0",
@@ -38334,8 +38507,12 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
     processor
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut rx,
+        turn_start_request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     wait_for_thread_manager_turn_status(
         thread_manager_for_assert.as_ref(),
         "thr_000000000000000022",
@@ -38481,8 +38658,12 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
     processor
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut rx,
+        turn_start_request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     let (_starting_binding, initial_attempt) = crud_store
@@ -41978,8 +42159,9 @@ async fn send_epic6_test_message(
             .to_string(),
         )
         .await;
-    let _ = recv_response_by_id(rx, request_id.as_str()).await;
-    let _ = recv_notification_by_method(rx, events::TURN_STARTED).await;
+    let _ =
+        recv_response_and_notification_by_id_method(rx, request_id.as_str(), events::TURN_STARTED)
+            .await;
     let _ = recv_notification_by_method(rx, events::TURN_COMPLETED).await;
     let _ = recv_notification_by_method(rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
 }
@@ -45514,8 +45696,12 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
     processor
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
-    let _turn_start_response = recv_response_by_id(&mut rx, "toolretryturnstart001").await;
-    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_turn_start_response, _turn_started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "toolretryturnstart001",
+        events::TURN_STARTED,
+    )
+    .await;
 
     let scheduled_notification =
         recv_notification_by_method(&mut rx, events::ITEM_TOOL_RETRY_SCHEDULED).await;
@@ -45606,9 +45792,12 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let turn_started_notification =
-        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (turn_response, turn_started_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "bbbbbbbbbbbbbbbbbbbbb",
+        events::TURN_STARTED,
+    )
+    .await;
     let turn_start_result: TurnStartResponse =
         serde_json::from_value(turn_response.result).expect("turn/start result should decode");
     assert_eq!(turn_start_result.turn.status, TurnStatus::InProgress);
@@ -45848,8 +46037,12 @@ Gateway skill body"#,
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
 
-    let _turn_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbdyn111").await;
-    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let (_turn_response, _turn_started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "bbbbbbbbbbbbbbbdyn111",
+        events::TURN_STARTED,
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while provider.snapshot_requests().len() < 2 {
@@ -52638,8 +52831,12 @@ async fn start_memory_e2e_turn(
         .processor
         .process_request_for_connection(harness.connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
 }
 
 async fn run_memory_e2e_turn(
@@ -52669,8 +52866,12 @@ async fn run_memory_e2e_turn_with_params(
         .processor
         .process_request_for_connection(harness.connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
-    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
     let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
 }
 
@@ -54441,8 +54642,8 @@ async fn start_thread_and_turn_with_permission_profile(
     processor
         .process_request_for_connection(connection_id, &turn_start_request.to_string())
         .await;
-    let _ = recv_response_by_id(rx, turn_request_id).await;
-    let _ = recv_notification_by_method(rx, events::TURN_STARTED).await;
+    let _ = recv_response_and_notification_by_id_method(rx, turn_request_id, events::TURN_STARTED)
+        .await;
 }
 
 async fn wait_for_task_anchor(

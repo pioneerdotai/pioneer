@@ -532,20 +532,6 @@ pub(super) fn retained_llm_context_view(
     }
 }
 
-pub(super) fn protocol_tool_result_view(
-    payload: ToolResultView,
-) -> pioneer_protocol::ToolResultView {
-    match payload {
-        ToolResultView::Text { text, truncated } => {
-            pioneer_protocol::ToolResultView::Text { text, truncated }
-        }
-        ToolResultView::Json { value, truncated } => {
-            pioneer_protocol::ToolResultView::Json { value, truncated }
-        }
-        ToolResultView::Empty => pioneer_protocol::ToolResultView::Empty,
-    }
-}
-
 fn storage_metadata_from_payload(storage: Option<&ToolStoragePayload>) -> Option<ToolMetadata> {
     match storage? {
         ToolStoragePayload::Metadata { metadata } => Some(metadata.clone()),

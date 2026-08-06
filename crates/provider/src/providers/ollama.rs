@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedProviderMessages, attachment_bytes, ensure_no_unrendered_attachments,
     prepare_messages_for_provider,
 };
+use crate::tools::stream::IncrementalLineDecoder;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
-    TokenUsage, ToolDefinition,
+    ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, Role,
+    StreamChunk, TokenUsage, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -91,6 +92,10 @@ struct OllamaOptions {
 struct OllamaChatResponse {
     message: OllamaResponseMessage,
     #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
+    #[serde(default)]
     prompt_eval_count: Option<u64>,
     #[serde(default)]
     eval_count: Option<u64>,
@@ -142,6 +147,8 @@ struct OllamaStreamChunk {
     message: OllamaResponseMessage,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
 }
 
 // ── Implementation ─────────────────────────────────────────────────────────
@@ -355,7 +362,6 @@ impl crate::traits::Provider for OllamaProvider {
         }
 
         let api_response: OllamaChatResponse = response.json().await?;
-
         let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
             (None, None) => None,
             (input, output) => Some(TokenUsage {
@@ -367,6 +373,19 @@ impl crate::traits::Provider for OllamaProvider {
         let reasoning_content = api_response.message.thinking.filter(|t| !t.is_empty());
         let tool_calls =
             Self::convert_tool_calls(api_response.message.tool_calls.unwrap_or_default());
+        let termination = api_response
+            .done_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| {
+                if !api_response.done {
+                    ProviderTermination::Unknown("missing_done_marker".to_owned())
+                } else if tool_calls.is_empty() {
+                    ProviderTermination::Complete
+                } else {
+                    ProviderTermination::ToolCalls
+                }
+            });
         let text = api_response.message.content.unwrap_or_default();
 
         if text.is_empty()
@@ -379,6 +398,7 @@ impl crate::traits::Provider for OllamaProvider {
         Ok(ChatResponse {
             text,
             usage,
+            termination,
             reasoning_content,
             tool_calls,
             provider_replay_state: None,
@@ -422,8 +442,9 @@ impl crate::traits::Provider for OllamaProvider {
         tokio::spawn(async move {
             use std::collections::HashSet;
 
-            let mut buffer = String::new();
+            let mut decoder = IncrementalLineDecoder::default();
             let mut emitted_tool_call_keys = HashSet::new();
+            let mut saw_tool_calls = false;
 
             tokio::pin!(byte_stream);
 
@@ -436,14 +457,16 @@ impl crate::traits::Provider for OllamaProvider {
                     }
                 };
 
-                let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                buffer.push_str(&text);
-
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                };
                 // Ollama streams newline-delimited JSON (not SSE)
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+                for line in lines {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
@@ -467,11 +490,25 @@ impl crate::traits::Provider for OllamaProvider {
                                     }
                                 }
                                 if !new_calls.is_empty() {
+                                    saw_tool_calls = true;
                                     let _ = tx.send(Ok(StreamChunk::tool_calls(new_calls))).await;
                                 }
                             }
                             if chunk.done {
-                                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                                let termination = chunk
+                                    .done_reason
+                                    .as_deref()
+                                    .map(ProviderTermination::from_openai_reason)
+                                    .unwrap_or_else(|| {
+                                        if saw_tool_calls {
+                                            ProviderTermination::ToolCalls
+                                        } else {
+                                            ProviderTermination::Complete
+                                        }
+                                    });
+                                let _ = tx
+                                    .send(Ok(StreamChunk::final_chunk_with(termination)))
+                                    .await;
                                 return;
                             }
                             if let Some(thinking) = thinking {
@@ -486,14 +523,20 @@ impl crate::traits::Provider for OllamaProvider {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("failed to parse Ollama stream chunk: {e}");
+                            let _ = tx
+                                .send(Err(anyhow!("malformed Ollama NDJSON frame: {e}")))
+                                .await;
+                            return;
                         }
                     }
                 }
             }
 
-            // Stream ended without an explicit done=true; send final chunk
-            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            let error = decoder
+                .finish()
+                .err()
+                .unwrap_or_else(|| anyhow!("Ollama stream ended before done=true"));
+            let _ = tx.send(Err(error)).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

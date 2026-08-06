@@ -382,7 +382,9 @@ mod tests {
         let inner = stream::iter(vec![
             Ok(StreamChunk::provider_replay_state(state)),
             Ok(StreamChunk::tool_calls(vec![tool_call()])),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                crate::ProviderTermination::ToolCalls,
+            )),
         ])
         .boxed();
 
@@ -419,7 +421,9 @@ mod tests {
         let inner = stream::iter(vec![
             Ok(StreamChunk::provider_replay_state(state.clone())),
             Ok(StreamChunk::tool_calls(vec![tool_call()])),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(
+                crate::ProviderTermination::ToolCalls,
+            )),
         ])
         .boxed();
 

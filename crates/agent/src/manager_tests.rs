@@ -1483,6 +1483,7 @@ fn test_preflight_response() -> ChatResponse {
         reasoning_content: None,
         tool_calls: Vec::new(),
         provider_replay_state: None,
+        termination: pioneer_provider::ProviderTermination::Complete,
     }
 }
 
@@ -2692,6 +2693,7 @@ impl Provider for CaptureStandardProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
         })
     }
 
@@ -2702,7 +2704,7 @@ impl Provider for CaptureStandardProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -2738,6 +2740,7 @@ impl Provider for SequencedToolProvider {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             });
         }
 
@@ -2752,6 +2755,7 @@ impl Provider for SequencedToolProvider {
                 reasoning_content: None,
                 tool_calls: self.first_tool_calls.clone(),
                 provider_replay_state: self.first_provider_replay_state.clone(),
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
             });
         }
 
@@ -2761,6 +2765,7 @@ impl Provider for SequencedToolProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
         })
     }
 
@@ -2771,7 +2776,7 @@ impl Provider for SequencedToolProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -2808,6 +2813,7 @@ impl Provider for LoopBudgetProvider {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             });
         }
 
@@ -2862,6 +2868,11 @@ impl Provider for LoopBudgetProvider {
             },
             usage: None,
             reasoning_content: None,
+            termination: if tool_calls.is_empty() {
+                pioneer_provider::ProviderTermination::Complete
+            } else {
+                pioneer_provider::ProviderTermination::ToolCalls
+            },
             tool_calls,
             provider_replay_state: None,
         })
@@ -2874,7 +2885,7 @@ impl Provider for LoopBudgetProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -2923,6 +2934,7 @@ impl Provider for AlwaysTaskCreateProvider {
                 .to_string(),
             }],
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::ToolCalls,
         })
     }
 
@@ -2933,7 +2945,7 @@ impl Provider for AlwaysTaskCreateProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -2978,6 +2990,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
                     arguments: "{}".to_owned(),
                 }],
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
             }),
             _ => Err(anyhow::anyhow!(
                 "late provider failure after recovery success"
@@ -2992,7 +3005,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -3028,6 +3041,7 @@ impl Provider for CaptureAgentProvider {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             });
         }
         Ok(ChatResponse {
@@ -3036,6 +3050,7 @@ impl Provider for CaptureAgentProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
         })
     }
 
@@ -3046,7 +3061,7 @@ impl Provider for CaptureAgentProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -3092,6 +3107,7 @@ impl Provider for ReviewGuardProvider {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             },
             ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
                 text: String::new(),
@@ -3103,6 +3119,7 @@ impl Provider for ReviewGuardProvider {
                     arguments: arguments.to_string(),
                 }],
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
             },
         };
         Ok(response)
@@ -3120,7 +3137,7 @@ impl Provider for ReviewGuardProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -3162,6 +3179,7 @@ impl Provider for EmptyNoToolRoundProvider {
                 reasoning_content: None,
                 tool_calls: vec![first_tool_call],
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
             });
         }
 
@@ -3173,6 +3191,7 @@ impl Provider for EmptyNoToolRoundProvider {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             });
         }
 
@@ -3182,6 +3201,7 @@ impl Provider for EmptyNoToolRoundProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
         })
     }
 
@@ -3192,7 +3212,7 @@ impl Provider for EmptyNoToolRoundProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -3238,6 +3258,7 @@ impl Provider for SequencedTextProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: pioneer_provider::ProviderTermination::Complete,
         })
     }
 
@@ -3248,7 +3269,7 @@ impl Provider for SequencedTextProvider {
         let response = self.chat(request).await?;
         Ok(futures_util::stream::iter(vec![
             Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk()),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
         ])
         .boxed())
     }
@@ -5454,11 +5475,12 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
         .iter()
         .find(|event| event.tool_name == "list_dir")
         .expect("list_dir event should be summarized");
-    assert_eq!(tool_event.item_id, "call_phase12_tool_summary");
+    assert_ne!(tool_event.item_id, "call_phase12_tool_summary");
+    assert_eq!(tool_event.item_id.len(), 21);
     assert_eq!(tool_event.status, TurnPostTurnToolStatus::Succeeded);
     assert!(!payload.tool_events_truncated);
     assert!(payload.domain_events.iter().any(|event| {
-        event.item_id.as_deref() == Some("call_phase12_tool_summary")
+        event.item_id.as_deref() == Some(tool_event.item_id.as_str())
             && event.code.as_deref() == Some("tool.succeeded")
     }));
     assert_eq!(provider.snapshot_requests().len(), 2);
@@ -9990,8 +10012,8 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
             .expect("agent event channel should stay open");
         if matches!(
             &event,
-            AgentEvent::TurnLlmContextAppended { item_id, .. }
-                if item_id == "call_batch_fast"
+            AgentEvent::TurnLlmContextAppended { tool_name, .. }
+                if tool_name == "batch_fast"
         ) {
             slow_release.add_permits(1);
         }
@@ -10013,8 +10035,10 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         .position(|event| {
             matches!(
                 event,
-                AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. })
-                    if item.item_id() == "call_batch_fast"
+                AgentEvent::ItemCompleted(ItemCompletedNotification {
+                    item: TurnItem::DynamicToolCall { tool_name, .. },
+                    ..
+                }) if tool_name == "batch_fast"
             )
         })
         .expect("fast tool should complete");
@@ -10023,8 +10047,8 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         .position(|event| {
             matches!(
                 event,
-                AgentEvent::TurnLlmContextAppended { item_id, .. }
-                    if item_id == "call_batch_fast"
+                AgentEvent::TurnLlmContextAppended { tool_name, .. }
+                    if tool_name == "batch_fast"
             )
         })
         .expect("fast tool result should be durably journaled");
@@ -10033,8 +10057,10 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         .position(|event| {
             matches!(
                 event,
-                AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. })
-                    if item.item_id() == "call_batch_slow"
+                AgentEvent::ItemCompleted(ItemCompletedNotification {
+                    item: TurnItem::DynamicToolCall { tool_name, .. },
+                    ..
+                }) if tool_name == "batch_slow"
             )
         })
         .expect("slow tool should complete");
@@ -10048,8 +10074,8 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
     );
     assert!(observed.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnLlmContextAppended { item_id, .. }
-            if item_id == "call_batch_slow"
+        AgentEvent::TurnLlmContextAppended { tool_name, .. }
+            if tool_name == "batch_slow"
     )));
 }
 
@@ -13123,17 +13149,36 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
 
     let mut recovery_requested = false;
     let mut saw_recovery_succeeded = false;
+    let mut recovery_item_id = None;
 
     for _ in 0..200 {
-        if !recovery_requested && !provider.snapshot_requests().is_empty() {
-            if manager
+        let event = match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                panic!("broadcast should remain open")
+            }
+            Err(_) => continue,
+        };
+
+        if let AgentEvent::ItemStarted(ItemStartedNotification {
+            item: TurnItem::DynamicToolCall { id, tool_name, .. },
+            ..
+        }) = &event
+            && tool_name == &test_skill_tool_name("my-skill", "slow-shell")
+        {
+            recovery_item_id = Some(id.clone());
+        }
+
+        if !recovery_requested
+            && let Some(item_id) = recovery_item_id.as_ref()
+            && manager
                 .start_recovery_attempt(
                     thread_id,
                     RecoveryAttemptRequest {
                         recovery_job_id: recovery_job_id.to_owned(),
                         recovery_attempt_id: recovery_attempt_id.to_owned(),
                         turn_id: turn_id.to_owned(),
-                        item_id: tool_call_id.to_owned(),
+                        item_id: item_id.clone(),
                         item_type: TurnItemType::DynamicToolCall,
                         force_non_stream: false,
                         disable_tool_calling: false,
@@ -13148,18 +13193,9 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
                 )
                 .await
                 .is_ok()
-            {
-                recovery_requested = true;
-            }
+        {
+            recovery_requested = true;
         }
-
-        let event = match timeout(Duration::from_millis(100), events.recv()).await {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                panic!("broadcast should remain open")
-            }
-            Err(_) => continue,
-        };
 
         match event {
             AgentEvent::RecoveryAttemptSucceeded { recovery, .. } => {

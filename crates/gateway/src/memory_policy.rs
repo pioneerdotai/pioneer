@@ -349,6 +349,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::Complete,
                     tool_calls: Vec::new(),
                 })
             }
@@ -444,6 +445,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::Complete,
                     tool_calls: Vec::new(),
                 })
             }

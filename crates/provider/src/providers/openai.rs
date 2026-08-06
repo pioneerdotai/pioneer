@@ -9,10 +9,12 @@ use crate::{
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
+    tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
-        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderTimeoutPolicy,
-        ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderTermination,
+        ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice,
+        ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -190,6 +192,8 @@ struct ApiChatResponse {
 #[derive(Debug, Deserialize)]
 struct ApiChoice {
     message: ApiResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -823,22 +827,27 @@ impl crate::traits::Provider for OpenAiProvider {
             output_tokens: u.completion_tokens,
         });
 
-        let message = api_response
+        let choice = api_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow!("no response from OpenAI"))?;
+        let termination = choice
+            .finish_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
+        let message = choice.message;
 
         let raw_content = message.content.clone();
         let mut text = message.effective_content();
         let mut tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref());
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
         let mut reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if tool_calls.is_empty() {
             if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content) {
+                if let Some(parsed) = parse_embedded_tool_payload(content)? {
                     text = parsed.text;
                     if reasoning_content.is_none() {
                         reasoning_content = parsed.reasoning_content;
@@ -858,6 +867,7 @@ impl crate::traits::Provider for OpenAiProvider {
         Ok(ChatResponse {
             text,
             usage,
+            termination,
             reasoning_content,
             tool_calls,
             provider_replay_state: None,
@@ -910,7 +920,7 @@ impl crate::traits::Provider for OpenAiProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
+            let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
 
             tokio::pin!(byte_stream);
@@ -924,27 +934,26 @@ impl crate::traits::Provider for OpenAiProvider {
                     }
                 };
 
-                let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                buffer.push_str(&text);
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                };
+                for line in lines {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
-
-                    let Some(data) = line.strip_prefix("data: ") else {
+                    let Some(data) = sse_data(line) else {
                         continue;
                     };
 
                     if data.trim() == "[DONE]" {
-                        let tool_calls = tool_call_accumulator.take_tool_calls();
-                        if !tool_calls.is_empty() {
-                            let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
-                        }
-                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                        let _ = tx
+                            .send(Err(anyhow!("OpenAI stream ended without a finish_reason")))
+                            .await;
                         return;
                     }
 
@@ -960,14 +969,6 @@ impl crate::traits::Provider for OpenAiProvider {
                                 return;
                             }
                             for choice in resp.choices {
-                                if choice.finish_reason.as_deref() == Some("error") {
-                                    let _ = tx
-                                        .send(Err(anyhow!(
-                                            "OpenAI stream finished with provider error"
-                                        )))
-                                        .await;
-                                    return;
-                                }
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
@@ -992,29 +993,40 @@ impl crate::traits::Provider for OpenAiProvider {
                                         arguments: None,
                                     }]);
                                 }
-                                if choice.finish_reason.is_some() {
-                                    let tool_calls = tool_call_accumulator.take_tool_calls();
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(reason.as_str());
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
+                                    };
                                     if !tool_calls.is_empty() {
                                         let _ =
                                             tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
                                     }
-                                    let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                                    let _ = tx
+                                        .send(Ok(StreamChunk::final_chunk_with(termination)))
+                                        .await;
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("failed to parse SSE chunk: {e}");
+                            let _ = tx
+                                .send(Err(anyhow!("malformed OpenAI SSE frame: {e}")))
+                                .await;
+                            return;
                         }
                     }
                 }
             }
-
-            let tool_calls = tool_call_accumulator.take_tool_calls();
-            if !tool_calls.is_empty() {
-                let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
-            }
-            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                anyhow!("OpenAI stream ended before a provider terminal marker")
+            });
+            let _ = tx.send(Err(error)).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

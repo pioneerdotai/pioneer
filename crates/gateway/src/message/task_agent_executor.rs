@@ -4369,8 +4369,26 @@ async fn load_execution_checkpoint_context_for_turn(
                 return Ok(None);
             }
         };
+    // `ExecutionCheckpointContext::window_id` is the provider/runtime window
+    // identity used by continuation events, not the database row primary key
+    // stored in `checkpoint.window_id`.  The transition validator compares it
+    // with the immutable runtimeWindowId written by the Started event.
+    let runtime_window_id = window
+        .metadata_json
+        .get("runtimeWindowId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            payload
+                .window
+                .window_id
+                .as_ref()
+                .filter(|id| id.as_str() != window.id.as_str())
+                .cloned()
+        })
+        .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index));
     Ok(Some(ExecutionCheckpointContext {
-        window_id: window.id,
+        window_id: runtime_window_id,
         window_index: window.window_index,
         checkpoint_id: checkpoint.id,
         checkpoint_kind: task_execution_checkpoint_kind_label(checkpoint.checkpoint_kind),

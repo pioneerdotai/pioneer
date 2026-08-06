@@ -3,10 +3,11 @@ use crate::attachments::{
     ensure_no_unrendered_attachments, prepare_messages_for_provider,
 };
 use crate::reasoning_registry;
+use crate::tools::stream::{IncrementalLineDecoder, sse_data};
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
-    ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -122,6 +123,8 @@ enum AnthropicToolChoice {
 struct ApiChatResponse {
     content: Vec<ContentBlock>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     usage: Option<ApiUsage>,
 }
 
@@ -171,6 +174,8 @@ struct StreamEvent {
 
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     text: Option<String>,
     /// Present on thinking block deltas.
@@ -447,21 +452,16 @@ struct PendingToolUse {
 }
 
 impl PendingToolUse {
-    fn finalize(self) -> ProviderToolCall {
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_owned()
-        } else {
-            match serde_json::from_str::<serde_json::Value>(self.arguments.as_str()) {
-                Ok(value) => serde_json::to_string(&value).unwrap_or(self.arguments),
-                Err(_) => self.arguments,
-            }
-        };
+    fn finalize(self) -> Result<ProviderToolCall> {
+        let value = serde_json::from_str::<serde_json::Value>(self.arguments.as_str())
+            .map_err(|error| anyhow!("Anthropic tool call contains invalid arguments: {error}"))?;
+        let arguments = serde_json::to_string(&value)?;
 
-        ProviderToolCall {
+        Ok(ProviderToolCall {
             id: self.id,
             name: self.name,
             arguments,
-        }
+        })
     }
 }
 
@@ -528,6 +528,11 @@ impl crate::traits::Provider for AnthropicProvider {
         }
 
         let api_response: ApiChatResponse = response.json().await?;
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
@@ -602,6 +607,7 @@ impl crate::traits::Provider for AnthropicProvider {
         Ok(ChatResponse {
             text,
             usage,
+            termination,
             reasoning_content,
             tool_calls,
             provider_replay_state,
@@ -656,7 +662,8 @@ impl crate::traits::Provider for AnthropicProvider {
         tokio::spawn(async move {
             use std::collections::{BTreeMap, HashMap, HashSet};
 
-            let mut buffer = String::new();
+            let mut decoder = IncrementalLineDecoder::default();
+            let mut termination = None;
             let mut thinking_blocks = HashSet::new();
             let mut replay_thinking_blocks: BTreeMap<usize, ApiMessageContentBlock> =
                 BTreeMap::new();
@@ -673,18 +680,20 @@ impl crate::traits::Provider for AnthropicProvider {
                     }
                 };
 
-                let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                buffer.push_str(&text);
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                };
+                for line in lines {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
 
-                    let Some(data) = line.strip_prefix("data: ") else {
+                    let Some(data) = sse_data(line) else {
                         continue;
                     };
 
@@ -694,7 +703,14 @@ impl crate::traits::Provider for AnthropicProvider {
                                 let remaining_calls = pending_tool_uses
                                     .drain()
                                     .map(|(_, call)| call.finalize())
-                                    .collect::<Vec<_>>();
+                                    .collect::<Result<Vec<_>>>();
+                                let remaining_calls = match remaining_calls {
+                                    Ok(calls) => calls,
+                                    Err(error) => {
+                                        let _ = tx.send(Err(error)).await;
+                                        return;
+                                    }
+                                };
                                 if !remaining_calls.is_empty() {
                                     let _ =
                                         tx.send(Ok(StreamChunk::tool_calls(remaining_calls))).await;
@@ -711,8 +727,26 @@ impl crate::traits::Provider for AnthropicProvider {
                                         )))
                                         .await;
                                 }
-                                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                                let _ = tx
+                                    .send(Ok(StreamChunk::final_chunk_with(
+                                        termination.take().unwrap_or_else(|| {
+                                            ProviderTermination::Unknown(
+                                                "missing_stop_reason".to_owned(),
+                                            )
+                                        }),
+                                    )))
+                                    .await;
                                 return;
+                            }
+
+                            if event.event_type == "message_delta" {
+                                if let Some(reason) =
+                                    event.delta.and_then(|delta| delta.stop_reason)
+                                {
+                                    termination =
+                                        Some(ProviderTermination::from_openai_reason(&reason));
+                                }
+                                continue;
                             }
 
                             if event.event_type == "content_block_start" {
@@ -782,9 +816,17 @@ impl crate::traits::Provider for AnthropicProvider {
                                 let index = event.index.unwrap_or(0);
                                 thinking_blocks.remove(&index);
                                 if let Some(call) = pending_tool_uses.remove(&index) {
-                                    let _ = tx
-                                        .send(Ok(StreamChunk::tool_calls(vec![call.finalize()])))
-                                        .await;
+                                    match call.finalize() {
+                                        Ok(call) => {
+                                            let _ = tx
+                                                .send(Ok(StreamChunk::tool_calls(vec![call])))
+                                                .await;
+                                        }
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
+                                    }
                                 }
                             }
 
@@ -832,31 +874,20 @@ impl crate::traits::Provider for AnthropicProvider {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("failed to parse Anthropic SSE chunk: {e}");
+                            let _ = tx
+                                .send(Err(anyhow!("malformed Anthropic SSE frame: {e}")))
+                                .await;
+                            return;
                         }
                     }
                 }
             }
 
-            let remaining_calls = pending_tool_uses
-                .drain()
-                .map(|(_, call)| call.finalize())
-                .collect::<Vec<_>>();
-            if !remaining_calls.is_empty() {
-                let _ = tx.send(Ok(StreamChunk::tool_calls(remaining_calls))).await;
-            }
-            if !replay_thinking_blocks.is_empty() {
-                let blocks = replay_thinking_blocks.into_values().collect::<Vec<_>>();
-                let _ = tx
-                    .send(Ok(StreamChunk::provider_replay_state(
-                        ProviderReplayState::new(
-                            "anthropic",
-                            serde_json::json!({ "blocks": blocks }),
-                        ),
-                    )))
-                    .await;
-            }
-            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            let error = decoder
+                .finish()
+                .err()
+                .unwrap_or_else(|| anyhow!("Anthropic stream ended before message_stop"));
+            let _ = tx.send(Err(error)).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

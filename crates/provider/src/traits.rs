@@ -117,6 +117,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: crate::ProviderTermination::Complete,
             })
         }
 
@@ -127,7 +128,9 @@ mod tests {
             let chunks = vec![
                 Ok(StreamChunk::delta("hello ")),
                 Ok(StreamChunk::delta("world")),
-                Ok(StreamChunk::final_chunk()),
+                Ok(StreamChunk::final_chunk_with(
+                    crate::ProviderTermination::Complete,
+                )),
             ];
             Ok(stream::iter(chunks).boxed())
         }

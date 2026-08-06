@@ -760,6 +760,63 @@ pub struct ProviderToolCall {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCallIdentity {
+    pub provider_call_id: String,
+    pub turn_item_id: String,
+    pub ordinal: u32,
+}
+
+/// Durable provider-facing assistant round plus the separate Pioneer domain
+/// identity of every requested operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalProviderRoundEnvelope {
+    pub version: u8,
+    pub round_id: String,
+    pub termination: ProviderTermination,
+    pub message: ChatMessage,
+    pub calls: Vec<ProviderCallIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "raw", rename_all = "snake_case")]
+pub enum ProviderTermination {
+    Complete,
+    ToolCalls,
+    Length,
+    ContentFiltered,
+    Safety,
+    Cancelled,
+    ProviderError,
+    Unknown(String),
+}
+
+impl ProviderTermination {
+    pub fn from_openai_reason(reason: &str) -> Self {
+        match reason.trim().to_ascii_lowercase().as_str() {
+            "stop" | "end_turn" | "stop_sequence" => Self::Complete,
+            "tool_calls" | "function_call" | "tool_use" => Self::ToolCalls,
+            "length" | "max_tokens" | "max_output_tokens" => Self::Length,
+            "content_filter" | "content_filtered" | "recitation" => Self::ContentFiltered,
+            "safety"
+            | "blocked"
+            | "blocklist"
+            | "prohibited_content"
+            | "spii"
+            | "image_safety"
+            | "refusal"
+            | "guardrail_intervened" => Self::Safety,
+            "cancelled" | "canceled" => Self::Cancelled,
+            "error" | "provider_error" => Self::ProviderError,
+            other => Self::Unknown(other.chars().take(64).collect()),
+        }
+    }
+
+    pub fn permits_success(&self) -> bool {
+        matches!(self, Self::Complete | Self::ToolCalls)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
@@ -770,6 +827,7 @@ pub struct TokenUsage {
 pub struct ChatResponse {
     pub text: String,
     pub usage: Option<TokenUsage>,
+    pub termination: ProviderTermination,
     /// Raw reasoning/thinking content from thinking models (e.g. DeepSeek-R1,
     /// o1, Kimi K2.5). Preserved as an opaque pass-through so it can be sent
     /// back in subsequent API requests — some providers reject tool-call history
@@ -790,6 +848,7 @@ pub struct StreamChunk {
     /// the latest snapshot replaces the previous one.
     pub provider_replay_state: Option<ProviderReplayState>,
     pub is_final: bool,
+    pub termination: Option<ProviderTermination>,
 }
 
 impl StreamChunk {
@@ -800,6 +859,7 @@ impl StreamChunk {
             tool_calls: Vec::new(),
             provider_replay_state: None,
             is_final: false,
+            termination: None,
         }
     }
 
@@ -810,6 +870,7 @@ impl StreamChunk {
             tool_calls: Vec::new(),
             provider_replay_state: None,
             is_final: false,
+            termination: None,
         }
     }
 
@@ -820,6 +881,7 @@ impl StreamChunk {
             tool_calls,
             provider_replay_state: None,
             is_final: false,
+            termination: None,
         }
     }
 
@@ -830,16 +892,18 @@ impl StreamChunk {
             tool_calls: Vec::new(),
             provider_replay_state: Some(state),
             is_final: false,
+            termination: None,
         }
     }
 
-    pub fn final_chunk() -> Self {
+    pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
             is_final: true,
+            termination: Some(termination),
         }
     }
 }
@@ -952,7 +1016,7 @@ mod tests {
         assert_eq!(tool_calls.tool_calls.len(), 1);
         assert!(!tool_calls.is_final);
 
-        let final_chunk = StreamChunk::final_chunk();
+        let final_chunk = StreamChunk::final_chunk_with(ProviderTermination::Complete);
         assert!(final_chunk.delta.is_empty());
         assert!(final_chunk.reasoning_delta.is_none());
         assert!(final_chunk.tool_calls.is_empty());
@@ -1002,10 +1066,27 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             provider_replay_state: None,
+            termination: ProviderTermination::Complete,
         };
         assert!(resp.usage.is_none());
         assert!(resp.reasoning_content.is_none());
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn provider_termination_preserves_common_cross_provider_reasons() {
+        assert_eq!(
+            ProviderTermination::from_openai_reason("stop_sequence"),
+            ProviderTermination::Complete
+        );
+        assert_eq!(
+            ProviderTermination::from_openai_reason("guardrail_intervened"),
+            ProviderTermination::Safety
+        );
+        assert_eq!(
+            ProviderTermination::from_openai_reason("new_provider_reason"),
+            ProviderTermination::Unknown("new_provider_reason".to_owned())
+        );
     }
 
     #[test]

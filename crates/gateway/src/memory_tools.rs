@@ -1571,7 +1571,9 @@ mod tests {
             Ok(Box::pin(stream::iter(vec![
                 Ok(StreamChunk::delta(r#"{"facts":"#.to_owned())),
                 Ok(StreamChunk::delta(r#"[]}"#.to_owned())),
-                Ok(StreamChunk::final_chunk()),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
             ])))
         }
     }

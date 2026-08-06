@@ -1910,6 +1910,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             })
         }
@@ -1953,6 +1954,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             })
         }
@@ -2018,6 +2020,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             })
         }
@@ -2059,6 +2062,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::Complete,
                     tool_calls: Vec::new(),
                 });
             }
@@ -2070,6 +2074,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
                     tool_calls: vec![ProviderToolCall {
                         id: "read_pinned_agent_skill".to_owned(),
                         name: "read_skill".to_owned(),
@@ -2082,6 +2087,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             })
         }
@@ -2098,7 +2104,9 @@ mod tests {
             if !response.tool_calls.is_empty() {
                 chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
             }
-            chunks.push(Ok(StreamChunk::final_chunk()));
+            chunks.push(Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )));
             Ok(futures_util::stream::iter(chunks).boxed())
         }
     }
@@ -2152,6 +2160,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::Complete,
                     tool_calls: Vec::new(),
                 });
             }
@@ -2161,6 +2170,7 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
                     tool_calls: vec![ProviderToolCall {
                         id: "read_active_agent_skill".to_owned(),
                         name: "read_skill".to_owned(),
@@ -2173,6 +2183,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
                 tool_calls: Vec::new(),
             })
         }
@@ -2189,7 +2200,9 @@ mod tests {
             if !response.tool_calls.is_empty() {
                 chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
             }
-            chunks.push(Ok(StreamChunk::final_chunk()));
+            chunks.push(Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )));
             Ok(futures_util::stream::iter(chunks).boxed())
         }
     }

@@ -5,9 +5,10 @@ use crate::{
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
+    tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
-        ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState,
+        ProviderCapabilities, ProviderInputCapabilities, ProviderReplayState, ProviderTermination,
         ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
     },
 };
@@ -200,6 +201,8 @@ struct ApiChatResponse {
 #[derive(Debug, Deserialize)]
 struct ApiChoice {
     message: ApiResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -993,8 +996,9 @@ fn finish_compatible_stream(
     replay_reasoning_content: bool,
     content: Option<String>,
     reasoning_content: Option<String>,
-) -> Vec<StreamChunk> {
-    let tool_calls = tool_call_accumulator.take_tool_calls();
+    termination: ProviderTermination,
+) -> Result<Vec<StreamChunk>> {
+    let tool_calls = tool_call_accumulator.take_tool_calls()?;
     let mut chunks = Vec::new();
     if replay_reasoning_content && !tool_calls.is_empty() {
         chunks.push(StreamChunk::provider_replay_state(
@@ -1009,8 +1013,8 @@ fn finish_compatible_stream(
     if !tool_calls.is_empty() {
         chunks.push(StreamChunk::tool_calls(tool_calls));
     }
-    chunks.push(StreamChunk::final_chunk());
-    chunks
+    chunks.push(StreamChunk::final_chunk_with(termination));
+    Ok(chunks)
 }
 
 // ── Provider trait implementation ───────────────────────────────────────────
@@ -1052,22 +1056,27 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             output_tokens: u.completion_tokens,
         });
 
-        let message = api_response
+        let choice = api_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow!("no response from {}", self.name))?;
+        let termination = choice
+            .finish_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
+        let message = choice.message;
 
         let raw_content = message.content.clone();
         let mut text = message.effective_content();
         let mut tool_calls =
-            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref());
+            parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
         let mut reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if tool_calls.is_empty() {
             if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content) {
+                if let Some(parsed) = parse_embedded_tool_payload(content)? {
                     text = parsed.text;
                     if reasoning_content.is_none() {
                         reasoning_content = parsed.reasoning_content;
@@ -1097,6 +1106,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         Ok(ChatResponse {
             text,
             usage,
+            termination,
             reasoning_content,
             tool_calls,
             provider_replay_state,
@@ -1126,7 +1136,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
+            let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
             let mut response_content: Option<String> = None;
             let mut response_reasoning_content: Option<String> = None;
@@ -1142,31 +1152,30 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                     }
                 };
 
-                let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                buffer.push_str(&text);
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                };
+                for line in lines {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
 
-                    let Some(data) = line.strip_prefix("data: ") else {
+                    let Some(data) = sse_data(line) else {
                         continue;
                     };
 
                     if data.trim() == "[DONE]" {
-                        for chunk in finish_compatible_stream(
-                            &mut tool_call_accumulator,
-                            provider_name.as_str(),
-                            replay_reasoning_content,
-                            response_content,
-                            response_reasoning_content,
-                        ) {
-                            let _ = tx.send(Ok(chunk)).await;
-                        }
+                        let _ = tx
+                            .send(Err(anyhow!(
+                                "{} stream ended without a finish_reason",
+                                provider_name
+                            )))
+                            .await;
                         return;
                     }
 
@@ -1183,15 +1192,6 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                 return;
                             }
                             for choice in resp.choices {
-                                if choice.finish_reason.as_deref() == Some("error") {
-                                    let _ = tx
-                                        .send(Err(anyhow!(
-                                            "{} stream finished with provider error",
-                                            provider_name
-                                        )))
-                                        .await;
-                                    return;
-                                }
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
@@ -1222,14 +1222,22 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                         arguments: None,
                                     }]);
                                 }
-                                if choice.finish_reason.is_some() {
-                                    for chunk in finish_compatible_stream(
+                                if let Some(reason) = choice.finish_reason {
+                                    let chunks = match finish_compatible_stream(
                                         &mut tool_call_accumulator,
                                         provider_name.as_str(),
                                         replay_reasoning_content,
                                         response_content,
                                         response_reasoning_content,
+                                        ProviderTermination::from_openai_reason(&reason),
                                     ) {
+                                        Ok(chunks) => chunks,
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
+                                    };
+                                    for chunk in chunks {
                                         let _ = tx.send(Ok(chunk)).await;
                                     }
                                     return;
@@ -1237,24 +1245,22 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!(
-                                provider = provider_name,
-                                "failed to parse SSE chunk: {e}"
-                            );
+                            let _ = tx
+                                .send(Err(anyhow!("malformed {} SSE frame: {e}", provider_name)))
+                                .await;
+                            return;
                         }
                     }
                 }
             }
 
-            for chunk in finish_compatible_stream(
-                &mut tool_call_accumulator,
-                provider_name.as_str(),
-                replay_reasoning_content,
-                response_content,
-                response_reasoning_content,
-            ) {
-                let _ = tx.send(Ok(chunk)).await;
-            }
+            let error = decoder.finish().err().unwrap_or_else(|| {
+                anyhow!(
+                    "{} stream ended before a provider terminal marker",
+                    provider_name
+                )
+            });
+            let _ = tx.send(Err(error)).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -1535,7 +1541,9 @@ mod tests {
             true,
             Some(String::new()),
             None,
-        );
+            ProviderTermination::ToolCalls,
+        )
+        .unwrap();
 
         let replay = OpenAiCompatibleProvider::new(
             "test-provider",

@@ -301,6 +301,28 @@ pub(super) async fn run_agent_loop(
                     }
                 };
 
+                // A direct start carrying an execution checkpoint is a native
+                // recovery start (task recovery uses this path instead of the
+                // explicit recovery command).  The durable state machine must
+                // observe the continuation before the chat flow emits the
+                // Started event for the next window; otherwise that Started
+                // event is rejected because the checkpointed predecessor has
+                // not been advanced yet and the provider loop waits forever
+                // for a commit that can never become valid.
+                if let Err(error) = publish_recovery_execution_window_continued(
+                    event_hub.as_ref(),
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    &turn_request,
+                )
+                .await
+                {
+                    let _ = ack.send(Err(AgentStartError::Internal(format!(
+                        "failed to publish execution window continuation for direct start: {error}"
+                    ))));
+                    continue;
+                }
+
                 active_turn_id = Some(turn_id.clone());
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());

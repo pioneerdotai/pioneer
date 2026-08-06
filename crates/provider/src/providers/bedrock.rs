@@ -5,8 +5,8 @@ use crate::attachments::{
 use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ProviderToolCall,
-    ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -146,6 +146,8 @@ struct BedrockInputSchema {
 #[derive(Debug, Deserialize)]
 struct BedrockResponse {
     output: BedrockOutput,
+    #[serde(default, rename = "stopReason")]
+    stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
 }
@@ -899,6 +901,11 @@ impl crate::traits::Provider for BedrockProvider {
         }
 
         let api_response: BedrockResponse = response.json().await?;
+        let termination = api_response
+            .stop_reason
+            .as_deref()
+            .map(ProviderTermination::from_openai_reason)
+            .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
 
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -957,6 +964,7 @@ impl crate::traits::Provider for BedrockProvider {
         Ok(ChatResponse {
             text,
             usage,
+            termination,
             reasoning_content,
             tool_calls,
             provider_replay_state,
@@ -970,6 +978,7 @@ impl crate::traits::Provider for BedrockProvider {
         // Bedrock Converse streaming uses a different binary event-stream protocol.
         // Fall back to a single non-streaming call returned as one chunk.
         let response = self.chat(request).await?;
+        let termination = response.termination.clone();
         let mut chunks = Vec::new();
         if let Some(reasoning) = response.reasoning_content {
             if !reasoning.is_empty() {
@@ -985,7 +994,7 @@ impl crate::traits::Provider for BedrockProvider {
         if let Some(state) = response.provider_replay_state {
             chunks.push(Ok(StreamChunk::provider_replay_state(state)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(termination)));
         Ok(Box::pin(futures_util::stream::iter(chunks)))
     }
 

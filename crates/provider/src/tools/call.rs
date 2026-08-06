@@ -1,4 +1,5 @@
 use crate::types::ProviderToolCall;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -70,29 +71,33 @@ impl StreamToolCallAccumulator {
         }
     }
 
-    pub(crate) fn take_tool_calls(&mut self) -> Vec<ProviderToolCall> {
+    pub(crate) fn take_tool_calls(&mut self) -> Result<Vec<ProviderToolCall>> {
         std::mem::take(&mut self.pending)
             .into_iter()
-            .filter_map(|(index, partial)| {
-                let name = partial.name?;
-                Some(ProviderToolCall {
+            .map(|(index, partial)| {
+                let name = partial
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .with_context(|| format!("provider tool call {index} is missing its name"))?;
+                Ok(ProviderToolCall {
                     id: partial.id.unwrap_or_else(|| format!("call_{}", index + 1)),
                     name,
-                    arguments: normalize_arguments(partial.arguments),
+                    arguments: normalize_arguments(partial.arguments)?,
                 })
             })
             .collect()
     }
 }
 
-fn normalize_arguments(arguments: String) -> String {
+fn normalize_arguments(arguments: String) -> Result<String> {
     if arguments.trim().is_empty() {
-        return "{}".to_owned();
+        bail!("provider tool call is missing arguments");
     }
 
     match serde_json::from_str::<Value>(arguments.as_str()) {
-        Ok(value) => serde_json::to_string(&value).unwrap_or(arguments),
-        Err(_) => arguments,
+        Ok(value) => serde_json::to_string(&value)
+            .context("provider tool call arguments cannot be serialized"),
+        Err(error) => Err(error).context("provider tool call arguments are incomplete or invalid"),
     }
 }
 
@@ -137,10 +142,26 @@ mod tests {
             arguments: None,
         }]);
 
-        let calls = acc.take_tool_calls();
+        let calls = acc.take_tool_calls().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn incomplete_tool_call_fails_the_round() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.ingest(vec![StreamToolCallDelta {
+            index: Some(0),
+            id: Some("call_1".to_owned()),
+            function: Some(StreamToolFunctionDelta {
+                name: Some("shell".to_owned()),
+                arguments: Some("{".to_owned()),
+            }),
+            name: None,
+            arguments: None,
+        }]);
+        assert!(acc.take_tool_calls().is_err());
     }
 }

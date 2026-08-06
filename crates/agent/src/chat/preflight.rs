@@ -1883,6 +1883,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
             })
         }
 
@@ -1898,7 +1899,9 @@ mod tests {
             let text = self.next_response().await?;
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(StreamChunk::delta(text)),
-                Ok(StreamChunk::final_chunk()),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
             ])))
         }
     }

@@ -3989,11 +3989,66 @@ impl MessageProcessor {
         let window_index = attempt
             .execution_window_index
             .context("CLI runtime attempt has no execution window index")?;
-        if let Some(latest) = self
+        let mut latest = self
             .crud_store
             .latest_turn_execution_window(binding.turn_id.as_str())
-            .await?
+            .await?;
+        if let Some(previous) = latest.as_ref()
+            && previous.window_index.checked_add(1) == Some(window_index)
+            && previous.status == pioneer_protocol::ExecutionWindowStatus::Checkpointed
         {
+            let checkpoint = self
+                .crud_store
+                .latest_turn_execution_checkpoint_for_turn(binding.turn_id.as_str())
+                .await?
+                .context("CLI runtime recovery has no durable execution checkpoint")?;
+            if checkpoint.window_id != previous.id {
+                anyhow::bail!(
+                    "CLI runtime recovery checkpoint `{}` does not belong to the latest execution window `{}`",
+                    checkpoint.id,
+                    previous.id
+                );
+            }
+            let previous_runtime_window_id = previous
+                .metadata_json
+                .get("runtimeWindowId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{}:window:{}", binding.turn_id, previous.window_index));
+            let continued_at_unix_ms = chrono::Utc::now()
+                .timestamp_millis()
+                .max(
+                    previous
+                        .completed_at
+                        .unwrap_or(previous.updated_at)
+                        .timestamp_millis(),
+                )
+                .max(checkpoint.created_at.timestamp_millis());
+            self.publish_cli_runtime_durable_and_wait(
+                session_instance,
+                AgentDurableEvent::TurnExecutionWindowContinued {
+                    notification: pioneer_protocol::TurnExecutionWindowContinuedNotification {
+                        workspace_id: binding.workspace_id.clone(),
+                        thread_id: binding.thread_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                        window_id: attempt.id.clone(),
+                        window_index,
+                        status: pioneer_protocol::ExecutionWindowStatus::Continued,
+                        previous_window_id: previous_runtime_window_id,
+                        previous_window_index: previous.window_index,
+                        checkpoint_id: checkpoint.id,
+                        continued_at_unix_ms,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to continue execution window: {error}"))?;
+            latest = self
+                .crud_store
+                .latest_turn_execution_window(binding.turn_id.as_str())
+                .await?;
+        }
+        if let Some(latest) = latest.as_ref() {
             if latest.window_index == window_index {
                 let owns_window = latest.status == pioneer_protocol::ExecutionWindowStatus::Running
                     && latest
@@ -4001,24 +4056,51 @@ impl MessageProcessor {
                         .get("runtimeWindowId")
                         .and_then(serde_json::Value::as_str)
                         == Some(attempt.id.as_str());
-                if owns_window {
+                let was_continued = latest
+                    .metadata_json
+                    .get("createdByContinuationCheckpointId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some();
+                if owns_window && !was_continued {
                     return Ok(());
                 }
-                anyhow::bail!(
-                    "CLI runtime attempt window {window_index} is already owned by another execution"
-                );
+                if !owns_window {
+                    anyhow::bail!(
+                        "CLI runtime attempt window {window_index} is already owned by another execution"
+                    );
+                }
             }
             if latest.window_index >= window_index {
-                anyhow::bail!(
-                    "CLI runtime attempt window {window_index} is behind stored window {}",
-                    latest.window_index
-                );
+                let owns_continued_window = latest.window_index == window_index
+                    && latest.status == pioneer_protocol::ExecutionWindowStatus::Running
+                    && latest
+                        .metadata_json
+                        .get("runtimeWindowId")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(attempt.id.as_str())
+                    && latest
+                        .metadata_json
+                        .get("createdByContinuationCheckpointId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                if !owns_continued_window {
+                    anyhow::bail!(
+                        "CLI runtime attempt window {window_index} is behind stored window {}",
+                        latest.window_index
+                    );
+                }
             }
         }
-        let started_at = attempt
-            .started_at
-            .unwrap_or(attempt.created_at)
-            .timestamp_millis();
+        let started_at = latest
+            .as_ref()
+            .filter(|window| window.window_index == window_index)
+            .map(|window| window.started_at.timestamp_millis())
+            .unwrap_or_else(|| {
+                attempt
+                    .started_at
+                    .unwrap_or(attempt.created_at)
+                    .timestamp_millis()
+            });
         self.publish_cli_runtime_durable_and_wait(
             session_instance,
             AgentDurableEvent::TurnExecutionWindowStarted {

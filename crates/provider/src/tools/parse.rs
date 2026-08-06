@@ -1,4 +1,5 @@
 use crate::types::ProviderToolCall;
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -11,29 +12,35 @@ pub(crate) struct EmbeddedToolPayload {
 pub(crate) fn parse_tool_calls(
     tool_calls: Option<&Value>,
     function_call: Option<&Value>,
-) -> Vec<ProviderToolCall> {
-    let mut parsed = tool_calls
-        .map(parse_tool_calls_from_value)
-        .unwrap_or_default();
+) -> Result<Vec<ProviderToolCall>> {
+    let mut parsed = match tool_calls {
+        Some(value) => parse_tool_calls_from_value(value)?,
+        None => Vec::new(),
+    };
 
     if parsed.is_empty() {
         if let Some(function_call) = function_call {
-            if let Some(call) = parse_tool_call_value(function_call, 0) {
-                parsed.push(call);
-            }
+            parsed.push(parse_tool_call_value(function_call, 0)?);
         }
     }
 
-    parsed
+    Ok(parsed)
 }
 
-pub(crate) fn parse_embedded_tool_payload(content: &str) -> Option<EmbeddedToolPayload> {
-    let value: Value = serde_json::from_str(content).ok()?;
-    let object = value.as_object()?;
+pub(crate) fn parse_embedded_tool_payload(content: &str) -> Result<Option<EmbeddedToolPayload>> {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if !object.contains_key("tool_calls") && !object.contains_key("function_call") {
+        return Ok(None);
+    }
 
-    let tool_calls = parse_tool_calls(object.get("tool_calls"), object.get("function_call"));
+    let tool_calls = parse_tool_calls(object.get("tool_calls"), object.get("function_call"))?;
     if tool_calls.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let text = object
@@ -49,29 +56,30 @@ pub(crate) fn parse_embedded_tool_payload(content: &str) -> Option<EmbeddedToolP
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    Some(EmbeddedToolPayload {
+    Ok(Some(EmbeddedToolPayload {
         text,
         reasoning_content,
         tool_calls,
-    })
+    }))
 }
 
-fn parse_tool_calls_from_value(value: &Value) -> Vec<ProviderToolCall> {
+fn parse_tool_calls_from_value(value: &Value) -> Result<Vec<ProviderToolCall>> {
     match value {
         Value::Array(items) => items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| parse_tool_call_value(item, index))
+            .map(|(index, item)| parse_tool_call_value(item, index))
             .collect(),
-        Value::String(encoded) => serde_json::from_str::<Value>(encoded)
-            .ok()
-            .map(|decoded| parse_tool_calls_from_value(&decoded))
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        Value::String(encoded) => {
+            let decoded = serde_json::from_str::<Value>(encoded)
+                .context("provider tool_calls string is not valid JSON")?;
+            parse_tool_calls_from_value(&decoded)
+        }
+        _ => bail!("provider tool_calls must be an array or encoded array"),
     }
 }
 
-fn parse_tool_call_value(value: &Value, index: usize) -> Option<ProviderToolCall> {
+fn parse_tool_call_value(value: &Value, index: usize) -> Result<ProviderToolCall> {
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -96,21 +104,29 @@ fn parse_tool_call_value(value: &Value, index: usize) -> Option<ProviderToolCall
         )
     };
 
-    let name = name?.to_owned();
-    let arguments = normalize_arguments(arguments_value);
+    let name = name
+        .filter(|name| !name.trim().is_empty())
+        .context("provider tool call is missing a non-empty function name")?
+        .to_owned();
+    let arguments = normalize_arguments(arguments_value)?;
 
-    Some(ProviderToolCall {
+    Ok(ProviderToolCall {
         id,
         name,
         arguments,
     })
 }
 
-fn normalize_arguments(arguments: Option<&Value>) -> String {
+fn normalize_arguments(arguments: Option<&Value>) -> Result<String> {
     match arguments {
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
-        None => "{}".to_owned(),
+        Some(Value::String(text)) => {
+            serde_json::from_str::<Value>(text)
+                .context("provider tool call arguments string is not valid JSON")?;
+            Ok(text.clone())
+        }
+        Some(other) => serde_json::to_string(other)
+            .context("provider tool call arguments cannot be serialized"),
+        None => bail!("provider tool call is missing arguments"),
     }
 }
 
@@ -130,11 +146,32 @@ mod tests {
             }
         ]);
 
-        let parsed = parse_tool_calls(Some(&value), None);
+        let parsed = parse_tool_calls(Some(&value), None).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "call_1");
         assert_eq!(parsed[0].name, "shell");
         assert_eq!(parsed[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn malformed_member_rejects_the_entire_parallel_round() {
+        let value = serde_json::json!([
+            {"id":"ok","function":{"name":"shell","arguments":"{}"}},
+            {"id":"bad","function":{"arguments":"{}"}}
+        ]);
+        assert!(parse_tool_calls(Some(&value), None).is_err());
+    }
+
+    #[test]
+    fn missing_and_invalid_arguments_are_not_coerced_to_empty_objects() {
+        let missing = serde_json::json!([
+            {"id":"bad","function":{"name":"shell"}}
+        ]);
+        let invalid = serde_json::json!([
+            {"id":"bad","function":{"name":"shell","arguments":"{"}}
+        ]);
+        assert!(parse_tool_calls(Some(&missing), None).is_err());
+        assert!(parse_tool_calls(Some(&invalid), None).is_err());
     }
 
     #[test]
@@ -148,10 +185,27 @@ mod tests {
             }]
         }"#;
 
-        let parsed = parse_embedded_tool_payload(content).expect("payload should parse");
+        let parsed = parse_embedded_tool_payload(content)
+            .expect("payload should be valid")
+            .expect("payload should parse");
         assert_eq!(parsed.text, "running tool");
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_9");
         assert_eq!(parsed.tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn malformed_embedded_tool_payload_is_not_downgraded_to_plain_text() {
+        let content = r#"{
+            "content": "fallback",
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "shell",
+                "arguments": "{"
+            }]
+        }"#;
+
+        let error = parse_embedded_tool_payload(content).unwrap_err();
+        assert!(error.to_string().contains("arguments"));
     }
 }

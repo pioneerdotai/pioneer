@@ -7,8 +7,8 @@ use pioneer_protocol::{
     ProviderTransportKind, TurnItem, TurnItemType,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderFailureClassification, ProviderTimeoutPolicy, ProviderToolCall,
-    StreamChunk, TokenUsage,
+    ChatRequest, Provider, ProviderFailureClassification, ProviderTermination,
+    ProviderTimeoutPolicy, ProviderToolCall, StreamChunk, TokenUsage,
 };
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -71,7 +71,7 @@ pub(super) async fn request_agent_round(
         let mut full_reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut provider_replay_state = None;
-        let mut saw_final = false;
+        let mut termination = None;
         let mut seen_any_chunk = false;
 
         while let Some(chunk) = read_next_stream_chunk(
@@ -85,7 +85,7 @@ pub(super) async fn request_agent_round(
         .await?
         {
             if chunk.is_final {
-                saw_final = true;
+                termination = chunk.termination;
                 break;
             }
 
@@ -116,6 +116,13 @@ pub(super) async fn request_agent_round(
                 full_text.push_str(chunk.delta.as_str());
             }
 
+            validate_provider_tool_calls(
+                chunk.tool_calls.as_slice(),
+                target,
+                provider_name.as_str(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+            )?;
             for tool_call in chunk.tool_calls {
                 upsert_tool_call(&mut tool_calls, tool_call);
             }
@@ -124,22 +131,21 @@ pub(super) async fn request_agent_round(
             }
         }
 
-        if !saw_final && seen_any_chunk {
-            return Err(stream_error_for_target(
-                target,
-                provider_name.as_str(),
-                model_name.as_str(),
-                ProviderFailureStage::Finalize,
-                "stream truncated before final chunk".to_owned(),
-            ));
-        }
-
+        let termination = require_round_termination(
+            termination,
+            tool_calls.as_slice(),
+            target,
+            provider_name.as_str(),
+            model_name.as_str(),
+            ProviderTransportKind::Stream,
+        )?;
         return Ok(AgentRoundResponse {
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
             provider_replay_state,
             provider_token_count: None,
+            termination,
         });
     }
 
@@ -180,12 +186,21 @@ pub(super) async fn request_agent_round(
         .await?;
     }
 
+    let termination = require_round_termination(
+        Some(response.termination),
+        response.tool_calls.as_slice(),
+        FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+        provider.name(),
+        model_name.as_str(),
+        ProviderTransportKind::NonStream,
+    )?;
     Ok(AgentRoundResponse {
         text: response.text,
         reasoning,
         tool_calls: response.tool_calls,
         provider_replay_state: response.provider_replay_state,
         provider_token_count,
+        termination,
     })
 }
 
@@ -220,7 +235,7 @@ pub(super) async fn stream_provider_response(
     let mut reasoning_parts = Vec::new();
     let mut message_started = false;
     let mut stream_tool_calls = Vec::new();
-    let mut saw_final = false;
+    let mut termination = None;
     let mut seen_any_chunk = false;
 
     while let Some(chunk) = read_next_stream_chunk(
@@ -239,13 +254,21 @@ pub(super) async fn stream_provider_response(
             tool_calls,
             is_final,
             provider_replay_state: _,
+            termination: chunk_termination,
         } = chunk;
 
         if is_final {
-            saw_final = true;
+            termination = chunk_termination;
             break;
         }
 
+        validate_provider_tool_calls(
+            tool_calls.as_slice(),
+            response_stream_target(message_started, thinking_item_id, message_item_id),
+            provider_name.as_str(),
+            model_name.as_str(),
+            ProviderTransportKind::Stream,
+        )?;
         for tool_call in tool_calls {
             upsert_tool_call(&mut stream_tool_calls, tool_call);
         }
@@ -341,16 +364,14 @@ pub(super) async fn stream_provider_response(
         }
     }
 
-    if !saw_final && seen_any_chunk {
-        return Err(stream_error_for_target(
-            response_stream_target(message_started, thinking_item_id, message_item_id),
-            provider_name.as_str(),
-            model_name.as_str(),
-            ProviderFailureStage::Finalize,
-            "stream truncated before final chunk".to_owned(),
-        ));
-    }
-
+    require_round_termination(
+        termination,
+        stream_tool_calls.as_slice(),
+        response_stream_target(message_started, thinking_item_id, message_item_id),
+        provider_name.as_str(),
+        model_name.as_str(),
+        ProviderTransportKind::Stream,
+    )?;
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
             event_tx,
@@ -486,6 +507,14 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    require_round_termination(
+        Some(response.termination.clone()),
+        response.tool_calls.as_slice(),
+        FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+        provider.name(),
+        model_name.as_str(),
+        ProviderTransportKind::NonStream,
+    )?;
     let reasoning_content = match &response.reasoning_content {
         Some(rc) if !rc.is_empty() => vec![rc.clone()],
         _ => Vec::new(),
@@ -621,6 +650,110 @@ fn adapter_error_for_target(
         format!("{prefix}: {error}"),
         provider.classify_failure(error),
     )
+}
+
+fn require_round_termination(
+    termination: Option<ProviderTermination>,
+    tool_calls: &[ProviderToolCall],
+    target: FailureTarget<'_>,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+) -> Result<ProviderTermination, ChatTurnError> {
+    let termination = termination.ok_or_else(|| {
+        provider_failure_error_with_classification(
+            target.item_id,
+            target.item_type,
+            provider,
+            model,
+            transport,
+            ProviderFailureStage::Finalize,
+            "provider response ended without a terminal marker".to_owned(),
+            Some(ProviderFailureClassification::new(
+                ProviderFailureClass::StreamTruncated,
+            )),
+        )
+    })?;
+
+    validate_provider_tool_calls(tool_calls, target, provider, model, transport)?;
+
+    let failure = match &termination {
+        ProviderTermination::Complete if !tool_calls.is_empty() => Some((
+            ProviderFailureClass::MalformedProviderRequest,
+            "provider declared a complete text response while returning tool calls".to_owned(),
+        )),
+        ProviderTermination::ToolCalls if tool_calls.is_empty() => Some((
+            ProviderFailureClass::MalformedProviderRequest,
+            "provider declared tool calls but returned no complete tool call".to_owned(),
+        )),
+        ProviderTermination::Complete | ProviderTermination::ToolCalls => None,
+        ProviderTermination::Length => Some((
+            ProviderFailureClass::MaxOutputTokens,
+            "provider stopped because the output token limit was reached".to_owned(),
+        )),
+        ProviderTermination::ContentFiltered | ProviderTermination::Safety => Some((
+            ProviderFailureClass::ProviderRejected,
+            "provider stopped the response because of a content or safety policy".to_owned(),
+        )),
+        ProviderTermination::Cancelled => Some((
+            ProviderFailureClass::ProviderRejected,
+            "provider cancelled the response before completion".to_owned(),
+        )),
+        ProviderTermination::ProviderError => Some((
+            ProviderFailureClass::Provider5xx,
+            "provider terminated the response with an error".to_owned(),
+        )),
+        ProviderTermination::Unknown(reason) => Some((
+            ProviderFailureClass::Unknown,
+            format!("provider returned an unknown terminal reason `{reason}`"),
+        )),
+    };
+
+    if let Some((class, message)) = failure {
+        return Err(provider_failure_error_with_classification(
+            target.item_id,
+            target.item_type,
+            provider,
+            model,
+            transport,
+            ProviderFailureStage::Finalize,
+            message,
+            Some(ProviderFailureClassification::new(class)),
+        ));
+    }
+
+    Ok(termination)
+}
+
+fn validate_provider_tool_calls(
+    tool_calls: &[ProviderToolCall],
+    target: FailureTarget<'_>,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+) -> Result<(), ChatTurnError> {
+    let mut provider_call_ids = std::collections::HashSet::with_capacity(tool_calls.len());
+    for call in tool_calls {
+        let malformed = call.id.trim().is_empty()
+            || call.name.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(call.arguments.as_str()).is_err()
+            || !provider_call_ids.insert(call.id.as_str());
+        if malformed {
+            return Err(provider_failure_error_with_classification(
+                target.item_id,
+                target.item_type,
+                provider,
+                model,
+                transport,
+                ProviderFailureStage::Finalize,
+                "provider returned an incomplete or duplicate tool-call identity".to_owned(),
+                Some(ProviderFailureClassification::new(
+                    ProviderFailureClass::MalformedProviderRequest,
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn upsert_tool_call(tool_calls: &mut Vec<ProviderToolCall>, incoming: ProviderToolCall) {
@@ -1241,5 +1374,103 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[1].id, "call_2");
+    }
+
+    #[test]
+    fn output_limit_is_not_accepted_as_a_successful_round() {
+        let error = require_round_termination(
+            Some(ProviderTermination::Length),
+            &[],
+            FailureTarget::new("reasoning", TurnItemType::Reasoning),
+            "provider",
+            "model",
+            ProviderTransportKind::Stream,
+        )
+        .unwrap_err();
+
+        let ChatTurnError::ProviderFailure { failure, .. } = error else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(failure.class, ProviderFailureClass::MaxOutputTokens);
+        assert!(failure.is_recoverable_hint);
+    }
+
+    #[test]
+    fn eof_without_terminal_marker_is_stream_truncation_even_with_no_chunks() {
+        let error = require_round_termination(
+            None,
+            &[],
+            FailureTarget::new("reasoning", TurnItemType::Reasoning),
+            "provider",
+            "model",
+            ProviderTransportKind::Stream,
+        )
+        .unwrap_err();
+
+        let ChatTurnError::ProviderFailure { failure, .. } = error else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(failure.class, ProviderFailureClass::StreamTruncated);
+    }
+
+    #[test]
+    fn tool_terminal_reason_requires_a_complete_tool_call() {
+        let error = require_round_termination(
+            Some(ProviderTermination::ToolCalls),
+            &[],
+            FailureTarget::new("reasoning", TurnItemType::Reasoning),
+            "provider",
+            "model",
+            ProviderTransportKind::NonStream,
+        )
+        .unwrap_err();
+
+        let ChatTurnError::ProviderFailure { failure, .. } = error else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(
+            failure.class,
+            ProviderFailureClass::MalformedProviderRequest
+        );
+    }
+
+    #[test]
+    fn duplicate_or_malformed_tool_calls_fail_before_execution() {
+        for calls in [
+            vec![
+                ProviderToolCall {
+                    id: "same".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                ProviderToolCall {
+                    id: "same".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ],
+            vec![ProviderToolCall {
+                id: "call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{".to_owned(),
+            }],
+        ] {
+            let error = require_round_termination(
+                Some(ProviderTermination::ToolCalls),
+                calls.as_slice(),
+                FailureTarget::new("reasoning", TurnItemType::Reasoning),
+                "provider",
+                "model",
+                ProviderTransportKind::Stream,
+            )
+            .unwrap_err();
+            let ChatTurnError::ProviderFailure { failure, .. } = error else {
+                panic!("expected provider failure");
+            };
+            assert_eq!(
+                failure.class,
+                ProviderFailureClass::MalformedProviderRequest
+            );
+        }
     }
 }

@@ -30,10 +30,11 @@ pub use http::validate_proxy_url;
 pub use registry::ProviderRegistry;
 pub use traits::Provider;
 pub use types::{
-    AttachmentArtifactContext, AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse,
-    CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse, InputContentType, InputTypeSupport,
-    MessageAttachment, MessageContentPart, ModelInputItem, ProviderCapabilities,
-    ProviderFailureClassification, ProviderInputCapabilities, ProviderReplayState,
-    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
-    TokenUsage, ToolChoice, ToolDefinition,
+    AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
+    ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
+    InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, ModelInputItem,
+    ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
+    ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
+    ToolDefinition,
 };

@@ -84,9 +84,10 @@ use pioneer_protocol::{
     build_execution_checkpoint_provider_budget_summary, generate_id,
 };
 use pioneer_provider::{
-    AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
-    MessageAttachment, MessageContentPart, Provider, ProviderRegistry, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, ToolDefinition, infer_mime_from_reference,
+    AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,
+    CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart, Provider,
+    ProviderCallIdentity, ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -119,6 +120,19 @@ pub(super) const TURN_FINALIZATION_GENERATION: i64 = 1;
 fn deterministic_final_message_item_id(turn_id: &str) -> String {
     let digest = Sha256::digest(
         format!("native-turn-finalization:{turn_id}:{TURN_FINALIZATION_GENERATION}").as_bytes(),
+    );
+    hex::encode(digest)[..TURN_ITEM_ID_LEN].to_owned()
+}
+
+fn deterministic_tool_item_id(
+    turn_id: &str,
+    round_id: &str,
+    ordinal: u32,
+    provider_call_id: &str,
+) -> String {
+    let digest = Sha256::digest(
+        format!("native-provider-call:{turn_id}:{round_id}:{ordinal}:{provider_call_id}")
+            .as_bytes(),
     );
     hex::encode(digest)[..TURN_ITEM_ID_LEN].to_owned()
 }
@@ -196,11 +210,14 @@ struct AgentRoundResponse {
     tool_calls: Vec<ProviderToolCall>,
     provider_replay_state: Option<pioneer_provider::ProviderReplayState>,
     provider_token_count: Option<u64>,
+    termination: pioneer_provider::ProviderTermination,
 }
 
 #[derive(Debug)]
 struct ExecutedToolResult {
     item_id: String,
+    provider_call_id: String,
+    ordinal: u32,
     item_type: TurnItemType,
     attempt_number: u32,
     tool_name: String,
@@ -216,8 +233,38 @@ struct ExecutedToolResult {
 
 struct SpawnedToolTask {
     item_id: String,
+    provider_call_id: String,
+    ordinal: u32,
     tool_name: String,
+    arguments: String,
     handle: AbortOnDropJoinHandle<Result<ExecutedToolResult, ChatTurnError>>,
+}
+
+fn unknown_tool_task_result(
+    item_id: String,
+    provider_call_id: String,
+    ordinal: u32,
+    tool_name: String,
+    arguments: String,
+    message: String,
+) -> ExecutedToolResult {
+    let outcome = ToolOutcome::fatal(ToolErrorClass::Internal, Some(message.clone()));
+    ExecutedToolResult {
+        item_id,
+        provider_call_id: provider_call_id.clone(),
+        ordinal,
+        item_type: tooling::tool_item_type_from_name(tool_name.as_str()),
+        attempt_number: 1,
+        tool_name: tool_name.clone(),
+        arguments,
+        model_visible_text: message.clone(),
+        success: false,
+        outcome: outcome.clone(),
+        recovery_view: None,
+        retained_llm_context: None,
+        request_tools_result: None,
+        message: tooling::build_tool_error_message(provider_call_id, tool_name, message, outcome),
+    }
 }
 
 struct AbortOnDropJoinHandle<T> {
@@ -970,9 +1017,9 @@ async fn persist_provider_history_message(
     thread_id: &str,
     turn_id: &str,
     item_id: &str,
-    message: &ChatMessage,
+    envelope: &CanonicalProviderRoundEnvelope,
 ) -> Result<(), ChatTurnError> {
-    let payload = serde_json::to_value(message).map_err(|error| {
+    let payload = serde_json::to_value(envelope).map_err(|error| {
         ChatTurnError::Terminal(format!(
             "failed to serialize provider history before tool execution: {error}"
         ))
@@ -995,9 +1042,27 @@ async fn persist_retained_tool_result(
     turn_id: &str,
     result: &ExecutedToolResult,
 ) -> Result<(), ChatTurnError> {
-    let Some((view, output_policy_snapshot)) = result.retained_llm_context.as_ref() else {
-        return Ok(());
-    };
+    if result.message.role != pioneer_provider::Role::Tool
+        || result.message.tool_call_id.as_deref() != Some(result.provider_call_id.as_str())
+        || result.message.name.as_deref() != Some(result.tool_name.as_str())
+    {
+        return Err(ChatTurnError::Terminal(format!(
+            "provider result envelope mismatch for Turn item `{}`",
+            result.item_id
+        )));
+    }
+    let payload = serde_json::to_value(&result.message).map_err(|error| {
+        ChatTurnError::Terminal(format!(
+            "failed to serialize exact provider tool result: {error}"
+        ))
+    })?;
+    let output_policy_snapshot = result
+        .retained_llm_context
+        .as_ref()
+        .map(|(_, snapshot)| snapshot.clone())
+        .unwrap_or_else(|| {
+            pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(&result.tool_name)
+        });
     event_tx
         .publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
             thread_id: thread_id.to_owned(),
@@ -1005,10 +1070,13 @@ async fn persist_retained_tool_result(
             item_id: result.item_id.clone(),
             attempt_id: None,
             sequence: 0,
-            source: "tool_result".to_owned(),
+            source: "tool_result_v2".to_owned(),
             tool_name: result.tool_name.clone(),
-            payload: tooling::protocol_tool_result_view(view.clone()),
-            output_policy_snapshot: output_policy_snapshot.clone(),
+            payload: pioneer_protocol::ToolResultView::Json {
+                value: payload,
+                truncated: false,
+            },
+            output_policy_snapshot,
         })
         .await
         .map_err(agent_event_error)
@@ -3837,6 +3905,7 @@ async fn execute_agent_provider_response(
         );
         ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
     })?;
+
     let prompt_sections =
         prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
     let prior_visible_assistant_text =
@@ -3901,6 +3970,7 @@ async fn execute_agent_provider_response(
         .event_bus
         .take_durable_receiver()
         .expect("native chat owns the tool lifecycle durable receiver");
+
     let mut tool_progress_rx = tools.event_bus.subscribe();
 
     let event_tx_for_tools = event_tx.clone();
@@ -4930,12 +5000,48 @@ async fn execute_agent_provider_response(
                 round.tool_calls.clone(),
                 round.provider_replay_state.clone(),
             );
+            let round_id = current_thinking_id.clone();
+            let resolved_tool_calls = round
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, provider_call)| {
+                    let ordinal = u32::try_from(ordinal).map_err(|_| {
+                        ChatTurnError::Terminal(
+                            "provider returned more tool calls than Pioneer can identify"
+                                .to_owned(),
+                        )
+                    })?;
+                    let item_id = deterministic_tool_item_id(
+                        turn_id,
+                        round_id.as_str(),
+                        ordinal,
+                        provider_call.id.as_str(),
+                    );
+                    Ok((provider_call, item_id, ordinal))
+                })
+                .collect::<Result<Vec<_>, ChatTurnError>>()
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            let provider_round = CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: round_id.clone(),
+                termination: round.termination,
+                message: assistant_round.clone(),
+                calls: resolved_tool_calls
+                    .iter()
+                    .map(|(call, item_id, ordinal)| ProviderCallIdentity {
+                        provider_call_id: call.id.clone(),
+                        turn_item_id: item_id.clone(),
+                        ordinal: *ordinal,
+                    })
+                    .collect(),
+            };
             persist_provider_history_message(
                 event_tx.as_ref(),
                 thread_id,
                 turn_id,
                 current_thinking_id.as_str(),
-                &assistant_round,
+                &provider_round,
             )
             .await
             .map_err(|error| (error, current_thinking_id.clone()))?;
@@ -4946,21 +5052,20 @@ async fn execute_agent_provider_response(
             );
             messages.push(assistant_round);
 
-            let guarded_tool_calls = round
-                .tool_calls
+            let guarded_tool_calls = resolved_tool_calls
                 .into_iter()
-                .map(|model_tool_call| {
+                .map(|(model_tool_call, item_id, ordinal)| {
                     let decision = tool_no_progress_guard.preflight(
                         model_tool_call.name.as_str(),
                         model_tool_call.arguments.as_str(),
                     );
-                    (model_tool_call, decision)
+                    (model_tool_call, item_id, ordinal, decision)
                 })
                 .collect::<Vec<_>>();
 
             let tool_tasks = guarded_tool_calls
                 .into_iter()
-                .map(|(model_tool_call, no_progress_decision)| {
+                .map(|(model_tool_call, item_id, ordinal, no_progress_decision)| {
                     let router = router.clone();
                     let runtime = runtime.clone();
                     let turn_control = turn_control.clone();
@@ -4972,13 +5077,15 @@ async fn execute_agent_provider_response(
                     let workspace_id = workspace_id.to_owned();
                     let thread_id = thread_id.to_owned();
                     let turn_id = turn_id.to_owned();
-                    let task_item_id = model_tool_call.id.clone();
+                    let task_item_id = item_id.clone();
                     let task_tool_name = model_tool_call.name.clone();
+                    let task_provider_call_id = model_tool_call.id.clone();
+                    let task_arguments = model_tool_call.arguments.clone();
                     // Tool handlers can execute nested tools. Running each model tool call in its
                     // own task keeps nested dispatch from being polled under the full chat-loop
                     // future, whose execution-window state is intentionally large.
                     let handle = tokio::spawn(async move {
-                        let item_id = model_tool_call.id.clone();
+                        let provider_call_id = model_tool_call.id.clone();
                         let arguments = model_tool_call.arguments.clone();
                         let tool_name = model_tool_call.name.clone();
                         let item_type = tooling::tool_item_type_from_name(tool_name.as_str());
@@ -5065,6 +5172,8 @@ async fn execute_agent_provider_response(
                             .await?;
                             return Ok(ExecutedToolResult {
                                 item_id: item_id.clone(),
+                                provider_call_id: provider_call_id.clone(),
+                                ordinal,
                                 item_type,
                                 attempt_number,
                                 tool_name: tool_name.clone(),
@@ -5076,7 +5185,7 @@ async fn execute_agent_provider_response(
                                 retained_llm_context: None,
                                 request_tools_result: None,
                                 message: tooling::build_tool_error_message(
-                                    model_tool_call.id,
+                                    provider_call_id,
                                     tool_name,
                                     message,
                                     outcome,
@@ -5220,6 +5329,8 @@ async fn execute_agent_provider_response(
 
                                 return Ok(ExecutedToolResult {
                                     item_id: item_id.clone(),
+                                    provider_call_id: provider_call_id.clone(),
+                                    ordinal,
                                     item_type,
                                     attempt_number,
                                     tool_name: tool_name.clone(),
@@ -5231,7 +5342,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
-                                        model_tool_call.id,
+                                        provider_call_id,
                                         tool_name,
                                         error_text,
                                         outcome,
@@ -5241,7 +5352,7 @@ async fn execute_agent_provider_response(
                         }
 
                         let tool_call = match router.build_model_tool_call(RawToolCall {
-                            call_id: model_tool_call.id.clone(),
+                            call_id: item_id.clone(),
                             tool_name: tool_name.clone(),
                             arguments: arguments.clone(),
                         }).await {
@@ -5303,6 +5414,8 @@ async fn execute_agent_provider_response(
                                 }
                                 return Ok(ExecutedToolResult {
                                     item_id: item_id.clone(),
+                                    provider_call_id: provider_call_id.clone(),
+                                    ordinal,
                                     item_type,
                                     attempt_number,
                                     tool_name: tool_name.clone(),
@@ -5314,7 +5427,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
-                                        model_tool_call.id,
+                                        provider_call_id,
                                         tool_name,
                                         error_text,
                                         outcome,
@@ -5392,6 +5505,9 @@ async fn execute_agent_provider_response(
                                         success,
                                         projection,
                                     );
+                                    let mut message =
+                                        result.to_model_input_item().into_chat_message();
+                                    message.tool_call_id = Some(provider_call_id.clone());
                                     (
                                         result.model_visible_text(),
                                         success,
@@ -5399,14 +5515,14 @@ async fn execute_agent_provider_response(
                                         projection.and_then(|projection| projection.recovery.clone()),
                                         retained_llm_context,
                                         request_tools_result,
-                                        result.to_model_input_item().into_chat_message(),
+                                        message,
                                     )
                                 }
                                 Err(error) => {
                                     let output = error.to_string();
                                     let outcome = classify_tool_error(tool_name.as_str(), &error);
                                     let message = tooling::build_tool_error_message(
-                                        model_tool_call.id.clone(),
+                                        provider_call_id.clone(),
                                         tool_name.clone(),
                                         output.clone(),
                                         outcome.clone(),
@@ -5417,6 +5533,8 @@ async fn execute_agent_provider_response(
 
                         Ok(ExecutedToolResult {
                             item_id: item_id.clone(),
+                            provider_call_id,
+                            ordinal,
                             item_type,
                             attempt_number,
                             tool_name: tool_name.clone(),
@@ -5433,30 +5551,78 @@ async fn execute_agent_provider_response(
 
                     SpawnedToolTask {
                         item_id: task_item_id,
+                        provider_call_id: task_provider_call_id,
+                        ordinal,
                         tool_name: task_tool_name,
+                        arguments: task_arguments,
                         handle: AbortOnDropJoinHandle::new(handle),
                     }
                 })
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
-            let executed_results = stream::iter(tool_tasks)
+            let mut executed_results = stream::iter(tool_tasks)
                 .map(|task| {
                     let event_tx = event_tx.clone();
+                    let workspace_id = workspace_id.to_owned();
                     let thread_id = thread_id.to_owned();
                     let turn_id = turn_id.to_owned();
                     async move {
                     let SpawnedToolTask {
                         item_id,
+                        provider_call_id,
+                        ordinal,
                         tool_name,
+                        arguments,
                         handle,
                     } = task;
-                    let result = match handle.join().await {
-                        Ok(result) => result?,
-                        Err(error) => {
-                            return Err(ChatTurnError::Terminal(format!(
-                                "tool task `{tool_name}` (`{item_id}`) failed before durable completion: {error}"
-                            )));
+                    let joined_result = match handle.join().await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(error)) => Err(format!(
+                                "tool task failed before producing a verified result: {}; the side-effect outcome is unknown",
+                                chat_error_preview(&error)
+                            )),
+                        Err(error) => Err(format!(
+                                "tool task terminated before producing a verified result: {error}; the side-effect outcome is unknown"
+                            )),
+                    };
+                    let (result, unknown_side_effect) = match joined_result {
+                        Ok(result) => (result, None),
+                        Err(text) => {
+                            let outcome = ToolOutcome::fatal(
+                                ToolErrorClass::Internal,
+                                Some(text.clone()),
+                            );
+                            emit_durable_event(
+                                event_tx.as_ref(),
+                                AgentDurableEvent::ItemCompleted {
+                                    notification: ItemCompletedNotification {
+                                        workspace_id,
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        item: tooling::build_failed_tool_turn_item(
+                                            item_id.clone(),
+                                            tool_name.clone(),
+                                            arguments.clone(),
+                                            text.clone(),
+                                            outcome.clone(),
+                                            None,
+                                            None,
+                                            None,
+                                        ),
+                                    },
+                                },
+                            )
+                            .await?;
+                            let result = unknown_tool_task_result(
+                                item_id,
+                                provider_call_id,
+                                ordinal,
+                                tool_name,
+                                arguments,
+                                text.clone(),
+                            );
+                            (result, Some(text))
                         }
                     };
                     persist_retained_tool_result(
@@ -5466,6 +5632,9 @@ async fn execute_agent_provider_response(
                         &result,
                     )
                     .await?;
+                    if let Some(error) = unknown_side_effect {
+                        return Err(ChatTurnError::Terminal(error));
+                    }
                     Ok::<ExecutedToolResult, ChatTurnError>(result)
                 }
                 })
@@ -5475,6 +5644,7 @@ async fn execute_agent_provider_response(
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+            executed_results.sort_by_key(|result| result.ordinal);
             if tool_event_forwarder.is_finished() {
                 return Err((
                     ChatTurnError::Terminal(
@@ -6040,11 +6210,11 @@ mod tests {
         build_execution_window_continuation, build_user_message,
         compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, deterministic_final_message_item_id,
-        materialize_mcp_tooling, normalize_turn_capabilities, readable_agent_skill_overlay,
-        resolve_skill_capability_summary, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
-        review_required_observation_payload, review_required_observation_signature,
-        runtime_sections_with_artifact_reference_policy,
+        deterministic_tool_item_id, materialize_mcp_tooling, normalize_turn_capabilities,
+        readable_agent_skill_overlay, resolve_skill_capability_summary,
+        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
+        retain_chat_mode_attachment_messages, review_required_observation_payload,
+        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
@@ -6068,6 +6238,17 @@ mod tests {
         assert_eq!(first, replay);
         assert_eq!(first.len(), TURN_ITEM_ID_LEN);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn provider_call_identity_is_round_scoped_even_when_provider_reuses_id() {
+        let first = deterministic_tool_item_id("turn", "round_1", 0, "call_1");
+        let replay = deterministic_tool_item_id("turn", "round_1", 0, "call_1");
+        let next_round = deterministic_tool_item_id("turn", "round_2", 0, "call_1");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, next_round);
+        assert_eq!(first.len(), TURN_ITEM_ID_LEN);
     }
     use pioneer_protocol::{
         ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
@@ -6830,6 +7011,8 @@ mod tests {
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
             item_id: "item_1234567890123456".to_owned(),
+            provider_call_id: "provider_call_1".to_owned(),
+            ordinal: 0,
             item_type: TurnItemType::DynamicToolCall,
             attempt_number: 1,
             tool_name: tool_name.to_owned(),
@@ -6844,7 +7027,7 @@ mod tests {
             recovery_view: None,
             retained_llm_context: None,
             request_tools_result: None,
-            message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
+            message: ChatMessage::tool_result("provider_call_1", tool_name, text),
         }
     }
 

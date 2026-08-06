@@ -46,10 +46,15 @@ impl crate::traits::Provider for EchoProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = prepared.messages;
         let raw_text = extract_last_user_text(rendered_messages.as_slice());
-        let parsed = parse_embedded_tool_payload(&raw_text);
+        let parsed = parse_embedded_tool_payload(&raw_text)?;
         let (text, reasoning_content, tool_calls) = match parsed {
             Some(payload) => (payload.text, payload.reasoning_content, payload.tool_calls),
             None => (raw_text, None, Vec::new()),
+        };
+        let termination = if tool_calls.is_empty() {
+            crate::ProviderTermination::Complete
+        } else {
+            crate::ProviderTermination::ToolCalls
         };
         Ok(ChatResponse {
             text,
@@ -57,6 +62,7 @@ impl crate::traits::Provider for EchoProvider {
             reasoning_content,
             tool_calls,
             provider_replay_state: None,
+            termination,
         })
     }
 
@@ -77,7 +83,7 @@ impl crate::traits::Provider for EchoProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk()));
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
         Ok(Box::pin(stream::iter(chunks)))
     }
 }

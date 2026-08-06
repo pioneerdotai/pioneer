@@ -1263,7 +1263,12 @@ mod tests {
 
                     for operation in *operations {
                         let id = get_rand_id(&db1)?;
-                        let id2 = get_rand_id(&db2)?;
+                        // Apply the same logical operation to both databases.
+                        // Choosing ids independently made the comparison itself
+                        // nondeterministic (especially for delete/update paths)
+                        // and could report compression corruption even when the
+                        // two implementations produced identical results.
+                        let id2 = get_rand_id(&db1)?;
                         operation(&db1, id, id2)
                             .context("Could not run operation on uncompressed db")?;
                         operation(&db2, id, id2)
