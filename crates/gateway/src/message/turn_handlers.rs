@@ -179,6 +179,69 @@ pub(super) struct PreparedCliRuntimeNativeTurnStart {
     request_timeout_ms: u64,
 }
 
+struct PreparedCliRuntimeCombinedPreflight {
+    plan: crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan,
+    codex_mcp_launch_projection:
+        Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
+    claude_mcp_launch_projection:
+        Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+}
+
+struct CliRuntimeAdmissionPhase {
+    thread: pioneer_protocol::Thread,
+    normalized_presentation_capabilities: Vec<pioneer_protocol::TurnCapability>,
+    normalized_pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
+    manager: std::sync::Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>,
+    continuation_thread_id: String,
+    context_thread_id: String,
+    session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    session_turn_lease: tokio::sync::OwnedMutexGuard<()>,
+    combined_preflight: crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan,
+    codex_mcp_launch_projection:
+        Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
+    claude_mcp_launch_projection:
+        Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+}
+
+struct CliRuntimeStartedPhase {
+    outcome: crate::thread::TurnStartOutcome,
+    user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
+    proxy_url: Option<String>,
+    input_mapping: pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
+    effective_approval_policy: String,
+    sandbox_policy_value: Option<JsonValue>,
+    provider_permissions_id: Option<String>,
+    effective_cli_runtime_effort: Option<String>,
+    cli_runtime_personality: Option<String>,
+    cli_runtime_summary: Option<String>,
+    security_params: TurnStartParams,
+}
+
+struct CliRuntimeMaterializedPhase {
+    security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+    installed_skills: Vec<crate::cli_runtime::skills::CliRuntimeSkillInstallResult>,
+}
+
+struct ComposerDetachedStartedPhase {
+    launch: TurnStartParams,
+    outcome: crate::thread::TurnStartOutcome,
+    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
+    profile_audit: pioneer_protocol::TurnPermissionAuditEvent,
+}
+
+struct ComposerDetachedMaterializedPhase {
+    launch: TurnStartParams,
+    outcome: crate::thread::TurnStartOutcome,
+    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
+    security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+}
+
+struct ComposerDetachedTaskCreatedPhase {
+    launch: TurnStartParams,
+    outcome: crate::thread::TurnStartOutcome,
+    capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
+}
+
 pub(super) enum TurnStartSuccessResponse {
     TurnStart,
     VoiceSessionFinalizeAccepted {
@@ -944,8 +1007,8 @@ impl MessageProcessor {
     /// Admit a collaborative Composer submission as a durable user message
     /// followed by an immediate detached task. The message turn completes
     /// synchronously; the task child owns all agent execution.
-    pub(super) async fn composer_detached_task_start(
-        &self,
+    pub(super) fn composer_detached_task_start<'a>(
+        &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         request_actor: pioneer_protocol::PersistedActorRef,
@@ -953,109 +1016,118 @@ impl MessageProcessor {
         thread: pioneer_protocol::Thread,
         execution_admission: Option<ExecutionAuthorizationAdmission>,
         success_response: TurnStartSuccessResponse,
-    ) {
-        let turn_id = params.turn_id.clone();
-        let normalized_capabilities = match self
-            .normalize_turn_skill_capabilities(
-                thread.workspace_id.as_str(),
-                params.capabilities.as_slice(),
-            )
-            .await
-        {
-            Ok(normalized) => normalized,
-            Err(message) => {
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    message,
-                )
-                .await;
-                return;
-            }
-        };
-        if execution_admission
-            .as_ref()
-            .is_some_and(ExecutionAuthorizationAdmission::is_member)
-            && let Err(message) = self
-                .enforce_member_skill_capability_projection(
-                    thread.workspace_id.as_str(),
-                    normalized_capabilities.execution.as_slice(),
-                )
-                .await
-        {
-            self.send_turn_start_failure(
-                connection_id,
-                request_id.clone(),
-                &success_response,
-                thread.id.as_str(),
-                turn_id.as_str(),
-                message,
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = super::message_turn::normalize_turn_collaboration_params(&mut params) {
-            self.send_turn_start_failure(
-                connection_id,
-                request_id.clone(),
-                &success_response,
-                thread.id.as_str(),
-                turn_id.as_str(),
-                format!("invalid Turn collaboration metadata: {error}"),
-            )
-            .await;
-            return;
-        }
-        // The detached Task must replay the exact presentation selected in the
-        // Composer. Skill packs are expanded only at the execution boundary;
-        // persisting the expanded capabilities here would make the child
-        // message render every pack member as an individually selected skill.
-        let launch = params.clone();
-        params.capabilities = normalized_capabilities.execution.clone();
-        if let Err(error) = self
-            .validate_turn_artifact_user_inputs(
-                thread.workspace_id.as_str(),
-                thread.id.as_str(),
-                params.input.as_slice(),
-            )
-            .await
-        {
-            self.send_turn_start_failure(
-                connection_id,
-                request_id.clone(),
-                &success_response,
-                thread.id.as_str(),
-                turn_id.as_str(),
-                format!("failed to validate artifact input: {error:#}"),
-            )
-            .await;
-            return;
-        }
-        let skill_catalog = match self
-            .validate_turn_skill_capabilities(
-                thread.workspace_id.as_str(),
-                params.capabilities.as_slice(),
-            )
-            .await
-        {
-            Ok(catalog) => catalog,
-            Err(message) => {
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    message,
-                )
-                .await;
-                return;
-            }
-        };
-        let capability_attachments =
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let turn_id = params.turn_id.clone();
+            // Keep Composer admission, durable materialization, detached Task
+            // creation, and finalization in separate heap-backed futures. Polling
+            // the complete lifecycle as one state machine stacks its large frame
+            // on top of the database projector and can exhaust a standard Tokio
+            // worker stack.
+            let started_phase = message_future(async {
+                let normalized_capabilities = match self
+                    .normalize_turn_skill_capabilities(
+                        thread.workspace_id.as_str(),
+                        params.capabilities.as_slice(),
+                    )
+                    .await
+                {
+                    Ok(normalized) => normalized,
+                    Err(message) => {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            message,
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                if execution_admission
+                    .as_ref()
+                    .is_some_and(ExecutionAuthorizationAdmission::is_member)
+                    && let Err(message) = self
+                        .enforce_member_skill_capability_projection(
+                            thread.workspace_id.as_str(),
+                            normalized_capabilities.execution.as_slice(),
+                        )
+                        .await
+                {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        message,
+                    )
+                    .await;
+                    return None;
+                }
+                if let Err(error) =
+                    super::message_turn::normalize_turn_collaboration_params(&mut params)
+                {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        format!("invalid Turn collaboration metadata: {error}"),
+                    )
+                    .await;
+                    return None;
+                }
+                // The detached Task must replay the exact presentation selected in the
+                // Composer. Skill packs are expanded only at the execution boundary;
+                // persisting the expanded capabilities here would make the child
+                // message render every pack member as an individually selected skill.
+                let launch = params.clone();
+                params.capabilities = normalized_capabilities.execution.clone();
+                if let Err(error) = self
+                    .validate_turn_artifact_user_inputs(
+                        thread.workspace_id.as_str(),
+                        thread.id.as_str(),
+                        params.input.as_slice(),
+                    )
+                    .await
+                {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        format!("failed to validate artifact input: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
+                let skill_catalog = match self
+                    .validate_turn_skill_capabilities(
+                        thread.workspace_id.as_str(),
+                        params.capabilities.as_slice(),
+                    )
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(message) => {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            message,
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let capability_attachments =
             match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
                 normalized_capabilities.presentation.as_slice(),
                 &skill_catalog,
@@ -1072,328 +1144,385 @@ impl MessageProcessor {
                         format!("failed to snapshot selected capability presentation: {error:#}"),
                     )
                     .await;
-                    return;
+                    return None;
                 }
             };
 
-        // Preserve the exact client launch for Task replay, but admit the
-        // parent message with the canonical provider selected by its
-        // execution backend. CLI clients intentionally omit `model_provider`,
-        // so leaving the field empty here would keep the parent's previous
-        // API provider even though the detached child runs in Codex/Claude.
-        canonicalize_cli_runtime_model_provider(&mut params);
-        let author = match super::message_turn::resolve_turn_author_snapshot(
-            self.crud_store.as_ref(),
-            &request_actor,
-        )
-        .await
-        {
-            Ok(author) => author,
-            Err(error) => {
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("failed to resolve Turn author: {error:#}"),
+                // Preserve the exact client launch for Task replay, but admit the
+                // parent message with the canonical provider selected by its
+                // execution backend. CLI clients intentionally omit `model_provider`,
+                // so leaving the field empty here would keep the parent's previous
+                // API provider even though the detached child runs in Codex/Claude.
+                canonicalize_cli_runtime_model_provider(&mut params);
+                let author = match super::message_turn::resolve_turn_author_snapshot(
+                    self.crud_store.as_ref(),
+                    &request_actor,
                 )
-                .await;
-                return;
-            }
-        };
-        let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
-            self.crud_store.as_ref(),
-            &request_actor,
-            &params,
-        )
-        .await
-        {
-            Ok(mentions) => mentions,
-            Err(error) => {
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("invalid Turn collaboration metadata: {error}"),
+                .await
+                {
+                    Ok(author) => author,
+                    Err(error) => {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to resolve Turn author: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
+                    self.crud_store.as_ref(),
+                    &request_actor,
+                    &params,
                 )
-                .await;
-                return;
-            }
-        };
-        let outcome = match self
-            .thread_manager
-            .turn_start_with_user_metadata(connection_id, params, author, mentions)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("failed to admit Composer message: {error:#}"),
-                )
-                .await;
-                return;
-            }
-        };
-        let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
-            Ok(event) => event,
-            Err(error) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("failed to resolve Composer permission profile: {error:#}"),
-                )
-                .await;
-                return;
-            }
-        };
-        if let Err(error) = persist_admitted_turn_start(
-            self.crud_store.as_ref(),
-            &outcome.materialization,
-            requested_reasoning_effort(&launch).as_deref(),
-            request_actor,
-            profile_audit,
-            execution_admission
-                .as_ref()
-                .and_then(ExecutionAuthorizationAdmission::runtime_draft),
-            None,
-        )
-        .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            self.send_turn_start_failure(
-                connection_id,
-                request_id.clone(),
-                &success_response,
-                thread.id.as_str(),
-                turn_id.as_str(),
-                format!("failed to persist Composer message: {error:#}"),
-            )
+                .await
+                {
+                    Ok(mentions) => mentions,
+                    Err(error) => {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("invalid Turn collaboration metadata: {error}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let outcome = match self
+                    .thread_manager
+                    .turn_start_with_user_metadata(connection_id, params, author, mentions)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to admit Composer message: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to resolve Composer permission profile: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                Some(ComposerDetachedStartedPhase {
+                    launch,
+                    outcome,
+                    capability_attachments,
+                    profile_audit,
+                })
+            })
             .await;
-            return;
-        }
-        self.complete_runtime_draft_materialization(execution_admission.as_ref())
-            .await;
-        let security_snapshot = match self
-            .persist_turn_execution_security_snapshot(
-                &launch,
-                &outcome,
-                None,
-                None,
-                execution_admission.as_ref(),
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(message) => {
-                self.mark_turn_blocked(thread.id.clone(), launch.turn_id.clone(), message.clone())
-                    .await;
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    message,
-                )
-                .await;
+            let Some(ComposerDetachedStartedPhase {
+                launch,
+                outcome,
+                capability_attachments,
+                profile_audit,
+            }) = started_phase
+            else {
                 return;
-            }
-        };
+            };
+            let materialized_phase = message_future(async {
+                if let Err(error) = persist_admitted_turn_start(
+                    self.crud_store.as_ref(),
+                    &outcome.materialization,
+                    requested_reasoning_effort(&launch).as_deref(),
+                    request_actor,
+                    profile_audit,
+                    execution_admission
+                        .as_ref()
+                        .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+                    None,
+                )
+                .await
+                {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        format!("failed to persist Composer message: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
+                self.complete_runtime_draft_materialization(execution_admission.as_ref())
+                    .await;
+                let security_snapshot = match self
+                    .persist_turn_execution_security_snapshot(
+                        &launch,
+                        &outcome,
+                        None,
+                        None,
+                        execution_admission.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(message) => {
+                        self.mark_turn_blocked(
+                            thread.id.clone(),
+                            launch.turn_id.clone(),
+                            message.clone(),
+                        )
+                        .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            message,
+                        )
+                        .await;
+                        return None;
+                    }
+                };
 
-        let first_text = first_user_text(launch.input.as_slice());
-        let goal = first_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .unwrap_or("Composer task")
-            .to_owned();
-        let title = goal.chars().take(96).collect::<String>();
-        let permission_profile = outcome.materialization.turn.permission_profile.clone();
-        let task_model_provider = outcome.materialization.thread.model_provider.clone();
-        // Freeze the causally closed parent branch before the Task becomes
-        // visible to the scheduler. A later sibling message must not change
-        // the context of this run, even if execution starts later.
-        let frozen_history = self
-            .load_conversation_history_for_workspace_in_execution_excluding_turn(
-                thread.workspace_id.as_str(),
-                thread.id.as_str(),
-                thread.id.as_str(),
-                launch.turn_id.as_str(),
-                Some(launch.turn_id.as_str()),
-                Some(outcome.materialization.thread.model.as_str()),
-                Some(task_model_provider.as_str()),
-            )
+                Some(ComposerDetachedMaterializedPhase {
+                    launch,
+                    outcome,
+                    capability_attachments,
+                    security_snapshot,
+                })
+            })
             .await;
-        let frozen_history_json = match serde_json::to_string(&frozen_history) {
-            Ok(history_json) => history_json,
-            Err(error) => {
+            let Some(ComposerDetachedMaterializedPhase {
+                launch,
+                outcome,
+                capability_attachments,
+                security_snapshot,
+            }) = materialized_phase
+            else {
+                return;
+            };
+            let task_created_phase = message_future(async {
+                let first_text = first_user_text(launch.input.as_slice());
+                let goal = first_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("Composer task")
+                    .to_owned();
+                let title = goal.chars().take(96).collect::<String>();
+                let permission_profile = outcome.materialization.turn.permission_profile.clone();
+                let task_model_provider = outcome.materialization.thread.model_provider.clone();
+                // Freeze the causally closed parent branch before the Task becomes
+                // visible to the scheduler. A later sibling message must not change
+                // the context of this run, even if execution starts later.
+                let frozen_history = self
+                    .load_conversation_history_for_workspace_in_execution_excluding_turn(
+                        thread.workspace_id.as_str(),
+                        thread.id.as_str(),
+                        thread.id.as_str(),
+                        launch.turn_id.as_str(),
+                        Some(launch.turn_id.as_str()),
+                        Some(outcome.materialization.thread.model.as_str()),
+                        Some(task_model_provider.as_str()),
+                    )
+                    .await;
+                let frozen_history_json = match serde_json::to_string(&frozen_history) {
+                    Ok(history_json) => history_json,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            thread.id.clone(),
+                            launch.turn_id.clone(),
+                            format!("failed to freeze Composer task history: {error:#}"),
+                        )
+                        .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to freeze Composer task history: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let task_params = pioneer_protocol::TaskCreateParams {
+                    workspace_id: thread.workspace_id.clone(),
+                    owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+                    owner_id: Some(thread.id.clone()),
+                    created_by_thread_id: Some(thread.id.clone()),
+                    created_by_turn_id: Some(launch.turn_id.clone()),
+                    parent_task_id: None,
+                    executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+                    title,
+                    goal: goal.clone(),
+                    priority: 0,
+                    trigger: pioneer_protocol::TaskTriggerInput {
+                        spec: pioneer_protocol::TaskTriggerSpec::Immediate,
+                    },
+                    agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
+                        agent_role: thread.agent_role.clone(),
+                        agent_nickname: thread.agent_nickname.clone(),
+                        model: Some(outcome.materialization.thread.model.clone()),
+                        model_provider: Some(task_model_provider),
+                        prompt: pioneer_protocol::TaskAgentPrompt {
+                            goal,
+                            instructions: Vec::new(),
+                            input: None,
+                            output_instructions: None,
+                        },
+                        context_policy: None,
+                        tool_policy: None,
+                        permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                            &permission_profile,
+                        )),
+                        security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
+                            &security_snapshot,
+                        )),
+                        result_contract: None,
+                        review_policy: None,
+                        depth: 0,
+                        max_depth: 3,
+                    }),
+                    lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
+                        attachment: pioneer_protocol::TaskAttachmentMode::Detached,
+                        on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                        on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                        completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
+                    }),
+                    delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
+                        mode: pioneer_protocol::TaskDeliveryMode::OwnerThread,
+                        thread_id: None,
+                        webhook_url: None,
+                        include_result: true,
+                        format: pioneer_protocol::TaskDeliveryFormat::FullResult,
+                    }),
+                    retry_policy: None,
+                    timeout_policy: None,
+                    concurrency_policy: None,
+                    metadata: Some(pioneer_protocol::TaskMetadata {
+                        labels: vec!["composer".to_owned()],
+                        data: None,
+                        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
+                    }),
+                };
+                let create_context = pioneer_tasks::TaskCreateContext {
+                    conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
+                        conversation_thread_id: thread.id.clone(),
+                        source_turn_id: Some(launch.turn_id.clone()),
+                        history_json: frozen_history_json,
+                    }),
+                    ..Default::default()
+                };
+                if let Err(error) = self
+                    .task_runtime
+                    .service()
+                    .create_task(create_context, task_params)
+                    .await
+                {
+                    self.mark_turn_blocked(
+                        thread.id.clone(),
+                        launch.turn_id.clone(),
+                        format!("failed to create detached Composer task: {error:#}"),
+                    )
+                    .await;
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        format!("failed to create detached Composer task: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
+
+                Some(ComposerDetachedTaskCreatedPhase {
+                    launch,
+                    outcome,
+                    capability_attachments,
+                })
+            })
+            .await;
+            let Some(ComposerDetachedTaskCreatedPhase {
+                launch,
+                outcome,
+                capability_attachments,
+            }) = task_created_phase
+            else {
+                return;
+            };
+
+            let success_sent = match &success_response {
+                TurnStartSuccessResponse::TurnStart => {
+                    self.finish_turn_start_success(
+                        connection_id,
+                        request_id,
+                        &outcome,
+                        capability_attachments.as_slice(),
+                    )
+                    .await
+                }
+                TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
+                    self.finish_voice_session_finalize_accepted_turn_start_success(
+                        connection_id,
+                        &outcome,
+                        capability_attachments.as_slice(),
+                        session_id,
+                    )
+                    .await
+                }
+                TurnStartSuccessResponse::Task { .. } => false,
+            };
+            if !success_sent {
                 self.mark_turn_blocked(
                     thread.id.clone(),
                     launch.turn_id.clone(),
-                    format!("failed to freeze Composer task history: {error:#}"),
-                )
-                .await;
-                self.send_turn_start_failure(
-                    connection_id,
-                    request_id.clone(),
-                    &success_response,
-                    thread.id.as_str(),
-                    turn_id.as_str(),
-                    format!("failed to freeze Composer task history: {error:#}"),
+                    "failed to commit Composer turn start lifecycle".to_owned(),
                 )
                 .await;
                 return;
             }
-        };
-        let task_params = pioneer_protocol::TaskCreateParams {
-            workspace_id: thread.workspace_id.clone(),
-            owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
-            owner_id: Some(thread.id.clone()),
-            created_by_thread_id: Some(thread.id.clone()),
-            created_by_turn_id: Some(launch.turn_id.clone()),
-            parent_task_id: None,
-            executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
-            title,
-            goal: goal.clone(),
-            priority: 0,
-            trigger: pioneer_protocol::TaskTriggerInput {
-                spec: pioneer_protocol::TaskTriggerSpec::Immediate,
-            },
-            agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
-                agent_role: thread.agent_role.clone(),
-                agent_nickname: thread.agent_nickname.clone(),
-                model: Some(outcome.materialization.thread.model.clone()),
-                model_provider: Some(task_model_provider),
-                prompt: pioneer_protocol::TaskAgentPrompt {
-                    goal,
-                    instructions: Vec::new(),
-                    input: None,
-                    output_instructions: None,
-                },
-                context_policy: None,
-                tool_policy: None,
-                permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
-                    &permission_profile,
-                )),
-                security_cap: Some(crate::turn_security::task_security_cap_from_snapshot(
-                    &security_snapshot,
-                )),
-                result_contract: None,
-                review_policy: None,
-                depth: 0,
-                max_depth: 3,
-            }),
-            lifecycle_policy: Some(pioneer_protocol::TaskLifecyclePolicy {
-                attachment: pioneer_protocol::TaskAttachmentMode::Detached,
-                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
-            }),
-            delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
-                mode: pioneer_protocol::TaskDeliveryMode::OwnerThread,
-                thread_id: None,
-                webhook_url: None,
-                include_result: true,
-                format: pioneer_protocol::TaskDeliveryFormat::FullResult,
-            }),
-            retry_policy: None,
-            timeout_policy: None,
-            concurrency_policy: None,
-            metadata: Some(pioneer_protocol::TaskMetadata {
-                labels: vec!["composer".to_owned()],
-                data: None,
-                composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
-            }),
-        };
-        let create_context = pioneer_tasks::TaskCreateContext {
-            conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
-                conversation_thread_id: thread.id.clone(),
-                source_turn_id: Some(launch.turn_id.clone()),
-                history_json: frozen_history_json,
-            }),
-            ..Default::default()
-        };
-        if let Err(error) = self
-            .task_runtime
-            .service()
-            .create_task(create_context, task_params)
-            .await
-        {
-            self.mark_turn_blocked(
-                thread.id.clone(),
-                launch.turn_id.clone(),
-                format!("failed to create detached Composer task: {error:#}"),
-            )
-            .await;
-            self.send_turn_start_failure(
-                connection_id,
-                request_id.clone(),
-                &success_response,
-                thread.id.as_str(),
-                turn_id.as_str(),
-                format!("failed to create detached Composer task: {error:#}"),
-            )
-            .await;
-            return;
-        }
-
-        let success_sent = match &success_response {
-            TurnStartSuccessResponse::TurnStart => {
-                self.finish_turn_start_success(
-                    connection_id,
-                    request_id,
-                    &outcome,
-                    capability_attachments.as_slice(),
-                )
+            if !self
+                .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
                 .await
-            }
-            TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
-                self.finish_voice_session_finalize_accepted_turn_start_success(
-                    connection_id,
-                    &outcome,
-                    capability_attachments.as_slice(),
-                    session_id,
+            {
+                self.mark_turn_blocked(
+                    thread.id,
+                    launch.turn_id,
+                    "failed to durably complete Composer turn after task creation".to_owned(),
                 )
-                .await
+                .await;
             }
-            TurnStartSuccessResponse::Task { .. } => false,
-        };
-        if !success_sent {
-            self.mark_turn_blocked(
-                thread.id.clone(),
-                launch.turn_id.clone(),
-                "failed to commit Composer turn start lifecycle".to_owned(),
-            )
-            .await;
-            return;
-        }
-        if !self
-            .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
-            .await
-        {
-            self.mark_turn_blocked(
-                thread.id,
-                launch.turn_id,
-                "failed to durably complete Composer turn after task creation".to_owned(),
-            )
-            .await;
-        }
+        })
     }
 
     pub(super) async fn prepare_api_provider_turn_start(
@@ -2059,6 +2188,343 @@ impl MessageProcessor {
             .await;
     }
 
+    fn prepare_cli_runtime_combined_preflight<'a>(
+        &'a self,
+        thread: &'a pioneer_protocol::Thread,
+        params: &'a TurnStartParams,
+        runtime_id: &'a str,
+        runtime_kind: CLIAgentRuntimeKind,
+        runtime_config: &'a pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        capability_partition: crate::cli_runtime::skills::CliRuntimeCapabilityPartition,
+        requested_mcp: bool,
+        provider_claim_matches: bool,
+    ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, String>> {
+        message_future(async move {
+            let mcp_projection = match self
+                .mcp_service
+                .resolve_mcp_turn_projection(&pioneer_agent::AgentMcpMaterializationRequest {
+                    workspace_id: thread.workspace_id.clone(),
+                    turn_id: params.turn_id.clone(),
+                    explicit_servers: capability_partition.mcp_servers.clone(),
+                    explicit_tools: capability_partition.mcp_tools.clone(),
+                })
+                .await
+            {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    let code = match error.reason {
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {
+                            crate::cli_mcp_client_validation::CliMcpClientValidationRejectionCode::ExplicitCapabilityUnresolved.as_str()
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::RequiredInstallationUnavailable => {
+                            "cli_runtime.mcp.required_installation_unavailable"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ResolutionUncertain => {
+                            "cli_runtime.mcp.resolution_uncertain"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ProjectionInvalid => {
+                            "cli_runtime.mcp.projection_invalid"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ProviderUnavailable => {
+                            "cli_runtime.mcp.provider_unavailable"
+                        }
+                    };
+                    crate::cli_mcp_client_validation::persist_cli_mcp_materialization_rejections(
+                        &self.crud_store,
+                        crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
+                            workspace_id: Some(thread.workspace_id.as_str()),
+                            thread_id: thread.id.as_str(),
+                            turn_id: params.turn_id.as_str(),
+                            runtime_id,
+                        },
+                        cli_mcp_client_target(runtime_kind),
+                        code,
+                        error.rejected_capabilities.as_slice(),
+                    )
+                    .await;
+                    return Err(format!(
+                        "{code}: combined MCP and skill preflight failed: {error}"
+                    ));
+                }
+            };
+            let combined_preflight_input =
+                crate::cli_runtime::skills::CliRuntimeCombinedPreflightInput {
+                    capabilities: capability_partition,
+                    mcp_projection,
+                };
+            let projected_mcp_availability = combined_preflight_input.exact_mcp_availability();
+            let attachments = combined_preflight_input.capabilities.skills.as_slice();
+            let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let preflight_started = std::time::Instant::now();
+                let resolved = match self
+                    .resolve_cli_runtime_skill_attachments(
+                        thread.workspace_id.as_str(),
+                        attachments,
+                        &projected_mcp_availability,
+                    )
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let failure_reason =
+                            format!("failed to resolve CLI runtime skills: {error:#}");
+                        for attachment in attachments {
+                            warn!(
+                                event = "cli_runtime_skill_preflight",
+                                runtime_id,
+                                runtime_kind = ?runtime_kind,
+                                skill_id = %attachment.skill_id,
+                                capability_id = attachment.capability_id.as_str(),
+                                result = "failed",
+                                failure_reason = failure_reason.as_str(),
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "CLI runtime skill preflight failed"
+                            );
+                        }
+                        return Err(failure_reason);
+                    }
+                };
+                if let Err(error) =
+                    crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&resolved)
+                {
+                    warn!(
+                        event = "cli_runtime_skill_preflight",
+                        runtime_id,
+                        runtime_kind = ?runtime_kind,
+                        skill_slug = error.skill_slug.as_str(),
+                        source_kind = "system",
+                        result = "failed",
+                        failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
+                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                        "CLI runtime skill preflight rejected Pioneer-only required system skill"
+                    );
+                    return Err(error.to_string());
+                }
+                if let Err(error) =
+                    crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
+                        runtime_kind,
+                        &runtime_config.display_name,
+                        &resolved,
+                    )
+                {
+                    if let Some(skill) = resolved
+                        .iter()
+                        .find(|skill| skill.definition.runtime.disable_model_invocation)
+                    {
+                        warn!(
+                            event = "cli_runtime_skill_preflight",
+                            runtime_id,
+                            runtime_kind = ?runtime_kind,
+                            skill_slug = skill.slug.as_str(),
+                            source_kind = skill.definition.identity.source_kind.as_db_value(),
+                            result = "failed",
+                            failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE,
+                            elapsed_ms = preflight_started.elapsed().as_millis(),
+                            "CLI runtime skill preflight rejected unsupported native invocation"
+                        );
+                    }
+                    return Err(error.to_string());
+                }
+                let resolved_skill_bindings =
+                    crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
+                let receipt_path = self
+                    .artifact_runtime_home
+                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+                let plans = match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
+                    runtime_config,
+                    runtime_kind,
+                    &resolved,
+                    &receipt_path,
+                ) {
+                    Ok(plans) => plans,
+                    Err(error) => {
+                        let failure_reason =
+                            format!("failed to plan CLI runtime skills: {error:#}");
+                        for skill in &resolved {
+                            warn!(
+                                event = "cli_runtime_skill_preflight",
+                                runtime_id,
+                                runtime_kind = ?runtime_kind,
+                                skill_slug = skill.slug.as_str(),
+                                source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                install_name = pioneer_skills::sanitize_name(
+                                    &skill.definition.identity.name
+                                ),
+                                result = "failed",
+                                failure_reason = failure_reason.as_str(),
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "CLI runtime skill preflight planning failed"
+                            );
+                        }
+                        return Err(failure_reason);
+                    }
+                };
+                (plans, resolved_skill_bindings)
+            };
+            let plan = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
+                mcp_projection: combined_preflight_input.mcp_projection,
+                skill_install_plans,
+                skill_bindings: resolved_skill_bindings,
+            };
+            let mut codex_mcp_launch_projection = None;
+            let mut claude_mcp_launch_projection = None;
+            if let Some(projection) = plan.mcp_projection.as_ref() {
+                let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
+                if has_mcp_projection {
+                    let readiness_summary = self
+                        .cli_runtime_live_summary_from_instance(
+                            thread.workspace_id.as_str(),
+                            runtime_config.clone(),
+                        )
+                        .await;
+                    let validation =
+                        crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
+                            &self.crud_store,
+                            crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
+                                workspace_id: Some(thread.workspace_id.as_str()),
+                                thread_id: thread.id.as_str(),
+                                turn_id: params.turn_id.as_str(),
+                                runtime_id,
+                            },
+                            crate::cli_mcp_client_validation::CliMcpClientValidationEvidence {
+                                target: cli_mcp_client_target(runtime_kind),
+                                has_mcp_projection,
+                                provider_claim_matches,
+                                runtime_snapshot_current: matches!(
+                                    readiness_summary.status,
+                                    RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
+                                ),
+                                runtime_supports_mcp_tools: readiness_summary
+                                    .capabilities
+                                    .supports_mcp_tools,
+                                projection_workspace_matches: projection.workspace_id
+                                    == thread.workspace_id,
+                                explicit_capabilities_resolved:
+                                    cli_mcp_projection_resolves_all_explicit_capabilities(
+                                        &combined_preflight_input.capabilities,
+                                        projection,
+                                    ),
+                            },
+                        )
+                        .await;
+                    if let Err(rejection) = validation {
+                        let diagnostic = readiness_summary
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        let code = diagnostic
+                            .map(|diagnostic| diagnostic.code.as_str())
+                            .unwrap_or_else(|| rejection.code.as_str());
+                        let message = diagnostic
+                            .map(|diagnostic| diagnostic.message.as_str())
+                            .unwrap_or(rejection.message);
+                        warn!(
+                            event = "combined_cli_preflight",
+                            runtime_id,
+                            runtime_kind = ?runtime_kind,
+                            manifest_hash = projection.manifest_hash.as_str(),
+                            diagnostic_code = code,
+                            rejection_reason = ?rejection.reason,
+                            "combined MCP and skill preflight rejected the client MCP claim"
+                        );
+                        return Err(format!("{code}: {message}"));
+                    }
+                    let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                    #[cfg(test)]
+                    let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                    #[cfg(not(test))]
+                    let readiness_override: Option<
+                        pioneer_protocol::CliMcpAdapterReadiness,
+                    > = None;
+                    if runtime_kind == CLIAgentRuntimeKind::Codex {
+                        let readiness = match readiness_override {
+                            Some(readiness) => readiness,
+                            None => crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                                runtime_config,
+                                self.artifact_runtime_home.as_path(),
+                                matches!(readiness_summary.status, RuntimeStatus::Ready),
+                                readiness_summary.version.as_deref(),
+                                readiness_summary.proxy_url.as_deref(),
+                                max_tools,
+                                max_schema_bytes,
+                            )
+                            .await,
+                        };
+                        if !readiness.supported {
+                            let diagnostic = readiness
+                                .diagnostics
+                                .iter()
+                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                            return Err(format!(
+                                "{}: {}",
+                                diagnostic
+                                    .map(|diagnostic| diagnostic.code.as_str())
+                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                                diagnostic
+                                    .map(|diagnostic| diagnostic.message.as_str())
+                                    .unwrap_or("MCP tool readiness is not available")
+                            ));
+                        }
+                        codex_mcp_launch_projection = Some(
+                            crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
+                                projection.clone(),
+                                readiness.contract_fingerprint,
+                            )
+                            .map_err(|error| {
+                                format!("failed to prepare Codex MCP schema projection: {error}")
+                            })?,
+                        );
+                    } else if runtime_kind == CLIAgentRuntimeKind::Claude {
+                        let readiness = match readiness_override {
+                            Some(readiness) => readiness,
+                            None => crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                                runtime_config,
+                                self.artifact_runtime_home.as_path(),
+                                matches!(readiness_summary.status, RuntimeStatus::Ready),
+                                readiness_summary.version.as_deref(),
+                                readiness_summary.proxy_url.as_deref(),
+                                max_tools,
+                                max_schema_bytes,
+                            )
+                            .await,
+                        };
+                        if !readiness.supported {
+                            let diagnostic = readiness
+                                .diagnostics
+                                .iter()
+                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                            return Err(format!(
+                                "{}: {}",
+                                diagnostic
+                                    .map(|diagnostic| diagnostic.code.as_str())
+                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                                diagnostic
+                                    .map(|diagnostic| diagnostic.message.as_str())
+                                    .unwrap_or("MCP tool readiness is not available")
+                            ));
+                        }
+                        claude_mcp_launch_projection = Some(
+                            crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
+                                projection.clone(),
+                                readiness.contract_fingerprint,
+                            )
+                            .map_err(|error| {
+                                format!("failed to prepare Claude MCP schema projection: {error}")
+                            })?,
+                        );
+                    }
+                }
+            }
+            Ok(PreparedCliRuntimeCombinedPreflight {
+                plan,
+                codex_mcp_launch_projection,
+                claude_mcp_launch_projection,
+            })
+        })
+    }
+
     pub(super) fn turn_start_cli_runtime<'a>(
         &'a self,
         connection_id: ConnectionId,
@@ -2104,6 +2570,12 @@ impl MessageProcessor {
             };
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
+            // Keep backend discovery, admission/preflight, and durable launch in
+            // separate heap-backed futures. Combining this entire lifecycle in one
+            // async state machine creates a poll frame large enough to exhaust a
+            // standard Tokio worker stack before ordinary callees can run.
+            let admission_phase = message_future(async {
+
             let Some(thread) = self
                 .thread_manager
                 .thread_get(params.thread_id.trim())
@@ -2113,7 +2585,7 @@ impl MessageProcessor {
                     "thread `{}` is not loaded",
                     params.thread_id.trim()
                 ));
-                return;
+                return None;
             };
             let normalized_capabilities = match self
                 .normalize_turn_skill_capabilities(
@@ -2125,7 +2597,7 @@ impl MessageProcessor {
                 Ok(normalized) => normalized,
                 Err(message) => {
                     send_turn_start_failure!(message);
-                    return;
+                    return None;
                 }
             };
             if execution_admission
@@ -2139,7 +2611,7 @@ impl MessageProcessor {
                     .await
             {
                 send_turn_start_failure!(message);
-                return;
+                return None;
             }
             let normalized_presentation_capabilities = normalized_capabilities.presentation;
             let normalized_pack_names = normalized_capabilities.pack_names;
@@ -2152,7 +2624,7 @@ impl MessageProcessor {
                     Ok(partition) => partition,
                     Err(message) => {
                         send_turn_start_failure!(message);
-                        return;
+                        return None;
                     }
                 };
             let requested_mcp = capability_partition.has_mcp();
@@ -2183,7 +2655,7 @@ impl MessageProcessor {
                 .await
             {
                 send_turn_start_failure!(rejection.to_string());
-                return;
+                return None;
             }
             if let Some(input_kind) = params
                 .input
@@ -2193,14 +2665,14 @@ impl MessageProcessor {
                 send_turn_start_failure!(format!(
                     "CLI runtime providers only support text and attachment inputs; `{input_kind}` input is not supported"
                 ));
-                return;
+                return None;
             }
 
-            let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            let Some(manager) = self.cli_runtime_manager.clone() else {
                 send_turn_start_failure!(
                     "CLI runtime manager is not available for turn start".to_owned()
                 );
-                return;
+                return None;
             };
             let continuation_thread_id = success_response
                 .continuation_thread_id(thread.id.as_str())
@@ -2216,7 +2688,7 @@ impl MessageProcessor {
                 Ok(session_key) => session_key,
                 Err(error) => {
                     send_turn_start_failure!(format!("invalid CLI runtime session key: {error:#}"));
-                    return;
+                    return None;
                 }
             };
             let session_turn_mutex = self.cli_runtime_session_turn_mutex(&session_key).await;
@@ -2243,13 +2715,13 @@ impl MessageProcessor {
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
                                     );
-                                    return;
+                                    return None;
                                 }
                                 Err(error) => {
                                     send_turn_start_failure!(format!(
                                         "failed to maintain queued task CLI runtime execution: {error:#}"
                                     ));
-                                    return;
+                                    return None;
                                 }
                             }
                         }
@@ -2263,7 +2735,7 @@ impl MessageProcessor {
                             "CLI runtime continuation `{}` already has an active turn",
                             session_key.thread_id
                         ));
-                        return;
+                        return None;
                     }
                 }
             };
@@ -2291,13 +2763,13 @@ impl MessageProcessor {
                                         "task run ended while waiting for its CLI runtime continuation"
                                             .to_owned()
                                     );
-                                    return;
+                                    return None;
                                 }
                                 Err(error) => {
                                     send_turn_start_failure!(format!(
                                         "failed to maintain queued task CLI runtime execution: {error:#}"
                                     ));
-                                    return;
+                                    return None;
                                 }
                             }
                         }
@@ -2305,14 +2777,14 @@ impl MessageProcessor {
                     }
                     Ok(Some(message)) => {
                         send_turn_start_failure!(message);
-                        return;
+                        return None;
                     }
                     Ok(None) => break,
                     Err(error) => {
                         send_turn_start_failure!(format!(
                             "failed to check active CLI runtime turns: {error:#}"
                         ));
-                        return;
+                        return None;
                     }
                 }
             }
@@ -2326,362 +2798,71 @@ impl MessageProcessor {
                         send_turn_start_failure!(
                             "task run ended before its CLI runtime turn started".to_owned()
                         );
-                        return;
+                        return None;
                     }
                     Err(error) => {
                         send_turn_start_failure!(format!(
                             "failed to validate task CLI runtime execution: {error:#}"
                         ));
-                        return;
+                        return None;
                     }
                 }
             }
-            let mcp_projection = match self
-                .mcp_service
-                .resolve_mcp_turn_projection(&pioneer_agent::AgentMcpMaterializationRequest {
-                    workspace_id: thread.workspace_id.clone(),
-                    turn_id: params.turn_id.clone(),
-                    explicit_servers: capability_partition.mcp_servers.clone(),
-                    explicit_tools: capability_partition.mcp_tools.clone(),
-                })
+            let PreparedCliRuntimeCombinedPreflight {
+                plan: combined_preflight,
+                codex_mcp_launch_projection,
+                claude_mcp_launch_projection,
+            } = match self
+                .prepare_cli_runtime_combined_preflight(
+                    &thread,
+                    &params,
+                    runtime_id.as_str(),
+                    runtime_kind,
+                    &runtime_config,
+                    capability_partition,
+                    requested_mcp,
+                    provider_claim_matches,
+                )
                 .await
             {
-                Ok(projection) => Some(projection),
-                Err(error) => {
-                    let code = match error.reason {
-                        pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {
-                            crate::cli_mcp_client_validation::CliMcpClientValidationRejectionCode::ExplicitCapabilityUnresolved.as_str()
-                        }
-                        pioneer_agent::AgentMcpMaterializationFailureReason::RequiredInstallationUnavailable => {
-                            "cli_runtime.mcp.required_installation_unavailable"
-                        }
-                        pioneer_agent::AgentMcpMaterializationFailureReason::ResolutionUncertain => {
-                            "cli_runtime.mcp.resolution_uncertain"
-                        }
-                        pioneer_agent::AgentMcpMaterializationFailureReason::ProjectionInvalid => {
-                            "cli_runtime.mcp.projection_invalid"
-                        }
-                        pioneer_agent::AgentMcpMaterializationFailureReason::ProviderUnavailable => {
-                            "cli_runtime.mcp.provider_unavailable"
-                        }
-                    };
-                    crate::cli_mcp_client_validation::persist_cli_mcp_materialization_rejections(
-                        &self.crud_store,
-                        crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
-                            workspace_id: Some(thread.workspace_id.as_str()),
-                            thread_id: thread.id.as_str(),
-                            turn_id: params.turn_id.as_str(),
-                            runtime_id: runtime_id.as_str(),
-                        },
-                        cli_mcp_client_target(runtime_kind),
-                        code,
-                        error.rejected_capabilities.as_slice(),
-                    )
-                    .await;
-                    send_turn_start_failure!(format!(
-                        "{code}: combined MCP and skill preflight failed: {error}"
-                    ));
-                    return;
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    send_turn_start_failure!(message);
+                    return None;
                 }
             };
-            let combined_preflight_input =
-                crate::cli_runtime::skills::CliRuntimeCombinedPreflightInput {
-                    capabilities: capability_partition,
-                    mcp_projection,
-                };
-            let projected_mcp_availability = combined_preflight_input.exact_mcp_availability();
-            let attachments = combined_preflight_input.capabilities.skills.as_slice();
-            let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty() {
-                (Vec::new(), Vec::new())
-            } else {
-                let preflight_started = std::time::Instant::now();
-                let resolved = match self
-                    .resolve_cli_runtime_skill_attachments(
-                        thread.workspace_id.as_str(),
-                        attachments,
-                        &projected_mcp_availability,
-                    )
-                    .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let failure_reason =
-                            format!("failed to resolve CLI runtime skills: {error:#}");
-                        for attachment in attachments {
-                            warn!(
-                                event = "cli_runtime_skill_preflight",
-                                runtime_id = runtime_id.as_str(),
-                                runtime_kind = ?runtime_kind,
-                                skill_id = %attachment.skill_id,
-                                capability_id = attachment.capability_id.as_str(),
-                                result = "failed",
-                                failure_reason = failure_reason.as_str(),
-                                elapsed_ms = preflight_started.elapsed().as_millis(),
-                                "CLI runtime skill preflight failed"
-                            );
-                        }
-                        send_turn_start_failure!(failure_reason);
-                        return;
-                    }
-                };
-                if let Err(error) =
-                    crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&resolved)
-                {
-                    warn!(
-                        event = "cli_runtime_skill_preflight",
-                        runtime_id = runtime_id.as_str(),
-                        runtime_kind = ?runtime_kind,
-                        skill_slug = error.skill_slug.as_str(),
-                        source_kind = "system",
-                        result = "failed",
-                        failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
-                        elapsed_ms = preflight_started.elapsed().as_millis(),
-                        "CLI runtime skill preflight rejected Pioneer-only required system skill"
-                    );
-                    send_turn_start_failure!(error.to_string());
-                    return;
-                }
-                if let Err(error) =
-                    crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
-                        runtime_kind,
-                        &runtime_config.display_name,
-                        &resolved,
-                    )
-                {
-                    if let Some(skill) = resolved
-                        .iter()
-                        .find(|skill| skill.definition.runtime.disable_model_invocation)
-                    {
-                        warn!(
-                            event = "cli_runtime_skill_preflight",
-                            runtime_id = runtime_id.as_str(),
-                            runtime_kind = ?runtime_kind,
-                            skill_slug = skill.slug.as_str(),
-                            source_kind = skill.definition.identity.source_kind.as_db_value(),
-                            result = "failed",
-                            failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE,
-                            elapsed_ms = preflight_started.elapsed().as_millis(),
-                            "CLI runtime skill preflight rejected unsupported native invocation"
-                        );
-                    }
-                    send_turn_start_failure!(error.to_string());
-                    return;
-                }
-                let resolved_skill_bindings =
-                    crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
-                let receipt_path = self
-                    .artifact_runtime_home
-                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-                let plans = match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
-                    &runtime_config,
-                    runtime_kind,
-                    &resolved,
-                    &receipt_path,
-                ) {
-                    Ok(plans) => plans,
-                    Err(error) => {
-                        let failure_reason =
-                            format!("failed to plan CLI runtime skills: {error:#}");
-                        for skill in &resolved {
-                            warn!(
-                                event = "cli_runtime_skill_preflight",
-                                runtime_id = runtime_id.as_str(),
-                                runtime_kind = ?runtime_kind,
-                                skill_slug = skill.slug.as_str(),
-                                source_kind = skill.definition.identity.source_kind.as_db_value(),
-                                install_name = pioneer_skills::sanitize_name(
-                                    &skill.definition.identity.name
-                                ),
-                                result = "failed",
-                                failure_reason = failure_reason.as_str(),
-                                elapsed_ms = preflight_started.elapsed().as_millis(),
-                                "CLI runtime skill preflight planning failed"
-                            );
-                        }
-                        send_turn_start_failure!(failure_reason);
-                        return;
-                    }
-                };
-                (plans, resolved_skill_bindings)
+            Some(CliRuntimeAdmissionPhase {
+                thread,
+                normalized_presentation_capabilities,
+                normalized_pack_names,
+                manager,
+                continuation_thread_id,
+                context_thread_id,
+                session_key,
+                session_turn_lease,
+                combined_preflight,
+                codex_mcp_launch_projection,
+                claude_mcp_launch_projection,
+            })
+            })
+            .await;
+            let Some(CliRuntimeAdmissionPhase {
+                thread,
+                normalized_presentation_capabilities,
+                normalized_pack_names,
+                manager,
+                continuation_thread_id,
+                context_thread_id,
+                session_key,
+                session_turn_lease,
+                combined_preflight,
+                codex_mcp_launch_projection,
+                claude_mcp_launch_projection,
+            }) = admission_phase
+            else {
+                return;
             };
-            let combined_preflight = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
-                mcp_projection: combined_preflight_input.mcp_projection,
-                skill_install_plans,
-                skill_bindings: resolved_skill_bindings,
-            };
-            let mut codex_mcp_launch_projection = None;
-            let mut claude_mcp_launch_projection = None;
-            if let Some(projection) = combined_preflight.mcp_projection.as_ref() {
-                let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
-                if has_mcp_projection {
-                    let readiness_summary = self
-                        .cli_runtime_live_summary_from_instance(
-                            thread.workspace_id.as_str(),
-                            runtime_config.clone(),
-                        )
-                        .await;
-                    let validation =
-                        crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
-                            &self.crud_store,
-                            crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
-                                workspace_id: Some(thread.workspace_id.as_str()),
-                                thread_id: thread.id.as_str(),
-                                turn_id: params.turn_id.as_str(),
-                                runtime_id: runtime_id.as_str(),
-                            },
-                            crate::cli_mcp_client_validation::CliMcpClientValidationEvidence {
-                                target: cli_mcp_client_target(runtime_kind),
-                                has_mcp_projection,
-                                provider_claim_matches,
-                                runtime_snapshot_current: matches!(
-                                    readiness_summary.status,
-                                    RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-                                ),
-                                runtime_supports_mcp_tools: readiness_summary
-                                    .capabilities
-                                    .supports_mcp_tools,
-                                projection_workspace_matches: projection.workspace_id
-                                    == thread.workspace_id,
-                                explicit_capabilities_resolved:
-                                    cli_mcp_projection_resolves_all_explicit_capabilities(
-                                        &combined_preflight_input.capabilities,
-                                        projection,
-                                    ),
-                            },
-                        )
-                        .await;
-                    if let Err(rejection) = validation {
-                        let diagnostic = readiness_summary
-                            .diagnostics
-                            .iter()
-                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                        let code = diagnostic
-                            .map(|diagnostic| diagnostic.code.as_str())
-                            .unwrap_or_else(|| rejection.code.as_str());
-                        let message = diagnostic
-                            .map(|diagnostic| diagnostic.message.as_str())
-                            .unwrap_or(rejection.message);
-                        warn!(
-                            event = "combined_cli_preflight",
-                            runtime_id = runtime_id.as_str(),
-                            runtime_kind = ?runtime_kind,
-                            manifest_hash = projection.manifest_hash.as_str(),
-                            diagnostic_code = code,
-                            rejection_reason = ?rejection.reason,
-                            "combined MCP and skill preflight rejected the client MCP claim"
-                        );
-                        send_turn_start_failure!(format!("{code}: {message}"));
-                        return;
-                    }
-                    if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Codex {
-                        let (max_tools, max_schema_bytes) =
-                            self.mcp_service.projection_limit_values();
-                        #[cfg(test)]
-                        let readiness_override = self.cli_mcp_readiness_override_for_tests();
-                        #[cfg(not(test))]
-                        let readiness_override: Option<
-                            pioneer_protocol::CliMcpAdapterReadiness,
-                        > = None;
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                                &runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            send_turn_start_failure!(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            ));
-                            return;
-                        }
-                        codex_mcp_launch_projection = Some(
-                        match crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
-                            projection.clone(),
-                            readiness.contract_fingerprint,
-                        ) {
-                            Ok(projection) => projection,
-                            Err(error) => {
-                                send_turn_start_failure!(format!(
-                                    "failed to prepare Codex MCP schema projection: {error}"
-                                ));
-                                return;
-                            }
-                        },
-                    );
-                    } else if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Claude {
-                        let (max_tools, max_schema_bytes) =
-                            self.mcp_service.projection_limit_values();
-                        #[cfg(test)]
-                        let readiness_override = self.cli_mcp_readiness_override_for_tests();
-                        #[cfg(not(test))]
-                        let readiness_override: Option<
-                            pioneer_protocol::CliMcpAdapterReadiness,
-                        > = None;
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                                &runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            send_turn_start_failure!(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            ));
-                            return;
-                        }
-                        claude_mcp_launch_projection = Some(
-                        match crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
-                            projection.clone(),
-                            readiness.contract_fingerprint,
-                        ) {
-                            Ok(projection) => projection,
-                            Err(error) => {
-                                send_turn_start_failure!(format!(
-                                    "failed to prepare Claude MCP schema projection: {error}"
-                                ));
-                                return;
-                            }
-                        },
-                    );
-                    }
-                }
-            }
-            let mut installed_skills =
-                Vec::with_capacity(combined_preflight.skill_install_plans.len());
+            let started_phase = message_future(async {
             let proxy_url = match self
                 .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
                 .await
@@ -2691,7 +2872,7 @@ impl MessageProcessor {
                     send_turn_start_failure!(format!(
                         "failed to prepare CLI runtime proxy settings: {error:#}"
                     ));
-                    return;
+                    return None;
                 }
             };
             // Detached Task execution prepares its hidden child before that
@@ -2714,7 +2895,7 @@ impl MessageProcessor {
                 send_turn_start_failure!(format!(
                     "failed to validate CLI runtime artifact input: {error:#}"
                 ));
-                return;
+                return None;
             }
             let resolved_artifacts = match self
                 .resolve_provider_artifact_inputs(
@@ -2728,10 +2909,10 @@ impl MessageProcessor {
                     send_turn_start_failure!(format!(
                         "failed to materialize CLI runtime artifact input: {error:#}"
                     ));
-                    return;
+                    return None;
                 }
             };
-            let mut input_mapping = match match runtime_kind {
+            let input_mapping = match match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
                         params.input.as_slice(),
@@ -2748,7 +2929,7 @@ impl MessageProcessor {
                 Ok(input_mapping) => input_mapping,
                 Err(error) => {
                     send_turn_start_failure!(format!("{error}"));
-                    return;
+                    return None;
                 }
             };
             let task_permission_selection =
@@ -2775,7 +2956,7 @@ impl MessageProcessor {
             params.cli_runtime_options = Some(permission_adapter.options.clone());
             let effective_approval_policy = permission_adapter.output.approval_policy.clone();
             let sandbox_policy_value: Option<JsonValue> = None;
-            let mut provider_permissions_id: Option<String> = None;
+            let provider_permissions_id: Option<String> = None;
             let requested_reasoning_effort = requested_reasoning_effort(&params);
             let cli_runtime_effort = cli_runtime_effort(&params);
             // Transition rule: CLI turns may carry the legacy runtime effort, the
@@ -2788,7 +2969,7 @@ impl MessageProcessor {
                 Ok(effort) => effort,
                 Err(message) => {
                     send_turn_start_failure!(message);
-                    return;
+                    return None;
                 }
             };
             let cli_runtime_personality = params
@@ -2804,7 +2985,7 @@ impl MessageProcessor {
                 super::message_turn::normalize_turn_collaboration_params(&mut params)
             {
                 send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
-                return;
+                return None;
             }
             let security_params = params.clone();
             #[cfg(test)]
@@ -2821,7 +3002,7 @@ impl MessageProcessor {
                 Ok(author) => author,
                 Err(error) => {
                     send_turn_start_failure!(format!("failed to resolve Turn author: {error:#}"));
-                    return;
+                    return None;
                 }
             };
             let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
@@ -2836,7 +3017,7 @@ impl MessageProcessor {
                     send_turn_start_failure!(format!(
                         "invalid Turn collaboration metadata: {error}"
                     ));
-                    return;
+                    return None;
                 }
             };
             let outcome = match if let Some(permission_profile) =
@@ -2855,7 +3036,7 @@ impl MessageProcessor {
                     send_turn_start_failure!(format!(
                         "failed to start CLI runtime turn: {error:#}"
                     ));
-                    return;
+                    return None;
                 }
             };
             if let Err(message) = self
@@ -2869,7 +3050,7 @@ impl MessageProcessor {
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
                 send_turn_start_failure!(message);
-                return;
+                return None;
             }
             let user_message_capability_attachments =
                 match super::agent_runtime::user_message_attachments_from_capabilities_and_bindings(
@@ -2885,7 +3066,7 @@ impl MessageProcessor {
                         send_turn_start_failure!(format!(
                             "failed to snapshot selected skill presentation: {error:#}"
                         ));
-                        return;
+                        return None;
                     }
                 };
             let effective_cli_runtime_effort = match self
@@ -2906,9 +3087,43 @@ impl MessageProcessor {
                         .rollback_turn_start(outcome.rollback_context.clone())
                         .await;
                     send_turn_start_failure!(message);
-                    return;
+                    return None;
                 }
             };
+            Some(CliRuntimeStartedPhase {
+                outcome,
+                user_message_capability_attachments,
+                proxy_url,
+                input_mapping,
+                effective_approval_policy,
+                sandbox_policy_value,
+                provider_permissions_id,
+                effective_cli_runtime_effort,
+                cli_runtime_personality,
+                cli_runtime_summary,
+                security_params,
+            })
+            })
+            .await;
+            let Some(CliRuntimeStartedPhase {
+                outcome,
+                user_message_capability_attachments,
+                proxy_url,
+                mut input_mapping,
+                effective_approval_policy,
+                sandbox_policy_value,
+                mut provider_permissions_id,
+                effective_cli_runtime_effort,
+                cli_runtime_personality,
+                cli_runtime_summary,
+                security_params,
+            }) = started_phase
+            else {
+                return;
+            };
+            let materialized_phase = message_future(async {
+            let mut installed_skills =
+                Vec::with_capacity(combined_preflight.skill_install_plans.len());
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
                 Ok(event) => event,
                 Err(error) => {
@@ -2918,7 +3133,7 @@ impl MessageProcessor {
                     send_turn_start_failure!(format!(
                         "failed to resolve turn permission profile: {error:#}"
                     ));
-                    return;
+                    return None;
                 }
             };
             let runtime_draft = execution_admission
@@ -2957,7 +3172,7 @@ impl MessageProcessor {
                 send_turn_start_failure!(format!(
                     "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
                 ));
-                return;
+                return None;
             }
             self.complete_runtime_draft_materialization(execution_admission.as_ref())
                 .await;
@@ -2980,7 +3195,7 @@ impl MessageProcessor {
                     )
                     .await;
                     send_turn_start_failure!(message);
-                    return;
+                    return None;
                 }
             };
             if let Some(projection) = combined_preflight.mcp_projection.as_ref() {
@@ -3047,7 +3262,7 @@ impl MessageProcessor {
                         send_turn_start_failure!(format!(
                             "failed to persist resolved MCP projection: {error}"
                         ));
-                        return;
+                        return None;
                     }
                 };
                 if persisted.turn_id != outcome.started_notification.turn.id
@@ -3065,7 +3280,7 @@ impl MessageProcessor {
                         "persisted MCP projection acknowledgement did not match CLI preflight"
                             .to_owned()
                     );
-                    return;
+                    return None;
                 }
 
                 let event = AgentDurableEvent::TurnCapabilitiesResolved {
@@ -3101,7 +3316,7 @@ impl MessageProcessor {
                     send_turn_start_failure!(
                         "failed to emit durable CLI MCP capability result".to_owned()
                     );
-                    return;
+                    return None;
                 }
             }
             let event = AgentDurableEvent::TurnSkillsResolved {
@@ -3119,7 +3334,7 @@ impl MessageProcessor {
                 send_turn_start_failure!(
                     "failed to commit CLI runtime turn skill bindings".to_owned()
                 );
-                return;
+                return None;
             }
 
             for plan in &combined_preflight.skill_install_plans {
@@ -3179,7 +3394,7 @@ impl MessageProcessor {
                         )
                         .await;
                         send_turn_start_failure!(failure_reason);
-                        return;
+                        return None;
                     }
                 }
             }
@@ -3205,8 +3420,22 @@ impl MessageProcessor {
                 send_turn_start_failure!(format!(
                     "failed to refresh CLI runtime session for selected skills: {error:#}"
                 ));
-                return;
+                return None;
             }
+            Some(CliRuntimeMaterializedPhase {
+                security_snapshot,
+                installed_skills,
+            })
+            })
+            .await;
+            let Some(CliRuntimeMaterializedPhase {
+                security_snapshot,
+                installed_skills,
+            }) = materialized_phase
+            else {
+                return;
+            };
+            message_future(async move {
             if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
                 crate::cli_runtime::skills::prepend_codex_installed_skill_items(
                     &installed_skills,
@@ -3698,6 +3927,8 @@ impl MessageProcessor {
             } else {
                 self.spawn_prepared_cli_runtime_native_turn(native_turn_start);
             }
+            })
+            .await;
         })
     }
 

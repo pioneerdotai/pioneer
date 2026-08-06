@@ -59,10 +59,23 @@ impl MessageProcessor {
             else {
                 continue;
             };
-            if let Err(error) = self
-                .execute_task_delivery(delivery.clone(), attempt.clone())
-                .await
-            {
+            // Delivery can enter a deep CRUD projection chain. Run one
+            // attempt from a fresh standard Tokio task so that chain does not
+            // inherit the resilience worker or request-handler poll stack.
+            let processor = self.clone();
+            let delivery_execution = delivery.clone();
+            let attempt_execution = attempt.clone();
+            let execution_result = message_fresh_task(async move {
+                processor
+                    .execute_task_delivery(delivery_execution, attempt_execution)
+                    .await
+            })
+            .await;
+            let execution_result = match execution_result {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("task delivery execution task failed: {error}")),
+            };
+            if let Err(error) = execution_result {
                 let failed_at = now_timestamp_secs();
                 self.task_runtime
                     .service()
