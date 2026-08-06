@@ -10,30 +10,30 @@ permissions:
   contents: write
 
 jobs:
-  wait-for-ci:
-    name: wait-for-ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 155
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
+  # wait-for-ci:
+  #   name: wait-for-ci
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 155
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #       with:
+  #         ref: ${{ github.sha }}
+  #         persist-credentials: false
 
-      - name: wait-for-successful-exact-sha-ci
-        env:
-          CI_WAIT_REPOSITORY: ${{ github.repository }}
-          CI_WAIT_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/ci/wait_for_ci.py
-          --repository "$CI_WAIT_REPOSITORY"
-          --workflow ci.yml
-          --sha "$CI_WAIT_SHA"
-          --branch main
-          --event push
-          --timeout-seconds 9000
-          --poll-seconds 30
+  #     - name: wait-for-successful-exact-sha-ci
+  #       env:
+  #         CI_WAIT_REPOSITORY: ${{ github.repository }}
+  #         CI_WAIT_SHA: ${{ github.sha }}
+  #         GITHUB_TOKEN: ${{ github.token }}
+  #       run: >-
+  #         python3 scripts/ci/wait_for_ci.py
+  #         --repository "$CI_WAIT_REPOSITORY"
+  #         --workflow ci.yml
+  #         --sha "$CI_WAIT_SHA"
+  #         --branch main
+  #         --event push
+  #         --timeout-seconds 9000
+  #         --poll-seconds 30
 
   build-gateway:
     name: build-${{ matrix.target }}

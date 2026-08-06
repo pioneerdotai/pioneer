@@ -21,36 +21,36 @@ permissions:
   contents: write
 
 jobs:
-  wait-for-ci:
-    name: wait-for-ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 155
-    steps:
-      - name: skip-ci-wait-for-non-tag-run
-        if: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v') }}
-        run: echo "Exact-SHA CI wait is required only for v* tag releases."
+  # wait-for-ci:
+  #   name: wait-for-ci
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 155
+  #   steps:
+  #     - name: skip-ci-wait-for-non-tag-run
+  #       if: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v') }}
+  #       run: echo "Exact-SHA CI wait is required only for v* tag releases."
 
-      - uses: actions/checkout@v5
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
+  #     - uses: actions/checkout@v5
+  #       if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+  #       with:
+  #         ref: ${{ github.sha }}
+  #         persist-credentials: false
 
-      - name: wait-for-successful-exact-sha-ci
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-        env:
-          CI_WAIT_REPOSITORY: ${{ github.repository }}
-          CI_WAIT_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/ci/wait_for_ci.py
-          --repository "$CI_WAIT_REPOSITORY"
-          --workflow ci.yml
-          --sha "$CI_WAIT_SHA"
-          --branch main
-          --event push
-          --timeout-seconds 9000
-          --poll-seconds 30
+  #     - name: wait-for-successful-exact-sha-ci
+  #       if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+  #       env:
+  #         CI_WAIT_REPOSITORY: ${{ github.repository }}
+  #         CI_WAIT_SHA: ${{ github.sha }}
+  #         GITHUB_TOKEN: ${{ github.token }}
+  #       run: >-
+  #         python3 scripts/ci/wait_for_ci.py
+  #         --repository "$CI_WAIT_REPOSITORY"
+  #         --workflow ci.yml
+  #         --sha "$CI_WAIT_SHA"
+  #         --branch main
+  #         --event push
+  #         --timeout-seconds 9000
+  #         --poll-seconds 30
 
   package-desktop:
     name: package-${{ matrix.target }}
