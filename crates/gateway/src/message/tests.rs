@@ -1446,8 +1446,8 @@ where
         .build()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
     let result = runtime.block_on(async move { tokio::spawn(future).await });
-    // Memvid indexing is best-effort and may outlive the assertions.  Do not
-    // let runtime shutdown wait indefinitely for detached blocking work.
+    // Test futures may leave best-effort blocking index work behind. Give it
+    // a bounded grace period instead of waiting indefinitely during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
     result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
 }
@@ -39668,15 +39668,18 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name(name)
         .enable_all()
         .build()
-        .expect("test runtime should build")
-        .block_on(async move {
-            tokio::spawn(test()).await.expect("test task should finish");
-        });
+        .expect("test runtime should build");
+    let result = runtime.block_on(async move { tokio::spawn(test()).await });
+    // Message tests can leave best-effort Memvid indexing on spawn_blocking.
+    // Runtime::drop waits for blocking tasks without a deadline, even after
+    // the test future and all of its assertions have completed.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result.expect("test task should finish");
 }
 
 fn run_thread_agents_doc_rpc_test<F, Fut>(test: F)
