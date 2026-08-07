@@ -1426,7 +1426,6 @@ async fn seed_cli_runtime_skill_preflight_thread(
 fn capability_persistence_order_materializes_before_skill_install_and_native_start() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("capability persistence order test runtime should build")
@@ -1437,21 +1436,20 @@ fn capability_persistence_order_materializes_before_skill_install_and_native_sta
         });
 }
 
-fn run_large_stack_message_test<F>(name: &'static str, future: F)
+fn run_standard_stack_message_test<F>(name: &'static str, future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
-        .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"))
-        .block_on(async move {
-            tokio::spawn(future)
-                .await
-                .unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
-        });
+        .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
+    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    // Memvid indexing is best-effort and may outlive the assertions.  Do not
+    // let runtime shutdown wait indefinitely for detached blocking work.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
 }
 
 async fn capability_persistence_order_impl() {
@@ -1662,7 +1660,7 @@ async fn capability_persistence_order_impl() {
 
 #[test]
 fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "gateway CLI skill full-turn matrix test",
         gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl(),
     );
@@ -1840,7 +1838,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
 #[test]
 fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "CLI system skill rejection test",
         cli_runtime_system_skill_rejected_before_write_or_materialization_impl(),
     );
@@ -1907,7 +1905,7 @@ async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl(
 
 #[test]
 fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "native-agent system skill control test",
         cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl(),
     );
@@ -1973,7 +1971,7 @@ async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_fl
 
 #[test]
 fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "Codex skill restart test",
         codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl(),
     );
@@ -2017,7 +2015,6 @@ async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_im
 fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("Claude skill restart test runtime should build")
@@ -2079,7 +2076,7 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
 
 #[test]
 fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "Claude non-invocable skill rejection test",
         claude_skill_not_model_invocable_rejects_before_write_and_native_impl(),
     );
@@ -2145,7 +2142,7 @@ async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl()
 
 #[test]
 fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "CLI skill preflight failure test",
         cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn_impl(),
     );
@@ -2270,7 +2267,7 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
 
 #[test]
 fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "combined CLI preflight failure test",
         cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects_impl(),
     );
@@ -8265,7 +8262,7 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 
 #[test]
 fn collaborative_child_stop_cancels_task_and_survives_late_delivery() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "collaborative child cancellation and late delivery test",
         assert_collaborative_child_stop_cancels_task_and_survives_late_delivery(),
     );
@@ -19791,7 +19788,7 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
 
 #[test]
 fn cancelling_detached_native_child_turn_cancels_parent_task_anchor() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "detached native child cancellation projection test",
         assert_detached_native_child_turn_cancellation(),
     );
@@ -28586,7 +28583,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
 
 #[test]
 fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "CLI-disabled turn/start regression",
         turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl(),
     );
@@ -28684,7 +28681,7 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
 
 #[test]
 fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "Codex full-access security test",
         codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile_impl(),
     );
@@ -28802,7 +28799,7 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
 
 #[test]
 fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli() {
-    run_large_stack_message_test("production self-improvement vertical E2E", async {
+    run_standard_stack_message_test("production self-improvement vertical E2E", async {
         timeout(
             Duration::from_secs(120),
             production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli_impl(),
@@ -29646,7 +29643,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
 
 #[test]
 fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "Codex supervised security test",
         codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl(),
     );
@@ -29728,7 +29725,6 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() 
 fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("Claude supervised rejection test runtime should build")
@@ -29791,7 +29787,6 @@ async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runt
 fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("Claude legacy sandbox test runtime should build")
@@ -29861,7 +29856,6 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
 fn turn_start_security_audit_events_include_unavailable_sandbox_decision() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("CLI security audit test runtime should build")
@@ -32160,7 +32154,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
 
 #[test]
 fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "Codex Goal execution segment test",
         codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl(),
     );
@@ -38455,7 +38449,7 @@ async fn turn_get_returns_turn_snapshot() {
 
 #[test]
 fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
-    run_large_stack_message_test(
+    run_standard_stack_message_test(
         "turn cancel interruption and idempotency test",
         assert_turn_cancel_interrupts_running_turn_and_is_idempotent(),
     );

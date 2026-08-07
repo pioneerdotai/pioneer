@@ -111,7 +111,14 @@ impl ProviderRegistry {
 
     fn get_or_create_with_key(&self, key: ProviderCacheKey) -> Result<Arc<dyn Provider>> {
         {
-            let cache = self.cache.read().expect("provider cache poisoned");
+            // A poisoned cache must not panic the native agent actor. The
+            // registry only stores independently owned provider Arcs, so the
+            // map remains structurally usable after recovering the guard and
+            // the caller can continue through the normal provider error path.
+            let cache = self
+                .cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(provider) = cache.get(&key) {
                 return Ok(provider.clone());
             }
@@ -123,7 +130,10 @@ impl ProviderRegistry {
             }
         }
 
-        let mut cache = self.cache.write().expect("provider cache poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(provider) = cache.get(&key) {
             return Ok(provider.clone());
         }
@@ -146,13 +156,19 @@ impl ProviderRegistry {
     }
 
     pub fn insert(&self, name: impl Into<String>, provider: Arc<dyn Provider>) {
-        let mut cache = self.cache.write().expect("provider cache poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = name.into();
         cache.insert(ProviderCacheKey::global(name.as_str()), provider);
     }
 
     pub fn invalidate(&self, provider_name: &str) {
-        let mut cache = self.cache.write().expect("provider cache poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|key, _| key.provider_name != provider_name);
     }
 }
@@ -192,6 +208,21 @@ mod tests {
         let registry = ProviderRegistry::new(|_| String::new());
         let result = registry.get_or_create("nonexistent_provider_xyz");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn poisoned_cache_is_recovered_without_panicking() {
+        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.cache.write().expect("cache should be writable");
+            panic!("test cache poison");
+        }));
+        assert!(poisoned.is_err());
+
+        let provider = registry
+            .get_or_create("echo")
+            .expect("poisoned cache should remain readable");
+        assert_eq!(provider.name(), "echo");
     }
 
     #[test]

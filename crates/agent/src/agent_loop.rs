@@ -211,7 +211,10 @@ pub(super) async fn run_agent_loop(
     event_hub: Arc<AgentEventHub>,
 ) {
     let mut active_turn_id: Option<String> = None;
-    let mut active_turn_task: Option<JoinHandle<()>> = None;
+    // The actor is the owner of the active turn. If the actor exits
+    // unexpectedly, dropping a bare JoinHandle would detach provider/tool
+    // work and leave it without a consumer for its terminal command.
+    let mut active_turn_task: Option<ActiveTurnTask> = None;
     let mut active_turn_control: Option<TurnExecutionControl> = None;
     let mut active_turn_request: Option<ActiveTurnRequest> = None;
     let mut last_turn_request: Option<ActiveTurnRequest> = None;
@@ -341,7 +344,7 @@ pub(super) async fn run_agent_loop(
 
                 active_turn_run_id = Some(run_id);
 
-                active_turn_task = Some(spawn_turn_task(
+                active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -360,7 +363,7 @@ pub(super) async fn run_agent_loop(
                     turn_control,
                     task_recovery,
                     run_id,
-                ));
+                )));
 
                 let _ = ack.send(Ok(()));
             }
@@ -625,7 +628,7 @@ pub(super) async fn run_agent_loop(
                         last_turn_request = Some(next_turn_request.clone());
                         active_recovery = None;
 
-                        active_turn_task = Some(spawn_turn_task(
+                        active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                             command_tx.clone(),
                             event_hub.clone(),
                             thread_id.clone(),
@@ -644,7 +647,7 @@ pub(super) async fn run_agent_loop(
                             turn_control,
                             None,
                             run_id,
-                        ));
+                        )));
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
                         last_turn_observation = Some((
@@ -837,7 +840,7 @@ pub(super) async fn run_agent_loop(
                 }
 
                 if let Some(task) = active_turn_task.take() {
-                    wait_for_turn_task_shutdown(task).await;
+                    wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
                 let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.clone();
@@ -960,7 +963,7 @@ pub(super) async fn run_agent_loop(
                     let recovery = recovery_context(&request);
                     active_recovery = Some(recovery.clone());
 
-                    active_turn_task = Some(spawn_turn_task(
+                    active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                         command_tx.clone(),
                         event_hub.clone(),
                         thread_id.clone(),
@@ -979,7 +982,7 @@ pub(super) async fn run_agent_loop(
                         turn_control,
                         Some(recovery),
                         run_id,
-                    ));
+                    )));
 
                     let _ = ack.send(Ok(()));
                     continue;
@@ -1053,7 +1056,7 @@ pub(super) async fn run_agent_loop(
                     control.cancel_all_attempts().await;
                 }
                 if let Some(task) = active_turn_task.take() {
-                    wait_for_turn_task_shutdown(task).await;
+                    wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
 
                 if let Err(error) = publish_recovery_execution_window_continued(
@@ -1094,7 +1097,7 @@ pub(super) async fn run_agent_loop(
                 let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 active_turn_control = Some(turn_control.clone());
 
-                active_turn_task = Some(spawn_turn_task(
+                active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -1113,7 +1116,7 @@ pub(super) async fn run_agent_loop(
                     turn_control,
                     Some(recovery),
                     run_id,
-                ));
+                )));
 
                 let _ = ack.send(Ok(()));
             }
@@ -1204,7 +1207,7 @@ pub(super) async fn run_agent_loop(
                 last_turn_request = Some(active_request.clone());
                 active_recovery = Some(recovery.clone());
 
-                active_turn_task = Some(spawn_turn_task(
+                active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                     command_tx.clone(),
                     event_hub.clone(),
                     thread_id.clone(),
@@ -1223,7 +1226,7 @@ pub(super) async fn run_agent_loop(
                     turn_control,
                     Some(recovery),
                     run_id,
-                ));
+                )));
 
                 let _ = ack.send(Ok(()));
             }
@@ -1232,7 +1235,7 @@ pub(super) async fn run_agent_loop(
                     control.cancel_all_attempts().await;
                 }
                 if let Some(task) = active_turn_task.take() {
-                    wait_for_turn_task_shutdown(task).await;
+                    wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
                 break;
             }
@@ -1326,6 +1329,35 @@ fn spawn_turn_task(
             })
             .await;
     }))
+}
+
+struct ActiveTurnTask {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ActiveTurnTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn into_join_handle(mut self) -> JoinHandle<()> {
+        self.handle
+            .take()
+            .expect("active turn task handle should be present")
+    }
+}
+
+impl Drop for ActiveTurnTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            // Dropping the actor must fence its active owner. Normal
+            // cancellation takes the explicit cooperative path below; this
+            // is the last-resort actor-panic boundary.
+            handle.abort();
+        }
+    }
 }
 
 async fn wait_for_turn_task_shutdown(mut task: JoinHandle<()>) {

@@ -463,16 +463,32 @@ impl MessageProcessor {
         // same listener rather than letting the loser mistake an already leased
         // healthy receiver for a fatal closed lane.
         let mut listeners = self.agent_listener_tasks.lock().await;
-        if listeners
+        let has_live_listener = listeners
             .get(thread_id)
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Ok(());
-        }
-        listeners.remove(thread_id);
+            .is_some_and(|handle| !handle.is_finished());
+        // A stale actor replacement creates a fresh AgentEventHub while the
+        // old listener may still be draining the old hub.  A live listener is
+        // therefore not sufficient proof that the current hub is leased. If
+        // the current hub offers a receiver, fence the old listener and lease
+        // the new generation under the same mutex.
+        let replacement_receiver = if has_live_listener {
+            let receiver = self.agent_manager.take_durable_receiver(thread_id).await;
+            if receiver.is_none() {
+                return Ok(());
+            }
+            if let Some(handle) = listeners.remove(thread_id) {
+                handle.abort();
+            }
+            receiver
+        } else {
+            listeners.remove(thread_id);
+            None
+        };
 
-        let Some(mut durable_receiver) = self.agent_manager.take_durable_receiver(thread_id).await
-        else {
+        let Some(mut durable_receiver) = (match replacement_receiver {
+            Some(receiver) => Some(receiver),
+            None => self.agent_manager.take_durable_receiver(thread_id).await,
+        }) else {
             bail!("native durable listener receiver is already leased for thread `{thread_id}`");
         };
 

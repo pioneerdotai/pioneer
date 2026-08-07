@@ -44,6 +44,18 @@ pub const TURN_RECOVERY_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 // attempt alive; an unchanged episode still gets bounded and re-planned.
 const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 
+/// Distinguish causal execution progress from the periodic owner heartbeat.
+///
+/// `item/heartbeat` is emitted by a task that is waiting for a tool/provider
+/// operation and therefore can continue indefinitely even when that operation
+/// is stuck. It keeps the short idle lease alive, but must not defeat the
+/// bounded recovery-episode watchdog. Runtime observations are handled by the
+/// explicit CLI/native liveness paths and are not a recovery progress frontier
+/// by themselves.
+fn is_causal_recovery_progress(activity_kind: &str) -> bool {
+    !activity_kind.starts_with("runtime/") && activity_kind != "item/heartbeat"
+}
+
 type RecoveryListenerStarter =
     Arc<dyn Fn(String) -> BoxFuture<'static, std::result::Result<(), String>> + Send + Sync>;
 
@@ -1735,7 +1747,7 @@ impl RecoveryCoordinator {
                 .get_turn_liveness(job.turn_id.as_str())
                 .await?;
             let progress_since_attempt = progress_frontier.as_ref().is_some_and(|liveness| {
-                !liveness.last_activity_kind.starts_with("runtime/")
+                is_causal_recovery_progress(liveness.last_activity_kind.as_str())
                     && now_unix.saturating_sub(liveness.last_activity_at_unix)
                         <= RECOVERY_PROGRESS_STALE_SECS
                     && liveness.last_activity_at_unix
@@ -4247,7 +4259,7 @@ mod tests {
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
         RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
         RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
-        assemble_retained_provider_history,
+        assemble_retained_provider_history, is_causal_recovery_progress,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -7891,6 +7903,16 @@ mod tests {
             reloaded.active_attempt_id.as_deref(),
             Some(active_attempt_id.as_str())
         );
+    }
+
+    #[test]
+    fn periodic_item_heartbeat_is_not_recovery_progress() {
+        assert!(!is_causal_recovery_progress("item/heartbeat"));
+        assert!(!is_causal_recovery_progress("runtime/observed_in_progress"));
+        assert!(is_causal_recovery_progress("item/snapshot_updated"));
+        assert!(is_causal_recovery_progress(
+            "turn/execution_window_continued"
+        ));
     }
 
     #[tokio::test]
