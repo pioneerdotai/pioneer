@@ -53,7 +53,7 @@ impl PioneerDesktop {
         let foreground = cx.theme().foreground;
 
         Popover::new("composer-permission-popover")
-            .anchor(Corner::BottomLeft)
+            .anchor(Anchor::BottomLeft)
             .trigger(
                 Button::new("composer-permission-trigger")
                     .small()

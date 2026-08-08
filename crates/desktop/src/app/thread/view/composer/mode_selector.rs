@@ -1,26 +1,41 @@
-use crate::app::root::PioneerDesktop;
+use crate::app::root::{DesktopComposerEditTarget, PioneerDesktop};
 use crate::assets::PioneerIconName;
 use gpui::{prelude::*, *};
-use gpui_component::{
-    Icon,
-    button::*,
-    popover::{Popover, PopoverState},
-    theme::ActiveTheme,
-    *,
-};
+use gpui_component::{Icon, button::*, theme::ActiveTheme, *};
 use pioneer_client::composer::{
-    model_selection as composer_model_selection, state_machine::ComposerDomainAction,
+    model_selection as composer_model_selection,
+    state_machine::{ComposerDomainAction, ComposerReplyTarget},
 };
 use pioneer_protocol::ThreadMode;
 
 impl PioneerDesktop {
-    fn composer_mode_icon(mode: ThreadMode) -> PioneerIconName {
+    fn composer_mode_label(mode: ThreadMode) -> String {
         match mode {
-            ThreadMode::Agent => PioneerIconName::Infinity,
-            ThreadMode::Chat => PioneerIconName::MessageCircle,
-            ThreadMode::Message => {
-                unreachable!("the Message composer UI is introduced in Epic 7")
-            }
+            ThreadMode::Agent => t!("chat.composer.mode.agent_label").to_string(),
+            ThreadMode::Chat => t!("chat.composer.mode.chat_label").to_string(),
+            ThreadMode::Message => t!("chat.composer.mode.message_label").to_string(),
+        }
+    }
+
+    fn composer_mode_description(mode: ThreadMode) -> String {
+        match mode {
+            ThreadMode::Agent => t!("chat.composer.mode.agent_description").to_string(),
+            ThreadMode::Chat => t!("chat.composer.mode.chat_description").to_string(),
+            ThreadMode::Message => t!("chat.composer.mode.message_description").to_string(),
+        }
+    }
+
+    fn composer_mode_button_icon(mode: ThreadMode) -> AnyElement {
+        match mode {
+            ThreadMode::Agent => Icon::new(PioneerIconName::Infinity)
+                .size_3p5()
+                .into_any_element(),
+            ThreadMode::Chat => Icon::new(PioneerIconName::MessageCircle)
+                .size_3p5()
+                .into_any_element(),
+            ThreadMode::Message => Icon::new(PioneerIconName::Users)
+                .size_3p5()
+                .into_any_element(),
         }
     }
 
@@ -29,162 +44,223 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected_mode = self.composer_turn_mode;
-        let trigger_icon = Self::composer_mode_icon(selected_mode);
-        let trigger_label = match selected_mode {
-            ThreadMode::Agent => t!("chat.composer.mode.agent_label").to_string(),
-            ThreadMode::Chat => t!("chat.composer.mode.chat_label").to_string(),
-            ThreadMode::Message => {
-                unreachable!("the Message composer UI is introduced in Epic 7")
-            }
-        };
-
         let desktop_entity = cx.entity();
-
-        let ghost_hover = if cx.theme().mode.is_dark() {
-            cx.theme().secondary.lighten(0.2).opacity(0.8)
+        let content = if let Some(target) = self.composer_edit_target.clone() {
+            vec![self.render_composer_edit_target(target, cx)]
+        } else if let Some(target) = self.composer_reply_target.clone() {
+            vec![self.render_composer_reply_target(target, cx)]
         } else {
-            cx.theme().secondary.darken(0.1).opacity(0.8)
-        };
-
-        let ghost_active = if cx.theme().mode.is_dark() {
-            cx.theme().secondary.lighten(0.3).opacity(0.8)
-        } else {
-            cx.theme().secondary.darken(0.2).opacity(0.8)
-        };
-
-        let muted_bg = cx.theme().muted;
-        let radius = cx.theme().radius;
-        let foreground = cx.theme().foreground;
-
-        Popover::new("composer-mode-popover")
-            .anchor(Corner::TopRight)
-            .trigger(
-                Button::new("composer-mode-trigger")
-                    .small()
-                    .ghost()
-                    .compact()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .opacity(0.6)
-                            .child(Icon::new(trigger_icon).size_3p5())
-                            .child(trigger_label)
-                            .font_medium(),
-                    ),
-            )
-            .content(move |_, _, popover_cx| {
-                let popover_entity: Entity<PopoverState> = popover_cx.entity();
-
-                let render_option = |id: &'static str,
-                                     mode: ThreadMode,
-                                     icon: PioneerIconName,
-                                     label: String,
-                                     description: String| {
+            composer_model_selection::composer_turn_mode_options()
+                .into_iter()
+                .map(|mode| {
+                    let id = match mode {
+                        ThreadMode::Agent => "composer-mode-agent",
+                        ThreadMode::Chat => "composer-mode-chat",
+                        ThreadMode::Message => "composer-mode-message",
+                    };
                     let is_active = selected_mode == mode;
-
                     let desktop_entity = desktop_entity.clone();
-                    let popover_entity = popover_entity.clone();
+                    let hover_entity = desktop_entity.clone();
+                    let description = Self::composer_mode_description(mode);
+                    let show_label = is_active || self.composer_hovered_mode == Some(mode);
+                    let hover_id = format!("{id}-hover");
 
-                    div()
-                        .id(id)
-                        .w_full()
-                        .cursor_pointer()
-                        .rounded(radius)
-                        .p_2()
-                        .text_color(foreground)
-                        .when(is_active, |d| d.bg(muted_bg))
-                        .hover(move |d| d.bg(ghost_hover))
-                        .active(move |d| d.bg(ghost_active))
-                        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                            window.prevent_default();
-                        })
-                        .on_click(move |_, window, cx| {
+                    let button = Button::new(id)
+                        .ghost()
+                        .rounded_full()
+                        .gap_2()
+                        .h_7()
+                        .disabled(self.composer_upload_in_progress)
+                        .selected(is_active)
+                        .tooltip(description)
+                        .on_click(move |_, _, cx| {
                             let _ = desktop_entity.update(cx, |view, cx| {
-                                if view
-                                    .reduce_composer_domain(ComposerDomainAction::SetModeFromUser {
-                                        mode,
-                                    })
-                                    .changed
-                                {
+                                let transition = view.reduce_composer_domain(
+                                    ComposerDomainAction::SetModeFromUser { mode },
+                                );
+                                if mode != ThreadMode::Message {
+                                    view.sync_composer_model_selection_for_active_thread();
+                                }
+                                if transition.changed {
                                     cx.notify();
                                 }
-                            });
-                            let _ = popover_entity.update(cx, |state, cx| {
-                                state.dismiss(window, cx);
                             });
                         })
                         .child(
                             h_flex()
-                                .w_full()
                                 .items_center()
-                                .gap_3()
-                                .child(Icon::new(icon).size_4())
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap_1p5()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .line_height(relative(1.0))
-                                                .font_semibold()
-                                                .whitespace_normal()
-                                                .child(label),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .line_height(relative(1.3))
-                                                .whitespace_normal()
-                                                .opacity(0.6)
-                                                .child(description),
-                                        ),
-                                ),
-                        )
-                        .into_any_element()
-                };
+                                .gap_1()
+                                .child(Self::composer_mode_button_icon(mode))
+                                .when(show_label, |this| {
+                                    this.child(Self::composer_mode_label(mode))
+                                })
+                                .font_medium()
+                                .text_xs()
+                                .when(!is_active, |this| this.opacity(0.6)),
+                        );
 
-                v_flex().w(px(320.)).gap_1().children(
-                    composer_model_selection::composer_turn_mode_options()
-                        .into_iter()
-                        .map(|mode| {
-                            let (id, description) = match mode {
-                                ThreadMode::Agent => (
-                                    "composer-mode-agent",
-                                    t!("chat.composer.mode.agent_description").to_string(),
-                                ),
-                                ThreadMode::Chat => (
-                                    "composer-mode-chat",
-                                    t!("chat.composer.mode.chat_description").to_string(),
-                                ),
-                                ThreadMode::Message => {
-                                    unreachable!("the Message composer UI is introduced in Epic 7")
+                    div()
+                        .id(hover_id)
+                        .on_hover(move |hovered, _, cx| {
+                            let _ = hover_entity.update(cx, |view, cx| {
+                                if *hovered {
+                                    view.composer_hovered_mode = Some(mode);
+                                } else if view.composer_hovered_mode == Some(mode) {
+                                    view.composer_hovered_mode = None;
                                 }
-                            };
-                            render_option(
-                                id,
-                                mode,
-                                Self::composer_mode_icon(mode),
-                                match mode {
-                                    ThreadMode::Agent => {
-                                        t!("chat.composer.mode.agent_label").to_string()
-                                    }
-                                    ThreadMode::Chat => {
-                                        t!("chat.composer.mode.chat_label").to_string()
-                                    }
-                                    ThreadMode::Message => {
-                                        unreachable!(
-                                            "the Message composer UI is introduced in Epic 7"
-                                        )
-                                    }
-                                },
-                                description,
-                            )
-                        }),
-                )
-            })
+                                cx.notify();
+                            });
+                        })
+                        .child(button)
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        div()
+            .w_full()
+            .flex_none()
+            .px_3p5()
+            .child(
+                h_flex()
+                    .id("composer-mode-selector")
+                    .w_full()
+                    // The selector is a fixed-height toolbar.  Keep it out of the
+                    // flex distribution of the thread body so switching modes cannot
+                    // make the composer (or the timeline) consume the remaining
+                    // height.
+                    .flex_none()
+                    .items_center()
+                    .gap_0p5()
+                    .rounded_t_2xl()
+                    .bg(cx.theme().muted)
+                    .px_1p5()
+                    .pt_1p5()
+                    .pb_1()
+                    .children(content),
+            )
             .into_any_element()
+    }
+
+    fn render_composer_reply_target(
+        &self,
+        target: ComposerReplyTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = target
+            .author_display_name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| t!("timeline.message.unknown_author").to_string());
+        let preview = target
+            .preview
+            .unwrap_or_else(|| t!("timeline.message.reply_unavailable").to_string());
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "composer-reply-{}",
+                target.turn_id
+            )))
+            .w_full()
+            .min_w_0()
+            .h_7()
+            .items_center()
+            .gap_10()
+            .pl_2()
+            .pr_0p5()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .font_medium()
+                    .child(format!("{label}: {preview}")),
+            )
+            .child(
+                Button::new("cancel-composer-reply")
+                    .small()
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Close)
+                    .disabled(self.composer_upload_in_progress)
+                    .tooltip(t!("chat.composer.reply.cancel").to_string())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.reduce_composer_domain(ComposerDomainAction::ClearReplyTarget);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_composer_edit_target(
+        &self,
+        target: DesktopComposerEditTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = t!("timeline.message.edit_title").to_string();
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "composer-edit-{}",
+                target.presentation.turn_id
+            )))
+            .w_full()
+            .min_w_0()
+            .h_7()
+            .items_center()
+            .gap_10()
+            .pl_2()
+            .pr_0p5()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .font_medium()
+                    .child(format!("{label}: {}", target.preview)),
+            )
+            .child(
+                Button::new("cancel-composer-edit")
+                    .small()
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Close)
+                    .disabled(self.message_mutation_pending)
+                    .tooltip(t!("buttons.cancel").to_string())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.cancel_composer_message_edit(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_mode_selector_has_all_three_shared_modes_without_legacy_unreachable_path() {
+        let source = include_str!("mode_selector.rs");
+        for id in [
+            "composer-mode-message",
+            "composer-mode-chat",
+            "composer-mode-agent",
+        ] {
+            assert!(source.contains(id));
+        }
+        assert!(!source.contains(&["Message composer UI", " is introduced"].concat()));
+    }
+
+    #[test]
+    fn desktop_reply_replaces_mode_buttons_with_truncated_cancelable_context() {
+        let source = include_str!("mode_selector.rs");
+        assert!(source.contains("self.composer_reply_target.clone()"));
+        assert!(source.contains(".text_ellipsis()"));
+        assert!(source.contains("cancel-composer-reply"));
     }
 }

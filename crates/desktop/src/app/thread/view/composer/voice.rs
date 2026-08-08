@@ -28,7 +28,7 @@ use pioneer_client::{
     turns::start as turn_start,
     voice::{VoiceFinalizeUiAction, reduce_voice_session_finalize_response},
 };
-use pioneer_protocol::{VoiceSessionStartContext, VoiceStatus, VoiceStatusParams};
+use pioneer_protocol::{ThreadMode, VoiceSessionStartContext, VoiceStatus, VoiceStatusParams};
 use std::time::Duration;
 use tracing::warn;
 
@@ -162,7 +162,9 @@ impl PioneerDesktop {
                     return;
                 }
 
-                Timer::after(DESKTOP_VOICE_STATUS_RETRY_INTERVAL).await;
+                cx.background_executor()
+                    .timer(DESKTOP_VOICE_STATUS_RETRY_INTERVAL)
+                    .await;
                 let _ = this.update(&mut cx, |view, cx| {
                     if view.gateway.ws_connection_id == Some(connection_id)
                         && view.gateway.connection_state == GatewayConnectionState::Connected
@@ -190,10 +192,12 @@ impl PioneerDesktop {
                     self.gateway.connection_state,
                 ),
                 active_thread: self.current_active_thread_id().is_some(),
-                model_selected: self.has_complete_composer_model_selection(),
-                conversation_can_submit: self
-                    .active_thread_conversation()
-                    .is_some_and(|conversation| conversation.can_submit_message()),
+                model_selected: self.composer_turn_mode == ThreadMode::Message
+                    || self.has_complete_composer_model_selection(),
+                conversation_can_submit: self.composer_turn_mode == ThreadMode::Message
+                    || self
+                        .active_thread_conversation()
+                        .is_some_and(|conversation| conversation.can_submit_message()),
                 upload_idle: !self.composer_upload_in_progress,
             },
             voice_input_enabled,
@@ -326,7 +330,9 @@ impl PioneerDesktop {
                     .update(&mut cx, |view, _| view.gateway.session_refresh_in_flight)
                     .unwrap_or(false)
                 {
-                    Timer::after(DESKTOP_VOICE_SESSION_READY_RETRY_DELAY).await;
+                    cx.background_executor()
+                        .timer(DESKTOP_VOICE_SESSION_READY_RETRY_DELAY)
+                        .await;
                 }
                 let preflight_result = cx
                     .background_spawn({

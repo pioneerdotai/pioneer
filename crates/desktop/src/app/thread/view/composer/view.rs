@@ -9,6 +9,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     IconName,
     button::*,
+    combobox::Combobox,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
     spinner::Spinner,
@@ -18,7 +19,11 @@ use gpui_component::{
 use pioneer_client::composer::skill_selection::{
     ComposerSkillChip, ComposerSkillChipKind, ComposerSkillSelection, project_composer_skill_chips,
 };
+use pioneer_client::composer::state_machine::{
+    ComposerDomainAction, ComposerMentionCandidate, composer_mention_candidates,
+};
 use pioneer_client::state::snapshot::ActiveThreadSnapshot;
+use pioneer_protocol::{ThreadMode, WorkspaceId};
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +44,7 @@ struct DesktopComposerPrimaryActionState {
 struct DesktopComposerPrimaryActionInput {
     voice_hold_ui_active: bool,
     has_in_flight_turn: bool,
+    message_mode: bool,
     composer_text_empty: bool,
     voice_entry_availability: DesktopVoiceEntryAvailability,
     can_send: bool,
@@ -71,7 +77,7 @@ fn resolve_desktop_composer_primary_action(
 ) -> DesktopComposerPrimaryActionState {
     let action = if input.voice_hold_ui_active {
         DesktopComposerPrimaryAction::VoiceReady
-    } else if input.has_in_flight_turn {
+    } else if input.has_in_flight_turn && !input.message_mode {
         DesktopComposerPrimaryAction::Stop
     } else if input.composer_text_empty
         && input.voice_entry_availability == DesktopVoiceEntryAvailability::Ready
@@ -86,7 +92,9 @@ fn resolve_desktop_composer_primary_action(
         DesktopComposerPrimaryAction::Send => !input.voice_send_processing && !input.can_send,
     };
     let loading = input.upload_in_progress
-        || (input.has_in_flight_turn && input.is_cancelling)
+        || (action == DesktopComposerPrimaryAction::Stop
+            && input.has_in_flight_turn
+            && input.is_cancelling)
         || input.voice_send_processing;
 
     DesktopComposerPrimaryActionState {
@@ -97,14 +105,23 @@ fn resolve_desktop_composer_primary_action(
 }
 
 impl PioneerDesktop {
-    pub(crate) fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_composer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
         let capabilities = self.effective_composer_capabilities();
         let skill_chips = self.composer_skill_chips();
-        let upload_error = self.composer_upload_error.clone();
+        let composer_error = self
+            .composer_edit_target
+            .as_ref()
+            .and_then(|target| target.error.clone())
+            .or_else(|| self.composer_upload_error.clone());
         let microphone_error = self.desktop_microphone_error_message();
-        let can_send = self.can_submit_message(cx);
+        let editing_message = self.composer_edit_target.is_some();
+        let message_mode = self.composer_turn_mode == ThreadMode::Message;
         let active_thread_snapshot = self.client_snapshot().active_thread;
         let gateway_connected =
             self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
@@ -116,6 +133,14 @@ impl PioneerDesktop {
         let can_stop = active_turn_state.can_stop;
         let has_in_flight_turn = active_turn_state.has_in_flight_turn;
         let composer_text = composer_state.read(cx).value().trim().to_owned();
+        let can_send = if let Some(target) = self.composer_edit_target.as_ref() {
+            gateway_connected
+                && !self.message_mutation_pending
+                && !target.conflicted
+                && (!composer_text.is_empty() || !target.artifacts.is_empty())
+        } else {
+            self.can_submit_message(cx)
+        };
         let cli_runtime_thread_binding = if has_in_flight_turn {
             active_thread_snapshot
                 .thread_id
@@ -144,21 +169,25 @@ impl PioneerDesktop {
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
         let desktop_voice_send_processing = self.desktop_voice_send_processing();
-        let voice_entry_availability = if has_in_flight_turn {
+        let voice_entry_availability = if editing_message
+            || (has_in_flight_turn && !message_mode)
+        {
             DesktopVoiceEntryAvailability::Hidden
         } else {
             self.desktop_voice_entry_availability()
         };
+        let composer_busy = self.composer_upload_in_progress || self.message_mutation_pending;
         let composer_primary_action =
             resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
                 voice_hold_ui_active: desktop_voice_hold_ui_active,
                 has_in_flight_turn,
+                message_mode,
                 composer_text_empty: composer_text.is_empty(),
                 voice_entry_availability,
                 can_send,
                 can_stop,
                 is_cancelling,
-                upload_in_progress: self.composer_upload_in_progress,
+                upload_in_progress: composer_busy,
                 voice_send_processing: desktop_voice_send_processing,
             });
         let composer_action_loading = composer_primary_action.loading;
@@ -171,195 +200,399 @@ impl PioneerDesktop {
         } else {
             "send-message"
         };
+        let mention_picker = if message_mode {
+            self.render_composer_mention_picker(window, cx)
+        } else {
+            None
+        };
 
         h_flex()
             .w_full()
+            .flex_none()
             .justify_center()
             .pb_4()
             .child(
-                v_flex().w_full().max_w(px(800.)).px_6().child(
-                    v_flex()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded_2xl()
-                        .shadow_xs()
-                        .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
-                            view.update_desktop_voice_hold_pointer(event.position, cx);
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|view, event: &MouseUpEvent, _, cx| {
-                                view.release_desktop_voice_hold_at(event.position, cx);
-                            }),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|view, event: &MouseUpEvent, _, cx| {
-                                view.release_desktop_voice_hold_at(event.position, cx);
-                            }),
-                        )
-                        .child(
-                            v_flex()
-                                .bg(cx.theme().background)
-                                .rounded_t_2xl()
-                                .when(
-                                    !attachments.is_empty()
-                                        || !capabilities.is_empty()
-                                        || !skill_chips.is_empty(),
-                                    |this| this.child(self.render_composer_chip_badges(cx)),
-                                )
-                                .when_some(upload_error, |this, error| {
-                                    this.child(
-                                        h_flex()
-                                            .mx_2()
-                                            .mb_2()
-                                            .gap_2()
-                                            .items_start()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().danger.opacity(0.25))
-                                            .bg(cx.theme().danger.opacity(0.08))
-                                            .px_2()
-                                            .py_1p5()
-                                            .child(
-                                                Icon::new(IconName::TriangleAlert)
-                                                    .size_3()
-                                                    .text_color(cx.theme().danger),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .line_height(relative(1.25))
-                                                    .text_color(cx.theme().danger)
-                                                    .child(error),
-                                            ),
-                                    )
-                                })
-                                .when_some(microphone_error, |this, error| {
-                                    this.child(
-                                        h_flex()
-                                            .mx_2()
-                                            .mb_2()
-                                            .gap_2()
-                                            .items_start()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().danger.opacity(0.25))
-                                            .bg(cx.theme().danger.opacity(0.08))
-                                            .px_2()
-                                            .py_1p5()
-                                            .child(
-                                                Icon::new(IconName::TriangleAlert)
-                                                    .size_3()
-                                                    .text_color(cx.theme().danger),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .line_height(relative(1.25))
-                                                    .text_color(cx.theme().danger)
-                                                    .child(error),
-                                            ),
-                                    )
-                                })
-                                .child(if desktop_voice_hold_ui_active {
-                                    self.render_desktop_voice_hold_prompt(cx)
-                                } else {
-                                    Input::new(&composer_state)
-                                        .appearance(false)
-                                        .disabled(desktop_voice_context_locked)
-                                        .into_any_element()
+                v_flex()
+                    .w_full()
+                    .flex_none()
+                    .max_w(px(800.))
+                    .px_6()
+                    .items_end()
+                    .child(self.render_composer_mode_selector(cx))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .flex_none()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded_2xl()
+                            .shadow_xs()
+                            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                                view.update_desktop_voice_hold_pointer(event.position, cx);
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                                    view.release_desktop_voice_hold_at(event.position, cx);
                                 }),
-                        )
-                        .child(
-                            h_flex()
-                                .px_2()
-                                .pb_2()
-                                .justify_between()
-                                .items_center()
-                                .bg(cx.theme().background)
-                                .rounded_b_2xl()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(self.render_composer_add_menu(cx))
-                                        .child(self.render_composer_permission_selector(cx))
-                                        .child(self.render_composer_model_selector(cx)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when(has_cli_runtime_steer_target, |this| {
-                                            this.child(
-                                                Button::new("steer-running-cli-runtime-turn")
-                                                    .small()
-                                                    .ghost()
-                                                    .rounded_full()
-                                                    .icon(IconName::ArrowUp)
-                                                    .tooltip(
-                                                        t!("chat.composer.steer_cli_runtime")
-                                                            .to_string(),
-                                                    )
-                                                    .disabled(!can_steer_cli_runtime_turn)
-                                                    .on_click(cx.listener(
-                                                        move |view, _, window, cx| {
-                                                            view.steer_active_cli_runtime_turn(
-                                                                window, cx,
-                                                            );
-                                                        },
-                                                    )),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                                    view.release_desktop_voice_hold_at(event.position, cx);
+                                }),
+                            )
+                            .child(
+                                v_flex()
+                                    .bg(cx.theme().background)
+                                    .rounded_t_2xl()
+                                    .when(
+                                        !attachments.is_empty()
+                                            || !capabilities.is_empty()
+                                            || !skill_chips.is_empty(),
+                                        |this| this.child(self.render_composer_chip_badges(cx)),
+                                    )
+                                    .when_some(composer_error, |this, error| {
+                                        this.child(
+                                            h_flex()
+                                                .mx_2()
+                                                .mb_2()
+                                                .gap_2()
+                                                .items_start()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(cx.theme().danger.opacity(0.25))
+                                                .bg(cx.theme().danger.opacity(0.08))
+                                                .px_2()
+                                                .py_1p5()
+                                                .child(
+                                                    Icon::new(IconName::TriangleAlert)
+                                                        .size_3()
+                                                        .text_color(cx.theme().danger),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .line_height(relative(1.25))
+                                                        .text_color(cx.theme().danger)
+                                                        .child(error),
+                                                ),
+                                        )
+                                    })
+                                    .when_some(microphone_error, |this, error| {
+                                        this.child(
+                                            h_flex()
+                                                .mx_2()
+                                                .mb_2()
+                                                .gap_2()
+                                                .items_start()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(cx.theme().danger.opacity(0.25))
+                                                .bg(cx.theme().danger.opacity(0.08))
+                                                .px_2()
+                                                .py_1p5()
+                                                .child(
+                                                    Icon::new(IconName::TriangleAlert)
+                                                        .size_3()
+                                                        .text_color(cx.theme().danger),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .line_height(relative(1.25))
+                                                        .text_color(cx.theme().danger)
+                                                        .child(error),
+                                                ),
+                                        )
+                                    })
+                                    .child(if desktop_voice_hold_ui_active {
+                                        self.render_desktop_voice_hold_prompt(cx)
+                                    } else {
+                                        Input::new(&composer_state)
+                                            .appearance(false)
+                                            .disabled(
+                                                desktop_voice_context_locked
+                                                    || composer_busy,
                                             )
-                                        })
-                                        .child(match composer_primary_action {
-                                            DesktopComposerPrimaryAction::VoiceReady => {
-                                                self.render_desktop_voice_idle_button(cx)
-                                            }
-                                            DesktopComposerPrimaryAction::Send
-                                            | DesktopComposerPrimaryAction::Stop => {
-                                                Button::new(composer_action_id)
-                                                    .primary()
-                                                    .rounded_full()
-                                                    .disabled(composer_action_disabled)
-                                                    .loading(composer_action_loading)
-                                                    .when(composer_action_is_stop, |this| {
-                                                        this.icon(PioneerIconName::Square)
-                                                    })
-                                                    .when(!composer_action_is_stop, |this| {
-                                                        this.icon(IconName::ArrowUp)
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |view, _, window, cx| {
-                                                            if composer_action_is_stop {
+                                            .into_any_element()
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .px_2()
+                                    .pb_2()
+                                    .justify_between()
+                                    .items_center()
+                                    .bg(cx.theme().background)
+                                    .rounded_b_2xl()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(self.render_composer_add_menu(cx))
+                                            .when_some(mention_picker, |this, picker| {
+                                                this.child(picker)
+                                            })
+                                            .when(!message_mode, |this| {
+                                                this.child(
+                                                    self.render_composer_permission_selector(cx),
+                                                )
+                                                .child(self.render_composer_model_selector(cx))
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .when(message_mode && has_in_flight_turn, |this| {
+                                                this.child(
+                                                    Button::new("stop-turn-while-messaging")
+                                                        .small()
+                                                        .ghost()
+                                                        .rounded_full()
+                                                        .icon(PioneerIconName::Square)
+                                                        .tooltip(
+                                                            t!("chat.composer.stop_reason")
+                                                                .to_string(),
+                                                        )
+                                                        .disabled(!can_stop)
+                                                        .loading(is_cancelling)
+                                                        .on_click(cx.listener(
+                                                            |view, _, window, cx| {
                                                                 view.stop_active_turn(window, cx);
-                                                            } else {
-                                                                view.submit_composer_message(
+                                                            },
+                                                        )),
+                                                )
+                                            })
+                                            .when(has_cli_runtime_steer_target, |this| {
+                                                this.child(
+                                                    Button::new("steer-running-cli-runtime-turn")
+                                                        .small()
+                                                        .ghost()
+                                                        .rounded_full()
+                                                        .icon(IconName::ArrowUp)
+                                                        .tooltip(
+                                                            t!("chat.composer.steer_cli_runtime")
+                                                                .to_string(),
+                                                        )
+                                                        .disabled(!can_steer_cli_runtime_turn)
+                                                        .on_click(cx.listener(
+                                                            move |view, _, window, cx| {
+                                                                view.steer_active_cli_runtime_turn(
                                                                     window, cx,
                                                                 );
-                                                            }
-                                                        },
-                                                    ))
-                                                    .into_any_element()
-                                            }
-                                        }),
-                                ),
-                        ),
-                ),
+                                                            },
+                                                        )),
+                                                )
+                                            })
+                                            .child(match composer_primary_action {
+                                                DesktopComposerPrimaryAction::VoiceReady => {
+                                                    self.render_desktop_voice_idle_button(cx)
+                                                }
+                                                DesktopComposerPrimaryAction::Send
+                                                | DesktopComposerPrimaryAction::Stop => {
+                                                    Button::new(composer_action_id)
+                                                        .primary()
+                                                        .rounded_full()
+                                                        .disabled(composer_action_disabled)
+                                                        .loading(composer_action_loading)
+                                                        .when(composer_action_is_stop, |this| {
+                                                            this.icon(PioneerIconName::Square)
+                                                        })
+                                                        .when(!composer_action_is_stop, |this| {
+                                                            this.icon(IconName::ArrowUp)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |view, _, window, cx| {
+                                                                if composer_action_is_stop {
+                                                                    view.stop_active_turn(
+                                                                        window, cx,
+                                                                    );
+                                                                } else {
+                                                                    if view
+                                                                        .composer_edit_target
+                                                                        .is_some()
+                                                                    {
+                                                                        view.submit_composer_message_edit(
+                                                                            window, cx,
+                                                                        );
+                                                                    } else {
+                                                                        view.submit_composer_message(
+                                                                            window, cx,
+                                                                        );
+                                                                    }
+                                                                }
+                                                            },
+                                                        ))
+                                                        .into_any_element()
+                                                }
+                                            }),
+                                    ),
+                            ),
+                    ),
             )
             .into_any_element()
     }
 
+    fn render_composer_mention_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let workspace_id = self
+            .current_active_thread_id()
+            .and_then(|thread_id| self.thread_workspace_id(thread_id))
+            .and_then(|workspace_id| WorkspaceId::new(workspace_id.to_owned()).ok());
+        let directory_loading = workspace_id
+            .as_ref()
+            .is_some_and(|workspace_id| self.workspace_members_loading.contains(workspace_id));
+        let candidates = workspace_id
+            .as_ref()
+            .and_then(|workspace_id| self.administration.workspace_members(workspace_id))
+            .map(|members| composer_mention_candidates(members.iter().cloned()))
+            .unwrap_or_default();
+
+        // There is no useful action when a workspace has no active members to
+        // mention. Keep the toolbar clean instead of opening an empty picker.
+        if candidates.is_empty() && !directory_loading {
+            return None;
+        }
+
+        // Updating the Combobox items on every render resets SearchableVec's
+        // current query and makes typing appear to have no effect. Keep the
+        // source candidates in the view and replace the items only when the
+        // workspace member list actually changes.
+        if self.composer_mention_items != candidates {
+            self.composer_mention_items = candidates.clone();
+
+            let select_items = gpui_component::searchable_list::SearchableVec::new(
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let avatar_path = self
+                            .member_avatar_state
+                            .presentation(&candidate.principal_id)
+                            .and_then(|avatar| avatar.cached_image_path.clone());
+                        crate::app::root::DesktopComposerMentionItem {
+                            candidate,
+                            avatar_path,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            self.composer_mention_select.update(cx, |state, cx| {
+                state.set_items(select_items, window, cx);
+            });
+        }
+
+        let trigger = if directory_loading || self.composer_upload_in_progress {
+            div()
+                .size_6()
+                .ml_0p5()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.35)
+                .child(Icon::new(PioneerIconName::AtSign).size_3p5())
+                .into_any_element()
+        } else {
+            let hover_background = if cx.theme().mode.is_dark() {
+                cx.theme().secondary.lighten(0.1).opacity(0.8)
+            } else {
+                cx.theme().secondary.darken(0.1).opacity(0.8)
+            };
+            let active_background = if cx.theme().mode.is_dark() {
+                cx.theme().secondary.lighten(0.2).opacity(0.8)
+            } else {
+                cx.theme().secondary.darken(0.2).opacity(0.8)
+            };
+
+            div()
+                .size_6()
+                .relative()
+                .child(
+                    Combobox::new(&self.composer_mention_select)
+                        .appearance(false)
+                        .search_placeholder(t!("chat.composer.mention.search").to_string())
+                        .placeholder("")
+                        .menu_width(px(420.))
+                        // This picker is intentionally single-select. Mentions remain in the
+                        // composer text, but the dropdown does not present a persistent checked
+                        // selection when opened again.
+                        .check_icon(Icon::new(IconName::Check).opacity(0.0))
+                        .with_size(gpui_component::Size::Small)
+                        .render_trigger(|_, _, _| div()),
+                )
+                // The current Combobox always paints its focus border for a custom
+                // trigger. Paint the actual button above that container so the
+                // trigger keeps button hover/active feedback without a stuck ring.
+                .child(
+                    div().absolute().inset_0().bg(cx.theme().background).child(
+                        div()
+                            .id("composer-mention-trigger-button")
+                            .size_full()
+                            .flex()
+                            .ml_0p5()
+                            .items_center()
+                            .justify_center()
+                            .rounded(cx.theme().radius)
+                            .cursor_pointer()
+                            .text_color(cx.theme().secondary_foreground)
+                            .hover(move |this| this.bg(hover_background))
+                            .active(move |this| this.bg(active_background))
+                            .child(Icon::new(PioneerIconName::AtSign).size_3p5().opacity(0.6)),
+                    ),
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("composer-mention-picker")
+                .size_6()
+                .child(trigger)
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn insert_composer_mention(
+        &mut self,
+        candidate: ComposerMentionCandidate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let token = format!("@{}", candidate.nickname.trim());
+        let current = self.composer_state.read(cx).value();
+        let next = if current.trim().is_empty() {
+            format!("{token} ")
+        } else if current.contains(token.as_str()) {
+            current.to_string()
+        } else {
+            format!("{} {token} ", current.trim_end())
+        };
+        self.composer_state.update(cx, move |state, cx| {
+            state.set_value(next, window, cx);
+            state.focus(window, cx);
+        });
+        self.reduce_composer_domain(ComposerDomainAction::SelectMention { candidate });
+        cx.notify();
+    }
+
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let disabled = self.composer_upload_in_progress || self.desktop_voice_context_locked();
+        let disabled = self.composer_upload_in_progress
+            || self.message_mutation_pending
+            || self.composer_edit_target.is_some()
+            || self.desktop_voice_context_locked();
+        let message_mode = self.composer_turn_mode == ThreadMode::Message;
         Button::new("composer-add-attachment")
             .small()
             .ghost()
             .compact()
             .child(Icon::new(IconName::Plus).size_5().opacity(0.6))
             .disabled(disabled)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _, _| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let menu = menu.min_w(px(196.)).item(Self::composer_add_menu_item(
                     t!("chat.composer.add_menu.files").to_string().into(),
                     PioneerIconName::Paperclip,
@@ -373,6 +606,10 @@ impl PioneerDesktop {
                         }
                     },
                 ));
+
+                if message_mode {
+                    return menu;
+                }
 
                 let menu = menu.item(Self::composer_add_menu_item(
                     t!("chat.composer.add_menu.skills").to_string().into(),
@@ -752,6 +989,7 @@ mod tests {
     const READY_INPUT: DesktopComposerPrimaryActionInput = DesktopComposerPrimaryActionInput {
         voice_hold_ui_active: false,
         has_in_flight_turn: false,
+        message_mode: false,
         composer_text_empty: true,
         voice_entry_availability: DesktopVoiceEntryAvailability::Ready,
         can_send: false,
@@ -857,6 +1095,25 @@ mod tests {
         assert_eq!(
             resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
                 composer_text_empty: false,
+                can_send: true,
+                ..READY_INPUT
+            }),
+            DesktopComposerPrimaryActionState {
+                action: DesktopComposerPrimaryAction::Send,
+                disabled: false,
+                loading: false,
+            },
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn message_mode_can_send_while_an_execution_is_running() {
+        assert_eq!(
+            resolve_desktop_composer_primary_action(DesktopComposerPrimaryActionInput {
+                has_in_flight_turn: true,
+                message_mode: true,
+                composer_text_empty: false,
+                voice_entry_availability: DesktopVoiceEntryAvailability::Hidden,
                 can_send: true,
                 ..READY_INPUT
             }),

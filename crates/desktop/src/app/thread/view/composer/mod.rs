@@ -29,6 +29,7 @@ impl PioneerDesktop {
             gateway_connected: desktop_composer_transport_ready(self.gateway.connection_state),
             upload_in_progress: self.composer_upload_in_progress,
             has_active_thread: self.current_active_thread_id().is_some(),
+            selected_mode: self.composer_turn_mode,
             has_complete_model_selection: self.has_complete_composer_model_selection(),
             conversation_can_submit: self
                 .active_thread_conversation()
