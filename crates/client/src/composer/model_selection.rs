@@ -275,11 +275,11 @@ pub fn resolve_composer_model_selection(
 }
 
 pub fn default_composer_turn_mode() -> ThreadMode {
-    ThreadMode::Agent
+    ThreadMode::Message
 }
 
-pub fn composer_turn_mode_options() -> [ThreadMode; 2] {
-    [ThreadMode::Agent, ThreadMode::Chat]
+pub fn composer_turn_mode_options() -> [ThreadMode; 3] {
+    [ThreadMode::Message, ThreadMode::Agent, ThreadMode::Chat]
 }
 
 pub fn set_composer_turn_mode(current: &mut ThreadMode, mode: ThreadMode) -> bool {
@@ -720,12 +720,12 @@ mod tests {
     fn set_composer_turn_mode_reports_changes() {
         let mut mode = default_composer_turn_mode();
 
-        assert!(!set_composer_turn_mode(&mut mode, ThreadMode::Agent));
-        assert!(set_composer_turn_mode(&mut mode, ThreadMode::Chat));
-        assert_eq!(mode, ThreadMode::Chat);
+        assert!(!set_composer_turn_mode(&mut mode, ThreadMode::Message));
+        assert!(set_composer_turn_mode(&mut mode, ThreadMode::Agent));
+        assert_eq!(mode, ThreadMode::Agent);
         assert_eq!(
             composer_turn_mode_options(),
-            [ThreadMode::Agent, ThreadMode::Chat]
+            [ThreadMode::Message, ThreadMode::Chat, ThreadMode::Agent]
         );
     }
 

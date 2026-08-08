@@ -20,6 +20,8 @@ pub enum SessionTerminalReason {
     SessionRevoked,
     SessionExpired,
     SessionCompromised,
+    PrincipalSuspended,
+    PrincipalRemoved,
     GatewayIdentityMismatch,
     SecureStorageFailed,
     RefreshOutcomeUnknown,
@@ -420,6 +422,8 @@ pub fn terminal_reason_from_auth_code(code: &str) -> Option<SessionTerminalReaso
         "session_revoked" => Some(SessionTerminalReason::SessionRevoked),
         "session_expired" => Some(SessionTerminalReason::SessionExpired),
         "session_compromised" => Some(SessionTerminalReason::SessionCompromised),
+        "principal_suspended" => Some(SessionTerminalReason::PrincipalSuspended),
+        "principal_removed" => Some(SessionTerminalReason::PrincipalRemoved),
         "gateway_identity_mismatch" => Some(SessionTerminalReason::GatewayIdentityMismatch),
         "secure_storage_failed" => Some(SessionTerminalReason::SecureStorageFailed),
         "invalid_credential" => Some(SessionTerminalReason::RefreshCredentialInvalid),
@@ -667,6 +671,14 @@ mod tests {
         assert_eq!(
             terminal_reason_from_auth_code("session_expired"),
             Some(SessionTerminalReason::SessionExpired)
+        );
+        assert_eq!(
+            terminal_reason_from_auth_code("principal_suspended"),
+            Some(SessionTerminalReason::PrincipalSuspended)
+        );
+        assert_eq!(
+            terminal_reason_from_auth_code("principal_removed"),
+            Some(SessionTerminalReason::PrincipalRemoved)
         );
     }
 }

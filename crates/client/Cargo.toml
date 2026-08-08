@@ -52,7 +52,7 @@ tempfile.workspace = true
 forbidden-dependencies = [
   "gpui",
   "gpui-component",
-  "gpui-terminal",
+  "terminal",
   "pioneer-gateway",
   "rust-i18n",
 ]

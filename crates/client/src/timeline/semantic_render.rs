@@ -8,7 +8,10 @@ use crate::{
     timeline::{
         labels::RunningTurnDisplay,
         render_fingerprint::timeline_row_content_fingerprint,
-        rows::{TimelineRow, TimelineRowKind, TurnWorkGroupRow},
+        rows::{
+            TimelineRow, TimelineRowKind, TurnWorkGroupRow, UserMessagePresentation,
+            timeline_reply_state,
+        },
         semantic::{SemanticTimelineRow, SemanticTimelineRowId, SemanticTimelineRowKind},
     },
 };
@@ -20,6 +23,7 @@ use pioneer_protocol::{
 use std::collections::HashMap;
 
 pub const SEMANTIC_TURN_WORK_GROUP_PREFIX: &str = "semantic-turn-work-group::";
+const MAX_REPLY_PREVIEW_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Default)]
 pub struct SemanticTimelineRenderModel {
@@ -122,6 +126,13 @@ fn push_user_block(
         item_id,
         text,
         attachments,
+        mode,
+        author,
+        reply,
+        mentions,
+        revision,
+        edited,
+        deleted,
         ..
     } = &block.kind
     else {
@@ -129,12 +140,14 @@ fn push_user_block(
     };
     let item_id = item_id.as_deref().unwrap_or(block.block_id.as_str());
     let turn_id = block.turn_id.as_deref().unwrap_or(block.block_id.as_str());
+    let visible_text = (!*deleted).then(|| text.clone()).unwrap_or_default();
+    let visible_attachments = (!*deleted).then(|| attachments.clone()).unwrap_or_default();
     let item = TurnItem::UserMessage {
         id: item_id.to_owned(),
-        text: text.clone(),
-        attachments: attachments.clone(),
+        text: visible_text.clone(),
+        attachments: visible_attachments.clone(),
     };
-    push_item_row(
+    let timeline_index = push_item_row(
         projection,
         rows,
         ItemRowInput {
@@ -146,14 +159,46 @@ fn push_user_block(
             started_at_unix_ms: block.started_at_unix_ms.or(block.updated_at_unix_ms),
             updated_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
             completed_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
-            partial_text: text.clone(),
-            final_text: Some(text.clone()),
+            partial_text: visible_text.clone(),
+            final_text: Some(visible_text),
             partial_markdown: None,
             final_markdown: None,
             item,
             opaque_meta: None,
         },
     );
+    rows.last_mut().expect("user item row was appended").kind = TimelineRowKind::UserMessage {
+        timeline_index,
+        presentation: UserMessagePresentation {
+            workspace_id: block.workspace_id.clone(),
+            thread_id: block.thread_id.clone(),
+            block_id: block.block_id.clone(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            mode: *mode,
+            author: author.clone(),
+            reply: reply.clone().map(bound_reply_summary),
+            reply_state: reply.as_ref().map(timeline_reply_state),
+            mentions: (!*deleted).then(|| mentions.clone()).unwrap_or_default(),
+            attachments: visible_attachments,
+            revision: *revision,
+            edited: *edited,
+            deleted: *deleted,
+        },
+    };
+}
+
+fn bound_reply_summary(
+    mut reply: pioneer_protocol::TimelineReplySummary,
+) -> pioneer_protocol::TimelineReplySummary {
+    if let Some(text) = reply.text.as_mut() {
+        let truncated = text
+            .chars()
+            .take(MAX_REPLY_PREVIEW_CHARS)
+            .collect::<String>();
+        *text = truncated;
+    }
+    reply
 }
 
 fn push_assistant_block(
@@ -420,7 +465,7 @@ fn push_item_row(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     input: ItemRowInput,
-) {
+) -> usize {
     let item_index = projection.items.len();
     let timeline_index = projection.timeline.len();
     projection.items.push(ItemView {
@@ -449,6 +494,7 @@ fn push_item_row(
         key: input.entry_id,
         kind: TimelineRowKind::Item { timeline_index },
     });
+    timeline_index
 }
 
 fn live_work_by_turn(
@@ -569,8 +615,9 @@ mod tests {
     use super::*;
     use crate::conversation::ConversationViewState;
     use pioneer_protocol::{
-        MarkdownDocument, TaskAttachmentMode, TaskExecutorKind, TaskTriggerKind, TaskTurnItem,
-        TimelineCursor, Turn, TurnKind, TurnOrigin, TurnPermissionMode,
+        MarkdownDocument, PersistedActorRef, PrincipalId, TaskAttachmentMode, TaskExecutorKind,
+        TaskTriggerKind, TaskTurnItem, ThreadMode, TimelineCursor, TimelineReplySummary, Turn,
+        TurnAuthorSnapshot, TurnKind, TurnMention, TurnOrigin, TurnPermissionMode,
         TurnPermissionProfileSource, TurnStatus,
     };
 
@@ -601,6 +648,70 @@ mod tests {
             Some(markdown.clone())
         );
         assert_eq!(model.projection.items[0].final_markdown, Some(markdown));
+    }
+
+    #[test]
+    fn user_block_projects_authoritative_collaboration_metadata_and_exact_refs() {
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::UserBlock {
+                block: user_message_block(false, "r".repeat(200)),
+            })],
+            ConversationViewState::default(),
+        );
+
+        let TimelineRowKind::UserMessage {
+            timeline_index,
+            presentation,
+        } = &model.rows[0].kind
+        else {
+            panic!("expected authored user-message row");
+        };
+        assert_eq!(*timeline_index, 0);
+        assert_eq!(presentation.workspace_id, "workspace_a");
+        assert_eq!(presentation.thread_id, "thread_a");
+        assert_eq!(presentation.block_id, "block_user");
+        assert_eq!(presentation.turn_id, "turn_user");
+        assert_eq!(presentation.item_id, "item_user");
+        assert_eq!(presentation.mode, ThreadMode::Message);
+        assert_eq!(presentation.author.as_ref().unwrap().display_name, "Alice");
+        assert_eq!(presentation.mentions[0].nickname, "bob");
+        assert_eq!(
+            presentation
+                .reply
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_REPLY_PREVIEW_CHARS
+        );
+        assert_eq!(presentation.revision, 4);
+        assert_eq!(
+            presentation.reply_state,
+            Some(crate::timeline::rows::TimelineReplyState::Available)
+        );
+        assert!(presentation.edited);
+        assert!(!presentation.deleted);
+    }
+
+    #[test]
+    fn deleted_user_block_redacts_body_attachments_and_mentions() {
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::UserBlock {
+                block: user_message_block(true, "reply".to_owned()),
+            })],
+            ConversationViewState::default(),
+        );
+
+        let TimelineRowKind::UserMessage { presentation, .. } = &model.rows[0].kind else {
+            panic!("expected authored user-message row");
+        };
+        assert!(presentation.deleted);
+        assert!(presentation.attachments.is_empty());
+        assert!(presentation.mentions.is_empty());
+        assert_eq!(model.projection.items[0].final_text.as_deref(), Some(""));
     }
 
     #[test]
@@ -857,6 +968,46 @@ mod tests {
                 block_id: "block".to_owned(),
             },
             kind,
+        }
+    }
+
+    fn user_message_block(deleted: bool, reply_text: String) -> TimelineBlock {
+        let alice = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("principal id");
+        let bob = PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB").expect("principal id");
+        TimelineBlock {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            block_id: "block_user".to_owned(),
+            turn_id: Some("turn_user".to_owned()),
+            sort_key: "001".to_owned(),
+            started_at_unix_ms: Some(1),
+            updated_at_unix_ms: Some(2),
+            kind: TimelineBlockKind::UserMessage {
+                item_id: Some("item_user".to_owned()),
+                inputs: Vec::new(),
+                text: "hello @bob".to_owned(),
+                attachments: Vec::new(),
+                mode: ThreadMode::Message,
+                author: Some(TurnAuthorSnapshot {
+                    actor: PersistedActorRef::Principal(alice.clone()),
+                    display_name: "Alice".to_owned(),
+                    nickname: "alice".to_owned(),
+                    avatar_revision: Some("avatar-4".to_owned()),
+                }),
+                reply: Some(TimelineReplySummary {
+                    turn_id: "turn_parent".to_owned(),
+                    author: None,
+                    text: Some(reply_text),
+                    deleted: false,
+                }),
+                mentions: vec![TurnMention {
+                    principal_id: bob,
+                    nickname: "bob".to_owned(),
+                }],
+                revision: 4,
+                edited: true,
+                deleted,
+            },
         }
     }
 

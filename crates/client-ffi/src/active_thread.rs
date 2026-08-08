@@ -2,6 +2,7 @@ use crate::contracts::ClientEvent;
 use crate::threads::ClientThreadTreeSnapshot;
 use pioneer_client::{
     ClientError, ClientResult,
+    administration::{AdministrationEventTracker, AdministrationRefetch},
     authorization::{ThreadAuthorizationScope, plan_access_changed},
     cli_runtime::approvals::{
         PendingRequest, PendingRequestState, PendingRequestsReduction,
@@ -103,6 +104,8 @@ pub struct ClientActiveThreadSnapshotRequest {
 pub struct ClientEnsureWorkspaceDraftRequest {
     pub workspace_id: String,
     #[serde(default)]
+    pub visibility: Option<pioneer_protocol::ThreadVisibility>,
+    #[serde(default)]
     pub expanded_keys: Vec<String>,
 }
 
@@ -131,6 +134,8 @@ pub struct ClientActiveThreadEventResult {
     pub semantic_timeline_patch: SemanticTimelineCachePatch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_changed: Option<ClientAccessChangedLifecycle>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub administration_refetch: Vec<AdministrationRefetch>,
 }
 
 /// Payload-safe bridge projection of the shared Rust access-change plan.
@@ -305,6 +310,7 @@ struct ClientFfiActiveThreadInner {
     coordinators: HashMap<String, ThreadCoordinator>,
     semantic_timelines: SemanticTimelineState,
     pending_requests: PendingRequestState,
+    administration_events: AdministrationEventTracker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,6 +335,7 @@ enum SemanticTimelineReconcileRequest {
 struct ClientFfiNotificationReduction {
     semantic_timeline_patch: SemanticTimelineCachePatch,
     access_changed: Option<ClientAccessChangedLifecycle>,
+    administration_refetch: Vec<AdministrationRefetch>,
 }
 
 impl ClientFfiActiveThreadState {
@@ -355,6 +362,7 @@ impl ClientFfiActiveThreadState {
     ) -> anyhow::Result<ClientActiveThreadSnapshot> {
         let ClientEnsureWorkspaceDraftRequest {
             workspace_id,
+            visibility,
             expanded_keys,
         } = request;
         let workspace_id = non_empty_string(Some(workspace_id))
@@ -369,7 +377,11 @@ impl ClientFfiActiveThreadState {
         let planned_thread_id = thread_start::generate_thread_start_id();
         let response = ws_commands::thread_start(
             &runtime.ws_command_sender(),
-            thread_start::thread_start_params(planned_thread_id, workspace_id.clone()),
+            thread_start::thread_create_params(
+                planned_thread_id,
+                workspace_id.clone(),
+                visibility.unwrap_or(pioneer_protocol::ThreadVisibility::Private),
+            ),
         )?;
         let reduction = thread_start::reduce_thread_start_bootstrap_success(
             workspace_id.clone(),
@@ -525,6 +537,7 @@ impl ClientFfiActiveThreadState {
             snapshot,
             semantic_timeline_patch: notification_reduction.semantic_timeline_patch,
             access_changed: notification_reduction.access_changed,
+            administration_refetch: notification_reduction.administration_refetch,
         })
     }
 
@@ -762,6 +775,8 @@ impl ClientFfiActiveThreadState {
                 selected_provider: selection.selected_provider,
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
+                reply_to_turn_id,
+                mentioned_principal_ids,
                 permission_mode,
                 execution_backend: execution_target.execution_backend,
                 selected_reasoning_effort,
@@ -773,10 +788,8 @@ impl ClientFfiActiveThreadState {
         let thread_snapshot_update = submit_reduction.thread_snapshot_update.clone();
         let local_turn_start_requested_event =
             submit_reduction.local_turn_start_requested_event.clone();
-        let mut turn_start_params_plan = submit_reduction.turn_start_params_plan;
-        turn_start_params_plan.reply_to_turn_id = reply_to_turn_id;
-        turn_start_params_plan.mentioned_principal_ids = mentioned_principal_ids;
-        let turn_start_params = turn_start_params_from_plan(turn_start_params_plan);
+        let turn_start_params =
+            turn_start_params_from_plan(submit_reduction.turn_start_params_plan);
 
         let semantic_timeline_patch = {
             let mut inner = self
@@ -894,29 +907,47 @@ impl ClientFfiActiveThreadState {
                 selected_mode,
             )?
         };
-        let selected_provider = selection.selected_provider.ok_or_else(|| {
-            anyhow::anyhow!("model and provider must be selected before starting voice")
-        })?;
-        let selected_model = selection.selected_model.ok_or_else(|| {
-            anyhow::anyhow!("model and provider must be selected before starting voice")
-        })?;
-        let execution_target = resolve_selected_execution_target(
-            runtime,
-            workspace_id.as_str(),
-            Some(selected_provider.as_str()),
-        )?;
-        let cli_runtime_selected = execution_target.execution_backend.is_some();
-        let capabilities = plan_composer_submission(
-            Some(selected_provider.as_str()),
-            "",
-            !attachments.is_empty(),
-            capabilities.as_slice(),
-        )
-        .capabilities;
+        let message_mode = selection.selected_mode == ThreadMode::Message;
+        let selected_provider = if message_mode {
+            None
+        } else {
+            Some(selection.selected_provider.ok_or_else(|| {
+                anyhow::anyhow!("model and provider must be selected before starting voice")
+            })?)
+        };
+        let selected_model = if message_mode {
+            None
+        } else {
+            Some(selection.selected_model.ok_or_else(|| {
+                anyhow::anyhow!("model and provider must be selected before starting voice")
+            })?)
+        };
+        let execution_backend = if message_mode {
+            None
+        } else {
+            resolve_selected_execution_target(
+                runtime,
+                workspace_id.as_str(),
+                selected_provider.as_deref(),
+            )?
+            .execution_backend
+        };
+        let cli_runtime_selected = execution_backend.is_some();
+        let capabilities = if message_mode {
+            Vec::new()
+        } else {
+            plan_composer_submission(
+                selected_provider.as_deref(),
+                "",
+                !attachments.is_empty(),
+                capabilities.as_slice(),
+            )
+            .capabilities
+        };
         let turn_model_provider = if cli_runtime_selected {
             None
         } else {
-            Some(selected_provider.clone())
+            selected_provider.clone()
         };
 
         prepare_voice_composer_snapshot(
@@ -931,12 +962,12 @@ impl ClientFfiActiveThreadState {
                 capabilities,
                 skill_selections,
                 skill_picker,
-                selected_model: Some(selected_model),
-                selected_provider: Some(selected_provider),
+                selected_model,
+                selected_provider,
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 permission_mode,
-                execution_backend: execution_target.execution_backend,
+                execution_backend,
                 selected_reasoning_effort,
                 cli_runtime_options: None,
             },
@@ -1206,8 +1237,16 @@ impl ClientFfiActiveThreadState {
                     ..Default::default()
                 });
             }
-            ClientRuntimeNotification::AdministrationChanged(_) => {
-                SemanticTimelineCachePatch::default()
+            ClientRuntimeNotification::AdministrationChanged(event) => {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+                let invalidation = inner.administration_events.apply_event(&event);
+                return Ok(ClientFfiNotificationReduction {
+                    administration_refetch: invalidation.effects,
+                    ..Default::default()
+                });
             }
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 let mut inner = self
@@ -1361,6 +1400,7 @@ impl ClientFfiActiveThreadState {
         Ok(ClientFfiNotificationReduction {
             semantic_timeline_patch,
             access_changed: None,
+            administration_refetch: Vec::new(),
         })
     }
 
@@ -1615,6 +1655,7 @@ fn clear_authorization_derived_state(inner: &mut ClientFfiActiveThreadInner) -> 
     inner.coordinators.clear();
     inner.semantic_timelines = Default::default();
     inner.pending_requests = Default::default();
+    inner.administration_events = AdministrationEventTracker::default();
     inner.authorization_revision = None;
     thread_session::bump_session_revision(&mut inner.session_revision);
     thread_ids
@@ -1949,6 +1990,7 @@ fn resolve_turn_selection(
             gateway_connected: true,
             upload_in_progress: false,
             has_active_thread: true,
+            selected_mode,
             has_complete_model_selection: true,
             // Message is an instant-completed Turn and never claims the
             // foreground execution slot held by Chat/Agent.
@@ -1999,6 +2041,7 @@ fn resolve_turn_selection(
         gateway_connected: true,
         upload_in_progress: false,
         has_active_thread: true,
+        selected_mode,
         has_complete_model_selection: true,
         conversation_can_submit: coordinator.conversation.can_submit_message(),
         text,
@@ -2026,10 +2069,16 @@ fn resolve_voice_turn_selection(
 ) -> anyhow::Result<ClientActiveThreadTurnSelection> {
     let selected_mode =
         requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
+    let coordinator = inner
+        .coordinators
+        .get(thread_id)
+        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting voice"))?;
     if selected_mode == ThreadMode::Message {
-        return Err(anyhow::anyhow!(
-            "voice composer does not support Message mode"
-        ));
+        return Ok(ClientActiveThreadTurnSelection {
+            selected_model: None,
+            selected_provider: None,
+            selected_mode,
+        });
     }
 
     let requested_provider = non_empty_string(requested_provider);
@@ -2047,10 +2096,6 @@ fn resolve_voice_turn_selection(
             ));
         }
     };
-    let coordinator = inner
-        .coordinators
-        .get(thread_id)
-        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting voice"))?;
     let resolved_selection = match requested_selection {
         Some(selection) => selection,
         None => client_selectors::resolve_composer_model_selection_from(
@@ -2775,21 +2820,19 @@ mod tests {
     }
 
     #[test]
-    fn voice_composer_rejects_message_mode_before_provider_resolution() {
-        let error = resolve_voice_turn_selection(
-            &ClientFfiActiveThreadInner::default(),
-            "thread_a",
-            None,
-            None,
-            Some(ThreadMode::Message),
-        )
-        .expect_err("Message voice mode must be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("voice composer does not support Message mode")
+    fn voice_composer_allows_message_mode_without_provider() {
+        let mut inner = ClientFfiActiveThreadInner::default();
+        inner.coordinators.insert(
+            "thread_a".to_owned(),
+            ThreadCoordinator::new(thread("thread_a", "ws_a")),
         );
+        let selection =
+            resolve_voice_turn_selection(&inner, "thread_a", None, None, Some(ThreadMode::Message))
+                .expect("Message voice mode should not require a model");
+
+        assert_eq!(selection.selected_mode, ThreadMode::Message);
+        assert!(selection.selected_model.is_none());
+        assert!(selection.selected_provider.is_none());
     }
 
     #[test]

@@ -55,13 +55,14 @@ use pioneer_protocol::{
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadReadParams, ThreadReadResponse, ThreadStartParams,
-    ThreadStartResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams,
-    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams,
-    ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse,
-    TurnItemsParams, TurnItemsResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
-    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageErrorReason,
-    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
+    ThreadMoveParams, ThreadMoveResponse, ThreadParticipantMutationParams,
+    ThreadParticipantsListParams, ThreadParticipantsResponse, ThreadReadParams, ThreadReadResponse,
+    ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+    ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams,
+    TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnMessageDeleteParams,
+    TurnMessageDeleteResponse, TurnMessageEditParams, TurnMessageEditResponse,
+    TurnMessageErrorReason, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
     TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
     TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams,
     TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
@@ -422,6 +423,81 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::THREAD_UPDATE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_participants_list<TTransport>(
+    transport: &TTransport,
+    params: ThreadParticipantsListParams,
+) -> Result<ThreadParticipantsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::THREAD_PARTICIPANTS_LIST,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::THREAD_PARTICIPANTS_LIST,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_PARTICIPANTS_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_participant_add<TTransport>(
+    transport: &TTransport,
+    params: ThreadParticipantMutationParams,
+) -> Result<ThreadParticipantsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::THREAD_PARTICIPANTS_ADD,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::THREAD_PARTICIPANTS_ADD,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_PARTICIPANTS_ADD,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_participant_remove<TTransport>(
+    transport: &TTransport,
+    params: ThreadParticipantMutationParams,
+) -> Result<ThreadParticipantsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::THREAD_PARTICIPANTS_REMOVE,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::THREAD_PARTICIPANTS_REMOVE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_PARTICIPANTS_REMOVE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2747,6 +2823,51 @@ mod tests {
                 methods::WORKSPACE_MEMBER_LIST,
                 methods::WORKSPACE_MEMBER_ADD,
                 methods::WORKSPACE_MEMBER_REMOVE,
+            ]
+        );
+    }
+
+    #[test]
+    fn epic7_participant_wrappers_use_existing_methods_and_protocol_dtos() {
+        let transport = RecordingFailureTransport::default();
+        let workspace_id = "WAAAAAAAAAAAAAAAAAAAA";
+        let thread_id = "TAAAAAAAAAAAAAAAAAAAA";
+        let principal_id = "PAAAAAAAAAAAAAAAAAAAA";
+
+        let _ = thread_participants_list(
+            &transport,
+            params(json!({
+                "workspace_id": workspace_id,
+                "thread_id": thread_id
+            })),
+        );
+        let _ = thread_participant_add(
+            &transport,
+            params(json!({
+                "workspace_id": workspace_id,
+                "thread_id": thread_id,
+                "principal_id": principal_id
+            })),
+        );
+        let _ = thread_participant_remove(
+            &transport,
+            params(json!({
+                "workspace_id": workspace_id,
+                "thread_id": thread_id,
+                "principal_id": principal_id
+            })),
+        );
+
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                methods::THREAD_PARTICIPANTS_LIST,
+                methods::THREAD_PARTICIPANTS_ADD,
+                methods::THREAD_PARTICIPANTS_REMOVE,
             ]
         );
     }

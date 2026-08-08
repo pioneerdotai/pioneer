@@ -13,6 +13,7 @@ mod diagnostics;
 mod gateway;
 mod invitation;
 mod pending_requests;
+mod presentation;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod skills;
@@ -116,6 +117,7 @@ use pioneer_client::{
         },
     },
     runtime::ClientRuntime,
+    timeline::rows::{MessageRevisionPagePresentation, project_message_revision_page},
     timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode},
     workspaces::{
         actions::WorkspaceBootstrapSuccessReduction,
@@ -140,6 +142,13 @@ use pioneer_protocol::{
     VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
+};
+use presentation::{
+    ClientCurrentPrincipalPresentationRequest, ClientInvitationListRowRequest,
+    ClientMemberPresentationRequest, ClientThreadCreateVisibilityRequest,
+    ClientThreadScopeMutationPlanRequest, ClientThreadScopePresentationRequest, current_principal,
+    invitation_list_row, member_presentation, principal_capabilities, session_list_row,
+    thread_create_visibility, thread_scope, thread_scope_mutation_plan,
 };
 use serde::{Deserialize, Serialize};
 use skills::{
@@ -995,6 +1004,54 @@ impl ClientFfiRuntime {
             .map_err(administration_rpc_error)
     }
 
+    fn thread_participants_list(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::ThreadParticipantsResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "thread participants list")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .thread_participants_list(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn thread_update(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::ThreadUpdateResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "thread update")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .thread_update(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn thread_participant_add(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::ThreadParticipantsResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "thread participant add")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .thread_participant_add(params)
+            .map_err(administration_rpc_error)
+    }
+
+    fn thread_participant_remove(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::ThreadParticipantsResponse, ClientFfiError> {
+        let params = parse_normal_params(input_json, "thread participant remove")?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .thread_participant_remove(params)
+            .map_err(administration_rpc_error)
+    }
+
     fn gateway_session_replace_access(
         &self,
         input_json: &str,
@@ -1668,6 +1725,97 @@ impl ClientFfiRuntime {
         )
     }
 
+    fn composer_turn_mode_options(&self) -> Result<Vec<pioneer_protocol::ThreadMode>, String> {
+        Ok(
+            pioneer_client::composer::model_selection::composer_turn_mode_options()
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn principal_presentation_capabilities(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::authorization::PrincipalPresentationCapabilities, String> {
+        let auth = serde_json::from_str::<pioneer_protocol::AuthMeResponse>(input_json)
+            .map_err(|_| "invalid current principal presentation request".to_owned())?;
+        Ok(principal_capabilities(auth))
+    }
+
+    fn current_principal_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::authorization::CurrentPrincipalPresentation, String> {
+        let request = serde_json::from_str::<ClientCurrentPrincipalPresentationRequest>(input_json)
+            .map_err(|_| "invalid current principal presentation request".to_owned())?;
+        Ok(current_principal(request))
+    }
+
+    fn session_list_row_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::authorization::SessionListRowPresentation, String> {
+        let item = serde_json::from_str::<pioneer_protocol::AuthSessionListItem>(input_json)
+            .map_err(|_| "invalid session list row presentation request".to_owned())?;
+        Ok(session_list_row(item))
+    }
+
+    fn thread_scope_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::threads::scope::ThreadScopePresentation, String> {
+        let request = serde_json::from_str::<ClientThreadScopePresentationRequest>(input_json)
+            .map_err(|_| "invalid thread scope presentation request".to_owned())?;
+        Ok(thread_scope(request))
+    }
+
+    fn thread_create_visibility_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::threads::scope::ThreadCreateVisibilityPlan, String> {
+        let request = serde_json::from_str::<ClientThreadCreateVisibilityRequest>(input_json)
+            .map_err(|_| "invalid thread create visibility request".to_owned())?;
+        Ok(thread_create_visibility(request))
+    }
+
+    fn thread_scope_mutation_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::threads::scope::ThreadScopeMutationPlan, String> {
+        let request = serde_json::from_str::<ClientThreadScopeMutationPlanRequest>(input_json)
+            .map_err(|_| "invalid thread scope mutation plan request".to_owned())?;
+        Ok(thread_scope_mutation_plan(request))
+    }
+
+    fn member_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::administration::MemberListRow, String> {
+        let request = serde_json::from_str::<ClientMemberPresentationRequest>(input_json)
+            .map_err(|_| "invalid member presentation request".to_owned())?;
+        Ok(member_presentation(request))
+    }
+
+    fn invitation_list_row(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::administration::InvitationListRow, String> {
+        let request = serde_json::from_str::<ClientInvitationListRowRequest>(input_json)
+            .map_err(|_| "invalid invitation list row request".to_owned())?;
+        Ok(invitation_list_row(request))
+    }
+
+    fn administration_conflict_refetch(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::administration::AdministrationRefetch>, String> {
+        let action = serde_json::from_str::<pioneer_client::administration::AdministrationAction>(
+            input_json,
+        )
+        .map_err(|_| "invalid administration conflict action".to_owned())?;
+        Ok(pioneer_client::administration::conflict_refetch(&action))
+    }
+
     fn composer_attachment_from_path(
         &self,
         input_json: &str,
@@ -1974,6 +2122,15 @@ impl ClientFfiRuntime {
             },
         )?;
         timeline::turn_message_revisions_page(&self.client_runtime.ws_command_sender(), params)
+    }
+
+    fn message_revision_page_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<MessageRevisionPagePresentation, String> {
+        let response = serde_json::from_str::<TurnMessageRevisionsPageResponse>(input_json)
+            .map_err(|error| format!("invalid Turn message revisions page response: {error}"))?;
+        Ok(project_message_revision_page(response))
     }
 
     fn thread_read(&self, input_json: &str) -> Result<ThreadReadResponse, ClientFfiError> {
@@ -2582,6 +2739,19 @@ ffi_client_json_typed_method!(
     workspace_member_remove
 );
 ffi_client_json_typed_method!(
+    pioneer_client_ffi_thread_participants_list,
+    thread_participants_list
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_thread_update, thread_update);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_thread_participant_add,
+    thread_participant_add
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_thread_participant_remove,
+    thread_participant_remove
+);
+ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_session_replace_access,
     gateway_session_replace_access
 );
@@ -2717,6 +2887,44 @@ pub unsafe extern "C" fn pioneer_client_ffi_composer_permission_mode_options(
         runtime.composer_permission_mode_options()
     })
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_composer_turn_mode_options(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, "composer_turn_mode_options", |runtime| {
+        runtime.composer_turn_mode_options()
+    })
+}
+ffi_client_json_method!(
+    pioneer_client_ffi_principal_presentation_capabilities,
+    principal_presentation_capabilities
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_current_principal_presentation,
+    current_principal_presentation
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_session_list_row_presentation,
+    session_list_row_presentation
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_thread_scope_presentation,
+    thread_scope_presentation
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_thread_create_visibility_plan,
+    thread_create_visibility_plan
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_thread_scope_mutation_plan,
+    thread_scope_mutation_plan
+);
+ffi_client_json_method!(pioneer_client_ffi_member_presentation, member_presentation);
+ffi_client_json_method!(pioneer_client_ffi_invitation_list_row, invitation_list_row);
+ffi_client_json_method!(
+    pioneer_client_ffi_administration_conflict_refetch,
+    administration_conflict_refetch
+);
 ffi_client_json_method!(
     pioneer_client_ffi_composer_attachment_from_path,
     composer_attachment_from_path
@@ -2805,6 +3013,10 @@ ffi_client_json_typed_method!(pioneer_client_ffi_turn_message_delete, turn_messa
 ffi_client_json_typed_method!(
     pioneer_client_ffi_turn_message_revisions_page,
     turn_message_revisions_page
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_message_revision_page_presentation,
+    message_revision_page_presentation
 );
 ffi_client_json_typed_method!(pioneer_client_ffi_thread_read, thread_read);
 ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_page, turn_work_page);
@@ -3143,6 +3355,42 @@ mod tests {
         let value: serde_json::Value = decode_response(response.as_str());
 
         assert_eq!(value["value"], 1);
+    }
+
+    #[test]
+    fn revision_page_presentation_crosses_the_mobile_json_boundary_without_file_inputs() {
+        let runtime = ClientFfiRuntime::default();
+        let presentation = runtime
+            .message_revision_page_presentation(
+                serde_json::json!({
+                    "workspace_id": "workspace-a",
+                    "thread_id": "thread-a",
+                    "turn_id": "turn-a",
+                    "revisions": [{
+                        "turn_id": "turn-a",
+                        "revision": 2,
+                        "change_kind": "edit",
+                        "changed_by": { "kind": "system" },
+                        "created_at": 1_700_000_000_000_i64,
+                        "input": [
+                            { "type": "text", "text": "updated" },
+                            { "type": "file", "url": "private://must-not-cross" }
+                        ],
+                        "mentions": []
+                    }],
+                    "next_cursor": null
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("revision presentation");
+
+        assert_eq!(presentation.revisions[0].text.as_deref(), Some("updated"));
+        assert!(
+            !serde_json::to_string(&presentation)
+                .expect("serialize")
+                .contains("private://")
+        );
     }
 
     #[test]

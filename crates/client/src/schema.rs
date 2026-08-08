@@ -178,6 +178,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::state_machine::ComposerDomainTransition
         ),
         schema_doc!(
+            "composer_reply_target.json",
+            crate::composer::state_machine::ComposerReplyTarget
+        ),
+        schema_doc!(
+            "composer_mention_candidate.json",
+            crate::composer::state_machine::ComposerMentionCandidate
+        ),
+        schema_doc!(
+            "composer_mention_selection.json",
+            crate::composer::state_machine::ComposerMentionSelection
+        ),
+        schema_doc!(
             "composer_draft.json",
             crate::composer::draft::ComposerDraft<
                 crate::composer::attachments::ComposerAttachment,
@@ -1276,6 +1288,75 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "workspace_member_mutation_response.json",
             pioneer_protocol::WorkspaceMemberMutationResponse
+        ),
+        schema_doc!(
+            "thread_participants_list_params.json",
+            pioneer_protocol::ThreadParticipantsListParams
+        ),
+        schema_doc!(
+            "thread_participant_mutation_params.json",
+            pioneer_protocol::ThreadParticipantMutationParams
+        ),
+        schema_doc!(
+            "thread_participants_response.json",
+            pioneer_protocol::ThreadParticipantsResponse
+        ),
+        schema_doc!(
+            "thread_update_params.json",
+            pioneer_protocol::ThreadUpdateParams
+        ),
+        schema_doc!(
+            "thread_update_response.json",
+            pioneer_protocol::ThreadUpdateResponse
+        ),
+        schema_doc!(
+            "principal_presentation_capabilities.json",
+            crate::authorization::PrincipalPresentationCapabilities
+        ),
+        schema_doc!(
+            "current_principal_kind_presentation.json",
+            crate::authorization::CurrentPrincipalKindPresentation
+        ),
+        schema_doc!(
+            "current_principal_presentation.json",
+            crate::authorization::CurrentPrincipalPresentation
+        ),
+        schema_doc!(
+            "session_list_row_presentation.json",
+            crate::authorization::SessionListRowPresentation
+        ),
+        schema_doc!(
+            "thread_create_visibility_plan.json",
+            crate::threads::scope::ThreadCreateVisibilityPlan
+        ),
+        schema_doc!(
+            "thread_scope_presentation.json",
+            crate::threads::scope::ThreadScopePresentation
+        ),
+        schema_doc!(
+            "thread_scope_mutation_plan.json",
+            crate::threads::scope::ThreadScopeMutationPlan
+        ),
+        schema_doc!(
+            "administration_refetch.json",
+            crate::administration::AdministrationRefetch
+        ),
+        schema_doc!(
+            "administration_action.json",
+            crate::administration::AdministrationAction
+        ),
+        schema_doc!(
+            "invitation_list_row.json",
+            crate::administration::InvitationListRow
+        ),
+        schema_doc!("member_list_row.json", crate::administration::MemberListRow),
+        schema_doc!(
+            "message_revision_presentation.json",
+            crate::timeline::rows::MessageRevisionPresentation
+        ),
+        schema_doc!(
+            "message_revision_page_presentation.json",
+            crate::timeline::rows::MessageRevisionPagePresentation
         ),
         schema_doc!(
             "member_changed_notification.json",

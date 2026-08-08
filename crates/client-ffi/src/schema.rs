@@ -80,6 +80,30 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
+            "client_thread_scope_presentation_request.json",
+            crate::presentation::ClientThreadScopePresentationRequest
+        ),
+        schema_doc!(
+            "client_thread_create_visibility_request.json",
+            crate::presentation::ClientThreadCreateVisibilityRequest
+        ),
+        schema_doc!(
+            "client_thread_scope_mutation_plan_request.json",
+            crate::presentation::ClientThreadScopeMutationPlanRequest
+        ),
+        schema_doc!(
+            "client_member_presentation_request.json",
+            crate::presentation::ClientMemberPresentationRequest
+        ),
+        schema_doc!(
+            "client_invitation_list_row_request.json",
+            crate::presentation::ClientInvitationListRowRequest
+        ),
+        schema_doc!(
+            "client_current_principal_presentation_request.json",
+            crate::presentation::ClientCurrentPrincipalPresentationRequest
+        ),
+        schema_doc!(
             "client_gateway_session_lifecycle_request.json",
             crate::auth::ClientGatewaySessionLifecycleRequest
         ),
@@ -340,6 +364,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::AuthRefreshGrant
         ),
         schema_doc!("auth_me_response.json", pioneer_protocol::AuthMeResponse),
+        schema_doc!(
+            "session_list_row_presentation.json",
+            pioneer_client::authorization::SessionListRowPresentation
+        ),
         schema_doc!(
             "auth_session_list_response.json",
             pioneer_protocol::AuthSessionListResponse

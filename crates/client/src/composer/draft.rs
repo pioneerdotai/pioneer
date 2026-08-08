@@ -67,6 +67,8 @@ pub fn composer_thread_switch_fallback(mut domain: ComposerDomainState) -> Compo
     domain.attachments.clear();
     domain.capabilities.clear();
     domain.skill_selections.clear();
+    domain.reply_target = None;
+    domain.selected_mentions.clear();
     ComposerDomainDraft {
         text: String::new(),
         domain,

@@ -1,7 +1,7 @@
 const FORBIDDEN_DEPENDENCIES: &[&str] = &[
     "gpui",
     "gpui-component",
-    "gpui-terminal",
+    "terminal",
     "pioneer-gateway",
     "rust-i18n",
 ];

@@ -266,6 +266,20 @@ pub fn thread_start_params(thread_id: String, workspace_id: String) -> ThreadSta
     }
 }
 
+/// Create a new collaborative user thread with an explicit server-owned
+/// visibility choice. Subscription/reconnect callers must continue using
+/// [`thread_start_params`] so they never mutate an existing thread's scope.
+pub fn thread_create_params(
+    thread_id: String,
+    workspace_id: String,
+    visibility: pioneer_protocol::ThreadVisibility,
+) -> ThreadStartParams {
+    ThreadStartParams {
+        visibility: Some(visibility),
+        ..thread_start_params(thread_id, workspace_id)
+    }
+}
+
 pub fn reduce_thread_start_bootstrap_success(
     resolved_workspace_id: String,
     response: ThreadStartResponse,
@@ -533,6 +547,17 @@ mod tests {
         assert_eq!(params.thread_id, "thread_a");
         assert_eq!(params.workspace_id, "ws_a");
         assert_eq!(params.name, None);
+        assert_eq!(params.visibility, None);
+
+        let create = thread_create_params(
+            "thread_b".to_owned(),
+            "ws_a".to_owned(),
+            pioneer_protocol::ThreadVisibility::Workspace,
+        );
+        assert_eq!(
+            create.visibility,
+            Some(pioneer_protocol::ThreadVisibility::Workspace)
+        );
     }
 
     #[test]

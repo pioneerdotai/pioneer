@@ -284,6 +284,27 @@ impl GatewayWsCommandSender {
         client_ws_commands::thread_update(self, params)
     }
 
+    pub fn thread_participants_list(
+        &self,
+        params: ThreadParticipantsListParams,
+    ) -> Result<ThreadParticipantsResponse> {
+        client_ws_commands::thread_participants_list(self, params)
+    }
+
+    pub fn thread_participant_add(
+        &self,
+        params: ThreadParticipantMutationParams,
+    ) -> Result<ThreadParticipantsResponse> {
+        client_ws_commands::thread_participant_add(self, params)
+    }
+
+    pub fn thread_participant_remove(
+        &self,
+        params: ThreadParticipantMutationParams,
+    ) -> Result<ThreadParticipantsResponse> {
+        client_ws_commands::thread_participant_remove(self, params)
+    }
+
     pub fn thread_move(&self, params: ThreadMoveParams) -> Result<ThreadMoveResponse> {
         client_ws_commands::thread_move(self, params)
     }

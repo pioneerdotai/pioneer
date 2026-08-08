@@ -117,6 +117,8 @@ pub struct PreparedComposerTurnSubmitContext {
     pub selected_provider: Option<String>,
     pub turn_model_provider: Option<String>,
     pub selected_mode: Option<ThreadMode>,
+    pub reply_to_turn_id: Option<String>,
+    pub mentioned_principal_ids: Vec<pioneer_protocol::PrincipalId>,
     pub permission_mode: TurnPermissionMode,
     pub execution_backend: Option<AgentExecutionBackend>,
     pub selected_reasoning_effort: Option<String>,
@@ -321,9 +323,36 @@ pub fn build_prepared_voice_composer_snapshot(
         .map(|prepared_attachment| prepared_attachment.artifact.clone())
         .collect::<Vec<_>>();
     let selected_mode = context.selected_mode.unwrap_or(ThreadMode::Agent);
-    let selected_reasoning_effort = context.selected_reasoning_effort.clone();
-    let cli_runtime_options = if matches!(
-        &context.execution_backend,
+    let message_mode = selected_mode == ThreadMode::Message;
+    let capabilities = if message_mode {
+        Vec::new()
+    } else {
+        prepared.capabilities
+    };
+    let selected_model = if message_mode {
+        None
+    } else {
+        context.selected_model
+    };
+    let turn_model_provider = if message_mode {
+        None
+    } else {
+        context.turn_model_provider
+    };
+    let execution_backend = if message_mode {
+        None
+    } else {
+        context.execution_backend
+    };
+    let selected_reasoning_effort = if message_mode {
+        None
+    } else {
+        context.selected_reasoning_effort
+    };
+    let cli_runtime_options = if message_mode {
+        None
+    } else if matches!(
+        &execution_backend,
         Some(AgentExecutionBackend::CLIAgentRuntime { .. })
     ) {
         cli_runtime_options_with_reasoning_effort(
@@ -334,7 +363,7 @@ pub fn build_prepared_voice_composer_snapshot(
         context.cli_runtime_options
     };
     let locked_attachment_count = prepared.attachments.len();
-    let locked_capability_count = prepared.capabilities.len();
+    let locked_capability_count = capabilities.len();
 
     Ok(PreparedVoiceComposerSnapshot {
         context: VoiceTurnContext {
@@ -342,18 +371,18 @@ pub fn build_prepared_voice_composer_snapshot(
             thread_id: context.thread_id,
             turn_id: context.turn_id,
             prepared_input: prepared.input,
-            capabilities: prepared.capabilities,
-            model: context.selected_model,
-            model_provider: context.turn_model_provider,
+            capabilities,
+            model: selected_model,
+            model_provider: turn_model_provider,
             sandbox_policy: None,
             mode: Some(selected_mode),
-            execution_backend: context.execution_backend,
+            execution_backend,
             reasoning: turn_start::turn_reasoning_selection_from_effort(selected_reasoning_effort),
-            permission_profile: Some(
+            permission_profile: (!message_mode).then(|| {
                 composer_permissions::turn_permission_profile_selection_from_composer_mode(
                     context.permission_mode,
-                ),
-            ),
+                )
+            }),
             cli_runtime_options,
         },
         attachments: prepared.attachments,
@@ -673,8 +702,8 @@ pub fn reduce_prepared_composer_turn_submit_success(
             model: context.selected_model,
             model_provider: context.turn_model_provider,
             mode: Some(selected_mode),
-            reply_to_turn_id: None,
-            mentioned_principal_ids: Vec::new(),
+            reply_to_turn_id: context.reply_to_turn_id,
+            mentioned_principal_ids: context.mentioned_principal_ids,
             execution_backend: context.execution_backend,
             reasoning,
             permission_profile:
@@ -733,6 +762,7 @@ pub struct ComposerSubmitAvailabilityInput<'a> {
     pub gateway_connected: bool,
     pub upload_in_progress: bool,
     pub has_active_thread: bool,
+    pub selected_mode: ThreadMode,
     pub has_complete_model_selection: bool,
     pub conversation_can_submit: bool,
     pub text: &'a str,
@@ -741,12 +771,17 @@ pub struct ComposerSubmitAvailabilityInput<'a> {
 }
 
 pub fn can_submit_composer_message(input: ComposerSubmitAvailabilityInput<'_>) -> bool {
+    let is_message = input.selected_mode == ThreadMode::Message;
     input.gateway_connected
         && !input.upload_in_progress
         && input.has_active_thread
-        && input.has_complete_model_selection
-        && input.conversation_can_submit
-        && composer_has_sendable_content(input.text, input.has_attachments, input.has_capabilities)
+        && (is_message || input.has_complete_model_selection)
+        && (is_message || input.conversation_can_submit)
+        && composer_has_sendable_content(
+            input.text,
+            input.has_attachments,
+            !is_message && input.has_capabilities,
+        )
 }
 
 pub fn composer_has_sendable_content(
@@ -976,7 +1011,8 @@ mod tests {
     use super::*;
     use crate::composer::attachments::{ComposerAttachmentKind, ComposerAttachmentUploadState};
     use crate::composer::capabilities::{
-        ComposerCapabilityKind, SelectableSkillCapability, SkillCapabilityUnavailableReason,
+        ComposerCapability, ComposerCapabilityKind, SelectableSkillCapability,
+        SkillCapabilityUnavailableReason,
     };
     use crate::composer::skill_selection::{
         SelectablePackedSkillCapability, SelectableSkillPackCapability,
@@ -1193,6 +1229,54 @@ mod tests {
         assert_eq!(text.user_attachments.len(), 2);
     }
 
+    #[test]
+    fn message_voice_snapshot_clears_execution_only_context() {
+        let mut context = voice_snapshot_context();
+        context.selected_mode = Some(ThreadMode::Message);
+        context.selected_model = Some("stale-model".to_owned());
+        context.turn_model_provider = Some("stale-provider".to_owned());
+        context.execution_backend = Some(AgentExecutionBackend::ApiProvider {
+            provider: "stale-provider".to_owned(),
+        });
+        context.selected_reasoning_effort = Some("high".to_owned());
+        context.cli_runtime_options = Some(TurnCLIRuntimeOptions {
+            sandbox: None,
+            effort: Some("high".to_owned()),
+            personality: None,
+            summary: None,
+            steer_if_active: None,
+        });
+
+        let skill_id = SkillId::new("S".repeat(21)).expect("skill id");
+        let snapshot = build_prepared_voice_composer_snapshot(
+            context,
+            build_prepared_composer_turn(
+                String::new(),
+                Vec::new(),
+                vec![ComposerCapability {
+                    id: pioneer_protocol::skill_capability_key(&skill_id),
+                    label: "stale skill".to_owned(),
+                    kind: ComposerCapabilityKind::Skill {
+                        skill_id,
+                        owner: None,
+                        slug: "stale-skill".to_owned(),
+                        source_kind: "test".to_owned(),
+                    },
+                }],
+            ),
+        )
+        .expect("message voice snapshot");
+
+        assert_eq!(snapshot.context.mode, Some(ThreadMode::Message));
+        assert!(snapshot.context.model.is_none());
+        assert!(snapshot.context.model_provider.is_none());
+        assert!(snapshot.context.execution_backend.is_none());
+        assert!(snapshot.context.reasoning.is_none());
+        assert!(snapshot.context.permission_profile.is_none());
+        assert!(snapshot.context.cli_runtime_options.is_none());
+        assert!(snapshot.context.capabilities.is_empty());
+    }
+
     fn voice_snapshot_context() -> PreparedVoiceComposerSnapshotContext {
         PreparedVoiceComposerSnapshotContext {
             workspace_id: "ws_1".to_owned(),
@@ -1233,6 +1317,7 @@ mod tests {
             gateway_connected: true,
             upload_in_progress: false,
             has_active_thread: true,
+            selected_mode: ThreadMode::Agent,
             has_complete_model_selection: true,
             conversation_can_submit: true,
             text: "hello",
@@ -1281,6 +1366,26 @@ mod tests {
             ComposerSubmitAvailabilityInput {
                 text: "   ",
                 has_attachments: true,
+                ..ready
+            }
+        ));
+
+        assert!(can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                selected_mode: ThreadMode::Message,
+                has_complete_model_selection: false,
+                conversation_can_submit: false,
+                text: "ordinary message",
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                selected_mode: ThreadMode::Message,
+                has_complete_model_selection: false,
+                conversation_can_submit: false,
+                text: "   ",
+                has_capabilities: true,
                 ..ready
             }
         ));
@@ -1676,6 +1781,11 @@ mod tests {
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
+                reply_to_turn_id: Some("turn_parent".to_owned()),
+                mentioned_principal_ids: vec![
+                    pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA")
+                        .expect("principal id"),
+                ],
                 permission_mode: TurnPermissionMode::Supervised,
                 execution_backend: None,
                 selected_reasoning_effort: None,
@@ -1756,6 +1866,14 @@ mod tests {
         assert_eq!(reduction.send_context.thread_id, "thread_a");
         assert_eq!(reduction.send_context.turn_id, "turn_a");
         assert_eq!(reduction.send_context.pending_request_id, "pending_a");
+        assert_eq!(
+            reduction.turn_start_params_plan.reply_to_turn_id.as_deref(),
+            Some("turn_parent")
+        );
+        assert_eq!(
+            reduction.turn_start_params_plan.mentioned_principal_ids[0].as_str(),
+            "PAAAAAAAAAAAAAAAAAAAA"
+        );
     }
 
     #[test]
@@ -1772,6 +1890,8 @@ mod tests {
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 permission_mode: TurnPermissionMode::Supervised,
                 execution_backend: None,
                 selected_reasoning_effort: None,
@@ -1809,6 +1929,8 @@ mod tests {
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 permission_mode: TurnPermissionMode::AutoAcceptEdits,
                 execution_backend: None,
                 selected_reasoning_effort: Some(" high ".to_owned()),
@@ -1848,6 +1970,8 @@ mod tests {
                 selected_provider: Some("cli_runtime:codex".to_owned()),
                 turn_model_provider: None,
                 selected_mode: Some(ThreadMode::Agent),
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
                 permission_mode: TurnPermissionMode::Supervised,
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id: "codex".to_owned(),

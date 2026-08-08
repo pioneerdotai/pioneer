@@ -9,7 +9,197 @@ use crate::{
     state::{client_state::ClientState, selectors},
     threads::start::ThreadStartCoordinator,
 };
-use pioneer_protocol::{AccessChangeKind, AccessChangedNotification};
+use pioneer_protocol::{
+    AccessChangeKind, AccessChangedNotification, AuthMeResponse, AuthSessionListItem,
+    AuthSessionStatus, DeviceStatus, MemberSummary, PrincipalId, PrincipalKind, RoleKey,
+};
+
+/// Global, shell-neutral discoverability derived from the authenticated
+/// principal snapshot.
+///
+/// These flags are presentation hints only. The Gateway remains authoritative
+/// for every operation and callers must still handle an authoritative denial.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalPresentationCapabilities {
+    pub can_view_invitations: bool,
+    pub can_create_invitation: bool,
+    pub can_view_member_directory: bool,
+    pub can_add_workspace_member: bool,
+    pub can_manage_member_lifecycle: bool,
+    pub can_remove_workspace_member: bool,
+    pub can_manage_own_sessions: bool,
+}
+
+/// Stable UI vocabulary for the authenticated principal kind. `Unknown` keeps
+/// clients fail-closed when a future protocol kind reaches a newer boundary.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentPrincipalKindPresentation {
+    Superuser,
+    Member,
+    Unknown,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentPrincipalPresentation {
+    pub principal_id: PrincipalId,
+    pub display_name: String,
+    pub nickname: String,
+    pub kind: CurrentPrincipalKindPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_revision: Option<String>,
+    pub read_only: bool,
+    pub capabilities: PrincipalPresentationCapabilities,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatusPresentation {
+    Active,
+    Pending,
+    Expired,
+    Revoked,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListRowPresentation {
+    pub status: SessionStatusPresentation,
+    pub actionable: bool,
+}
+
+pub fn session_list_row_presentation(item: &AuthSessionListItem) -> SessionListRowPresentation {
+    let status = match (item.session.status, item.device.status) {
+        (AuthSessionStatus::Active, DeviceStatus::Active) => SessionStatusPresentation::Active,
+        (AuthSessionStatus::Pending, _) | (_, DeviceStatus::Pending) => {
+            SessionStatusPresentation::Pending
+        }
+        (AuthSessionStatus::Expired, _) => SessionStatusPresentation::Expired,
+        (AuthSessionStatus::Revoked, _) | (_, DeviceStatus::Revoked) => {
+            SessionStatusPresentation::Revoked
+        }
+    };
+    SessionListRowPresentation {
+        status,
+        actionable: status == SessionStatusPresentation::Active,
+    }
+}
+
+pub fn current_principal_kind_presentation(
+    kind: Option<PrincipalKind>,
+) -> CurrentPrincipalKindPresentation {
+    match kind {
+        Some(PrincipalKind::Superuser) => CurrentPrincipalKindPresentation::Superuser,
+        Some(PrincipalKind::User) => CurrentPrincipalKindPresentation::Member,
+        None => CurrentPrincipalKindPresentation::Unknown,
+    }
+}
+
+/// Project the authenticated identity. A directory row may contribute only an
+/// already-disclosed avatar revision and only when it names the same principal;
+/// auth/me remains the identity authority.
+pub fn current_principal_presentation(
+    auth: &AuthMeResponse,
+    visible_member: Option<&MemberSummary>,
+) -> CurrentPrincipalPresentation {
+    let avatar_revision = visible_member
+        .filter(|member| member.principal_id == auth.principal.id)
+        .and_then(|member| member.avatar_revision.clone());
+
+    CurrentPrincipalPresentation {
+        principal_id: auth.principal.id.clone(),
+        display_name: auth.principal.display_name.clone(),
+        nickname: auth.principal.nickname.clone(),
+        kind: current_principal_kind_presentation(Some(auth.principal.kind)),
+        avatar_revision,
+        read_only: true,
+        capabilities: principal_presentation_capabilities_from_auth(auth),
+    }
+}
+
+/// Server-owned resource facts needed to decide whether thread-management UI
+/// is discoverable. Shells must obtain these facts from an authoritative
+/// thread detail/action response rather than infer them from a cached list row.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadPresentationFacts {
+    pub is_user_thread: bool,
+    pub is_private_thread: bool,
+    pub current_principal_is_creator: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadPresentationCapabilities {
+    pub can_manage_thread: bool,
+    pub can_manage_private_participants: bool,
+}
+
+/// Derive global presentation capabilities from server-owned identity facts.
+/// Missing/future principal kinds and unsupported roles fail closed.
+pub fn principal_presentation_capabilities(
+    principal_kind: Option<PrincipalKind>,
+    role_key: Option<&RoleKey>,
+) -> PrincipalPresentationCapabilities {
+    match (principal_kind, role_key) {
+        (Some(PrincipalKind::Superuser), None) => PrincipalPresentationCapabilities {
+            can_view_invitations: true,
+            can_create_invitation: true,
+            can_view_member_directory: true,
+            can_add_workspace_member: true,
+            can_manage_member_lifecycle: true,
+            can_remove_workspace_member: true,
+            can_manage_own_sessions: true,
+        },
+        (Some(PrincipalKind::User), Some(role_key)) if role_key.is_supported() => {
+            PrincipalPresentationCapabilities {
+                can_view_invitations: true,
+                can_create_invitation: true,
+                can_view_member_directory: true,
+                can_add_workspace_member: true,
+                can_manage_member_lifecycle: false,
+                can_remove_workspace_member: false,
+                can_manage_own_sessions: true,
+            }
+        }
+        _ => PrincipalPresentationCapabilities::default(),
+    }
+}
+
+pub fn principal_presentation_capabilities_from_auth(
+    auth: &AuthMeResponse,
+) -> PrincipalPresentationCapabilities {
+    principal_presentation_capabilities(Some(auth.principal.kind), auth.role_key.as_ref())
+}
+
+/// Derive resource-scoped thread discoverability. This output is never an
+/// authorization proof and must not be sent back as one.
+pub fn thread_presentation_capabilities(
+    principal_kind: Option<PrincipalKind>,
+    role_key: Option<&RoleKey>,
+    facts: ThreadPresentationFacts,
+) -> ThreadPresentationCapabilities {
+    let recognized_superuser =
+        matches!(principal_kind, Some(PrincipalKind::Superuser)) && role_key.is_none();
+    let recognized_member = matches!(principal_kind, Some(PrincipalKind::User))
+        && role_key.is_some_and(RoleKey::is_supported);
+    let may_manage = facts.is_user_thread
+        && (recognized_superuser || (recognized_member && facts.current_principal_is_creator));
+
+    ThreadPresentationCapabilities {
+        can_manage_thread: may_manage,
+        can_manage_private_participants: may_manage && facts.is_private_thread,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadAuthorizationScope {
@@ -271,11 +461,190 @@ mod tests {
         threads::coordinator::ThreadCoordinator,
     };
     use pioneer_protocol::{
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        AuthDeviceSnapshot, AuthSessionId, AuthSessionSnapshot, ClientKind, DeviceId, Thread,
+        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TokenFamilyId,
         TurnPermissionActionKind, TurnPermissionApprovalRequest, TurnPermissionDecisionReason,
         Workspace,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn current_principal_kind_has_safe_future_fallback() {
+        assert_eq!(
+            current_principal_kind_presentation(Some(PrincipalKind::Superuser)),
+            CurrentPrincipalKindPresentation::Superuser
+        );
+        assert_eq!(
+            current_principal_kind_presentation(Some(PrincipalKind::User)),
+            CurrentPrincipalKindPresentation::Member
+        );
+        assert_eq!(
+            current_principal_kind_presentation(None),
+            CurrentPrincipalKindPresentation::Unknown
+        );
+    }
+
+    #[test]
+    fn session_rows_share_authoritative_status_and_actionability() {
+        let mut item = AuthSessionListItem {
+            current: false,
+            last_seen_at_unix: 1,
+            device: AuthDeviceSnapshot {
+                id: DeviceId::new("D00000000000000000001").unwrap(),
+                installation_id: "install-1".to_owned(),
+                display_name: "Device".to_owned(),
+                client_kind: ClientKind::Mobile,
+                status: DeviceStatus::Active,
+            },
+            session: AuthSessionSnapshot {
+                id: AuthSessionId::new("S00000000000000000001").unwrap(),
+                device_id: DeviceId::new("D00000000000000000001").unwrap(),
+                token_family_id: TokenFamilyId::new("F00000000000000000001").unwrap(),
+                status: AuthSessionStatus::Active,
+                refresh_generation: 1,
+                refresh_expires_at_unix: 2,
+            },
+        };
+        assert_eq!(
+            session_list_row_presentation(&item),
+            SessionListRowPresentation {
+                status: SessionStatusPresentation::Active,
+                actionable: true,
+            }
+        );
+
+        item.device.status = DeviceStatus::Revoked;
+        assert_eq!(
+            session_list_row_presentation(&item),
+            SessionListRowPresentation {
+                status: SessionStatusPresentation::Revoked,
+                actionable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn principal_capability_matrix_is_bounded_and_future_roles_fail_closed() {
+        struct Case {
+            kind: Option<PrincipalKind>,
+            role: Option<RoleKey>,
+            expected: PrincipalPresentationCapabilities,
+        }
+
+        let cases = [
+            Case {
+                kind: Some(PrincipalKind::Superuser),
+                role: None,
+                expected: PrincipalPresentationCapabilities {
+                    can_view_invitations: true,
+                    can_create_invitation: true,
+                    can_view_member_directory: true,
+                    can_add_workspace_member: true,
+                    can_manage_member_lifecycle: true,
+                    can_remove_workspace_member: true,
+                    can_manage_own_sessions: true,
+                },
+            },
+            Case {
+                kind: Some(PrincipalKind::User),
+                role: Some(RoleKey::member()),
+                expected: PrincipalPresentationCapabilities {
+                    can_view_invitations: true,
+                    can_create_invitation: true,
+                    can_view_member_directory: true,
+                    can_add_workspace_member: true,
+                    can_manage_member_lifecycle: false,
+                    can_remove_workspace_member: false,
+                    can_manage_own_sessions: true,
+                },
+            },
+            Case {
+                kind: Some(PrincipalKind::User),
+                role: Some(RoleKey::new("future_role").expect("valid future role")),
+                expected: PrincipalPresentationCapabilities::default(),
+            },
+            Case {
+                kind: None,
+                role: None,
+                expected: PrincipalPresentationCapabilities::default(),
+            },
+            Case {
+                kind: Some(PrincipalKind::Superuser),
+                role: Some(RoleKey::member()),
+                expected: PrincipalPresentationCapabilities::default(),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                principal_presentation_capabilities(case.kind, case.role.as_ref()),
+                case.expected
+            );
+        }
+    }
+
+    #[test]
+    fn thread_capabilities_require_recognized_principal_and_explicit_resource_facts() {
+        let private_creator = ThreadPresentationFacts {
+            is_user_thread: true,
+            is_private_thread: true,
+            current_principal_is_creator: true,
+        };
+        let member = RoleKey::member();
+
+        assert_eq!(
+            thread_presentation_capabilities(
+                Some(PrincipalKind::User),
+                Some(&member),
+                private_creator,
+            ),
+            ThreadPresentationCapabilities {
+                can_manage_thread: true,
+                can_manage_private_participants: true,
+            }
+        );
+        assert_eq!(
+            thread_presentation_capabilities(
+                Some(PrincipalKind::User),
+                Some(&member),
+                ThreadPresentationFacts {
+                    current_principal_is_creator: false,
+                    ..private_creator
+                },
+            ),
+            ThreadPresentationCapabilities::default()
+        );
+        assert_eq!(
+            thread_presentation_capabilities(
+                Some(PrincipalKind::Superuser),
+                None,
+                ThreadPresentationFacts {
+                    is_private_thread: false,
+                    current_principal_is_creator: false,
+                    ..private_creator
+                },
+            ),
+            ThreadPresentationCapabilities {
+                can_manage_thread: true,
+                can_manage_private_participants: false,
+            }
+        );
+        assert_eq!(
+            thread_presentation_capabilities(None, None, private_creator,),
+            ThreadPresentationCapabilities::default()
+        );
+        assert_eq!(
+            thread_presentation_capabilities(
+                Some(PrincipalKind::Superuser),
+                None,
+                ThreadPresentationFacts {
+                    is_user_thread: false,
+                    ..private_creator
+                },
+            ),
+            ThreadPresentationCapabilities::default()
+        );
+    }
 
     fn workspace(id: &str) -> Workspace {
         Workspace {

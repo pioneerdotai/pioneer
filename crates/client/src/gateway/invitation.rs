@@ -13,6 +13,7 @@ use pioneer_protocol::{
 };
 
 use crate::{ClientError, ClientResult};
+use qrcode::{Color, QrCode};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct InvitationQrPresentation {
@@ -60,6 +61,21 @@ impl InvitationQrPresentation {
     pub fn qr_payload(&self) -> &[u8] {
         self.presentation.deep_link().as_bytes()
     }
+
+    /// Platform-neutral QR matrix for shells that do not ship a QR encoder.
+    /// The matrix is secret-bearing and must follow the same ephemeral owner
+    /// boundary as the canonical URI.
+    pub fn qr_modules(&self) -> ClientResult<(usize, Vec<bool>)> {
+        let qr = QrCode::new(self.qr_payload())
+            .map_err(|_| ClientError::protocol("invalid invitation QR payload"))?;
+        Ok((
+            qr.width(),
+            qr.to_colors()
+                .into_iter()
+                .map(|color| color == Color::Dark)
+                .collect(),
+        ))
+    }
 }
 
 impl std::fmt::Debug for InvitationQrPresentation {
@@ -72,6 +88,276 @@ impl std::fmt::Debug for InvitationQrPresentation {
             .field("credential", &"[redacted]")
             .field("deep_link", &"[redacted]")
             .field("qr_payload", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Shell-neutral, non-serializable invitation join phase.
+///
+/// The phase is safe to project into UI state. The secret presentation itself
+/// remains owned by [`InvitationJoinFlow`] and is never part of a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationJoinPhase {
+    Parsing,
+    Previewing,
+    EditingProfile,
+    Accepting,
+    Committing,
+    Complete,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationJoinField {
+    DisplayName,
+    Nickname,
+    Avatar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InvitationJoinSafeProfile {
+    pub display_name: String,
+    pub nickname: String,
+    pub has_avatar: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitationJoinSafeState {
+    pub phase: InvitationJoinPhase,
+    pub profile: InvitationJoinSafeProfile,
+    pub field_error: Option<InvitationJoinField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationJoinEffect {
+    Preview,
+    Accept,
+    TakeRefreshForSecureStorage,
+    ConfirmSecureStorage,
+    PersistRegistryBinding,
+    ReleaseAccess,
+    ActivateGateway,
+    CleanupSession,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvitationJoinTransition {
+    pub effect: InvitationJoinEffect,
+    pub duplicate_delivery: bool,
+}
+
+/// Owns the only raw invitation presentation for an active join flow.
+///
+/// This type deliberately has no `Clone`, `Serialize` or schema support. Its
+/// debug representation is inherited from the redacted presentation and every
+/// terminal path drops the secret before returning control to a shell.
+pub struct InvitationJoinFlow {
+    presentation: Option<InvitationQrPresentation>,
+    state: InvitationJoinSafeState,
+}
+
+impl InvitationJoinFlow {
+    pub fn from_uri(uri: &str) -> ClientResult<(Self, InvitationJoinTransition)> {
+        let presentation = InvitationQrPresentation::parse(uri)?;
+        Ok((
+            Self {
+                presentation: Some(presentation),
+                state: InvitationJoinSafeState {
+                    phase: InvitationJoinPhase::Previewing,
+                    profile: InvitationJoinSafeProfile::default(),
+                    field_error: None,
+                },
+            },
+            InvitationJoinTransition {
+                effect: InvitationJoinEffect::Preview,
+                duplicate_delivery: false,
+            },
+        ))
+    }
+
+    pub fn safe_state(&self) -> &InvitationJoinSafeState {
+        &self.state
+    }
+
+    pub fn presentation(&self) -> ClientResult<&InvitationQrPresentation> {
+        self.presentation
+            .as_ref()
+            .ok_or_else(|| ClientError::invalid_state("invitation presentation is unavailable"))
+    }
+
+    pub fn deliver_uri(&mut self, uri: &str) -> ClientResult<InvitationJoinTransition> {
+        let incoming = InvitationQrPresentation::parse(uri)?;
+        if self
+            .presentation
+            .as_ref()
+            .is_some_and(|active| active.deep_link() == incoming.deep_link())
+            && !matches!(
+                self.state.phase,
+                InvitationJoinPhase::Complete | InvitationJoinPhase::Terminal
+            )
+        {
+            return Ok(InvitationJoinTransition {
+                effect: InvitationJoinEffect::None,
+                duplicate_delivery: true,
+            });
+        }
+
+        self.presentation = Some(incoming);
+        self.state = InvitationJoinSafeState {
+            phase: InvitationJoinPhase::Previewing,
+            profile: InvitationJoinSafeProfile::default(),
+            field_error: None,
+        };
+        Ok(InvitationJoinTransition {
+            effect: InvitationJoinEffect::Preview,
+            duplicate_delivery: false,
+        })
+    }
+
+    pub fn preview_succeeded(&mut self) -> InvitationJoinTransition {
+        self.state.phase = InvitationJoinPhase::EditingProfile;
+        self.state.field_error = None;
+        InvitationJoinTransition {
+            effect: InvitationJoinEffect::None,
+            duplicate_delivery: false,
+        }
+    }
+
+    pub fn update_safe_profile(&mut self, profile: InvitationJoinSafeProfile) {
+        self.state.profile = profile;
+        self.state.field_error = None;
+    }
+
+    pub fn submit(&mut self) -> ClientResult<InvitationJoinTransition> {
+        if self.state.phase != InvitationJoinPhase::EditingProfile || self.presentation.is_none() {
+            return Err(ClientError::invalid_state(
+                "invitation profile cannot be submitted in the current state",
+            ));
+        }
+        self.state.phase = InvitationJoinPhase::Accepting;
+        self.state.field_error = None;
+        Ok(InvitationJoinTransition {
+            effect: InvitationJoinEffect::Accept,
+            duplicate_delivery: false,
+        })
+    }
+
+    pub fn validation_failed(&mut self, field: InvitationJoinField) {
+        self.state.phase = InvitationJoinPhase::EditingProfile;
+        self.state.field_error = Some(field);
+    }
+
+    pub fn retryable_failure(&mut self) -> ClientResult<()> {
+        if !matches!(
+            self.state.phase,
+            InvitationJoinPhase::Accepting | InvitationJoinPhase::Committing
+        ) || self.presentation.is_none()
+        {
+            return Err(ClientError::invalid_state(
+                "invitation join cannot be retried in the current state",
+            ));
+        }
+        self.state.phase = InvitationJoinPhase::EditingProfile;
+        self.state.field_error = None;
+        Ok(())
+    }
+
+    pub fn accept_succeeded(&mut self) -> ClientResult<InvitationJoinTransition> {
+        if self.state.phase != InvitationJoinPhase::Accepting {
+            return Err(ClientError::invalid_state(
+                "invitation acceptance completed out of order",
+            ));
+        }
+        self.state.phase = InvitationJoinPhase::Committing;
+        Ok(InvitationJoinTransition {
+            effect: InvitationJoinEffect::TakeRefreshForSecureStorage,
+            duplicate_delivery: false,
+        })
+    }
+
+    pub fn refresh_stored(&self) -> ClientResult<InvitationJoinTransition> {
+        self.require_committing(InvitationJoinEffect::ConfirmSecureStorage)
+    }
+
+    pub fn secure_storage_confirmed(&self) -> ClientResult<InvitationJoinTransition> {
+        self.require_committing(InvitationJoinEffect::PersistRegistryBinding)
+    }
+
+    pub fn registry_stored(&self) -> ClientResult<InvitationJoinTransition> {
+        self.require_committing(InvitationJoinEffect::ReleaseAccess)
+    }
+
+    pub fn access_released(&self) -> ClientResult<InvitationJoinTransition> {
+        self.require_committing(InvitationJoinEffect::ActivateGateway)
+    }
+
+    pub fn complete(&mut self) -> ClientResult<InvitationJoinTransition> {
+        if self.state.phase != InvitationJoinPhase::Committing {
+            return Err(ClientError::invalid_state(
+                "invitation join completed out of order",
+            ));
+        }
+        self.presentation.take();
+        self.state.phase = InvitationJoinPhase::Complete;
+        self.state.field_error = None;
+        Ok(InvitationJoinTransition {
+            effect: InvitationJoinEffect::None,
+            duplicate_delivery: false,
+        })
+    }
+
+    pub fn cancel(&mut self) -> InvitationJoinTransition {
+        self.presentation.take();
+        self.state.phase = InvitationJoinPhase::Terminal;
+        self.state.field_error = None;
+        InvitationJoinTransition {
+            effect: InvitationJoinEffect::None,
+            duplicate_delivery: false,
+        }
+    }
+
+    pub fn terminal_failure(&mut self, cleanup_session: bool) -> InvitationJoinTransition {
+        self.presentation.take();
+        self.state.phase = InvitationJoinPhase::Terminal;
+        self.state.field_error = None;
+        InvitationJoinTransition {
+            effect: if cleanup_session {
+                InvitationJoinEffect::CleanupSession
+            } else {
+                InvitationJoinEffect::None
+            },
+            duplicate_delivery: false,
+        }
+    }
+
+    fn require_committing(
+        &self,
+        effect: InvitationJoinEffect,
+    ) -> ClientResult<InvitationJoinTransition> {
+        if self.state.phase != InvitationJoinPhase::Committing || self.presentation.is_none() {
+            return Err(ClientError::invalid_state(
+                "invitation durable commit step is out of order",
+            ));
+        }
+        Ok(InvitationJoinTransition {
+            effect,
+            duplicate_delivery: false,
+        })
+    }
+}
+
+impl std::fmt::Debug for InvitationJoinFlow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InvitationJoinFlow")
+            .field("phase", &self.state.phase)
+            .field("profile", &self.state.profile)
+            .field("field_error", &self.state.field_error)
+            .field(
+                "presentation",
+                &self.presentation.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }
@@ -608,5 +894,80 @@ mod tests {
         assert!(
             InvitationSessionCommit::new(&invitation, excessive_grants, "installation-1").is_err()
         );
+    }
+
+    #[test]
+    fn join_flow_deduplicates_active_delivery_and_preserves_only_safe_form_state() {
+        let uri = presentation().deep_link().to_owned();
+        let secret = presentation().token().to_owned();
+        let (mut flow, transition) = InvitationJoinFlow::from_uri(uri.as_str()).unwrap();
+        assert_eq!(transition.effect, InvitationJoinEffect::Preview);
+        assert_eq!(flow.safe_state().phase, InvitationJoinPhase::Previewing);
+
+        let duplicate = flow.deliver_uri(uri.as_str()).unwrap();
+        assert!(duplicate.duplicate_delivery);
+        assert_eq!(duplicate.effect, InvitationJoinEffect::None);
+
+        flow.preview_succeeded();
+        flow.update_safe_profile(InvitationJoinSafeProfile {
+            display_name: "Member".to_owned(),
+            nickname: "member".to_owned(),
+            has_avatar: true,
+        });
+        assert_eq!(flow.submit().unwrap().effect, InvitationJoinEffect::Accept);
+        flow.validation_failed(InvitationJoinField::Nickname);
+        assert_eq!(flow.safe_state().profile.display_name, "Member");
+        assert_eq!(flow.safe_state().profile.nickname, "member");
+        assert_eq!(
+            flow.safe_state().field_error,
+            Some(InvitationJoinField::Nickname)
+        );
+        let debug = format!("{flow:?}");
+        assert!(!debug.contains(uri.as_str()));
+        assert!(!debug.contains(secret.as_str()));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn join_flow_orders_durable_effects_and_drops_secret_on_every_terminal_path() {
+        let uri = presentation().deep_link().to_owned();
+        let (mut flow, _) = InvitationJoinFlow::from_uri(uri.as_str()).unwrap();
+        flow.preview_succeeded();
+        assert_eq!(flow.submit().unwrap().effect, InvitationJoinEffect::Accept);
+        assert_eq!(
+            flow.accept_succeeded().unwrap().effect,
+            InvitationJoinEffect::TakeRefreshForSecureStorage
+        );
+        assert_eq!(
+            flow.refresh_stored().unwrap().effect,
+            InvitationJoinEffect::ConfirmSecureStorage
+        );
+        assert_eq!(
+            flow.secure_storage_confirmed().unwrap().effect,
+            InvitationJoinEffect::PersistRegistryBinding
+        );
+        assert_eq!(
+            flow.registry_stored().unwrap().effect,
+            InvitationJoinEffect::ReleaseAccess
+        );
+        assert_eq!(
+            flow.access_released().unwrap().effect,
+            InvitationJoinEffect::ActivateGateway
+        );
+        flow.complete().unwrap();
+        assert_eq!(flow.safe_state().phase, InvitationJoinPhase::Complete);
+        assert!(flow.presentation().is_err());
+
+        let (mut cancelled, _) = InvitationJoinFlow::from_uri(uri.as_str()).unwrap();
+        cancelled.cancel();
+        assert_eq!(cancelled.safe_state().phase, InvitationJoinPhase::Terminal);
+        assert!(cancelled.presentation().is_err());
+
+        let (mut failed, _) = InvitationJoinFlow::from_uri(uri.as_str()).unwrap();
+        assert_eq!(
+            failed.terminal_failure(true).effect,
+            InvitationJoinEffect::CleanupSession
+        );
+        assert!(failed.presentation().is_err());
     }
 }

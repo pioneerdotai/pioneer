@@ -30,6 +30,8 @@ pub struct ClientInvitationPresentationResult {
     pub transport_security: InvitationTransportSecurity,
     pub canonical_uri: AuthSecretString,
     pub qr_payload: AuthSecretString,
+    pub qr_width: usize,
+    pub qr_modules: Vec<bool>,
 }
 
 impl ClientInvitationPresentationResult {
@@ -40,12 +42,17 @@ impl ClientInvitationPresentationResult {
         let qr_payload = std::str::from_utf8(presentation.qr_payload())
             .map(|payload| AuthSecretString::new(payload.to_owned()))
             .map_err(|_| "invalid invitation QR payload".to_owned())?;
+        let (qr_width, qr_modules) = presentation
+            .qr_modules()
+            .map_err(|_| "invalid invitation QR payload".to_owned())?;
         Ok(Self {
             gateway_base_url: presentation.gateway_base_url().clone(),
             gateway_id: presentation.gateway_id().clone(),
             transport_security: presentation.transport_security(),
             canonical_uri,
             qr_payload,
+            qr_width,
+            qr_modules,
         })
     }
 }

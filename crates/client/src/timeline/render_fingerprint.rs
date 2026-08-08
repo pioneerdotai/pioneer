@@ -98,8 +98,13 @@ pub fn timeline_row_content_fingerprint(
                 }
             }
         }
-        TimelineRowKind::Item { timeline_index } => {
+        TimelineRowKind::Item { timeline_index }
+        | TimelineRowKind::UserMessage { timeline_index, .. } => {
             0u8.hash(&mut hasher);
+
+            if let TimelineRowKind::UserMessage { presentation, .. } = &row.kind {
+                hash_serializable(presentation, &mut hasher);
+            }
 
             if let Some(entry) = projection.timeline.get(*timeline_index) {
                 entry.id.hash(&mut hasher);
@@ -135,13 +140,13 @@ fn timeline_row_is_expanded(
     row: &TimelineRow,
     expanded: &HashSet<String>,
 ) -> bool {
-    let TimelineRowKind::Item { timeline_index } = &row.kind else {
+    let Some(timeline_index) = timeline_row_index(row) else {
         return false;
     };
 
     projection
         .timeline
-        .get(*timeline_index)
+        .get(timeline_index)
         .is_some_and(|entry| expanded.contains(entry.id.as_str()))
 }
 
@@ -169,7 +174,8 @@ fn hash_serializable(
 
 pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineRow) -> usize {
     match &row.kind {
-        TimelineRowKind::Item { timeline_index } => projection
+        TimelineRowKind::Item { timeline_index }
+        | TimelineRowKind::UserMessage { timeline_index, .. } => projection
             .timeline
             .get(*timeline_index)
             .and_then(|entry| projection.item_for_timeline_entry(entry))
@@ -379,6 +385,18 @@ pub fn timeline_row_toggle_key(row: &TimelineRow) -> Option<&str> {
     match &row.kind {
         TimelineRowKind::TurnWorkToggle(group) => Some(group.toggle_key.as_str()),
         TimelineRowKind::CoalescedTools(group) => Some(group.toggle_key.as_str()),
-        TimelineRowKind::Item { .. } | TimelineRowKind::RunningTurn(_) => None,
+        TimelineRowKind::Item { .. }
+        | TimelineRowKind::UserMessage { .. }
+        | TimelineRowKind::RunningTurn(_) => None,
+    }
+}
+
+fn timeline_row_index(row: &TimelineRow) -> Option<usize> {
+    match &row.kind {
+        TimelineRowKind::Item { timeline_index }
+        | TimelineRowKind::UserMessage { timeline_index, .. } => Some(*timeline_index),
+        TimelineRowKind::TurnWorkToggle(_)
+        | TimelineRowKind::CoalescedTools(_)
+        | TimelineRowKind::RunningTurn(_) => None,
     }
 }
