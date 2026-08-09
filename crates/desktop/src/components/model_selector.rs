@@ -6,11 +6,12 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     Icon,
-    divider::Divider,
+    dialog::DialogFooter,
     form::{Field, field, v_form},
     input::{Input, InputState},
     popover::{Popover, PopoverState},
     scroll::Scrollbar,
+    separator::Separator,
     spinner::Spinner,
     theme::ActiveTheme,
     *,
@@ -427,31 +428,29 @@ impl PioneerDesktop {
                     let save_selection = save_selection.clone();
                     move |_, _, cx| save_selection(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let save_selection = save_selection.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("model-selector-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("model-selector-save")
-                                .label(t!("buttons.save").to_string())
-                                .on_click({
-                                    let save_selection = save_selection.clone();
-                                    move |_, window, cx| {
-                                        if save_selection(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                    vec![
+                        default_outline_button("model-selector-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("model-selector-save")
+                            .label(t!("buttons.save").to_string())
+                            .on_click({
+                                let save_selection = save_selection.clone();
+                                move |_, window, cx| {
+                                    if save_selection(cx) {
+                                        window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(v_flex().w_full().pt_4().pb_5().child({
                     let form = v_form()
                         .child(Self::render_provider_selector_section(
@@ -596,7 +595,7 @@ impl PioneerDesktop {
                     .relative()
                     .child(
                         Popover::new("model-provider-popover")
-                            .anchor(Corner::TopLeft)
+                            .anchor(Anchor::TopLeft)
                             .p_0()
                             .trigger(SelectorPopoverTrigger::new(
                                 "model-provider-trigger",
@@ -679,7 +678,7 @@ impl PioneerDesktop {
         let mut content = v_flex()
             .w(popover_width)
             .child(render_selector_filter_form(&state.provider_search_input))
-            .child(Divider::horizontal());
+            .child(Separator::horizontal());
 
         let mut list = v_flex()
             .id("provider-popover-list")
@@ -790,7 +789,7 @@ impl PioneerDesktop {
                     .relative()
                     .child(
                         Popover::new("model-model-popover")
-                            .anchor(Corner::TopLeft)
+                            .anchor(Anchor::TopLeft)
                             .p_0()
                             .trigger(
                                 SelectorPopoverTrigger::new(
@@ -847,7 +846,7 @@ impl PioneerDesktop {
                         .relative()
                         .child(
                             Popover::new("model-reasoning-effort-popover")
-                                .anchor(Corner::TopLeft)
+                                .anchor(Anchor::TopLeft)
                                 .p_0()
                                 .trigger(SelectorPopoverTrigger::new(
                                     "model-reasoning-effort-trigger",
@@ -1033,7 +1032,7 @@ impl PioneerDesktop {
         let mut content = v_flex()
             .w(popover_width)
             .child(render_selector_filter_form(&state.model_search_input))
-            .child(Divider::horizontal());
+            .child(Separator::horizontal());
 
         if is_loading {
             content = content.child(

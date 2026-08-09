@@ -4,7 +4,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, ParentElement, Pixels, RenderOnce, StyleRefinement,
     Styled, Window, canvas, div, px, relative,
 };
-use gpui_component::{ActiveTheme, PixelsExt, Sizable, Size, StyledExt};
+use gpui_component::{ActiveTheme, Sizable, Size, StyledExt};
 use std::{f32::consts::TAU, time::Duration};
 
 use gpui_component::plot::shape::{Arc, ArcData};
