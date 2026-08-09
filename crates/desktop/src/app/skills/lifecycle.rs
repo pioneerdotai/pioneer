@@ -244,7 +244,9 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 loop {
-                    Timer::after(Duration::from_secs(SKILLS_POLL_INTERVAL_SECS)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_secs(SKILLS_POLL_INTERVAL_SECS))
+                        .await;
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(

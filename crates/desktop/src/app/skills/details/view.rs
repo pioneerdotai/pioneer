@@ -10,8 +10,8 @@ use gpui_component::{
     StyledExt,
     button::*,
     collapsible::Collapsible,
-    divider::Divider,
-    table::{Table, TableState},
+    separator::Separator,
+    table::{DataTable, TableState},
     theme::ActiveTheme,
     *,
 };
@@ -272,31 +272,31 @@ impl PioneerDesktop {
                                 t!("skills.card.fingerprint").to_string(),
                             )),
                     )
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_validation_section(
                         detail_diagnostics.validation_issues.as_slice(),
                         cx,
                     ))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_dependency_section(
                         detail_diagnostics.dependency_diagnostics.as_slice(),
                         diagnostics_grid_columns,
                         cx,
                     ))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_security_section(
                         detail_diagnostics.security_findings.as_slice(),
                         diagnostics_grid_columns,
                         cx,
                     ))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(
                         self.render_trust_gate_section(
                             detail_diagnostics.trust_gate.as_slice(),
                             cx,
                         ),
                     )
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_recent_audit_section(
                         detail_diagnostics.recent_audit.as_slice(),
                         cx,
@@ -1078,7 +1078,7 @@ impl PioneerDesktop {
             .w_full()
             .h(table_height)
             .child(
-                Table::new(state_entity)
+                DataTable::new(state_entity)
                     .with_size(gpui_component::Size::Small)
                     .scrollbar_visible(true, false),
             )

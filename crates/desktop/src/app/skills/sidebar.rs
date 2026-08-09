@@ -35,31 +35,39 @@ impl PioneerDesktop {
                             .group("skills-sidebar-install-btn")
                             .disabled(!is_connected)
                             .child({
-                                let icon_bg = cx.theme().foreground.opacity(0.075);
-                                let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                div()
-                                    .id("skills-sidebar-install-icon")
-                                    .size_6()
-                                    .rounded_full()
-                                    .bg(icon_bg)
-                                    .group_hover("skills-sidebar-install-btn", move |style| {
-                                        style.bg(icon_bg_hover)
-                                    })
-                                    .flex()
+                                h_flex()
+                                    .w_full()
                                     .items_center()
-                                    .justify_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child({
+                                        let icon_bg = cx.theme().foreground.opacity(0.075);
+                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                        div()
+                                            .id("skills-sidebar-install-icon")
+                                            .size_6()
+                                            .rounded_full()
+                                            .bg(icon_bg)
+                                            .group_hover(
+                                                "skills-sidebar-install-btn",
+                                                move |style| style.bg(icon_bg_hover),
+                                            )
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(IconName::Plus)
+                                                    .size_4()
+                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            )
+                                    })
                                     .child(
-                                        Icon::new(IconName::Plus)
-                                            .size_4()
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                        div()
+                                            .line_height(relative(1.))
+                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                            .child(t!("skills.button.install").to_string()),
                                     )
                             })
-                            .child(
-                                div()
-                                    .line_height(relative(1.))
-                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                    .child(t!("skills.button.install").to_string()),
-                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, window, cx| {
@@ -77,26 +85,33 @@ impl PioneerDesktop {
                             .px_2()
                             .group("skills-sidebar-update-btn")
                             .child({
-                                div()
-                                    .id("skills-sidebar-update-icon")
-                                    .size_6()
-                                    .rounded_full()
-                                    .flex()
+                                h_flex()
+                                    .w_full()
                                     .items_center()
-                                    .justify_center()
+                                    .justify_start()
+                                    .gap_2()
                                     .child(
-                                        Icon::new(PioneerIconName::RefreshCw)
-                                            .size_4()
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                        div()
+                                            .id("skills-sidebar-update-icon")
+                                            .size_6()
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(PioneerIconName::RefreshCw)
+                                                    .size_4()
+                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .line_height(relative(1.))
+                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                            .child(t!("skills.button.update").to_string()),
                                     )
                             })
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .line_height(relative(1.))
-                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                    .child(t!("skills.button.update").to_string()),
-                            )
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.refresh_installed_skills(cx);
                                 cx.notify();
@@ -136,32 +151,40 @@ impl PioneerDesktop {
                             .px_2()
                             .group("skills-details-sidebar-back-btn")
                             .child({
-                                let icon_bg = cx.theme().foreground.opacity(0.075);
-                                let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                div()
-                                    .id("skills-details-sidebar-back-icon")
-                                    .size_6()
-                                    .rounded_full()
-                                    .bg(icon_bg)
-                                    .group_hover("skills-details-sidebar-back-btn", move |style| {
-                                        style.bg(icon_bg_hover)
-                                    })
-                                    .flex()
+                                h_flex()
+                                    .w_full()
                                     .items_center()
-                                    .justify_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child({
+                                        let icon_bg = cx.theme().foreground.opacity(0.075);
+                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                        div()
+                                            .id("skills-details-sidebar-back-icon")
+                                            .size_6()
+                                            .rounded_full()
+                                            .bg(icon_bg)
+                                            .group_hover(
+                                                "skills-details-sidebar-back-btn",
+                                                move |style| style.bg(icon_bg_hover),
+                                            )
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(IconName::ChevronLeft)
+                                                    .size_5()
+                                                    .ml_neg_px()
+                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            )
+                                    })
                                     .child(
-                                        Icon::new(IconName::ChevronLeft)
-                                            .size_5()
-                                            .ml_neg_px()
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                        div()
+                                            .line_height(relative(1.))
+                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                            .child(t!("settings.sidebar.back").to_string()),
                                     )
                             })
-                            .child(
-                                div()
-                                    .line_height(relative(1.))
-                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                    .child(t!("settings.sidebar.back").to_string()),
-                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, _, cx| {
@@ -182,25 +205,32 @@ impl PioneerDesktop {
                                 .disabled(!is_connected || selected_skill.is_none() || is_pending)
                                 .loading(is_pending)
                                 .child({
-                                    div()
-                                        .id("skills-details-sidebar-update-icon")
-                                        .size_6()
-                                        .rounded_full()
-                                        .flex()
+                                    h_flex()
+                                        .w_full()
                                         .items_center()
-                                        .justify_center()
+                                        .justify_start()
+                                        .gap_2()
                                         .child(
-                                            Icon::new(PioneerIconName::RefreshCw)
-                                                .size_4()
-                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            div()
+                                                .id("skills-details-sidebar-update-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(PioneerIconName::RefreshCw)
+                                                        .size_4()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .line_height(relative(1.))
+                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                                .child(t!("skills.button.update").to_string()),
                                         )
                                 })
-                                .child(
-                                    div()
-                                        .line_height(relative(1.))
-                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                        .child(t!("skills.button.update").to_string()),
-                                )
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
                                     let selected_skill = selected_skill.clone();
@@ -229,25 +259,32 @@ impl PioneerDesktop {
                                 .group("skills-details-sidebar-uninstall-btn")
                                 .disabled(!is_connected || selected_skill.is_none() || is_pending)
                                 .child({
-                                    div()
-                                        .id("skills-details-sidebar-uninstall-icon")
-                                        .size_6()
-                                        .rounded_full()
-                                        .flex()
+                                    h_flex()
+                                        .w_full()
                                         .items_center()
-                                        .justify_center()
+                                        .justify_start()
+                                        .gap_2()
                                         .child(
-                                            Icon::new(PioneerIconName::Trash)
-                                                .size_4()
-                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            div()
+                                                .id("skills-details-sidebar-uninstall-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(PioneerIconName::Trash)
+                                                        .size_4()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .line_height(relative(1.))
+                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                                .child(t!("skills.button.uninstall").to_string()),
                                         )
                                 })
-                                .child(
-                                    div()
-                                        .line_height(relative(1.))
-                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                        .child(t!("skills.button.uninstall").to_string()),
-                                )
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
                                     let selected_skill = selected_skill.clone();
