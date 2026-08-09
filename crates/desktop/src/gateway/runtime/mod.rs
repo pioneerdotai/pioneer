@@ -1,8 +1,10 @@
 mod compat;
 mod discovery;
+mod invitation;
 mod recovery;
 mod session;
 
+pub(crate) use invitation::{DesktopInvitationCommitError, DesktopInvitationRegistryRecovery};
 pub(crate) use session::{DesktopSessionConnectionOutcome, DesktopSessionPreparation};
 
 use crate::gateway::activation::{

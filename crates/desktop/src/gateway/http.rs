@@ -9,6 +9,10 @@ use pioneer_client::{
         ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
     },
     artifacts::preview::{ArtifactHttpPreviewService, ArtifactPreviewReadData},
+    avatars::{
+        AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheResult,
+        AvatarCacheService,
+    },
     gateway::endpoint::GatewayBaseUrl,
     transport::{
         http::{
@@ -32,6 +36,7 @@ pub(crate) struct DesktopGatewayHttpClient {
     session: GatewayHttpSession,
     downloads: ArtifactHttpDownloadService,
     previews: ArtifactHttpPreviewService,
+    avatars: AvatarCacheService,
     runtime: Arc<Runtime>,
 }
 
@@ -69,6 +74,12 @@ impl DesktopGatewayHttpClient {
             GatewayHttpSession::from_endpoint(endpoint, access.session_id.clone(), authority)?;
         let downloads = ArtifactHttpDownloadService::new(session.clone(), runtime_home.clone());
         let previews = ArtifactHttpPreviewService::new(session.clone());
+        let avatars = AvatarCacheService::new(
+            session.clone(),
+            runtime_home,
+            access.gateway_id,
+            access.session_id.clone(),
+        );
         let runtime = Runtime::new().map_err(|_| GatewayHttpError::ServiceUnavailable)?;
         Ok(Self {
             endpoint_id: endpoint.id.clone(),
@@ -77,8 +88,26 @@ impl DesktopGatewayHttpClient {
             session,
             downloads,
             previews,
+            avatars,
             runtime: Arc::new(runtime),
         })
+    }
+
+    pub(crate) fn resolve_member_avatar(
+        &self,
+        request: AvatarCacheRequest,
+        cancellation: CancellationToken,
+    ) -> Result<AvatarCacheResult, AvatarCacheError> {
+        self.runtime
+            .block_on(self.avatars.resolve(request, cancellation))
+    }
+
+    pub(crate) fn resolve_agent_avatar(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAvatarCacheResult, AvatarCacheError> {
+        self.runtime
+            .block_on(self.avatars.resolve_agent_avatar(cancellation))
     }
 
     pub(crate) fn matches(

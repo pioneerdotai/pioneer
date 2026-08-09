@@ -12,6 +12,7 @@ pub(crate) use control::GatewayInstallWarning;
 pub(crate) use http::DesktopGatewayHttpClient;
 
 pub use pioneer_client::runtime::ClientRuntime;
+pub(crate) use runtime::{DesktopInvitationCommitError, DesktopInvitationRegistryRecovery};
 pub(crate) use runtime::{DesktopSessionConnectionOutcome, DesktopSessionPreparation};
 pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
 pub(crate) use ws::DesktopGatewayWsCommandSenderExt;
