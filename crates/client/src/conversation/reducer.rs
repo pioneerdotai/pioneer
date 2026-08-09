@@ -2,7 +2,7 @@ use super::state_machine::TurnStateMachine;
 use crate::security::ClientTurnSecuritySummary;
 use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, MarkdownDocument, RecoveryJobStatus,
-    SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    SystemEventLevel, ThreadMode, TimelineOrigin, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
@@ -224,6 +224,7 @@ impl ConversationViewState {
     }
 
     pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
+        let permission_profile = projected_turn_permission_profile(turn);
         if let Some(existing) = self
             .turns
             .iter_mut()
@@ -233,7 +234,7 @@ impl ConversationViewState {
             if turn.error.is_some() {
                 existing.error = turn.error.clone();
             }
-            existing.permission_profile = Some(turn.permission_profile.clone());
+            existing.permission_profile = permission_profile;
             return;
         }
 
@@ -243,7 +244,7 @@ impl ConversationViewState {
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             error: turn.error.clone(),
-            permission_profile: Some(turn.permission_profile.clone()),
+            permission_profile,
             security_summary: None,
             resume: None,
         });
@@ -415,7 +416,7 @@ impl ConversationProjector {
             None,
             turn.error.clone(),
         );
-        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
+        self.set_turn_permission_profile(turn);
     }
 
     pub fn apply_permission_audit_event(
@@ -452,7 +453,7 @@ impl ConversationProjector {
             None,
             turn.error.clone(),
         );
-        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
+        self.set_turn_permission_profile(turn);
         self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Completed, ts_unix_ms);
     }
 
@@ -484,7 +485,7 @@ impl ConversationProjector {
             Some(ts_unix_ms),
             turn.error.clone(),
         );
-        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
+        self.set_turn_permission_profile(turn);
         self.mark_turn_items_terminal(turn.id.as_str(), item_status, ts_unix_ms);
         self.view_state.last_error = turn.error.clone();
 
@@ -1238,15 +1239,11 @@ impl ConversationProjector {
         self.turn_index.insert(turn_id.to_owned(), index);
     }
 
-    fn set_turn_permission_profile(
-        &mut self,
-        turn_id: &str,
-        permission_profile: TurnPermissionProfileSnapshot,
-    ) {
-        if let Some(index) = self.turn_index.get(turn_id).copied()
-            && let Some(turn) = self.view_state.turns.get_mut(index)
+    fn set_turn_permission_profile(&mut self, turn: &Turn) {
+        if let Some(index) = self.turn_index.get(turn.id.as_str()).copied()
+            && let Some(turn_view) = self.view_state.turns.get_mut(index)
         {
-            turn.permission_profile = Some(permission_profile);
+            turn_view.permission_profile = projected_turn_permission_profile(turn);
         }
     }
 
@@ -1627,6 +1624,10 @@ fn permission_profile_source_label(source: TurnPermissionProfileSource) -> &'sta
         TurnPermissionProfileSource::TaskPermissionCap => "task_permission_cap",
         TurnPermissionProfileSource::System => "system",
     }
+}
+
+fn projected_turn_permission_profile(turn: &Turn) -> Option<TurnPermissionProfileSnapshot> {
+    (turn.mode != ThreadMode::Message).then(|| turn.permission_profile.clone())
 }
 
 fn turn_phase_for_status(status: TurnStatus) -> TurnPhase {

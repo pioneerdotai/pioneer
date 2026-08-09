@@ -63,6 +63,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::avatars::ClientMemberAvatarCacheResult
         ),
         schema_doc!(
+            "client_agent_avatar_cache_request.json",
+            crate::avatars::ClientAgentAvatarCacheRequest
+        ),
+        schema_doc!(
+            "client_agent_avatar_cache_result.json",
+            crate::avatars::ClientAgentAvatarCacheResult
+        ),
+        schema_doc!(
             "add_and_activate_remote_gateway_registry_plan.json",
             crate::gateway::AddAndActivateRemoteGatewayRegistryPlan
         ),

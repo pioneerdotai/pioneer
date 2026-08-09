@@ -1,4 +1,4 @@
-//! Native authenticated member-avatar cache.
+//! Native authenticated avatar cache.
 //!
 //! Cache entries are immutable, revision-addressed and contain no credentials.
 //! Authorization remains owned by `GatewayHttpSession`; shell boundaries only
@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use pioneer_protocol::{
-    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId, ProfileAvatarMediaType,
+    AuthSessionId, GatewayId, PIONEER_AGENT_AVATAR_REVISION, PROFILE_AVATAR_MAX_DECODED_BYTES,
+    PrincipalId, ProfileAvatarMediaType,
 };
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
@@ -55,6 +56,15 @@ pub enum AvatarCacheSource {
 pub struct AvatarCacheResult {
     pub local_path: ClientPath,
     pub principal_id: PrincipalId,
+    pub avatar_revision: String,
+    pub media_type: ProfileAvatarMediaType,
+    pub source: AvatarCacheSource,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AgentAvatarCacheResult {
+    pub local_path: ClientPath,
     pub avatar_revision: String,
     pub media_type: ProfileAvatarMediaType,
     pub source: AvatarCacheSource,
@@ -155,12 +165,44 @@ impl AvatarCacheService {
         request: AvatarCacheRequest,
         cancellation: CancellationToken,
     ) -> Result<AvatarCacheResult, AvatarCacheError> {
-        let request = ValidatedAvatarRequest::new(request)?;
+        let request = ValidatedAvatarRequest::member(request)?;
+        let representation = self.resolve_validated(&request, cancellation).await?;
+        let AvatarCacheTarget::Member(principal_id) = &request.target else {
+            unreachable!("member request preserves its target")
+        };
+        Ok(AvatarCacheResult {
+            local_path: representation.local_path,
+            principal_id: principal_id.clone(),
+            avatar_revision: request.revision,
+            media_type: representation.media_type,
+            source: representation.source,
+        })
+    }
+
+    pub async fn resolve_agent_avatar(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAvatarCacheResult, AvatarCacheError> {
+        let request = ValidatedAvatarRequest::agent();
+        let representation = self.resolve_validated(&request, cancellation).await?;
+        Ok(AgentAvatarCacheResult {
+            local_path: representation.local_path,
+            avatar_revision: request.revision,
+            media_type: representation.media_type,
+            source: representation.source,
+        })
+    }
+
+    async fn resolve_validated(
+        &self,
+        request: &ValidatedAvatarRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ResolvedAvatarRepresentation, AvatarCacheError> {
         let paths = AvatarCachePaths::new(
             self.runtime_home.as_path(),
             &self.gateway_id,
             &self.session_id,
-            &request,
+            request,
         )?;
         let operation_gate = avatar_cache_gate_for(paths.gateway_root.as_path());
         let _operation = operation_gate.lock().await;
@@ -168,7 +210,7 @@ impl AvatarCacheService {
         ensure_owned_directory(self.runtime_home.as_path(), paths.parent())
             .await
             .map_err(|_| AvatarCacheError::Disk)?;
-        let cached_media_type = verify_cached(paths.final_path.as_path(), &request).await?;
+        let cached_media_type = verify_cached(paths.final_path.as_path(), request).await?;
         if cached_media_type.is_none() {
             remove_owned_file(paths.final_path.as_path()).await;
         }
@@ -194,11 +236,11 @@ impl AvatarCacheService {
                 if let Some(media_type) = cached_media_type
                     && mapped == AvatarCacheError::Offline
                 {
-                    return Ok(request.result(
-                        paths.final_path,
+                    return Ok(ResolvedAvatarRepresentation {
+                        local_path: paths.final_path,
                         media_type,
-                        AvatarCacheSource::OfflineCache,
-                    ));
+                        source: AvatarCacheSource::OfflineCache,
+                    });
                 }
                 return Err(mapped);
             }
@@ -211,13 +253,14 @@ impl AvatarCacheService {
                 remove_owned_file(paths.final_path.as_path()).await;
                 return Err(AvatarCacheError::InvalidResponse);
             }
-            return Ok(request.result(
-                paths.final_path,
-                cached_media_type.expect("304 requires a verified cached representation"),
-                AvatarCacheSource::Revalidated,
-            ));
+            return Ok(ResolvedAvatarRepresentation {
+                local_path: paths.final_path,
+                media_type: cached_media_type
+                    .expect("304 requires a verified cached representation"),
+                source: AvatarCacheSource::Revalidated,
+            });
         }
-        let media_type = validate_response_head(&response, &request)?;
+        let media_type = validate_response_head(&response, request)?;
         let expected_length = response
             .head
             .content_length
@@ -241,7 +284,11 @@ impl AvatarCacheService {
         persist_atomically(&paths, bytes.as_slice()).await?;
         prune_other_revisions(paths.parent(), paths.final_path.as_path()).await?;
         let _ = prune_avatar_cache(self.runtime_home.as_path()).await;
-        Ok(request.result(paths.final_path, media_type, AvatarCacheSource::Downloaded))
+        Ok(ResolvedAvatarRepresentation {
+            local_path: paths.final_path,
+            media_type,
+            source: AvatarCacheSource::Downloaded,
+        })
     }
 
     pub async fn invalidate_gateway(&self) -> Result<(), AvatarCacheError> {
@@ -288,13 +335,18 @@ pub fn invalidate_avatar_cache(runtime_home: &Path) -> Result<(), AvatarCacheErr
     .map_err(|_| AvatarCacheError::Disk)
 }
 
+enum AvatarCacheTarget {
+    Member(PrincipalId),
+    Agent,
+}
+
 struct ValidatedAvatarRequest {
-    principal_id: PrincipalId,
+    target: AvatarCacheTarget,
     revision: String,
 }
 
 impl ValidatedAvatarRequest {
-    fn new(request: AvatarCacheRequest) -> Result<Self, AvatarCacheError> {
+    fn member(request: AvatarCacheRequest) -> Result<Self, AvatarCacheError> {
         if request.avatar_revision.len() != 64
             || !request
                 .avatar_revision
@@ -304,36 +356,47 @@ impl ValidatedAvatarRequest {
             return Err(AvatarCacheError::InvalidRequest);
         }
         Ok(Self {
-            principal_id: request.principal_id,
+            target: AvatarCacheTarget::Member(request.principal_id),
             revision: request.avatar_revision,
         })
     }
 
+    fn agent() -> Self {
+        Self {
+            target: AvatarCacheTarget::Agent,
+            revision: PIONEER_AGENT_AVATAR_REVISION.to_owned(),
+        }
+    }
+
     fn storage_path(&self) -> String {
-        format!(
-            "storage/members/{}/avatar/{}",
-            self.principal_id, self.revision
-        )
+        match &self.target {
+            AvatarCacheTarget::Member(principal_id) => {
+                format!("storage/members/{principal_id}/avatar/{}", self.revision)
+            }
+            AvatarCacheTarget::Agent => {
+                format!("storage/system/agent/avatar/{}", self.revision)
+            }
+        }
     }
 
     fn etag(&self) -> String {
         format!("\"{}\"", self.revision)
     }
 
-    fn result(
-        &self,
-        local_path: ClientPath,
-        media_type: ProfileAvatarMediaType,
-        source: AvatarCacheSource,
-    ) -> AvatarCacheResult {
-        AvatarCacheResult {
-            local_path,
-            principal_id: self.principal_id.clone(),
-            avatar_revision: self.revision.clone(),
-            media_type,
-            source,
+    fn cache_parent(&self, session_root: PathBuf) -> PathBuf {
+        match &self.target {
+            AvatarCacheTarget::Member(principal_id) => {
+                session_root.join("members").join(principal_id.as_str())
+            }
+            AvatarCacheTarget::Agent => session_root.join("system").join("agent"),
         }
     }
+}
+
+struct ResolvedAvatarRepresentation {
+    local_path: ClientPath,
+    media_type: ProfileAvatarMediaType,
+    source: AvatarCacheSource,
 }
 
 struct AvatarCachePaths {
@@ -351,11 +414,8 @@ impl AvatarCachePaths {
     ) -> Result<Self, AvatarCacheError> {
         static NEXT_PART_ID: AtomicU64 = AtomicU64::new(1);
         let gateway_root = avatar_cache_root(runtime_home).join(gateway_id.as_str());
-        let parent = gateway_root
-            .join("sessions")
-            .join(session_id.as_str())
-            .join("members")
-            .join(request.principal_id.as_str());
+        let session_root = gateway_root.join("sessions").join(session_id.as_str());
+        let parent = request.cache_parent(session_root);
         let final_path = parent.join(format!("{}.avatar", request.revision));
         let part_id = NEXT_PART_ID.fetch_add(1, Ordering::Relaxed);
         let part_path = parent.join(format!(
@@ -919,7 +979,7 @@ mod tests {
             temp.path(),
             &gateway_id(),
             &session_id(),
-            &ValidatedAvatarRequest::new(avatar.clone()).unwrap(),
+            &ValidatedAvatarRequest::member(avatar.clone()).unwrap(),
         )
         .unwrap();
         let second_session = AuthSessionId::new("S00000000000000000002").unwrap();
@@ -927,10 +987,25 @@ mod tests {
             temp.path(),
             &gateway_id(),
             &second_session,
-            &ValidatedAvatarRequest::new(avatar).unwrap(),
+            &ValidatedAvatarRequest::member(avatar).unwrap(),
         )
         .unwrap();
 
         assert_ne!(first.final_path, second.final_path);
+    }
+
+    #[test]
+    fn agent_avatar_uses_the_authenticated_system_route_and_an_isolated_cache_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_request = ValidatedAvatarRequest::agent();
+        assert_eq!(
+            agent_request.storage_path(),
+            format!("storage/system/agent/avatar/{PIONEER_AGENT_AVATAR_REVISION}")
+        );
+
+        let paths =
+            AvatarCachePaths::new(temp.path(), &gateway_id(), &session_id(), &agent_request)
+                .unwrap();
+        assert!(paths.parent().ends_with("system/agent"));
     }
 }

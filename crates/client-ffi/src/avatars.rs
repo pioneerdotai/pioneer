@@ -1,4 +1,4 @@
-//! Secret-free FFI projection for the native member-avatar cache.
+//! Secret-free FFI projection for the native avatar cache.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use pioneer_client::{
     avatars::{
-        AvatarCacheError, AvatarCacheRequest, AvatarCacheService, AvatarCacheSource,
-        invalidate_avatar_cache,
+        AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheService,
+        AvatarCacheSource, invalidate_avatar_cache,
     },
     transport::{
         http::{
@@ -39,6 +39,20 @@ pub struct ClientMemberAvatarCacheRequest {
 pub struct ClientMemberAvatarCacheResult {
     pub cached_image_path: String,
     pub principal_id: PrincipalId,
+    pub avatar_revision: String,
+    pub media_type: ProfileAvatarMediaType,
+    pub source: AvatarCacheSource,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAgentAvatarCacheRequest {}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ClientAgentAvatarCacheResult {
+    pub cached_image_path: String,
     pub avatar_revision: String,
     pub media_type: ProfileAvatarMediaType,
     pub source: AvatarCacheSource,
@@ -109,12 +123,70 @@ impl ClientFfiAvatarCache {
         })
     }
 
+    pub(crate) fn resolve_agent(
+        &self,
+        sender: &GatewayWsCommandSender,
+        runtime_home: PathBuf,
+        _request: ClientAgentAvatarCacheRequest,
+    ) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
+        let _operation = self.operation_gate.lock().map_err(|_| {
+            ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
+        })?;
+        let access = sender
+            .current_gateway_http_access()
+            .map_err(map_authority_error)?;
+        let authority = Arc::new(FfiAvatarHttpAuthority {
+            sender: sender.clone(),
+        });
+        let session = GatewayHttpSession::from_access(&access, authority).map_err(|_| {
+            ClientFfiError::new(
+                "Gateway endpoint is unavailable for avatar access",
+                AVATAR_RECONFIGURATION_CODE,
+            )
+        })?;
+        let service =
+            AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
+        let runtime = Runtime::new().map_err(|_| {
+            ClientFfiError::new(
+                "avatar cache runtime is unavailable",
+                "avatar_cache_unavailable",
+            )
+        })?;
+        let result = runtime
+            .block_on(service.resolve_agent_avatar(CancellationToken::new()))
+            .map_err(map_cache_error)?;
+        agent_result_for_shell(result)
+    }
+
     pub(crate) fn invalidate_all(&self, runtime_home: &Path) {
         let Ok(_operation) = self.operation_gate.lock() else {
             return;
         };
         let _ = invalidate_avatar_cache(runtime_home);
     }
+}
+
+fn agent_result_for_shell(
+    result: AgentAvatarCacheResult,
+) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
+    let cached_image_path = result
+        .local_path
+        .as_path()
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ClientFfiError::new(
+                "avatar cache path cannot be represented for the native shell",
+                "avatar_cache_path_invalid",
+            )
+        })?
+        .to_owned();
+    Ok(ClientAgentAvatarCacheResult {
+        cached_image_path,
+        avatar_revision: result.avatar_revision,
+        media_type: result.media_type,
+        source: result.source,
+    })
 }
 
 struct FfiAvatarHttpAuthority {
@@ -154,7 +226,7 @@ fn map_authority_error(error: GatewayHttpAuthorityError) -> ClientFfiError {
 }
 
 fn map_cache_error(error: AvatarCacheError) -> ClientFfiError {
-    ClientFfiError::new("member avatar is unavailable", error.code())
+    ClientFfiError::new("avatar is unavailable", error.code())
 }
 
 #[cfg(test)]
@@ -169,6 +241,24 @@ mod tests {
             avatar_revision: "a".repeat(64),
             media_type: ProfileAvatarMediaType::Png,
             source: AvatarCacheSource::Revalidated,
+        };
+        let value = serde_json::to_value(result).unwrap();
+        assert!(value.get("cached_image_path").is_some());
+        for forbidden in ["content", "content_base64", "access_token", "authorization"] {
+            assert!(
+                value.get(forbidden).is_none(),
+                "forbidden FFI field {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_ffi_result_serialization_contains_no_content_or_credentials() {
+        let result = ClientAgentAvatarCacheResult {
+            cached_image_path: "/owned/cache/agent-avatar".to_owned(),
+            avatar_revision: "a".repeat(64),
+            media_type: ProfileAvatarMediaType::Jpeg,
+            source: AvatarCacheSource::Downloaded,
         };
         let value = serde_json::to_value(result).unwrap();
         assert!(value.get("cached_image_path").is_some());

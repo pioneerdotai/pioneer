@@ -42,7 +42,8 @@ use auth::{
     auth_exchange_error, auth_exchange_runtime,
 };
 use avatars::{
-    ClientFfiAvatarCache, ClientMemberAvatarCacheRequest, ClientMemberAvatarCacheResult,
+    ClientAgentAvatarCacheRequest, ClientAgentAvatarCacheResult, ClientFfiAvatarCache,
+    ClientMemberAvatarCacheRequest, ClientMemberAvatarCacheResult,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
@@ -914,6 +915,25 @@ impl ClientFfiRuntime {
                 )
             })?;
         self.avatar_cache.resolve(
+            &self.client_runtime.ws_command_sender(),
+            self.native_cache_runtime_home()?,
+            request,
+        )
+    }
+
+    fn agent_avatar_cache(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
+        self.require_initialized_and_connected()?;
+        let request =
+            serde_json::from_str::<ClientAgentAvatarCacheRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid Agent avatar cache request",
+                    "avatar_invalid_request",
+                )
+            })?;
+        self.avatar_cache.resolve_agent(
             &self.client_runtime.ws_command_sender(),
             self.native_cache_runtime_home()?,
             request,
@@ -2719,6 +2739,7 @@ ffi_client_json_typed_method!(pioneer_client_ffi_invitation_list, invitation_lis
 ffi_client_json_typed_method!(pioneer_client_ffi_invitation_revoke, invitation_revoke);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_list, member_list);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_avatar_cache, member_avatar_cache);
+ffi_client_json_typed_method!(pioneer_client_ffi_agent_avatar_cache, agent_avatar_cache);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_suspend, member_suspend);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_restore, member_restore);
 ffi_client_json_typed_method!(pioneer_client_ffi_member_remove, member_remove);

@@ -150,6 +150,12 @@ fn message_lifecycle_preserves_running_agent_execution_flow() {
     assert_eq!(conversation.in_flight_turn_id(), Some(agent_turn_id));
     assert_eq!(conversation.status_label(), "running");
     assert!(!conversation.can_submit_message());
+    assert_eq!(
+        conversation
+            .projection()
+            .turn_permission_profile(message_turn_id),
+        None
+    );
 
     let mut snapshot = thread_snapshot_with_turn(agent);
     snapshot.turns.push(message);
@@ -157,6 +163,12 @@ fn message_lifecycle_preserves_running_agent_execution_flow() {
     reloaded.sync_thread_snapshot(&snapshot);
     assert_eq!(reloaded.in_flight_turn_id(), Some(agent_turn_id));
     assert_eq!(reloaded.status_label(), "running");
+    assert_eq!(
+        reloaded
+            .projection()
+            .turn_permission_profile(message_turn_id),
+        None
+    );
 }
 
 #[test]
