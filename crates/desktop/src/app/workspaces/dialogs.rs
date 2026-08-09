@@ -5,6 +5,7 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, StyledExt, WindowExt,
+    dialog::DialogFooter,
     form::{field, v_form},
     input::{Input, InputState},
     theme::ActiveTheme,
@@ -91,32 +92,30 @@ impl PioneerDesktop {
                     let rename_workspace = rename_workspace.clone();
                     move |_, _, cx| rename_workspace(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let rename_workspace = rename_workspace.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("rename-workspace-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("rename-workspace-save")
-                                .label(t!("buttons.save").to_string())
-                                .disabled(!can_submit)
-                                .on_click({
-                                    let rename_workspace = rename_workspace.clone();
-                                    move |_, window, cx| {
-                                        if rename_workspace(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                    vec![
+                        default_outline_button("rename-workspace-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("rename-workspace-save")
+                            .label(t!("buttons.save").to_string())
+                            .disabled(!can_submit)
+                            .on_click({
+                                let rename_workspace = rename_workspace.clone();
+                                move |_, window, cx| {
+                                    if rename_workspace(cx) {
+                                        window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()
@@ -221,32 +220,30 @@ impl PioneerDesktop {
                     let create_workspace = create_workspace.clone();
                     move |_, _, cx| create_workspace(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let create_workspace = create_workspace.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("create-workspace-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("create-workspace-save")
-                                .label(t!("workspace.action.create").to_string())
-                                .disabled(!can_submit)
-                                .on_click({
-                                    let create_workspace = create_workspace.clone();
-                                    move |_, window, cx| {
-                                        if create_workspace(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                    vec![
+                        default_outline_button("create-workspace-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("create-workspace-save")
+                            .label(t!("workspace.action.create").to_string())
+                            .disabled(!can_submit)
+                            .on_click({
+                                let create_workspace = create_workspace.clone();
+                                move |_, window, cx| {
+                                    if create_workspace(cx) {
+                                        window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()

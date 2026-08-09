@@ -5,10 +5,10 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     Colorize, Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
-    button::{Button, ButtonCustomVariant, ButtonVariants},
-    divider::Divider,
+    button::{Button, ButtonVariants},
     h_flex,
     popover::{Popover, PopoverState},
+    separator::Separator,
     spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
@@ -237,6 +237,8 @@ impl PioneerDesktop {
         let desktop_entity = cx.entity();
         let active_indicator_color = cx.theme().success;
         let inactive_indicator_color = cx.theme().yellow;
+        let option_foreground = cx.theme().foreground;
+        let option_muted_background = cx.theme().muted;
 
         let ghost_hover = if cx.theme().mode.is_dark() {
             cx.theme().secondary.lighten(0.2).opacity(0.8)
@@ -250,20 +252,8 @@ impl PioneerDesktop {
             cx.theme().secondary.darken(0.2).opacity(0.8)
         };
 
-        let option_style = ButtonCustomVariant::new(cx)
-            .color(cx.theme().transparent)
-            .foreground(cx.theme().foreground)
-            .hover(ghost_hover)
-            .active(ghost_active);
-
-        let selected_style = ButtonCustomVariant::new(cx)
-            .color(cx.theme().muted)
-            .foreground(cx.theme().foreground)
-            .hover(ghost_hover)
-            .active(ghost_active);
-
         Popover::new("workspace-switcher-popover")
-            .anchor(Corner::TopRight)
+            .anchor(Anchor::TopRight)
             .p_0()
             .trigger(WorkspaceSelectorTrigger::new(
                 "workspace-switcher-button",
@@ -279,6 +269,10 @@ impl PioneerDesktop {
                 let desktop_entity = desktop_entity.clone();
                 let active_indicator_color = active_indicator_color;
                 let inactive_indicator_color = inactive_indicator_color;
+                let option_foreground = option_foreground;
+                let option_muted_background = option_muted_background;
+                let ghost_hover = ghost_hover;
+                let ghost_active = ghost_active;
                 move |_, _window, popover_cx| {
                     let popover_entity = popover_cx.entity();
 
@@ -322,10 +316,12 @@ impl PioneerDesktop {
                                                 workspace,
                                                 active_workspace_id.as_deref(),
                                                 selector_disabled,
-                                                option_style,
-                                                selected_style,
                                                 active_indicator_color,
                                                 inactive_indicator_color,
+                                                option_foreground,
+                                                option_muted_background,
+                                                ghost_hover,
+                                                ghost_active,
                                                 desktop_entity.clone(),
                                                 popover_entity.clone(),
                                             )
@@ -334,7 +330,7 @@ impl PioneerDesktop {
                                 ),
                             )
                         })
-                        .child(Divider::horizontal())
+                        .child(Separator::horizontal())
                         .child(h_flex().p_2().pt_0().justify_start().child(
                             Self::render_create_workspace_popover_action(
                                 selector_disabled,
@@ -383,10 +379,12 @@ impl PioneerDesktop {
         workspace: &Workspace,
         active_workspace_id: Option<&str>,
         selector_disabled: bool,
-        option_style: ButtonCustomVariant,
-        selected_style: ButtonCustomVariant,
         active_indicator_color: Hsla,
         inactive_indicator_color: Hsla,
+        option_foreground: Hsla,
+        option_muted_background: Hsla,
+        ghost_hover: Hsla,
+        ghost_active: Hsla,
         desktop_entity: Entity<Self>,
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
@@ -395,25 +393,32 @@ impl PioneerDesktop {
             .map(str::to_owned)
             .unwrap_or_else(|| t!("workspace.unnamed").to_string());
         let is_active = active_workspace_id == Some(workspace_id.as_str());
-        let style = if is_active {
-            selected_style
-        } else {
-            option_style
-        };
         let workspace_id_for_click = workspace_id.clone();
 
-        let select_button = Button::new(("workspace-option", index))
-            .custom(style)
-            .with_size(px(14.))
+        let select_button = div()
+            .id(("workspace-option", index))
             .w_full()
-            .justify_start()
+            .min_w_0()
+            .cursor_pointer()
+            .rounded_lg()
             .pr(px(36.))
             .p_2()
-            .disabled(selector_disabled)
+            .text_color(option_foreground)
+            .when(is_active, |this| this.bg(option_muted_background))
+            .hover(move |this| this.bg(ghost_hover))
+            .active(move |this| this.bg(ghost_active))
+            .when(selector_disabled, |this| this.opacity(0.5))
+            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                window.prevent_default();
+            })
             .on_click({
                 let desktop_entity = desktop_entity.clone();
                 let popover_entity = popover_entity.clone();
                 move |_, window, cx| {
+                    if selector_disabled {
+                        cx.stop_propagation();
+                        return;
+                    }
                     let _ = desktop_entity.update(cx, |view, cx| {
                         view.switch_workspace_from_ui(workspace_id_for_click.clone(), cx);
                     });
@@ -448,6 +453,7 @@ impl PioneerDesktop {
                                     .w_full()
                                     .min_w_0()
                                     .text_sm()
+                                    .text_color(option_foreground)
                                     .line_height(relative(1.0))
                                     .font_semibold()
                                     .overflow_hidden()
@@ -460,6 +466,7 @@ impl PioneerDesktop {
                                     .w_full()
                                     .min_w_0()
                                     .text_xs()
+                                    .text_color(option_foreground)
                                     .line_height(relative(1.05))
                                     .opacity(0.6)
                                     .overflow_hidden()
