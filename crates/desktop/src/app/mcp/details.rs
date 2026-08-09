@@ -11,9 +11,9 @@ use gpui_component::{
     StyledExt,
     button::*,
     collapsible::Collapsible,
-    divider::Divider,
     scroll::ScrollableElement,
-    table::{Table, TableState},
+    separator::Separator,
+    table::{DataTable, TableState},
     theme::ActiveTheme,
     *,
 };
@@ -168,17 +168,17 @@ impl PioneerDesktop {
                         this.child(detail_error_block(error, cx))
                     })
                     .child(self.render_mcp_overview_section(&server, details, meta_grid_columns))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_health_section(&server, details, meta_grid_columns, cx))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_tools_section(details, cx))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_resources_section(details, cx))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_resource_templates_section(details, cx))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_prompts_section(details, cx))
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(self.render_mcp_audit_section(details, cx)),
             )
             .into_any_element()
@@ -561,7 +561,7 @@ impl PioneerDesktop {
             .w_full()
             .h(table_height)
             .child(
-                Table::new(state_entity)
+                DataTable::new(state_entity)
                     .with_size(gpui_component::Size::Small)
                     .scrollbar_visible(true, false),
             )

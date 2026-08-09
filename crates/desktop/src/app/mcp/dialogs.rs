@@ -3,6 +3,7 @@ use crate::components::buttonts::{default_outline_button, default_primary_button
 use gpui::{prelude::*, *};
 use gpui_component::{
     StyledExt, WindowExt,
+    dialog::DialogFooter,
     form::{field, v_form},
     input::{Input, InputState},
     *,
@@ -243,32 +244,30 @@ impl PioneerDesktop {
                     let install_config = install_config.clone();
                     move |_, window, cx| install_config(window, cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let install_config = install_config.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("mcp-config-dialog-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .disabled(is_install_pending)
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("mcp-config-dialog-save")
-                                .label(t!("mcp.dialog.install").to_string())
-                                .disabled(is_install_pending)
-                                .loading(is_install_pending)
-                                .on_click({
-                                    let install_config = install_config.clone();
-                                    move |_, window, cx| {
-                                        install_config(window, cx);
-                                    }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                    vec![
+                        default_outline_button("mcp-config-dialog-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .disabled(is_install_pending)
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("mcp-config-dialog-save")
+                            .label(t!("mcp.dialog.install").to_string())
+                            .disabled(is_install_pending)
+                            .loading(is_install_pending)
+                            .on_click({
+                                let install_config = install_config.clone();
+                                move |_, window, cx| {
+                                    install_config(window, cx);
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()

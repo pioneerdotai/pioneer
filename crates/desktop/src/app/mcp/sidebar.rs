@@ -31,8 +31,15 @@ impl PioneerDesktop {
                             .px_2()
                             .disabled(!is_connected || install_pending)
                             .loading(install_pending)
-                            .child(sidebar_icon(IconName::Plus, cx))
-                            .child(sidebar_label(t!("mcp.sidebar.install").to_string()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(sidebar_icon(IconName::Plus, cx))
+                                    .child(sidebar_label(t!("mcp.sidebar.install").to_string())),
+                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, window, cx| {
@@ -50,8 +57,15 @@ impl PioneerDesktop {
                             .px_2()
                             .disabled(!is_connected)
                             .loading(self.mcp_loading)
-                            .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
-                            .child(sidebar_label(t!("mcp.sidebar.refresh").to_string()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
+                                    .child(sidebar_label(t!("mcp.sidebar.refresh").to_string())),
+                            )
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.refresh_mcp_servers(cx);
                                 cx.notify();
@@ -92,27 +106,35 @@ impl PioneerDesktop {
                             .justify_start()
                             .px_2()
                             .child({
-                                let icon_bg = cx.theme().foreground.opacity(0.075);
-                                let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                div()
-                                    .id("mcp-details-sidebar-back-icon")
-                                    .size_6()
-                                    .rounded_full()
-                                    .bg(icon_bg)
-                                    .group_hover("mcp-details-sidebar-back-btn", move |style| {
-                                        style.bg(icon_bg_hover)
-                                    })
-                                    .flex()
+                                h_flex()
+                                    .w_full()
                                     .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::new(IconName::ChevronLeft)
-                                            .size_5()
-                                            .ml_neg_px()
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                    )
+                                    .justify_start()
+                                    .gap_2()
+                                    .child({
+                                        let icon_bg = cx.theme().foreground.opacity(0.075);
+                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                        div()
+                                            .id("mcp-details-sidebar-back-icon")
+                                            .size_6()
+                                            .rounded_full()
+                                            .bg(icon_bg)
+                                            .group_hover(
+                                                "mcp-details-sidebar-back-btn",
+                                                move |style| style.bg(icon_bg_hover),
+                                            )
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(IconName::ChevronLeft)
+                                                    .size_5()
+                                                    .ml_neg_px()
+                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                            )
+                                    })
+                                    .child(sidebar_label(t!("mcp.sidebar.back").to_string()))
                             })
-                            .child(sidebar_label(t!("mcp.sidebar.back").to_string()))
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, _, cx| {
@@ -129,8 +151,17 @@ impl PioneerDesktop {
                             .justify_start()
                             .px_2()
                             .disabled(!is_connected || selected.is_none() || is_pending)
-                            .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
-                            .child(sidebar_label(t!("mcp.sidebar.update_config").to_string()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
+                                    .child(sidebar_label(
+                                        t!("mcp.sidebar.update_config").to_string(),
+                                    )),
+                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, window, cx| {
@@ -153,8 +184,15 @@ impl PioneerDesktop {
                                     || restart_disabled,
                             )
                             .loading(is_pending)
-                            .child(sidebar_pioneer_icon(PioneerIconName::RotateCcw))
-                            .child(sidebar_label(t!("mcp.sidebar.restart").to_string()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(sidebar_pioneer_icon(PioneerIconName::RotateCcw))
+                                    .child(sidebar_label(t!("mcp.sidebar.restart").to_string())),
+                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 let selected = selected.clone();
@@ -175,8 +213,15 @@ impl PioneerDesktop {
                             .justify_start()
                             .px_2()
                             .disabled(!is_connected || selected.is_none() || is_pending)
-                            .child(sidebar_pioneer_icon(PioneerIconName::Trash))
-                            .child(sidebar_label(t!("mcp.sidebar.uninstall").to_string()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(sidebar_pioneer_icon(PioneerIconName::Trash))
+                                    .child(sidebar_label(t!("mcp.sidebar.uninstall").to_string())),
+                            )
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
                                 let selected = selected.clone();
