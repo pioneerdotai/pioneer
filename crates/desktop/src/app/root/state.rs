@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::{state, window};
-use gpui_component::table::TableState;
+use gpui_component::{combobox::ComboboxState, searchable_list::SearchableVec, table::TableState};
 use pioneer_client::composer::{
     model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
 };
@@ -28,6 +28,17 @@ impl PioneerDesktop {
                 .auto_grow(2, 13)
                 .placeholder(t!("chat.composer.placeholder").to_string())
         });
+        let composer_mention_select = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(Vec::<DesktopComposerMentionItem>::new()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let member_exact_principal_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("P00000000000000000000"));
         let thread_tree_state = cx.new(|cx| TreeState::new(cx));
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
         let provider_tree_state = cx.new(|cx| TreeState::new(cx));
@@ -62,7 +73,9 @@ impl PioneerDesktop {
         let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
 
         let mut view = Self {
+            invitation_join: None,
             thread_coordinators: HashMap::new(),
+            thread_unread: HashMap::new(),
             thread_folders: HashMap::new(),
             thread_placements: HashMap::new(),
             thread_agents_doc_summaries: HashMap::new(),
@@ -72,6 +85,23 @@ impl PioneerDesktop {
             thread_tree_selected_node_id: None,
             thread_tree_state,
             settings_content_view: SettingsContentView::General,
+            administration: AdministrationCache::default(),
+            workspace_members_loading: HashSet::new(),
+            thread_scope_pending: ThreadScopePendingAction::Idle,
+            thread_scope_error: None,
+            thread_scope_dialog: None,
+            message_revision_dialog: None,
+            message_revision_loading: false,
+            message_mutation_pending: false,
+            invitations_loading: false,
+            invitations_error: None,
+            invitation_workspace_selection: HashSet::new(),
+            members_loading: false,
+            members_error: None,
+            selected_member_id: None,
+            member_avatar_state: DesktopMemberAvatarState::default(),
+            member_exact_principal_input,
+            member_exact_workspace_id: None,
             voice_input_action_error: None,
             voice_input_action_generation: 0,
             pending_voice_input_enabled: None,
@@ -94,13 +124,21 @@ impl PioneerDesktop {
             last_active_thread_by_workspace: HashMap::new(),
             draft_thread_by_workspace: HashMap::new(),
             composer_state,
+            composer_input_subscription: None,
+            composer_mention_select,
+            composer_mention_select_subscription: None,
+            composer_mention_items: Vec::new(),
             composer_attachments: Vec::new(),
             composer_capabilities: Vec::new(),
             composer_skill_selections: Vec::new(),
             composer_upload_in_progress: false,
             composer_upload_error: None,
             composer_turn_mode: default_composer_turn_mode(),
+            composer_hovered_mode: None,
             composer_mode_manually_selected: false,
+            composer_reply_target: None,
+            composer_edit_target: None,
+            composer_selected_mentions: Vec::new(),
             composer_selected_provider: None,
             composer_capability_target: ComposerCapabilityTarget::native(),
             composer_selected_model: None,
@@ -154,6 +192,7 @@ impl PioneerDesktop {
             composer_draft_lifecycle: ComposerDraftLifecycleState::default(),
             thread_start: ThreadStartCoordinator::default(),
             thread_start_requested: false,
+            pending_thread_create_visibility: ThreadVisibility::Private,
             thread_timeline_scroll_handle: VirtualListScrollHandle::new(),
             thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
             thread_timeline_item_expanded: RefCell::new(HashSet::new()),
@@ -197,8 +236,62 @@ impl PioneerDesktop {
                 auth_sessions: Vec::new(),
                 auth_sessions_loading: false,
                 auth_sessions_error: None,
+                auth_session_action_pending: None,
+                current_auth: None,
             },
         };
+
+        let composer_state = view.composer_state.clone();
+        view.composer_input_subscription = Some(cx.subscribe(
+            &composer_state,
+            |view, input, event: &gpui_component::input::InputEvent, cx| {
+                if !matches!(event, gpui_component::input::InputEvent::Change) {
+                    return;
+                }
+                let text = input.read(cx).value();
+                if view
+                    .reduce_composer_domain(
+                        pioneer_client::composer::state_machine::ComposerDomainAction::ReconcileMentionsWithText {
+                            text: text.to_string(),
+                        },
+                    )
+                    .changed
+                {
+                    cx.notify();
+                }
+            },
+        ));
+
+        let composer_mention_select = view.composer_mention_select.clone();
+        view.composer_mention_select_subscription = Some(cx.subscribe_in(
+            &composer_mention_select,
+            window,
+            |_view,
+             select,
+             event: &gpui_component::combobox::ComboboxEvent<
+                DesktopComposerMentionComboboxDelegate,
+            >,
+             window,
+             cx| {
+                if let gpui_component::combobox::ComboboxEvent::Confirm(candidates) = event {
+                    let Some(candidate) = candidates.first().cloned() else {
+                        return;
+                    };
+
+                    // Keep the parent update outside the render pass.
+                    let desktop_entity = cx.entity().clone();
+                    let select = select.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.insert_composer_mention(candidate, window, cx);
+                        });
+                        let _ = select.update(cx, |state, cx| {
+                            state.clear_selection(cx);
+                        });
+                    });
+                }
+            },
+        ));
 
         cx.observe_window_bounds(window, |view, _, cx| {
             {

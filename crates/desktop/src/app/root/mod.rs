@@ -11,8 +11,14 @@ use crate::{
         conversation::Conversation,
         editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
+        invitation_join::DesktopInvitationJoinState,
+        member_avatars::DesktopMemberAvatarState,
         skills::details::table::SkillDiagnosticsTableDelegate,
-        thread::{ThreadCoordinator, view::timeline::TimelineRenderModel},
+        thread::{
+            ThreadCoordinator,
+            message_revisions::DesktopMessageRevisionDialogState,
+            view::timeline::{TimelineLayoutIndex, TimelineRenderModel},
+        },
     },
     audio::{
         capture::{
@@ -26,10 +32,17 @@ use crate::{
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
+    Sizable, VirtualListScrollHandle,
+    avatar::Avatar,
+    combobox::ComboboxState,
+    h_flex,
+    input::InputState,
+    searchable_list::{SearchableListItem, SearchableVec},
+    table::TableState,
+    tree::TreeState,
 };
-use gpui_terminal::TerminalView;
 pub(super) use pioneer_client::{
+    administration::AdministrationCache,
     agents_doc::scope::{
         AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
     },
@@ -44,6 +57,7 @@ pub(super) use pioneer_client::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},
         draft::ComposerDraftLifecycleState,
         skill_selection::ComposerSkillSelection,
+        state_machine::ComposerMentionCandidate,
         turn_prepare::PrepareVoiceComposerSnapshotRequest,
     },
     gateway::runtime::GatewaySetupAction,
@@ -53,15 +67,18 @@ pub(super) use pioneer_client::{
     skills::{catalog::SkillManagementProjection, upload::SkillUploadProgress},
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     tasks::review::TaskReviewActionState,
+    threads::scope::ThreadScopePendingAction,
     threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
+    timeline::rows::UserMessagePresentation,
     timeline::semantic::{
         SemanticTimelineRequestAction, SemanticTimelineRequestKey, SemanticTimelineState,
     },
 };
 use pioneer_protocol::{
-    CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    SkillHealthItem, SkillId, SkillListItem, SkillPackId, Thread, ThreadAgentsDocSummary,
-    ThreadFolder, ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
+    ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
+    McpServerDetailsResponse, PrincipalId, SkillHealthItem, SkillId, SkillListItem, SkillPackId,
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement, ThreadVisibility,
+    TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -73,6 +90,7 @@ use std::{
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
 };
+use terminal::TerminalView;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GatewayOperationSource {
@@ -156,9 +174,79 @@ pub(super) enum MainContentView {
 pub(super) enum SettingsContentView {
     General,
     Devices,
+    Invitations,
+    Members,
     Memory,
     SelfImprovement,
 }
+
+#[derive(Clone)]
+pub(super) struct DesktopComposerMentionItem {
+    pub(super) candidate: ComposerMentionCandidate,
+    pub(super) avatar_path: Option<String>,
+}
+
+impl SearchableListItem for DesktopComposerMentionItem {
+    type Value = ComposerMentionCandidate;
+
+    fn title(&self) -> SharedString {
+        format!(
+            "{} · @{}",
+            self.candidate.display_name, self.candidate.nickname
+        )
+        .into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.candidate
+    }
+
+    fn render(&self, _: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let avatar = Avatar::new()
+            .small()
+            .name(self.candidate.display_name.clone())
+            .when_some(self.avatar_path.clone(), |this, path| this.src(path));
+
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .py_0p5()
+            .child(avatar)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .child(self.candidate.display_name.clone()),
+                    )
+                    .when(!self.candidate.nickname.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .opacity(0.6)
+                                .child(format!("@{}", self.candidate.nickname)),
+                        )
+                    }),
+            )
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.candidate.display_name.to_lowercase().contains(&query)
+            || self.candidate.nickname.to_lowercase().contains(&query)
+    }
+}
+
+pub(super) type DesktopComposerMentionComboboxDelegate = SearchableVec<DesktopComposerMentionItem>;
 
 pub(super) struct GatewayCoordinator {
     pub(super) runtime: Option<GatewayRuntime>,
@@ -184,6 +272,8 @@ pub(super) struct GatewayCoordinator {
     pub(super) auth_sessions: Vec<pioneer_protocol::AuthSessionListItem>,
     pub(super) auth_sessions_loading: bool,
     pub(super) auth_sessions_error: Option<String>,
+    pub(super) auth_session_action_pending: Option<pioneer_protocol::AuthSessionId>,
+    pub(super) current_auth: Option<AuthMeResponse>,
 }
 
 #[derive(Default)]
@@ -192,6 +282,7 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) item_count: usize,
     pub(super) tail_entry_id: Option<String>,
     pub(super) tail_text_len: usize,
+    pub(super) last_read_requested_through_turn_id: Option<String>,
     pub(super) autoscroll_paused_by_user: bool,
     pub(super) measured_list_width: Pixels,
     pub(super) pending_width_probe: bool,
@@ -203,7 +294,10 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_render_tail_entry_id: Option<String>,
     pub(super) cached_render_tail_fingerprint: u64,
     pub(super) cached_render_model_fingerprint: u64,
+    pub(super) cached_render_principal_id: Option<String>,
+    pub(super) cached_render_task_child_thread: bool,
     pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
+    pub(super) cached_timeline_layout_index: Option<Rc<TimelineLayoutIndex>>,
     pub(super) cached_semantic_model_active_thread_id: Option<String>,
     pub(super) cached_semantic_model_revision: u64,
     pub(super) cached_semantic_model: Option<TimelineRenderModel>,
@@ -308,8 +402,22 @@ pub(super) struct TaskThreadNavigationEntry {
     pub(super) title: String,
 }
 
+#[derive(Clone)]
+pub(super) struct DesktopComposerEditTarget {
+    pub(super) presentation: UserMessagePresentation,
+    pub(super) preview: String,
+    pub(super) artifacts: Vec<ArtifactRef>,
+    pub(super) mention_selections: Vec<(PrincipalId, String)>,
+    pub(super) error: Option<String>,
+    pub(super) conflicted: bool,
+}
+
 pub struct PioneerDesktop {
+    pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
+    /// Authoritative per-thread counts from `thread/tree`; never derived from
+    /// the locally loaded timeline window.
+    pub(super) thread_unread: HashMap<String, u64>,
     pub(super) thread_folders: HashMap<String, ThreadFolder>,
     pub(super) thread_placements: HashMap<String, ThreadPlacement>,
     pub(super) thread_agents_doc_summaries:
@@ -320,6 +428,24 @@ pub struct PioneerDesktop {
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,
     pub(super) settings_content_view: SettingsContentView,
+    pub(super) administration: AdministrationCache,
+    pub(super) workspace_members_loading: HashSet<WorkspaceId>,
+    pub(super) thread_scope_pending: ThreadScopePendingAction,
+    pub(super) thread_scope_error: Option<String>,
+    pub(super) thread_scope_dialog:
+        Option<Entity<Option<pioneer_client::threads::scope::ThreadScopePresentation>>>,
+    pub(super) message_revision_dialog: Option<Entity<DesktopMessageRevisionDialogState>>,
+    pub(super) message_revision_loading: bool,
+    pub(super) message_mutation_pending: bool,
+    pub(super) invitations_loading: bool,
+    pub(super) invitations_error: Option<String>,
+    pub(super) invitation_workspace_selection: HashSet<String>,
+    pub(super) members_loading: bool,
+    pub(super) members_error: Option<String>,
+    pub(super) selected_member_id: Option<pioneer_protocol::PrincipalId>,
+    pub(super) member_avatar_state: DesktopMemberAvatarState,
+    pub(super) member_exact_principal_input: Entity<InputState>,
+    pub(super) member_exact_workspace_id: Option<String>,
     pub(super) voice_input_action_error: Option<String>,
     pub(super) voice_input_action_generation: u64,
     pub(super) pending_voice_input_enabled: Option<bool>,
@@ -342,13 +468,24 @@ pub struct PioneerDesktop {
     pub(super) last_active_thread_by_workspace: HashMap<String, String>,
     pub(super) draft_thread_by_workspace: HashMap<String, String>,
     pub(super) composer_state: Entity<InputState>,
+    pub(super) composer_input_subscription: Option<Subscription>,
+    pub(super) composer_mention_select:
+        Entity<ComboboxState<DesktopComposerMentionComboboxDelegate>>,
+    pub(super) composer_mention_select_subscription: Option<Subscription>,
+    pub(super) composer_mention_items: Vec<ComposerMentionCandidate>,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
     pub(super) composer_capabilities: Vec<ComposerCapability>,
     pub(super) composer_skill_selections: Vec<ComposerSkillSelection>,
     pub(super) composer_upload_in_progress: bool,
     pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
+    pub(super) composer_hovered_mode: Option<ThreadMode>,
     pub(super) composer_mode_manually_selected: bool,
+    pub(super) composer_reply_target:
+        Option<pioneer_client::composer::state_machine::ComposerReplyTarget>,
+    pub(super) composer_edit_target: Option<DesktopComposerEditTarget>,
+    pub(super) composer_selected_mentions:
+        Vec<pioneer_client::composer::state_machine::ComposerMentionSelection>,
     pub(super) composer_selected_provider: Option<String>,
     pub(super) composer_capability_target: ComposerCapabilityTarget,
     pub(super) composer_selected_model: Option<String>,
@@ -403,6 +540,7 @@ pub struct PioneerDesktop {
     pub(super) composer_draft_lifecycle: ComposerDraftLifecycleState,
     pub(super) thread_start: ThreadStartCoordinator,
     pub(super) thread_start_requested: bool,
+    pub(super) pending_thread_create_visibility: ThreadVisibility,
     pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,

@@ -24,6 +24,7 @@ impl PioneerDesktop {
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
         let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
         if changed {
+            self.composer_edit_target = None;
             self.active_thread_resubscribe_pending = self.active_thread_id.is_some()
                 && self.gateway.connection_state == GatewayConnectionState::Connected;
             self.reset_composer_model_selection_for_active_thread();
@@ -34,6 +35,7 @@ impl PioneerDesktop {
         let changed =
             thread_session::clear_active_thread_if_matches(&mut self.active_thread_id, thread_id);
         if changed {
+            self.composer_edit_target = None;
             self.reset_composer_model_selection_for_active_thread();
         }
         changed
@@ -159,6 +161,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.composer_edit_target = None;
         let fallback = composer_thread_switch_fallback(self.composer_domain_state());
         let transition = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
@@ -182,10 +185,15 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let current_thread_id = self.active_thread_id.clone();
-        let current_draft = current_thread_id.as_ref().map(|_| ComposerDomainDraft {
-            text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
-            domain: self.composer_domain_state(),
+        let current_draft = current_thread_id.as_ref().and_then(|_| {
+            self.composer_edit_target
+                .is_none()
+                .then(|| ComposerDomainDraft {
+                    text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
+                    domain: self.composer_domain_state(),
+                })
         });
+        self.composer_edit_target = None;
         self.set_active_thread_id(Some(thread_id.clone()));
         let fallback = composer_thread_switch_fallback(self.composer_domain_state());
         let transition = reduce_composer_draft_lifecycle(
@@ -204,6 +212,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_edit_target = None;
         self.composer_state
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
@@ -213,6 +222,7 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn clear_composer_payload_for_thread(&mut self, thread_id: &str) {
         if self.active_thread_id.as_deref() == Some(thread_id) {
+            self.composer_edit_target = None;
             self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
             self.composer_upload_in_progress = false;
             self.composer_upload_error = None;
@@ -222,6 +232,7 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn reset_thread_start_state(&mut self) {
         client_state_reducers::reset_thread_start_coordinator(&mut self.thread_start);
+        self.pending_thread_create_visibility = pioneer_protocol::ThreadVisibility::Private;
     }
 
     pub(in crate::app) fn thread_start_coordinator_mut(&mut self) -> &mut ThreadStartCoordinator {
@@ -316,6 +327,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
+        self.thread_unread.remove(thread_id);
         let workspace_id = self.thread_workspace_id(thread_id).map(str::to_owned);
         client_state_reducers::remove_thread_scoped_entries(
             thread_id,
@@ -346,6 +358,11 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
+        self.thread_unread.clear();
+        self.message_revision_dialog = None;
+        self.message_revision_loading = false;
+        self.message_mutation_pending = false;
+        self.composer_edit_target = None;
         client_state_reducers::clear_thread_client_state(
             &mut self.draft_thread_id,
             &mut self.thread_coordinators,
@@ -367,6 +384,10 @@ impl PioneerDesktop {
         let mut composer_defaults = self.composer_domain_state();
         composer_defaults.attachments.clear();
         composer_defaults.capabilities.clear();
+        composer_defaults.skill_selections.clear();
+        composer_defaults.selected_mode =
+            pioneer_client::composer::model_selection::default_composer_turn_mode();
+        composer_defaults.mode_manually_selected = false;
         composer_defaults.selected_provider = None;
         composer_defaults.capability_target =
             pioneer_client::composer::capabilities::ComposerCapabilityTarget::native();
@@ -375,6 +396,8 @@ impl PioneerDesktop {
         composer_defaults.selected_permission_mode =
             pioneer_client::composer::permissions::default_composer_permission_mode();
         composer_defaults.model_manually_selected = false;
+        composer_defaults.reply_target = None;
+        composer_defaults.selected_mentions.clear();
         self.reduce_composer_domain(ComposerDomainAction::Reset {
             defaults: composer_defaults,
         });
@@ -412,6 +435,12 @@ impl PioneerDesktop {
         self.composer_capabilities.clear();
         self.composer_skill_selections.clear();
         self.composer_attachments.clear();
+        self.composer_reply_target = None;
+        self.composer_edit_target = None;
+        self.composer_selected_mentions.clear();
+        self.composer_turn_mode =
+            pioneer_client::composer::model_selection::default_composer_turn_mode();
+        self.composer_mode_manually_selected = false;
         self.composer_selected_provider = None;
         self.composer_selected_model = None;
         self.composer_selected_reasoning_effort = None;

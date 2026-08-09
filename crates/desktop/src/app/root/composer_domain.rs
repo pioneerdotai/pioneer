@@ -18,6 +18,8 @@ impl PioneerDesktop {
             selected_reasoning_effort: self.composer_selected_reasoning_effort.clone(),
             selected_permission_mode: self.composer_permission_mode,
             model_manually_selected: self.composer_model_selection_manually_selected,
+            reply_target: self.composer_reply_target.clone(),
+            selected_mentions: self.composer_selected_mentions.clone(),
         }
     }
 
@@ -33,6 +35,8 @@ impl PioneerDesktop {
         self.composer_selected_reasoning_effort = state.selected_reasoning_effort;
         self.composer_permission_mode = state.selected_permission_mode;
         self.composer_model_selection_manually_selected = state.model_manually_selected;
+        self.composer_reply_target = state.reply_target;
+        self.composer_selected_mentions = state.selected_mentions;
     }
 
     pub(in crate::app) fn reduce_composer_domain(

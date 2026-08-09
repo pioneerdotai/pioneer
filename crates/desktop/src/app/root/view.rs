@@ -145,7 +145,7 @@ impl Render for PioneerDesktop {
                                         .gap_2()
                                         .items_center()
                                         // .child(if !is_gateway_setup_required {
-                                        //     Divider::vertical().mr_1().into_any_element()
+                                        //     Separator::vertical().mr_1().into_any_element()
                                         // } else {
                                         //     div().into_any_element()
                                         // })
