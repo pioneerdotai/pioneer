@@ -19,6 +19,7 @@ pub(crate) const TIMELINE_GROUP_MESSAGE_GAP: Pixels = px(4.);
 pub(crate) const TIMELINE_MESSAGE_END_BOTTOM_SPACING: Pixels = TIMELINE_EDGE_PADDING;
 pub(crate) const TIMELINE_ITEM_BOTTOM_SPACING: Pixels = px(10.);
 pub(crate) const TIMELINE_END_BOTTOM_SPACING: Pixels = TIMELINE_EDGE_PADDING;
+pub(crate) const TIMELINE_ROW_MEASUREMENT_GUARD: Pixels = px(1.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TimelineRowTopSpacing {
@@ -50,7 +51,7 @@ pub(crate) enum TimelineAvatarGroupKind {
 #[derive(Clone, Debug)]
 pub(crate) enum TimelineAvatarSource {
     HistoricalUser { author: Option<TurnAuthorSnapshot> },
-    Agent,
+    Agent { shows_running_dino: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +91,7 @@ impl TimelineGrouping {
         projection: &ConversationViewState,
         current_principal_id: Option<&str>,
         presentation_context: TimelinePresentationContext,
+        message_text_bottom_inset: Pixels,
     ) -> Rc<Self> {
         let descriptors = rows
             .iter()
@@ -137,6 +139,21 @@ impl TimelineGrouping {
             }
 
             if let Some(source) = descriptor.avatar_source.clone() {
+                let source = match source {
+                    TimelineAvatarSource::Agent { .. } => TimelineAvatarSource::Agent {
+                        shows_running_dino: presentation_context.task_child_thread
+                            && rows[index..=end].iter().any(|row| {
+                                matches!(
+                                    row,
+                                    TimelineRenderRow::Timeline(TimelineRow {
+                                        kind: TimelineRowKind::RunningTurn(_),
+                                        ..
+                                    })
+                                )
+                            }),
+                    },
+                    source => source,
+                };
                 avatar_groups.push(TimelineAvatarGroup {
                     first_row_index: index,
                     last_row_index: end,
@@ -145,6 +162,7 @@ impl TimelineGrouping {
                         &rows[end],
                         projection,
                         end + 1 == rows.len(),
+                        message_text_bottom_inset,
                     ),
                 });
             }
@@ -226,18 +244,19 @@ fn avatar_group_bottom_inset(
     row: &TimelineRenderRow,
     projection: &ConversationViewState,
     is_timeline_end: bool,
+    message_text_bottom_inset: Pixels,
 ) -> Pixels {
-    let message_end_spacing = if is_timeline_end {
-        TIMELINE_MESSAGE_END_BOTTOM_SPACING
-    } else {
-        px(0.)
-    };
+    let message_end_spacing = message_text_bottom_inset
+        + if is_timeline_end {
+            TIMELINE_MESSAGE_END_BOTTOM_SPACING
+        } else {
+            px(0.)
+        };
     let item_end_spacing = if is_timeline_end {
         TIMELINE_END_BOTTOM_SPACING
     } else {
         TIMELINE_ITEM_BOTTOM_SPACING
     };
-
     match row {
         TimelineRenderRow::Timeline(TimelineRow {
             kind: TimelineRowKind::UserMessage { .. },
@@ -347,7 +366,9 @@ fn row_cluster_descriptor(
     Some(TimelineClusterDescriptor {
         key: TimelineClusterKey::Agent(turn_id),
         avatar_kind: Some(TimelineAvatarGroupKind::Agent),
-        avatar_source: Some(TimelineAvatarSource::Agent),
+        avatar_source: Some(TimelineAvatarSource::Agent {
+            shows_running_dino: false,
+        }),
     })
 }
 
@@ -481,6 +502,7 @@ mod tests {
             &ConversationViewState::default(),
             None,
             TimelinePresentationContext::default(),
+            px(0.),
         );
 
         assert_eq!(grouping.avatar_groups.len(), 2);
@@ -503,6 +525,7 @@ mod tests {
             &ConversationViewState::default(),
             None,
             TimelinePresentationContext::default(),
+            px(0.),
         );
         let child_grouping = TimelineGrouping::build(
             &rows,
@@ -511,6 +534,7 @@ mod tests {
             TimelinePresentationContext {
                 task_child_thread: true,
             },
+            px(0.),
         );
 
         assert_eq!(standard_grouping.avatar_groups.len(), 1);
@@ -551,12 +575,13 @@ mod tests {
             &projection,
             None,
             TimelinePresentationContext::default(),
+            px(0.),
         );
 
         assert_eq!(grouping.avatar_groups.len(), 1);
         assert!(matches!(
             &grouping.avatar_groups[0].source,
-            TimelineAvatarSource::Agent
+            TimelineAvatarSource::Agent { .. }
         ));
         assert_eq!(grouping.avatar_groups[0].first_row_index, 0);
         assert_eq!(grouping.avatar_groups[0].last_row_index, 1);
@@ -600,11 +625,59 @@ mod tests {
             &ConversationViewState::default(),
             None,
             TimelinePresentationContext::default(),
+            px(0.),
         );
 
         assert_eq!(grouping.avatar_groups.len(), 1);
         assert_eq!(grouping.avatar_groups[0].first_row_index, 0);
         assert_eq!(grouping.avatar_groups[0].last_row_index, 1);
+    }
+
+    #[test]
+    fn running_child_turn_replaces_only_its_agent_avatar_with_the_dino() {
+        let rows = vec![TimelineRenderRow::Timeline(TimelineRow {
+            key: "running".to_owned(),
+            kind: TimelineRowKind::RunningTurn(
+                pioneer_client::timeline::labels::RunningTurnDisplay {
+                    turn_id: "turn".to_owned(),
+                    started_at_unix_ms: None,
+                    state: None,
+                    message: None,
+                    permission_profile: None,
+                    security_summary: None,
+                },
+            ),
+        })];
+
+        let root_grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext::default(),
+            px(0.),
+        );
+        let child_grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext {
+                task_child_thread: true,
+            },
+            px(0.),
+        );
+
+        assert!(matches!(
+            &root_grouping.avatar_groups[0].source,
+            TimelineAvatarSource::Agent {
+                shows_running_dino: false
+            }
+        ));
+        assert!(matches!(
+            &child_grouping.avatar_groups[0].source,
+            TimelineAvatarSource::Agent {
+                shows_running_dino: true
+            }
+        ));
     }
 
     #[test]
@@ -618,6 +691,7 @@ mod tests {
             &ConversationViewState::default(),
             None,
             TimelinePresentationContext::default(),
+            px(4.),
         );
         let index = TimelineLayoutIndex::new(
             grouping.clone(),
@@ -629,7 +703,7 @@ mod tests {
 
         assert_eq!(
             index.avatar_group_bounds(&grouping.avatar_groups[0]),
-            Some((px(40.), px(80.)))
+            Some((px(40.), px(76.)))
         );
     }
 }

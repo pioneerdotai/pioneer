@@ -7,6 +7,29 @@ use pioneer_protocol::{
 };
 use std::{ops::Range, sync::Arc};
 
+use super::layout::TIMELINE_ROW_MEASUREMENT_GUARD;
+
+const TIMELINE_MESSAGE_FONT_SIZE_REM: f32 = 0.875;
+const TIMELINE_MESSAGE_LINE_HEIGHT_RATIO: f32 = 1.65;
+
+pub(super) fn timeline_message_text_bottom_inset(window: &Window) -> Pixels {
+    let font_size = px(window.rem_size().as_f32() * TIMELINE_MESSAGE_FONT_SIZE_REM);
+    let line_height = px((font_size.as_f32() * TIMELINE_MESSAGE_LINE_HEIGHT_RATIO).round());
+    let text_style = window.text_style();
+    let font_id = window.text_system().resolve_font(&text_style.font());
+    let ascent = window.text_system().ascent(font_id, font_size).as_f32();
+    // GPUI stores the OpenType descender with its native negative sign.
+    let descent = window
+        .text_system()
+        .descent(font_id, font_size)
+        .as_f32()
+        .abs();
+    let text_height = px(ascent + descent);
+    let lower_leading = px(((line_height - text_height).as_f32() / 2.).max(0.));
+
+    lower_leading + TIMELINE_ROW_MEASUREMENT_GUARD
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MarkdownTextVariant {
     Paragraph,

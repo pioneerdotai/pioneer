@@ -373,6 +373,7 @@ impl PioneerDesktop {
                     .or(item_view.started_at_unix_ms)
                     .or(Some(task_item.created_at.saturating_mul(1_000))),
                 None,
+                true,
                 cx,
             )
         });

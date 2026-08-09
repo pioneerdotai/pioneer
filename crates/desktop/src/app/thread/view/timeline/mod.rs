@@ -10,7 +10,7 @@ mod semantic_adapter;
 mod semantic_requests;
 mod view;
 
-use self::layout::TIMELINE_CONTENT_MAX_WIDTH;
+use self::layout::{TIMELINE_CONTENT_MAX_WIDTH, TIMELINE_ROW_MEASUREMENT_GUARD};
 pub(crate) use self::layout::{
     TimelineAvatarGroupKind, TimelineGrouping, TimelineLayoutIndex, TimelineRowLayout,
     TimelineRowTopSpacing,
@@ -250,7 +250,10 @@ impl PioneerDesktop {
             cx,
         );
 
-        size(px(0.), (measured.height + px(1.)).max(px(1.)))
+        size(
+            px(0.),
+            (measured.height + TIMELINE_ROW_MEASUREMENT_GUARD).max(px(1.)),
+        )
     }
 
     fn cached_or_measure_timeline_row_size(

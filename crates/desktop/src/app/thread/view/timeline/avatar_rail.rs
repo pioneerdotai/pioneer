@@ -2,9 +2,10 @@ use super::layout::{
     TIMELINE_AVATAR_SIZE, TIMELINE_AVATAR_STICKY_BOTTOM, TIMELINE_CONTENT_HORIZONTAL_PADDING,
     TimelineAvatarSource, TimelineLayoutIndex,
 };
+use super::running_indicator::render_running_turn_dino;
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
-use gpui_component::{Sizable as _, avatar::Avatar};
+use gpui_component::{Sizable as _, avatar::Avatar, theme::ActiveTheme};
 use std::{path::PathBuf, rc::Rc};
 
 #[derive(Clone)]
@@ -15,6 +16,10 @@ enum TimelineAvatarVisual {
     },
     Agent {
         cached_path: Option<String>,
+    },
+    RunningAgent {
+        is_dark: bool,
+        image_id: ElementId,
     },
 }
 
@@ -41,7 +46,16 @@ impl PioneerDesktop {
                             cached_path,
                         }
                     }
-                    TimelineAvatarSource::Agent => TimelineAvatarVisual::Agent {
+                    TimelineAvatarSource::Agent {
+                        shows_running_dino: true,
+                    } => TimelineAvatarVisual::RunningAgent {
+                        is_dark: cx.theme().mode.is_dark(),
+                        image_id: ElementId::from((
+                            ElementId::from("timeline-avatar-running-dino"),
+                            format!("{}:{}", group.first_row_index, group.last_row_index),
+                        )),
+                    },
+                    TimelineAvatarSource::Agent { .. } => TimelineAvatarVisual::Agent {
                         cached_path: self
                             .member_avatar_state
                             .agent_cached_image_path()
@@ -91,8 +105,7 @@ impl PioneerDesktop {
                     }
 
                     let group_top = natural_top - viewport_top;
-                    let natural_bottom_top =
-                        group_bottom - viewport_top - TIMELINE_AVATAR_SIZE - px(4.);
+                    let natural_bottom_top = group_bottom - viewport_top - TIMELINE_AVATAR_SIZE;
                     let sticky_bottom_top =
                         bounds.size.height - TIMELINE_AVATAR_STICKY_BOTTOM - TIMELINE_AVATAR_SIZE;
                     let avatar_top = natural_bottom_top.min(sticky_bottom_top).max(group_top);
@@ -181,6 +194,11 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
             .name("Agent")
             .size(TIMELINE_AVATAR_SIZE)
             .border_0()
+            .into_any_element(),
+        TimelineAvatarVisual::RunningAgent { is_dark, image_id } => div()
+            .w(TIMELINE_AVATAR_SIZE)
+            .h(TIMELINE_AVATAR_SIZE)
+            .child(render_running_turn_dino(image_id.clone(), *is_dark))
             .into_any_element(),
     }
 }

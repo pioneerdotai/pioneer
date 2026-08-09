@@ -6,6 +6,7 @@ use super::{
     layout::{
         TIMELINE_AVATAR_RAIL_WIDTH, TIMELINE_AVATAR_SIZE, TIMELINE_CONTENT_HORIZONTAL_PADDING,
     },
+    markdown::timeline_message_text_bottom_inset,
     model::{
         TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind,
         TurnWorkGroupRow,
@@ -85,6 +86,7 @@ impl PioneerDesktop {
         // margins around it. Sidebar resizing above the cap must not invalidate every row.
         let width_px = (content_width / px(1.)).round() as i32;
         let tail_row_key = rows.last().map(|row| row.key());
+        let message_text_bottom_inset = timeline_message_text_bottom_inset(window);
 
         let (grouping, item_sizes, layout_index) = {
             let mut state = self.thread_timeline_view_state.borrow_mut();
@@ -111,6 +113,7 @@ impl PioneerDesktop {
                     projection.as_ref(),
                     render_current_principal_id.as_deref(),
                     presentation_context,
+                    message_text_bottom_inset,
                 );
                 let item_sizes = self.compute_timeline_item_sizes(
                     &mut state,

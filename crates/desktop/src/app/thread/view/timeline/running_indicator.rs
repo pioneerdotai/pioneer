@@ -19,6 +19,17 @@ fn running_turn_dino_image_source(is_dark: bool) -> ImageSource {
     ImageSource::Resource(Resource::Embedded(asset_path.into()))
 }
 
+pub(super) fn render_running_turn_dino(image_id: ElementId, is_dark: bool) -> AnyElement {
+    // GPUI retains animated-image frame state and requests subsequent frames only
+    // for stateful images with a stable global element id.
+    img(running_turn_dino_image_source(is_dark))
+        .id(image_id)
+        .w_full()
+        .h_full()
+        .object_fit(ObjectFit::Contain)
+        .into_any_element()
+}
+
 impl PioneerDesktop {
     pub(super) fn semantic_timeline_has_running_turn_row(&self) -> bool {
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
@@ -127,6 +138,7 @@ impl PioneerDesktop {
             format!("turn:{}", running_turn.turn_id),
             running_turn.started_at_unix_ms,
             running_turn.security_summary.as_ref(),
+            self.active_task_thread_navigation().is_none(),
             cx,
         );
 
@@ -143,6 +155,7 @@ impl PioneerDesktop {
         activity_id: String,
         started_at_unix_ms: Option<i64>,
         security_summary: Option<&ClientTurnSecuritySummary>,
+        show_dino: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Timeline measurement renders item cards while holding a mutable borrow of the
@@ -165,7 +178,6 @@ impl PioneerDesktop {
         ));
         let image_id = ElementId::from((ElementId::from("running-activity-image"), activity_id));
         let is_dark = cx.theme().mode.is_dark();
-        let dino_image_source = running_turn_dino_image_source(is_dark);
         let status_label = t!("timeline.running.turn").to_string();
 
         h_flex()
@@ -178,26 +190,32 @@ impl PioneerDesktop {
                 h_flex()
                     .items_center()
                     .gap_4()
-                    .child(
-                        div().size_8().child(
-                            img(dino_image_source)
-                                .id(image_id)
-                                .w_full()
-                                .h_full()
-                                .object_fit(ObjectFit::Contain),
-                        ),
-                    )
+                    .when(show_dino, |this| {
+                        this.child(
+                            div()
+                                .size_8()
+                                .child(render_running_turn_dino(image_id, is_dark)),
+                        )
+                    })
                     .child(
                         v_flex()
                             .pt_1()
                             .gap_1()
+                            .when(!show_dino, |this| this.pt_0().pl_2().mb(px(2.)))
                             .child(div().font_semibold().child(status_label))
                             .when_some(security_summary, |this, summary| {
                                 this.child(self.render_turn_security_summary(summary, cx))
                             }),
                     ),
             )
-            .child(div().id(elapsed_id).pt_1().font_semibold().child(elapsed))
+            .child(
+                div()
+                    .id(elapsed_id)
+                    .pt_1()
+                    .when(!show_dino, |this| this.pt_0().mb(px(2.)))
+                    .font_semibold()
+                    .child(elapsed),
+            )
             .into_any_element()
     }
 

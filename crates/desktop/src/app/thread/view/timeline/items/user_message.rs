@@ -347,6 +347,7 @@ impl PioneerDesktop {
                             v_flex()
                                 .when(presentation.is_some_and(|value| value.deleted), |this| {
                                     this.text_sm()
+                                        .line_height(relative(1.65))
                                         .italic()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(t!("timeline.message.deleted").to_string())
