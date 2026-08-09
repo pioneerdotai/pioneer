@@ -1,3 +1,4 @@
+use super::super::TimelineRowTopSpacing;
 use super::format_running_elapsed;
 use crate::{
     app::{
@@ -8,7 +9,6 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use pioneer_client::timeline::labels::{
     command_execution_display_command, command_execution_terminal_text,
 };
@@ -17,6 +17,7 @@ use std::{
     hash::{Hash, Hasher},
     io::Cursor,
 };
+use terminal::{ColorPalette, TerminalConfig, TerminalView};
 
 impl PioneerDesktop {
     fn estimate_terminal_cols(content_width: Pixels) -> usize {
@@ -77,7 +78,7 @@ impl PioneerDesktop {
             rows,
             line_height_multiplier: 1.0,
             scrollback: 1000,
-            padding: Edges::all(px(16.0)),
+            padding: gpui::Edges::all(px(16.0)),
             colors: ColorPalette::builder().background(0x1e, 0x1e, 0x1e).build(),
             ..TerminalConfig::default()
         };
@@ -101,7 +102,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -268,6 +269,6 @@ impl PioneerDesktop {
                 .into_any_element()
         };
 
-        self.render_item_row(is_first_row, is_last_row, content_width, content)
+        self.render_item_row(top_spacing, is_last_row, content_width, content)
     }
 }

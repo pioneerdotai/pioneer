@@ -520,7 +520,7 @@ impl PioneerDesktop {
     }
 
     fn semantic_prefetch_can_request_thread_before(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
         if max_offset <= gpui::px(1.) {
             return false;
         }
@@ -528,7 +528,7 @@ impl PioneerDesktop {
     }
 
     fn semantic_prefetch_can_request_thread_after(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
         if max_offset <= gpui::px(1.) {
             return false;
         }
@@ -536,7 +536,7 @@ impl PioneerDesktop {
     }
 
     fn semantic_prefetch_can_request_work_range(&self) -> bool {
-        self.thread_timeline_scroll_handle.max_offset().height > gpui::px(1.)
+        self.thread_timeline_scroll_handle.max_offset().y > gpui::px(1.)
     }
 }
 

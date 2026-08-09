@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_client::threads::read::{MarkThreadReadContext, plan_mark_thread_read};
 impl PioneerDesktop {
     pub(super) fn capture_timeline_scroll_anchor_before_semantic_update(
         &self,
@@ -156,6 +157,7 @@ impl PioneerDesktop {
         state.tail_text_len = tail_text_len;
 
         if thread_changed {
+            state.last_read_requested_through_turn_id = None;
             state.entry_layout_cache.clear();
             state.cached_item_sizes = None;
         } else if timeline_changed {
@@ -214,7 +216,7 @@ impl PioneerDesktop {
     }
 
     pub(super) fn timeline_is_near_bottom(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
         if max_offset <= px(1.) {
             return true;
         }
@@ -222,6 +224,79 @@ impl PioneerDesktop {
         let current_offset = self.thread_timeline_scroll_handle.offset().y;
         let bottom_offset = px(0.) - max_offset;
         (current_offset - bottom_offset).abs() <= px(24.)
+    }
+
+    pub(super) fn request_mark_active_thread_read_if_viewed(
+        &self,
+        active_thread_id: Option<&str>,
+        rows: &[TimelineRenderRow],
+        application_is_foreground: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let latest_known_user_turn_id = rows.iter().rev().find_map(|row| match row {
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::UserMessage { presentation, .. },
+                ..
+            }) => Some(presentation.turn_id.as_str()),
+            _ => None,
+        });
+        let thread_id = active_thread_id.unwrap_or_default();
+        let mut state = self.thread_timeline_view_state.borrow_mut();
+        let params = plan_mark_thread_read(MarkThreadReadContext {
+            active_thread_id,
+            thread_id,
+            application_is_foreground,
+            thread_is_visible: self.timeline_is_near_bottom(),
+            latest_known_user_turn_id,
+            viewed_through_turn_id: latest_known_user_turn_id,
+            last_requested_through_turn_id: state.last_read_requested_through_turn_id.as_deref(),
+        });
+        let Some(params) = params else {
+            return;
+        };
+        state.last_read_requested_through_turn_id = Some(params.through_turn_id.clone());
+        drop(state);
+
+        let sender = self.gateway.ws_command_sender.clone();
+        let requested_turn_id = params.through_turn_id.clone();
+        let requested_thread_id = params.thread_id.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let response = cx
+                    .background_spawn(async move { sender.thread_read(params) })
+                    .await;
+                let _ = this.update(&mut cx, |view, cx| {
+                    match response {
+                        Ok(response) => {
+                            if view.thread_workspace_matches(
+                                response.thread_id.as_str(),
+                                response.workspace_id.as_str(),
+                            ) {
+                                if response.unread_count == 0 {
+                                    view.thread_unread.remove(response.thread_id.as_str());
+                                } else {
+                                    view.thread_unread
+                                        .insert(response.thread_id, response.unread_count);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let mut state = view.thread_timeline_view_state.borrow_mut();
+                            if state.last_read_requested_through_turn_id.as_deref()
+                                == Some(requested_turn_id.as_str())
+                                && state.active_thread_id.as_deref()
+                                    == Some(requested_thread_id.as_str())
+                            {
+                                state.last_read_requested_through_turn_id = None;
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub(super) fn on_timeline_scroll_wheel(
@@ -259,7 +334,7 @@ impl PioneerDesktop {
     }
 
     fn timeline_scroll_wheel_reaches_bottom(&self, delta_y: Pixels) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
         if max_offset <= px(1.) {
             return true;
         }

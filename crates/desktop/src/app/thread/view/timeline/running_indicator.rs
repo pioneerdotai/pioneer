@@ -1,3 +1,4 @@
+use super::TimelineRowTopSpacing;
 use super::items::format_elapsed_ms;
 use super::model::{TimelineRow, TimelineRowKind};
 use crate::app::conversation::ConversationViewState;
@@ -55,16 +56,6 @@ impl PioneerDesktop {
         if projection_has_running_task(projection) {
             self.ensure_running_indicator_timer(cx);
         }
-    }
-
-    pub(super) fn running_turn_row_size(
-        &self,
-        is_first_row: bool,
-        is_last_row: bool,
-    ) -> Size<Pixels> {
-        let top = if is_first_row { px(40.) } else { px(10.) };
-        let bottom = if is_last_row { px(40.) } else { px(10.) };
-        size(px(0.), top + px(66.) + bottom + px(1.))
     }
 
     pub(super) fn hydrate_running_turn_rows(
@@ -127,7 +118,7 @@ impl PioneerDesktop {
     pub(super) fn render_running_turn_row(
         &self,
         running_turn: &RunningTurnDisplay,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -140,7 +131,7 @@ impl PioneerDesktop {
         );
 
         self.render_item_row(
-            is_first_row,
+            top_spacing,
             is_last_row,
             content_width,
             div().w_full().pt_5().child(content).into_any_element(),

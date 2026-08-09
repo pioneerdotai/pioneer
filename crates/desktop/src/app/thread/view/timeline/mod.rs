@@ -1,5 +1,7 @@
+mod avatar_rail;
 mod code_highlighting;
 mod items;
+mod layout;
 mod markdown;
 pub(crate) mod model;
 mod running_indicator;
@@ -8,6 +10,11 @@ mod semantic_adapter;
 mod semantic_requests;
 mod view;
 
+use self::layout::TIMELINE_CONTENT_MAX_WIDTH;
+pub(crate) use self::layout::{
+    TimelineAvatarGroupKind, TimelineGrouping, TimelineLayoutIndex, TimelineRowLayout,
+    TimelineRowTopSpacing,
+};
 use self::model::{TimelineRow, TimelineRowKind};
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
@@ -17,6 +24,8 @@ use crate::app::{
     },
 };
 use gpui::{prelude::*, *};
+use pioneer_client::timeline::rows::UserMessagePresentation;
+use pioneer_protocol::PersistedActorRef;
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -42,6 +51,54 @@ impl TimelineRenderRow {
             TimelineRenderRow::PendingRequest(row) => row.key.as_str(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimelinePresentationContext {
+    pub(crate) task_child_thread: bool,
+}
+
+fn user_message_uses_current_principal_alignment(
+    presentation: Option<&UserMessagePresentation>,
+    current_principal_id: Option<&str>,
+    presentation_context: TimelinePresentationContext,
+) -> bool {
+    let Some(presentation) = presentation else {
+        return true;
+    };
+
+    match presentation.author.as_ref().map(|author| &author.actor) {
+        Some(PersistedActorRef::Principal(principal_id)) => {
+            current_principal_id == Some(principal_id.as_str())
+        }
+        Some(PersistedActorRef::System) => presentation_context.task_child_thread,
+        None => {
+            presentation_context.task_child_thread
+                || presentation.item_id == format!("user_{}", presentation.turn_id)
+                || presentation.item_id == format!("turn:{}:user", presentation.turn_id)
+                || presentation.block_id == format!("turn:{}:user", presentation.turn_id)
+        }
+    }
+}
+
+fn is_current_principal_user_message(
+    row: &TimelineRenderRow,
+    current_principal_id: Option<&str>,
+    presentation_context: TimelinePresentationContext,
+) -> bool {
+    let TimelineRenderRow::Timeline(TimelineRow {
+        kind: TimelineRowKind::UserMessage { presentation, .. },
+        ..
+    }) = row
+    else {
+        return false;
+    };
+
+    user_message_uses_current_principal_alignment(
+        Some(presentation),
+        current_principal_id,
+        presentation_context,
+    )
 }
 
 #[derive(Clone)]
@@ -71,30 +128,46 @@ impl TimelineRenderModel {
 impl PioneerDesktop {
     fn sync_timeline_layout_width(&self, cx: &mut Context<Self>) {
         let measured_width = self.thread_timeline_scroll_handle.bounds().size.width;
-        let mut should_notify = false;
-
-        {
-            let mut state = self.thread_timeline_view_state.borrow_mut();
-            if measured_width > px(1.) {
-                state.pending_width_probe = false;
-                state.width_probe_attempts = 0;
-                if (state.measured_list_width - measured_width).abs() > px(1.) {
-                    state.measured_list_width = measured_width;
-                    state.entry_layout_cache.clear();
-                    state.cached_item_sizes = None;
-                }
-            } else if state.measured_list_width <= px(1.) {
-                if state.width_probe_attempts < 12 {
-                    state.width_probe_attempts = state.width_probe_attempts.saturating_add(1);
-                    state.pending_width_probe = true;
-                    should_notify = true;
-                }
-            }
+        if measured_width > px(1.) {
+            self.update_timeline_layout_width(measured_width);
+            return;
         }
 
-        if should_notify {
+        let mut state = self.thread_timeline_view_state.borrow_mut();
+        if state.measured_list_width <= px(1.) && state.width_probe_attempts < 12 {
+            state.width_probe_attempts = state.width_probe_attempts.saturating_add(1);
+            state.pending_width_probe = true;
+            drop(state);
             cx.notify();
         }
+    }
+
+    pub(super) fn update_timeline_layout_width(&self, measured_width: Pixels) -> bool {
+        if measured_width <= px(1.) {
+            return false;
+        }
+
+        let mut state = self.thread_timeline_view_state.borrow_mut();
+        state.pending_width_probe = false;
+        state.width_probe_attempts = 0;
+        if (state.measured_list_width - measured_width).abs() <= px(1.) {
+            return false;
+        }
+
+        let previous_content_width = state
+            .measured_list_width
+            .max(px(1.))
+            .min(TIMELINE_CONTENT_MAX_WIDTH);
+        let next_content_width = measured_width.max(px(1.)).min(TIMELINE_CONTENT_MAX_WIDTH);
+        state.measured_list_width = measured_width;
+
+        let content_width_changed = (previous_content_width - next_content_width).abs() > px(1.);
+        if content_width_changed {
+            state.entry_layout_cache.clear();
+            state.cached_item_sizes = None;
+            state.cached_timeline_layout_index = None;
+        }
+        content_width_changed
     }
 
     fn timeline_entry_text(item_view: &ItemView) -> &str {
@@ -152,28 +225,22 @@ impl PioneerDesktop {
     }
 
     fn timeline_entry_content_width(&self, list_width: Pixels) -> Pixels {
-        list_width.max(px(1.)).min(px(800.))
+        list_width.max(px(1.)).min(TIMELINE_CONTENT_MAX_WIDTH)
     }
 
     fn measure_timeline_row_size(
         &self,
         projection: &ConversationViewState,
         row: &TimelineRenderRow,
-        is_first_row: bool,
         is_last_row: bool,
+        row_layout: TimelineRowLayout,
         row_width: Pixels,
         content_width: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
-        let mut row_element = self.render_timeline_row(
-            projection,
-            row,
-            is_first_row,
-            is_last_row,
-            content_width,
-            cx,
-        );
+        let mut row_element =
+            self.render_timeline_row(projection, row, is_last_row, row_layout, content_width, cx);
         let measured = row_element.layout_as_root(
             size(
                 AvailableSpace::Definite(row_width),
@@ -191,8 +258,8 @@ impl PioneerDesktop {
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
         row: &TimelineRenderRow,
-        is_first_row: bool,
         is_last_row: bool,
+        row_layout: TimelineRowLayout,
         row_width: Pixels,
         content_width: Pixels,
         row_render_fingerprints: &HashMap<String, u64>,
@@ -200,21 +267,11 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
-        if matches!(
-            row,
-            TimelineRenderRow::Timeline(TimelineRow {
-                kind: TimelineRowKind::RunningTurn(_),
-                ..
-            })
-        ) {
-            return self.running_turn_row_size(is_first_row, is_last_row);
-        }
-
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.timeline_row_render_fingerprint(projection, row, row_render_fingerprints, expanded)
             .hash(&mut hasher);
-        is_first_row.hash(&mut hasher);
         is_last_row.hash(&mut hasher);
+        row_layout.hash(&mut hasher);
         let render_fingerprint = hasher.finish();
 
         if let Some(cached) = state.entry_layout_cache.get(row.key())
@@ -226,8 +283,8 @@ impl PioneerDesktop {
         let measured = self.measure_timeline_row_size(
             projection,
             row,
-            is_first_row,
             is_last_row,
+            row_layout,
             row_width,
             content_width,
             window,
@@ -248,6 +305,7 @@ impl PioneerDesktop {
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
         rows: &[TimelineRenderRow],
+        grouping: &TimelineGrouping,
         row_width: Pixels,
         content_width: Pixels,
         row_render_fingerprints: &HashMap<String, u64>,
@@ -264,8 +322,8 @@ impl PioneerDesktop {
                         state,
                         projection,
                         row,
-                        ix == 0,
                         ix + 1 == row_len,
+                        grouping.row_layout(ix),
                         row_width,
                         content_width,
                         row_render_fingerprints,

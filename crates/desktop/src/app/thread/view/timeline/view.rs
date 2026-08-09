@@ -1,6 +1,11 @@
 use super::{
-    TimelinePendingRequestRow, TimelineRenderModel, TimelineRenderRow,
+    TimelineAvatarGroupKind, TimelineGrouping, TimelineLayoutIndex, TimelinePendingRequestRow,
+    TimelinePresentationContext, TimelineRenderModel, TimelineRenderRow, TimelineRowLayout,
+    TimelineRowTopSpacing,
     items::format_elapsed_ms,
+    layout::{
+        TIMELINE_AVATAR_RAIL_WIDTH, TIMELINE_AVATAR_SIZE, TIMELINE_CONTENT_HORIZONTAL_PADDING,
+    },
     model::{
         TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind,
         TurnWorkGroupRow,
@@ -11,7 +16,9 @@ use crate::app::{
     root::{PendingRequest, PioneerDesktop},
 };
 use gpui::{prelude::*, *};
-use gpui_component::{Icon, IconName, h_flex, scroll::Scrollbar, v_flex, v_virtual_list};
+use gpui_component::{
+    Icon, IconName, StyledExt, h_flex, scroll::Scrollbar, v_flex, v_virtual_list,
+};
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
@@ -61,28 +68,55 @@ impl PioneerDesktop {
         let should_follow_bottom =
             self.sync_timeline_scroll(active_thread_id, projection.as_ref(), rows.as_ref());
 
+        let render_current_principal_id = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .map(|auth| auth.principal.id.as_str().to_owned());
+        let presentation_context = TimelinePresentationContext {
+            task_child_thread: self.active_task_thread_navigation().is_some(),
+        };
+
         if rows.is_empty() {
             return div().w_full().h_full().into_any_element();
         }
 
-        let width_px = (list_width / px(1.)).round() as i32;
+        // Timeline row heights depend on the capped content width, not on the empty
+        // margins around it. Sidebar resizing above the cap must not invalidate every row.
+        let width_px = (content_width / px(1.)).round() as i32;
         let tail_row_key = rows.last().map(|row| row.key());
 
-        let item_sizes = {
+        let (grouping, item_sizes, layout_index) = {
             let mut state = self.thread_timeline_view_state.borrow_mut();
 
             let can_reuse = state.cached_render_active_thread_id.as_deref() == active_thread_id
                 && state.cached_render_width_px == width_px
                 && state.cached_render_item_count == rows.len()
-                && state.cached_render_model_fingerprint == rows_render_fingerprint;
+                && state.cached_render_model_fingerprint == rows_render_fingerprint
+                && state.cached_render_principal_id == render_current_principal_id
+                && state.cached_render_task_child_thread == presentation_context.task_child_thread;
 
-            if can_reuse && let Some(sizes) = state.cached_item_sizes.as_ref() {
-                sizes.clone()
+            if can_reuse
+                && let Some(sizes) = state.cached_item_sizes.as_ref()
+                && let Some(layout_index) = state.cached_timeline_layout_index.as_ref()
+            {
+                (
+                    layout_index.grouping_rc(),
+                    sizes.clone(),
+                    layout_index.clone(),
+                )
             } else {
+                let grouping = TimelineGrouping::build(
+                    rows.as_ref(),
+                    projection.as_ref(),
+                    render_current_principal_id.as_deref(),
+                    presentation_context,
+                );
                 let item_sizes = self.compute_timeline_item_sizes(
                     &mut state,
                     projection.as_ref(),
                     rows.as_ref(),
+                    grouping.as_ref(),
                     list_width,
                     content_width,
                     row_render_fingerprints.as_ref(),
@@ -90,6 +124,7 @@ impl PioneerDesktop {
                     window,
                     cx,
                 );
+                let layout_index = TimelineLayoutIndex::new(grouping.clone(), item_sizes.clone());
 
                 state.cached_render_active_thread_id = active_thread_id.map(str::to_owned);
                 state.cached_render_width_px = width_px;
@@ -97,9 +132,12 @@ impl PioneerDesktop {
                 state.cached_render_tail_entry_id = tail_row_key.map(str::to_owned);
                 state.cached_render_tail_fingerprint = rows_render_fingerprint;
                 state.cached_render_model_fingerprint = rows_render_fingerprint;
+                state.cached_render_principal_id = render_current_principal_id.clone();
+                state.cached_render_task_child_thread = presentation_context.task_child_thread;
                 state.cached_item_sizes = Some(item_sizes.clone());
+                state.cached_timeline_layout_index = Some(layout_index.clone());
 
-                item_sizes
+                (grouping, item_sizes, layout_index)
             }
         };
 
@@ -111,13 +149,27 @@ impl PioneerDesktop {
         if should_follow_bottom {
             self.scroll_timeline_to_bottom_for_item_sizes(item_sizes.as_ref());
         }
+        self.request_mark_active_thread_read_if_viewed(
+            active_thread_id,
+            rows.as_ref(),
+            window.is_window_active(),
+            cx,
+        );
 
         let render_thread_id = active_thread_id.map(str::to_owned);
         let render_projection = projection.clone();
         let render_semantic_row_ids = semantic_row_ids.clone();
         let render_semantic_rows = model.semantic_rows.clone();
         let render_rows = rows.clone();
+        let render_grouping = grouping.clone();
         let render_row_count = render_rows.len();
+        let timeline_avatar_rail = self.render_timeline_avatar_rail(
+            layout_index,
+            self.thread_timeline_scroll_handle.clone(),
+            content_width,
+            list_width,
+            cx,
+        );
 
         div()
             .w_full()
@@ -153,8 +205,8 @@ impl PioneerDesktop {
                                     view.render_timeline_row(
                                         projection,
                                         row,
-                                        ix == 0,
                                         ix + 1 == render_row_count,
+                                        render_grouping.row_layout(ix),
                                         content_width,
                                         cx,
                                     )
@@ -163,9 +215,12 @@ impl PioneerDesktop {
                             .collect::<Vec<_>>()
                     },
                 )
+                .gap_0()
+                .p_0()
                 .with_sizing_behavior(ListSizingBehavior::Auto)
                 .track_scroll(&self.thread_timeline_scroll_handle),
             )
+            .child(timeline_avatar_rail)
             .child(
                 div()
                     .absolute()
@@ -182,12 +237,74 @@ impl PioneerDesktop {
         &self,
         projection: &ConversationViewState,
         row: &TimelineRenderRow,
-        is_first_row: bool,
         is_last_row: bool,
+        row_layout: TimelineRowLayout,
+        content_width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if row_layout.avatar_group_kind == Some(TimelineAvatarGroupKind::Agent) {
+            let grouped_content_width = (content_width - TIMELINE_AVATAR_RAIL_WIDTH).max(px(1.));
+            let body_top_spacing = if row_layout.starts_avatar_group {
+                TimelineRowTopSpacing::Compact
+            } else {
+                row_layout.top_spacing
+            };
+            let body = self.render_timeline_row_body(
+                projection,
+                row,
+                is_last_row,
+                body_top_spacing,
+                grouped_content_width,
+                cx,
+            );
+            return self.render_agent_timeline_group_row(body, row_layout, content_width);
+        }
+
+        self.render_timeline_row_body(
+            projection,
+            row,
+            is_last_row,
+            row_layout.top_spacing,
+            content_width,
+            cx,
+        )
+    }
+
+    fn render_timeline_row_body(
+        &self,
+        projection: &ConversationViewState,
+        row: &TimelineRenderRow,
+        is_last_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match row {
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind:
+                    TimelineRowKind::UserMessage {
+                        timeline_index,
+                        presentation,
+                    },
+                ..
+            }) => {
+                let Some(entry) = projection.timeline.get(*timeline_index) else {
+                    return div().into_any_element();
+                };
+                let Some(item_view) = projection.item_for_timeline_entry(entry) else {
+                    return div().into_any_element();
+                };
+                self.render_item_user_message(
+                    entry,
+                    item_view,
+                    &item_view.item,
+                    Some(presentation),
+                    top_spacing,
+                    is_last_row,
+                    content_width,
+                    cx,
+                )
+            }
             TimelineRenderRow::Timeline(TimelineRow {
                 kind: TimelineRowKind::Item { timeline_index },
                 ..
@@ -198,14 +315,11 @@ impl PioneerDesktop {
                 let Some(item_view) = projection.item_for_timeline_entry(entry) else {
                     return div().into_any_element();
                 };
-                let permission_profile = projection.turn_permission_profile(entry.turn_id.as_str());
-
                 self.render_turn_item_entry(
                     entry,
                     item_view,
                     &item_view.item,
-                    permission_profile,
-                    is_first_row,
+                    top_spacing,
                     is_last_row,
                     content_width,
                     cx,
@@ -216,7 +330,7 @@ impl PioneerDesktop {
                 ..
             }) => self.render_turn_work_group_toggle(
                 group,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -226,7 +340,7 @@ impl PioneerDesktop {
                 ..
             }) => self.render_coalesced_tools_toggle(
                 group,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -236,22 +350,52 @@ impl PioneerDesktop {
                 ..
             }) => self.render_running_turn_row(
                 running_turn,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
             ),
             TimelineRenderRow::PendingRequest(row) => {
                 let content = self.render_pending_request_card(row.request.clone(), cx);
-                self.render_item_row(is_first_row, is_last_row, content_width, content)
+                self.render_item_row(top_spacing, is_last_row, content_width, content)
             }
         }
+    }
+
+    fn render_agent_timeline_group_row(
+        &self,
+        body: AnyElement,
+        row_layout: TimelineRowLayout,
+        content_width: Pixels,
+    ) -> AnyElement {
+        v_flex()
+            .w_full()
+            .when(row_layout.starts_avatar_group, |this| {
+                this.pt(row_layout.top_spacing.pixels()).child(
+                    div().flex().w_full().justify_center().child(
+                        h_flex()
+                            .w(content_width)
+                            .h(TIMELINE_AVATAR_SIZE)
+                            .px(TIMELINE_CONTENT_HORIZONTAL_PADDING)
+                            .items_center()
+                            .child(
+                                div()
+                                    .ml(TIMELINE_AVATAR_RAIL_WIDTH)
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("chat.composer.mode.agent_label").to_string()),
+                            ),
+                    ),
+                )
+            })
+            .child(div().w_full().pl(TIMELINE_AVATAR_RAIL_WIDTH).child(body))
+            .into_any_element()
     }
 
     fn render_coalesced_tools_toggle(
         &self,
         group: &TimelineCoalescedToolsRow,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -292,7 +436,7 @@ impl PioneerDesktop {
             });
 
         self.render_item_row(
-            is_first_row,
+            top_spacing,
             is_last_row,
             content_width,
             toggle.into_any_element(),
@@ -302,7 +446,7 @@ impl PioneerDesktop {
     fn render_turn_work_group_toggle(
         &self,
         group: &TurnWorkGroupRow,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -350,7 +494,7 @@ impl PioneerDesktop {
             });
 
         self.render_item_row(
-            is_first_row,
+            top_spacing,
             is_last_row,
             content_width,
             toggle.into_any_element(),

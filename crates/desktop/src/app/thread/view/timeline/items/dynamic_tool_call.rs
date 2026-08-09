@@ -1,3 +1,4 @@
+use super::super::TimelineRowTopSpacing;
 use super::format_running_elapsed;
 use crate::{
     app::{
@@ -38,7 +39,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -230,7 +231,7 @@ impl PioneerDesktop {
                 .into_any_element()
         };
 
-        self.render_item_row(is_first_row, is_last_row, content_width, content)
+        self.render_item_row(top_spacing, is_last_row, content_width, content)
     }
 
     fn dynamic_tool_details(
@@ -606,35 +607,37 @@ impl PioneerDesktop {
                     let submit_revision = submit_revision.clone();
                     move |_, _, cx| submit_revision(cx)
                 })
-                .footer({
-                    let submit_revision = submit_revision.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            Button::new("task-review-revise-cancel")
-                                .small()
-                                .outline()
-                                .label(t!("buttons.cancel").to_string())
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            Button::new("task-review-revise-submit")
-                                .small()
-                                .primary()
-                                .label(t!("timeline.task_review.request_revision").to_string())
-                                .disabled(!can_submit)
-                                .on_click({
-                                    let submit_revision = submit_revision.clone();
-                                    move |_, window, cx| {
-                                        if submit_revision(cx) {
-                                            window.close_dialog(cx);
+                .footer(
+                    crate::components::legacy_dialog_footer::legacy_dialog_footer({
+                        let submit_revision = submit_revision.clone();
+                        move |_, _, _, _| {
+                            vec![
+                                Button::new("task-review-revise-cancel")
+                                    .small()
+                                    .outline()
+                                    .label(t!("buttons.cancel").to_string())
+                                    .on_click(|_, window, cx| {
+                                        window.close_dialog(cx);
+                                    })
+                                    .into_any_element(),
+                                Button::new("task-review-revise-submit")
+                                    .small()
+                                    .primary()
+                                    .label(t!("timeline.task_review.request_revision").to_string())
+                                    .disabled(!can_submit)
+                                    .on_click({
+                                        let submit_revision = submit_revision.clone();
+                                        move |_, window, cx| {
+                                            if submit_revision(cx) {
+                                                window.close_dialog(cx);
+                                            }
                                         }
-                                    }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                    })
+                                    .into_any_element(),
+                            ]
+                        }
+                    }),
+                )
                 .child(
                     v_form()
                         .child(

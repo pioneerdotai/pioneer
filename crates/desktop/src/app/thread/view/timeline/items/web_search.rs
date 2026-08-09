@@ -1,3 +1,4 @@
+use super::super::TimelineRowTopSpacing;
 use super::{format_running_elapsed, host_from_url};
 use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
@@ -19,7 +20,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -202,7 +203,7 @@ impl PioneerDesktop {
                 .into_any_element()
         };
 
-        self.render_item_row(is_first_row, is_last_row, content_width, content)
+        self.render_item_row(top_spacing, is_last_row, content_width, content)
     }
 
     fn web_search_result_row(

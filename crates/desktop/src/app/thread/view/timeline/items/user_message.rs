@@ -1,4 +1,11 @@
 use super::super::markdown::CodeHighlightPolicy;
+use super::super::{
+    TimelinePresentationContext, TimelineRowTopSpacing,
+    layout::{
+        TIMELINE_AVATAR_RAIL_WIDTH, TIMELINE_CONTENT_HORIZONTAL_PADDING,
+        TIMELINE_MESSAGE_END_BOTTOM_SPACING,
+    },
+};
 use crate::app::{
     conversation::{ItemView, TimelineEntry},
     root::PioneerDesktop,
@@ -6,22 +13,34 @@ use crate::app::{
 use crate::assets::PioneerIconName;
 use chrono::{Local, TimeZone};
 use gpui::{prelude::*, *};
-use gpui_component::{Icon, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
+use gpui_component::{
+    Icon, StyledExt, h_flex,
+    menu::{ContextMenuExt, PopupMenuItem},
+    theme::ActiveTheme,
+    v_flex,
+};
+use pioneer_client::composer::state_machine::{
+    ComposerDomainAction, composer_reply_target_from_visible_message,
+};
 use pioneer_client::timeline::labels::{
     ParsedUserAttachment, ParsedUserAttachmentKind, parse_user_attachments,
     stable_user_message_attachment_chip_id,
 };
-use pioneer_protocol::{TurnItem, TurnPermissionProfileSnapshot};
+use pioneer_client::timeline::rows::{
+    TimelineReplyState, UserMessageAlignment, UserMessagePresentation,
+    user_message_mutation_availability,
+};
+use pioneer_protocol::TurnItem;
 use std::path::PathBuf;
 
 impl PioneerDesktop {
-    pub(super) fn render_item_user_message(
+    pub(in crate::app) fn render_item_user_message(
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
-        permission_profile: Option<&TurnPermissionProfileSnapshot>,
-        is_first_row: bool,
+        presentation: Option<&UserMessagePresentation>,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -40,76 +59,310 @@ impl PioneerDesktop {
             .and_then(|ts| Local.timestamp_millis_opt(ts).single())
             .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
             .unwrap_or_default();
+        let last_edited_timestamp_text = item_view
+            .updated_at_unix_ms
+            .or(item_view.started_at_unix_ms)
+            .or(item_view.completed_at_unix_ms)
+            .and_then(|ts| Local.timestamp_millis_opt(ts).single())
+            .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
+            .unwrap_or_default();
 
         let copy_text = raw_text.to_owned();
+        let current_principal_id = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .map(|auth| &auth.principal.id);
+        let presentation_context = TimelinePresentationContext {
+            task_child_thread: self.active_task_thread_navigation().is_some(),
+        };
+        let alignment = if super::super::user_message_uses_current_principal_alignment(
+            presentation,
+            current_principal_id.map(|principal_id| principal_id.as_str()),
+            presentation_context,
+        ) {
+            UserMessageAlignment::CurrentPrincipal
+        } else {
+            UserMessageAlignment::Other
+        };
+        let mutation_availability =
+            presentation
+                .zip(current_principal_id)
+                .map(|(presentation, principal_id)| {
+                    user_message_mutation_availability(presentation, principal_id)
+                });
+        let editable_message = mutation_availability
+            .is_some_and(|value| value.can_edit)
+            .then(|| presentation.cloned())
+            .flatten();
+        let deletable_message = mutation_availability
+            .is_some_and(|value| value.can_delete)
+            .then(|| presentation.cloned())
+            .flatten();
+        let author_label = presentation
+            .and_then(|presentation| presentation.author.as_ref())
+            .map(|author| format!("{} · @{}", author.display_name, author.nickname))
+            .unwrap_or_else(|| t!("timeline.message.unknown_author").to_string());
         let active_workspace_id = self
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_workspace_id(thread_id))
             .map(str::to_owned);
+        let reply_target = presentation.and_then(|presentation| {
+            composer_reply_target_from_visible_message(presentation, raw_text)
+        });
+        let editable_artifacts = attachments
+            .iter()
+            .filter_map(|attachment| attachment.artifact.clone())
+            .collect::<Vec<_>>();
 
+        let context_reply_target = reply_target.clone();
+        let context_editable_message = editable_message.clone();
+        let context_deletable_message = deletable_message.clone();
+        let context_can_copy = !presentation.is_some_and(|presentation| presentation.deleted);
+        let context_last_edited = presentation
+            .filter(|presentation| presentation.edited)
+            .map(|presentation| (presentation.thread_id.clone(), presentation.turn_id.clone()));
+        let context_timestamp = timestamp_text;
+        let context_last_edited_timestamp = last_edited_timestamp_text;
+        let context_copy_text = copy_text.clone();
+        let context_edit_text = raw_text.to_owned();
+        let desktop_entity = cx.entity().clone();
         let mut row = div().flex().w_full().justify_center();
 
-        if is_first_row {
-            row = row.pt(px(40.));
-        } else {
-            row = row.pt(px(30.));
-        }
+        row = row.pt(top_spacing.pixels());
 
         if is_last_row {
-            row = row.pb(px(10.));
+            row = row.pb(TIMELINE_MESSAGE_END_BOTTOM_SPACING);
         }
 
         row.child(
             v_flex()
+                .id(("timeline-user-message", entry.item_index))
                 .w(content_width)
-                .px_6()
-                .items_end()
-                .group(format!("user-message-{}", item_view.id))
-                .when(!attachments.is_empty(), |this| {
-                    this.child(self.render_user_message_attachment_badges(
-                        item_view.id.as_str(),
-                        attachments.clone(),
-                        active_workspace_id.clone(),
-                        cx,
-                    ))
+                .px(TIMELINE_CONTENT_HORIZONTAL_PADDING)
+                .when(
+                    alignment == UserMessageAlignment::CurrentPrincipal,
+                    |this| this.items_end(),
+                )
+                .when(alignment == UserMessageAlignment::Other, |this| {
+                    this.items_start()
                 })
-                .child(
-                    div()
-                        .max_w_3_4()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .bg(cx.theme().muted)
-                        .rounded_2xl()
-                        .p_4()
-                        .child(v_flex().when(!raw_text.trim().is_empty(), |this| {
-                            this.child(self.render_markdown_auto(
-                                raw_text,
-                                item_view.partial_markdown.as_ref(),
-                                CodeHighlightPolicy::Disabled,
-                                cx,
-                            ))
-                        })),
+                .group(format!("user-message-{}", item_view.id))
+                .context_menu(move |menu, _, _| {
+                    let mut menu = menu;
+                    if let Some(reply_target) = context_reply_target.clone() {
+                        let desktop_entity = desktop_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("timeline.message.reply_action").to_string())
+                                .icon(PioneerIconName::Reply)
+                                .on_click(move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        if view.composer_edit_target.is_some() {
+                                            view.cancel_composer_message_edit(window, cx);
+                                        }
+                                        view.reduce_composer_domain(
+                                            ComposerDomainAction::SetReplyTarget {
+                                                target: reply_target.clone(),
+                                            },
+                                        );
+                                        view.composer_state.update(cx, |state, cx| {
+                                            state.focus(window, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    if context_can_copy {
+                        let copy_text = context_copy_text.clone();
+                        let desktop_entity = desktop_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("timeline.message.copy_action").to_string())
+                                .icon(PioneerIconName::Copy)
+                                .on_click(move |_, _, cx| {
+                                    let _ = desktop_entity.update(cx, |_, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_text.clone(),
+                                        ));
+                                    });
+                                }),
+                        );
+                    }
+                    if let Some(editable_message) = context_editable_message.clone() {
+                        let text = context_edit_text.clone();
+                        let artifacts = editable_artifacts.clone();
+                        let desktop_entity = desktop_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("timeline.message.edit_action").to_string())
+                                .icon(PioneerIconName::SquarePen)
+                                .on_click(move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.start_composer_message_edit(
+                                            editable_message.clone(),
+                                            text.clone(),
+                                            artifacts.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        );
+                    }
+                    if let Some(deletable_message) = context_deletable_message.clone() {
+                        let desktop_entity = desktop_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("timeline.message.delete_action").to_string())
+                                .icon(PioneerIconName::Trash)
+                                .on_click(move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.confirm_delete_message(
+                                            deletable_message.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        );
+                    }
+                    if !context_timestamp.is_empty() || context_last_edited.is_some() {
+                        menu = menu.separator();
+                    }
+                    if let Some((thread_id, turn_id)) = context_last_edited.clone() {
+                        let desktop_entity = desktop_entity.clone();
+                        let label = SharedString::from(format!(
+                            "{} · {}",
+                            t!("timeline.message.last_edited"),
+                            context_last_edited_timestamp
+                        ));
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, _| {
+                                div().text_xs().child(label.clone())
+                            })
+                            .icon(PioneerIconName::RotateCcwClock)
+                            .on_click(move |_, window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.open_message_revision_history(
+                                        thread_id.clone(),
+                                        turn_id.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                        );
+                    }
+                    if !context_timestamp.is_empty() {
+                        let label = SharedString::from(context_timestamp.clone());
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, _| {
+                                div().text_xs().child(label.clone())
+                            })
+                            .icon(PioneerIconName::Clock),
+                        );
+                    }
+                    menu
+                })
+                .when(
+                    alignment == UserMessageAlignment::Other
+                        && !matches!(
+                            top_spacing,
+                            TimelineRowTopSpacing::Compact | TimelineRowTopSpacing::GroupMessage
+                        ),
+                    |this| {
+                        this.child(
+                            h_flex()
+                                .ml(TIMELINE_AVATAR_RAIL_WIDTH)
+                                .h(px(32.))
+                                .max_w_3_4()
+                                .min_w_0()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(author_label),
+                                ),
+                        )
+                    },
+                )
+                .when_some(
+                    presentation.and_then(|value| value.reply.as_ref()),
+                    |this, reply| {
+                        let label = match presentation.and_then(|value| value.reply_state) {
+                            Some(TimelineReplyState::Deleted) => {
+                                t!("timeline.message.reply_deleted").to_string()
+                            }
+                            Some(TimelineReplyState::Unavailable) => {
+                                t!("timeline.message.reply_unavailable").to_string()
+                            }
+                            _ => reply.text.clone().unwrap_or_else(|| {
+                                t!("timeline.message.reply_unavailable").to_string()
+                            }),
+                        };
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "timeline-reply-target-{}",
+                                    reply.turn_id
+                                )))
+                                .max_w_3_4()
+                                .min_w_0()
+                                .when(alignment == UserMessageAlignment::Other, |this| {
+                                    this.ml(TIMELINE_AVATAR_RAIL_WIDTH)
+                                })
+                                .mt_2()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .opacity(0.75)
+                                .child(label),
+                        )
+                    },
+                )
+                .when(
+                    !presentation.is_some_and(|value| value.deleted) && !attachments.is_empty(),
+                    |this| {
+                        this.child(self.render_user_message_attachment_badges(
+                            item_view.id.as_str(),
+                            attachments.clone(),
+                            active_workspace_id.clone(),
+                            alignment == UserMessageAlignment::CurrentPrincipal,
+                            cx,
+                        ))
+                    },
                 )
                 .child(
-                    h_flex()
-                        .max_w_3_4()
+                    div()
                         .min_w_0()
-                        .h(px(30.))
-                        .justify_end()
-                        .items_center()
-                        .gap_2p5()
-                        .text_xs()
-                        .opacity(0.0)
-                        .group_hover(format!("user-message-{}", item_view.id), |this| {
-                            this.opacity(0.6)
+                        .overflow_hidden()
+                        .when(
+                            alignment == UserMessageAlignment::CurrentPrincipal,
+                            |this| this.max_w_3_4().bg(cx.theme().muted).rounded_2xl().p_4(),
+                        )
+                        .when(alignment == UserMessageAlignment::Other, |this| {
+                            this.w_full().pl(TIMELINE_AVATAR_RAIL_WIDTH)
                         })
-                        .when_some(permission_profile, |this, permission_profile| {
-                            this.child(self.render_turn_permission_badge(permission_profile, cx))
-                        })
-                        .child(timestamp_text)
                         .child(
-                            Clipboard::new(("copy-user-message", entry.item_index))
-                                .value(copy_text),
+                            v_flex()
+                                .when(presentation.is_some_and(|value| value.deleted), |this| {
+                                    this.text_sm()
+                                        .italic()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(t!("timeline.message.deleted").to_string())
+                                })
+                                .when(
+                                    !presentation.is_some_and(|value| value.deleted)
+                                        && !raw_text.trim().is_empty(),
+                                    |this| {
+                                        this.child(self.render_markdown_auto(
+                                            raw_text,
+                                            item_view.partial_markdown.as_ref(),
+                                            CodeHighlightPolicy::Disabled,
+                                            cx,
+                                        ))
+                                    },
+                                ),
                         ),
                 ),
         )
@@ -121,13 +374,17 @@ impl PioneerDesktop {
         item_id: &str,
         attachments: Vec<ParsedUserAttachment>,
         workspace_id: Option<String>,
+        align_end: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item_id = item_id.to_owned();
         h_flex()
             .w_full()
             .min_w_0()
-            .justify_end()
+            .when(align_end, |this| this.justify_end())
+            .when(!align_end, |this| {
+                this.pl(TIMELINE_AVATAR_RAIL_WIDTH).justify_start()
+            })
             .items_center()
             .flex_wrap()
             .gap_1p5()
@@ -280,6 +537,13 @@ fn attachment_capability_icon(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collaboration_actions_are_not_hover_only() {
+        let source = include_str!("user_message.rs");
+        assert!(source.contains(".opacity(0.0)\n                        .group_hover"));
+        assert!(!source.contains(".opacity(0.6)\n                        .group_hover"));
+    }
+
     use super::{ParsedUserAttachmentKind, parse_user_attachments};
     use pioneer_protocol::{
         SkillId, SkillPackId, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
@@ -333,5 +597,26 @@ mod tests {
                 .iter()
                 .all(|attachment| attachment.kind == ParsedUserAttachmentKind::Skill)
         );
+    }
+
+    #[test]
+    fn authored_row_uses_shared_identity_and_safe_collaboration_fields() {
+        let source = include_str!("user_message.rs");
+        for required in [
+            "user_message_alignment",
+            "author.display_name",
+            "author.nickname",
+            "author.avatar_revision",
+            "reply_state",
+            "value.deleted",
+            "value.edited",
+            "open_message_revision_history",
+            "user_message_mutation_availability",
+            "start_composer_message_edit",
+            "confirm_delete_message",
+        ] {
+            assert!(source.contains(required), "missing `{required}`");
+        }
+        assert!(!source.contains(&["conversation", "_message"].concat()));
     }
 }

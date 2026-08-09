@@ -9,6 +9,13 @@ mod user_message;
 mod web_fetch;
 mod web_search;
 
+use super::{
+    TimelineRowTopSpacing,
+    layout::{
+        TIMELINE_CONTENT_HORIZONTAL_PADDING, TIMELINE_END_BOTTOM_SPACING,
+        TIMELINE_ITEM_BOTTOM_SPACING,
+    },
+};
 use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
@@ -16,7 +23,7 @@ use crate::app::{
 use crate::assets::PioneerIconName;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Icon, IconName, StyledExt, divider::Divider, h_flex, theme::ActiveTheme, v_flex,
+    Icon, IconName, StyledExt, h_flex, separator::Separator, theme::ActiveTheme, v_flex,
 };
 use pioneer_client::{
     security::{
@@ -25,9 +32,7 @@ use pioneer_client::{
     },
     timeline::labels as timeline_labels,
 };
-use pioneer_protocol::{
-    TaskAttachmentMode, TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot,
-};
+use pioneer_protocol::{TaskAttachmentMode, TaskStatus, TurnItem};
 use std::hash::{Hash, Hasher};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
@@ -100,37 +105,6 @@ fn task_status_label(status: TaskStatus) -> String {
 }
 
 impl PioneerDesktop {
-    pub(super) fn turn_permission_icon(mode: TurnPermissionMode) -> PioneerIconName {
-        match mode {
-            TurnPermissionMode::FullAccess => PioneerIconName::ShieldCheck,
-            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::ShieldAlert,
-            TurnPermissionMode::Supervised => PioneerIconName::ShieldX,
-        }
-    }
-
-    pub(super) fn render_turn_permission_badge(
-        &self,
-        permission_profile: &TurnPermissionProfileSnapshot,
-        _: &mut Context<Self>,
-    ) -> AnyElement {
-        let display = timeline_labels::turn_permission_profile_display(permission_profile);
-        let mode = display.mode;
-
-        h_flex()
-            .items_center()
-            .gap_1()
-            .text_xs()
-            .child(Icon::new(Self::turn_permission_icon(mode)).size_3())
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(display.label),
-            )
-            .into_any_element()
-    }
-
     pub(super) fn turn_security_icon(summary: &ClientTurnSecuritySummary) -> PioneerIconName {
         match summary.enforcement {
             ClientSecurityEnforcementStatus::Unavailable => PioneerIconName::ShieldX,
@@ -264,8 +238,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
-        permission_profile: Option<&TurnPermissionProfileSnapshot>,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -275,8 +248,8 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                permission_profile,
-                is_first_row,
+                None,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -285,7 +258,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -294,7 +267,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -303,7 +276,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -311,7 +284,7 @@ impl PioneerDesktop {
             TurnItem::Task { item: task_item } => self.render_item_task(
                 item_view,
                 task_item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -320,7 +293,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -329,7 +302,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -338,7 +311,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -347,7 +320,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -356,7 +329,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -365,7 +338,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
-                is_first_row,
+                top_spacing,
                 is_last_row,
                 content_width,
                 cx,
@@ -377,7 +350,7 @@ impl PioneerDesktop {
         &self,
         item_view: &ItemView,
         task_item: &pioneer_protocol::TaskTurnItem,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
@@ -430,7 +403,7 @@ impl PioneerDesktop {
                                 this.child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6))
                             }),
                     )
-                    .child(Divider::horizontal())
+                    .child(Separator::horizontal())
                     .child(
                         div()
                             .when(!is_running, |this| {
@@ -477,32 +450,33 @@ impl PioneerDesktop {
             content.into_any_element()
         };
 
-        self.render_item_row(is_first_row, is_last_row, content_width, content)
+        self.render_item_row(top_spacing, is_last_row, content_width, content)
     }
 
     pub(super) fn render_item_row(
         &self,
-        is_first_row: bool,
+        top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         content: AnyElement,
     ) -> AnyElement {
         let mut row = div().flex().w_full().justify_center();
 
-        if is_first_row {
-            row = row.pt(px(40.));
-        } else {
-            row = row.pt(px(10.));
-        }
+        row = row.pt(top_spacing.pixels());
 
         if is_last_row {
-            row = row.pb(px(40.));
+            row = row.pb(TIMELINE_END_BOTTOM_SPACING);
         } else {
-            row = row.pb(px(10.));
+            row = row.pb(TIMELINE_ITEM_BOTTOM_SPACING);
         }
 
-        row.child(v_flex().w(content_width).px_6().child(content))
-            .into_any_element()
+        row.child(
+            v_flex()
+                .w(content_width)
+                .px(TIMELINE_CONTENT_HORIZONTAL_PADDING)
+                .child(content),
+        )
+        .into_any_element()
     }
 
     pub(super) fn truncate_for_card(text: &str, max_chars: usize) -> String {
