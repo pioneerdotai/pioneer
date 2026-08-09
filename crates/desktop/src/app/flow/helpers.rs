@@ -15,6 +15,12 @@ pub(crate) fn desktop_session_terminal_message(reason: SessionTerminalReason) ->
         | SessionTerminalReason::RefreshOutcomeUnknown => {
             t!("gateway.session_terminal.compromised").to_string()
         }
+        SessionTerminalReason::PrincipalSuspended => {
+            t!("gateway.session_terminal.principal_suspended").to_string()
+        }
+        SessionTerminalReason::PrincipalRemoved => {
+            t!("gateway.session_terminal.principal_removed").to_string()
+        }
         SessionTerminalReason::GatewayIdentityMismatch => {
             t!("gateway.session_terminal.gateway_mismatch").to_string()
         }

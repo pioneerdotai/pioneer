@@ -54,6 +54,8 @@ impl PioneerDesktop {
 
         let active_indicator_color = cx.theme().success;
         let inactive_indicator_color = cx.theme().yellow;
+        let option_foreground = cx.theme().foreground;
+        let option_muted_background = cx.theme().muted;
 
         let desktop_entity = cx.entity();
 
@@ -69,20 +71,8 @@ impl PioneerDesktop {
             cx.theme().secondary.darken(0.2).opacity(0.8)
         };
 
-        let gateway_option_style = ButtonCustomVariant::new(cx)
-            .color(cx.theme().transparent)
-            .foreground(cx.theme().foreground)
-            .hover(ghost_hover)
-            .active(ghost_active);
-
-        let gateway_option_active_style = ButtonCustomVariant::new(cx)
-            .color(cx.theme().muted)
-            .foreground(cx.theme().foreground)
-            .hover(ghost_hover)
-            .active(ghost_active);
-
         Popover::new("gateway-switcher-popover")
-            .anchor(Corner::TopLeft)
+            .anchor(Anchor::TopLeft)
             .p_0()
             .trigger(
                 Button::new("gateway-switcher-button")
@@ -159,10 +149,12 @@ impl PioneerDesktop {
                 let desktop_entity = desktop_entity.clone();
                 let gateway_endpoints = gateway_endpoints.clone();
                 let active_gateway_id = active_gateway_id.clone();
-                let gateway_option_style = gateway_option_style;
-                let gateway_option_active_style = gateway_option_active_style;
                 let active_indicator_color = active_indicator_color;
                 let inactive_indicator_color = inactive_indicator_color;
+                let option_foreground = option_foreground;
+                let option_muted_background = option_muted_background;
+                let ghost_hover = ghost_hover;
+                let ghost_active = ghost_active;
 
                 move |_, _window, popover_cx| {
                     let popover_entity = popover_cx.entity();
@@ -189,10 +181,12 @@ impl PioneerDesktop {
                                                 endpoint,
                                                 active_gateway_id.as_deref(),
                                                 gateway_selection_locked,
-                                                gateway_option_style,
-                                                gateway_option_active_style,
                                                 active_indicator_color,
                                                 inactive_indicator_color,
+                                                option_foreground,
+                                                option_muted_background,
+                                                ghost_hover,
+                                                ghost_active,
                                                 desktop_entity.clone(),
                                                 popover_entity.clone(),
                                             )
@@ -201,7 +195,7 @@ impl PioneerDesktop {
                                 ),
                             )
                         })
-                        .child(Divider::horizontal())
+                        .child(Separator::horizontal())
                         .child(h_flex().p_2().pt_0().justify_start().child(
                             Self::render_add_gateway_popover_action(
                                 gateway_selection_locked,
@@ -251,10 +245,12 @@ impl PioneerDesktop {
         endpoint: &GatewayEndpoint,
         active_gateway_id: Option<&str>,
         gateway_selection_locked: bool,
-        gateway_option_style: ButtonCustomVariant,
-        gateway_option_active_style: ButtonCustomVariant,
         active_indicator_color: Hsla,
         inactive_indicator_color: Hsla,
+        option_foreground: Hsla,
+        option_muted_background: Hsla,
+        ghost_hover: Hsla,
+        ghost_active: Hsla,
         desktop_entity: Entity<Self>,
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
@@ -267,27 +263,34 @@ impl PioneerDesktop {
         let endpoint_id_for_click = endpoint_id.clone();
         let endpoint_name_for_click = endpoint_name.clone();
         let is_active = active_gateway_id == Some(endpoint_id.as_str());
-        let button_style = if is_active {
-            gateway_option_active_style
-        } else {
-            gateway_option_style
-        };
 
-        let select_button = Button::new(("gateway-option", index))
-            .custom(button_style)
-            .with_size(px(14.))
+        let select_button = div()
+            .id(("gateway-option", index))
             .w_full()
-            .justify_start()
+            .min_w_0()
+            .cursor_pointer()
+            .rounded_lg()
             .p_2()
+            .text_color(option_foreground)
+            .when(is_active, |this| this.bg(option_muted_background))
+            .hover(move |this| this.bg(ghost_hover))
+            .active(move |this| this.bg(ghost_active))
+            .when(gateway_selection_locked, |this| this.opacity(0.5))
             .when(endpoint.kind == GatewayEndpointKind::Remote, |this| {
                 this.pr(px(36.))
             })
-            .disabled(gateway_selection_locked)
+            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                window.prevent_default();
+            })
             .on_click({
                 let desktop_entity = desktop_entity.clone();
                 let popover_entity = popover_entity.clone();
 
                 move |_, window, cx| {
+                    if gateway_selection_locked {
+                        cx.stop_propagation();
+                        return;
+                    }
                     let started = desktop_entity.update(cx, |view, cx| {
                         if requires_reauthentication {
                             view.open_reauthenticate_gateway_dialog(
@@ -339,6 +342,7 @@ impl PioneerDesktop {
                                     .w_full()
                                     .min_w_0()
                                     .text_sm()
+                                    .text_color(option_foreground)
                                     .line_height(relative(1.0))
                                     .font_semibold()
                                     .overflow_hidden()
@@ -351,6 +355,7 @@ impl PioneerDesktop {
                                     .w_full()
                                     .min_w_0()
                                     .text_xs()
+                                    .text_color(option_foreground)
                                     .line_height(relative(1.05))
                                     .opacity(0.6)
                                     .overflow_hidden()

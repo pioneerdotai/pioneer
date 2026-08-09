@@ -56,6 +56,7 @@ impl PioneerDesktop {
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.active_thread_resubscribe_pending = false;
+            self.workspace_members_loading.clear();
             self.semantic_timeline_in_flight.clear();
             self.semantic_timeline_pending.clear();
             self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
@@ -68,11 +69,21 @@ impl PioneerDesktop {
         if let Some(cx) = cx.as_deref_mut() {
             self.rebuild_sidebar_tree_state(cx);
             if self.gateway.connection_state == GatewayConnectionState::Connected {
+                self.resolve_agent_avatar(cx);
+                self.refresh_current_principal(cx);
                 self.active_thread_resubscribe_pending = self.current_active_thread_id().is_some();
                 self.refresh_desktop_voice_status(cx);
                 if !was_connected {
                     self.reconcile_semantic_timeline_after_reconnect(cx);
                 }
+            }
+            if self.gateway.connection_state != GatewayConnectionState::Connected {
+                self.gateway.current_auth = None;
+                self.administration.clear_for_session_termination();
+                self.selected_member_id = None;
+                self.member_avatar_state.clear();
+                self.members_loading = false;
+                self.members_error = None;
             }
             execute_desktop_client_effects(self, reduction.effects, cx);
         }

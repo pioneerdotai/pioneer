@@ -92,6 +92,7 @@ impl PioneerDesktop {
         };
         let requested_thread_id = start_plan.requested_thread_id;
         let requested_workspace_id = start_plan.requested_workspace_id;
+        let requested_visibility = self.pending_thread_create_visibility;
 
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -114,9 +115,10 @@ impl PioneerDesktop {
                         };
 
                         let response =
-                            match ws_sender.thread_start(thread_start::thread_start_params(
+                            match ws_sender.thread_start(thread_start::thread_create_params(
                                 requested_thread_id_for_request,
                                 workspace_id.clone(),
+                                requested_visibility,
                             )) {
                                 Ok(response) => response,
                                 Err(error) => {

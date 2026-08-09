@@ -1,6 +1,7 @@
 use super::*;
-use crate::app::root::DesktopVoiceComposerState;
+use crate::app::root::{DesktopVoiceComposerState, SettingsContentView};
 use crate::audio::capture::DesktopVoiceCaptureErrorKind;
+use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
 use pioneer_client::authorization::{
     AccessChangedPlan, ThreadAuthorizationScope, plan_access_changed,
 };
@@ -107,10 +108,9 @@ impl PioneerDesktop {
             ClientRuntimeNotification::AccessChanged(notification) => {
                 self.apply_access_changed_notification(notification, cx);
             }
-            // Epic 5 does not add production administration screens. The
-            // shared reducer exposes these events for generated/mobile
-            // contracts; Desktop will consume them when that UI is added.
-            ClientRuntimeNotification::AdministrationChanged(_) => {}
+            ClientRuntimeNotification::AdministrationChanged(event) => {
+                self.apply_administration_event(event, cx);
+            }
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 self.apply_thread_started_reduction(reduction);
             }
@@ -187,6 +187,40 @@ impl PioneerDesktop {
         }
     }
 
+    fn apply_administration_event(&mut self, event: AdministrationEvent, cx: &mut Context<Self>) {
+        let invalidation = self.administration.apply_event(&event);
+        if invalidation.apply {
+            self.apply_administration_refetches(invalidation.effects, cx);
+        }
+    }
+
+    pub(in crate::app) fn apply_administration_refetches(
+        &mut self,
+        effects: Vec<AdministrationRefetch>,
+        cx: &mut Context<Self>,
+    ) {
+        for effect in effects {
+            match effect {
+                AdministrationRefetch::InvitationList
+                    if self.settings_content_view == SettingsContentView::Invitations =>
+                {
+                    self.refresh_invitations(false, cx);
+                }
+                AdministrationRefetch::MemberDirectory
+                    if self.settings_content_view == SettingsContentView::Members =>
+                {
+                    self.refresh_members(false, cx);
+                }
+                AdministrationRefetch::WorkspaceMembers { workspace_id }
+                    if self.settings_content_view == SettingsContentView::Members =>
+                {
+                    self.refresh_workspace_members(workspace_id, cx);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn apply_access_changed_notification(
         &mut self,
         notification: pioneer_protocol::AccessChangedNotification,
@@ -206,7 +240,22 @@ impl PioneerDesktop {
             return;
         }
 
+        let administration_invalidation = self.administration.apply_access_changed(&notification);
+
         self.gateway.authorization_revision = Some(plan.authorization_revision);
+        if plan.clear_active_thread || plan.clear_active_workspace {
+            if let Some(state) = self.thread_scope_dialog.take() {
+                state.update(cx, |presentation, cx| {
+                    *presentation = None;
+                    cx.notify();
+                });
+            }
+            self.thread_scope_pending = Default::default();
+            self.thread_scope_error = None;
+            self.message_revision_dialog = None;
+            self.message_revision_loading = false;
+            self.message_mutation_pending = false;
+        }
         apply_desktop_workspace_catalog_invalidation(
             &mut self.workspaces,
             &mut self.preferred_workspace_id,
@@ -224,6 +273,8 @@ impl PioneerDesktop {
             .iter()
             .map(String::as_str)
             .collect::<std::collections::HashSet<_>>();
+        self.thread_unread
+            .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
         self.task_thread_navigation_stack.retain(|entry| {
             !(workspace_wide && entry.workspace_id == plan.workspace_id)
@@ -303,6 +354,9 @@ impl PioneerDesktop {
 
         self.rebuild_sidebar_tree_state(cx);
         execute_desktop_client_effects(self, plan.effects, cx);
+        if administration_invalidation.apply {
+            self.apply_administration_refetches(administration_invalidation.effects, cx);
+        }
         cx.notify();
     }
 
@@ -854,17 +908,21 @@ mod access_change_tests {
     }
 
     #[::core::prelude::v1::test]
-    fn desktop_ignores_epic5_administration_events_until_the_ui_exists() {
+    fn desktop_routes_administration_events_through_shared_revisioned_invalidation() {
         let source = include_str!("ws_events_notifications.rs");
         let production_source = source
             .split_once("#[cfg(test)]\nmod access_change_tests")
             .map(|(production_source, _)| production_source)
             .expect("Desktop notification tests must remain outside production wiring");
 
+        assert!(production_source.contains("self.administration.apply_event(&event)"));
         assert!(
-            production_source.contains("ClientRuntimeNotification::AdministrationChanged(_) => {}")
+            production_source.contains("self.administration.apply_access_changed(&notification)")
         );
-        assert!(!production_source.contains("apply_administration"));
+        assert!(
+            !production_source
+                .contains("ClientRuntimeNotification::AdministrationChanged(_) => {}")
+        );
     }
 }
 

@@ -33,10 +33,10 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     WindowExt,
     button::*,
-    divider::Divider,
     h_flex,
     notification::{Notification, NotificationType},
     popover::{Popover, PopoverState},
+    separator::Separator,
     spinner::Spinner,
     theme::ActiveTheme,
     *,

@@ -17,6 +17,20 @@ impl PioneerDesktop {
         connection_id: u64,
         cx: &mut Context<Self>,
     ) {
+        let workspace_thread_ids = self
+            .thread_coordinators
+            .iter()
+            .filter(|(_, coordinator)| coordinator.workspace_id == reduction.workspace_id)
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.thread_unread
+            .retain(|thread_id, _| !workspace_thread_ids.contains(thread_id));
+        self.thread_unread.extend(
+            pioneer_client::threads::read::project_thread_unread(&reduction.unread)
+                .into_iter()
+                .filter(|summary| summary.unread_count > 0)
+                .map(|summary| (summary.thread_id, summary.unread_count)),
+        );
         for thread in reduction.threads {
             let thread_id = thread.id.clone();
             let workspace_id = thread.workspace_id.clone();

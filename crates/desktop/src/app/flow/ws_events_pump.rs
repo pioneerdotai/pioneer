@@ -277,6 +277,12 @@ impl PioneerDesktop {
                     pioneer_protocol::AuthSessionTerminationReason::SessionCompromised => {
                         pioneer_client::gateway::session_lifecycle::SessionTerminalReason::SessionCompromised
                     }
+                    pioneer_protocol::AuthSessionTerminationReason::PrincipalSuspended => {
+                        pioneer_client::gateway::session_lifecycle::SessionTerminalReason::PrincipalSuspended
+                    }
+                    pioneer_protocol::AuthSessionTerminationReason::PrincipalRemoved => {
+                        pioneer_client::gateway::session_lifecycle::SessionTerminalReason::PrincipalRemoved
+                    }
                 })
             }
             GatewayWsEvent::Disconnected { reason, .. }
@@ -334,7 +340,14 @@ impl PioneerDesktop {
         self.gateway.session_refresh_generation =
             self.gateway.session_refresh_generation.wrapping_add(1);
         self.gateway.session_refresh_in_flight = false;
+        self.gateway.auth_session_action_pending = None;
         self.discard_deferred_gateway_ws_events();
+        self.clear_authorization_epoch_cache();
+        self.gateway.current_auth = None;
+        self.administration.clear_for_session_termination();
+        self.selected_member_id = None;
+        self.member_avatar_state.clear();
+        self.gateway.auth_sessions.clear();
         self.gateway.ws_connection_id = None;
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(desktop_session_terminal_message(
