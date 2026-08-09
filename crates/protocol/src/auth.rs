@@ -61,6 +61,8 @@ pub enum AuthSessionTerminationReason {
     SessionRevoked,
     SessionExpired,
     SessionCompromised,
+    PrincipalSuspended,
+    PrincipalRemoved,
 }
 
 impl AuthSessionTerminationReason {
@@ -69,6 +71,8 @@ impl AuthSessionTerminationReason {
             Self::SessionRevoked => "session_revoked",
             Self::SessionExpired => "session_expired",
             Self::SessionCompromised => "session_compromised",
+            Self::PrincipalSuspended => "principal_suspended",
+            Self::PrincipalRemoved => "principal_removed",
         }
     }
 }

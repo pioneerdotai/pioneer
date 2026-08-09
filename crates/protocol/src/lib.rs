@@ -20,6 +20,7 @@ mod provider;
 mod schema;
 mod settings;
 mod skills;
+mod system_assets;
 mod task;
 mod thread;
 mod thread_agents_doc;
@@ -231,6 +232,7 @@ pub use skills::{
     SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
+pub use system_assets::PIONEER_AGENT_AVATAR_REVISION;
 pub use task::{
     TASK_COMPOSER_WORK_VERSION, Task, TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem,
     TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
