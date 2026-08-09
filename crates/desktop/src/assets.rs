@@ -44,7 +44,10 @@ impl AssetSource for PioneerAssetsSource {
 
 #[derive(IntoElement, Clone)]
 pub enum PioneerIconName {
+    AtSign,
     Bolt,
+    Clock,
+    Copy,
     FolderPlus,
     FolderTree,
     GalleryVerticalEnd,
@@ -57,21 +60,28 @@ pub enum PioneerIconName {
     Paperclip,
     PowerOff,
     RefreshCw,
+    Reply,
     RotateCcw,
+    RotateCcwClock,
     ShieldAlert,
     ShieldCheck,
     ShieldX,
     Square,
+    SquarePen,
     SunMoon,
     Terminal,
     Trash,
+    Users,
     Zap,
 }
 
 impl IconNamed for PioneerIconName {
     fn path(self) -> SharedString {
         match self {
+            Self::AtSign => "icons/at-sign.svg",
             Self::Bolt => "icons/bolt.svg",
+            Self::Clock => "icons/clock.svg",
+            Self::Copy => "icons/copy.svg",
             Self::FolderPlus => "icons/folder-plus.svg",
             Self::FolderTree => "icons/folder-tree.svg",
             Self::GalleryVerticalEnd => "icons/gallery-vertical-end.svg",
@@ -84,14 +94,18 @@ impl IconNamed for PioneerIconName {
             Self::Paperclip => "icons/paperclip.svg",
             Self::PowerOff => "icons/power-off.svg",
             Self::RefreshCw => "icons/refresh-cw.svg",
+            Self::Reply => "icons/reply.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
+            Self::RotateCcwClock => "icons/rotate-ccw-clock.svg",
             Self::ShieldAlert => "icons/shield-alert.svg",
             Self::ShieldCheck => "icons/shield-check.svg",
             Self::ShieldX => "icons/shield-x.svg",
             Self::Square => "icons/square.svg",
+            Self::SquarePen => "icons/square-pen.svg",
             Self::SunMoon => "icons/sun-moon.svg",
             Self::Terminal => "icons/terminal.svg",
             Self::Trash => "icons/trash.svg",
+            Self::Users => "icons/users.svg",
             Self::Zap => "icons/zap.svg",
         }
         .into()

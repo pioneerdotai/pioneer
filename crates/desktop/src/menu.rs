@@ -20,6 +20,7 @@ pub(crate) fn init_system_menus(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("secondary-q", QuitApp, None)]);
     cx.set_menus(vec![Menu {
         name: t!("menu.app.name").into(),
+        disabled: false,
         items: vec![
             MenuItem::action(t!("menu.app.about"), ShowAbout),
             MenuItem::separator(),

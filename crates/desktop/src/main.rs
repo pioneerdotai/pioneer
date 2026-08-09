@@ -54,12 +54,12 @@ impl DesktopHttpClient {
 }
 
 impl HttpClient for DesktopHttpClient {
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn user_agent(&self) -> Option<&HeaderValue> {
         Some(&self.user_agent)
+    }
+
+    fn proxy(&self) -> Option<&http_client::Url> {
+        None
     }
 
     fn send(
@@ -96,10 +96,6 @@ impl HttpClient for DesktopHttpClient {
         }
         .boxed()
     }
-
-    fn proxy(&self) -> Option<&http_client::Url> {
-        None
-    }
 }
 
 fn main() {
@@ -126,9 +122,13 @@ fn main() {
     let http_client = DesktopHttpClient::new("pioneer-desktop")
         .expect("failed to initialize HTTP client for remote assets");
 
-    let app = Application::new()
+    let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    let app = gpui_platform::application()
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
+    app.on_open_urls(move |urls| {
+        let _ = url_sender.send(urls);
+    });
 
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -144,11 +144,26 @@ fn main() {
                 ..Default::default()
             };
 
-            cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| PioneerDesktop::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .context(t!("errors.window.open_failed").to_string())?;
+            let mut desktop = None;
+            let window_handle = cx
+                .open_window(window_options, |window, cx| {
+                    let view = cx.new(|cx| PioneerDesktop::new(window, cx));
+                    desktop = Some(view.clone());
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
+                .context(t!("errors.window.open_failed").to_string())?;
+            let desktop = desktop.context("desktop view was not created")?;
+
+            while let Some(urls) = url_receiver.recv().await {
+                for url in urls {
+                    let desktop = desktop.clone();
+                    let _ = window_handle.update(cx, move |_, window, cx| {
+                        let _ = desktop.update(cx, |view, cx| {
+                            view.handle_invitation_url(url, window, cx);
+                        });
+                    });
+                }
+            }
 
             Ok::<_, anyhow::Error>(())
         })

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 pioneer-config.workspace = true
@@ -27,7 +28,8 @@ sha2.workspace = true
 toml.workspace = true
 zeroize.workspace = true
 gpui.workspace = true
-gpui-terminal.workspace = true
+gpui_platform.workspace = true
+terminal.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 rust-i18n.workspace = true
@@ -56,7 +58,6 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-base64.workspace = true
 hex.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
