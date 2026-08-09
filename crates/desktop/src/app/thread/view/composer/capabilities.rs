@@ -6,6 +6,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     WindowExt,
     button::*,
+    dialog::DialogFooter,
     form::{field, v_form},
     input::{Input, InputState},
     scroll::ScrollableElement,
@@ -291,53 +292,49 @@ impl PioneerDesktop {
                         .font_semibold()
                         .child(t!("chat.composer.add_menu.skills").to_string()),
                 )
-                .footer(
-                    crate::components::legacy_dialog_footer::legacy_dialog_footer({
-                        let desktop_entity = desktop_entity.clone();
-                        let picker_state = picker_state.clone();
-                        let target_thread_id = target_thread_id.clone();
-                        move |_, _, _, cx| {
-                            let selections = normalize_composer_skill_selections(
-                                picker_state.read(cx).skill_selections.iter().cloned(),
-                            );
+                .footer(DialogFooter::new().children({
+                    let desktop_entity = desktop_entity.clone();
+                    let picker_state = picker_state.clone();
+                    let target_thread_id = target_thread_id.clone();
+                    let selections = normalize_composer_skill_selections(
+                        picker_state.read(cx).skill_selections.iter().cloned(),
+                    );
 
-                            vec![
-                                default_outline_button("composer-skills-cancel")
-                                    .label(t!("buttons.cancel").to_string())
-                                    .outline()
-                                    .on_click(|_, window, cx| window.close_dialog(cx))
-                                    .into_any_element(),
-                                default_primary_button("composer-skills-save")
-                                    .label(t!("buttons.add").to_string())
-                                    .disabled(selections.is_empty())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let target_thread_id = target_thread_id.clone();
-                                        move |_, window, cx| {
-                                            if selections.is_empty() {
-                                                return;
-                                            }
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                if view.current_active_thread_id()
-                                                    != Some(target_thread_id.as_str())
-                                                {
-                                                    return;
-                                                }
-                                                view.reduce_composer_domain(
-                                                    ComposerDomainAction::SetSkillSelections {
-                                                        selections: selections.clone(),
-                                                    },
-                                                );
-                                                cx.notify();
-                                            });
-                                            window.close_dialog(cx);
+                    vec![
+                        default_outline_button("composer-skills-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| window.close_dialog(cx))
+                            .into_any_element(),
+                        default_primary_button("composer-skills-save")
+                            .label(t!("buttons.add").to_string())
+                            .disabled(selections.is_empty())
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                let target_thread_id = target_thread_id.clone();
+                                move |_, window, cx| {
+                                    if selections.is_empty() {
+                                        return;
+                                    }
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        if view.current_active_thread_id()
+                                            != Some(target_thread_id.as_str())
+                                        {
+                                            return;
                                         }
-                                    })
-                                    .into_any_element(),
-                            ]
-                        }
-                    }),
-                )
+                                        view.reduce_composer_domain(
+                                            ComposerDomainAction::SetSkillSelections {
+                                                selections: selections.clone(),
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()
@@ -451,50 +448,43 @@ impl PioneerDesktop {
                         .font_semibold()
                         .child(t!("chat.composer.add_menu.mcp").to_string()),
                 )
-                .footer(
-                    crate::components::legacy_dialog_footer::legacy_dialog_footer({
-                        let desktop_entity = desktop_entity.clone();
-                        let picker_state = picker_state.clone();
-                        let target_thread_id = target_thread_id.clone();
-                        move |_, _, _, cx| {
-                            let capabilities =
-                                selected_mcp_composer_capabilities(&picker_state.read(cx));
+                .footer(DialogFooter::new().children({
+                    let desktop_entity = desktop_entity.clone();
+                    let picker_state = picker_state.clone();
+                    let target_thread_id = target_thread_id.clone();
+                    let capabilities = selected_mcp_composer_capabilities(&picker_state.read(cx));
 
-                            vec![
-                                default_outline_button("composer-mcp-cancel")
-                                    .label(t!("buttons.cancel").to_string())
-                                    .outline()
-                                    .on_click(|_, window, cx| window.close_dialog(cx))
-                                    .into_any_element(),
-                                default_primary_button("composer-mcp-save")
-                                    .label(t!("buttons.add").to_string())
-                                    .disabled(capabilities.is_empty())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let target_thread_id = target_thread_id.clone();
-                                        move |_, window, cx| {
-                                            if capabilities.is_empty() {
-                                                return;
-                                            }
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                if view.current_active_thread_id()
-                                                    != Some(target_thread_id.as_str())
-                                                {
-                                                    return;
-                                                }
-                                                view.add_composer_capabilities(
-                                                    capabilities.clone(),
-                                                );
-                                                cx.notify();
-                                            });
-                                            window.close_dialog(cx);
+                    vec![
+                        default_outline_button("composer-mcp-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| window.close_dialog(cx))
+                            .into_any_element(),
+                        default_primary_button("composer-mcp-save")
+                            .label(t!("buttons.add").to_string())
+                            .disabled(capabilities.is_empty())
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                let target_thread_id = target_thread_id.clone();
+                                move |_, window, cx| {
+                                    if capabilities.is_empty() {
+                                        return;
+                                    }
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        if view.current_active_thread_id()
+                                            != Some(target_thread_id.as_str())
+                                        {
+                                            return;
                                         }
-                                    })
-                                    .into_any_element(),
-                            ]
-                        }
-                    }),
-                )
+                                        view.add_composer_capabilities(capabilities.clone());
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()
