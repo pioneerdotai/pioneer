@@ -6,7 +6,9 @@ use pioneer_client::cli_runtime::approvals::{
     PendingRequestsReduction, plan_pending_request_response,
 };
 use pioneer_client::composer::attachments as composer_attachments;
-use pioneer_client::composer::state_machine::ComposerDomainAction;
+use pioneer_client::composer::state_machine::{
+    ComposerDomainAction, bound_composer_mentioned_principal_ids,
+};
 use pioneer_client::composer::turn_prepare::{
     self as composer_turn_prepare, PrepareComposerTurnRequest,
 };
@@ -272,7 +274,10 @@ impl PioneerDesktop {
         let selected_model = self.composer_selected_model.clone();
         let selected_provider = self.composer_selected_provider.clone();
         let selected_reasoning_effort = self.composer_selected_reasoning_effort.clone();
-        let selected_cli_runtime_backend =
+        let selected_cli_runtime_backend = if selected_mode == pioneer_protocol::ThreadMode::Message
+        {
+            None
+        } else {
             match provider_list::resolve_cli_runtime_execution_backend(
                 selected_provider.as_deref(),
                 self.providers.cli_runtimes(),
@@ -287,7 +292,8 @@ impl PioneerDesktop {
                     cx.notify();
                     return;
                 }
-            };
+            }
+        };
         let turn_model_provider = if selected_cli_runtime_backend.is_some() {
             None
         } else {
@@ -303,6 +309,13 @@ impl PioneerDesktop {
             .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
+        let composer_domain_state = self.composer_domain_state();
+        let reply_to_turn_id = composer_domain_state
+            .reply_target
+            .as_ref()
+            .map(|target| target.turn_id.clone());
+        let mentioned_principal_ids =
+            bound_composer_mentioned_principal_ids(&composer_domain_state, composer_text.as_str());
         let composer_attachments = self.composer_attachments.clone();
         let submission =
             self.composer_submission_plan(composer_text.as_str(), !composer_attachments.is_empty());
@@ -355,7 +368,7 @@ impl PioneerDesktop {
                         })
                         .unwrap_or(false)
                     {
-                        Timer::after(COMPOSER_SESSION_READY_RETRY_DELAY).await;
+                        cx.background_executor().timer(COMPOSER_SESSION_READY_RETRY_DELAY).await;
                     }
                     let prepare_result = cx
                         .background_spawn(async move {
@@ -376,10 +389,10 @@ impl PioneerDesktop {
                     let _ = this.update_in(&mut cx, move |view, window, cx| {
                         let prepared = match prepare_result {
                             Ok(prepared) => prepared,
-                            Err(error) => {
+                            Err(_error) => {
                                 let reduction =
                                     composer_turn_prepare::reduce_prepare_composer_turn_failure(
-                                        format!("{error:#}"),
+                                        t!("chat.composer.send_failed").to_string(),
                                     );
                                 view.composer_upload_in_progress =
                                     reduction.composer_upload_in_progress;
@@ -408,6 +421,8 @@ impl PioneerDesktop {
                                     selected_provider: selected_provider.clone(),
                                     turn_model_provider: turn_model_provider.clone(),
                                     selected_mode: Some(selected_mode),
+                                    reply_to_turn_id: reply_to_turn_id.clone(),
+                                    mentioned_principal_ids: mentioned_principal_ids.clone(),
                                     permission_mode: selected_permission_mode,
                                     execution_backend: selected_cli_runtime_backend.clone(),
                                     selected_reasoning_effort: selected_reasoning_effort.clone(),
@@ -425,15 +440,13 @@ impl PioneerDesktop {
                         if reduction.clear_composer_upload_error {
                             view.composer_upload_error = None;
                         }
+                        let clear_composer_on_accept = reduction.clear_composer;
+                        let clear_thread_draft_id = reduction.clear_thread_draft_id.clone();
                         view.reduce_composer_domain(
                             ComposerDomainAction::ApplyUploadedAttachments {
                                 artifacts: reduction.uploaded_attachment_artifacts,
                             },
                         );
-                        if reduction.clear_composer {
-                            view.clear_composer(window, cx);
-                        }
-                        view.clear_thread_draft(reduction.clear_thread_draft_id.as_str());
 
                         if let Some(coordinator) = view.thread_coordinator_mut(thread_id.as_str()) {
                             if let Some(thread) = coordinator.thread_mut() {
@@ -486,7 +499,9 @@ impl PioneerDesktop {
                         let send_context = reduction.send_context;
                         let workspace_id_for_update = workspace_id.clone();
 
-                        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                        cx.spawn_in(
+                            window,
+                            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
                             let mut cx = cx.clone();
                             let thread_id_for_update = send_context.thread_id.clone();
                             let send_context_for_update = send_context.clone();
@@ -506,26 +521,48 @@ impl PioneerDesktop {
                                     })
                                     .await;
 
-                                let _ = this.update(&mut cx, |view, cx| {
+                                let _ = this.update_in(&mut cx, |view, window, cx| {
                                     view.composer_upload_in_progress = false;
                                     let reduction = match result {
                                         Ok(response) => turn_start::reduce_turn_start_send_success(
                                             send_context_for_update,
                                             response,
                                         ),
-                                        Err(error) => turn_start::reduce_turn_start_send_failure(
+                                        Err(_error) => turn_start::reduce_turn_start_send_failure(
                                             send_context_for_update,
-                                            format!("{error:#}"),
+                                            t!("chat.composer.send_failed").to_string(),
                                         ),
                                     };
-                                    let events = match reduction {
+                                    let (events, accepted) = match reduction {
                                         turn_start::TurnStartSendReduction::Accepted { events } => {
-                                            events
+                                            (events, true)
                                         }
                                         turn_start::TurnStartSendReduction::Rejected { event } => {
-                                            vec![event]
+                                            (vec![event], false)
                                         }
                                     };
+                                    if accepted {
+                                        if clear_composer_on_accept
+                                            && view.current_active_thread_id()
+                                                == Some(thread_id_for_update.as_str())
+                                        {
+                                            view.composer_state.update(cx, |state, cx| {
+                                                state.set_value("", window, cx)
+                                            });
+                                            view.reduce_composer_domain(
+                                                ComposerDomainAction::SendSucceeded,
+                                            );
+                                        }
+                                        view.clear_thread_draft(clear_thread_draft_id.as_str());
+                                        view.composer_upload_error = None;
+                                    } else {
+                                        view.reduce_composer_domain(
+                                            ComposerDomainAction::SendFailed,
+                                        );
+                                        view.composer_upload_error = Some(
+                                            t!("chat.composer.send_failed").to_string(),
+                                        );
+                                    }
                                     {
                                         let Some(conversation) = view
                                             .thread_conversation_mut(thread_id_for_update.as_str())
@@ -553,7 +590,8 @@ impl PioneerDesktop {
                                     cx.notify();
                                 });
                             }
-                        })
+                        },
+                        )
                         .detach();
 
                         cx.notify();
@@ -658,5 +696,20 @@ impl PioneerDesktop {
             self.composer_upload_error = None;
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_message_send_reuses_turn_start_and_clears_only_after_acceptance() {
+        let source = include_str!("actions.rs");
+        assert!(source.contains("ws_sender.turn_start"));
+        assert!(source.contains("reply_to_turn_id: reply_to_turn_id.clone()"));
+        assert!(source.contains("mentioned_principal_ids: mentioned_principal_ids.clone()"));
+        assert!(source.contains("ComposerDomainAction::SendSucceeded"));
+        assert!(source.contains("ComposerDomainAction::SendFailed"));
+        assert!(source.contains("if accepted"));
+        assert!(!source.contains(&["message", "/send"].concat()));
     }
 }

@@ -18,6 +18,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.ensure_active_thread_workspace_members_loaded(cx);
         self.ensure_active_thread_artifacts_loaded(cx);
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
 
@@ -44,7 +45,7 @@ impl PioneerDesktop {
                     .min_h_0()
                     .overflow_hidden()
                     .child(div().flex_1().min_h_0().child(timeline))
-                    .child(self.render_composer(cx)),
+                    .child(self.render_composer(window, cx)),
             );
 
         let thread_split = h_resizable("thread-artifacts-layout")

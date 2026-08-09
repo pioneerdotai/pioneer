@@ -6,6 +6,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Icon, IconName, WindowExt,
     button::*,
+    dialog::DialogFooter,
     form::{Field, field, v_form},
     input::{Input, InputState},
     scroll::ScrollableElement,
@@ -191,45 +192,43 @@ impl PioneerDesktop {
                     let submit = submit.clone();
                     move |_, _, cx| submit(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let submit = submit.clone();
                     let request = request.clone();
                     let desktop_entity = desktop_entity.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("cli-runtime-user-input-cancel")
-                                .label("Cancel turn")
-                                .danger()
-                                .on_click({
-                                    let request = request.clone();
-                                    let desktop_entity = desktop_entity.clone();
-                                    move |_, window, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.respond_pending_request(
-                                                request.clone(),
-                                                PendingRequestResolution::Cancel,
-                                                cx,
-                                            );
-                                            cx.notify();
-                                        });
+                    vec![
+                        default_outline_button("cli-runtime-user-input-cancel")
+                            .label("Cancel turn")
+                            .danger()
+                            .on_click({
+                                let request = request.clone();
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.respond_pending_request(
+                                            request.clone(),
+                                            PendingRequestResolution::Cancel,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }
+                            })
+                            .into_any_element(),
+                        default_primary_button("cli-runtime-user-input-submit")
+                            .label("Submit")
+                            .on_click({
+                                let submit = submit.clone();
+                                move |_, window, cx| {
+                                    if submit(cx) {
                                         window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                            default_primary_button("cli-runtime-user-input-submit")
-                                .label("Submit")
-                                .on_click({
-                                    let submit = submit.clone();
-                                    move |_, window, cx| {
-                                        if submit(cx) {
-                                            window.close_dialog(cx);
-                                        }
-                                    }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_form()
                         .gap_4()
