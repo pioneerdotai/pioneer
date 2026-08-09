@@ -1346,6 +1346,41 @@ impl MessageProcessor {
                 &notification,
             )
             .await;
+
+            // Participant mutations change discoverability for exactly this
+            // thread. Deliver its committed snapshot to every connection that
+            // remains authorized (including a newly added participant) rather
+            // than invalidating or reloading the workspace thread tree.
+            match self
+                .crud_store
+                .get_thread_model(authorization.thread_id())
+                .await
+            {
+                Ok(Some(thread)) => {
+                    let placement = self
+                        .crud_store
+                        .get_thread_placement(thread.id.as_str())
+                        .await
+                        .ok()
+                        .flatten();
+                    self.send_thread_scoped_notification_to_connections(
+                        thread.id.as_str(),
+                        events::THREAD_UPDATED,
+                        &ThreadUpdatedNotification { thread, placement },
+                        self.session_manager.connection_ids().await,
+                    )
+                    .await;
+                }
+                Ok(None) => warn!(
+                    thread_id = authorization.thread_id(),
+                    "committed thread disappeared after participant mutation"
+                ),
+                Err(error) => warn!(
+                    thread_id = authorization.thread_id(),
+                    error = %format!("{error:#}"),
+                    "failed to load committed thread after participant mutation"
+                ),
+            }
         }
     }
 
