@@ -131,7 +131,7 @@ impl PioneerDesktop {
                                     .icon(IconName::Plus)
                                     .tooltip(t!("providers.cli.action.add").to_string())
                                     .disabled(!is_connected)
-                                    .dropdown_menu_with_anchor(Corner::TopRight, {
+                                    .dropdown_menu_with_anchor(Anchor::TopRight, {
                                         let desktop_entity = desktop_entity.clone();
                                         move |menu, _, _| {
                                             cli_provider_settings::CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS

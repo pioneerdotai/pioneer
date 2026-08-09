@@ -4,6 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     WindowExt,
     button::*,
+    dialog::DialogFooter,
     form::{field, v_form},
     input::{Input, InputState},
     switch::Switch,
@@ -119,61 +120,56 @@ impl PioneerDesktop {
                     let save_provider_configuration = save_provider_configuration.clone();
                     move |_, _, cx| save_provider_configuration(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let save_provider_configuration = save_provider_configuration.clone();
                     let desktop_entity = desktop_entity.clone();
                     let delete_provider_id = delete_provider_id.clone();
 
-                    move |_, _, _, _| {
-                        let mut actions = vec![
-                            default_outline_button("provider-dialog-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("provider-dialog-save")
-                                .label(t!("providers.button.submit").to_string())
+                    let mut actions = vec![
+                        default_outline_button("provider-dialog-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("provider-dialog-save")
+                            .label(t!("providers.button.submit").to_string())
+                            .on_click({
+                                let save_provider_configuration =
+                                    save_provider_configuration.clone();
+                                move |_, window, cx| {
+                                    if save_provider_configuration(cx) {
+                                        window.close_dialog(cx);
+                                    }
+                                }
+                            })
+                            .into_any_element(),
+                    ];
+
+                    if let Some(provider_id) = delete_provider_id.clone() {
+                        actions.insert(
+                            1,
+                            default_outline_button("provider-dialog-delete")
+                                .label(t!("providers.button.remove_key").to_string())
+                                .danger()
                                 .on_click({
-                                    let save_provider_configuration =
-                                        save_provider_configuration.clone();
+                                    let desktop_entity = desktop_entity.clone();
+                                    let provider_id = provider_id.clone();
                                     move |_, window, cx| {
-                                        if save_provider_configuration(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.delete_provider_api_key(provider_id.clone(), cx);
+                                            cx.notify();
+                                        });
+                                        window.close_dialog(cx);
                                     }
                                 })
                                 .into_any_element(),
-                        ];
-
-                        if let Some(provider_id) = delete_provider_id.clone() {
-                            actions.insert(
-                                1,
-                                default_outline_button("provider-dialog-delete")
-                                    .label(t!("providers.button.remove_key").to_string())
-                                    .danger()
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let provider_id = provider_id.clone();
-                                        move |_, window, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.delete_provider_api_key(
-                                                    provider_id.clone(),
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                            window.close_dialog(cx);
-                                        }
-                                    })
-                                    .into_any_element(),
-                            );
-                        }
-
-                        actions
+                        );
                     }
-                })
+
+                    actions
+                }))
                 .child(
                     v_flex()
                         .w_full()
@@ -343,40 +339,38 @@ impl PioneerDesktop {
                     let save_cli_provider = save_cli_provider.clone();
                     move |_, _, cx| save_cli_provider(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let save_cli_provider = save_cli_provider.clone();
                     let desktop_entity = desktop_entity.clone();
 
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("cli-runtime-provider-dialog-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click({
-                                    let desktop_entity = desktop_entity.clone();
-                                    move |_, window, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.providers.clear_cli_runtime_draft();
-                                            cx.notify();
-                                        });
+                    vec![
+                        default_outline_button("cli-runtime-provider-dialog-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.providers.clear_cli_runtime_draft();
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }
+                            })
+                            .into_any_element(),
+                        default_primary_button("cli-runtime-provider-dialog-save")
+                            .label(t!("providers.button.submit").to_string())
+                            .on_click({
+                                let save_cli_provider = save_cli_provider.clone();
+                                move |_, window, cx| {
+                                    if save_cli_provider(cx) {
                                         window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                            default_primary_button("cli-runtime-provider-dialog-save")
-                                .label(t!("providers.button.submit").to_string())
-                                .on_click({
-                                    let save_cli_provider = save_cli_provider.clone();
-                                    move |_, window, cx| {
-                                        if save_cli_provider(cx) {
-                                            window.close_dialog(cx);
-                                        }
-                                    }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()
