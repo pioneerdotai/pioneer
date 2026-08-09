@@ -6,9 +6,9 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::ButtonVariants,
-    divider::Divider,
     form::{field, v_form},
     input::{Input, InputState, OtpInput, OtpState},
+    separator::Separator,
     theme::ActiveTheme,
     *,
 };
@@ -465,7 +465,7 @@ fn render_gateway_setup_form_actions(
             .operation_source()
             .expect("local gateway action should only render for setup modes");
         actions = actions
-            .child(Divider::horizontal().label(t!("common.or").to_string()))
+            .child(Separator::horizontal().label(t!("common.or").to_string()))
             .child(
                 default_outline_button(
                     mode.secondary_button_id()
